@@ -19,9 +19,10 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
-    AcceptedBatchEvent, BatchId, BlockId, BlockOwner, ContentDigest, DocumentId,
-    LogseqIdentityOrigin, LogseqUuid, ManagedPath, ManagedTextKind, PageId, PageState,
-    PolicyGeneratedAnchorReason, ReferenceSourceLocatorV1, SemanticEffect,
+    AcceptedBatchEvent, BatchCausalDot, BatchId, BlockId, BlockOwner, CausalPeerId, ContentDigest,
+    DeviceId, DocumentId, LogicalPageName, LogseqIdentityOrigin, LogseqUuid, ManagedPath,
+    ManagedTextKind, PageId, PageState, PolicyGeneratedAnchorReason, ReferenceSourceLocatorV1,
+    SemanticEffect,
 };
 
 pub const MAX_MATERIALIZATION_QUERY_ROWS: usize = storage::MAX_MATERIALIZATION_QUERY_ROWS;
@@ -50,7 +51,7 @@ const REFERENCE_CATALOG_POSTING_OVERHEAD_BYTES: usize = 96;
 const REFERENCE_CATALOG_ALIAS_OVERHEAD_BYTES: usize = 80;
 // Parser-derived query facts are disposable rows bound only by the accepted
 // frontier stamp. They are never a second authenticated authority.
-const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 5;
+const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 6;
 
 pub(crate) type ApplyChangeInstrumentation = storage::ApplyChangeInstrumentation;
 
@@ -236,6 +237,13 @@ pub(crate) struct MaterializedPortablePathClaim {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct MaterializedIdentityRecord {
+    pub(crate) key_digest: ContentDigest,
+    pub(crate) record: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterializedReference {
     pub target: MaterializedEntityId,
     pub kind: MaterializedReferenceKind,
@@ -303,6 +311,8 @@ pub struct MaterializationChange {
     derived_reference_postings: Vec<MaterializedReferencePosting>,
     derived_aliases: Vec<MaterializedAliasDeclaration>,
     portable_path_claims: Vec<MaterializedPortablePathClaim>,
+    page_name_identity_records: Vec<MaterializedIdentityRecord>,
+    portable_path_identity_records: Vec<MaterializedIdentityRecord>,
 }
 
 impl MaterializationChange {
@@ -324,6 +334,8 @@ impl MaterializationChange {
             derived_reference_postings: Vec::new(),
             derived_aliases: Vec::new(),
             portable_path_claims: Vec::new(),
+            page_name_identity_records: Vec::new(),
+            portable_path_identity_records: Vec::new(),
         };
         change.validate_shape()?;
         Ok(change)
@@ -353,6 +365,19 @@ impl MaterializationChange {
         self.derived_reference_postings = reference_postings;
         self.derived_aliases = aliases;
         self.portable_path_claims = portable_path_claims;
+        self.validate_shape()?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_identity_projection_records(
+        mut self,
+        mut page_names: Vec<MaterializedIdentityRecord>,
+        mut portable_paths: Vec<MaterializedIdentityRecord>,
+    ) -> Result<Self, MaterializationError> {
+        page_names.sort_unstable();
+        portable_paths.sort_unstable();
+        self.page_name_identity_records = page_names;
+        self.portable_path_identity_records = portable_paths;
         self.validate_shape()?;
         Ok(self)
     }
@@ -470,6 +495,12 @@ impl MaterializationChange {
                 alias.ordinal,
             )
         }) || !strictly_sorted_unique_by(&self.portable_path_claims, |claim| claim.page_id)
+            || !strictly_sorted_unique_by(&self.page_name_identity_records, |record| {
+                record.key_digest
+            })
+            || !strictly_sorted_unique_by(&self.portable_path_identity_records, |record| {
+                record.key_digest
+            })
         {
             return Err(MaterializationError::InvalidInput(
                 "derived graph facts are not canonical".into(),
@@ -516,6 +547,20 @@ impl MaterializationChange {
                 )
             },
         )?)?;
+        for record in self
+            .page_name_identity_records
+            .iter()
+            .chain(&self.portable_path_identity_records)
+        {
+            if record.record.is_empty() || record.record.len() > MAX_MATERIALIZATION_FIELD_BYTES {
+                return Err(resource_limit(
+                    "causal identity record bytes",
+                    record.record.len(),
+                    MAX_MATERIALIZATION_FIELD_BYTES,
+                ));
+            }
+            input_budget.add_bytes(record.record.len().saturating_add(48))?;
+        }
         Ok(())
     }
 
@@ -1194,7 +1239,7 @@ pub(crate) fn apply_change(
     input_digest: ContentDigest,
     post_frontier_digest: ContentDigest,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-    let physical = lower_validated_change(change, semantic_effect)?;
+    let physical = lower_validated_change(change, semantic_effect, None)?;
     storage::apply_materialization_change_for_test(
         transaction,
         &physical,
@@ -1208,6 +1253,7 @@ pub(crate) fn apply_change(
 pub(crate) fn lower_validated_change(
     change: &MaterializationChange,
     semantic_effect: &[u8],
+    causal_dot: Option<BatchCausalDot>,
 ) -> Result<storage::PhysicalMaterializationChange, MaterializationError> {
     change.validate_shape()?;
     let effect = SemanticEffect::decode(semantic_effect)
@@ -1219,6 +1265,40 @@ pub(crate) fn lower_validated_change(
         .iter()
         .filter(|delta| matches!(delta.after.as_ref(), Some(PageState::Live { .. })))
         .map(|delta| delta.page_id.as_uuid().into_bytes())
+        .collect();
+    let block_home_claims = effect
+        .blocks()
+        .iter()
+        .filter(|delta| delta.before.is_none() && delta.after.is_some())
+        .map(|delta| storage::PhysicalBlockHomeClaim {
+            block_id: delta.block_id.as_uuid().into_bytes(),
+            home_document_id: delta.home_document_id.as_uuid().into_bytes(),
+            batch_id: Some(change.batch_id.as_uuid().into_bytes()),
+            causal_peer_id: causal_dot
+                .map(|dot| dot.peer_id().as_device_id().as_uuid().into_bytes()),
+            causal_counter: causal_dot.map(BatchCausalDot::counter),
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let logseq_uuid_introductions = effect
+        .blocks()
+        .iter()
+        .filter_map(|delta| {
+            let before = delta.before.as_ref().and_then(|state| state.logseq_uuid);
+            let after = delta.after.as_ref()?.logseq_uuid?;
+            (before != Some(after)).then_some(storage::PhysicalLogseqUuidIntroduction {
+                logseq_uuid: after.as_uuid().into_bytes(),
+                block_id: delta.block_id.as_uuid().into_bytes(),
+                home_document_id: delta.home_document_id.as_uuid().into_bytes(),
+                batch_id: Some(change.batch_id.as_uuid().into_bytes()),
+                causal_peer_id: causal_dot
+                    .map(|dot| dot.peer_id().as_device_id().as_uuid().into_bytes()),
+                causal_counter: causal_dot.map(BatchCausalDot::counter),
+            })
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
     let replacements = change
         .replacements
@@ -1244,6 +1324,24 @@ pub(crate) fn lower_validated_change(
                 portable_path_key: claim.portable_path_key,
             })
             .collect(),
+        block_home_claims,
+        page_name_identity_records: change
+            .page_name_identity_records
+            .iter()
+            .map(|record| storage::PhysicalIdentityRecord {
+                key_digest: record.key_digest,
+                record: record.record.clone(),
+            })
+            .collect(),
+        portable_path_identity_records: change
+            .portable_path_identity_records
+            .iter()
+            .map(|record| storage::PhysicalIdentityRecord {
+                key_digest: record.key_digest,
+                record: record.record.clone(),
+            })
+            .collect(),
+        logseq_uuid_introductions,
     })
 }
 
@@ -1475,6 +1573,52 @@ pub(crate) fn lower_terminal_chunk(
         }
         validate_alias_declaration(alias, &mut input_budget)?;
     }
+    let mut page_name_identity_records = chunk
+        .pages
+        .iter()
+        .map(|page| {
+            let name = LogicalPageName::parse(&page.name)
+                .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+            let record =
+                super::sqlite_identity::PageNameIdentityRecordV1::baseline(page.page_id, name)
+                    .map_err(MaterializationError::InvalidInput)?;
+            Ok(storage::PhysicalIdentityRecord {
+                key_digest: ContentDigest::from_bytes(*record.key_digest().as_bytes()),
+                record: record
+                    .encode()
+                    .map_err(MaterializationError::InvalidInput)?,
+            })
+        })
+        .collect::<Result<Vec<_>, MaterializationError>>()?;
+    page_name_identity_records.sort_unstable_by_key(|record| record.key_digest);
+    if !strictly_sorted_unique_by(&page_name_identity_records, |record| record.key_digest) {
+        return Err(MaterializationError::InvalidInput(
+            "terminal baseline repeats a canonical page-name key".into(),
+        ));
+    }
+    let mut portable_path_identity_records = chunk
+        .pages
+        .iter()
+        .map(|page| {
+            let record = super::sqlite_identity::PortablePathIdentityRecordV1::baseline(
+                page.page_id,
+                page.path.clone(),
+            )
+            .map_err(MaterializationError::InvalidInput)?;
+            Ok(storage::PhysicalIdentityRecord {
+                key_digest: ContentDigest::from_bytes(*record.key_digest().as_bytes()),
+                record: record
+                    .encode()
+                    .map_err(MaterializationError::InvalidInput)?,
+            })
+        })
+        .collect::<Result<Vec<_>, MaterializationError>>()?;
+    portable_path_identity_records.sort_unstable_by_key(|record| record.key_digest);
+    if !strictly_sorted_unique_by(&portable_path_identity_records, |record| record.key_digest) {
+        return Err(MaterializationError::InvalidInput(
+            "terminal baseline repeats a portable path key".into(),
+        ));
+    }
     Ok(storage::PhysicalTerminalMaterializationChunk {
         pages: chunk
             .pages
@@ -1483,6 +1627,37 @@ pub(crate) fn lower_terminal_chunk(
             .collect::<Result<Vec<_>, _>>()?,
         postings: lower_reference_postings(&chunk.postings)?,
         aliases: lower_alias_declarations(&chunk.aliases)?,
+        block_home_claims: chunk
+            .pages
+            .iter()
+            .flat_map(|page| page.blocks.iter())
+            .map(|block| storage::PhysicalBlockHomeClaim {
+                block_id: block.block_id.as_uuid().into_bytes(),
+                home_document_id: block.home_document_id.as_uuid().into_bytes(),
+                batch_id: None,
+                causal_peer_id: None,
+                causal_counter: None,
+            })
+            .collect(),
+        page_name_identity_records,
+        portable_path_identity_records,
+        logseq_uuid_introductions: chunk
+            .pages
+            .iter()
+            .flat_map(|page| page.blocks.iter())
+            .filter_map(|block| {
+                block
+                    .logseq_uuid
+                    .map(|logseq_uuid| storage::PhysicalLogseqUuidIntroduction {
+                        logseq_uuid: logseq_uuid.as_uuid().into_bytes(),
+                        block_id: block.block_id.as_uuid().into_bytes(),
+                        home_document_id: block.home_document_id.as_uuid().into_bytes(),
+                        batch_id: None,
+                        causal_peer_id: None,
+                        causal_counter: None,
+                    })
+            })
+            .collect(),
     })
 }
 
@@ -1545,6 +1720,32 @@ pub struct MaterializedBlockRow {
     pub collapsed: bool,
     pub logseq_uuid: Option<LogseqUuid>,
     pub logseq_identity_origin: Option<LogseqIdentityOrigin>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockHomeClaimRow {
+    pub block_id: BlockId,
+    pub home_document_id: DocumentId,
+    /// Absent only for a claim inherent in the immutable activation baseline.
+    pub batch_id: Option<BatchId>,
+    pub causal_dot: Option<BatchCausalDot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedIdentityRecordRow {
+    pub key_digest: ContentDigest,
+    pub record: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaterializedLogseqUuidIntroductionRow {
+    pub logseq_uuid: LogseqUuid,
+    pub block_id: BlockId,
+    pub home_document_id: DocumentId,
+    /// Absent only for an introduction inherent in the immutable activation
+    /// baseline.
+    pub batch_id: Option<BatchId>,
+    pub causal_dot: Option<BatchCausalDot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1708,14 +1909,60 @@ impl<'a> SqliteMaterializedRead<'a> {
             .transpose()
     }
 
-    pub fn block_by_logseq_uuid(
+    pub fn block_home_claims(
+        &self,
+        block_id: BlockId,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockHomeClaimRow>, MaterializationError> {
+        convert_rows(
+            self.inner
+                .block_home_claims(block_id.as_uuid().into_bytes(), limit)?,
+            block_home_claim_row_from_storage,
+        )
+    }
+
+    pub fn page_name_identity_record(
+        &self,
+        key_digest: ContentDigest,
+    ) -> Result<Option<MaterializedIdentityRecordRow>, MaterializationError> {
+        self.inner
+            .page_name_identity_record(key_digest)?
+            .map(identity_record_row_from_storage)
+            .transpose()
+    }
+
+    pub fn portable_path_identity_record(
+        &self,
+        key_digest: ContentDigest,
+    ) -> Result<Option<MaterializedIdentityRecordRow>, MaterializationError> {
+        self.inner
+            .portable_path_identity_record(key_digest)?
+            .map(identity_record_row_from_storage)
+            .transpose()
+    }
+
+    pub fn logseq_uuid_introductions(
         &self,
         logseq_uuid: LogseqUuid,
-    ) -> Result<Option<MaterializedBlockRow>, MaterializationError> {
-        self.inner
-            .block_by_logseq_uuid(logseq_uuid.as_uuid().into_bytes())?
-            .map(block_row_from_storage)
-            .transpose()
+        limit: usize,
+    ) -> Result<Vec<MaterializedLogseqUuidIntroductionRow>, MaterializationError> {
+        convert_rows(
+            self.inner
+                .logseq_uuid_introductions(logseq_uuid.as_uuid().into_bytes(), limit)?,
+            logseq_uuid_introduction_row_from_storage,
+        )
+    }
+
+    pub fn blocks_by_logseq_uuid(
+        &self,
+        logseq_uuid: LogseqUuid,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockRow>, MaterializationError> {
+        convert_rows(
+            self.inner
+                .blocks_by_logseq_uuid(logseq_uuid.as_uuid().into_bytes(), limit)?,
+            block_row_from_storage,
+        )
     }
 
     pub fn pages_by_name(
@@ -2211,6 +2458,82 @@ fn block_row_from_storage(
             .map(identity_origin_from_sql)
             .transpose()
             .map_err(typed_sql_decode_error)?,
+    })
+}
+
+fn block_home_claim_row_from_storage(
+    row: storage::PhysicalBlockHomeClaimRow,
+) -> Result<MaterializedBlockHomeClaimRow, MaterializationError> {
+    let causal_dot = match (row.causal_peer_id, row.causal_counter) {
+        (None, None) => None,
+        (Some(peer), Some(counter)) => Some(
+            BatchCausalDot::new(
+                CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_bytes(peer))),
+                counter,
+            )
+            .map_err(|error| MaterializationError::Corrupt(error.to_string()))?,
+        ),
+        _ => {
+            return Err(MaterializationError::Corrupt(
+                "block-home claim has incomplete causal provenance".into(),
+            ))
+        }
+    };
+    if row.batch_id.is_none() && causal_dot.is_some() {
+        return Err(MaterializationError::Corrupt(
+            "baseline block-home claim has accepted-batch causality".into(),
+        ));
+    }
+    Ok(MaterializedBlockHomeClaimRow {
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+        home_document_id: DocumentId::from_uuid(Uuid::from_bytes(row.home_document_id)),
+        batch_id: row
+            .batch_id
+            .map(|id| BatchId::from_uuid(Uuid::from_bytes(id))),
+        causal_dot,
+    })
+}
+
+fn identity_record_row_from_storage(
+    row: storage::PhysicalIdentityRecordRow,
+) -> Result<MaterializedIdentityRecordRow, MaterializationError> {
+    Ok(MaterializedIdentityRecordRow {
+        key_digest: row.key_digest,
+        record: row.record,
+    })
+}
+
+fn logseq_uuid_introduction_row_from_storage(
+    row: storage::PhysicalLogseqUuidIntroductionRow,
+) -> Result<MaterializedLogseqUuidIntroductionRow, MaterializationError> {
+    let causal_dot = match (row.causal_peer_id, row.causal_counter) {
+        (None, None) => None,
+        (Some(peer), Some(counter)) => Some(
+            BatchCausalDot::new(
+                CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_bytes(peer))),
+                counter,
+            )
+            .map_err(|error| MaterializationError::Corrupt(error.to_string()))?,
+        ),
+        _ => {
+            return Err(MaterializationError::Corrupt(
+                "external UUID introduction has incomplete causal provenance".into(),
+            ))
+        }
+    };
+    if row.batch_id.is_none() && causal_dot.is_some() {
+        return Err(MaterializationError::Corrupt(
+            "baseline external UUID introduction has accepted-batch causality".into(),
+        ));
+    }
+    Ok(MaterializedLogseqUuidIntroductionRow {
+        logseq_uuid: LogseqUuid::from_uuid(Uuid::from_bytes(row.logseq_uuid)),
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+        home_document_id: DocumentId::from_uuid(Uuid::from_bytes(row.home_document_id)),
+        batch_id: row
+            .batch_id
+            .map(|id| BatchId::from_uuid(Uuid::from_bytes(id))),
+        causal_dot,
     })
 }
 

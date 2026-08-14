@@ -3593,6 +3593,7 @@ fn spool_bootstrap_operations(
     let mut lazy_genesis = LazyGenesisPackBuilder::new(
         workspace_id,
         lineage_digest,
+        catalog_document_id,
         capture.capture_identity()?,
         working,
     )?;

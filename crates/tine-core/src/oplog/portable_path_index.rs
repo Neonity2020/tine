@@ -172,6 +172,13 @@ impl PortablePathRecord {
         self.latest_release.as_ref()
     }
 
+    /// Canonical opaque bytes used while SQLite shadows and replaces the
+    /// Patricia point map. Domain interpretation remains in tine-core.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        self.validate(self.key_digest)?;
+        encode_record(self)
+    }
+
     fn validate(&self, expected: PortablePathKeyDigest) -> Result<(), StoreError> {
         if self.schema_version != PORTABLE_PATH_RECORD_SCHEMA_VERSION
             || self.key_version != PORTABLE_PATH_KEY_VERSION

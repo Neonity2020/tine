@@ -1536,6 +1536,13 @@ impl PageNameOwnershipRecordV1 {
         self.latest_release.as_ref()
     }
 
+    /// Canonical opaque bytes used while SQLite shadows and replaces the
+    /// Patricia point map. Domain interpretation remains in tine-core.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        self.validate_shape(self.key_digest)?;
+        encode_canonical(self)
+    }
+
     fn validate_shape(&self, expected_key: PageNameKeyDigest) -> Result<(), StoreError> {
         require_version(
             "page-name ownership record",

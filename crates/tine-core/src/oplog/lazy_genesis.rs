@@ -19,7 +19,7 @@ use super::{
     LogseqUuid, ManagedPath, ManagedTextKind, PageId, WorkspaceId,
 };
 
-const LAZY_GENESIS_SCHEMA_VERSION: u32 = 2;
+const LAZY_GENESIS_SCHEMA_VERSION: u32 = 3;
 const LAZY_GENESIS_COMMIT_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_ACTIVATION_MARKER_MAGIC: &[u8] = b"TINE-LAZY-GENESIS-ACTIVATION\0";
@@ -220,6 +220,7 @@ struct LazyGenesisManifestV1 {
     schema_version: u32,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
     source_capture: BlobDescription,
     catalog_checkpoint: BlobDescription,
     catalog_dependencies: Option<DocumentDependencies>,
@@ -373,6 +374,7 @@ impl LazyGenesisCommitV1 {
 pub(crate) struct LazyGenesisPackBuilder {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
     source_capture: BlobDescription,
     scratch: PathBuf,
     current: Vec<u8>,
@@ -389,6 +391,7 @@ impl LazyGenesisPackBuilder {
     pub(crate) fn new(
         workspace_id: WorkspaceId,
         lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
         source_capture: BlobDescription,
         scratch_parent: &Path,
     ) -> io::Result<Self> {
@@ -397,6 +400,7 @@ impl LazyGenesisPackBuilder {
         Ok(Self {
             workspace_id,
             lineage_digest,
+            catalog_document_id,
             source_capture,
             scratch,
             current: Vec::with_capacity(LAZY_GENESIS_SEGMENT_TARGET_BYTES),
@@ -508,7 +512,8 @@ impl LazyGenesisPackBuilder {
             ));
         }
         if catalog_dependencies.as_ref().is_some_and(|dependencies| {
-            !dependencies.direct_dependency_heads().is_empty()
+            dependencies.document_id() != self.catalog_document_id
+                || !dependencies.direct_dependency_heads().is_empty()
                 || self
                     .descriptors
                     .iter()
@@ -530,6 +535,7 @@ impl LazyGenesisPackBuilder {
             schema_version: LAZY_GENESIS_SCHEMA_VERSION,
             workspace_id: self.workspace_id,
             lineage_digest: self.lineage_digest,
+            catalog_document_id: self.catalog_document_id,
             source_capture: self.source_capture,
             catalog_checkpoint: catalog_description,
             catalog_dependencies,
@@ -600,6 +606,10 @@ impl LazyGenesisCandidate {
 
     pub(crate) const fn lineage_digest(&self) -> LineageDigest {
         self.manifest.lineage_digest
+    }
+
+    pub(crate) const fn catalog_document_id(&self) -> DocumentId {
+        self.manifest.catalog_document_id
     }
 
     pub(crate) fn manifest_bytes(&self) -> &[u8] {
@@ -849,7 +859,8 @@ fn validate_manifest(manifest: &LazyGenesisManifestV1) -> io::Result<()> {
         .catalog_dependencies
         .as_ref()
         .is_some_and(|dependencies| {
-            !dependencies.direct_dependency_heads().is_empty()
+            dependencies.document_id() != manifest.catalog_document_id
+                || !dependencies.direct_dependency_heads().is_empty()
                 || !dependency_documents.insert(dependencies.document_id())
         })
     {
@@ -966,15 +977,24 @@ mod tests {
         .unwrap()
     }
 
+    fn catalog_document_id() -> DocumentId {
+        catalog_dependencies().document_id()
+    }
+
     #[test]
     fn lazy_genesis_pack_is_deterministic_bounded_and_point_readable() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
         let lineage = LineageDigest::of(b"lazy-genesis-test");
         let source = BlobDescription::of(b"capture");
         let build = || {
-            let mut builder =
-                LazyGenesisPackBuilder::new(workspace, lineage, source, &std::env::temp_dir())
-                    .unwrap();
+            let mut builder = LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog_document_id(),
+                source,
+                &std::env::temp_dir(),
+            )
+            .unwrap();
             let pages = vec![page(1, "pages/a.md", 2), page(2, "pages/b.org", 1)];
             for page in pages {
                 builder.push(page).unwrap();
@@ -989,6 +1009,7 @@ mod tests {
         assert_eq!(first.manifest_bytes(), second.manifest_bytes());
         assert_eq!(first.page_count(), 2);
         assert_eq!(first.block_count(), 3);
+        assert_eq!(first.catalog_document_id(), catalog_document_id());
         let read = first
             .page(PageId::from_uuid(Uuid::from_u128(2)))
             .unwrap()
@@ -1054,6 +1075,7 @@ mod tests {
         let mut builder = LazyGenesisPackBuilder::new(
             workspace,
             lineage,
+            catalog_document_id(),
             BlobDescription::of(b"capture"),
             &std::env::temp_dir(),
         )
@@ -1065,6 +1087,7 @@ mod tests {
         let mut builder = LazyGenesisPackBuilder::new(
             workspace,
             lineage,
+            catalog_document_id(),
             BlobDescription::of(b"capture"),
             &std::env::temp_dir(),
         )
@@ -1086,6 +1109,7 @@ mod tests {
         let mut builder = LazyGenesisPackBuilder::new(
             workspace,
             lineage,
+            catalog_document_id(),
             BlobDescription::of(b"capture"),
             &parent,
         )

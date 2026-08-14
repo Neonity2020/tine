@@ -94,7 +94,7 @@ from the immutable archive.
 | `reconciliation/{scan.sqlite,scan.sqlite-wal,scan.sqlite-shm,scan.sqlite-journal}` | reconciliation | reconciliation scheduler | SQLite baseline v3 | disposable |
 | `reconciliation/<workspace>/<endpoint>/scan.sqlite.forensic-<uuid>/{database,wal,shm,journal,EVIDENCE_COMPLETE,REBUILD_COMPLETE}` | reconciliation recovery | cache-corruption diagnostics and crash-resumable rebuild | exact former baseline file set plus completion markers | diagnostic; never authority; created only when the disposable baseline fails semantic validation |
 | `.tine-runtime/sqlite-workspaces/sqlite-applier.lock` | SQLite applier | SQLite applier | empty OS-lock file | disposable process coordination |
-| `projection/materialization.sqlite{,-wal,-shm}` | SQLite applier | managed queries/navigation | `tine-storage` SQLite schema 18 | disposable; mismatch causes one rebuild |
+| `projection/materialization.sqlite{,-wal,-shm}` | SQLite applier | managed queries/navigation | `tine-storage` SQLite schema 20 | disposable; mismatch causes one rebuild |
 | runtime scratch (`tine-storage::formats::SCRATCH_DIR` and its marker/lease/pages/blobs) | hot engine/import | hot engine/rebuild | scratch schema 13, page schema 1 | disposable; one run only |
 | `managed-local-journal-v1/` | actor fast durability lane | drain/recovery | journal frames/segments | durable until incorporated into oplog, then reclaimable |
 | `local-authorship-v1/` | actor publication | provider repair/recovery | receipt v1 | retained until corresponding publication is proven |
@@ -260,11 +260,12 @@ byte/inventory comparison under the watcher fence matches the sealed source.
 Each page capsule carries one deterministic CRDT checkpoint constructed
 directly from its terminal page state, plus its compact causal dependencies.
 The single catalog checkpoint is constructed by the same direct terminal-state
-builder. These checkpoints are baseline semantic/causal state, not fabricated
-interactive history: their construction authors no `SemanticOperation`, batch,
-ordinary mutation receipt, partition, or detached bootstrap part. Untouched
-page checkpoints remain unopened in the lazy pack until a page read or first
-ordinary operation needs one.
+builder, and the sealed manifest binds its non-derivable catalog document ID.
+These checkpoints are baseline semantic/causal state, not fabricated interactive
+history: their construction authors no `SemanticOperation`, batch, ordinary
+mutation receipt, partition, or detached bootstrap part. Untouched page
+checkpoints remain unopened in the lazy pack until a page read or first ordinary
+operation needs one.
 
 The corresponding crash states are exhaustive:
 
@@ -286,6 +287,17 @@ commit SQLite at `F+1`. A crash after the durable append leaves a stale
 projection which is replayed/rebuilt. A SQLite failure after the append does
 not turn the accepted edit into a retryable save or permit a duplicate write.
 SQLite must never publish `F+1` before semantic history does.
+
+SQLite schema 20 provides the physical replacement for all four native
+identity-index families. Page-name and portable-path rows contain one complete,
+application-owned causal point record; exact names and paths are inline and do
+not depend on a content-addressed side blob. External Logseq UUID introductions
+and block-home claims are append-only bounded histories which preserve every
+claimant. Every causal origin is explicitly either `Baseline` or an accepted
+`(batch, dot)`; activation never fabricates a bootstrap batch merely to seed an
+index. The old Patricia values remain only as a differential oracle until the
+single production cutover, and are then deleted rather than retained as a
+second ready route.
 
 ## 3. Invariants and versioning
 

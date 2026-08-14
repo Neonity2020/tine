@@ -964,6 +964,16 @@ struct PortablePathPublicationCandidate {
     conflicts: Vec<PortablePathConflict>,
 }
 
+/// Opaque causal point records read from the exact post-acceptance Patricia
+/// roots while SQLite runs as a differential shadow. The final cutover keeps
+/// this shape but derives it directly from the baseline/oplog transition
+/// machine and deletes the Patricia source.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AcceptedIdentityProjectionRecords {
+    pub(crate) page_names: Vec<(ContentDigest, Vec<u8>)>,
+    pub(crate) portable_paths: Vec<(ContentDigest, Vec<u8>)>,
+}
+
 struct TerminalPublicationCandidate {
     portable_path_conflicts: BTreeMap<PortablePathKeyDigest, PortablePathConflict>,
     fatal_handle: Option<FatalEvidenceHandle>,
@@ -12936,6 +12946,164 @@ impl ShardedHotEngine {
     pub fn page_name_index_root(&self) -> Result<&PageNameOwnershipRootV1, EngineError> {
         self.ensure_not_blocked()?;
         Ok(&self.page_name_root)
+    }
+
+    /// Read the exact post-acceptance causal identity records touched by one
+    /// accepted semantic effect. During the differential phase the old
+    /// Patricia roots are the oracle; SQLite receives the same canonical point
+    /// values. The clean cutover replaces this reader with the baseline/oplog
+    /// transition machine and removes the roots.
+    pub(crate) fn accepted_identity_projection_records(
+        &self,
+        batch_id: BatchId,
+        effect: &SemanticEffect,
+    ) -> Result<AcceptedIdentityProjectionRecords, EngineError> {
+        self.ensure_not_blocked()?;
+        let (Some(page_name_index), Some(portable_path_index), Some(_)) = (
+            &self.page_name_index,
+            &self.portable_path_index,
+            &self.history_store,
+        ) else {
+            // Storeless engines exist only in bounded semantic tests. They do
+            // not provide a historical post-batch root to shadow.
+            return Ok(AcceptedIdentityProjectionRecords::default());
+        };
+        let record = self.sealed_history_record(batch_id)?.ok_or_else(|| {
+            EngineError::Archive(format!(
+                "accepted batch {batch_id} has no sealed identity-history record"
+            ))
+        })?;
+        match &record.status {
+            ArchiveStatus::Accepted { evidence, .. } if evidence.batch_id() == batch_id => {}
+            _ => {
+                return Err(EngineError::Archive(format!(
+                    "batch {batch_id} has no accepted identity-history state"
+                )));
+            }
+        }
+
+        let mut page_name_keys = BTreeSet::new();
+        let mut portable_path_keys = BTreeSet::new();
+        for delta in effect.pages() {
+            for state in [&delta.before, &delta.after].into_iter().flatten() {
+                page_name_keys.insert(state.name().key_digest());
+                if let Some(path) = state.path() {
+                    portable_path_keys.insert(path.portable_key().digest());
+                }
+            }
+        }
+        let page_name_keys = page_name_keys.into_iter().collect::<Vec<_>>();
+        let portable_path_keys = portable_path_keys.into_iter().collect::<Vec<_>>();
+        let old_page_names = page_name_index
+            .lookup_many(&record.page_names.ownership_root, &page_name_keys)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let mut page_names = Vec::with_capacity(old_page_names.len());
+        for (key, old) in old_page_names {
+            let occupied = old
+                .occupied()
+                .map(|occupied| {
+                    Ok::<_, EngineError>(super::sqlite_identity::PageNameIdentityOccupiedV1::new(
+                        occupied.page_id(),
+                        page_name_index
+                            .read_exact_name(key, occupied.exact_name())
+                            .map_err(|error| EngineError::Archive(error.to_string()))?,
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            occupied.acquisition_batch(),
+                            occupied.acquisition_dot(),
+                        ),
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            occupied.exact_state_batch(),
+                            occupied.exact_state_dot(),
+                        ),
+                    ))
+                })
+                .transpose()?;
+            let latest_release = old
+                .latest_release()
+                .map(|released| {
+                    Ok::<_, EngineError>(super::sqlite_identity::PageNameIdentityReleasedV1::new(
+                        released.prior_page_id(),
+                        page_name_index
+                            .read_exact_name(key, released.prior_exact_name())
+                            .map_err(|error| EngineError::Archive(error.to_string()))?,
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            released.prior_acquisition_batch(),
+                            released.prior_acquisition_dot(),
+                        ),
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            released.prior_exact_state_batch(),
+                            released.prior_exact_state_dot(),
+                        ),
+                        super::sqlite_identity::IdentityOriginV1::accepted(
+                            released.release_batch(),
+                            released.release_dot(),
+                        ),
+                    ))
+                })
+                .transpose()?;
+            let clean = super::sqlite_identity::PageNameIdentityRecordV1::new(
+                key,
+                occupied,
+                latest_release,
+            )
+            .map_err(EngineError::Archive)?;
+            page_names.push((
+                ContentDigest::from_bytes(*key.as_bytes()),
+                clean.encode().map_err(EngineError::Archive)?,
+            ));
+        }
+        let old_portable_paths = portable_path_index
+            .lookup_many(record.portable_path_root, &portable_path_keys)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let mut portable_paths = Vec::with_capacity(old_portable_paths.len());
+        for (key, old) in old_portable_paths {
+            let occupied = old.occupied().map(|occupied| {
+                super::sqlite_identity::PortablePathIdentityOccupiedV1::new(
+                    occupied.page_id(),
+                    occupied.exact_path().clone(),
+                    super::sqlite_identity::IdentityOriginV1::accepted(
+                        occupied.acquisition_batch(),
+                        occupied.causal_dot(),
+                    ),
+                )
+            });
+            let latest_release = old
+                .latest_release()
+                .map(|released| {
+                    let acquisition_dot = self
+                        .load_observed_manifest(released.prior_acquisition_batch())?
+                        .causal_dot();
+                    Ok::<_, EngineError>(
+                        super::sqlite_identity::PortablePathIdentityReleasedV1::new(
+                            released.prior_page_id(),
+                            released.prior_exact_path().clone(),
+                            super::sqlite_identity::IdentityOriginV1::accepted(
+                                released.prior_acquisition_batch(),
+                                acquisition_dot,
+                            ),
+                            super::sqlite_identity::IdentityOriginV1::accepted(
+                                released.release_batch(),
+                                released.causal_dot(),
+                            ),
+                        ),
+                    )
+                })
+                .transpose()?;
+            let clean = super::sqlite_identity::PortablePathIdentityRecordV1::new(
+                key,
+                occupied,
+                latest_release,
+            )
+            .map_err(EngineError::Archive)?;
+            portable_paths.push((
+                ContentDigest::from_bytes(*key.as_bytes()),
+                clean.encode().map_err(EngineError::Archive)?,
+            ));
+        }
+        Ok(AcceptedIdentityProjectionRecords {
+            page_names,
+            portable_paths,
+        })
     }
 
     /// The parser-owned reference policy used by both accepted-history

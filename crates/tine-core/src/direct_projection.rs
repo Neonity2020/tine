@@ -509,10 +509,13 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let block = read
-            .block(uuid)
-            .ok()?
-            .or_else(|| read.block_by_logseq_uuid(uuid).ok().flatten());
+        let block = match read.block(uuid).ok()? {
+            Some(block) => Some(block),
+            None => {
+                let mut claimants = read.blocks_by_logseq_uuid(uuid, 2).ok()?;
+                (claimants.len() == 1).then(|| claimants.pop().expect("one UUID claimant"))
+            }
+        };
         let page = match block {
             Some(block) => read
                 .page_with_header_validation(block.page_id, |_, _| Ok(()))
@@ -1480,6 +1483,53 @@ mod tests {
             .page_aliases_with_owners()
             .iter()
             .any(|(alias, _, _)| alias == "changed alias"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_projection_preserves_external_uuid_ambiguity_for_parser_resolution() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("external-uuid-ambiguity");
+        let target_id = "11111111-2222-4333-8444-555555555555";
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/alpha.md"),
+            format!("- alpha claimant\n  id:: {target_id}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pages/beta.md"),
+            format!("- beta claimant\n  id:: {target_id}\n"),
+        )
+        .unwrap();
+
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let parser_resolution = crate::query::resolve_block(&graph, target_id)
+            .map(|group| signature(std::slice::from_ref(&group)));
+        let projection_path = root.join("private/projection.sqlite");
+        graph
+            .attach_direct_projection(projection_path.clone())
+            .unwrap();
+        wait_ready(&graph);
+
+        let database = PhysicalGraphProjectionDatabase::open_read_only(&projection_path).unwrap();
+        let claim = Uuid::parse_str(target_id).unwrap().into_bytes();
+        assert_eq!(
+            database
+                .read()
+                .blocks_by_logseq_uuid(claim, 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            crate::query::resolve_block(&graph, target_id)
+                .map(|group| signature(std::slice::from_ref(&group))),
+            parser_resolution,
+            "SQLite must not choose one external UUID owner from an ambiguous graph"
+        );
+        drop(database);
         let _ = std::fs::remove_dir_all(root);
     }
 

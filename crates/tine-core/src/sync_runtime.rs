@@ -12047,12 +12047,16 @@ impl RuntimeActor {
                 continue;
             };
             let logseq_uuid = LogseqUuid::from_uuid(uuid_value);
-            let Some(block) = read
-                .block_by_logseq_uuid(logseq_uuid)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-            else {
+            let mut claimants = read
+                .blocks_by_logseq_uuid(logseq_uuid, 2)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            if claimants.len() != 1 {
+                // Zero claims are absent; multiple claims are an explicit
+                // semantic ambiguity. Never let the physical row order choose
+                // an owner for a block reference.
                 continue;
-            };
+            }
+            let block = claimants.pop().expect("one Logseq UUID claimant");
             let Some(page) = read
                 .page(block.page_id)
                 .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?

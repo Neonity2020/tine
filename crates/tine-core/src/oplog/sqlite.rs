@@ -1538,6 +1538,7 @@ fn effective_transition_index(
 fn attach_parser_derived_graph_facts(
     engine: &ShardedHotEngine,
     change: super::MaterializationChange,
+    semantic_effect: &[u8],
 ) -> Result<super::MaterializationChange, ProjectionError> {
     let policy = engine
         .reference_catalog_policy()
@@ -1559,8 +1560,37 @@ fn attach_parser_derived_graph_facts(
             },
         )
         .collect();
+    let effect = SemanticEffect::decode(semantic_effect)
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    let identity = engine
+        .accepted_identity_projection_records(change.batch_id(), &effect)
+        .map_err(ProjectionError::materialization_from_engine)?;
     change
         .with_derived_graph_facts(rows.postings, rows.aliases, portable_path_claims)
+        .and_then(|change| {
+            change.with_identity_projection_records(
+                identity
+                    .page_names
+                    .into_iter()
+                    .map(|(key_digest, record)| {
+                        super::sqlite_materialization::MaterializedIdentityRecord {
+                            key_digest,
+                            record,
+                        }
+                    })
+                    .collect(),
+                identity
+                    .portable_paths
+                    .into_iter()
+                    .map(|(key_digest, record)| {
+                        super::sqlite_materialization::MaterializedIdentityRecord {
+                            key_digest,
+                            record,
+                        }
+                    })
+                    .collect(),
+            )
+        })
         .map_err(Into::into)
 }
 
@@ -4136,7 +4166,8 @@ impl SqliteFrontier {
         }
         let (materialization, materialization_stats) =
             materialize_accepted_event_with_stats(engine, event)?;
-        let materialization = attach_parser_derived_graph_facts(engine, materialization)?;
+        let materialization =
+            attach_parser_derived_graph_facts(engine, materialization, event.semantic_effect())?;
         let (disposition, apply_stats) = self.apply_internal_with_materialization_and_stats(
             event,
             ApplyFault::None,
@@ -4156,7 +4187,8 @@ impl SqliteFrontier {
             return Err(ProjectionError::AuthorityMismatch);
         }
         authenticate_event_for_engine(engine, event)?;
-        let materialization = attach_parser_derived_graph_facts(engine, materialization)?;
+        let materialization =
+            attach_parser_derived_graph_facts(engine, materialization, event.semantic_effect())?;
         self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
     }
 
@@ -4233,7 +4265,8 @@ impl SqliteFrontier {
                     ))
                 })?;
             if let Some(engine) = reference_engine {
-                change = attach_parser_derived_graph_facts(engine, change)?;
+                change =
+                    attach_parser_derived_graph_facts(engine, change, &stored.semantic_effect)?;
             }
             let input_digest =
                 change.validate_against_stored(stored.batch_id, &stored.semantic_effect)?;
@@ -4244,6 +4277,7 @@ impl SqliteFrontier {
             let physical = super::sqlite_materialization::lower_validated_change(
                 &change,
                 &stored.semantic_effect,
+                Some(stored.causal_dot()?),
             )?;
             self.physical.apply_materialization_for_test(
                 &physical,
@@ -4954,8 +4988,11 @@ impl SqliteFrontier {
             let apply_stats = if inactive_bulk {
                 let (materialization, materialization_stats) =
                     materialize_inactive_bootstrap_event_bulk(source.engine, &event)?;
-                let materialization =
-                    attach_parser_derived_graph_facts(source.engine, materialization)?;
+                let materialization = attach_parser_derived_graph_facts(
+                    source.engine,
+                    materialization,
+                    event.semantic_effect(),
+                )?;
                 instrumentation.record_materialization(materialization_stats);
                 intermediate_page_materializations += 1;
                 self.apply_candidate_with_materialization_and_stats(
@@ -5129,6 +5166,7 @@ impl SqliteFrontier {
             Some(change) => Some(super::sqlite_materialization::lower_validated_change(
                 change,
                 event.semantic_effect(),
+                Some(event.causal_dot()),
             )?),
             None => None,
         };
@@ -8886,11 +8924,12 @@ mod tests {
     use crate::oplog::{
         AuthorBatch, BatchCausalDot, BatchDisposition, BatchOrigin, BlockId, BlockLocation,
         CausalPeerId, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentDependencies, DocumentId,
-        ManagedPath, ManagedTextKind, MaterializationChange, MaterializedBlockInput,
-        MaterializedEntityId, MaterializedPageInput, MaterializedProperty, MaterializedReference,
-        MaterializedReferenceKind, MaterializedReferrerRow, MaterializedTask, OperationBatch,
-        OperationObject, OperationTransaction, PageId, PageRename, PreparedBatch,
-        SemanticOperation, SessionId,
+        LogseqIdentityMutation, LogseqUuid, ManagedPath, ManagedTextKind, MaterializationChange,
+        MaterializedBlockInput, MaterializedEntityId, MaterializedPageInput, MaterializedProperty,
+        MaterializedReference, MaterializedReferenceKind, MaterializedReferrerRow,
+        MaterializedTask, OperationBatch, OperationObject, OperationTransaction, PageId,
+        PageRename, PreparedBatch, ProjectionEndpointBinding, ProjectionEndpointId,
+        ProjectionReceiptStore, SemanticOperation, SessionId,
     };
 
     struct TestDir(PathBuf);
@@ -9121,6 +9160,83 @@ mod tests {
             outcome.disposition,
             BatchDisposition::Accepted { .. }
         ));
+    }
+
+    fn enrolled_test_engine(dir: &TestDir, ids: TestIds) -> (ObjectStore, ShardedHotEngine) {
+        let graph_path = dir.path().join("graph");
+        fs::create_dir(&graph_path).unwrap();
+        let graph = crate::Graph::open(&graph_path);
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(uuid(2_000_000)),
+            DeviceId::from_uuid(uuid(2_000_001)),
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &dir.path().join("receipts"),
+            ids.workspace,
+            endpoint,
+        )
+        .unwrap();
+        let archive = dir.path().join("objects");
+        let writer = ObjectStore::open(&archive, ids.workspace).unwrap();
+        let engine = ShardedHotEngine::with_enrolled_projection(
+            ObjectStore::open(&archive, ids.workspace).unwrap(),
+            ids.lineage,
+            ids.catalog,
+            &graph,
+            &receipts,
+        );
+        (writer, engine)
+    }
+
+    fn apply_and_assert_identity_shadow(
+        database: &mut SqliteFrontier,
+        engine: &mut ShardedHotEngine,
+        store: &ObjectStore,
+        prepared: &PreparedBatch,
+    ) -> AcceptedBatchEvent {
+        publish_and_stage_archive(engine, store, prepared);
+        let event =
+            AcceptedBatchEvent::from_accepted(engine, store, prepared.manifest().batch_id())
+                .unwrap();
+        let effect = SemanticEffect::decode(event.semantic_effect()).unwrap();
+        let oracle = engine
+            .accepted_identity_projection_records(event.batch_id(), &effect)
+            .unwrap();
+        let change = materialize_accepted_event(engine, &event).unwrap();
+        assert_eq!(
+            database
+                .apply_parser_derived_materialized_accepted(&event, change, engine)
+                .unwrap(),
+            ApplyDisposition::Applied
+        );
+        let read = database.materialized_read().unwrap();
+        for (key_digest, record) in oracle.page_names {
+            assert_eq!(
+                read.page_name_identity_record(key_digest).unwrap(),
+                Some(
+                    crate::oplog::sqlite_materialization::MaterializedIdentityRecordRow {
+                        key_digest,
+                        record,
+                    },
+                ),
+                "SQLite page-name identity shadow diverged from the accepted Patricia root"
+            );
+        }
+        for (key_digest, record) in oracle.portable_paths {
+            assert_eq!(
+                read.portable_path_identity_record(key_digest).unwrap(),
+                Some(
+                    crate::oplog::sqlite_materialization::MaterializedIdentityRecordRow {
+                        key_digest,
+                        record,
+                    },
+                ),
+                "SQLite portable-path identity shadow diverged from the accepted Patricia root"
+            );
+        }
+        event
     }
 
     fn wait_for_file(path: &Path) {
@@ -11455,8 +11571,18 @@ mod tests {
         assert_eq!(create_stats.accepted_root_authentications, 1);
         assert_eq!(create_stats.exact_catalog_loads, 1);
         assert_eq!(
-            attach_parser_derived_graph_facts(&engine, scoped_create.clone()).unwrap(),
-            attach_parser_derived_graph_facts(&engine, point_create).unwrap(),
+            attach_parser_derived_graph_facts(
+                &engine,
+                scoped_create.clone(),
+                create_event.semantic_effect(),
+            )
+            .unwrap(),
+            attach_parser_derived_graph_facts(
+                &engine,
+                point_create,
+                create_event.semantic_effect(),
+            )
+            .unwrap(),
             "aliases and raw reference evidence must be identical"
         );
 
@@ -11523,6 +11649,183 @@ mod tests {
         assert_eq!(scoped_delete.deletions(), &[ids.page]);
         assert_eq!(delete_stats.accepted_root_authentications, 1);
         assert_eq!(delete_stats.exact_catalog_loads, 1);
+    }
+
+    #[test]
+    fn enrolled_identity_shadow_matches_accepted_history_across_lifecycle() {
+        let ids = TestIds::new(2_260);
+        let dir = TestDir::new("enrolled-identity-shadow");
+        let (store, mut engine) = enrolled_test_engine(&dir, ids);
+        let mut database = open_test_projection(
+            &dir.path().join("identity-shadow.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
+
+        let create = engine
+            .prepare_bootstrap_transaction(
+                author(2_270),
+                &root_transaction_named(
+                    ids,
+                    "pages/identity-alpha.md",
+                    "Identity Alpha",
+                    "identity block",
+                ),
+            )
+            .unwrap();
+        let create_event =
+            apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &create);
+        assert_eq!(
+            database
+                .materialized_read()
+                .unwrap()
+                .block_home_claims(ids.block, 2)
+                .unwrap(),
+            vec![
+                crate::oplog::sqlite_materialization::MaterializedBlockHomeClaimRow {
+                    block_id: ids.block,
+                    home_document_id: ids.document,
+                    batch_id: Some(create_event.batch_id()),
+                    causal_dot: Some(create_event.causal_dot()),
+                }
+            ]
+        );
+
+        let external_uuid = LogseqUuid::from_uuid(uuid(2_280));
+        let assign = engine
+            .prepare_bootstrap_transaction(
+                author(2_271),
+                &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
+                    block: BlockLocation {
+                        block_id: ids.block,
+                        home_document_id: ids.document,
+                    },
+                    mutation: LogseqIdentityMutation::AssignExternal {
+                        logseq_uuid: external_uuid,
+                    },
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let assign_event =
+            apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &assign);
+        assert_eq!(
+            database
+                .materialized_read()
+                .unwrap()
+                .logseq_uuid_introductions(external_uuid, 3)
+                .unwrap(),
+            vec![
+                crate::oplog::sqlite_materialization::MaterializedLogseqUuidIntroductionRow {
+                    logseq_uuid: external_uuid,
+                    block_id: ids.block,
+                    home_document_id: ids.document,
+                    batch_id: Some(assign_event.batch_id()),
+                    causal_dot: Some(assign_event.causal_dot()),
+                },
+            ]
+        );
+
+        for (batch_seed, name, path) in [
+            (2_272, "IDENTITY ALPHA", "pages/identity-alpha.md"),
+            (2_273, "Identity Beta", "pages/identity-beta.md"),
+        ] {
+            let rename = engine
+                .prepare_bootstrap_transaction(
+                    author(batch_seed),
+                    &OperationTransaction::new(vec![
+                        SemanticOperation::RenamePagesAndRewriteReferrers {
+                            page_changes: vec![PageRename {
+                                page_id: ids.page,
+                                new_name: crate::oplog::LogicalPageName::parse(name).unwrap(),
+                                new_path: ManagedPath::parse(path).unwrap(),
+                            }],
+                            block_rewrites: Vec::new(),
+                            page_preamble_rewrites: Vec::new(),
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .unwrap();
+            apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &rename);
+        }
+
+        let delete = engine
+            .prepare_bootstrap_transaction(
+                author(2_274),
+                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
+                    page_id: ids.page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &delete);
+
+        let replacement_page = PageId::from_uuid(uuid(2_281));
+        let replacement_document = DocumentId::from_uuid(uuid(2_282));
+        let replacement_block = BlockId::from_uuid(uuid(2_283));
+        let reacquire = engine
+            .prepare_bootstrap_transaction(
+                author(2_275),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id: replacement_page,
+                        home_document_id: replacement_document,
+                        name: crate::oplog::LogicalPageName::parse("Identity Alpha").unwrap(),
+                        path: ManagedPath::parse("pages/identity-alpha.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id: replacement_block,
+                            home_document_id: replacement_document,
+                        },
+                        page_id: replacement_page,
+                        parent: None,
+                        order: "a".into(),
+                        content: "replacement identity block".into(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &reacquire);
+
+        let reintroduce = engine
+            .prepare_bootstrap_transaction(
+                author(2_276),
+                &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
+                    block: BlockLocation {
+                        block_id: replacement_block,
+                        home_document_id: replacement_document,
+                    },
+                    mutation: LogseqIdentityMutation::AssignExternal {
+                        logseq_uuid: external_uuid,
+                    },
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let reintroduce_event =
+            apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &reintroduce);
+        let introductions = database
+            .materialized_read()
+            .unwrap()
+            .logseq_uuid_introductions(external_uuid, 3)
+            .unwrap();
+        assert_eq!(introductions.len(), 2);
+        assert_eq!(introductions[0].block_id, ids.block);
+        assert_eq!(introductions[1].block_id, replacement_block);
+        assert_eq!(
+            introductions[1].batch_id,
+            Some(reintroduce_event.batch_id())
+        );
+        assert_eq!(
+            introductions[1].causal_dot,
+            Some(reintroduce_event.causal_dot())
+        );
     }
 
     #[test]
