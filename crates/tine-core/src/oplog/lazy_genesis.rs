@@ -19,7 +19,7 @@ use super::{
     LogseqUuid, ManagedPath, ManagedTextKind, PageId, WorkspaceId,
 };
 
-const LAZY_GENESIS_SCHEMA_VERSION: u32 = 3;
+const LAZY_GENESIS_SCHEMA_VERSION: u32 = 4;
 const LAZY_GENESIS_COMMIT_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_ACTIVATION_MARKER_MAGIC: &[u8] = b"TINE-LAZY-GENESIS-ACTIVATION\0";
@@ -95,7 +95,7 @@ pub(crate) struct LazyGenesisBlockInput {
 #[serde(deny_unknown_fields)]
 pub(crate) struct LazyGenesisPageInput {
     pub(crate) source_leaf: [u8; 32],
-    pub(crate) exact_source_bytes: u64,
+    pub(crate) exact_source_bytes: Vec<u8>,
     pub(crate) page_id: PageId,
     pub(crate) home_document_id: DocumentId,
     pub(crate) name: String,
@@ -112,7 +112,7 @@ pub(crate) struct LazyGenesisPageInput {
 struct LazyGenesisPageCapsuleV1 {
     schema_version: u32,
     source_leaf: [u8; 32],
-    exact_source_bytes: u64,
+    exact_source_bytes: Vec<u8>,
     page_id: PageId,
     home_document_id: DocumentId,
     name: String,
@@ -146,6 +146,7 @@ impl LazyGenesisPageCapsuleV1 {
         if self.schema_version != LAZY_GENESIS_SCHEMA_VERSION
             || self.name.is_empty()
             || self.document_checkpoint.is_empty()
+            || self.exact_source_bytes.len() > MAX_LAZY_GENESIS_CAPSULE_BYTES
         {
             return Err(invalid("lazy genesis page capsule has an invalid header"));
         }
@@ -931,7 +932,7 @@ mod tests {
         let source_digest = ContentDigest::of(path.as_bytes());
         LazyGenesisPageInput {
             source_leaf: *source_digest.as_bytes(),
-            exact_source_bytes: blocks as u64 * 8,
+            exact_source_bytes: vec![b'x'; blocks * 8],
             page_id: PageId::from_uuid(Uuid::from_u128(ordinal)),
             home_document_id: home,
             name: path.to_owned(),
@@ -1016,6 +1017,7 @@ mod tests {
             .unwrap();
         assert_eq!(read.path.as_str(), "pages/b.org");
         assert_eq!(read.blocks.len(), 1);
+        assert_eq!(read.exact_source_bytes, vec![b'x'; 8]);
     }
 
     #[test]

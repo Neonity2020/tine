@@ -822,7 +822,7 @@ impl InactiveBootstrapAcceptedAuthority {
     }
 }
 
-const ACTIVATION_PAGE_RECORD_SCHEMA_VERSION: u32 = 1;
+const ACTIVATION_PAGE_RECORD_SCHEMA_VERSION: u32 = 2;
 const MAX_ACTIVATION_PAGE_RECORD_BYTES: usize = 256 * 1024 * 1024;
 
 /// Source-only facts needed by the temporary old-operation oracle but not by
@@ -847,6 +847,7 @@ struct ActivationBlockSourceV1 {
 pub(crate) struct ActivationPageRecordV1 {
     schema_version: u32,
     source_leaf: [u8; 32],
+    exact_source_bytes: Vec<u8>,
     full_span: Option<StructuralSpan>,
     page: super::MaterializedPageInput,
     block_sources: Vec<ActivationBlockSourceV1>,
@@ -855,6 +856,7 @@ pub(crate) struct ActivationPageRecordV1 {
 impl ActivationPageRecordV1 {
     fn new(
         source_leaf: SourceLeafDigestV1,
+        exact_source_bytes: Vec<u8>,
         full_span: Option<StructuralSpan>,
         page: super::MaterializedPageInput,
         block_sources: Vec<ActivationBlockSourceV1>,
@@ -862,6 +864,7 @@ impl ActivationPageRecordV1 {
         let record = Self {
             schema_version: ACTIVATION_PAGE_RECORD_SCHEMA_VERSION,
             source_leaf: *source_leaf.as_bytes(),
+            exact_source_bytes,
             full_span,
             page,
             block_sources,
@@ -873,6 +876,11 @@ impl ActivationPageRecordV1 {
     fn validate(&self) -> Result<(), BootstrapStreamingImportError> {
         if self.schema_version != ACTIVATION_PAGE_RECORD_SCHEMA_VERSION
             || self.page.blocks.len() != self.block_sources.len()
+            || self
+                .full_span
+                .map(|span| span.end().saturating_sub(span.start()))
+                != (!self.exact_source_bytes.is_empty())
+                    .then_some(self.exact_source_bytes.len() as u64)
         {
             return Err(BootstrapStreamingImportError::InvalidOperation(
                 "activation page record shape is malformed".into(),
@@ -3579,6 +3587,7 @@ fn capture_activation_page_records(
         }
         let record = ActivationPageRecordV1::new(
             source_leaf,
+            bytes,
             full_span,
             super::MaterializedPageInput {
                 page_id,
@@ -3700,9 +3709,7 @@ fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageIn
         .collect();
     LazyGenesisPageInput {
         source_leaf: record.source_leaf,
-        exact_source_bytes: record
-            .full_span
-            .map_or(0, |span| span.end().saturating_sub(span.start())),
+        exact_source_bytes: record.exact_source_bytes.clone(),
         page_id: record.page.page_id,
         home_document_id: record.page.home_document_id,
         name: record.page.name.clone(),

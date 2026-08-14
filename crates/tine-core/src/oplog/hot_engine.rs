@@ -44698,7 +44698,10 @@ mod validation_tests {
             let path = format!("pages/receipt-{page_ordinal:08}.md");
             let page = LazyGenesisPageInput {
                 source_leaf: *ContentDigest::of(path.as_bytes()).as_bytes(),
-                exact_source_bytes: (blocks_per_page as u64).saturating_mul(96),
+                exact_source_bytes: vec![
+                    b'x';
+                    blocks_per_page.saturating_mul(96)
+                ],
                 page_id,
                 home_document_id: home,
                 name: format!("Receipt {page_ordinal:08}"),

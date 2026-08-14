@@ -257,8 +257,9 @@ projection and can be rebuilt without changing the marker or semantic truth.
 The marker is published only after the baseline is durable and one final
 byte/inventory comparison under the watcher fence matches the sealed source.
 
-Each page capsule carries one deterministic CRDT checkpoint constructed
-directly from its terminal page state, plus its compact causal dependencies.
+Each page capsule carries the exact original Markdown/Org bytes once, one
+deterministic CRDT checkpoint constructed directly from its terminal page
+state, plus its compact causal dependencies.
 The single catalog checkpoint is constructed by the same direct terminal-state
 builder, and the sealed manifest binds its non-derivable catalog document ID.
 These checkpoints are baseline semantic/causal state, not fabricated interactive
