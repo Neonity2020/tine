@@ -29,7 +29,9 @@ use super::content_patricia::{
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
-use super::lazy_genesis::{LazyGenesisCandidate, LazyGenesisPageInput};
+use super::lazy_genesis::{
+    LazyGenesisCandidate, LazyGenesisFrontierBindingV1, LazyGenesisPageInput,
+};
 use super::object_store::{
     BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
     CompletedDetachedBootstrapPublication, ControlDirectoryIdentity,
@@ -110,8 +112,8 @@ const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
 const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 13;
 const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
-const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 6;
-const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 5;
+const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 7;
+const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 6;
 pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
@@ -4178,6 +4180,7 @@ pub struct AcceptedFrontierRoot {
     // causal dot, and authenticated sparse-clock root.
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: ContentDigest,
+    genesis: Option<LazyGenesisFrontierBindingV1>,
     reference_catalog_root: ReferenceCatalogRootV2,
     state_digest: ContentDigest,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
@@ -4203,6 +4206,7 @@ pub(crate) struct AcceptedFrontierIdentity<'a> {
     document_map_root_digest: &'a ContentDigest,
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: &'a ContentDigest,
+    genesis: &'a Option<LazyGenesisFrontierBindingV1>,
     reference_catalog_root: &'a ReferenceCatalogRootV2,
     state_digest: &'a ContentDigest,
 }
@@ -4227,6 +4231,7 @@ impl AcceptedFrontierRoot {
             document_map_root_digest: &self.document_map_root_digest,
             batch_map_root_key: self.batch_map_root_key,
             batch_map_root_digest: &self.batch_map_root_digest,
+            genesis: &self.genesis,
             reference_catalog_root: &self.reference_catalog_root,
             state_digest: &self.state_digest,
         }
@@ -4370,6 +4375,7 @@ impl AcceptedFrontierRoot {
             document_map_root_digest: ContentDigest::of(b"saturated document map"),
             batch_map_root_key: Some([0xff; 16]),
             batch_map_root_digest: ContentDigest::of(b"saturated batch map"),
+            genesis: None,
             reference_catalog_root: empty_accepted_frontier_root().reference_catalog_root,
             state_digest: ContentDigest::of(b"saturated frontier state"),
             scratch_root: Some(super::scratch_store::ScratchLsmRoot::saturated_for_test(
@@ -4408,6 +4414,10 @@ impl AcceptedFrontierRoot {
 
     pub const fn state_digest(&self) -> ContentDigest {
         self.state_digest
+    }
+
+    pub(crate) const fn genesis(&self) -> Option<LazyGenesisFrontierBindingV1> {
+        self.genesis
     }
 
     /// This root without its run-local scratch-store reference.
@@ -4450,6 +4460,7 @@ impl AcceptedFrontierRoot {
             document_map_root_digest,
             batch_map_root_key,
             batch_map_root_digest,
+            genesis,
             reference_catalog_root,
             state_digest,
             scratch_root: _,
@@ -4462,6 +4473,7 @@ impl AcceptedFrontierRoot {
             && *document_map_root_digest == other.document_map_root_digest
             && *batch_map_root_key == other.batch_map_root_key
             && *batch_map_root_digest == other.batch_map_root_digest
+            && *genesis == other.genesis
             && *reference_catalog_root == other.reference_catalog_root
             && *state_digest == other.state_digest
     }
@@ -7627,7 +7639,7 @@ impl LazyGenesisCheckpointBuilder {
         &mut self,
         page: &LazyGenesisPageInput,
         accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
-    ) -> Result<Vec<u8>, EngineError> {
+    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
         if page.home_document_id == self.catalog_document_id
             || read_page_state(&self.catalog, page.page_id)?.is_some()
         {
@@ -7704,14 +7716,28 @@ impl LazyGenesisCheckpointBuilder {
             .export(ExportMode::all_updates())
             .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
         verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &snapshot)?;
-        Ok(snapshot)
+        let dependencies = DocumentDependencies::new(
+            page.home_document_id,
+            canonical_peer_counters(&document.oplog_vv())?,
+            Vec::new(),
+        )
+        .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?;
+        Ok((snapshot, dependencies))
     }
 
-    pub(crate) fn finish(self) -> Result<Vec<u8>, EngineError> {
+    pub(crate) fn finish(self) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
         self.catalog.commit();
-        self.catalog
+        let dependencies = DocumentDependencies::new(
+            self.catalog_document_id,
+            canonical_peer_counters(&self.catalog.oplog_vv())?,
+            Vec::new(),
+        )
+        .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?;
+        let checkpoint = self
+            .catalog
             .export(ExportMode::all_updates())
-            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))
+            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        Ok((checkpoint, dependencies))
     }
 }
 
@@ -8161,6 +8187,10 @@ impl ShardedHotEngine {
             || candidate.lineage_digest() != self.lineage_digest
             || !self.visible_documents.is_empty()
             || !self.visible_document_heads.is_empty()
+            || !self.accepted_frontier.is_empty()
+            || self.accepted_frontier_root.acceptance_sequence() != 0
+            || self.accepted_frontier_root.document_count() != 0
+            || self.accepted_frontier_root.genesis().is_some()
             || self.history_generation != 0
         {
             return Err(EngineError::InvalidTransaction(
@@ -8174,6 +8204,31 @@ impl ShardedHotEngine {
         import_complete(self.catalog_document_id, &catalog, &[catalog_snapshot])?;
         catalog.set_peer_id(1).map_err(loro_error)?;
         validate_catalog(self.catalog_document_id, &catalog)?;
+        let documents = candidate.frontier_documents();
+        if documents
+            .binary_search_by_key(&self.catalog_document_id, DocumentDependencies::document_id)
+            .is_err()
+        {
+            return Err(EngineError::InvalidTransaction(
+                "lazy genesis causal baseline omits the catalog document".into(),
+            ));
+        }
+        let accepted_frontier_root = lazy_genesis_accepted_frontier_root(
+            candidate
+                .frontier_binding()
+                .map_err(|error| EngineError::Archive(error.to_string()))?,
+            &documents,
+            self.reference_catalog.root().clone(),
+        )?;
+        if self.scratch.is_none() {
+            self.accepted_frontier = documents
+                .into_iter()
+                .map(|document| (document.document_id(), document))
+                .collect();
+        }
+        self.accepted_frontier_root = accepted_frontier_root.clone();
+        self.current_path_catalog.accepted_frontier_root = accepted_frontier_root;
+        self.current_path_cursor_book.borrow_mut().active.clear();
         self.visible_documents
             .insert(self.catalog_document_id, catalog);
         self.lazy_genesis = Some(candidate);
@@ -12167,7 +12222,14 @@ impl ShardedHotEngine {
         validate_accepted_frontier_root(root)?;
         let Some(scratch_root) = &root.scratch_root else {
             if root == &self.accepted_frontier_root {
-                return Ok(self.accepted_frontier.get(&document_id).cloned());
+                return Ok(self
+                    .accepted_frontier
+                    .get(&document_id)
+                    .cloned()
+                    .or_else(|| self.lazy_genesis_frontier_document(root, document_id)));
+            }
+            if let Some(document) = self.lazy_genesis_frontier_document(root, document_id) {
+                return Ok(Some(document));
             }
             return Err(EngineError::Archive(
                 "historical frontier point queries require store-backed accepted history".into(),
@@ -12185,9 +12247,22 @@ impl ShardedHotEngine {
                 document_id.as_uuid().as_bytes(),
             )
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        bytes
+        let overlay = bytes
             .map(|bytes| decode_accepted_document(document_id, &bytes))
-            .transpose()
+            .transpose()?;
+        Ok(overlay.or_else(|| self.lazy_genesis_frontier_document(root, document_id)))
+    }
+
+    fn lazy_genesis_frontier_document(
+        &self,
+        root: &AcceptedFrontierRoot,
+        document_id: DocumentId,
+    ) -> Option<DocumentDependencies> {
+        let binding = root.genesis()?;
+        let candidate = self.lazy_genesis.as_ref()?;
+        (candidate.frontier_binding().ok()? == binding)
+            .then(|| candidate.frontier_document(document_id))
+            .flatten()
     }
 
     fn accepted_frontier_documents_many_authenticated_with_session(
@@ -12202,6 +12277,13 @@ impl ShardedHotEngine {
         }
         let Some(scratch_root) = &root.scratch_root else {
             if root != &self.accepted_frontier_root {
+                let baseline = document_ids
+                    .iter()
+                    .map(|document_id| self.lazy_genesis_frontier_document(root, *document_id))
+                    .collect::<Vec<_>>();
+                if baseline.iter().any(Option::is_some) {
+                    return Ok(baseline);
+                }
                 return Err(EngineError::Archive(
                     "historical frontier multi-point queries require store-backed accepted history"
                         .into(),
@@ -12209,7 +12291,12 @@ impl ShardedHotEngine {
             }
             return Ok(document_ids
                 .iter()
-                .map(|document_id| self.accepted_frontier.get(document_id).cloned())
+                .map(|document_id| {
+                    self.accepted_frontier
+                        .get(document_id)
+                        .cloned()
+                        .or_else(|| self.lazy_genesis_frontier_document(root, *document_id))
+                })
                 .collect());
         };
         let store = self.scratch.as_ref().ok_or_else(|| {
@@ -12242,6 +12329,9 @@ impl ShardedHotEngine {
                 bytes
                     .map(|bytes| decode_accepted_document(*document_id, &bytes))
                     .transpose()
+                    .map(|overlay| {
+                        overlay.or_else(|| self.lazy_genesis_frontier_document(root, *document_id))
+                    })
             })
             .collect()
     }
@@ -12325,9 +12415,24 @@ impl ShardedHotEngine {
         self.ensure_not_blocked()?;
         validate_accepted_frontier_root(root)?;
         if root.acceptance_sequence() == 0 {
-            if root != &AcceptedFrontierRoot::empty() {
+            if root == &AcceptedFrontierRoot::empty() {
+                return Ok(());
+            }
+            let Some(binding) = root.genesis() else {
                 return Err(EngineError::Archive(
-                    "requested empty accepted frontier is not canonical".into(),
+                    "requested sequence-zero accepted frontier is not canonical".into(),
+                ));
+            };
+            let candidate = self.lazy_genesis.as_ref().ok_or_else(|| {
+                EngineError::Archive("requested genesis frontier has no immutable baseline".into())
+            })?;
+            if candidate
+                .frontier_binding()
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                != binding
+            {
+                return Err(EngineError::Archive(
+                    "requested genesis frontier names a different immutable baseline".into(),
                 ));
             }
             return Ok(());
@@ -12701,7 +12806,13 @@ impl ShardedHotEngine {
                         &authenticated_records,
                     )
                     .map_err(|error| EngineError::Archive(error.to_string()))?;
-                if roots.accepted_document_map_root.count() != new_document_count {
+                let overlay_count = roots.accepted_document_map_root.count();
+                let invalid_count = if prior_frontier_root.genesis().is_some() {
+                    overlay_count > new_document_count
+                } else {
+                    overlay_count != new_document_count
+                };
+                if invalid_count {
                     return Err(EngineError::Archive(
                         "authenticated document map count differs from accepted frontier".into(),
                     ));
@@ -12715,8 +12826,20 @@ impl ShardedHotEngine {
             } else {
                 let mut post_documents = self.accepted_frontier.clone();
                 post_documents.extend(changed_documents.clone());
-                let all_documents = post_documents.values().cloned().collect::<Vec<_>>();
-                let (root_key, root_digest) = authenticated_document_map_root(&all_documents)?;
+                let overlay_documents = post_documents
+                    .values()
+                    .filter(|document| {
+                        self.lazy_genesis
+                            .as_ref()
+                            .and_then(|candidate| {
+                                candidate.frontier_document(document.document_id())
+                            })
+                            .as_ref()
+                            != Some(*document)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (root_key, root_digest) = authenticated_document_map_root(&overlay_documents)?;
                 (Some(post_documents), None, root_key, root_digest)
             };
         let manifest_fingerprint = self
@@ -29899,7 +30022,7 @@ fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
 fn empty_accepted_frontier_root_with_catalog(
     reference_catalog_root: ReferenceCatalogRootV2,
 ) -> AcceptedFrontierRoot {
-    let mut state_bytes = b"tine/oplog/accepted-frontier/v4/empty\0".to_vec();
+    let mut state_bytes = b"tine/oplog/accepted-frontier/v5/empty\0".to_vec();
     state_bytes.extend_from_slice(
         reference_catalog_root
             .external_digest()
@@ -29915,10 +30038,85 @@ fn empty_accepted_frontier_root_with_catalog(
         document_map_root_digest: super::scratch_store::authenticated_map_empty_digest(),
         batch_map_root_key: None,
         batch_map_root_digest: super::scratch_store::authenticated_map_empty_digest(),
+        genesis: None,
         reference_catalog_root,
         state_digest: ContentDigest::of(&state_bytes),
         scratch_root: None,
     }
+}
+
+fn lazy_genesis_accepted_frontier_root(
+    binding: LazyGenesisFrontierBindingV1,
+    documents: &[DocumentDependencies],
+    reference_catalog_root: ReferenceCatalogRootV2,
+) -> Result<AcceptedFrontierRoot, EngineError> {
+    binding
+        .validate()
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    if documents.len() as u64 != binding.document_count() {
+        return Err(EngineError::Archive(
+            "lazy genesis frontier document count differs from its binding".into(),
+        ));
+    }
+    // The immutable genesis manifest already authenticates every baseline
+    // dependency row. The accepted document map is therefore an overlay for
+    // documents changed after genesis, and starts empty instead of copying the
+    // entire graph into a second authenticated tree.
+    let document_map_root_key = None;
+    let document_map_root_digest = super::scratch_store::authenticated_map_empty_digest();
+    let state_digest = lazy_genesis_frontier_state_digest(
+        binding,
+        documents.len() as u64,
+        document_map_root_key,
+        document_map_root_digest,
+        &reference_catalog_root,
+    )?;
+    let root = AcceptedFrontierRoot {
+        schema_version: ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION,
+        acceptance_sequence: 0,
+        document_count: documents.len() as u64,
+        retained_bytes_total: 0,
+        document_map_root_key,
+        document_map_root_digest,
+        batch_map_root_key: None,
+        batch_map_root_digest: super::scratch_store::authenticated_map_empty_digest(),
+        genesis: Some(binding),
+        reference_catalog_root,
+        state_digest,
+        scratch_root: None,
+    };
+    validate_accepted_frontier_root(&root)?;
+    Ok(root)
+}
+
+fn lazy_genesis_frontier_state_digest(
+    binding: LazyGenesisFrontierBindingV1,
+    document_count: u64,
+    document_map_root_key: Option<[u8; 16]>,
+    document_map_root_digest: ContentDigest,
+    reference_catalog_root: &ReferenceCatalogRootV2,
+) -> Result<ContentDigest, EngineError> {
+    let mut bytes = b"tine/oplog/accepted-frontier/v5/genesis\0".to_vec();
+    let binding =
+        postcard::to_allocvec(&binding).map_err(|error| EngineError::Archive(error.to_string()))?;
+    bytes.extend_from_slice(&(binding.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&binding);
+    bytes.extend_from_slice(&document_count.to_be_bytes());
+    match document_map_root_key {
+        Some(key) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&key);
+        }
+        None => bytes.push(0),
+    }
+    bytes.extend_from_slice(document_map_root_digest.as_bytes());
+    bytes.extend_from_slice(
+        reference_catalog_root
+            .external_digest()
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .as_bytes(),
+    );
+    Ok(ContentDigest::of(&bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -29946,7 +30144,7 @@ fn next_accepted_frontier_root(
         .encode()
         .map(|_| ())
         .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let mut bytes = b"tine/oplog/accepted-frontier/v4\0".to_vec();
+    let mut bytes = b"tine/oplog/accepted-frontier/v5\0".to_vec();
     bytes.extend_from_slice(prior.state_digest.as_bytes());
     bytes.extend_from_slice(event_binding_digest.as_bytes());
     bytes.extend_from_slice(&acceptance_sequence.to_be_bytes());
@@ -29972,6 +30170,11 @@ fn next_accepted_frontier_root(
         None => bytes.push(0),
     }
     bytes.extend_from_slice(batch_map_root_digest.as_bytes());
+    if let Some(genesis) = prior.genesis {
+        genesis
+            .validate()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+    }
     bytes.extend_from_slice(
         reference_catalog_root
             .external_digest()
@@ -29993,6 +30196,7 @@ fn next_accepted_frontier_root(
         document_map_root_digest,
         batch_map_root_key,
         batch_map_root_digest,
+        genesis: prior.genesis,
         reference_catalog_root,
         state_digest: ContentDigest::of(&bytes),
         scratch_root,
@@ -30011,11 +30215,7 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
             .external_digest()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         let empty_uuid_claim_authority_root = LogseqClaimIndexRoot::empty().digest();
-        if root.document_count != 0
-            || root.retained_bytes_total != 0
-            || root.document_map_root_key.is_some()
-            || root.document_map_root_digest
-                != super::scratch_store::authenticated_map_empty_digest()
+        if root.retained_bytes_total != 0
             || root.batch_map_root_key.is_some()
             || root.batch_map_root_digest != super::scratch_store::authenticated_map_empty_digest()
             || root.reference_catalog_root.source_count() != 0
@@ -30025,14 +30225,51 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
                 .reference_catalog_root
                 .external_uuid_claim_authority_root()
                 != empty_uuid_claim_authority_root
-            || root.state_digest
-                != empty_accepted_frontier_root_with_catalog(root.reference_catalog_root.clone())
-                    .state_digest
             || root.scratch_root.is_some()
         {
             return Err(EngineError::Archive(
-                "malformed empty accepted-frontier root".into(),
+                "malformed sequence-zero accepted-frontier root".into(),
             ));
+        }
+        match root.genesis {
+            None => {
+                if root.document_count != 0
+                    || root.document_map_root_key.is_some()
+                    || root.document_map_root_digest
+                        != super::scratch_store::authenticated_map_empty_digest()
+                    || root.state_digest
+                        != empty_accepted_frontier_root_with_catalog(
+                            root.reference_catalog_root.clone(),
+                        )
+                        .state_digest
+                {
+                    return Err(EngineError::Archive(
+                        "malformed empty accepted-frontier root".into(),
+                    ));
+                }
+            }
+            Some(genesis) => {
+                genesis
+                    .validate()
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+                if root.document_count != genesis.document_count()
+                    || root.document_map_root_key.is_some()
+                    || root.document_map_root_digest
+                        != super::scratch_store::authenticated_map_empty_digest()
+                    || root.state_digest
+                        != lazy_genesis_frontier_state_digest(
+                            genesis,
+                            root.document_count,
+                            root.document_map_root_key,
+                            root.document_map_root_digest,
+                            &root.reference_catalog_root,
+                        )?
+                {
+                    return Err(EngineError::Archive(
+                        "malformed lazy-genesis accepted-frontier root".into(),
+                    ));
+                }
+            }
         }
     } else if root.batch_map_root_key.is_none()
         || root.batch_map_root_digest == super::scratch_store::authenticated_map_empty_digest()
@@ -30048,6 +30285,11 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
         return Err(EngineError::Archive(
             "malformed nonempty accepted-frontier document map".into(),
         ));
+    }
+    if let Some(genesis) = root.genesis {
+        genesis
+            .validate()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
     }
     root.reference_catalog_root
         .encode()

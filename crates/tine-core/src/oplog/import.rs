@@ -3622,11 +3622,14 @@ fn spool_bootstrap_operations(
         })?;
         let accepted = accepted_identities.assignments_for(&record.page.path)?;
         let mut genesis_page = lazy_genesis_page_input(&record);
-        genesis_page.document_checkpoint = lazy_checkpoints.push_page(&genesis_page, &accepted)?;
+        let (checkpoint, dependencies) = lazy_checkpoints.push_page(&genesis_page, &accepted)?;
+        genesis_page.document_checkpoint = checkpoint;
+        genesis_page.document_dependencies = Some(dependencies);
         lazy_genesis.push(genesis_page)?;
     }
     accepted_identities.finish()?;
-    let lazy_genesis = lazy_genesis.finish(lazy_checkpoints.finish()?)?;
+    let (catalog_checkpoint, catalog_dependencies) = lazy_checkpoints.finish()?;
+    let lazy_genesis = lazy_genesis.finish(catalog_checkpoint, catalog_dependencies)?;
     instrumentation.terminal_projection_hint_pages = activation_pages.page_count() as u64;
     instrumentation.terminal_projection_hint_bytes = activation_pages.encoded_bytes() as u64;
     instrumentation.terminal_projection_hint_spilled = activation_pages.spilled();
@@ -3677,6 +3680,7 @@ fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageIn
         preamble: record.page.preamble.clone(),
         blocks,
         document_checkpoint: Vec::new(),
+        document_dependencies: None,
     }
 }
 
@@ -13710,6 +13714,17 @@ mod tests {
             engine
                 .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
                 .unwrap();
+            let frontier = engine.accepted_frontier_root().unwrap();
+            assert_eq!(
+                frontier.genesis().unwrap().root(),
+                candidate.root(),
+                "accepted frontier must bind the exact immutable genesis"
+            );
+            assert_eq!(
+                frontier.document_count(),
+                candidate.page_count() as u64 + 1,
+                "accepted frontier must include every page and the catalog causal baseline"
+            );
             assert_eq!(
                 engine.lazy_genesis_resident_page_documents_for_test(),
                 0,
@@ -13730,6 +13745,57 @@ mod tests {
                 )
                 .unwrap();
         }
+        let mut renamed = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"canonical-activation-stream-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+        );
+        renamed
+            .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
+            .unwrap();
+        let renamed_name = LogicalPageName::parse("Lazy Genesis Renamed").unwrap();
+        let renamed_path = ManagedPath::parse("pages/lazy-genesis-renamed.md").unwrap();
+        let rename = renamed
+            .prepare_bootstrap_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e58)),
+                    author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e59)),
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e5a)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0x5e5b),
+                },
+                &OperationTransaction::new(vec![
+                    SemanticOperation::RenamePagesAndRewriteReferrers {
+                        page_changes: vec![super::super::PageRename {
+                            page_id: first_page.page_id,
+                            new_name: renamed_name.clone(),
+                            new_path: renamed_path.clone(),
+                        }],
+                        block_rewrites: Vec::new(),
+                        page_preamble_rewrites: Vec::new(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            renamed
+                .stage_ready(super::super::ValidatedBatch::new(rename))
+                .disposition,
+            super::super::BatchDisposition::Accepted { .. }
+        ));
+        let renamed_page = renamed.materialize_page(first_page.page_id).unwrap();
+        assert_eq!(renamed_page.name, renamed_name);
+        assert_eq!(renamed_page.path, renamed_path);
+        assert_eq!(
+            renamed
+                .accepted_frontier_root()
+                .unwrap()
+                .genesis()
+                .unwrap()
+                .root(),
+            candidate.root(),
+            "first page identity mutation must preserve genesis authority"
+        );
         let make_engine = || {
             let mut engine = ShardedHotEngine::new(
                 workspace,
@@ -13773,6 +13839,16 @@ mod tests {
                     outcome.disposition
                 );
             }
+            assert_eq!(
+                merged
+                    .accepted_frontier_root()
+                    .unwrap()
+                    .genesis()
+                    .unwrap()
+                    .root(),
+                candidate.root(),
+                "ordinary accepted events must preserve the genesis authority binding"
+            );
             let merged_page = merged.materialize_page(first_page.page_id).unwrap();
             merged_page
                 .blocks

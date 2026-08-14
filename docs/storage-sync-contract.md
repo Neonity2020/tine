@@ -19,6 +19,15 @@ lifecycle below describe the current multipart-bootstrap runtime; acceptance
 of the ADR alone does not make partially implemented genesis artifacts
 authoritative. The exact removal/replacement ledger is
 [managed-activation-authority-census.md](managed-activation-authority-census.md).
+Every constructed lazy-genesis candidate nevertheless carries the exact causal
+`DocumentDependencies` for its catalog and page checkpoints. Installing that
+candidate into the shadow engine constructs a sequence-zero accepted frontier
+whose constant-size genesis binding commits the sealed manifest root. Its
+accepted-document map is an initially empty overlay containing only causal rows
+superseded by later operations; it does not copy the graph-sized genesis map.
+Subsequent accepted operations must preserve the genesis binding. This is the
+test oracle for the eventual production switch, not an alternate activation
+marker or permission to admit a partially constructed candidate.
 
 ## 1. On-disk layout
 

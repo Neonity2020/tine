@@ -15,11 +15,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    BlobDescription, BlockId, ContentDigest, DocumentId, LineageDigest, LogseqUuid, ManagedPath,
-    ManagedTextKind, PageId, WorkspaceId,
+    BlobDescription, BlockId, ContentDigest, DocumentDependencies, DocumentId, LineageDigest,
+    LogseqUuid, ManagedPath, ManagedTextKind, PageId, WorkspaceId,
 };
 
-const LAZY_GENESIS_SCHEMA_VERSION: u32 = 1;
+const LAZY_GENESIS_SCHEMA_VERSION: u32 = 2;
 const LAZY_GENESIS_COMMIT_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_MANIFEST_FILE: &str = "manifest.postcard";
 const LAZY_GENESIS_COMMIT_FILE: &str = "commit.postcard";
@@ -29,6 +29,56 @@ const MAX_LAZY_GENESIS_CAPSULE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_LAZY_GENESIS_PAGES: usize = 1_000_000;
 const MAX_LAZY_GENESIS_BLOCKS: u64 = 100_000_000;
+const LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION: u32 = 1;
+
+/// Constant-size durable identity of the immutable baseline carried by an
+/// accepted frontier. The manifest root transitively binds the source capture,
+/// every page capsule/checkpoint, and the catalog checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LazyGenesisFrontierBindingV1 {
+    schema_version: u32,
+    root: ContentDigest,
+    source_capture: BlobDescription,
+    document_count: u64,
+    block_count: u64,
+}
+
+impl LazyGenesisFrontierBindingV1 {
+    fn new(candidate: &LazyGenesisCandidate) -> io::Result<Self> {
+        let document_count = candidate
+            .manifest
+            .page_count
+            .checked_add(1)
+            .ok_or_else(|| invalid("lazy genesis document count overflowed"))?;
+        let binding = Self {
+            schema_version: LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION,
+            root: candidate.root,
+            source_capture: candidate.manifest.source_capture,
+            document_count,
+            block_count: candidate.manifest.block_count,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub(crate) fn validate(self) -> io::Result<()> {
+        if self.schema_version != LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION
+            || self.document_count == 0
+        {
+            return Err(invalid("lazy genesis frontier binding is malformed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn root(self) -> ContentDigest {
+        self.root
+    }
+
+    pub(crate) const fn document_count(self) -> u64 {
+        self.document_count
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +104,7 @@ pub(crate) struct LazyGenesisPageInput {
     pub(crate) preamble: Option<String>,
     pub(crate) blocks: Vec<LazyGenesisBlockInput>,
     pub(crate) document_checkpoint: Vec<u8>,
+    pub(crate) document_dependencies: Option<DocumentDependencies>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,6 +211,7 @@ struct LazyGenesisPageDescriptorV1 {
     offset: u64,
     length: u64,
     blocks: u32,
+    document_dependencies: DocumentDependencies,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -170,6 +222,7 @@ struct LazyGenesisManifestV1 {
     lineage_digest: LineageDigest,
     source_capture: BlobDescription,
     catalog_checkpoint: BlobDescription,
+    catalog_dependencies: DocumentDependencies,
     pages: Vec<LazyGenesisPageDescriptorV1>,
     segments: Vec<BlobDescription>,
     page_count: u64,
@@ -262,7 +315,18 @@ impl LazyGenesisPackBuilder {
         if self.descriptors.len() == MAX_LAZY_GENESIS_PAGES {
             return Err(invalid("lazy genesis page-count cap exceeded"));
         }
+        let document_dependencies = input
+            .document_dependencies
+            .clone()
+            .ok_or_else(|| invalid("lazy genesis page has no sealed causal dependencies"))?;
         let capsule = LazyGenesisPageCapsuleV1::from_input(input)?;
+        if document_dependencies.document_id() != capsule.home_document_id
+            || !document_dependencies.direct_dependency_heads().is_empty()
+        {
+            return Err(invalid(
+                "lazy genesis page dependencies do not name an unheaded home document",
+            ));
+        }
         if self
             .last_path
             .as_ref()
@@ -308,6 +372,7 @@ impl LazyGenesisPackBuilder {
             offset,
             length: encoded.len() as u64,
             blocks: capsule.blocks.len() as u32,
+            document_dependencies,
         });
         if self.current.len() >= LAZY_GENESIS_SEGMENT_TARGET_BYTES {
             self.flush_segment()?;
@@ -334,12 +399,23 @@ impl LazyGenesisPackBuilder {
     pub(crate) fn finish(
         mut self,
         catalog_checkpoint: Vec<u8>,
+        catalog_dependencies: DocumentDependencies,
     ) -> io::Result<LazyGenesisCandidate> {
         if catalog_checkpoint.is_empty()
             || catalog_checkpoint.len() > MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES
         {
             return Err(invalid(
                 "lazy genesis catalog checkpoint is empty or exceeds its fixed cap",
+            ));
+        }
+        if !catalog_dependencies.direct_dependency_heads().is_empty()
+            || self
+                .descriptors
+                .iter()
+                .any(|page| page.home_document_id == catalog_dependencies.document_id())
+        {
+            return Err(invalid(
+                "lazy genesis catalog dependencies are headed or alias a page home",
             ));
         }
         self.flush_segment()?;
@@ -356,6 +432,7 @@ impl LazyGenesisPackBuilder {
             lineage_digest: self.lineage_digest,
             source_capture: self.source_capture,
             catalog_checkpoint: catalog_description,
+            catalog_dependencies,
             page_count: self.descriptors.len() as u64,
             block_count: self.block_count,
             pages: std::mem::take(&mut self.descriptors),
@@ -413,6 +490,10 @@ impl LazyGenesisCandidate {
         self.root
     }
 
+    pub(crate) fn frontier_binding(&self) -> io::Result<LazyGenesisFrontierBindingV1> {
+        LazyGenesisFrontierBindingV1::new(self)
+    }
+
     pub(crate) const fn workspace_id(&self) -> WorkspaceId {
         self.manifest.workspace_id
     }
@@ -431,6 +512,36 @@ impl LazyGenesisCandidate {
 
     pub(crate) fn page_ids(&self) -> impl Iterator<Item = PageId> + '_ {
         self.manifest.pages.iter().map(|page| page.page_id)
+    }
+
+    /// The complete causal baseline bound by the sealed manifest. These rows
+    /// are small dependency records, not eagerly opened CRDT documents.
+    pub(crate) fn frontier_documents(&self) -> Vec<DocumentDependencies> {
+        let mut documents = Vec::with_capacity(self.manifest.pages.len() + 1);
+        documents.push(self.manifest.catalog_dependencies.clone());
+        documents.extend(
+            self.manifest
+                .pages
+                .iter()
+                .map(|page| page.document_dependencies.clone()),
+        );
+        documents.sort_unstable_by_key(DocumentDependencies::document_id);
+        documents
+    }
+
+    /// Resolve one causal baseline row without opening a CRDT checkpoint or a
+    /// page capsule. Ordinary accepted events keep only rows that supersede
+    /// this immutable baseline.
+    pub(crate) fn frontier_document(
+        &self,
+        document_id: DocumentId,
+    ) -> Option<DocumentDependencies> {
+        if self.manifest.catalog_dependencies.document_id() == document_id {
+            return Some(self.manifest.catalog_dependencies.clone());
+        }
+        self.home_index
+            .get(&document_id)
+            .map(|index| self.manifest.pages[*index].document_dependencies.clone())
     }
 
     /// Resolve immutable page ownership without decoding its capsule or the
@@ -486,6 +597,7 @@ impl LazyGenesisCandidate {
             preamble: capsule.preamble,
             blocks: capsule.blocks,
             document_checkpoint: capsule.document_checkpoint,
+            document_dependencies: Some(descriptor.document_dependencies.clone()),
         }))
     }
 
@@ -630,9 +742,23 @@ fn validate_manifest(manifest: &LazyGenesisManifestV1) -> io::Result<()> {
     }
     let mut pages = BTreeSet::new();
     let mut homes = BTreeSet::new();
+    let mut dependency_documents = BTreeSet::from([manifest.catalog_dependencies.document_id()]);
+    if !manifest
+        .catalog_dependencies
+        .direct_dependency_heads()
+        .is_empty()
+    {
+        return Err(invalid("lazy genesis catalog dependencies are headed"));
+    }
     for page in &manifest.pages {
         if !pages.insert(page.page_id)
             || !homes.insert(page.home_document_id)
+            || page.document_dependencies.document_id() != page.home_document_id
+            || !page
+                .document_dependencies
+                .direct_dependency_heads()
+                .is_empty()
+            || !dependency_documents.insert(page.document_dependencies.document_id())
             || page.segment as usize >= manifest.segments.len()
             || page.length > MAX_LAZY_GENESIS_CAPSULE_BYTES as u64
         {
@@ -697,6 +823,17 @@ mod tests {
             kind: ManagedTextKind::Page,
             preamble: None,
             document_checkpoint: vec![ordinal as u8, blocks as u8, 0x47],
+            document_dependencies: Some(
+                DocumentDependencies::new(
+                    home,
+                    vec![super::super::CrdtPeerCounter::new(
+                        super::super::CrdtPeerId::from_u64(7),
+                        ordinal as u64,
+                    )],
+                    Vec::new(),
+                )
+                .unwrap(),
+            ),
             blocks: (0..blocks)
                 .map(|index| LazyGenesisBlockInput {
                     block_id: BlockId::from_uuid(Uuid::from_u128(
@@ -712,6 +849,18 @@ mod tests {
         }
     }
 
+    fn catalog_dependencies() -> DocumentDependencies {
+        DocumentDependencies::new(
+            DocumentId::from_uuid(Uuid::from_u128(99_999)),
+            vec![super::super::CrdtPeerCounter::new(
+                super::super::CrdtPeerId::from_u64(7),
+                1,
+            )],
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn lazy_genesis_pack_is_deterministic_bounded_and_point_readable() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
@@ -725,7 +874,9 @@ mod tests {
             for page in pages {
                 builder.push(page).unwrap();
             }
-            builder.finish(vec![0x43, 0x41, 0x54]).unwrap()
+            builder
+                .finish(vec![0x43, 0x41, 0x54], catalog_dependencies())
+                .unwrap()
         };
         let first = build();
         let second = build();
@@ -785,7 +936,9 @@ mod tests {
         )
         .unwrap();
         builder.push(page(1, "pages/a.md", 1)).unwrap();
-        let candidate = builder.finish(vec![0x43, 0x41, 0x54]).unwrap();
+        let candidate = builder
+            .finish(vec![0x43, 0x41, 0x54], catalog_dependencies())
+            .unwrap();
         let (candidate, commit) = candidate.stage_into(&parent.join("genesis")).unwrap();
         fs::rename(&parent, &moved_parent).unwrap();
         let candidate = candidate
