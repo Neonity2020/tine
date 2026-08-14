@@ -3690,6 +3690,95 @@ fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageIn
     }
 }
 
+/// Resolve the only graph-wide decision needed while constructing baseline
+/// page checkpoints: an external Logseq UUID is installed when and only when
+/// exactly one block claims it. Ambiguous claims remain visible in SQLite but
+/// do not become CRDT block identity. This is the same deterministic policy as
+/// the legacy identity-operation collapse, expressed without manufacturing an
+/// operation.
+fn unique_baseline_external_uuids(
+    pages: &ActivationPageRecordStore,
+) -> Result<BTreeMap<BlockId, LogseqUuid>, BootstrapStreamingImportError> {
+    let mut claims = BTreeMap::<LogseqUuid, Option<BlockId>>::new();
+    for page_id in pages.path_order() {
+        let record = pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        for (block, source) in record.page.blocks.iter().zip(&record.block_sources) {
+            let Some(logseq_uuid) = (source.raw_ids.len() == 1)
+                .then(|| LogseqUuid::parse(source.raw_ids[0].trim()).ok())
+                .flatten()
+            else {
+                continue;
+            };
+            match claims.entry(logseq_uuid) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(block.block_id));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    Ok(claims
+        .into_iter()
+        .filter_map(|(logseq_uuid, block_id)| block_id.map(|block_id| (block_id, logseq_uuid)))
+        .collect())
+}
+
+/// Construct the immutable baseline directly from terminal activation records.
+/// It does not create semantic operations, batches, receipts, parts, or a
+/// Patricia identity index. The record store may be memory-backed or spilled;
+/// source pages are never reparsed.
+fn build_lazy_genesis_from_activation_records(
+    pages: &ActivationPageRecordStore,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    source_capture: BlobDescription,
+    working: &Path,
+) -> Result<LazyGenesisCandidate, BootstrapStreamingImportError> {
+    let accepted_external_uuids = unique_baseline_external_uuids(pages)?;
+    let mut lazy_genesis = LazyGenesisPackBuilder::new(
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        source_capture,
+        working,
+    )?;
+    let mut checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
+    for page_id in pages.path_order() {
+        let record = pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        let page_assignments = record
+            .page
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                accepted_external_uuids
+                    .get(&block.block_id)
+                    .copied()
+                    .map(|logseq_uuid| (block.block_id, logseq_uuid))
+            })
+            .collect();
+        let mut page = lazy_genesis_page_input(&record);
+        let (checkpoint, dependencies) = checkpoints.push_page(&page, &page_assignments)?;
+        page.document_checkpoint = checkpoint;
+        page.document_dependencies = Some(dependencies);
+        lazy_genesis.push(page)?;
+    }
+    let (catalog_checkpoint, catalog_dependencies) = checkpoints.finish()?;
+    lazy_genesis
+        .finish(catalog_checkpoint, catalog_dependencies)
+        .map_err(Into::into)
+}
+
 fn collapse_unique_identity_candidates(
     candidates: &Path,
     destination: &Path,
@@ -13407,7 +13496,10 @@ mod tests {
         )
         .unwrap();
         for (path, contents) in [
-            ("Root.md", "title:: Root logical name\n\n- root\n"),
+            (
+                "Root.md",
+                "title:: Root logical name\n\n- root\n  id:: 00000000-0000-0000-0000-000000005e00\n- ambiguous root claimant\n  id:: 00000000-0000-0000-0000-000000005e00\n",
+            ),
             (
                 "notes/arbitrary/nested/Markdown.md",
                 "title:: Markdown title ☕\n\n- parent\n  - child\n",
@@ -13467,6 +13559,23 @@ mod tests {
             .lazy_genesis
             .as_ref()
             .expect("shadow lazy-genesis candidate");
+        let clean_lazy_genesis = build_lazy_genesis_from_activation_records(
+            streaming
+                .activation_pages
+                .as_ref()
+                .expect("terminal activation records"),
+            workspace,
+            LineageDigest::of(b"canonical-activation-stream-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            capture.capture_identity().unwrap(),
+            &working,
+        )
+        .unwrap();
+        assert_eq!(
+            clean_lazy_genesis.root(),
+            lazy_genesis.root(),
+            "operation-free baseline construction must be byte-identical to the temporary operation oracle"
+        );
         assert_eq!(
             lazy_genesis.page_count(),
             usize::try_from(capture.source_file_count()).unwrap()
