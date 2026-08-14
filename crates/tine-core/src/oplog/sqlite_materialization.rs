@@ -353,6 +353,14 @@ impl MaterializationChange {
         &self.deletions
     }
 
+    pub(crate) fn page_name_identity_records(&self) -> &[MaterializedIdentityRecord] {
+        &self.page_name_identity_records
+    }
+
+    pub(crate) fn portable_path_identity_records(&self) -> &[MaterializedIdentityRecord] {
+        &self.portable_path_identity_records
+    }
+
     pub(crate) fn with_derived_graph_facts(
         mut self,
         mut reference_postings: Vec<MaterializedReferencePosting>,

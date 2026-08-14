@@ -76,7 +76,7 @@ use super::sync_layout::{
 use super::{
     BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
-    ObjectKind, ObjectStore, OperationBatch, PageId, PreparedBatch, ReferenceFactV1,
+    ObjectKind, ObjectStore, OperationBatch, PageId, PageState, PreparedBatch, ReferenceFactV1,
     ReferenceSourceLocatorV1, SemanticEffect, SemanticEffectDigest, ShardedHotEngine,
     ValidatedBatch, WorkspaceId, WorkspaceStatus, MANAGED_ENTITY_SET_VERSION,
     MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
@@ -1592,6 +1592,192 @@ fn attach_parser_derived_graph_facts(
             )
         })
         .map_err(Into::into)
+}
+
+/// Differentially prove that SQLite's clean identity transition machine makes
+/// the same ownership decision as the temporary Patricia oracle. The oracle
+/// still supplies production rows during this phase; this function has no
+/// write side effect and cannot change accepted behavior.
+fn verify_sqlite_identity_transition_against_legacy(
+    engine: &ShardedHotEngine,
+    event: &AcceptedBatchEvent,
+    prior: &super::SqliteMaterializedRead<'_>,
+    oracle: &super::MaterializationChange,
+) -> Result<(), ProjectionError> {
+    let authored = SemanticEffect::decode(event.authored_semantic_effect())
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    if authored.pages().is_empty() {
+        return Ok(());
+    }
+    let page_ids = authored
+        .pages()
+        .iter()
+        .map(|delta| delta.page_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if page_ids.len() != authored.pages().len() {
+        return Err(ProjectionError::Materialization(
+            "identity differential received duplicate page deltas".into(),
+        ));
+    }
+    let exact_before = authored
+        .pages()
+        .iter()
+        .map(|delta| (delta.page_id, delta.before.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let current = engine
+        .accepted_catalog_page_states(event.prior_frontier_root(), &page_ids)
+        .map_err(ProjectionError::materialization_from_engine)?;
+    let mut prospective = engine
+        .accepted_catalog_page_states(event.post_frontier_root(), &page_ids)
+        .map_err(ProjectionError::materialization_from_engine)?;
+    for transition in event.effective_transitions() {
+        let Some(Some(PageState::Live { name, .. })) = prospective.get_mut(&transition.page_id())
+        else {
+            return Err(ProjectionError::Materialization(
+                "effective title transition has no live prospective page".into(),
+            ));
+        };
+        if name.key_digest() != transition.selected_name().key_digest() {
+            return Err(ProjectionError::Materialization(
+                "effective title transition changes the canonical key".into(),
+            ));
+        }
+        name.clone_from(transition.selected_name());
+    }
+
+    let mut name_keys = BTreeSet::new();
+    let mut path_keys = BTreeSet::new();
+    for state in exact_before
+        .values()
+        .chain(current.values())
+        .chain(prospective.values())
+        .flatten()
+    {
+        name_keys.insert(state.name().key_digest());
+        if let Some(path) = state.path() {
+            path_keys.insert(path.portable_key().digest());
+        }
+    }
+    for delta in authored.pages() {
+        for state in [&delta.before, &delta.after].into_iter().flatten() {
+            name_keys.insert(state.name().key_digest());
+            if let Some(path) = state.path() {
+                path_keys.insert(path.portable_key().digest());
+            }
+        }
+    }
+    let mut name_records = BTreeMap::new();
+    for key in &name_keys {
+        if let Some(record) = prior.causal_page_name_identity_record(*key)? {
+            name_records.insert(*key, record);
+        }
+    }
+    let mut path_records = BTreeMap::new();
+    for key in &path_keys {
+        if let Some(record) = prior.causal_portable_path_identity_record(*key)? {
+            path_records.insert(*key, record);
+        }
+    }
+    let containment = engine
+        .accepted_batch_causal_containment(
+            event.batch_id(),
+            event.causal_dot(),
+            event.causal_dependency_heads(),
+        )
+        .map_err(ProjectionError::materialization_from_engine)?;
+    let names = super::sqlite_identity::prepare_page_name_identity_transition(
+        event.batch_id(),
+        event.causal_dot(),
+        &exact_before,
+        authored.pages(),
+        &current,
+        &prospective,
+        name_records.clone(),
+        |dot, batch| containment.contains(dot, batch),
+    )
+    .map_err(|error| {
+        ProjectionError::Materialization(format!(
+            "clean page-name identity differential refused accepted event: {error:?}"
+        ))
+    })?;
+    let paths = super::sqlite_identity::prepare_portable_path_identity_transition(
+        event.batch_id(),
+        event.causal_dot(),
+        authored.pages(),
+        &current,
+        &prospective,
+        path_records.clone(),
+        |dot, batch| containment.contains(dot, batch),
+    )
+    .map_err(|error| {
+        ProjectionError::Materialization(format!(
+            "clean portable-path identity differential refused accepted event: {error:?}"
+        ))
+    })?;
+    name_records.extend(names.changed.clone());
+    path_records.extend(paths.changed.clone());
+
+    let oracle_names = oracle
+        .page_name_identity_records()
+        .iter()
+        .map(|record| (record.key_digest, &record.record))
+        .collect::<BTreeMap<_, _>>();
+    let oracle_paths = oracle
+        .portable_path_identity_records()
+        .iter()
+        .map(|record| (record.key_digest, &record.record))
+        .collect::<BTreeMap<_, _>>();
+    for key in names.changed.keys() {
+        if !oracle_names.contains_key(&ContentDigest::from_bytes(*key.as_bytes())) {
+            return Err(ProjectionError::Materialization(
+                "clean page-name transition changed a key absent from the legacy oracle".into(),
+            ));
+        }
+    }
+    for (digest, bytes) in oracle_names {
+        let Some((key, clean)) = name_records
+            .iter()
+            .find(|(key, _)| ContentDigest::from_bytes(*key.as_bytes()) == digest)
+        else {
+            return Err(ProjectionError::Materialization(
+                "legacy page-name oracle returned a key absent from clean observations".into(),
+            ));
+        };
+        let legacy = super::sqlite_identity::PageNameIdentityRecordV1::decode(*key, bytes)
+            .map_err(ProjectionError::Materialization)?;
+        if !clean.equivalent_to_legacy_oracle(&legacy) {
+            return Err(ProjectionError::Materialization(
+                "clean page-name identity transition differs from the legacy oracle".into(),
+            ));
+        }
+    }
+    for key in paths.changed.keys() {
+        if !oracle_paths.contains_key(&ContentDigest::from_bytes(*key.as_bytes())) {
+            return Err(ProjectionError::Materialization(
+                "clean portable-path transition changed a key absent from the legacy oracle".into(),
+            ));
+        }
+    }
+    for (digest, bytes) in oracle_paths {
+        let Some((key, clean)) = path_records
+            .iter()
+            .find(|(key, _)| ContentDigest::from_bytes(*key.as_bytes()) == digest)
+        else {
+            return Err(ProjectionError::Materialization(
+                "legacy portable-path oracle returned a key absent from clean observations".into(),
+            ));
+        };
+        let legacy = super::sqlite_identity::PortablePathIdentityRecordV1::decode(*key, bytes)
+            .map_err(ProjectionError::Materialization)?;
+        if !clean.equivalent_to_legacy_oracle(&legacy) {
+            return Err(ProjectionError::Materialization(
+                "clean portable-path identity transition differs from the legacy oracle".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parser_derived_reference_source_posting(
@@ -4168,6 +4354,14 @@ impl SqliteFrontier {
             materialize_accepted_event_with_stats(engine, event)?;
         let materialization =
             attach_parser_derived_graph_facts(engine, materialization, event.semantic_effect())?;
+        let prior_digest = canonical_frontier_root_digest(event.prior_frontier_root())?;
+        let prior = self.physical.materialized_read(
+            event.prior_frontier_root().acceptance_sequence(),
+            prior_digest,
+        )?;
+        let prior = super::SqliteMaterializedRead::from_storage(prior);
+        verify_sqlite_identity_transition_against_legacy(engine, event, &prior, &materialization)?;
+        drop(prior);
         let (disposition, apply_stats) = self.apply_internal_with_materialization_and_stats(
             event,
             ApplyFault::None,
@@ -4189,6 +4383,14 @@ impl SqliteFrontier {
         authenticate_event_for_engine(engine, event)?;
         let materialization =
             attach_parser_derived_graph_facts(engine, materialization, event.semantic_effect())?;
+        let prior_digest = canonical_frontier_root_digest(event.prior_frontier_root())?;
+        let prior = self.physical.materialized_read(
+            event.prior_frontier_root().acceptance_sequence(),
+            prior_digest,
+        )?;
+        let prior = super::SqliteMaterializedRead::from_storage(prior);
+        verify_sqlite_identity_transition_against_legacy(engine, event, &prior, &materialization)?;
+        drop(prior);
         self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
     }
 

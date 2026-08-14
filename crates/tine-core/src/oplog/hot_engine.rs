@@ -794,6 +794,25 @@ pub(crate) struct AuthenticatedEffectiveSemanticView {
     transitions: Vec<AuthenticatedPageLocalEffectiveTransition>,
 }
 
+/// Bounded causal-containment proof for one accepted batch. Identity
+/// transitions use this ordinary oplog fact after the Patricia indexes are
+/// removed; it is not an identity-specific authority.
+pub(crate) struct AcceptedBatchCausalContainment {
+    batch_id: BatchId,
+    clock: Vec<(CausalPeerId, u64)>,
+}
+
+impl AcceptedBatchCausalContainment {
+    pub(crate) fn contains(&self, dot: BatchCausalDot, batch_id: BatchId) -> bool {
+        batch_id == self.batch_id
+            || self
+                .clock
+                .binary_search_by_key(&dot.peer_id(), |(peer, _)| *peer)
+                .ok()
+                .is_some_and(|index| self.clock[index].1 >= dot.counter())
+    }
+}
+
 impl AuthenticatedEffectiveSemanticView {
     pub(crate) const fn effect(&self) -> &SemanticEffect {
         &self.effect
@@ -12946,6 +12965,83 @@ impl ShardedHotEngine {
     pub fn page_name_index_root(&self) -> Result<&PageNameOwnershipRootV1, EngineError> {
         self.ensure_not_blocked()?;
         Ok(&self.page_name_root)
+    }
+
+    /// Read only the requested catalog page states at one authenticated
+    /// accepted root. This is an ordinary oplog/catalog observation, not an
+    /// identity-index lookup, and therefore remains after Patricia removal.
+    pub(crate) fn accepted_catalog_page_states(
+        &self,
+        root: &AcceptedFrontierRoot,
+        page_ids: &[PageId],
+    ) -> Result<BTreeMap<PageId, Option<PageState>>, EngineError> {
+        self.begin_point_operation();
+        self.authenticate_accepted_frontier_root(root)?;
+        if page_ids.len() > super::page_name_index::MAX_PAGE_NAME_POINT_BATCH
+            || page_ids.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(EngineError::Archive(
+                "accepted catalog page-state request is not canonical or exceeds its bound".into(),
+            ));
+        }
+        if root == &AcceptedFrontierRoot::empty() {
+            return Ok(page_ids.iter().map(|page_id| (*page_id, None)).collect());
+        }
+        let catalog = self.load_document_at_accepted_frontier(root, self.catalog_document_id)?;
+        if let Some(catalog) = &catalog {
+            validate_catalog(self.catalog_document_id, catalog)?;
+        }
+        page_ids
+            .iter()
+            .map(|page_id| {
+                let state = catalog
+                    .as_ref()
+                    .map(|catalog| {
+                        validate_catalog_page(self.catalog_document_id, catalog, *page_id)
+                    })
+                    .transpose()?
+                    .flatten();
+                Ok((*page_id, state))
+            })
+            .collect()
+    }
+
+    /// Materialize the already-authenticated causal clock used by ordinary
+    /// operation admission. SQLite identity preflight consumes this instead
+    /// of retaining a second identity-specific ancestry structure.
+    pub(crate) fn accepted_batch_causal_containment(
+        &self,
+        batch_id: BatchId,
+        causal_dot: BatchCausalDot,
+        causal_dependency_heads: &[BatchId],
+    ) -> Result<AcceptedBatchCausalContainment, EngineError> {
+        self.ensure_not_blocked()?;
+        let record = self
+            .scratch
+            .as_ref()
+            .map(|store| super::causal_index::batch_record(store, &self.scratch_roots, batch_id))
+            .transpose()
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .flatten();
+        let clock = if let Some(record) = record {
+            record.clock().to_vec()
+        } else {
+            self.derive_inline_causal_clock(
+                &self.scratch_roots,
+                causal_dot,
+                causal_dependency_heads,
+            )?
+        };
+        if !clock
+            .binary_search_by_key(&causal_dot.peer_id(), |(peer, _)| *peer)
+            .ok()
+            .is_some_and(|index| clock[index].1 >= causal_dot.counter())
+        {
+            return Err(EngineError::Archive(
+                "accepted batch causal clock does not contain its own dot".into(),
+            ));
+        }
+        Ok(AcceptedBatchCausalContainment { batch_id, clock })
     }
 
     /// Read the exact post-acceptance causal identity records touched by one

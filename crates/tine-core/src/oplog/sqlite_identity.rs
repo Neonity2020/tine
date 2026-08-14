@@ -224,6 +224,52 @@ impl PageNameIdentityRecordV1 {
         }
         Ok(())
     }
+
+    /// Compare a clean SQLite-owned result with the temporary Patricia oracle.
+    /// Patricia represents imported baseline ownership as a fabricated
+    /// accepted bootstrap operation; the clean design deliberately represents
+    /// the same fact as `Baseline`. No other causal mismatch is accepted.
+    pub(crate) fn equivalent_to_legacy_oracle(&self, oracle: &Self) -> bool {
+        self.key_digest == oracle.key_digest
+            && match (&self.occupied, &oracle.occupied) {
+                (Some(clean), Some(old)) => {
+                    clean.page_id == old.page_id
+                        && clean.exact_name == old.exact_name
+                        && origin_equivalent_to_legacy(clean.acquisition, old.acquisition)
+                        && origin_equivalent_to_legacy(clean.exact_state, old.exact_state)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.latest_release, &oracle.latest_release) {
+                (Some(clean), Some(old)) => {
+                    clean.prior_page_id == old.prior_page_id
+                        && clean.prior_exact_name == old.prior_exact_name
+                        && origin_equivalent_to_legacy(
+                            clean.prior_acquisition,
+                            old.prior_acquisition,
+                        )
+                        && origin_equivalent_to_legacy(
+                            clean.prior_exact_state,
+                            old.prior_exact_state,
+                        )
+                        && origin_equivalent_to_legacy(clean.release, old.release)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+fn origin_equivalent_to_legacy(clean: IdentityOriginV1, oracle: IdentityOriginV1) -> bool {
+    clean == oracle
+        || matches!(
+            (clean, oracle),
+            (
+                IdentityOriginV1::Baseline,
+                IdentityOriginV1::Accepted { .. }
+            )
+        )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -384,6 +430,32 @@ impl PortablePathIdentityRecordV1 {
             return Err("malformed portable-path identity record".into());
         }
         Ok(())
+    }
+
+    pub(crate) fn equivalent_to_legacy_oracle(&self, oracle: &Self) -> bool {
+        self.key_digest == oracle.key_digest
+            && match (&self.occupied, &oracle.occupied) {
+                (Some(clean), Some(old)) => {
+                    clean.page_id == old.page_id
+                        && clean.exact_path == old.exact_path
+                        && origin_equivalent_to_legacy(clean.acquisition, old.acquisition)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.latest_release, &oracle.latest_release) {
+                (Some(clean), Some(old)) => {
+                    clean.prior_page_id == old.prior_page_id
+                        && clean.prior_exact_path == old.prior_exact_path
+                        && origin_equivalent_to_legacy(
+                            clean.prior_acquisition,
+                            old.prior_acquisition,
+                        )
+                        && origin_equivalent_to_legacy(clean.release, old.release)
+                }
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 
@@ -905,6 +977,39 @@ mod tests {
             path_record.occupied().unwrap().acquisition(),
             IdentityOriginV1::Baseline
         );
+    }
+
+    #[test]
+    fn differential_allows_only_clean_baseline_to_replace_legacy_bootstrap_origin() {
+        let page_id = page(2);
+        let name = LogicalPageName::parse("Imported").unwrap();
+        let clean = PageNameIdentityRecordV1::baseline(page_id, name.clone()).unwrap();
+        let legacy = PageNameIdentityRecordV1::new(
+            name.key_digest(),
+            Some(PageNameIdentityOccupiedV1::new(
+                page_id,
+                name.clone(),
+                IdentityOriginV1::accepted(batch(3), dot(3)),
+                IdentityOriginV1::accepted(batch(3), dot(3)),
+            )),
+            None,
+        )
+        .unwrap();
+        assert!(clean.equivalent_to_legacy_oracle(&legacy));
+        assert!(!legacy.equivalent_to_legacy_oracle(&clean));
+
+        let wrong_legacy = PageNameIdentityRecordV1::new(
+            name.key_digest(),
+            Some(PageNameIdentityOccupiedV1::new(
+                page_id,
+                name,
+                IdentityOriginV1::accepted(batch(4), dot(4)),
+                IdentityOriginV1::accepted(batch(4), dot(4)),
+            )),
+            None,
+        )
+        .unwrap();
+        assert!(!legacy.equivalent_to_legacy_oracle(&wrong_legacy));
     }
 
     #[test]
