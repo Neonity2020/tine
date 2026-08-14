@@ -29554,7 +29554,9 @@ fn next_accepted_frontier_root(
     })
 }
 
-fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), EngineError> {
+pub(crate) fn validate_accepted_frontier_root(
+    root: &AcceptedFrontierRoot,
+) -> Result<(), EngineError> {
     if root.schema_version != ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION {
         return Err(EngineError::Archive(format!(
             "unknown accepted-frontier root schema {}",

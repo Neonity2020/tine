@@ -844,7 +844,7 @@ struct ActivationBlockSourceV1 {
 /// consume.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ActivationPageRecordV1 {
+pub(crate) struct ActivationPageRecordV1 {
     schema_version: u32,
     source_leaf: [u8; 32],
     full_span: Option<StructuralSpan>,
@@ -1137,7 +1137,7 @@ fn write_activation_page_record_frame(
     Ok(())
 }
 
-enum ActivationPageRecordStore {
+pub(crate) enum ActivationPageRecordStore {
     Memory {
         records: Vec<ActivationPageRecordV1>,
         encoded_bytes: usize,
@@ -1147,14 +1147,14 @@ enum ActivationPageRecordStore {
 }
 
 impl ActivationPageRecordStore {
-    fn page_count(&self) -> usize {
+    pub(crate) fn page_count(&self) -> usize {
         match self {
             Self::Memory { records, .. } => records.len(),
             Self::Spilled(spilled) => spilled.index.len(),
         }
     }
 
-    fn path_order(&self) -> &[PageId] {
+    pub(crate) fn path_order(&self) -> &[PageId] {
         match self {
             Self::Memory { path_order, .. } => path_order,
             Self::Spilled(spilled) => &spilled.path_order,
@@ -1184,9 +1184,34 @@ impl ActivationPageRecordStore {
             Self::Spilled(spilled) => spilled.page(page_id),
         }
     }
+
+    /// Return the parser-owned terminal page for SQLite construction.
+    ///
+    /// Every syntactically valid single `id::` claim is retained here,
+    /// including graph-wide ambiguity. The immutable CRDT baseline separately
+    /// installs only a uniquely claimed UUID; SQLite must preserve all
+    /// claimants so the application can make that decision without Patricia.
+    pub(crate) fn sqlite_page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<super::MaterializedPageInput>, BootstrapStreamingImportError> {
+        let Some(record) = self.page(page_id)? else {
+            return Ok(None);
+        };
+        let mut page = record.page;
+        for (block, source) in page.blocks.iter_mut().zip(record.block_sources) {
+            let logseq_uuid = (source.raw_ids.len() == 1)
+                .then(|| LogseqUuid::parse(source.raw_ids[0].trim()).ok())
+                .flatten();
+            block.logseq_uuid = logseq_uuid;
+            block.logseq_identity_origin =
+                logseq_uuid.map(|_| super::LogseqIdentityOrigin::ExternalImported);
+        }
+        Ok(Some(page))
+    }
 }
 
-struct SpilledActivationPageRecords {
+pub(crate) struct SpilledActivationPageRecords {
     file: RefCell<Option<File>>,
     path: PathBuf,
     index: BTreeMap<PageId, (u64, u64)>,
@@ -12082,11 +12107,12 @@ mod tests {
             ),
         ];
         force_next_activation_page_record_memory_limit(usize::MAX);
-        let (_memory_root, memory, _) =
+        let (memory_root, memory, workspace) =
             prepare_streaming_bootstrap("activation-pages-memory", &files);
         force_next_activation_page_record_memory_limit(0);
-        let (_spilled_root, spilled, _) =
+        let (spilled_root, spilled, spilled_workspace) =
             prepare_streaming_bootstrap("activation-pages-spilled", &files);
+        assert_eq!(workspace, spilled_workspace);
 
         assert!(!memory.instrumentation().terminal_projection_hint_spilled);
         assert!(spilled.instrumentation().terminal_projection_hint_spilled);
@@ -12115,6 +12141,60 @@ mod tests {
         };
         assert_eq!(collect(&memory), collect(&spilled));
 
+        let build_clean_sqlite =
+            |fixture: &TestRoot, prepared: &InactiveBootstrapPreparedPublication, label: &str| {
+                let pages = prepared
+                    .terminal_construction
+                    .as_ref()
+                    .and_then(|material| material.activation_pages.as_ref())
+                    .unwrap();
+                let working = fixture.path().join(format!("clean-genesis-{label}"));
+                fs::create_dir(&working).unwrap();
+                let lineage = LineageDigest::of(b"inactive-streaming-bootstrap-test");
+                let catalog = DocumentId::from_uuid(Uuid::from_u128(0x5a02));
+                let candidate = std::sync::Arc::new(
+                    build_lazy_genesis_from_activation_records(
+                        pages,
+                        workspace,
+                        lineage,
+                        catalog,
+                        prepared.source_capture().capture_identity().unwrap(),
+                        &working,
+                    )
+                    .unwrap(),
+                );
+                let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+                let policy = ReferenceCatalogPolicyV1::default();
+                engine
+                    .configure_reference_catalog_policy(policy.clone())
+                    .unwrap();
+                engine.install_lazy_genesis_baseline(candidate).unwrap();
+                let root = engine.accepted_frontier_root().unwrap();
+                assert_eq!(root.acceptance_sequence(), 0);
+                assert!(root.genesis().is_some());
+                let physical = crate::oplog::sqlite::build_clean_genesis_sqlite_for_test(
+                    &working.join("projection.sqlite"),
+                    ProjectionClaim::current(workspace, lineage),
+                    &root,
+                    &policy,
+                    pages,
+                )
+                .unwrap();
+                assert!(physical.load_all_batches().unwrap().is_empty());
+                assert_eq!(physical.diagnostic_row_counts().unwrap(), (0, 0));
+                physical
+                    .materialized_row_digests_by_table()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(table, _)| *table != "materialization_stamp")
+                    .collect::<Vec<_>>()
+            };
+        assert_eq!(
+            build_clean_sqlite(&memory_root, &memory, "memory"),
+            build_clean_sqlite(&spilled_root, &spilled, "spilled"),
+            "memory and spilled activation records must build the same operation-free SQLite projection"
+        );
+
         let spill_path = match spilled
             .terminal_construction
             .as_ref()
@@ -12127,6 +12207,96 @@ mod tests {
         assert!(spill_path.exists());
         drop(spilled);
         assert!(!spill_path.exists());
+    }
+
+    #[test]
+    fn operation_free_sqlite_genesis_matches_legacy_bootstrap_projection_rows() {
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            "clean-sqlite-legacy-differential",
+            &[
+                (
+                    "pages/alpha.md",
+                    "title:: Alpha\nalias:: A\n\n- TODO [#A] one [[Beta]] #work\n  id:: 00000000-0000-0000-0000-000000000041\n",
+                ),
+                (
+                    "pages/beta.md",
+                    "- two ((00000000-0000-0000-0000-000000000041))\n  property:: value\n",
+                ),
+            ],
+        );
+        let pages = prepared
+            .terminal_construction
+            .as_ref()
+            .and_then(|material| material.activation_pages.as_ref())
+            .unwrap();
+        let lineage = LineageDigest::of(b"inactive-streaming-bootstrap-test");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0x5a02));
+        let working = root.path().join("clean-sqlite-differential");
+        fs::create_dir(&working).unwrap();
+        let candidate = std::sync::Arc::new(
+            build_lazy_genesis_from_activation_records(
+                pages,
+                workspace,
+                lineage,
+                catalog,
+                prepared.source_capture().capture_identity().unwrap(),
+                &working,
+            )
+            .unwrap(),
+        );
+        let policy = ReferenceCatalogPolicyV1::default();
+        let mut clean_engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        clean_engine
+            .configure_reference_catalog_policy(policy.clone())
+            .unwrap();
+        clean_engine
+            .install_lazy_genesis_baseline(candidate)
+            .unwrap();
+        let clean_root = clean_engine.accepted_frontier_root().unwrap();
+        let clean = crate::oplog::sqlite::build_clean_genesis_sqlite_for_test(
+            &working.join("clean.sqlite"),
+            ProjectionClaim::current(workspace, lineage),
+            &clean_root,
+            &policy,
+            pages,
+        )
+        .unwrap();
+
+        let (_, _, legacy_authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x5ac0, "archive");
+        let runtime =
+            ApplicationRuntimeRoot::open_for_test(&root.path().join("legacy-runtime")).unwrap();
+        let (legacy, _) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &root.path().join("legacy.sqlite"),
+            &runtime,
+            &legacy_authority,
+        )
+        .unwrap();
+
+        let projection_rows = |rows: Vec<(&'static str, ContentDigest)>| {
+            rows.into_iter()
+                .filter(|(table, _)| {
+                    !matches!(*table, "materialization_stamp" | "materialization_batches")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            projection_rows(clean.materialized_row_digests_by_table().unwrap()),
+            projection_rows(
+                legacy
+                    .database
+                    .materialized_row_digests_by_table_for_test()
+                    .unwrap()
+            ),
+            "operation-free genesis must change construction provenance, not query-visible SQLite rows"
+        );
+        assert!(clean.load_all_batches().unwrap().is_empty());
+        assert!(clean_engine
+            .status()
+            .accepted_batch_ids()
+            .unwrap()
+            .is_empty());
+        assert!(legacy.database.applied_batch_count().unwrap() > 0);
     }
 
     #[test]
