@@ -14,7 +14,6 @@ use std::io;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::Path;
 
-#[cfg(any(test, not(target_os = "linux")))]
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
@@ -99,6 +98,16 @@ fn sync_private_tree_exact(path: &Path) -> io::Result<()> {
 /// limitation must not block activation; ordinary I/O errors remain fatal.
 pub(crate) fn sync_reconstructible_directory(directory: &Dir) -> io::Result<()> {
     finish_android_reconstructible_directory_sync(tine_storage::sync_dir_required(directory))
+}
+
+/// Synchronize one already-created directory entry while its contents are
+/// still reconstructible from Direct Files. This is the publication barrier
+/// used immediately before the clean activation marker: Linux/desktop keeps
+/// the strict directory barrier, while Android tolerates only the documented
+/// directory-fsync capability refusal after all exact files were flushed.
+pub(crate) fn sync_reconstructible_directory_path(path: &Path) -> io::Result<()> {
+    let directory = Dir::open_ambient_dir(path, ambient_authority())?;
+    sync_reconstructible_directory(&directory)
 }
 
 #[cfg(target_os = "android")]

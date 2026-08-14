@@ -25,6 +25,8 @@ const LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_ACTIVATION_MARKER_MAGIC: &[u8] = b"TINE-LAZY-GENESIS-ACTIVATION\0";
 const LAZY_GENESIS_MANIFEST_FILE: &str = "manifest.postcard";
 const LAZY_GENESIS_COMMIT_FILE: &str = "commit.postcard";
+pub(crate) const LAZY_GENESIS_BASELINE_DIRECTORY: &str = "lazy-genesis";
+pub(crate) const LAZY_GENESIS_ACTIVATION_MARKER_FILE: &str = "lazy-genesis.marker";
 const MAX_LAZY_GENESIS_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
 const LAZY_GENESIS_SEGMENT_TARGET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_LAZY_GENESIS_CAPSULE_BYTES: usize = 256 * 1024 * 1024;
@@ -609,6 +611,10 @@ impl LazyGenesisCandidate {
         self.manifest.lineage_digest
     }
 
+    pub(crate) const fn source_capture(&self) -> BlobDescription {
+        self.manifest.source_capture
+    }
+
     pub(crate) const fn catalog_document_id(&self) -> DocumentId {
         self.manifest.catalog_document_id
     }
@@ -767,6 +773,29 @@ impl LazyGenesisCandidate {
         Ok((self, commit))
     }
 
+    /// Publish and flush the immutable pack while it is still disposable.
+    /// The returned candidate deliberately retains cleanup ownership: only a
+    /// successfully published activation marker may convert it into authority.
+    pub(crate) fn publish_durable(
+        self,
+        destination: &Path,
+    ) -> io::Result<(Self, LazyGenesisCommitV1)> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| invalid("lazy genesis destination has no parent"))?;
+        let (candidate, commit) = self.stage_into(destination)?;
+        crate::filesystem_durability::sync_private_tree(destination)?;
+        crate::filesystem_durability::sync_reconstructible_directory_path(parent)?;
+        Ok((candidate, commit))
+    }
+
+    /// Transfer cleanup ownership to the durable activation marker. Calling
+    /// this before marker publication would strand Direct Files authority.
+    pub(crate) fn retain_as_authoritative(mut self) -> Self {
+        self.cleanup_on_drop = false;
+        self
+    }
+
     pub(crate) fn relocate_after_parent_move(mut self, destination: &Path) -> io::Result<Self> {
         if self.scratch.exists() || !destination.is_dir() {
             return Err(invalid(
@@ -826,6 +855,24 @@ impl LazyGenesisCandidate {
             home_index,
             cleanup_on_drop: false,
         })
+    }
+
+    pub(crate) fn open_sealed_for_marker(
+        directory: &Path,
+        marker: LazyGenesisActivationMarkerV1,
+    ) -> io::Result<Self> {
+        let commit_bytes = read_bounded(&directory.join(LAZY_GENESIS_COMMIT_FILE), 1024)?;
+        let commit = LazyGenesisCommitV1::decode(&commit_bytes)?;
+        if commit.workspace_id != marker.workspace_id()
+            || commit.lineage_digest != marker.lineage_digest()
+            || commit.source_capture != marker.source_capture()
+            || commit.root != marker.baseline_root()
+        {
+            return Err(invalid(
+                "lazy genesis activation marker does not bind the sealed baseline",
+            ));
+        }
+        Self::open_sealed(directory, commit)
     }
 }
 
@@ -902,6 +949,63 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .create_new(true)
         .open(path)?;
     file.write_all(bytes)
+}
+
+pub(crate) fn read_activation_marker(
+    enrollment_root: &Path,
+) -> io::Result<Option<LazyGenesisActivationMarkerV1>> {
+    let path = enrollment_root.join(LAZY_GENESIS_ACTIVATION_MARKER_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4096 {
+        return Err(invalid(
+            "lazy genesis activation marker is not a bounded regular file",
+        ));
+    }
+    LazyGenesisActivationMarkerV1::decode(&fs::read(path)?).map(Some)
+}
+
+/// Publish the sole authority-changing activation record. The exact baseline
+/// and SQLite candidate must already be complete; the caller must perform the
+/// final source comparison immediately before this call.
+pub(crate) fn publish_activation_marker(
+    enrollment_root: &Path,
+    marker: LazyGenesisActivationMarkerV1,
+) -> io::Result<()> {
+    fs::create_dir_all(enrollment_root)?;
+    let bytes = marker.encode()?;
+    let destination = enrollment_root.join(LAZY_GENESIS_ACTIVATION_MARKER_FILE);
+    if destination.exists() {
+        if read_activation_marker(enrollment_root)? == Some(marker) {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a different lazy genesis activation marker already exists",
+        ));
+    }
+    let temporary = enrollment_root.join(format!(
+        ".{LAZY_GENESIS_ACTIVATION_MARKER_FILE}.{}",
+        Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &destination)?;
+        crate::filesystem_durability::sync_reconstructible_directory_path(enrollment_root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn read_bounded(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
@@ -1096,6 +1200,63 @@ mod tests {
         .unwrap();
         builder.push(page(2, "pages/b.md", 0)).unwrap();
         assert!(builder.push(page(1, "pages/a.md", 0)).is_err());
+    }
+
+    #[test]
+    fn baseline_remains_disposable_until_the_marker_is_published_last() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-lazy-genesis-marker-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let archive = root.join("archive");
+        let enrollment = root.join("enrollment");
+        fs::create_dir_all(&archive).unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
+        let lineage = LineageDigest::of(b"lazy-genesis-marker-test");
+        let source = BlobDescription::of(b"sealed source capture");
+        let build = || {
+            let mut builder = LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog_document_id(),
+                source,
+                &root,
+            )
+            .unwrap();
+            builder.push(page(1, "pages/a.md", 1)).unwrap();
+            builder
+                .finish(vec![0x43, 0x41, 0x54], Some(catalog_dependencies()))
+                .unwrap()
+        };
+
+        let destination = archive.join(LAZY_GENESIS_BASELINE_DIRECTORY);
+        let (disposable, _) = build().publish_durable(&destination).unwrap();
+        assert!(destination.is_dir());
+        assert_eq!(read_activation_marker(&enrollment).unwrap(), None);
+        drop(disposable);
+        assert!(!destination.exists());
+
+        let (candidate, _) = build().publish_durable(&destination).unwrap();
+        let marker = LazyGenesisActivationMarkerV1::new(
+            workspace,
+            lineage,
+            candidate.root(),
+            candidate.source_capture(),
+            ContentDigest::of(b"accepted frontier"),
+            73,
+        )
+        .unwrap();
+        assert_eq!(read_activation_marker(&enrollment).unwrap(), None);
+        publish_activation_marker(&enrollment, marker).unwrap();
+        publish_activation_marker(&enrollment, marker).unwrap();
+        drop(candidate.retain_as_authoritative());
+
+        assert_eq!(read_activation_marker(&enrollment).unwrap(), Some(marker));
+        let reopened = LazyGenesisCandidate::open_sealed_for_marker(&destination, marker).unwrap();
+        assert_eq!(reopened.root(), marker.baseline_root());
+        assert_eq!(reopened.page_count(), 1);
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
