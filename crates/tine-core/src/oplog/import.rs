@@ -191,6 +191,7 @@ const BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES: usize = MAX_PREPARED_MANIFEST_BYTES_P
 /// canonical bytes are charged separately. Exact prepared bytes are still
 /// checked before the authoritative detached pass.
 const BOOTSTRAP_STREAM_SEMANTIC_EFFECT_OVERHEAD: u64 = 1024;
+const MAX_TERMINAL_PROJECTION_HINT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BootstrapStreamingImportInstrumentation {
@@ -211,6 +212,9 @@ pub(crate) struct BootstrapStreamingImportInstrumentation {
     pub(crate) operation_spool_bytes: u64,
     pub(crate) operation_builder_retained_bytes: u64,
     pub(crate) operation_builder_spilled: bool,
+    pub(crate) terminal_projection_hint_pages: u64,
+    pub(crate) terminal_projection_hint_bytes: u64,
+    pub(crate) terminal_projection_hint_spilled: bool,
     pub(crate) prepared_bytes: u64,
     pub(crate) external_sort_runs: u64,
     pub(crate) capture_passes: u64,
@@ -812,6 +816,7 @@ pub(crate) struct TerminalBootstrapConstructionMaterial {
     operation_count: u64,
     declaration_count: u64,
     accepted_events: Vec<AcceptedBatchEvent>,
+    terminal_projection_pages: Option<Vec<super::MaterializedPageInput>>,
 }
 
 #[allow(dead_code)]
@@ -838,6 +843,17 @@ impl TerminalBootstrapConstructionMaterial {
 
     pub(crate) const fn declaration_count(&self) -> u64 {
         self.declaration_count
+    }
+
+    pub(crate) fn terminal_projection_page(
+        &self,
+        page_id: PageId,
+    ) -> Option<&super::MaterializedPageInput> {
+        let pages = self.terminal_projection_pages.as_ref()?;
+        pages
+            .binary_search_by_key(&page_id, |page| page.page_id)
+            .ok()
+            .map(|index| &pages[index])
     }
 }
 
@@ -2508,6 +2524,7 @@ struct BootstrapOperationSpool {
     storage: BootstrapOperationStorage,
     operation_count: u64,
     declaration_count: u64,
+    terminal_projection_pages: Option<Vec<super::MaterializedPageInput>>,
 }
 
 enum BootstrapOperationCollectionMode {
@@ -2774,6 +2791,8 @@ fn spool_bootstrap_operations(
     let mut entries = capture.entries_cursor()?;
     let mut operation_count = 0_u64;
     let mut declaration_count = 0_u64;
+    let mut terminal_projection_pages = Some(Vec::new());
+    let mut terminal_projection_bytes = 0_usize;
 
     while let Some(entry) = entries.next()? {
         let bytes = source_reader.read_entry(&entry, instrumentation)?;
@@ -2804,7 +2823,7 @@ fn spool_bootstrap_operations(
             .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
 
         let mut parser_instrumentation = ImportInstrumentation::default();
-        let tree = parse_nodes(entry.path(), bytes.as_slice(), &mut parser_instrumentation)
+        let mut tree = parse_nodes(entry.path(), bytes.as_slice(), &mut parser_instrumentation)
             .map_err(|block| {
                 BootstrapStreamingImportError::InvalidSource(format!(
                     "{}: {}",
@@ -2821,6 +2840,8 @@ fn spool_bootstrap_operations(
         }
         // Source admission and parsing complete before the first semantic
         // operation for this external document is constructible.
+        let page_name = logical_name.as_str().to_owned();
+        let page_name_key = logical_name.canonical_key();
         let page_operation = BootstrapOperationRecord::new(
             SemanticOperation::CreatePage {
                 page_id,
@@ -2862,6 +2883,9 @@ fn spool_bootstrap_operations(
             operation_count = checked_bootstrap_operation_count(operation_count)?;
         }
         let mut node_ids = Vec::with_capacity(tree.nodes.len());
+        let mut terminal_blocks = terminal_projection_pages
+            .as_ref()
+            .map(|_| Vec::with_capacity(tree.nodes.len()));
         for index in 0..tree.nodes.len() {
             let locator = materialize_locator(&tree, index, &mut parser_instrumentation).map_err(
                 |block| {
@@ -2924,6 +2948,68 @@ fn spool_bootstrap_operations(
                     collector.push_identity(logseq_uuid.as_uuid().as_bytes().to_vec(), value)?;
                 }
             }
+            if let Some(blocks) = terminal_blocks.as_mut() {
+                let facets = std::mem::take(&mut tree.nodes[index].projection_facets);
+                blocks.push(super::MaterializedBlockInput {
+                    block_id,
+                    home_document_id,
+                    parent,
+                    order: imported_order(tree.nodes[index].sibling_position),
+                    content: std::mem::take(&mut tree.nodes[index].raw),
+                    searchable_text: facets.searchable_text,
+                    heading_level: facets.heading_level,
+                    collapsed: facets.collapsed,
+                    logseq_uuid: None,
+                    logseq_identity_origin: None,
+                    references: Vec::new(),
+                    properties: facets.properties,
+                    tags: facets.tags,
+                    task: facets.task,
+                });
+            }
+        }
+        if let Some(blocks) = terminal_blocks {
+            let is_org = super::reference_catalog::reference_source_is_org(entry.path());
+            let (preamble_search, _, _, properties, tags, _) = tree
+                .preamble
+                .as_deref()
+                .map(|preamble| super::sqlite::document_facets(preamble, is_org))
+                .unwrap_or_default();
+            let mut searchable = page_name.clone();
+            if !preamble_search.is_empty() {
+                searchable.push(' ');
+                searchable.push_str(&preamble_search);
+            }
+            let page = super::MaterializedPageInput {
+                page_id,
+                home_document_id,
+                name: page_name,
+                name_key: page_name_key,
+                path: entry.path().clone(),
+                kind: entry.kind(),
+                preamble: tree.preamble,
+                searchable_text: searchable,
+                references: Vec::new(),
+                properties,
+                tags,
+                blocks,
+            };
+            let encoded_bytes = postcard::to_allocvec(&page)
+                .map_err(|error| {
+                    BootstrapStreamingImportError::InvalidOperation(error.to_string())
+                })?
+                .len();
+            let next = terminal_projection_bytes.saturating_add(encoded_bytes);
+            if next > MAX_TERMINAL_PROJECTION_HINT_BYTES {
+                terminal_projection_pages = None;
+                instrumentation.terminal_projection_hint_spilled = true;
+            } else {
+                terminal_projection_bytes = next;
+                terminal_projection_pages
+                    .as_mut()
+                    .expect("terminal projection pages remain enabled")
+                    .push(page);
+            }
         }
         let _ = text;
     }
@@ -2935,10 +3021,15 @@ fn spool_bootstrap_operations(
     })?;
     require_bootstrap_operation_limit(operation_count)?;
     instrumentation.operations = operation_count;
+    instrumentation.terminal_projection_hint_pages = terminal_projection_pages
+        .as_ref()
+        .map_or(0, |pages| pages.len() as u64);
+    instrumentation.terminal_projection_hint_bytes = terminal_projection_bytes as u64;
     Ok(BootstrapOperationSpool {
         storage,
         operation_count,
         declaration_count,
+        terminal_projection_pages,
     })
 }
 
@@ -3725,7 +3816,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         BootstrapPreparationSubphase::OperationSpool,
     ));
     let phase_started = Instant::now();
-    let operations = spool_bootstrap_operations(
+    let mut operations = spool_bootstrap_operations(
         &capture,
         source.import_id,
         workspace_id,
@@ -3776,7 +3867,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         reference_catalog_policy,
         reference_catalog,
         source.import_id,
-        &operations,
+        &mut operations,
         part_count,
         &working,
         &mut instrumentation,
@@ -3856,7 +3947,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         workspace_id,
         lineage_digest,
         source.import_id,
-        &operations,
+        &mut operations,
         authored.accepted_events,
     );
     let _ = fs::remove_dir_all(&working);
@@ -3908,9 +3999,13 @@ fn retain_terminal_construction_material(
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     import_id: ImportId,
-    operations: &BootstrapOperationSpool,
+    operations: &mut BootstrapOperationSpool,
     accepted_events: Vec<AcceptedBatchEvent>,
 ) -> Option<TerminalBootstrapConstructionMaterial> {
+    let mut terminal_projection_pages = operations.terminal_projection_pages.take();
+    if let Some(pages) = terminal_projection_pages.as_mut() {
+        pages.sort_unstable_by_key(|page| page.page_id);
+    }
     Some(TerminalBootstrapConstructionMaterial {
         workspace_id,
         lineage_digest,
@@ -3918,6 +4013,7 @@ fn retain_terminal_construction_material(
         operation_count: operations.operation_count,
         declaration_count: operations.declaration_count,
         accepted_events,
+        terminal_projection_pages,
     })
 }
 
@@ -7591,6 +7687,17 @@ struct ParsedNode {
     span: StructuralSpan,
     raw: String,
     raw_ids: Vec<String>,
+    projection_facets: ParsedBlockProjectionFacets,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ParsedBlockProjectionFacets {
+    searchable_text: String,
+    heading_level: Option<u8>,
+    collapsed: bool,
+    properties: Vec<super::MaterializedProperty>,
+    tags: Vec<String>,
+    task: Option<super::MaterializedTask>,
 }
 
 struct ParsedTree {
@@ -7980,6 +8087,8 @@ fn flatten_document(
                 (crate::doc::property_key_norm(&key) == "id").then_some(value)
             })
             .collect();
+        let (searchable_text, heading_level, collapsed, properties, tags, task) =
+            super::sqlite::document_facets_from_parsed_block(block);
         let index = nodes.len();
         let span = spans.get(index).copied().ok_or_else(|| {
             authority_block(
@@ -7996,6 +8105,14 @@ fn flatten_document(
             span,
             raw: block.raw.clone(),
             raw_ids,
+            projection_facets: ParsedBlockProjectionFacets {
+                searchable_text,
+                heading_level,
+                collapsed,
+                properties,
+                tags,
+                task,
+            },
         });
         instrumentation.parsed_nodes = instrumentation.parsed_nodes.saturating_add(1);
         instrumentation.max_depth = instrumentation.max_depth.max(depth);
@@ -10782,6 +10899,7 @@ mod tests {
                 span: StructuralSpan::new(0, 0).unwrap(),
                 raw: "node".into(),
                 raw_ids: Vec::new(),
+                projection_facets: ParsedBlockProjectionFacets::default(),
             }],
         };
         let mut instrumentation = ImportInstrumentation {
@@ -10896,6 +11014,7 @@ mod tests {
             storage: BootstrapOperationStorage::File(operation_path),
             operation_count,
             declaration_count: pages as u64,
+            terminal_projection_pages: None,
         };
         force_next_bootstrap_part_operation_limit(128);
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
@@ -10970,6 +11089,7 @@ mod tests {
                 span: StructuralSpan::new(0, 0).unwrap(),
                 raw: "node".into(),
                 raw_ids: vec!["duplicate".into(), "duplicate".into()],
+                projection_facets: ParsedBlockProjectionFacets::default(),
             });
         }
         let deep = ParsedTree {
@@ -11005,6 +11125,7 @@ mod tests {
                         span: StructuralSpan::new(0, 0).unwrap(),
                         raw: format!("unique-{index:08}"),
                         raw_ids: Vec::new(),
+                        projection_facets: ParsedBlockProjectionFacets::default(),
                     }],
                 };
                 structural_classes(&tree, &mut interner, &mut instrumentation).unwrap();
@@ -11716,6 +11837,7 @@ mod tests {
             storage: BootstrapOperationStorage::File(path),
             operation_count,
             declaration_count: 0,
+            terminal_projection_pages: None,
         }
     }
 
@@ -11748,6 +11870,7 @@ mod tests {
             storage: BootstrapOperationStorage::File(path),
             operation_count: page_count,
             declaration_count: 0,
+            terminal_projection_pages: None,
         }
     }
 
@@ -11789,6 +11912,7 @@ mod tests {
             storage: BootstrapOperationStorage::File(path),
             operation_count: declaration_count,
             declaration_count,
+            terminal_projection_pages: None,
         }
     }
 
@@ -12298,6 +12422,7 @@ mod tests {
                 storage: BootstrapOperationStorage::File(operation_path),
                 operation_count: 4,
                 declaration_count: 0,
+                terminal_projection_pages: None,
             },
             2,
             &working,
@@ -12369,6 +12494,7 @@ mod tests {
                 storage: BootstrapOperationStorage::File(operation_path),
                 operation_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
                 declaration_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
+                terminal_projection_pages: None,
             },
             1,
             &working,

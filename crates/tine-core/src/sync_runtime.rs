@@ -25098,7 +25098,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("activation composition body must remain identifiable");
         let final_proof = activation
-            .find("verify_inactive_bootstrap_shadow_projection(")
+            .find("verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence(")
             .expect("activation must retain the final source/shadow proof");
         let enrollment = activation
             .find("begin_or_resume_shadow_import(")
@@ -48027,6 +48027,14 @@ mod tests {
             assert_eq!(
                 receipt.construction.sqlite.terminal_pages_materialized,
                 receipt.source_files
+            );
+            assert_eq!(
+                receipt.construction.sqlite.terminal_projection_hint_hits,
+                receipt.source_files
+            );
+            assert_eq!(
+                receipt.construction.sqlite.terminal_projection_hint_misses,
+                0
             );
             assert!(receipt.construction.sqlite.terminal_materialization_chunks > 0);
             assert!(

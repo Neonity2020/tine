@@ -337,6 +337,10 @@ pub(crate) const MAX_CURRENT_PATH_CURSORS: usize = 32;
 pub(crate) struct CurrentPathCursorProbe {
     pub(crate) rows: usize,
     pub(crate) catalog_document_validations: usize,
+    /// Total page-map entries visited by those shape validations. Unlike the
+    /// call count, this distinguishes many one-page home documents from
+    /// repeatedly validating one graph-sized catalog document.
+    pub(crate) catalog_entries_validated: usize,
     pub(crate) walk_micros: u128,
     pub(crate) portable_path_micros: u128,
     pub(crate) catalog_state_micros: u128,
@@ -348,6 +352,7 @@ thread_local! {
         const { Cell::new(CurrentPathCursorProbe {
             rows: 0,
             catalog_document_validations: 0,
+            catalog_entries_validated: 0,
             walk_micros: 0,
             portable_path_micros: 0,
             catalog_state_micros: 0,
@@ -5328,17 +5333,24 @@ impl BootstrapBulkMaterializer<'_> {
         }
 
         let evidence = ProjectionClaimEvidence::new(logseq_uuid, participants)?;
-        let resolution = self.engine.resolve_logseq_uuid_from_document_lookup(
-            logseq_uuid,
-            &evidence,
-            |document_id| {
-                if document_id == self.engine.catalog_document_id {
-                    Some(&self.catalog)
-                } else {
-                    documents.get(&document_id).map(|(_, document)| document)
-                }
-            },
-        )?;
+        let validated_catalog = ValidatedCatalogDocument {
+            catalog_document_id: self.engine.catalog_document_id,
+            document: &self.catalog,
+        };
+        let resolution = self
+            .engine
+            .resolve_logseq_uuid_from_document_lookup_with_page_state(
+                logseq_uuid,
+                &evidence,
+                |document_id| {
+                    if document_id == self.engine.catalog_document_id {
+                        Some(&self.catalog)
+                    } else {
+                        documents.get(&document_id).map(|(_, document)| document)
+                    }
+                },
+                |page_id| read_validated_catalog_page(validated_catalog, page_id),
+            )?;
         let dependencies = evidence
             .participants()
             .iter()
@@ -5367,7 +5379,20 @@ impl BootstrapBulkMaterializer<'_> {
         ),
         EngineError,
     > {
-        let (resolution, evidence, homes) = self.engine.resolve_logseq_uuid_current(logseq_uuid)?;
+        // A current-root materializer proved this immutable catalog once, and
+        // `materialize_chunk` rechecked its decoded version immediately before
+        // this projection pass. Reuse that window for cross-page UUID claims.
+        // A historical materializer must still ask the current engine for its
+        // current catalog rather than treating the historical page set as live.
+        let catalog = self
+            .current_claim_root_proven
+            .then_some(ValidatedCatalogDocument {
+                catalog_document_id: self.engine.catalog_document_id,
+                document: &self.catalog,
+            });
+        let (resolution, evidence, homes) = self
+            .engine
+            .resolve_logseq_uuid_current_in_catalog_window(logseq_uuid, catalog)?;
         let dependencies = homes
             .into_iter()
             .map(|(home_document_id, home)| {
@@ -20877,6 +20902,21 @@ impl ShardedHotEngine {
         ),
         EngineError,
     > {
+        self.resolve_logseq_uuid_current_in_catalog_window(logseq_uuid, None)
+    }
+
+    fn resolve_logseq_uuid_current_in_catalog_window(
+        &self,
+        logseq_uuid: LogseqUuid,
+        catalog: Option<ValidatedCatalogDocument<'_>>,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, LoroDoc>,
+        ),
+        EngineError,
+    > {
         let record = self.logseq_claim_record(self.logseq_claim_root, logseq_uuid)?;
         let participants: Vec<_> = record
             .introductions
@@ -20911,7 +20951,12 @@ impl ShardedHotEngine {
             else {
                 continue;
             };
-            let page_is_live = match self.current_hot_page_state(page_id) {
+            let page_state = match catalog {
+                Some(catalog) => read_validated_catalog_page(catalog, page_id)?
+                    .ok_or(EngineError::PageNotFound(page_id)),
+                None => self.current_hot_page_state(page_id),
+            };
+            let page_is_live = match page_state {
                 Ok(PageState::Live { .. }) => true,
                 Ok(PageState::Tombstone { .. })
                 | Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => false,
@@ -30687,11 +30732,14 @@ pub(super) fn validate_catalog_document(
     catalog_document_id: DocumentId,
     document: &LoroDoc,
 ) -> Result<ValidatedCatalogDocument<'_>, EngineError> {
+    let page_count = document.get_map(CATALOG_PAGES).len();
     update_cursor_probe(|probe| {
         probe.catalog_document_validations = probe.catalog_document_validations.saturating_add(1);
+        probe.catalog_entries_validated =
+            probe.catalog_entries_validated.saturating_add(page_count);
     });
     validate_document_roots(catalog_document_id, document, &[CATALOG_PAGES])?;
-    if document.get_map(CATALOG_PAGES).len() > MAX_DOCUMENT_ENTRIES {
+    if page_count > MAX_DOCUMENT_ENTRIES {
         return Err(EngineError::InvalidCrdt(
             "catalog entry bound exceeded".into(),
         ));

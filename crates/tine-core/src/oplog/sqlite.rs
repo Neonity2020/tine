@@ -1108,7 +1108,7 @@ fn authenticate_event_for_engine(
     Ok(())
 }
 
-fn document_facets(
+pub(super) fn document_facets(
     content: &str,
     is_org: bool,
 ) -> (
@@ -1139,6 +1139,24 @@ fn document_facets(
     }
     let mut block = crate::doc::DocBlock::new(content);
     block.is_org = is_org;
+    document_facets_from_parsed_block(&block)
+}
+
+/// Extract SQLite/search facets from the parser-owned block that source
+/// admission already constructed. Fresh activation retains this bounded,
+/// process-only result so terminal SQLite lowering does not parse the same raw
+/// block a second time. Ordinary edits and archive replay continue to enter
+/// through [`document_facets`].
+pub(super) fn document_facets_from_parsed_block(
+    block: &crate::doc::DocBlock,
+) -> (
+    String,
+    Option<u8>,
+    bool,
+    Vec<super::MaterializedProperty>,
+    Vec<String>,
+    Option<super::MaterializedTask>,
+) {
     let searchable_text = block
         .visible_text()
         .split_whitespace()
@@ -1218,6 +1236,37 @@ fn materialized_page_input(page: super::MaterializedPage) -> super::Materialized
         tags,
         blocks,
     }
+}
+
+fn materialized_page_input_from_hint(
+    page: &super::MaterializedPage,
+    hint: &super::MaterializedPageInput,
+) -> Option<super::MaterializedPageInput> {
+    if hint.page_id != page.page_id
+        || hint.home_document_id != page.home_document_id
+        || hint.name != page.name.as_str()
+        || hint.name_key != page.name.canonical_key()
+        || hint.path != page.path
+        || hint.kind != page.kind
+        || hint.preamble != page.preamble
+        || hint.blocks.len() != page.blocks.len()
+    {
+        return None;
+    }
+    let mut prepared = hint.clone();
+    for (prepared_block, terminal_block) in prepared.blocks.iter_mut().zip(&page.blocks) {
+        if prepared_block.block_id != terminal_block.block_id
+            || prepared_block.home_document_id != terminal_block.home_document_id
+            || prepared_block.parent != terminal_block.parent
+            || prepared_block.order != terminal_block.order
+            || prepared_block.content != terminal_block.content
+        {
+            return None;
+        }
+        prepared_block.logseq_uuid = terminal_block.logseq_uuid;
+        prepared_block.logseq_identity_origin = terminal_block.logseq_identity_origin;
+    }
+    Some(prepared)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1998,6 +2047,11 @@ pub(crate) struct BootstrapSqliteRebuildInstrumentation {
     pub(crate) terminal_pages_materialized: usize,
     pub(crate) terminal_materialization_chunks: usize,
     pub(crate) peak_terminal_bulk_pages: usize,
+    /// Source-parser facet bundles reused after exact terminal page comparison.
+    pub(crate) terminal_projection_hint_hits: usize,
+    /// Pages reparsed because no bounded source hint existed or terminal state
+    /// differed from the captured page shape.
+    pub(crate) terminal_projection_hint_misses: usize,
     pub(crate) terminal_materialization_micros: u128,
     pub(crate) terminal_reference_micros: u128,
     pub(crate) terminal_lowering_micros: u128,
@@ -4595,6 +4649,7 @@ impl SqliteFrontier {
             &provenance,
             &mut instrumentation,
             &mut bootstrap,
+            Some(material),
             terminal_projection_sink,
         )?;
         trace_terminal_phase("terminal row seed", rows_started);
@@ -4645,10 +4700,11 @@ impl SqliteFrontier {
         {
             return Err(ProjectionError::Rebuild(format!(
                 "terminal candidate catalog authority is not bounded by its read window: \
-                 rows {} pages {} validations {} bound {window_bound}",
+                 rows {} pages {} validations {} entries {} bound {window_bound}",
                 bootstrap.terminal_catalog_rows_authenticated,
                 bootstrap.terminal_pages_materialized,
                 bootstrap.terminal_catalog_document_validations,
+                cursor_probe.catalog_entries_validated,
             )));
         }
         let proof_started = std::time::Instant::now();
@@ -4766,6 +4822,7 @@ impl SqliteFrontier {
             &provenance,
             &mut instrumentation,
             &mut bootstrap,
+            None,
             terminal_projection_sink,
         )?;
         trace_terminal_phase("archive terminal row seed", rows_started);
@@ -4808,10 +4865,11 @@ impl SqliteFrontier {
         {
             return Err(ProjectionError::Rebuild(format!(
                 "terminal archive catalog authority is not bounded by its read window: \
-                 rows {} pages {} validations {} bound {window_bound}",
+                 rows {} pages {} validations {} entries {} bound {window_bound}",
                 bootstrap.terminal_catalog_rows_authenticated,
                 bootstrap.terminal_pages_materialized,
                 bootstrap.terminal_catalog_document_validations,
+                cursor_probe.catalog_entries_validated,
             )));
         }
         self.finish_fresh_candidate(source, coverage_count, &mut instrumentation)?;
@@ -4837,6 +4895,7 @@ impl SqliteFrontier {
         provenance: &[storage_frontier::PhysicalTerminalConstructionBatch],
         instrumentation: &mut RebuildInstrumentation,
         bootstrap: &mut BootstrapSqliteRebuildInstrumentation,
+        terminal_material: Option<&TerminalBootstrapConstructionMaterial>,
         terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<u64, ProjectionError> {
         let binding = engine
@@ -4930,6 +4989,7 @@ impl SqliteFrontier {
                 chunk_rows,
                 instrumentation,
                 bootstrap,
+                terminal_material,
                 terminal_projection_sink,
             )?;
         }
@@ -5012,6 +5072,7 @@ impl SqliteFrontier {
         rows: &[super::hot_engine::CurrentPathCatalogRow],
         instrumentation: &mut RebuildInstrumentation,
         bootstrap: &mut BootstrapSqliteRebuildInstrumentation,
+        terminal_material: Option<&TerminalBootstrapConstructionMaterial>,
         terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<(), ProjectionError> {
         let page_ids = rows.iter().map(|row| row.page_id()).collect::<Vec<_>>();
@@ -5047,7 +5108,19 @@ impl SqliteFrontier {
                     "terminal page identity differs from its authenticated catalog row".into(),
                 ));
             }
-            chunk.pages.push(materialized_page_input(page));
+            let hinted = terminal_material
+                .and_then(|material| material.terminal_projection_page(page.page_id))
+                .and_then(|hint| materialized_page_input_from_hint(&page, hint));
+            if hinted.is_some() {
+                bootstrap.terminal_projection_hint_hits =
+                    bootstrap.terminal_projection_hint_hits.saturating_add(1);
+            } else {
+                bootstrap.terminal_projection_hint_misses =
+                    bootstrap.terminal_projection_hint_misses.saturating_add(1);
+            }
+            chunk
+                .pages
+                .push(hinted.unwrap_or_else(|| materialized_page_input(page)));
             let reference_started = std::time::Instant::now();
             let posted = collect_indexed_reference_source_rows(
                 engine,
