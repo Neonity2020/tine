@@ -22,6 +22,7 @@ use super::{
 const LAZY_GENESIS_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_SEGMENT_TARGET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_LAZY_GENESIS_CAPSULE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_LAZY_GENESIS_PAGES: usize = 1_000_000;
 const MAX_LAZY_GENESIS_BLOCKS: u64 = 100_000_000;
 
@@ -48,6 +49,7 @@ pub(crate) struct LazyGenesisPageInput {
     pub(crate) kind: ManagedTextKind,
     pub(crate) preamble: Option<String>,
     pub(crate) blocks: Vec<LazyGenesisBlockInput>,
+    pub(crate) document_checkpoint: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -63,6 +65,7 @@ struct LazyGenesisPageCapsuleV1 {
     kind: ManagedTextKind,
     preamble: Option<String>,
     blocks: Vec<LazyGenesisBlockInput>,
+    document_checkpoint: Vec<u8>,
 }
 
 impl LazyGenesisPageCapsuleV1 {
@@ -78,13 +81,17 @@ impl LazyGenesisPageCapsuleV1 {
             kind: input.kind,
             preamble: input.preamble,
             blocks: input.blocks,
+            document_checkpoint: input.document_checkpoint,
         };
         capsule.validate()?;
         Ok(capsule)
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.schema_version != LAZY_GENESIS_SCHEMA_VERSION || self.name.is_empty() {
+        if self.schema_version != LAZY_GENESIS_SCHEMA_VERSION
+            || self.name.is_empty()
+            || self.document_checkpoint.is_empty()
+        {
             return Err(invalid("lazy genesis page capsule has an invalid header"));
         }
         let mut block_ids = BTreeSet::new();
@@ -158,6 +165,7 @@ struct LazyGenesisManifestV1 {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     source_capture: BlobDescription,
+    catalog_checkpoint: BlobDescription,
     pages: Vec<LazyGenesisPageDescriptorV1>,
     segments: Vec<BlobDescription>,
     page_count: u64,
@@ -277,13 +285,31 @@ impl LazyGenesisPackBuilder {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<LazyGenesisCandidate> {
+    pub(crate) fn finish(
+        mut self,
+        catalog_checkpoint: Vec<u8>,
+    ) -> io::Result<LazyGenesisCandidate> {
+        if catalog_checkpoint.is_empty()
+            || catalog_checkpoint.len() > MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES
+        {
+            return Err(invalid(
+                "lazy genesis catalog checkpoint is empty or exceeds its fixed cap",
+            ));
+        }
         self.flush_segment()?;
+        let catalog_description = BlobDescription::of(&catalog_checkpoint);
+        let catalog_path = self.scratch.join("catalog.snapshot");
+        let mut catalog_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(catalog_path)?;
+        catalog_file.write_all(&catalog_checkpoint)?;
         let manifest = LazyGenesisManifestV1 {
             schema_version: LAZY_GENESIS_SCHEMA_VERSION,
             workspace_id: self.workspace_id,
             lineage_digest: self.lineage_digest,
             source_capture: self.source_capture,
+            catalog_checkpoint: catalog_description,
             page_count: self.descriptors.len() as u64,
             block_count: self.block_count,
             pages: std::mem::take(&mut self.descriptors),
@@ -348,6 +374,10 @@ impl LazyGenesisCandidate {
         self.manifest.pages.len()
     }
 
+    pub(crate) fn page_ids(&self) -> impl Iterator<Item = PageId> + '_ {
+        self.manifest.pages.iter().map(|page| page.page_id)
+    }
+
     pub(crate) const fn block_count(&self) -> u64 {
         self.manifest.block_count
     }
@@ -391,7 +421,18 @@ impl LazyGenesisCandidate {
             kind: capsule.kind,
             preamble: capsule.preamble,
             blocks: capsule.blocks,
+            document_checkpoint: capsule.document_checkpoint,
         }))
+    }
+
+    pub(crate) fn catalog_checkpoint(&self) -> io::Result<Vec<u8>> {
+        let bytes = fs::read(self.scratch.join("catalog.snapshot"))?;
+        if bytes.len() > MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES
+            || BlobDescription::of(&bytes) != self.manifest.catalog_checkpoint
+        {
+            return Err(invalid("lazy genesis catalog checkpoint bytes changed"));
+        }
+        Ok(bytes)
     }
 }
 
@@ -460,6 +501,7 @@ mod tests {
             path: ManagedPath::parse(path).unwrap(),
             kind: ManagedTextKind::Page,
             preamble: None,
+            document_checkpoint: vec![ordinal as u8, blocks as u8, 0x47],
             blocks: (0..blocks)
                 .map(|index| LazyGenesisBlockInput {
                     block_id: BlockId::from_uuid(Uuid::from_u128(
@@ -486,7 +528,7 @@ mod tests {
             for page in pages {
                 builder.push(page).unwrap();
             }
-            builder.finish().unwrap()
+            builder.finish(vec![0x43, 0x41, 0x54]).unwrap()
         };
         let first = build();
         let second = build();

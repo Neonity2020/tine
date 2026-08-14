@@ -39,7 +39,7 @@ use super::external_import::{
 use super::hot_engine::{
     AcceptedFrontierRoot, AuthorBatch, DetachedBootstrapAcceptedEngineMaterial,
     DetachedBootstrapAuthoringSession, DetachedBootstrapCandidate, DetachedBootstrapReplayIdentity,
-    ProjectionStorageBinding, MAX_TRANSACTION_OPERATIONS,
+    LazyGenesisCheckpointBuilder, ProjectionStorageBinding, MAX_TRANSACTION_OPERATIONS,
 };
 use super::identity::BootstrapPartId;
 use super::lazy_genesis::{
@@ -934,6 +934,7 @@ enum ActivationPageRecordBuildMode {
 struct ActivationPageRecordBuilder {
     memory_limit: usize,
     mode: ActivationPageRecordBuildMode,
+    path_order: Vec<PageId>,
 }
 
 impl ActivationPageRecordBuilder {
@@ -944,6 +945,7 @@ impl ActivationPageRecordBuilder {
                 records: Vec::new(),
                 encoded_bytes: 0,
             },
+            path_order: Vec::new(),
         }
     }
 
@@ -961,7 +963,8 @@ impl ActivationPageRecordBuilder {
         if transition {
             self.spill_memory_records()?;
         }
-        match &mut self.mode {
+        let page_id = record.page.page_id;
+        let result = match &mut self.mode {
             ActivationPageRecordBuildMode::Memory {
                 records,
                 encoded_bytes,
@@ -989,7 +992,11 @@ impl ActivationPageRecordBuilder {
                 Ok(())
             }
             ActivationPageRecordBuildMode::Transitioning => unreachable!(),
+        };
+        if result.is_ok() {
+            self.path_order.push(page_id);
         }
+        result
     }
 
     fn spill_memory_records(&mut self) -> Result<(), BootstrapStreamingImportError> {
@@ -1035,7 +1042,10 @@ impl ActivationPageRecordBuilder {
     }
 
     fn finish(self) -> Result<ActivationPageRecordStore, BootstrapStreamingImportError> {
-        match self.mode {
+        let Self {
+            mode, path_order, ..
+        } = self;
+        match mode {
             ActivationPageRecordBuildMode::Memory {
                 mut records,
                 encoded_bytes,
@@ -1052,6 +1062,7 @@ impl ActivationPageRecordBuilder {
                 Ok(ActivationPageRecordStore::Memory {
                     records,
                     encoded_bytes,
+                    path_order,
                 })
             }
             ActivationPageRecordBuildMode::Spilled {
@@ -1081,6 +1092,7 @@ impl ActivationPageRecordBuilder {
                         path,
                         index,
                         encoded_bytes,
+                        path_order,
                     },
                 ))
             }
@@ -1123,6 +1135,7 @@ enum ActivationPageRecordStore {
     Memory {
         records: Vec<ActivationPageRecordV1>,
         encoded_bytes: usize,
+        path_order: Vec<PageId>,
     },
     Spilled(SpilledActivationPageRecords),
 }
@@ -1132,6 +1145,13 @@ impl ActivationPageRecordStore {
         match self {
             Self::Memory { records, .. } => records.len(),
             Self::Spilled(spilled) => spilled.index.len(),
+        }
+    }
+
+    fn path_order(&self) -> &[PageId] {
+        match self {
+            Self::Memory { path_order, .. } => path_order,
+            Self::Spilled(spilled) => &spilled.path_order,
         }
     }
 
@@ -1165,6 +1185,7 @@ struct SpilledActivationPageRecords {
     path: PathBuf,
     index: BTreeMap<PageId, (u64, u64)>,
     encoded_bytes: usize,
+    path_order: Vec<PageId>,
 }
 
 impl SpilledActivationPageRecords {
@@ -2951,6 +2972,113 @@ enum BootstrapOperationStorage {
     File(PathBuf),
 }
 
+enum SortRecordStorageReader<'a> {
+    Memory(std::slice::Iter<'a, SortRecord>),
+    File(SortRecordReader),
+}
+
+impl<'a> SortRecordStorageReader<'a> {
+    fn open(storage: &'a BootstrapOperationStorage) -> io::Result<Self> {
+        match storage {
+            BootstrapOperationStorage::Memory(records) => Ok(Self::Memory(records.iter())),
+            BootstrapOperationStorage::File(path) => Ok(Self::File(SortRecordReader::open(path)?)),
+        }
+    }
+
+    fn next(&mut self) -> io::Result<Option<SortRecord>> {
+        match self {
+            Self::Memory(records) => Ok(records.next().cloned()),
+            Self::File(records) => records.next(),
+        }
+    }
+}
+
+struct AcceptedIdentityCursor<'a> {
+    records: SortRecordStorageReader<'a>,
+    pending: Option<SortRecord>,
+}
+
+impl<'a> AcceptedIdentityCursor<'a> {
+    fn open(storage: &'a BootstrapOperationStorage) -> io::Result<Self> {
+        Ok(Self {
+            records: SortRecordStorageReader::open(storage)?,
+            pending: None,
+        })
+    }
+
+    fn assignments_for(
+        &mut self,
+        path: &ManagedPath,
+    ) -> Result<BTreeMap<BlockId, LogseqUuid>, BootstrapStreamingImportError> {
+        let mut assignments = BTreeMap::new();
+        loop {
+            if self.pending.is_none() {
+                self.pending = self.records.next()?;
+            }
+            let Some(record) = self.pending.as_ref() else {
+                break;
+            };
+            let record_path = page_capsule_key_path(&record.key)?;
+            match record_path.cmp(path) {
+                std::cmp::Ordering::Less => {
+                    return Err(BootstrapStreamingImportError::InvalidOperation(
+                        "accepted identity stream precedes the canonical page stream".into(),
+                    ));
+                }
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => {}
+            }
+            let record = self
+                .pending
+                .take()
+                .expect("accepted identity record exists");
+            let operation = BootstrapOperationRecord::decode(&record.value)?;
+            let SemanticOperation::MutateBlockLogseqIdentity {
+                block,
+                mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
+            } = operation.operation
+            else {
+                return Err(BootstrapStreamingImportError::InvalidOperation(
+                    "accepted identity stream contains a non-assignment operation".into(),
+                ));
+            };
+            if assignments.insert(block.block_id, logseq_uuid).is_some() {
+                return Err(BootstrapStreamingImportError::InvalidOperation(
+                    "accepted identity stream repeats a block assignment".into(),
+                ));
+            }
+        }
+        Ok(assignments)
+    }
+
+    fn finish(mut self) -> Result<(), BootstrapStreamingImportError> {
+        if self.pending.is_some() || self.records.next()?.is_some() {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "accepted identity stream contains an unknown page".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn page_capsule_key_path(key: &[u8]) -> Result<ManagedPath, BootstrapStreamingImportError> {
+    if key.len() < 9 || key[key.len() - 9] != 0 {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "accepted identity has a malformed page-capsule key".into(),
+        ));
+    }
+    let path = std::str::from_utf8(&key[..key.len() - 9]).map_err(|_| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "accepted identity page-capsule path is not UTF-8".into(),
+        )
+    })?;
+    ManagedPath::parse(path).map_err(|error| {
+        BootstrapStreamingImportError::InvalidOperation(format!(
+            "accepted identity page-capsule path is invalid: {error}"
+        ))
+    })
+}
+
 struct BootstrapOperationSpool {
     storage: BootstrapOperationStorage,
     operation_count: u64,
@@ -3097,7 +3225,10 @@ impl BootstrapOperationCollector {
     fn finish(
         self,
         instrumentation: &mut BootstrapStreamingImportInstrumentation,
-    ) -> Result<(BootstrapOperationStorage, u64), BootstrapStreamingImportError> {
+    ) -> Result<
+        (BootstrapOperationStorage, BootstrapOperationStorage, u64),
+        BootstrapStreamingImportError,
+    > {
         instrumentation.operation_builder_retained_bytes = instrumentation
             .operation_builder_retained_bytes
             .max(self.peak_retained_bytes as u64);
@@ -3117,6 +3248,7 @@ impl BootstrapOperationCollector {
                     (&left.key, &left.value).cmp(&(&right.key, &right.value))
                 });
                 let mut identity_count = 0_u64;
+                let mut accepted_identities = Vec::new();
                 let mut start = 0;
                 while start < identities.len() {
                     let mut end = start + 1;
@@ -3126,7 +3258,9 @@ impl BootstrapOperationCollector {
                     if end == start + 1 {
                         let unique = &identities[start];
                         let (key, value) = decode_identity_candidate(&unique.value)?;
-                        content.push(SortRecord { key, value });
+                        let accepted = SortRecord { key, value };
+                        content.push(accepted.clone());
+                        accepted_identities.push(accepted);
                         identity_count = identity_count.saturating_add(1);
                     }
                     start = end;
@@ -3134,7 +3268,14 @@ impl BootstrapOperationCollector {
                 content.sort_unstable_by(|left, right| {
                     (&left.key, &left.value).cmp(&(&right.key, &right.value))
                 });
-                Ok((BootstrapOperationStorage::Memory(content), identity_count))
+                accepted_identities.sort_unstable_by(|left, right| {
+                    (&left.key, &left.value).cmp(&(&right.key, &right.value))
+                });
+                Ok((
+                    BootstrapOperationStorage::Memory(content),
+                    BootstrapOperationStorage::Memory(accepted_identities),
+                    identity_count,
+                ))
             }
             BootstrapOperationCollectionMode::Streaming {
                 content,
@@ -3172,6 +3313,7 @@ impl BootstrapOperationCollector {
                     .saturating_add(operation_path.metadata()?.len());
                 Ok((
                     BootstrapOperationStorage::File(operation_path),
+                    BootstrapOperationStorage::File(identity_path),
                     identity_count,
                 ))
             }
@@ -3311,6 +3453,7 @@ fn spool_bootstrap_operations(
     import_id: ImportId,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
     working: &Path,
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
@@ -3321,8 +3464,6 @@ fn spool_bootstrap_operations(
     let mut operation_count = 0_u64;
     let mut declaration_count = 0_u64;
     let mut activation_pages = ActivationPageRecordBuilder::new();
-    let mut lazy_genesis =
-        LazyGenesisPackBuilder::new(workspace_id, lineage_digest, capture.capture_identity()?)?;
 
     while let Some(entry) = entries.next()? {
         let bytes = source_reader.read_entry(&entry, instrumentation)?;
@@ -3447,19 +3588,34 @@ fn spool_bootstrap_operations(
             &mut operation_count,
             &mut declaration_count,
         )?;
-        lazy_genesis.push(lazy_genesis_page_input(&record))?;
         activation_pages.push(record)?;
     }
     source_reader.finish()?;
 
-    let (storage, identity_count) = collector.finish(instrumentation)?;
+    let (storage, accepted_identity_storage, identity_count) = collector.finish(instrumentation)?;
     operation_count = operation_count.checked_add(identity_count).ok_or_else(|| {
         BootstrapStreamingImportError::InvalidOperation("bootstrap operation count overflow".into())
     })?;
     require_bootstrap_operation_limit(operation_count)?;
     instrumentation.operations = operation_count;
     let activation_pages = activation_pages.finish()?;
-    let lazy_genesis = lazy_genesis.finish()?;
+    let mut accepted_identities = AcceptedIdentityCursor::open(&accepted_identity_storage)?;
+    let mut lazy_genesis =
+        LazyGenesisPackBuilder::new(workspace_id, lineage_digest, capture.capture_identity()?)?;
+    let mut lazy_checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
+    for page_id in activation_pages.path_order() {
+        let record = activation_pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        let accepted = accepted_identities.assignments_for(&record.page.path)?;
+        let mut genesis_page = lazy_genesis_page_input(&record);
+        genesis_page.document_checkpoint = lazy_checkpoints.push_page(&genesis_page, &accepted)?;
+        lazy_genesis.push(genesis_page)?;
+    }
+    accepted_identities.finish()?;
+    let lazy_genesis = lazy_genesis.finish(lazy_checkpoints.finish()?)?;
     instrumentation.terminal_projection_hint_pages = activation_pages.page_count() as u64;
     instrumentation.terminal_projection_hint_bytes = activation_pages.encoded_bytes() as u64;
     instrumentation.terminal_projection_hint_spilled = activation_pages.spilled();
@@ -3509,6 +3665,7 @@ fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageIn
         kind: record.page.kind,
         preamble: record.page.preamble.clone(),
         blocks,
+        document_checkpoint: Vec::new(),
     }
 }
 
@@ -4300,6 +4457,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         source.import_id,
         workspace_id,
         lineage_digest,
+        catalog_document_id,
         &working,
         &mut instrumentation,
     )?;
@@ -13310,6 +13468,7 @@ mod tests {
             source.import_id,
             workspace,
             LineageDigest::of(b"canonical-activation-stream-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
             &working,
             &mut source_instrumentation,
         )
@@ -13479,10 +13638,26 @@ mod tests {
             ));
             engine.canonical_snapshot().unwrap()
         };
-        assert_eq!(
-            canonical_snapshot(&streaming_transaction),
-            canonical_snapshot(&old.transaction)
-        );
+        let old_snapshot = canonical_snapshot(&old.transaction);
+        let streaming_snapshot = canonical_snapshot(&streaming_transaction);
+        assert_eq!(streaming_snapshot, old_snapshot);
+        let lazy = streaming.lazy_genesis.as_ref().unwrap();
+        let lazy_pages = lazy
+            .page_ids()
+            .map(|page_id| {
+                let page = lazy.page(page_id).unwrap().unwrap();
+                (page.home_document_id, page.document_checkpoint)
+            })
+            .collect::<Vec<_>>();
+        let lazy_snapshot = ShardedHotEngine::canonical_snapshot_from_lazy_genesis_for_test(
+            workspace,
+            LineageDigest::of(b"streaming-differential-snapshot"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            &lazy.catalog_checkpoint().unwrap(),
+            lazy_pages,
+        )
+        .unwrap();
+        assert_eq!(lazy_snapshot, old_snapshot);
         assert_eq!(
             capture
                 .entries_cursor()
@@ -13568,6 +13743,62 @@ mod tests {
             memory.instrumentation().parts,
             spilled.instrumentation().parts
         );
+        let memory_genesis = memory
+            .terminal_construction
+            .as_ref()
+            .unwrap()
+            .lazy_genesis
+            .as_ref()
+            .unwrap();
+        let spilled_genesis = spilled
+            .terminal_construction
+            .as_ref()
+            .unwrap()
+            .lazy_genesis
+            .as_ref()
+            .unwrap();
+        assert_eq!(memory_genesis.root(), spilled_genesis.root());
+        assert_eq!(
+            memory_genesis.catalog_checkpoint().unwrap(),
+            spilled_genesis.catalog_checkpoint().unwrap()
+        );
+        let alpha_path = ManagedPath::parse("pages/alpha.md").unwrap();
+        let alpha_id = memory
+            .aggregate()
+            .import_id()
+            .unmatched_page_id(&ImportLocator::page(alpha_path));
+        let alpha = memory_genesis.page(alpha_id).unwrap().unwrap();
+        let unique = LogseqUuid::from_uuid(unique);
+        let duplicate = LogseqUuid::from_uuid(duplicate);
+        let unique_block = alpha
+            .blocks
+            .iter()
+            .find(|block| block.external_uuid_claims == vec![unique])
+            .unwrap();
+        let duplicate_block = alpha
+            .blocks
+            .iter()
+            .find(|block| block.external_uuid_claims == vec![duplicate])
+            .unwrap();
+        let checkpoint = loro::LoroDoc::new();
+        assert!(checkpoint
+            .import(&alpha.document_checkpoint)
+            .unwrap()
+            .pending
+            .is_none());
+        let identities = checkpoint.get_map("logseq_uuids");
+        assert_eq!(
+            match identities.get(&unique_block.block_id.to_string()) {
+                Some(loro::ValueOrContainer::Value(loro::LoroValue::String(value))) => {
+                    Some((*value).clone())
+                }
+                _ => None,
+            },
+            Some(unique.to_string())
+        );
+        assert!(identities
+            .get(&duplicate_block.block_id.to_string())
+            .is_none());
     }
 
     fn orchestration_binding(

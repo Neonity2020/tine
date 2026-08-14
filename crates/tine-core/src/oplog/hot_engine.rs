@@ -29,6 +29,7 @@ use super::content_patricia::{
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
+use super::lazy_genesis::LazyGenesisPageInput;
 use super::object_store::{
     BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
     CompletedDetachedBootstrapPublication, ControlDirectoryIdentity,
@@ -102,6 +103,7 @@ const MAX_PREAUTHORING_CAPTURE_PATHS: usize = MAX_TRANSACTION_OPERATIONS * 2;
 const MAX_PREAUTHORING_CAPTURE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREAUTHORING_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DOCUMENT_ENTRIES: usize = 1_000_000;
+const LAZY_GENESIS_PEER_ID: u64 = 0x5449_4e45_4745_4e31;
 const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 64;
 const CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION: u32 = 7;
 const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
@@ -7595,6 +7597,165 @@ impl Default for CommittedLocalOverlay {
             work: Cell::new(ManagedLocalWork::default()),
         }
     }
+}
+
+/// Builds ordinary Loro document snapshots directly from the canonical
+/// terminal page stream. It never authors semantic-operation batches and it
+/// retains only the graph catalog plus the page currently being encoded.
+///
+/// The snapshots are a shadow candidate until activation also supplies the
+/// globally accepted external-UUID assignments. That assignment is a graph
+/// identity decision and cannot be guessed independently by each page.
+pub(crate) struct LazyGenesisCheckpointBuilder {
+    catalog_document_id: DocumentId,
+    catalog: LoroDoc,
+}
+
+impl LazyGenesisCheckpointBuilder {
+    pub(crate) fn new(catalog_document_id: DocumentId) -> Result<Self, EngineError> {
+        let catalog = LoroDoc::new();
+        catalog
+            .set_peer_id(LAZY_GENESIS_PEER_ID)
+            .map_err(loro_error)?;
+        Ok(Self {
+            catalog_document_id,
+            catalog,
+        })
+    }
+
+    pub(crate) fn push_page(
+        &mut self,
+        page: &LazyGenesisPageInput,
+        accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
+    ) -> Result<Vec<u8>, EngineError> {
+        if page.home_document_id == self.catalog_document_id
+            || read_page_state(&self.catalog, page.page_id)?.is_some()
+        {
+            return Err(EngineError::InvalidTransaction(
+                "lazy genesis repeats or aliases a catalog/page identity".into(),
+            ));
+        }
+        let logical_name = LogicalPageName::parse(page.name.clone())
+            .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?;
+        insert_page_state(
+            &self.catalog,
+            page.page_id,
+            &PageState::Live {
+                name: logical_name,
+                path: page.path.clone(),
+                home_document_id: page.home_document_id,
+                kind: page.kind,
+            },
+        )?;
+
+        let document = LoroDoc::new();
+        document
+            .set_peer_id(LAZY_GENESIS_PEER_ID)
+            .map_err(loro_error)?;
+        document
+            .get_map(SHARD_META)
+            .insert(SHARD_PAGE_ID, page.page_id.to_string())
+            .map_err(loro_error)?;
+        if let Some(preamble) = &page.preamble {
+            document
+                .get_map(SHARD_PAGE_PREAMBLE)
+                .insert(SHARD_PAGE_PREAMBLE_VALUE, preamble.clone())
+                .map_err(loro_error)?;
+        }
+        let page_blocks: BTreeSet<_> = page.blocks.iter().map(|block| block.block_id).collect();
+        if accepted_external_uuids
+            .keys()
+            .any(|block_id| !page_blocks.contains(block_id))
+        {
+            return Err(EngineError::InvalidTransaction(
+                "lazy genesis UUID assignment names a block outside its page".into(),
+            ));
+        }
+        for block in &page.blocks {
+            let claim =
+                MembershipClaim::new(block.home_document_id, block.parent, block.order.clone())?;
+            document
+                .get_map(SHARD_OWNERS)
+                .insert(&block.block_id.to_string(), page.page_id.to_string())
+                .map_err(loro_error)?;
+            document
+                .get_map(SHARD_CONTENT)
+                .ensure_mergeable_text(&block.block_id.to_string())
+                .map_err(loro_error)?
+                .insert(0, &block.content)
+                .map_err(loro_error)?;
+            insert_membership(&document, block.block_id, &claim)?;
+            if let Some(logseq_uuid) = accepted_external_uuids.get(&block.block_id) {
+                document
+                    .get_map(SHARD_LOGSEQ_UUIDS)
+                    .insert(&block.block_id.to_string(), logseq_uuid.to_string())
+                    .map_err(loro_error)?;
+                document
+                    .get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS)
+                    .insert(
+                        &block.block_id.to_string(),
+                        encode_canonical(&LogseqIdentityOrigin::ExternalImported)?,
+                    )
+                    .map_err(loro_error)?;
+            }
+        }
+        document.commit();
+        let snapshot = document
+            .export(ExportMode::Snapshot)
+            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn finish(self) -> Result<Vec<u8>, EngineError> {
+        self.catalog.commit();
+        self.catalog
+            .export(ExportMode::Snapshot)
+            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))
+    }
+}
+
+fn verify_lazy_genesis_page_checkpoint(
+    expected: &LazyGenesisPageInput,
+    accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
+    snapshot: &[u8],
+) -> Result<(), EngineError> {
+    let document = LoroDoc::new();
+    import_complete(expected.home_document_id, &document, &[snapshot.to_vec()])?;
+    if shard_page_id(&document)? != Some(expected.page_id)
+        || read_page_preamble(expected.home_document_id, &document)? != expected.preamble
+    {
+        return Err(EngineError::InvalidCrdt(
+            "lazy genesis page checkpoint header differs from its capsule".into(),
+        ));
+    }
+    let blocks = read_all_blocks(expected.home_document_id, &document)?;
+    let memberships = read_memberships(expected.home_document_id, &document)?;
+    if blocks.len() != expected.blocks.len() || memberships.len() != expected.blocks.len() {
+        return Err(EngineError::InvalidCrdt(
+            "lazy genesis page checkpoint block coverage differs from its capsule".into(),
+        ));
+    }
+    for block in &expected.blocks {
+        let state = blocks.get(&block.block_id).ok_or_else(|| {
+            EngineError::InvalidCrdt("lazy genesis checkpoint omitted a block".into())
+        })?;
+        let membership = memberships.get(&block.block_id).ok_or_else(|| {
+            EngineError::InvalidCrdt("lazy genesis checkpoint omitted a membership".into())
+        })?;
+        if state.owner != BlockOwner::Page(expected.page_id)
+            || state.content != block.content
+            || membership.home_document_id != block.home_document_id
+            || membership.parent != block.parent
+            || membership.order != block.order
+            || state.logseq_uuid != accepted_external_uuids.get(&block.block_id).copied()
+        {
+            return Err(EngineError::InvalidCrdt(
+                "lazy genesis page checkpoint differs from its capsule".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub struct ShardedHotEngine {
@@ -21836,6 +21997,41 @@ impl ShardedHotEngine {
             memberships,
             path_conflicts,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_snapshot_from_lazy_genesis_for_test(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        catalog_snapshot: &[u8],
+        pages: impl IntoIterator<Item = (DocumentId, Vec<u8>)>,
+    ) -> Result<super::CanonicalSnapshot, EngineError> {
+        let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
+        let catalog = LoroDoc::new();
+        import_complete(catalog_document_id, &catalog, &[catalog_snapshot.to_vec()])?;
+        catalog
+            .set_peer_id(LAZY_GENESIS_PEER_ID.saturating_add(1))
+            .map_err(loro_error)?;
+        engine
+            .visible_documents
+            .insert(catalog_document_id, catalog);
+        for (document_id, snapshot) in pages {
+            if document_id == catalog_document_id
+                || engine.visible_documents.contains_key(&document_id)
+            {
+                return Err(EngineError::InvalidCrdt(
+                    "lazy genesis test constructor repeats a document identity".into(),
+                ));
+            }
+            let document = LoroDoc::new();
+            import_complete(document_id, &document, &[snapshot])?;
+            document
+                .set_peer_id(LAZY_GENESIS_PEER_ID.saturating_add(1))
+                .map_err(loro_error)?;
+            engine.visible_documents.insert(document_id, document);
+        }
+        engine.canonical_snapshot()
     }
 
     #[cfg(test)]
