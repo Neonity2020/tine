@@ -1201,7 +1201,6 @@ pub(crate) fn apply_change(
         sequence,
         input_digest,
         post_frontier_digest,
-        None,
     )
     .map_err(Into::into)
 }
@@ -1245,7 +1244,6 @@ pub(crate) fn lower_validated_change(
                 portable_path_key: claim.portable_path_key,
             })
             .collect(),
-        reference_catalog: None,
     })
 }
 
@@ -1483,7 +1481,6 @@ pub(crate) fn lower_terminal_chunk(
             .iter()
             .map(lower_page)
             .collect::<Result<Vec<_>, _>>()?,
-        coverage: Vec::new(),
         postings: lower_reference_postings(&chunk.postings)?,
         aliases: lower_alias_declarations(&chunk.aliases)?,
     })

@@ -15891,8 +15891,6 @@ mod tests {
         // state.
         // There is no longer a reference-coverage proof or scan in the SQLite
         // path (GH #314).
-        assert_eq!(multi_opened.rebuild.reference_coverage_inductive_checks, 0);
-        assert_eq!(multi_opened.rebuild.reference_coverage_full_scans, 0);
         assert_eq!(multi_opened.rebuild.final_semantic_equivalence_proofs, 1);
         assert_eq!(multi_opened.rebuild.final_row_digest_equivalence_proofs, 1);
         assert_eq!(multi_opened.rebuild.physical_candidate_transactions, 1);

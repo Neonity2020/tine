@@ -2167,8 +2167,6 @@ pub struct RebuildInstrumentation {
     pub cleanup_existing_pages: usize,
     pub cleanup_owned_rows: usize,
     pub cleanup_fts_rowids: usize,
-    pub reference_coverage_inductive_checks: usize,
-    pub reference_coverage_full_scans: usize,
     pub final_semantic_equivalence_proofs: usize,
     pub final_row_digest_equivalence_proofs: usize,
     #[cfg(test)]
@@ -2852,34 +2850,6 @@ impl TailOverlay {
     }
 }
 
-/// One applier's own `reference_source_coverage` row count, bound to the exact
-/// accepted sequence it was observed at.
-///
-/// Counting that whole table is the only graph-wide read an otherwise
-/// point-sized ordinary apply performs, and after the first one it is
-/// redundant: the apply already probes every source it touches, and the
-/// authenticated catalog root it is checked against carries both the prior and
-/// the post source count. Carrying the count forward is therefore an induction,
-/// and an induction is only sound over an unbroken chain — hence the sequence.
-/// Absence means "count the table", which is what every open starts with, so no
-/// reopened, rebuilt, or interrupted database can inherit a stale count.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InductiveReferenceCoverage {
-    applied_through: u64,
-    rows: u64,
-}
-
-impl InductiveReferenceCoverage {
-    /// The count to induct from when applying `acceptance_sequence`, or `None`
-    /// when this state does not immediately precede it.
-    const fn prior_rows_for(&self, acceptance_sequence: u64) -> Option<u64> {
-        match self.applied_through.checked_add(1) {
-            Some(next) if next == acceptance_sequence => Some(self.rows),
-            _ => None,
-        }
-    }
-}
-
 /// One leased device-local projection handle.
 ///
 /// The projection's database-adjacent applier lock lives exactly as long as
@@ -2899,7 +2869,6 @@ pub struct SqliteFrontier {
     required_frontier_root: AcceptedFrontierRoot,
     required_frontier_digest: ContentDigest,
     checkpoint_each_apply: bool,
-    reference_coverage: Option<InductiveReferenceCoverage>,
     _lease: Arc<HeldApplierLocks>,
 }
 
@@ -3645,7 +3614,6 @@ impl SqliteFrontier {
                         &source.exact_frontier_root,
                     )?,
                     checkpoint_each_apply: true,
-                    reference_coverage: None,
                     _lease: lease,
                 },
                 recovery: ProjectionRecovery::OpenedExisting,
@@ -3715,7 +3683,6 @@ impl SqliteFrontier {
                                     &source.exact_frontier_root,
                                 )?,
                                 checkpoint_each_apply: true,
-                                reference_coverage: None,
                                 _lease: lease,
                             },
                             recovery: ProjectionRecovery::RebuiltPreservingEvidence {
@@ -3740,7 +3707,6 @@ impl SqliteFrontier {
                                 &source.exact_frontier_root,
                             )?,
                             checkpoint_each_apply: true,
-                            reference_coverage: None,
                             _lease: lease,
                         },
                         recovery: {
@@ -3948,7 +3914,6 @@ impl SqliteFrontier {
                     &source.exact_frontier_root,
                 )?,
                 checkpoint_each_apply: true,
-                reference_coverage: None,
                 _lease: lease,
             },
             rebuild,
@@ -3976,10 +3941,6 @@ impl SqliteFrontier {
                 &AcceptedFrontierRoot::empty(),
             )?,
             checkpoint_each_apply: false,
-            reference_coverage: Some(InductiveReferenceCoverage {
-                applied_through: 0,
-                rows: 0,
-            }),
             _lease: lease,
         })
     }
@@ -4289,7 +4250,6 @@ impl SqliteFrontier {
                 sequence,
                 input_digest,
                 post_digest,
-                None,
             )?;
             applied = sequence;
         }
@@ -4429,10 +4389,6 @@ impl SqliteFrontier {
             instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
             instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
             instrumentation.cleanup_fts_rowids += apply_stats.cleanup_fts_rowids;
-            instrumentation.reference_coverage_inductive_checks +=
-                apply_stats.reference_coverage_inductive_checks;
-            instrumentation.reference_coverage_full_scans +=
-                apply_stats.reference_coverage_full_scans;
             // Construction provenance for one accepted sequence whose page and
             // reference rows this build did not replay: the digest is of the
             // empty change actually applied here, never a copied per-event one.
@@ -4483,12 +4439,9 @@ impl SqliteFrontier {
         if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
             eprintln!("sqlite terminal current-path cursor probe: {cursor_probe:?}");
         }
-        self.reference_coverage = None;
         if instrumentation.cleanup_page_attempts != 0
             || instrumentation.cleanup_owned_rows != 0
             || instrumentation.cleanup_fts_rowids != 0
-            || instrumentation.reference_coverage_inductive_checks != 0
-            || instrumentation.reference_coverage_full_scans != 0
             || bootstrap.intermediate_page_materializations != 0
             || bootstrap.terminal_frontier_bulk_seeds != 1
             || bootstrap.terminal_frontier_documents_seeded
@@ -4595,10 +4548,6 @@ impl SqliteFrontier {
             instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
             instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
             instrumentation.cleanup_fts_rowids += apply_stats.cleanup_fts_rowids;
-            instrumentation.reference_coverage_inductive_checks +=
-                apply_stats.reference_coverage_inductive_checks;
-            instrumentation.reference_coverage_full_scans +=
-                apply_stats.reference_coverage_full_scans;
             provenance.push(storage_frontier::PhysicalTerminalConstructionBatch {
                 acceptance_sequence: event.acceptance_sequence(),
                 batch_id: event.batch_id().as_uuid().into_bytes(),
@@ -4651,12 +4600,9 @@ impl SqliteFrontier {
         bootstrap.terminal_catalog_rows_authenticated = cursor_probe.rows;
         bootstrap.terminal_catalog_document_validations = cursor_probe.catalog_document_validations;
 
-        self.reference_coverage = None;
         if instrumentation.cleanup_page_attempts != 0
             || instrumentation.cleanup_owned_rows != 0
             || instrumentation.cleanup_fts_rowids != 0
-            || instrumentation.reference_coverage_inductive_checks != 0
-            || instrumentation.reference_coverage_full_scans != 0
             || bootstrap.intermediate_page_materializations != 0
             || bootstrap.terminal_frontier_bulk_seeds != 1
             || bootstrap.terminal_frontier_documents_seeded
@@ -4957,7 +4903,7 @@ impl SqliteFrontier {
         // Reference rows are disposable parser-derived projection state. The
         // legacy coverage table remains empty during this transition and is no
         // longer compared with an accepted-frontier catalog root.
-        self.physical.finalize_fresh_bootstrap(0, 0)?;
+        self.physical.finalize_fresh_bootstrap()?;
         if !matches!(&source.loader, RebuildLoader::InactiveBootstrap { .. }) {
             let _semantic_digest = self.semantic_projection_digest()?;
             instrumentation.final_semantic_equivalence_proofs += 1;
@@ -5028,10 +4974,6 @@ impl SqliteFrontier {
             instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
             instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
             instrumentation.cleanup_fts_rowids += apply_stats.cleanup_fts_rowids;
-            instrumentation.reference_coverage_inductive_checks +=
-                apply_stats.reference_coverage_inductive_checks;
-            instrumentation.reference_coverage_full_scans +=
-                apply_stats.reference_coverage_full_scans;
             instrumentation.accepted_events_applied += 1;
             maybe_abort_rebuild_test(instrumentation.accepted_events_applied);
         }
@@ -5055,8 +4997,6 @@ impl SqliteFrontier {
             || instrumentation.accepted_root_authentications
                 > instrumentation.accepted_events_applied
             || instrumentation.cleanup_fts_rowids > instrumentation.cleanup_owned_rows
-            || instrumentation.reference_coverage_inductive_checks != 0
-            || instrumentation.reference_coverage_full_scans != 0
         {
             return Err(ProjectionError::Rebuild(
                 "fresh candidate structural accounting invariant failed".into(),
@@ -5196,15 +5136,8 @@ impl SqliteFrontier {
             batch,
             materialization: physical_materialization,
             materialization_input_digest: materialization_digest,
-            authenticated_reference: None,
-            prior_reference_coverage_count: self
-                .reference_coverage
-                .and_then(|coverage| coverage.prior_rows_for(event.acceptance_sequence)),
             fault: storage_frontier::ApplyFault::None,
         };
-        if terminal_prefix {
-            request.prior_reference_coverage_count = None;
-        }
         let preflight = match self.physical.preflight(&current_physical, &request) {
             Ok(disposition) => disposition,
             Err(storage_frontier::FrontierError::BatchCollision(_)) => {
@@ -5306,32 +5239,6 @@ impl SqliteFrontier {
         let disposition = match result.disposition {
             storage_frontier::ApplyDisposition::Applied => ApplyDisposition::Applied,
             storage_frontier::ApplyDisposition::Duplicate => ApplyDisposition::Duplicate,
-        };
-        // Carry the induction forward exactly one accepted sequence, and only
-        // over an apply that actually advanced this database. A full scan and
-        // an inductive step both return the post-apply row count that was just
-        // checked against the authenticated catalog's post source count, so
-        // either is a sound base for the next sequence. A change that wrote no
-        // catalog rows returns none and cannot have altered the table, so the
-        // preceding count still holds at the new sequence. Anything else -- a
-        // duplicate, a non-contiguous apply, or a first apply that had no base
-        // -- drops the state and makes the next apply count the table itself.
-        self.reference_coverage = match (
-            self.reference_coverage,
-            result.materialization.reference_coverage_count,
-            disposition,
-        ) {
-            (_, Some(rows), ApplyDisposition::Applied) => Some(InductiveReferenceCoverage {
-                applied_through: event.acceptance_sequence,
-                rows,
-            }),
-            (Some(coverage), None, ApplyDisposition::Applied) => coverage
-                .prior_rows_for(event.acceptance_sequence)
-                .map(|rows| InductiveReferenceCoverage {
-                    applied_through: event.acceptance_sequence,
-                    rows,
-                }),
-            _ => None,
         };
         if matches!(disposition, ApplyDisposition::Applied) && self.checkpoint_each_apply {
             write_projection_checkpoint(&self.path, self.claim, &event.post_frontier_root)?;
@@ -12931,10 +12838,6 @@ mod tests {
                 .reference_page_candidates_for_name("drain org", 64)
                 .unwrap()
                 .is_empty());
-            assert_eq!(
-                database.physical.reference_source_coverage_count().unwrap(),
-                0
-            );
         }
 
         // One workspace applier lock covers this runtime root, so each
@@ -13020,159 +12923,6 @@ mod tests {
             );
         }
         after_refusal
-    }
-
-    /// Parser-derived references have no authenticated coverage table. Ordinary
-    /// applies therefore perform neither its old whole-table count nor its
-    /// inductive follow-up, independent of total graph size.
-    #[test]
-    fn parser_derived_applies_never_scan_the_legacy_reference_coverage_table() {
-        let small = coverage_accounting_for_graph(2_400, 0);
-        let large = coverage_accounting_for_graph(2_600, 40);
-        assert_eq!(
-            small.0, large.0,
-            "coverage accounting per ordinary save must not depend on total graph sources"
-        );
-        assert_eq!(small.1, 0, "the legacy coverage table stays empty");
-        assert_eq!(large.1, 0, "graph size cannot repopulate legacy coverage");
-    }
-
-    /// Returns the per-apply `(full_scans, inductive_checks)` sequence and the
-    /// final `reference_source_coverage` row count.
-    fn coverage_accounting_for_graph(
-        seed: u128,
-        extra_sources: usize,
-    ) -> (Vec<(usize, usize)>, i64) {
-        let ids = TestIds::new(seed);
-        let dir = TestDir::new(&format!("coverage-count-once-per-open-{extra_sources}"));
-        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
-        let mut database = open_test_projection(
-            &dir.path().join("frontier.sqlite"),
-            ids.claim(),
-            RebuildSource::new(&engine, &store).unwrap(),
-        )
-        .unwrap()
-        .database;
-        let mut bulk = Vec::new();
-        for extra in 0..extra_sources {
-            let extra = extra as u128;
-            bulk.push(SemanticOperation::CreatePage {
-                page_id: PageId::from_uuid(uuid(seed + 100_000 + extra)),
-                home_document_id: DocumentId::from_uuid(uuid(seed + 200_000 + extra)),
-                name: crate::oplog::LogicalPageName::parse(&format!("Bulk Source {extra}"))
-                    .unwrap(),
-                path: ManagedPath::parse(&format!("pages/bulk-source-{extra}.md")).unwrap(),
-                kind: ManagedTextKind::Page,
-            });
-            bulk.push(SemanticOperation::CreateBlock {
-                block: BlockLocation {
-                    block_id: BlockId::from_uuid(uuid(seed + 300_000 + extra)),
-                    home_document_id: DocumentId::from_uuid(uuid(seed + 200_000 + extra)),
-                },
-                page_id: PageId::from_uuid(uuid(seed + 100_000 + extra)),
-                parent: None,
-                order: "a".into(),
-                content: format!("bulk source {extra} referring to [[Root Fixture Page]]"),
-            });
-        }
-        let mut sequence = 0_u64;
-        if !bulk.is_empty() {
-            let prepared = engine
-                .prepare_bootstrap_transaction(
-                    author(seed + 90_000),
-                    &OperationTransaction::new(bulk).unwrap(),
-                )
-                .unwrap();
-            publish_and_stage_archive(&mut engine, &store, &prepared);
-            sequence += 1;
-        }
-        let prepared = engine
-            .prepare_bootstrap_transaction(
-                author(seed + 1),
-                &root_transaction(ids, "pages/coverage-induction.md", "first"),
-            )
-            .unwrap();
-        publish_and_stage_archive(&mut engine, &store, &prepared);
-
-        let mut coverage_accounting = Vec::new();
-        let apply_next = |database: &mut SqliteFrontier,
-                          engine: &ShardedHotEngine,
-                          store: &ObjectStore,
-                          sequence: u64| {
-            let source = RebuildSource::new(engine, store).unwrap();
-            let event = source.accepted_event_at(sequence).unwrap();
-            let (disposition, _, stats) = database
-                .apply_engine_owned_accepted_with_stats(&event, engine)
-                .unwrap();
-            assert_eq!(disposition, ApplyDisposition::Applied);
-            (
-                stats.reference_coverage_full_scans,
-                stats.reference_coverage_inductive_checks,
-            )
-        };
-
-        // The bulk sources, if any, are drained first and are not part of the
-        // ordinary-save accounting under test.
-        for bulk_sequence in 1..=sequence {
-            let _ = apply_next(&mut database, &engine, &store, bulk_sequence);
-        }
-        sequence += 1;
-        coverage_accounting.push(apply_next(&mut database, &engine, &store, sequence));
-        for (index, content) in ["second", "third", "fourth"].iter().enumerate() {
-            edit_block_content(
-                &mut engine,
-                &store,
-                ids,
-                seed + 2 + index as u128,
-                content,
-                publish_and_stage_archive,
-            );
-            sequence += 1;
-            coverage_accounting.push(apply_next(&mut database, &engine, &store, sequence));
-        }
-        assert_eq!(coverage_accounting[0], (0, 0));
-        assert_eq!(
-            &coverage_accounting[1..],
-            &[(0, 0), (0, 0), (0, 0)],
-            "parser-derived applies must not touch authenticated coverage bookkeeping"
-        );
-
-        // A reopened database never inherits the count, so it re-proves it.
-        let database_path = database.path().to_path_buf();
-        drop(database);
-        let reopened = open_test_projection(
-            &database_path,
-            ids.claim(),
-            RebuildSource::new(&engine, &store).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(reopened.recovery, ProjectionRecovery::OpenedExisting);
-        let mut database = reopened.database;
-        edit_block_content(
-            &mut engine,
-            &store,
-            ids,
-            seed + 10,
-            "fifth",
-            publish_and_stage_archive,
-        );
-        sequence += 1;
-        assert_eq!(apply_next(&mut database, &engine, &store, sequence), (0, 0));
-        edit_block_content(
-            &mut engine,
-            &store,
-            ids,
-            seed + 11,
-            "sixth",
-            publish_and_stage_archive,
-        );
-        sequence += 1;
-        assert_eq!(apply_next(&mut database, &engine, &store, sequence), (0, 0));
-        let coverage_rows = database.physical.reference_source_coverage_count().unwrap();
-        (coverage_accounting[1..].to_vec(), coverage_rows)
     }
 
     /// Per-save catalog accounting observed through the ordinary drain.
@@ -16551,8 +16301,6 @@ mod tests {
             reopened.database.frontier().unwrap(),
             accepted_engine.exact_frontier().unwrap()
         );
-        assert_eq!(reopened.rebuild.reference_coverage_full_scans, 0);
-        assert_eq!(reopened.rebuild.reference_coverage_inductive_checks, 0);
         let retry_semantic_digest = reopened.database.semantic_projection_digest().unwrap();
         let retry_row_digest = reopened
             .database

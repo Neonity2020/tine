@@ -49659,7 +49659,7 @@ mod tests {
         rebuild: &crate::oplog::sqlite::RebuildInstrumentation,
     ) -> String {
         format!(
-            " rebuild_events_validated={} rebuild_events_applied={} rebuild_root_authentications={} rebuild_exact_document_loads={} rebuild_exact_catalog_loads={} rebuild_exact_catalog_decodes={} rebuild_bulk_chunks={} rebuild_peak_bulk_pages={} rebuild_sequence_page_reads={} rebuild_sequence_bytes_read={} rebuild_cleanup_page_attempts={} rebuild_cleanup_existing_pages={} rebuild_cleanup_owned_rows={} rebuild_cleanup_fts_rowids={} rebuild_reference_inductive_checks={} rebuild_reference_full_scans={} rebuild_semantic_proofs={} rebuild_row_digest_proofs={} rebuild_frontier_session_hits={} rebuild_frontier_session_misses={} rebuild_external_session_hits={} rebuild_external_session_misses={} rebuild_candidate_transactions={} rebuild_candidate_barriers={} rebuild_ordinary_transactions={} rebuild_ordinary_barriers={}",
+            " rebuild_events_validated={} rebuild_events_applied={} rebuild_root_authentications={} rebuild_exact_document_loads={} rebuild_exact_catalog_loads={} rebuild_exact_catalog_decodes={} rebuild_bulk_chunks={} rebuild_peak_bulk_pages={} rebuild_sequence_page_reads={} rebuild_sequence_bytes_read={} rebuild_cleanup_page_attempts={} rebuild_cleanup_existing_pages={} rebuild_cleanup_owned_rows={} rebuild_cleanup_fts_rowids={} rebuild_semantic_proofs={} rebuild_row_digest_proofs={} rebuild_frontier_session_hits={} rebuild_frontier_session_misses={} rebuild_external_session_hits={} rebuild_external_session_misses={} rebuild_candidate_transactions={} rebuild_candidate_barriers={} rebuild_ordinary_transactions={} rebuild_ordinary_barriers={}",
             rebuild.accepted_events_validated,
             rebuild.accepted_events_applied,
             rebuild.accepted_root_authentications,
@@ -49674,8 +49674,6 @@ mod tests {
             rebuild.cleanup_existing_pages,
             rebuild.cleanup_owned_rows,
             rebuild.cleanup_fts_rowids,
-            rebuild.reference_coverage_inductive_checks,
-            rebuild.reference_coverage_full_scans,
             rebuild.final_semantic_equivalence_proofs,
             rebuild.final_row_digest_equivalence_proofs,
             rebuild.accepted_frontier_session_hits,
