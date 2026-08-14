@@ -7935,12 +7935,7 @@ impl ShardedHotEngine {
         catalog.set_peer_id(1).map_err(loro_error)?;
         validate_catalog(self.catalog_document_id, &catalog)?;
         let documents = candidate.frontier_documents();
-        let accepted_frontier_root = lazy_genesis_accepted_frontier_root(
-            candidate
-                .frontier_binding()
-                .map_err(|error| EngineError::Archive(error.to_string()))?,
-            &documents,
-        )?;
+        let accepted_frontier_root = accepted_frontier_root_for_lazy_genesis(&candidate)?;
         if self.scratch.is_none() {
             self.accepted_frontier = documents
                 .into_iter()
@@ -29457,6 +29452,17 @@ fn lazy_genesis_accepted_frontier_root(
     };
     validate_accepted_frontier_root(&root)?;
     Ok(root)
+}
+
+pub(crate) fn accepted_frontier_root_for_lazy_genesis(
+    candidate: &LazyGenesisCandidate,
+) -> Result<AcceptedFrontierRoot, EngineError> {
+    lazy_genesis_accepted_frontier_root(
+        candidate
+            .frontier_binding()
+            .map_err(|error| EngineError::Archive(error.to_string()))?,
+        &candidate.frontier_documents(),
+    )
 }
 
 fn lazy_genesis_frontier_state_digest(

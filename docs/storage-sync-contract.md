@@ -260,6 +260,10 @@ byte/inventory comparison under the watcher fence matches the sealed source.
 Each page capsule carries the exact original Markdown/Org bytes once, one
 deterministic CRDT checkpoint constructed directly from its terminal page
 state, plus its compact causal dependencies.
+One canonical activation-record pass fans each parsed page into both the
+baseline pack and bounded SQLite materialization chunks. Neither candidate is
+published by that construction pass, and SQLite does not re-read, re-parse, or
+replay the graph to derive the same terminal state a second time.
 The single catalog checkpoint is constructed by the same direct terminal-state
 builder, and the sealed manifest binds its non-derivable catalog document ID.
 These checkpoints are baseline semantic/causal state, not fabricated interactive

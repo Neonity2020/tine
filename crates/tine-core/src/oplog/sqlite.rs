@@ -62,9 +62,11 @@ use uuid::Uuid;
 use super::hot_engine::{
     AcceptedFrontierRoot, EngineAuthority, EngineError, RetainedScratchResumeFailure,
 };
+#[cfg(test)]
+use super::import::ActivationPageRecordStore;
 use super::import::{
-    ActivationPageRecordStore, InactiveBootstrapAcceptedAuthority,
-    InactiveBootstrapAcceptedAuthorityBinding, TerminalBootstrapConstructionMaterial,
+    InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
+    TerminalBootstrapConstructionMaterial,
 };
 use super::object_store::ValidatedBootstrapPublicationV1;
 use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
@@ -1970,79 +1972,171 @@ fn record_candidate_write_instrumentation(
 /// This is deliberately a sequence-zero construction: it installs no accepted
 /// batches, no bootstrap provenance rows, and no identity engine. The caller
 /// owns the unpublished database candidate and must discard it on any error.
-fn seed_clean_genesis_projection(
-    physical: &mut PhysicalSqliteDatabase,
-    root: &AcceptedFrontierRoot,
-    policy: &super::ReferenceCatalogPolicyV1,
-    pages: &ActivationPageRecordStore,
-) -> Result<(), ProjectionError> {
-    super::hot_engine::validate_accepted_frontier_root(root)
-        .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))?;
-    let Some(genesis) = root.genesis() else {
-        return Err(ProjectionError::InvalidFrontier(
-            "clean SQLite genesis has no immutable baseline binding".into(),
-        ));
-    };
-    if root.acceptance_sequence() != 0 || genesis.document_count() != pages.page_count() as u64 + 1
-    {
-        return Err(ProjectionError::InvalidFrontier(
-            "clean SQLite genesis page count differs from its immutable baseline".into(),
-        ));
+pub(crate) struct CleanGenesisProjectionBuilder {
+    physical: Option<PhysicalSqliteDatabase>,
+    files: Option<SqliteFileSet>,
+    target: PathBuf,
+    claim: ProjectionClaim,
+    pending: super::sqlite_materialization::TerminalMaterializationChunk,
+    observed_pages: usize,
+    expected_pages: usize,
+}
+
+pub(crate) struct CleanGenesisSqliteCandidate {
+    files: Option<SqliteFileSet>,
+    target: PathBuf,
+    claim: ProjectionClaim,
+    root: AcceptedFrontierRoot,
+}
+
+impl CleanGenesisProjectionBuilder {
+    pub(crate) fn new(
+        target: &Path,
+        claim: ProjectionClaim,
+        expected_pages: usize,
+    ) -> Result<Self, ProjectionError> {
+        let files = SqliteFileSet::prepare_candidate(target)?;
+        let mut physical = PhysicalSqliteDatabase::open_writable(files.database_path())?;
+        initialize_schema(&physical, claim)?;
+        physical.begin_candidate_build()?;
+        physical.begin_terminal_bootstrap_construction()?;
+        Ok(Self {
+            physical: Some(physical),
+            files: Some(files),
+            target: target.to_path_buf(),
+            claim,
+            pending: super::sqlite_materialization::TerminalMaterializationChunk::default(),
+            observed_pages: 0,
+            expected_pages,
+        })
     }
 
-    physical.begin_candidate_build()?;
-    physical.begin_terminal_bootstrap_construction()?;
-    let physical_root = lower_physical_frontier_root(root)?;
-    physical.seed_lazy_genesis_frontier(&physical_root)?;
-    let mut observed = 0_usize;
-    for page_ids in pages
-        .path_order()
-        .chunks(super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES)
-    {
-        let mut chunk = super::sqlite_materialization::TerminalMaterializationChunk::default();
-        let mut reference_rows = ReferenceCatalogSourceRows::default();
-        for page_id in page_ids {
-            let page = pages
-                .sqlite_page(*page_id)
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))?
-                .ok_or_else(|| {
-                    ProjectionError::Materialization(
-                        "clean SQLite genesis record order names a missing page".into(),
-                    )
-                })?;
-            let posting = parser_derived_reference_source_posting(policy, &page)?;
-            append_reference_fact_rows(posting.facts(), page.page_id, &mut reference_rows)?;
-            chunk.pages.push(page);
-            observed = observed.saturating_add(1);
+    pub(crate) fn push_page(
+        &mut self,
+        page: super::MaterializedPageInput,
+        policy: &super::ReferenceCatalogPolicyV1,
+    ) -> Result<(), ProjectionError> {
+        if self.observed_pages == self.expected_pages {
+            return Err(ProjectionError::Materialization(
+                "clean SQLite genesis exceeded its declared page count".into(),
+            ));
         }
-        chunk.postings = reference_rows.postings;
-        chunk.aliases = reference_rows.aliases;
+        let mut reference_rows = ReferenceCatalogSourceRows::default();
+        let posting = parser_derived_reference_source_posting(policy, &page)?;
+        append_reference_fact_rows(posting.facts(), page.page_id, &mut reference_rows)?;
+        self.pending.pages.push(page);
+        self.pending.postings.extend(reference_rows.postings);
+        self.pending.aliases.extend(reference_rows.aliases);
+        self.observed_pages = self.observed_pages.saturating_add(1);
+        if self.pending.pages.len() == super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES {
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> Result<(), ProjectionError> {
+        if self.pending.pages.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::take(&mut self.pending);
         let physical_chunk = super::sqlite_materialization::lower_terminal_chunk(chunk)?;
-        physical.seed_terminal_bootstrap_chunk(&physical_chunk)?;
+        self.physical
+            .as_mut()
+            .ok_or_else(|| ProjectionError::Corrupt("clean SQLite builder is closed".into()))?
+            .seed_terminal_bootstrap_chunk(&physical_chunk)?;
+        Ok(())
     }
-    if observed != pages.page_count() {
-        return Err(ProjectionError::Materialization(
-            "clean SQLite genesis did not cover every activation page".into(),
-        ));
+
+    pub(crate) fn finish(
+        mut self,
+        root: &AcceptedFrontierRoot,
+    ) -> Result<CleanGenesisSqliteCandidate, ProjectionError> {
+        super::hot_engine::validate_accepted_frontier_root(root)
+            .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))?;
+        let Some(genesis) = root.genesis() else {
+            return Err(ProjectionError::InvalidFrontier(
+                "clean SQLite genesis has no immutable baseline binding".into(),
+            ));
+        };
+        if root.acceptance_sequence() != 0
+            || genesis.document_count() != self.expected_pages as u64 + 1
+        {
+            return Err(ProjectionError::InvalidFrontier(
+                "clean SQLite genesis page count differs from its immutable baseline".into(),
+            ));
+        }
+        if self.observed_pages != self.expected_pages {
+            return Err(ProjectionError::Materialization(
+                "clean SQLite genesis did not cover every activation page".into(),
+            ));
+        }
+        self.flush_pending()?;
+        let mut physical = self
+            .physical
+            .take()
+            .ok_or_else(|| ProjectionError::Corrupt("clean SQLite builder is closed".into()))?;
+        let physical_root = lower_physical_frontier_root(root)?;
+        physical.seed_lazy_genesis_frontier(&physical_root)?;
+        physical.finish_terminal_graph_projection_construction(
+            &[],
+            storage_frontier::PhysicalTerminalProjectionStamp {
+                acceptance_sequence: 0,
+                frontier_root_digest: canonical_frontier_root_digest(root)?,
+            },
+        )?;
+        physical.finalize_fresh_bootstrap()?;
+        physical.finish_candidate_build()?;
+        let stored = read_frontier_root(&physical)?;
+        if stored != *root {
+            return Err(ProjectionError::FrontierRegression);
+        }
+        let materialized = physical.materialized_read(0, canonical_frontier_root_digest(root)?)?;
+        if materialized.acceptance_sequence() != 0 {
+            return Err(ProjectionError::FrontierRegression);
+        }
+        physical.checkpoint_truncate_and_disable_wal()?;
+        drop(physical);
+        Ok(CleanGenesisSqliteCandidate {
+            files: self.files.take(),
+            target: self.target.clone(),
+            claim: self.claim,
+            root: root.clone(),
+        })
     }
-    physical.finish_terminal_graph_projection_construction(
-        &[],
-        storage_frontier::PhysicalTerminalProjectionStamp {
-            acceptance_sequence: 0,
-            frontier_root_digest: canonical_frontier_root_digest(root)?,
-        },
-    )?;
-    physical.finalize_fresh_bootstrap()?;
-    physical.finish_candidate_build()?;
-    let stored = read_frontier_root(physical)?;
-    if stored != *root {
-        return Err(ProjectionError::FrontierRegression);
+}
+
+impl Drop for CleanGenesisProjectionBuilder {
+    fn drop(&mut self) {
+        drop(self.physical.take());
+        if let Some(files) = self.files.take() {
+            let _ = files.remove();
+        }
     }
-    let materialized = physical.materialized_read(0, canonical_frontier_root_digest(root)?)?;
-    if materialized.acceptance_sequence() != 0 {
-        return Err(ProjectionError::FrontierRegression);
+}
+
+impl CleanGenesisSqliteCandidate {
+    pub(crate) fn publish(mut self) -> Result<PhysicalSqliteDatabase, ProjectionError> {
+        let files = self
+            .files
+            .take()
+            .ok_or_else(|| ProjectionError::Corrupt("clean SQLite candidate is closed".into()))?;
+        files.publish_candidate(&self.target)?;
+        let physical = PhysicalSqliteDatabase::open_writable(&self.target)?;
+        let stored = read_frontier_root(&physical)?;
+        if stored != self.root {
+            return Err(ProjectionError::FrontierRegression);
+        }
+        write_projection_checkpoint(&self.target, self.claim, &stored)?;
+        Ok(physical)
     }
-    Ok(())
+}
+
+impl Drop for CleanGenesisSqliteCandidate {
+    fn drop(&mut self) {
+        if let Some(files) = self.files.take() {
+            let _ = files.remove();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2053,11 +2147,20 @@ pub(crate) fn build_clean_genesis_sqlite_for_test(
     policy: &super::ReferenceCatalogPolicyV1,
     pages: &ActivationPageRecordStore,
 ) -> Result<PhysicalSqliteDatabase, ProjectionError> {
-    let mut physical = PhysicalSqliteDatabase::open_writable(path)?;
-    initialize_schema(&physical, claim)?;
-    seed_clean_genesis_projection(&mut physical, root, policy, pages)?;
-    physical.checkpoint_truncate_and_disable_wal()?;
-    Ok(physical)
+    let mut builder = CleanGenesisProjectionBuilder::new(path, claim, pages.page_count())?;
+    for page_id in pages.path_order() {
+        let page = pages
+            .sqlite_page(*page_id)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+            .ok_or_else(|| {
+                ProjectionError::Materialization(
+                    "clean SQLite genesis record order names a missing page".into(),
+                )
+            })?;
+        builder.push_page(page, policy)?;
+    }
+    let candidate = builder.finish(root)?;
+    candidate.publish()
 }
 
 /// Bind the retained process-local construction material to the exact archive

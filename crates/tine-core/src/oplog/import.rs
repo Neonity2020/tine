@@ -311,6 +311,7 @@ pub(crate) enum BootstrapStreamingImportError {
     Protocol(BootstrapImportError),
     Store(StoreError),
     Engine(super::hot_engine::EngineError),
+    Projection(super::sqlite::ProjectionError),
     InvalidSource(String),
     InvalidOperation(String),
     ResourceLimit {
@@ -329,6 +330,7 @@ impl fmt::Display for BootstrapStreamingImportError {
             Self::Protocol(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
             Self::Engine(error) => error.fmt(formatter),
+            Self::Projection(error) => error.fmt(formatter),
             Self::InvalidSource(detail) | Self::InvalidOperation(detail) => {
                 formatter.write_str(detail)
             }
@@ -376,6 +378,12 @@ impl From<StoreError> for BootstrapStreamingImportError {
 impl From<super::hot_engine::EngineError> for BootstrapStreamingImportError {
     fn from(error: super::hot_engine::EngineError) -> Self {
         Self::Engine(error)
+    }
+}
+
+impl From<super::sqlite::ProjectionError> for BootstrapStreamingImportError {
+    fn from(error: super::sqlite::ProjectionError) -> Self {
+        Self::Projection(error)
     }
 }
 
@@ -929,6 +937,19 @@ impl ActivationPageRecordV1 {
         record.validate()?;
         Ok(record)
     }
+
+    fn sqlite_page(&self) -> super::MaterializedPageInput {
+        let mut page = self.page.clone();
+        for (block, source) in page.blocks.iter_mut().zip(&self.block_sources) {
+            let logseq_uuid = (source.raw_ids.len() == 1)
+                .then(|| LogseqUuid::parse(source.raw_ids[0].trim()).ok())
+                .flatten();
+            block.logseq_uuid = logseq_uuid;
+            block.logseq_identity_origin =
+                logseq_uuid.map(|_| super::LogseqIdentityOrigin::ExternalImported);
+        }
+        page
+    }
 }
 
 enum ActivationPageRecordBuildMode {
@@ -1206,16 +1227,7 @@ impl ActivationPageRecordStore {
         let Some(record) = self.page(page_id)? else {
             return Ok(None);
         };
-        let mut page = record.page;
-        for (block, source) in page.blocks.iter_mut().zip(record.block_sources) {
-            let logseq_uuid = (source.raw_ids.len() == 1)
-                .then(|| LogseqUuid::parse(source.raw_ids[0].trim()).ok())
-                .flatten();
-            block.logseq_uuid = logseq_uuid;
-            block.logseq_identity_origin =
-                logseq_uuid.map(|_| super::LogseqIdentityOrigin::ExternalImported);
-        }
-        Ok(Some(page))
+        Ok(Some(record.sqlite_page()))
     }
 }
 
@@ -3809,6 +3821,98 @@ fn build_lazy_genesis_from_activation_records(
     lazy_genesis
         .finish(catalog_checkpoint, catalog_dependencies)
         .map_err(Into::into)
+}
+
+/// The two unpublished products of one parser-owned activation-record pass.
+/// Neither value is authority; dropping either removes its private candidate.
+pub(crate) struct CleanActivationCandidates {
+    baseline: LazyGenesisCandidate,
+    sqlite: super::sqlite::CleanGenesisSqliteCandidate,
+    accepted_frontier: AcceptedFrontierRoot,
+}
+
+impl CleanActivationCandidates {
+    pub(crate) const fn baseline(&self) -> &LazyGenesisCandidate {
+        &self.baseline
+    }
+
+    pub(crate) const fn accepted_frontier(&self) -> &AcceptedFrontierRoot {
+        &self.accepted_frontier
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LazyGenesisCandidate,
+        super::sqlite::CleanGenesisSqliteCandidate,
+        AcceptedFrontierRoot,
+    ) {
+        (self.baseline, self.sqlite, self.accepted_frontier)
+    }
+}
+
+/// Fan every canonical activation record into the immutable baseline and the
+/// disposable SQLite projection in one pass. The preliminary UUID-claim scan
+/// is the only graph-wide decision and retains only a bounded identity map; it
+/// performs no parsing and emits no semantic operation.
+fn build_clean_activation_candidates(
+    pages: &ActivationPageRecordStore,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    source_capture: BlobDescription,
+    working: &Path,
+    database_path: &Path,
+    policy: &ReferenceCatalogPolicyV1,
+) -> Result<CleanActivationCandidates, BootstrapStreamingImportError> {
+    let accepted_external_uuids = unique_baseline_external_uuids(pages)?;
+    let mut baseline = LazyGenesisPackBuilder::new(
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        source_capture,
+        working,
+    )?;
+    let mut checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
+    let mut sqlite = super::sqlite::CleanGenesisProjectionBuilder::new(
+        database_path,
+        super::ProjectionClaim::current(workspace_id, lineage_digest),
+        pages.page_count(),
+    )?;
+
+    for page_id in pages.path_order() {
+        let record = pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
+        let page_assignments = record
+            .page
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                accepted_external_uuids
+                    .get(&block.block_id)
+                    .copied()
+                    .map(|logseq_uuid| (block.block_id, logseq_uuid))
+            })
+            .collect();
+        let mut capsule = lazy_genesis_page_input(&record);
+        let (checkpoint, dependencies) = checkpoints.push_page(&capsule, &page_assignments)?;
+        capsule.document_checkpoint = checkpoint;
+        capsule.document_dependencies = Some(dependencies);
+        baseline.push(capsule)?;
+        sqlite.push_page(record.sqlite_page(), policy)?;
+    }
+    let (catalog_checkpoint, catalog_dependencies) = checkpoints.finish()?;
+    let baseline = baseline.finish(catalog_checkpoint, catalog_dependencies)?;
+    let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline)?;
+    let sqlite = sqlite.finish(&accepted_frontier)?;
+    Ok(CleanActivationCandidates {
+        baseline,
+        sqlite,
+        accepted_frontier,
+    })
 }
 
 fn collapse_unique_identity_candidates(
@@ -12159,19 +12263,21 @@ mod tests {
                 fs::create_dir(&working).unwrap();
                 let lineage = LineageDigest::of(b"inactive-streaming-bootstrap-test");
                 let catalog = DocumentId::from_uuid(Uuid::from_u128(0x5a02));
-                let candidate = std::sync::Arc::new(
-                    build_lazy_genesis_from_activation_records(
-                        pages,
-                        workspace,
-                        lineage,
-                        catalog,
-                        prepared.source_capture().capture_identity().unwrap(),
-                        &working,
-                    )
-                    .unwrap(),
-                );
-                let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
                 let policy = ReferenceCatalogPolicyV1::default();
+                let candidates = build_clean_activation_candidates(
+                    pages,
+                    workspace,
+                    lineage,
+                    catalog,
+                    prepared.source_capture().capture_identity().unwrap(),
+                    &working,
+                    &working.join("projection.sqlite"),
+                    &policy,
+                )
+                .unwrap();
+                let (candidate, sqlite, accepted_frontier) = candidates.into_parts();
+                let candidate = std::sync::Arc::new(candidate);
+                let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
                 engine
                     .configure_reference_catalog_policy(policy.clone())
                     .unwrap();
@@ -12179,14 +12285,8 @@ mod tests {
                 let root = engine.accepted_frontier_root().unwrap();
                 assert_eq!(root.acceptance_sequence(), 0);
                 assert!(root.genesis().is_some());
-                let physical = crate::oplog::sqlite::build_clean_genesis_sqlite_for_test(
-                    &working.join("projection.sqlite"),
-                    ProjectionClaim::current(workspace, lineage),
-                    &root,
-                    &policy,
-                    pages,
-                )
-                .unwrap();
+                assert_eq!(root, accepted_frontier);
+                let physical = sqlite.publish().unwrap();
                 assert!(physical.load_all_batches().unwrap().is_empty());
                 assert_eq!(physical.diagnostic_row_counts().unwrap(), (0, 0));
                 physical
@@ -12240,18 +12340,20 @@ mod tests {
         let catalog = DocumentId::from_uuid(Uuid::from_u128(0x5a02));
         let working = root.path().join("clean-sqlite-differential");
         fs::create_dir(&working).unwrap();
-        let candidate = std::sync::Arc::new(
-            build_lazy_genesis_from_activation_records(
-                pages,
-                workspace,
-                lineage,
-                catalog,
-                prepared.source_capture().capture_identity().unwrap(),
-                &working,
-            )
-            .unwrap(),
-        );
         let policy = ReferenceCatalogPolicyV1::default();
+        let candidates = build_clean_activation_candidates(
+            pages,
+            workspace,
+            lineage,
+            catalog,
+            prepared.source_capture().capture_identity().unwrap(),
+            &working,
+            &working.join("clean.sqlite"),
+            &policy,
+        )
+        .unwrap();
+        let (candidate, clean_sqlite, candidate_root) = candidates.into_parts();
+        let candidate = std::sync::Arc::new(candidate);
         let mut clean_engine = ShardedHotEngine::new(workspace, lineage, catalog);
         clean_engine
             .configure_reference_catalog_policy(policy.clone())
@@ -12260,14 +12362,8 @@ mod tests {
             .install_lazy_genesis_baseline(candidate)
             .unwrap();
         let clean_root = clean_engine.accepted_frontier_root().unwrap();
-        let clean = crate::oplog::sqlite::build_clean_genesis_sqlite_for_test(
-            &working.join("clean.sqlite"),
-            ProjectionClaim::current(workspace, lineage),
-            &clean_root,
-            &policy,
-            pages,
-        )
-        .unwrap();
+        assert_eq!(clean_root, candidate_root);
+        let clean = clean_sqlite.publish().unwrap();
 
         let (_, _, legacy_authority) =
             install_accepted_authority(&root, &prepared, workspace, 0x5ac0, "archive");
