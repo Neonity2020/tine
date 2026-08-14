@@ -21,6 +21,8 @@ use super::{
 
 const LAZY_GENESIS_SCHEMA_VERSION: u32 = 2;
 const LAZY_GENESIS_COMMIT_SCHEMA_VERSION: u32 = 1;
+const LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION: u32 = 1;
+const LAZY_GENESIS_ACTIVATION_MARKER_MAGIC: &[u8] = b"TINE-LAZY-GENESIS-ACTIVATION\0";
 const LAZY_GENESIS_MANIFEST_FILE: &str = "manifest.postcard";
 const LAZY_GENESIS_COMMIT_FILE: &str = "commit.postcard";
 const MAX_LAZY_GENESIS_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
@@ -236,6 +238,105 @@ pub(crate) struct LazyGenesisCommitV1 {
     source_capture: BlobDescription,
     manifest: BlobDescription,
     root: ContentDigest,
+}
+
+/// The sole durable authority transition for the next activation generation.
+///
+/// The Tauri binding records the user's intent to use managed storage; it is
+/// not this marker and cannot make a partially built baseline authoritative.
+/// This record is published only after the baseline and its accepted frontier
+/// are durable and a final byte-exact source observation has completed. SQLite
+/// is deliberately absent because it is a disposable projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LazyGenesisActivationMarkerV1 {
+    schema_version: u32,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    baseline_root: ContentDigest,
+    source_capture: BlobDescription,
+    accepted_frontier_digest: ContentDigest,
+    watcher_fence: u64,
+}
+
+impl LazyGenesisActivationMarkerV1 {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        baseline_root: ContentDigest,
+        source_capture: BlobDescription,
+        accepted_frontier_digest: ContentDigest,
+        watcher_fence: u64,
+    ) -> io::Result<Self> {
+        let marker = Self {
+            schema_version: LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION,
+            workspace_id,
+            lineage_digest,
+            baseline_root,
+            source_capture,
+            accepted_frontier_digest,
+            watcher_fence,
+        };
+        marker.validate()?;
+        Ok(marker)
+    }
+
+    pub(crate) fn encode(self) -> io::Result<Vec<u8>> {
+        self.validate()?;
+        let body = postcard::to_allocvec(&self).map_err(|error| invalid(error.to_string()))?;
+        let mut bytes = Vec::with_capacity(LAZY_GENESIS_ACTIVATION_MARKER_MAGIC.len() + body.len());
+        bytes.extend_from_slice(LAZY_GENESIS_ACTIVATION_MARKER_MAGIC);
+        bytes.extend_from_slice(&body);
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let body = bytes
+            .strip_prefix(LAZY_GENESIS_ACTIVATION_MARKER_MAGIC)
+            .ok_or_else(|| invalid("lazy genesis activation marker has invalid magic"))?;
+        let marker: Self =
+            postcard::from_bytes(body).map_err(|error| invalid(error.to_string()))?;
+        marker.validate()?;
+        if marker.encode()? != bytes {
+            return Err(invalid(
+                "lazy genesis activation marker is not canonically encoded",
+            ));
+        }
+        Ok(marker)
+    }
+
+    fn validate(self) -> io::Result<()> {
+        if self.schema_version != LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION {
+            return Err(invalid(
+                "lazy genesis activation marker has an unsupported schema",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn workspace_id(self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    pub(crate) const fn baseline_root(self) -> ContentDigest {
+        self.baseline_root
+    }
+
+    pub(crate) const fn source_capture(self) -> BlobDescription {
+        self.source_capture
+    }
+
+    pub(crate) const fn accepted_frontier_digest(self) -> ContentDigest {
+        self.accepted_frontier_digest
+    }
+
+    pub(crate) const fn watcher_fence(self) -> u64 {
+        self.watcher_fence
+    }
 }
 
 impl LazyGenesisCommitV1 {
@@ -894,6 +995,56 @@ mod tests {
             .unwrap();
         assert_eq!(read.path.as_str(), "pages/b.org");
         assert_eq!(read.blocks.len(), 1);
+    }
+
+    #[test]
+    fn activation_marker_is_minimal_canonical_and_excludes_sqlite() {
+        let marker = LazyGenesisActivationMarkerV1::new(
+            WorkspaceId::from_uuid(Uuid::from_u128(1)),
+            LineageDigest::of(b"activation-marker-lineage"),
+            ContentDigest::of(b"baseline"),
+            BlobDescription::of(b"source capture"),
+            ContentDigest::of(b"accepted frontier"),
+            73,
+        )
+        .unwrap();
+        let encoded = marker.encode().unwrap();
+        assert_eq!(
+            LazyGenesisActivationMarkerV1::decode(&encoded).unwrap(),
+            marker
+        );
+        assert_eq!(marker.watcher_fence(), 73);
+        assert_eq!(
+            marker.workspace_id(),
+            WorkspaceId::from_uuid(Uuid::from_u128(1))
+        );
+        assert_eq!(marker.baseline_root(), ContentDigest::of(b"baseline"));
+        assert_eq!(
+            marker.source_capture(),
+            BlobDescription::of(b"source capture")
+        );
+        assert_eq!(
+            marker.accepted_frontier_digest(),
+            ContentDigest::of(b"accepted frontier")
+        );
+        assert_eq!(
+            marker.lineage_digest(),
+            LineageDigest::of(b"activation-marker-lineage")
+        );
+
+        let source = include_str!("lazy_genesis.rs");
+        let marker_source = source
+            .split_once("pub(crate) struct LazyGenesisActivationMarkerV1")
+            .and_then(|(_, tail)| tail.split_once("impl LazyGenesisActivationMarkerV1"))
+            .map(|(body, _)| body)
+            .expect("activation marker definition must remain identifiable");
+        assert!(!marker_source.contains("sqlite"));
+        assert!(!marker_source.contains("database"));
+
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("one final lazy-genesis authority marker"));
+        assert!(contract.contains("SQLite identity is deliberately absent"));
+        assert!(contract.contains("Tauri binding records opt-in\nintent"));
     }
 
     #[test]

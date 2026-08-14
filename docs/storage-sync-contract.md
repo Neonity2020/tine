@@ -83,7 +83,8 @@ from the immutable archive.
 | `archive/engine-history/{engine-history.claim,engine-history.head,engine-history.transition.lock}` | hot engine | hot-engine reopen | claim/head/OS lock | current local writer/accepted-frontier control |
 | `archive/engine-history/*.history-root` | hot engine | retained-history lookup | sealed root record | immutable history evidence |
 | `archive/promoted-runtime.state` | promotion/recovery | runtime open | promoted state v2 | current promoted-runtime selector |
-| `archive/{block-claim-index,logseq-uuid-claim-index-v1,portable-path-index-v1,page-name-ownership-index-v1,reference-catalog-v2,projection-work-index-v1}/` | hot engine | point lookup/materialization | content-addressed Patricia/work indexes | derived from authoritative history; rebuildable |
+| `archive/{block-claim-index,logseq-uuid-claim-index-v1,portable-path-index-v1,page-name-ownership-index-v1,projection-work-index-v1}/` | hot engine | point lookup/materialization | content-addressed Patricia/work indexes | derived from authoritative history; rebuildable; the four semantic identity indexes are removed by the next-generation cutover |
+| `archive/reference-catalog-v2/` | legacy experimental runtime | offline recovery/cleanup only | obsolete content-addressed reference index | no longer read, written, or committed by the current accepted frontier; preserved until old-format deletion |
 | `enrollment/sparse-storage/v2/local/enrollment/{authority-v1.claim,head,lease,records/*.enrollment}` | enrollment owner | startup/open | claim v2, record v6, checkpoint v3 | local lifecycle authority; lease is OS-owned |
 | `enrollment/.../local-activation-v1.reservation` | activation | activation recovery | reservation v1 | temporary until activation resolves |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v5 and versioned rows | derived receipts and diagnostics |
@@ -241,6 +242,42 @@ fallback.
    exact immutable collisions or inconsistent stable cuts block. A retry
    resumes from durable observations rather than inventing state.
 
+### 2.4 Next-generation lazy activation boundary (inactive until cutover)
+
+The accepted next activation generation has one authority-changing record:
+**one final lazy-genesis authority marker**. The Tauri binding records opt-in
+intent and permits setup/resume UI, but it is not semantic authority. Until the
+final marker exists, Direct Files remains the sole authority and every baseline,
+SQLite, receipt, and episode artifact is disposable.
+
+The marker binds exactly the workspace, lineage, immutable baseline root,
+sealed source-capture description, accepted-frontier digest, and watcher fence.
+SQLite identity is deliberately absent: SQLite is a frontier-stamped disposable
+projection and can be rebuilt without changing the marker or semantic truth.
+The marker is published only after the baseline is durable and one final
+byte/inventory comparison under the watcher fence matches the sealed source.
+
+The corresponding crash states are exhaustive:
+
+| Durable state at restart | Authority | Required behavior |
+| --- | --- | --- |
+| No final marker; no episode | Direct Files | Start activation from the current graph. |
+| No final marker; partial baseline or SQLite | Direct Files | Ignore/quarantine the episode and rebuild from the current graph. |
+| Final comparison differs; no marker | Direct Files | Preserve bounded diagnostics and restart from a fresh source observation. |
+| Marker publication began but no complete canonical marker exists | Direct Files | Treat every candidate artifact as uncommitted. |
+| Valid marker and complete baseline | Managed baseline plus later accepted operations | Open the lazy engine; open matching SQLite or rebuild it. |
+| Marker exists but baseline validation fails | No silent writer | Refuse managed admission and offer recovery or Return to Direct Files. |
+| First materialization has no durable ordinary operation | Baseline page capsule | Discard the partial materialization and retry deterministically. |
+| First ordinary operation is durable | Baseline plus that operation | The ordinary document state supersedes the page capsule. |
+
+Managed mutation ordering is likewise fixed before native identity-index
+removal: validate SQLite at accepted frontier `F`, prepare the semantic
+operation and exact row delta, durably append the operation as `F+1`, then
+commit SQLite at `F+1`. A crash after the durable append leaves a stale
+projection which is replayed/rebuilt. A SQLite failure after the append does
+not turn the accepted edit into a retryable save or permit a duplicate write.
+SQLite must never publish `F+1` before semantic history does.
+
 ## 3. Invariants and versioning
 
 1. The threat is crash, power loss, torn write, and interrupted/reordered file
@@ -362,7 +399,7 @@ source plus archive reconstruction path; differential and crash-cut tests
 require the two paths to publish identical durable shadow bytes.
 
 Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
-15. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
+18. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
 SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates
 only that derived representation and costs one rebuild; it must not migrate or
 reinterpret authoritative oplog bytes. Authoritative format changes require an
