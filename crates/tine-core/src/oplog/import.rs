@@ -3438,21 +3438,20 @@ fn emit_activation_page_operations(
     Ok(())
 }
 
-fn spool_bootstrap_operations(
+/// Parse each authoritative source page exactly once into the regime-neutral
+/// terminal record consumed by both the clean baseline pack and SQLite. This
+/// function deliberately knows nothing about semantic operations, parts,
+/// receipts, or accepted history. The legacy bootstrap oracle translates the
+/// returned records afterwards; the production redesign does not.
+fn capture_activation_page_records(
     capture: &BootstrapSourceCapture,
     import_id: ImportId,
     workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    catalog_document_id: DocumentId,
-    working: &Path,
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
-) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
+) -> Result<ActivationPageRecordStore, BootstrapStreamingImportError> {
     let authoritative_paths = bootstrap_authoritative_source_paths(capture)?;
-    let mut collector = BootstrapOperationCollector::new(working);
     let mut source_reader = BootstrapSourceReader::new(capture)?;
     let mut entries = capture.entries_cursor()?;
-    let mut operation_count = 0_u64;
-    let mut declaration_count = 0_u64;
     let mut activation_pages = ActivationPageRecordBuilder::new();
 
     while let Some(entry) = entries.next()? {
@@ -3572,15 +3571,39 @@ fn spool_bootstrap_operations(
             },
             activation_block_sources,
         )?;
+        activation_pages.push(record)?;
+    }
+    source_reader.finish()?;
+    activation_pages.finish()
+}
+
+fn spool_bootstrap_operations(
+    capture: &BootstrapSourceCapture,
+    import_id: ImportId,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    working: &Path,
+    instrumentation: &mut BootstrapStreamingImportInstrumentation,
+) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
+    let activation_pages =
+        capture_activation_page_records(capture, import_id, workspace_id, instrumentation)?;
+    let mut collector = BootstrapOperationCollector::new(working);
+    let mut operation_count = 0_u64;
+    let mut declaration_count = 0_u64;
+    for page_id in activation_pages.path_order() {
+        let record = activation_pages.page(*page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "canonical activation page order names a missing page".into(),
+            )
+        })?;
         emit_activation_page_operations(
             &record,
             &mut collector,
             &mut operation_count,
             &mut declaration_count,
         )?;
-        activation_pages.push(record)?;
     }
-    source_reader.finish()?;
 
     let (storage, accepted_identity_storage, identity_count) = collector.finish(instrumentation)?;
     operation_count = operation_count.checked_add(identity_count).ok_or_else(|| {
@@ -3588,7 +3611,6 @@ fn spool_bootstrap_operations(
     })?;
     require_bootstrap_operation_limit(operation_count)?;
     instrumentation.operations = operation_count;
-    let activation_pages = activation_pages.finish()?;
     let mut accepted_identities = AcceptedIdentityCursor::open(&accepted_identity_storage)?;
     let mut lazy_genesis = LazyGenesisPackBuilder::new(
         workspace_id,
