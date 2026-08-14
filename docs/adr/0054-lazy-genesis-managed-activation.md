@@ -27,8 +27,10 @@ replacement adds work without protecting an in-scope failure.
 Activation consumes one bounded canonical page stream. Each page is parsed once
 and yields exact-source evidence, deterministic page/block identity, the minimum
 identity facts needed by future operations, and disposable query/reference
-facts. The same records feed lazy genesis, SQLite, exact-source evidence, and
-migration backup.
+facts. The same records feed lazy genesis and SQLite, while their sealed exact
+source pack is adopted directly as both initial projection evidence and the
+rollback backup. Activation does not copy and independently prove those bytes
+under three different artifact vocabularies.
 
 The durable initial state is a versioned lazy-genesis pack, not simulated edit
 history. An untouched page resolves from its immutable genesis capsule. Its
@@ -39,12 +41,16 @@ oplog and sync protocol.
 
 Durable genesis retains semantic content, stable page/block identity, causal
 base, canonical page/path ownership, persisted block-UUID ownership, and other
-identity constraints demonstrably needed to accept later operations. Search,
-tasks, properties, aliases, reference postings, backlinks, unlinked candidates,
-and reference counts are disposable SQLite projection facts. In particular,
-the reference catalog's coverage, fact, and reverse-candidate Patricia roots do
-not belong to the new accepted frontier; they only bind to, but do not own, the
-separate page-name and UUID authorities.
+identity constraints demonstrably needed to accept later operations. Their
+truth belongs to genesis plus ordinary accepted operations; their lookup
+indexes are not a second durable authority. One complete frontier-stamped
+SQLite current-state projection owns the unique page-name/path, page/block and
+persisted block-UUID lookup indexes alongside search, tasks, properties,
+aliases, reference postings, backlinks, unlinked candidates and reference
+counts. If SQLite is missing, stale or corrupt, Tine rebuilds it before
+accepting another mutation. The accepted frontier and ordinary accepted-event
+evidence bind semantic history, not SQLite bytes and not authenticated
+reference or identity Patricia roots.
 
 The uninterrupted constructor passes move-only receipts between publication,
 SQLite, backup/shadow, and promotion. A receipt proves only what this process
