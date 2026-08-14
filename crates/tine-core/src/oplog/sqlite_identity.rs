@@ -438,6 +438,23 @@ fn origin_is_contained(
     }
 }
 
+fn concurrent_exact_state_wins(proposed: IdentityOriginV1, existing: IdentityOriginV1) -> bool {
+    match (proposed, existing) {
+        (_, IdentityOriginV1::Baseline) => true,
+        (
+            IdentityOriginV1::Accepted {
+                batch_id: proposed_batch,
+                causal_dot: proposed_dot,
+            },
+            IdentityOriginV1::Accepted {
+                batch_id: existing_batch,
+                causal_dot: existing_dot,
+            },
+        ) => (proposed_dot, proposed_batch) > (existing_dot, existing_batch),
+        (IdentityOriginV1::Baseline, IdentityOriginV1::Accepted { .. }) => false,
+    }
+}
+
 fn live_page_name(state: &PageState) -> Option<&LogicalPageName> {
     match state {
         PageState::Live { name, .. } => Some(name),
@@ -600,7 +617,7 @@ pub(crate) fn prepare_page_name_identity_transition(
                 }
                 let proposed_wins =
                     origin_is_contained(existing.exact_state(), batch_id, &contains)
-                        || proposed_origin > existing.exact_state();
+                        || concurrent_exact_state_wins(proposed_origin, existing.exact_state());
                 if !proposed_wins {
                     continue;
                 }
@@ -1029,10 +1046,12 @@ mod tests {
             )
             .unwrap()
         };
-        let left_batch = batch(42);
-        let right_batch = batch(43);
-        let left_dot = dot(42);
-        let right_dot = dot(43);
+        // Deliberately order batch IDs opposite to causal dots. The legacy
+        // rule compares (causal dot, batch ID), not the record's field order.
+        let left_batch = batch(100);
+        let right_batch = batch(1);
+        let left_dot = dot(1);
+        let right_dot = dot(2);
         let right_after_left = candidate(
             left.clone(),
             right.clone(),
