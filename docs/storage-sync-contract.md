@@ -90,41 +90,37 @@ history remains the baseline plus manifest-committed operation tail.
 
 Local managed state is deliberately outside the graph. The Tauri shell derives
 a private root for the exact graph and stores the following components there.
-Only the small binding is the opt-in marker; all caches may be reconstructed
-from the immutable archive.
+The Tauri binding selects the storage regime; inside the selected private
+root, `lazy-genesis.marker` is the sole managed-authority commit marker. All
+projection and query state may be reconstructed from the immutable baseline
+and manifest tail.
 
 | Path below the graph's private root | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; deleted on Return to Direct Files |
+| private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1 | written last; sole local managed-authority selector |
 | private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
-| `archive/lineage.claim` | object store initialization | every archive open | fixed binary claim | durable authority identity |
-| `archive/archive-instance-v1.claim` | object store initialization | archive reopen | fixed binary claim v1 | durable local archive identity |
-| `archive/objects/`, `archive/batches/` | oplog publisher/import | replay/runtime | immutable object and manifest bytes | authoritative append-only oplog |
-| `archive/bootstrap-v1/{source-inventory-indexes,source-blob-indexes,source-chunks,parts,part-spans,part-object-packs,objects,evidence,aggregates,commits}/` | bootstrap import | archive open/rebuild | versioned immutable bootstrap records | authoritative bootstrap history |
-| `archive/engine-history/{nodes,roots}/` | hot engine | hot-engine reopen | content-addressed nodes/roots | authoritative accepted history |
-| `archive/engine-history/{engine-history.claim,engine-history.head,engine-history.transition.lock}` | hot engine | hot-engine reopen | claim/head/OS lock | current local writer/accepted-frontier control |
-| `archive/engine-history/*.history-root` | hot engine | retained-history lookup | sealed root record | immutable history evidence |
-| `archive/promoted-runtime.state` | promotion/recovery | runtime open | promoted state v2 | current promoted-runtime selector |
-| `archive/{block-claim-index,logseq-uuid-claim-index-v1,portable-path-index-v1,page-name-ownership-index-v1,projection-work-index-v1}/` | hot engine | point lookup/materialization | content-addressed Patricia/work indexes | derived from authoritative history; rebuildable; the four semantic identity indexes are removed by the next-generation cutover |
-| `archive/reference-catalog-v2/` | legacy experimental runtime | offline recovery/cleanup only | obsolete content-addressed reference index | no longer read, written, or committed by the current accepted frontier; preserved until old-format deletion |
-| `enrollment/sparse-storage/v2/local/enrollment/{authority-v1.claim,head,lease,records/*.enrollment}` | enrollment owner | startup/open | claim v2, record v6, checkpoint v3 | local lifecycle authority; lease is OS-owned |
-| `enrollment/.../local-activation-v1.reservation` | activation | activation recovery | reservation v1 | temporary until activation resolves |
+| `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
+| `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v5 and versioned rows | derived receipts and diagnostics |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | receipt cleanup | receipt cleanup | bounded cleanup queue | disposable maintenance state |
-| `archive/projection-work-index-v1/{projection-work.claim,projection-work.head,*.prepared,*.work-node,*.work-root}` | projector | projection drain/recovery | work-index v11 | derived, reconstructable |
-| `archive/engine-history/resume-points/*.resume-point` | clean/unsafe handoff | promoted-runtime recovery | resume point v2 | bounded retained recovery hints |
-| `reconciliation/{scan.sqlite,scan.sqlite-wal,scan.sqlite-shm,scan.sqlite-journal}` | reconciliation | reconciliation scheduler | SQLite baseline v3 | disposable |
-| `reconciliation/<workspace>/<endpoint>/scan.sqlite.forensic-<uuid>/{database,wal,shm,journal,EVIDENCE_COMPLETE,REBUILD_COMPLETE}` | reconciliation recovery | cache-corruption diagnostics and crash-resumable rebuild | exact former baseline file set plus completion markers | diagnostic; never authority; created only when the disposable baseline fails semantic validation |
-| `.tine-runtime/sqlite-workspaces/sqlite-applier.lock` | SQLite applier | SQLite applier | empty OS-lock file | disposable process coordination |
-| `projection/materialization.sqlite{,-wal,-shm}` | SQLite applier | managed queries/navigation | `tine-storage` SQLite schema 20 | disposable; mismatch causes one rebuild |
-| runtime scratch (`tine-storage::formats::SCRATCH_DIR` and its marker/lease/pages/blobs) | hot engine/import | hot engine/rebuild | scratch schema 13, page schema 1 | disposable; one run only |
-| `managed-local-journal-v1/` | actor fast durability lane | drain/recovery | journal frames/segments | durable until incorporated into oplog, then reclaimable |
-| `local-authorship-v1/` | actor publication | provider repair/recovery | receipt v1 | retained until corresponding publication is proven |
-| `inactive-bootstrap-publication-v1/` and its sealed/aggregate/part spools | bootstrap authoring | bootstrap install/recovery | versioned bootstrap staging | disposable after installation |
-| `inactive-shadow-projections-v1/{manifest.bin,proof.bin,committed.bin}` | shadow verifier | activation/promotion | shadow v2/proof v1 | retained activation proof; staging siblings are disposable |
-| `migration-source-backups-v1/payload/` plus manifest/proof/commit markers | activation backup | restore/recovery | backup/proof/commit v1 | retained safety backup |
-| `bootstrap-source-capture-v1/` plus manifest, sorted inventories and `source-chunks/` | source capture | bootstrap authoring | capture v1 | scratch evidence; disposable after successful activation |
+| configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests |
+| application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
+| device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
+
+The following path families are **retired pre-0.7 artifacts**, not an alternate
+production layout: `archive/bootstrap-v1/`, `archive/engine-history/`,
+`archive/promoted-runtime.state`, the block/name/path/UUID Patricia indexes,
+`archive/projection-work-index-v1/`, `archive/reference-catalog-v2/`, the old
+multi-record enrollment tree and reservation, `reconciliation/`, runtime
+scratch, `managed-local-journal-v1/`, `local-authorship-v1/`,
+`inactive-bootstrap-publication-v1/`, `inactive-shadow-projections-v1/`,
+`migration-source-backups-v1/`, and `bootstrap-source-capture-v1/`. Production
+open never treats any of them as authority. Their decoders/construction paths
+remain only in the test oracle while the source is physically separated; a
+real graph containing only this state is refused and can Return to Direct
+Files for a fresh clean activation.
 
 Temporary prefixes (`.tmp-`, `.head-tmp-`, `.record-tmp-`,
 `.authority-tmp-`) and `.staging` files have no authority until their named
