@@ -3773,6 +3773,22 @@ impl SyncRuntimeHandle {
         if let Err(detail) = validate_activation_paths(&request, &request.graph_root) {
             return activation_retryable(SyncLocalActivationStage::Absent, detail);
         }
+        match open_clean_runtime_resources(&runtime_open_request_from_activation(&request)) {
+            Ok(Some(resources)) => {
+                return activation_open_clean_resources(
+                    request,
+                    resources,
+                    SyncRuntimeRecovery::CleanManifestReplay,
+                );
+            }
+            Ok(None) => {}
+            Err(detail) => {
+                return activation_retryable(
+                    SyncLocalActivationStage::LocalActive,
+                    format!("clean managed runtime recovery failed: {detail}"),
+                );
+            }
+        }
         let activation_identity = local_activation_identity(&request, graph_resource_id);
         let reservation = match inspect_local_activation_reservation_at(&request.enrollment_root) {
             Ok(reservation) => reservation,
@@ -3793,7 +3809,7 @@ impl SyncRuntimeHandle {
             runtime_root: &request.enrollment_root,
             archive_root: &request.archive_root,
         });
-        match discovery {
+        match &discovery {
             DiscoveryClassification::ExistingLocalActive(advisory) => {
                 if !identities_match_binding(&request.identities, &advisory.binding) {
                     return activation_blocked("explicit_identity_binding_mismatch");
@@ -3809,16 +3825,16 @@ impl SyncRuntimeHandle {
                 return activation_open_runtime(request);
             }
             DiscoveryClassification::Blocked(advisory) => {
-                return activation_blocked(advisory.reason_code);
+                return activation_blocked(advisory.reason_code.clone());
             }
             DiscoveryClassification::Retryable(_, detail) => {
-                return activation_retryable(SyncLocalActivationStage::Absent, detail);
+                return activation_retryable(SyncLocalActivationStage::Absent, detail.clone());
             }
             DiscoveryClassification::UnsupportedOrIncompatible(component, scenario) => {
                 return SyncLocalActivationResult {
                     status: SyncLocalActivationStatus::UnsupportedOrIncompatible {
-                        component: map_component(component),
-                        scenario,
+                        component: map_component(*component),
+                        scenario: *scenario,
                     },
                     handle: None,
                 };
@@ -3826,14 +3842,14 @@ impl SyncRuntimeHandle {
             DiscoveryClassification::CorruptOrUnreadable(component, scenario) => {
                 return SyncLocalActivationResult {
                     status: SyncLocalActivationStatus::CorruptOrUnreadable {
-                        component: map_component(component),
-                        scenario,
+                        component: map_component(*component),
+                        scenario: *scenario,
                     },
                     handle: None,
                 };
             }
             DiscoveryClassification::AmbiguousOrForeignResidue(evidence, scenario) => {
-                if evidence == AmbiguousEvidence::ArchiveResidue && reservation.is_some() {
+                if *evidence == AmbiguousEvidence::ArchiveResidue && reservation.is_some() {
                     // The private exact reservation predates every archive
                     // write and authenticates the sole resumable construction.
                     // Normal discovery remains strict and still refuses this
@@ -3841,8 +3857,8 @@ impl SyncRuntimeHandle {
                 } else {
                     return SyncLocalActivationResult {
                         status: SyncLocalActivationStatus::AmbiguousOrForeignResidue {
-                            evidence: map_ambiguous_evidence(evidence),
-                            scenario,
+                            evidence: map_ambiguous_evidence(*evidence),
+                            scenario: *scenario,
                         },
                         handle: None,
                     };
@@ -3855,6 +3871,30 @@ impl SyncRuntimeHandle {
                 );
             }
             DiscoveryClassification::Absent | DiscoveryClassification::ExistingNonActive(_) => {}
+        }
+
+        if matches!(&discovery, DiscoveryClassification::Absent) {
+            let clean_graph = match Graph::open_checked(&request.graph_root) {
+                Ok(graph) => graph,
+                Err(error) => {
+                    return activation_retryable(
+                        SyncLocalActivationStage::Absent,
+                        format!("cannot reopen graph for clean activation: {error}"),
+                    )
+                }
+            };
+            let resources =
+                match activate_clean_runtime_resources(&request, clean_graph, &mut progress) {
+                    Ok(resources) => resources,
+                    Err(detail) => {
+                        return activation_retryable(SyncLocalActivationStage::Absent, detail)
+                    }
+                };
+            return activation_open_clean_resources(
+                request,
+                resources,
+                SyncRuntimeRecovery::CleanActivation,
+            );
         }
 
         let (existing_binding, initial_stage) = match discovery {
@@ -5238,6 +5278,17 @@ fn open_clean_runtime_resources(
     let identities = request.clean_identities.as_ref().ok_or_else(|| {
         "clean managed runtime open has no persisted local identity record".to_owned()
     })?;
+    let Some(opened) = open_clean_activation(
+        &request.enrollment_root,
+        &clean_baseline_directory(&request.archive_root),
+        &request.database_path,
+        identities.catalog_document_id,
+        ReferenceCatalogPolicyV1::default(),
+    )
+    .map_err(display)?
+    else {
+        return Ok(None);
+    };
     let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
@@ -5251,17 +5302,6 @@ fn open_clean_runtime_resources(
         endpoint,
     )
     .map_err(display)?;
-    let Some(opened) = open_clean_activation(
-        &request.enrollment_root,
-        &clean_baseline_directory(&request.archive_root),
-        &request.database_path,
-        identities.catalog_document_id,
-        ReferenceCatalogPolicyV1::default(),
-    )
-    .map_err(display)?
-    else {
-        return Ok(None);
-    };
     if opened.marker().workspace_id() != identities.workspace_id
         || opened.marker().lineage_digest() != identities.lineage_digest
     {
@@ -5750,19 +5790,7 @@ fn archive_pre_promotion_receipts(receipt_root: &Path) -> Result<(), String> {
 fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActivationResult {
     let session_id = request.identities.session_id;
     let opened = SyncRuntimeHandle::open_with_session(
-        SyncRuntimeOpenRequest {
-            profile: SyncStorageProfile::ExperimentalLocal,
-            clean_identities: Some(request.identities.clone()),
-            graph_root: request.graph_root,
-            enrollment_root: request.enrollment_root,
-            archive_root: request.archive_root,
-            receipt_root: request.receipt_root,
-            database_path: request.database_path,
-            application_runtime_root: request.application_runtime_root,
-            migration_backup_root: request.migration_backup_root,
-            provider_root: request.provider_root,
-            provider_journal_root: request.provider_journal_root,
-        },
+        runtime_open_request_from_activation(&request),
         session_id,
         |_| {},
     );
@@ -5781,24 +5809,56 @@ fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActi
     }
 }
 
+fn runtime_open_request_from_activation(
+    request: &SyncLocalActivationRequest,
+) -> SyncRuntimeOpenRequest {
+    SyncRuntimeOpenRequest {
+        profile: SyncStorageProfile::ExperimentalLocal,
+        clean_identities: Some(request.identities.clone()),
+        graph_root: request.graph_root.clone(),
+        enrollment_root: request.enrollment_root.clone(),
+        archive_root: request.archive_root.clone(),
+        receipt_root: request.receipt_root.clone(),
+        database_path: request.database_path.clone(),
+        application_runtime_root: request.application_runtime_root.clone(),
+        migration_backup_root: request.migration_backup_root.clone(),
+        provider_root: request.provider_root.clone(),
+        provider_journal_root: request.provider_journal_root.clone(),
+    }
+}
+
+fn activation_open_clean_resources(
+    request: SyncLocalActivationRequest,
+    resources: CleanRuntimeResources,
+    recovery: SyncRuntimeRecovery,
+) -> SyncLocalActivationResult {
+    let opened = SyncRuntimeHandle::open_from_clean_resources(
+        runtime_open_request_from_activation(&request),
+        request.identities.clone(),
+        resources,
+        recovery,
+    );
+    match opened {
+        SyncRuntimeOpenResult {
+            status: SyncRuntimeOpenStatus::Active,
+            handle: Some(handle),
+        } => SyncLocalActivationResult {
+            status: SyncLocalActivationStatus::Active,
+            handle: Some(handle),
+        },
+        SyncRuntimeOpenResult { status, .. } => activation_retryable(
+            SyncLocalActivationStage::LocalActive,
+            format!("clean managed runtime actor open refused after commit: {status:?}"),
+        ),
+    }
+}
+
 fn activation_open_same_process_runtime(
     request: SyncLocalActivationRequest,
     handoff: SameProcessActivationHandoff,
 ) -> SyncLocalActivationResult {
     let opened = SyncRuntimeHandle::open_from_same_process_activation(
-        SyncRuntimeOpenRequest {
-            profile: SyncStorageProfile::ExperimentalLocal,
-            clean_identities: Some(request.identities.clone()),
-            graph_root: request.graph_root,
-            enrollment_root: request.enrollment_root,
-            archive_root: request.archive_root,
-            receipt_root: request.receipt_root,
-            database_path: request.database_path,
-            application_runtime_root: request.application_runtime_root,
-            migration_backup_root: request.migration_backup_root,
-            provider_root: request.provider_root,
-            provider_journal_root: request.provider_journal_root,
-        },
+        runtime_open_request_from_activation(&request),
         handoff,
     );
     match opened {
@@ -11361,6 +11421,73 @@ impl RuntimeActor {
             .ok_or(SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    fn active_projected_editor_name_state(
+        &self,
+        name: String,
+        page_kind: SyncPageKind,
+    ) -> Result<EditorNameState, SyncEditorRequestError> {
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncEditorRequestError::ActorUnavailable)?;
+        let database = self
+            .active_database()
+            .map_err(|_| SyncEditorRequestError::ActorUnavailable)?;
+        projected_editor_name_state_from_projection(engine, database, &self.graph, name, page_kind)
+    }
+
+    fn active_editor_name_state_for_format(
+        &self,
+        name: String,
+        page_kind: SyncPageKind,
+        format: Format,
+    ) -> Result<EditorNameState, SyncEditorRequestError> {
+        editor_name_state_for_format_with_engine(
+            self.active_engine()
+                .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
+            &self.graph,
+            name,
+            page_kind,
+            format,
+        )
+    }
+
+    fn load_active_preferred_application_page(
+        &self,
+        page_id: PageId,
+        projected_available: bool,
+    ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+        load_preferred_source_authenticated_application_page_from_parts(
+            self.active_engine()
+                .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
+            self.active_database()
+                .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
+            &self.graph,
+            page_id,
+            projected_available,
+        )
+    }
+
+    fn load_active_hot_application_page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+        load_hot_source_authenticated_page_with_block_limit_from_engine(
+            self.active_engine()
+                .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
+            &self.graph,
+            page_id,
+            MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+        )
+    }
+
+    fn load_active_hot_editor_page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
+        self.load_active_hot_application_page(page_id)
+            .map(|current| current.map(|current| current.editor))
+    }
+
     fn open(
         request: SyncRuntimeOpenRequest,
         advisory: LocalActiveAdvisory,
@@ -14543,14 +14670,9 @@ impl RuntimeActor {
                 Ok(application_load_outcome(current))
             }
             SyncApplicationPageSelector::Logical { name, page_kind } => {
-                let mut current = {
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                    projected_editor_name_state(runtime, &self.graph, name.clone(), page_kind)
-                        .map_err(map_editor_application_error)?
-                };
+                let mut current = self
+                    .active_projected_editor_name_state(name.clone(), page_kind)
+                    .map_err(map_editor_application_error)?;
                 if matches!(current, EditorNameState::Missing { .. })
                     && self.clean_startup_projection_read_available()
                 {
@@ -14559,11 +14681,8 @@ impl RuntimeActor {
                     {
                         return Ok(SyncApplicationPageLoadOutcome::Deferred { state });
                     }
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                    current = projected_editor_name_state(runtime, &self.graph, name, page_kind)
+                    current = self
+                        .active_projected_editor_name_state(name, page_kind)
                         .map_err(map_editor_application_error)?;
                 }
                 match current {
@@ -14600,16 +14719,17 @@ impl RuntimeActor {
                 SyncApplicationPageInvalidRequest::InvalidPath,
             )
         })?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
         if self.exact_projection_read_available() {
-            let read = runtime
-                .database()
+            let engine = self
+                .active_engine()
+                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+            let database = self
+                .active_database()
+                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+            let read = database
                 .materialized_read()
                 .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-            ensure_editor_frontier(runtime, read.acceptance_sequence())
+            ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())
                 .map_err(map_editor_application_error)?;
             let projected = match read
                 .pages_by_path(&path, 2)
@@ -14644,10 +14764,6 @@ impl RuntimeActor {
                 SyncApplicationPageInvalidRequest::InvalidPath,
             )
         })?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
         let read = self.application_materialized_read_ready()?;
         if let [page] = read
             .pages_by_path(&path, 2)
@@ -14655,8 +14771,11 @@ impl RuntimeActor {
             .as_slice()
         {
             if page.path == path {
-                if let Ok(Some(current)) = load_projected_source_rebased_application_page(
-                    runtime,
+                if let Ok(Some(current)) = load_projected_source_rebased_application_page_from_parts(
+                    self.active_engine()
+                        .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?,
+                    self.active_database()
+                        .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?,
                     &self.graph,
                     page.page_id,
                 ) {
@@ -14688,12 +14807,10 @@ impl RuntimeActor {
         if hot.current.revision != revision || hot.current.editor.page.path.as_str() != path {
             return Ok(None);
         }
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let accepted_frontier = runtime
-            .engine()
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let accepted_frontier = engine
             .accepted_frontier_root()
             .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
         if accepted_frontier != hot.accepted_frontier {
@@ -14704,8 +14821,7 @@ impl RuntimeActor {
                 SyncApplicationPageInvalidRequest::InvalidPath,
             )
         })?;
-        let exact_owner = runtime
-            .engine()
+        let exact_owner = engine
             .current_page_at_path(&managed_path)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
         if !matches!(
@@ -14729,10 +14845,8 @@ impl RuntimeActor {
     ) -> Result<(PageDto, String), SyncApplicationPageRequestError> {
         let response = (current.page.clone(), current.revision.clone());
         let accepted_frontier = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?
-            .engine()
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
             .accepted_frontier_root()
             .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
         self.hot_application_save_page = Some(HotApplicationSavePage {
@@ -14760,12 +14874,9 @@ impl RuntimeActor {
         &self,
         path: &ManagedPath,
     ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let page_id = match runtime
-            .engine()
+        let page_id = match self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
             .current_page_at_path(path)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
         {
@@ -14778,7 +14889,8 @@ impl RuntimeActor {
                 return Ok(ApplicationExactLoad::Ambiguous)
             }
         };
-        let current = load_hot_source_authenticated_application_page(runtime, &self.graph, page_id)
+        let current = self
+            .load_active_hot_application_page(page_id)
             .map_err(map_editor_application_error)?
             .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
         if current.editor.page.path != *path {
@@ -14799,18 +14911,10 @@ impl RuntimeActor {
         &self,
         page_id: PageId,
     ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let current = load_preferred_source_authenticated_application_page(
-            runtime,
-            &self.graph,
-            page_id,
-            self.exact_projection_read_available(),
-        )
-        .map_err(map_editor_application_error)?
-        .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        let current = self
+            .load_active_preferred_application_page(page_id, self.exact_projection_read_available())
+            .map_err(map_editor_application_error)?
+            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
         Ok(current)
     }
 
@@ -14961,18 +15065,13 @@ impl RuntimeActor {
             }
             SyncApplicationPageSaveTarget::New { name, page_kind } => {
                 validate_new_application_page_shape(&request.page, name, *page_kind)?;
-                let runtime = self
-                    .runtime
-                    .as_ref()
-                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                let current_revision = match editor_name_state_for_format(
-                    runtime,
-                    &self.graph,
-                    name.clone(),
-                    *page_kind,
-                    request.page.format,
-                )
-                .map_err(map_editor_application_error)?
+                let current_revision = match self
+                    .active_editor_name_state_for_format(
+                        name.clone(),
+                        *page_kind,
+                        request.page.format,
+                    )
+                    .map_err(map_editor_application_error)?
                 {
                     EditorNameState::Missing { revision, .. } => revision,
                     EditorNameState::Exact(_) => {
@@ -17185,31 +17284,19 @@ impl RuntimeActor {
         match request.page {
             SyncEditorPageSelector::PageId { page_id } => {
                 let page_id = parse_editor_page_id(&page_id)?;
-                let mut current = {
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    load_preferred_source_authenticated_application_page(
-                        runtime,
-                        &self.graph,
+                let mut current = self
+                    .load_active_preferred_application_page(
                         page_id,
                         self.exact_projection_read_available(),
                     )?
-                    .map(|current| current.editor)
-                };
+                    .map(|current| current.editor);
                 if current.is_none() && self.clean_startup_projection_read_available() {
                     if let EditorTurnReadiness::Deferred(state) =
                         self.settle_startup_negative_read()
                     {
                         return Ok(SyncEditorLoadOutcome::Deferred { state });
                     }
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    current =
-                        load_hot_source_authenticated_editor_page(runtime, &self.graph, page_id)?;
+                    current = self.load_active_hot_editor_page(page_id)?;
                 }
                 match current {
                     Some(current) => Ok(SyncEditorLoadOutcome::Loaded { page: current.dto }),
@@ -17217,13 +17304,8 @@ impl RuntimeActor {
                 }
             }
             SyncEditorPageSelector::Name { name, page_kind } => {
-                let mut current = {
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    projected_editor_name_state(runtime, &self.graph, name.clone(), page_kind)?
-                };
+                let mut current =
+                    self.active_projected_editor_name_state(name.clone(), page_kind)?;
                 if matches!(current, EditorNameState::Missing { .. })
                     && self.clean_startup_projection_read_available()
                 {
@@ -17232,26 +17314,17 @@ impl RuntimeActor {
                     {
                         return Ok(SyncEditorLoadOutcome::Deferred { state });
                     }
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    current = projected_editor_name_state(runtime, &self.graph, name, page_kind)?;
+                    current = self.active_projected_editor_name_state(name, page_kind)?;
                 }
                 match current {
                     EditorNameState::Exact(page_id) => {
-                        let runtime = self
-                            .runtime
-                            .as_ref()
-                            .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                        let current = load_preferred_source_authenticated_application_page(
-                            runtime,
-                            &self.graph,
-                            page_id,
-                            self.exact_projection_read_available(),
-                        )?
-                        .map(|current| current.editor)
-                        .ok_or(SyncEditorRequestError::ActorRefused)?;
+                        let current = self
+                            .load_active_preferred_application_page(
+                                page_id,
+                                self.exact_projection_read_available(),
+                            )?
+                            .map(|current| current.editor)
+                            .ok_or(SyncEditorRequestError::ActorRefused)?;
                         Ok(SyncEditorLoadOutcome::Loaded { page: current.dto })
                     }
                     EditorNameState::Missing { name, revision, .. } => {
@@ -17332,23 +17405,16 @@ impl RuntimeActor {
                     });
                     #[cfg(test)]
                     let current_page_admission_started = Instant::now();
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
                     let (current_application, requires_hot_recheck) = match prepared_existing.take()
                     {
                         Some(current) if current.editor.page.page_id == page_id => (current, false),
                         Some(_) => return Err(SyncEditorRequestError::ActorRefused),
                         None => {
-                            let Some(current) = load_hot_source_authenticated_application_page(
-                                runtime,
-                                &self.graph,
-                                page_id,
-                            )
-                            .map_err(|error| {
-                                editor_refusal_at(error, "loading the current managed page")
-                            })?
+                            let Some(current) = self
+                                .load_active_hot_application_page(page_id)
+                                .map_err(|error| {
+                                    editor_refusal_at(error, "loading the current managed page")
+                                })?
                             else {
                                 return Ok(SyncEditorSaveOutcome::Conflict {
                                     reason: SyncEditorConflict::MissingPage,
@@ -17359,8 +17425,9 @@ impl RuntimeActor {
                     };
                     let current = &current_application.editor;
                     if requires_hot_recheck {
-                        let authoritative = runtime
-                            .engine()
+                        let authoritative = self
+                            .active_engine()
+                            .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
                             .materialize_page(page_id)
                             .map_err(|_| SyncEditorRequestError::ActorRefused)?;
                         if !editor_materialization_matches(&authoritative, &current.page) {
@@ -17423,8 +17490,9 @@ impl RuntimeActor {
                     });
                     #[cfg(test)]
                     let projection_preparation_started = Instant::now();
-                    let hot_predecessor = runtime
-                        .engine()
+                    let hot_predecessor = self
+                        .active_engine()
+                        .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
                         .current_local_projection_predecessor_annotations(
                             current.page.page_id,
                             &current.page.path,
@@ -17602,8 +17670,9 @@ impl RuntimeActor {
                     #[cfg(test)]
                     let identity_rename_kind_started = Instant::now();
                     if final_name != current.page.name {
-                        match runtime
-                            .engine()
+                        match self
+                            .active_engine()
+                            .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
                             .current_page_for_logical_name(&final_name)
                             .map_err(|_| SyncEditorRequestError::ActorRefused)?
                         {
@@ -17619,13 +17688,16 @@ impl RuntimeActor {
                     let mut operations = Vec::new();
                     let mut affected = BTreeSet::from([page_id]);
                     if final_name != current.page.name {
-                        let store = runtime
-                            .engine()
+                        let engine = self
+                            .active_engine()
+                            .map_err(|_| SyncEditorRequestError::ActorUnavailable)?;
+                        let store = engine
                             .archive_store()
                             .ok_or(SyncEditorRequestError::ActorRefused)?;
-                        let mut query = runtime
-                            .database()
-                            .frontier_reference_query(runtime.engine(), store)
+                        let mut query = self
+                            .active_database()
+                            .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
+                            .frontier_reference_query(engine, store)
                             .map_err(|_| SyncEditorRequestError::ActorRefused)?;
                         let plan = query
                             .plan_page_rename(
@@ -17751,17 +17823,12 @@ impl RuntimeActor {
                     revision,
                     format,
                 } => {
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    let (logical_name, path, current_revision) = match editor_name_state_for_format(
-                        runtime,
-                        &self.graph,
-                        name.clone(),
-                        *page_kind,
-                        format.unwrap_or_else(|| self.graph.preferred_format()),
-                    )? {
+                    let (logical_name, path, current_revision) = match self
+                        .active_editor_name_state_for_format(
+                            name.clone(),
+                            *page_kind,
+                            format.unwrap_or_else(|| self.graph.preferred_format()),
+                        )? {
                         EditorNameState::Missing {
                             name,
                             path,
@@ -17813,8 +17880,9 @@ impl RuntimeActor {
                         )
                     })?;
                     let final_kind = model_sync_page_kind(identity.kind);
-                    if runtime
-                        .engine()
+                    if self
+                        .active_engine()
+                        .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
                         .current_page_for_logical_name(&final_name)
                         .map_err(|_| SyncEditorRequestError::ActorRefused)?
                         .is_some()
@@ -17854,14 +17922,9 @@ impl RuntimeActor {
         let Some(transaction) = transaction else {
             let current = match existing_application {
                 Some(current) => current.editor,
-                None => {
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    load_hot_source_authenticated_editor_page(runtime, &self.graph, page_id)?
-                        .ok_or(SyncEditorRequestError::ActorRefused)?
-                }
+                None => self
+                    .load_active_hot_editor_page(page_id)?
+                    .ok_or(SyncEditorRequestError::ActorRefused)?,
             };
             return Ok(SyncEditorSaveOutcome::Unchanged {
                 page: current.dto,
@@ -17886,6 +17949,17 @@ impl RuntimeActor {
                 batch_id: batch_id.map(|id| id.to_string()),
                 phase,
             });
+        }
+        if let Some(pending) = self.clean.as_ref().and_then(|clean| clean.pending.as_ref()) {
+            return EditorTurnReadiness::Deferred(
+                SyncEditorDeferred::RetryableRetainedPublication {
+                    batch_id: pending.batch_id().to_string(),
+                    phase: map_local_phase(pending.failure().phase()),
+                },
+            );
+        }
+        if self.clean.is_some() {
+            return EditorTurnReadiness::Ready;
         }
         if self.managed_local.as_ref().is_some_and(|managed| {
             managed.journal.protocol() == ManagedLocalJournalProtocol::LegacyV1
@@ -17934,6 +18008,24 @@ impl RuntimeActor {
                 batch_id: batch_id.map(|id| id.to_string()),
                 phase,
             });
+        }
+        if self.clean.is_some() {
+            return match self
+                .clean
+                .as_mut()
+                .expect("clean editor turn retains clean runtime")
+                .retry_pending(&self.graph, &self.receipts)
+            {
+                None | Some(CleanActorMutationOutcome::Durable(_)) => EditorTurnReadiness::Ready,
+                Some(CleanActorMutationOutcome::DurablePending { batch_id, phase }) => {
+                    EditorTurnReadiness::Deferred(
+                        SyncEditorDeferred::RetryableRetainedPublication {
+                            batch_id: batch_id.to_string(),
+                            phase: map_local_phase(phase),
+                        },
+                    )
+                }
+            };
         }
         if self.managed_local.as_ref().is_some_and(|managed| {
             managed.journal.protocol() == ManagedLocalJournalProtocol::LegacyV1
@@ -24500,7 +24592,13 @@ fn editor_name_state(
     name: String,
     page_kind: SyncPageKind,
 ) -> Result<EditorNameState, SyncEditorRequestError> {
-    editor_name_state_for_format(runtime, graph, name, page_kind, graph.preferred_format())
+    editor_name_state_for_format_with_engine(
+        runtime.engine(),
+        graph,
+        name,
+        page_kind,
+        graph.preferred_format(),
+    )
 }
 
 fn editor_name_state_for_format(
@@ -24510,16 +24608,24 @@ fn editor_name_state_for_format(
     page_kind: SyncPageKind,
     format: Format,
 ) -> Result<EditorNameState, SyncEditorRequestError> {
+    editor_name_state_for_format_with_engine(runtime.engine(), graph, name, page_kind, format)
+}
+
+fn editor_name_state_for_format_with_engine(
+    engine: &ShardedHotEngine,
+    graph: &Graph,
+    name: String,
+    page_kind: SyncPageKind,
+    format: Format,
+) -> Result<EditorNameState, SyncEditorRequestError> {
     let name = LogicalPageName::parse(name).map_err(|_| {
         SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
     })?;
-    let authenticated_owner = runtime
-        .engine()
+    let authenticated_owner = engine
         .current_page_for_logical_name(&name)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
     if let Some(page_id) = authenticated_owner {
-        let page = runtime
-            .engine()
+        let page = engine
             .materialize_page(page_id)
             .map_err(|_| SyncEditorRequestError::ActorRefused)?;
         return Ok(if page.kind == page_kind.into() {
@@ -24536,8 +24642,7 @@ fn editor_name_state_for_format(
     if path.as_str().len() > MAX_LOCAL_MUTATION_PATH_BYTES {
         return Err(editor_too_large(0, 0, 0, path.as_str().len()));
     }
-    match runtime
-        .engine()
+    match engine
         .current_page_at_path(&path)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?
     {
@@ -24562,14 +24667,29 @@ fn projected_editor_name_state(
     name: String,
     page_kind: SyncPageKind,
 ) -> Result<EditorNameState, SyncEditorRequestError> {
+    projected_editor_name_state_from_projection(
+        runtime.engine(),
+        runtime.database(),
+        graph,
+        name,
+        page_kind,
+    )
+}
+
+fn projected_editor_name_state_from_projection(
+    engine: &ShardedHotEngine,
+    database: &crate::oplog::SqliteFrontier,
+    graph: &Graph,
+    name: String,
+    page_kind: SyncPageKind,
+) -> Result<EditorNameState, SyncEditorRequestError> {
     let name = LogicalPageName::parse(name).map_err(|_| {
         SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
     })?;
-    let read = runtime
-        .database()
+    let read = database
         .materialized_read()
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    ensure_editor_frontier(runtime, read.acceptance_sequence())?;
+    ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())?;
     let owners = read
         .pages_by_name_key_and_kind(&name.canonical_key(), page_kind.into(), 2)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
@@ -24581,7 +24701,13 @@ fn projected_editor_name_state(
             // authenticated name/kind/path state. Authenticate only this
             // exceptional branch so clean, unambiguous reads keep the catalog
             // cold, independent of which counterfeit IDs SQLite returned.
-            return editor_name_state(runtime, graph, name.as_str().into(), page_kind);
+            return editor_name_state_for_format_with_engine(
+                engine,
+                graph,
+                name.as_str().into(),
+                page_kind,
+                graph.preferred_format(),
+            );
         }
         [] => {}
     }
@@ -24593,8 +24719,7 @@ fn projected_editor_name_state(
     if path.as_str().len() > MAX_LOCAL_MUTATION_PATH_BYTES {
         return Err(editor_too_large(0, 0, 0, path.as_str().len()));
     }
-    match runtime
-        .engine()
+    match engine
         .current_page_at_path(&path)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?
     {
@@ -24727,8 +24852,8 @@ fn load_hot_source_authenticated_application_page(
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    load_hot_source_authenticated_page_with_block_limit(
-        runtime,
+    load_hot_source_authenticated_page_with_block_limit_from_engine(
+        runtime.engine(),
         graph,
         page_id,
         MAX_SYNC_APPLICATION_PAGE_BLOCKS,
@@ -24741,7 +24866,21 @@ fn load_hot_source_authenticated_page_with_block_limit(
     page_id: PageId,
     block_limit: usize,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    let page = match runtime.engine().materialize_page(page_id) {
+    load_hot_source_authenticated_page_with_block_limit_from_engine(
+        runtime.engine(),
+        graph,
+        page_id,
+        block_limit,
+    )
+}
+
+fn load_hot_source_authenticated_page_with_block_limit_from_engine(
+    engine: &ShardedHotEngine,
+    graph: &Graph,
+    page_id: PageId,
+    block_limit: usize,
+) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+    let page = match engine.materialize_page(page_id) {
         Ok(page) => page,
         Err(
             crate::oplog::hot_engine::EngineError::PageNotFound(_)
@@ -24765,16 +24904,37 @@ fn load_preferred_source_authenticated_application_page(
     page_id: PageId,
     projected_available: bool,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+    load_preferred_source_authenticated_application_page_from_parts(
+        runtime.engine(),
+        runtime.database(),
+        graph,
+        page_id,
+        projected_available,
+    )
+}
+
+fn load_preferred_source_authenticated_application_page_from_parts(
+    engine: &ShardedHotEngine,
+    database: &crate::oplog::SqliteFrontier,
+    graph: &Graph,
+    page_id: PageId,
+    projected_available: bool,
+) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
     if projected_available {
-        if let Ok(Some(current)) =
-            load_projected_source_authenticated_application_page(runtime, graph, page_id)
-        {
+        if let Ok(Some(current)) = load_projected_source_authenticated_application_page_from_parts(
+            engine, database, graph, page_id,
+        ) {
             return Ok(Some(current));
         }
         // A point-local projection fault may be recovered from authenticated
         // oplog authority. Ordinary reads never enter this graph-sized path.
     }
-    load_hot_source_authenticated_application_page(runtime, graph, page_id)
+    load_hot_source_authenticated_page_with_block_limit_from_engine(
+        engine,
+        graph,
+        page_id,
+        MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+    )
 }
 
 fn load_projected_source_authenticated_application_page(
@@ -24782,7 +24942,26 @@ fn load_projected_source_authenticated_application_page(
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    let projected = load_projected_application_page(runtime, page_id);
+    load_projected_source_authenticated_application_page_from_parts(
+        runtime.engine(),
+        runtime.database(),
+        graph,
+        page_id,
+    )
+}
+
+fn load_projected_source_authenticated_application_page_from_parts(
+    engine: &ShardedHotEngine,
+    database: &crate::oplog::SqliteFrontier,
+    graph: &Graph,
+    page_id: PageId,
+) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+    let projected = load_projected_page_from_projection(
+        engine,
+        database,
+        page_id,
+        MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+    );
     #[cfg(test)]
     if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
         if let Err(error) = &projected {
@@ -24833,7 +25012,27 @@ fn load_projected_source_rebased_application_page(
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    let Some(mut current) = load_projected_application_page(runtime, page_id)? else {
+    load_projected_source_rebased_application_page_from_parts(
+        runtime.engine(),
+        runtime.database(),
+        graph,
+        page_id,
+    )
+}
+
+fn load_projected_source_rebased_application_page_from_parts(
+    engine: &ShardedHotEngine,
+    database: &crate::oplog::SqliteFrontier,
+    graph: &Graph,
+    page_id: PageId,
+) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+    let Some(mut current) = load_projected_page_from_projection(
+        engine,
+        database,
+        page_id,
+        MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+    )?
+    else {
         return Ok(None);
     };
     let parsed = graph
@@ -24961,8 +25160,8 @@ fn load_hot_source_authenticated_editor_page(
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    load_hot_source_authenticated_page_with_block_limit(
-        runtime,
+    load_hot_source_authenticated_page_with_block_limit_from_engine(
+        runtime.engine(),
         graph,
         page_id,
         MAX_SYNC_EDITOR_BLOCKS,
@@ -41383,6 +41582,157 @@ mod tests {
             !phases.contains(&SyncRuntimeOpenPhase::DiscoveringEnrollment),
             "clean marker must not enter legacy enrollment discovery"
         );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn public_fresh_activation_commits_clean_marker_and_skips_legacy_promotion() {
+        let fixture = ActivationFixture::nested_unicode("clean-public-activation", 0xa179);
+        let original = user_graph_bytes(&fixture.graph_root);
+        let mut phases = Vec::new();
+        let activated = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
+            fixture.request.clone(),
+            |progress| phases.push(progress),
+        );
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("fresh clean activation opens actor");
+        assert_eq!(
+            handle.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::CleanActivation)
+        );
+        assert!(fixture
+            .request
+            .enrollment_root
+            .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+            .is_file());
+        assert_eq!(user_graph_bytes(&fixture.graph_root), original);
+        assert!(phases.iter().any(|progress| matches!(
+            progress,
+            SyncLocalActivationProgress::Phase {
+                phase: SyncLocalActivationPhase::SourceCapture
+            }
+        )));
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn public_clean_activation_loads_saves_and_cold_reopens_an_editor_page() {
+        const SAVED_CONTENT: &str = "saved through the clean public actor";
+        let fixture = ActivationFixture::nested_unicode("clean-public-editor", 0xa17a);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        let pages = handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: Some(SyncPageKind::Page),
+                limit: 32,
+            })
+            .unwrap();
+        let SyncRuntimeQueryReply::Pages(pages) = pages else {
+            panic!("clean page listing returned the wrong reply");
+        };
+        let page_id = pages
+            .into_iter()
+            .find(|page| page.path == "Root.md")
+            .expect("clean SQLite projection contains Root.md")
+            .page_id;
+        let mut page = match handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId {
+                    page_id: page_id.clone(),
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::Loaded { page } => page,
+            other => panic!("clean editor page did not load: {other:?}"),
+        };
+        page.blocks[0].content = SAVED_CONTENT.into();
+        let saved = handle
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: page.page_id,
+                    revision: page.revision,
+                },
+                preamble: page.preamble,
+                blocks: page.blocks,
+            })
+            .unwrap();
+        assert!(matches!(saved, SyncEditorSaveOutcome::Durable { .. }));
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains(SAVED_CONTENT));
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("clean runtime cold-reopens");
+        assert_eq!(
+            reopened.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::CleanManifestReplay)
+        );
+        let page = match reopened
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId { page_id },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::Loaded { page } => page,
+            other => panic!("saved clean editor page did not reopen: {other:?}"),
+        };
+        assert_eq!(page.blocks[0].content, SAVED_CONTENT);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn public_clean_activation_loads_and_saves_the_application_page_contract() {
+        const SAVED_RAW: &str = "saved through the clean application contract";
+        let fixture = ActivationFixture::nested_unicode("clean-public-application", 0xa17b);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        let (mut page, revision) = match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "Root.md".into(),
+                },
+            })
+            .unwrap()
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("clean application page did not load: {other:?}"),
+        };
+        page.blocks[0].raw = SAVED_RAW.into();
+        let saved = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        let SyncApplicationPageSaveOutcome::Saved { page, .. } = saved else {
+            panic!("clean application save did not become durable: {saved:?}");
+        };
+        assert_eq!(page.blocks[0].raw, SAVED_RAW);
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains(SAVED_RAW));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
