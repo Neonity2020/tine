@@ -47,15 +47,9 @@ while ([DateTime]::UtcNow -lt $deadline) {
     )
     $affirmative = $null
     foreach ($button in $buttons) {
-      $isDefault = [bool]$button.GetCurrentPropertyValue(
-        [System.Windows.Automation.AutomationElement]::IsDefaultProperty
-      )
-      if ($isDefault) {
-        $affirmative = $button
-        break
-      }
       if ($button.Current.Name -match '^(Yes|OK|&Yes)$') {
         $affirmative = $button
+        break
       }
     }
     if ($null -eq $affirmative) {
