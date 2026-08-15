@@ -56631,22 +56631,8 @@ mod tests {
         drop(handle);
     }
 
-    fn tree_has_file_named(root: &Path, name: &str) -> bool {
-        let mut pending = vec![root.to_path_buf()];
-        while let Some(directory) = pending.pop() {
-            for entry in fs::read_dir(directory).unwrap().map(Result::unwrap) {
-                if entry.file_type().unwrap().is_dir() {
-                    pending.push(entry.path());
-                } else if entry.file_name() == name {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     #[test]
-    fn explicit_local_activation_preserves_nested_unicode_graph_bytes_and_proves_backup_sqlite() {
+    fn explicit_local_activation_preserves_nested_unicode_graph_bytes_without_retired_backup() {
         let fixture = ActivationFixture::nested_unicode("journey", 0xa100);
         let before = user_graph_bytes(&fixture.graph_root);
 
@@ -56656,14 +56642,10 @@ mod tests {
             .handle
             .expect("activation must retain the runtime handle");
         assert!(fixture.request.database_path.is_file());
-        assert!(tree_has_file_named(
-            &fixture.request.migration_backup_root,
-            "restore-proof.bin"
-        ));
-        assert!(tree_has_file_named(
-            &fixture.request.migration_backup_root,
-            "committed.bin"
-        ));
+        assert!(
+            recursive_file_bytes(&fixture.request.migration_backup_root).is_empty(),
+            "clean activation must not recreate the retired migration-backup authority"
+        );
         assert_eq!(
             user_graph_bytes(&fixture.graph_root),
             before,

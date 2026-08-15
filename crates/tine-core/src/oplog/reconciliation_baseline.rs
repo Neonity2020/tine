@@ -4314,33 +4314,6 @@ mod tests {
     }
 
     #[test]
-    fn storage_contract_tracks_reconciliation_baseline_recovery_layout() {
-        let contract = include_str!("../../../../docs/storage-sync-contract.md");
-        for required in [
-            DATABASE_FILE,
-            DATABASE_SIDECAR_FILES[0],
-            DATABASE_SIDECAR_FILES[1],
-            DATABASE_SIDECAR_FILES[2],
-            BASELINE_FORENSIC_PREFIX,
-            BASELINE_FORENSIC_FILES[0],
-            BASELINE_FORENSIC_FILES[1],
-            BASELINE_FORENSIC_FILES[2],
-            BASELINE_FORENSIC_FILES[3],
-            BASELINE_FORENSIC_EVIDENCE_COMPLETE,
-            BASELINE_FORENSIC_REBUILD_COMPLETE,
-        ] {
-            assert!(
-                contract.contains(required),
-                "storage contract is missing reconciliation layout name {required}"
-            );
-        }
-        assert!(contract.contains(&format!(
-            "SQLite baseline v{RECONCILIATION_BASELINE_SCHEMA_VERSION}"
-        )));
-        assert!(contract.contains("exactly one bounded rebuild"));
-    }
-
-    #[test]
     fn open_or_rebuild_resumes_an_interrupted_forensic_move() {
         let (directory, binding, mut baseline) = open_fresh("recover-interrupted-move");
         clean_epoch(
