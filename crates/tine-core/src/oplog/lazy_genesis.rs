@@ -1215,6 +1215,28 @@ impl LazyGenesisCandidate {
         }
         Self::open_sealed(directory, commit)
     }
+
+    pub(crate) fn open_provider_staged(
+        directory: &Path,
+        expected: &LazyGenesisProviderIndexV1,
+    ) -> io::Result<Self> {
+        for (name, description) in expected.file_descriptions() {
+            if describe_file(&directory.join(&name))? != description {
+                return Err(invalid(format!(
+                    "provider-staged lazy genesis file {name} differs from its index"
+                )));
+            }
+        }
+        let commit_bytes = read_bounded(&directory.join(LAZY_GENESIS_COMMIT_FILE), 1024)?;
+        let commit = LazyGenesisCommitV1::decode(&commit_bytes)?;
+        let candidate = Self::open_sealed(directory, commit)?;
+        if candidate.provider_index()? != *expected {
+            return Err(invalid(
+                "provider-staged lazy genesis pack differs from its exact index",
+            ));
+        }
+        Ok(candidate)
+    }
 }
 
 impl Drop for LazyGenesisCandidate {
@@ -1347,6 +1369,52 @@ pub(crate) fn publish_activation_marker(
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Replace one already-authoritative local marker during a semantically
+/// verified shared join. The prior marker is retained until the replacement
+/// entry and its parent directory are durable; a failed rename restores it.
+pub(crate) fn replace_activation_marker_for_join(
+    enrollment_root: &Path,
+    expected_prior: LazyGenesisActivationMarkerV1,
+    replacement: LazyGenesisActivationMarkerV1,
+) -> io::Result<()> {
+    if read_activation_marker(enrollment_root)? != Some(expected_prior) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "clean activation marker changed before shared join installation",
+        ));
+    }
+    let destination = enrollment_root.join(LAZY_GENESIS_ACTIVATION_MARKER_FILE);
+    let nonce = Uuid::new_v4().simple().to_string();
+    let temporary = enrollment_root.join(format!(
+        ".{LAZY_GENESIS_ACTIVATION_MARKER_FILE}.{nonce}.join"
+    ));
+    let backup = enrollment_root.join(format!(
+        ".{LAZY_GENESIS_ACTIVATION_MARKER_FILE}.{nonce}.prior"
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&replacement.encode()?)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&destination, &backup)?;
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        let _ = fs::rename(&backup, &destination);
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) =
+        crate::filesystem_durability::sync_reconstructible_directory_path(enrollment_root)
+    {
+        // The replacement may already be visible. Retain the prior marker as
+        // recovery evidence rather than pretending the transition settled.
+        return Err(error);
+    }
+    fs::remove_file(&backup)?;
+    crate::filesystem_durability::sync_reconstructible_directory_path(enrollment_root)
 }
 
 pub(crate) fn read_clean_shared_state(

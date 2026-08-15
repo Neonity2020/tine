@@ -245,8 +245,13 @@ fallback.
    then publishes the one shared descriptor and records the matching local
    phase.
 2. **Direct/explicit join → Joining (joiner).** The joiner reads that exact
-   descriptor, observes two stable bounded provider cuts, validates every
-   required manifest/object/recovery link, and constructs its private archive.
+   descriptor, reconstructs the descriptor-bound baseline and causal
+   manifest/object closure in a private staging area, and replays it to the
+   advertised frontier. Before replacing local managed authority it compares
+   the complete disk-expressible page/outline semantics with the currently
+   synchronized Markdown/Org graph. A mismatch leaves both authorities
+   unchanged; equality installs the provider history without rewriting graph
+   bytes. Local-only endpoint and device identities remain local.
 3. **SharePrepared/Joining → SharedActive.** Each device records its role
    (`Initiator` or `Joiner`) in its own enrollment. The descriptor remains the
    shared identity; local endpoint/device IDs remain local.

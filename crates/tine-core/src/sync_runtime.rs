@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -81,8 +81,9 @@ use crate::oplog::import::{
 };
 use crate::oplog::lazy_genesis::{
     publish_clean_shared_state, read_activation_marker, read_clean_shared_state,
-    CleanSharedEnrollmentDescriptorV1, CleanSharedRoleV1, CleanSharedStateV1,
-    LAZY_GENESIS_PROVIDER_CHUNK_BYTES,
+    replace_activation_marker_for_join, CleanSharedEnrollmentDescriptorV1, CleanSharedRoleV1,
+    CleanSharedStateV1, LazyGenesisActivationMarkerV1, LazyGenesisCandidate,
+    LazyGenesisProviderIndexV1, LAZY_GENESIS_PROVIDER_CHUNK_BYTES,
 };
 #[cfg(test)]
 use crate::oplog::local_active::{
@@ -182,17 +183,17 @@ pub use crate::oplog::ManagedStorageRefusalScenario;
 use crate::oplog::{
     classify_managed_local_anchor, decode_managed_local_record, managed_local_v2_anchor_name,
     parse_managed_local_v2_anchor_name, BatchId, BatchOrigin, BlobDescription, BlockId,
-    BlockLocation, CanonicalGraphResourceId, ContentDigest, CurrentPageAtPath, DeviceId,
-    DocumentId, FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin,
-    LogseqUuid, ManagedLocalAnchorEncoding, ManagedLocalAppendError,
+    BlockLocation, CanonicalGraphResourceId, CanonicalSnapshot, ContentDigest, CurrentPageAtPath,
+    DeviceId, DocumentId, FrontierReferenceHit, LineageDigest, LogicalPageName,
+    LogseqIdentityOrigin, LogseqUuid, ManagedLocalAnchorEncoding, ManagedLocalAppendError,
     ManagedLocalGenerationAnchorV2, ManagedLocalJournal, ManagedLocalJournalPayloadKind,
     ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind, MaterializedBlock,
     MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
     MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
-    OperationBatch, OperationObject, OperationTransaction, PageId, PreparedBatch, ProjectionClaim,
-    ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource, ReferenceCatalogPolicyV1,
-    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
-    SqliteMaterializedRead, WorkspaceId, MANAGED_LOCAL_ANCHOR_V2_BYTES,
+    OperationBatch, OperationObject, OperationTransaction, PageId, PageState, PreparedBatch,
+    ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
+    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
+    SessionId, SqliteMaterializedRead, WorkspaceId, MANAGED_LOCAL_ANCHOR_V2_BYTES,
     MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
 #[cfg(test)]
@@ -7841,6 +7842,408 @@ fn publish_complete_clean_baseline(
     Ok(BlobDescription::of(&bytes))
 }
 
+struct CleanJoinCandidate {
+    staging_root: PathBuf,
+    baseline_directory: PathBuf,
+    operation_archive_directory: PathBuf,
+    engine: Option<ShardedHotEngine>,
+    baseline_frontier_digest: ContentDigest,
+}
+
+impl Drop for CleanJoinCandidate {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.staging_root);
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CleanJoinUserPage {
+    path: String,
+    kind: ManagedTextKind,
+    preamble: Option<String>,
+    outline: Vec<(usize, String, Option<LogseqUuid>)>,
+}
+
+fn clean_join_user_semantics(
+    snapshot: CanonicalSnapshot,
+) -> Result<Vec<CleanJoinUserPage>, SyncRuntimeRequestError> {
+    if !snapshot.path_conflicts.is_empty() {
+        return Err(SyncRuntimeRequestError::ActorRefused(
+            "clean join cannot compare a graph with conflicting live page paths".into(),
+        ));
+    }
+    let preambles = snapshot
+        .page_preambles
+        .into_iter()
+        .map(|state| (state.page_id, state.preamble))
+        .collect::<BTreeMap<_, _>>();
+    let blocks = snapshot
+        .blocks
+        .into_iter()
+        .map(|block| {
+            let external_uuid = matches!(
+                block.logseq_identity_origin,
+                Some(LogseqIdentityOrigin::ExternalImported)
+            )
+            .then_some(block.logseq_uuid)
+            .flatten();
+            (block.block_id, (block.content, external_uuid))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut memberships = BTreeMap::<PageId, Vec<_>>::new();
+    for membership in snapshot.memberships {
+        memberships
+            .entry(membership.page_id)
+            .or_default()
+            .push(membership);
+    }
+    let mut pages = Vec::new();
+    for (page_id, state) in snapshot.pages {
+        let PageState::Live { path, kind, .. } = state else {
+            continue;
+        };
+        let page_memberships = memberships.remove(&page_id).unwrap_or_default();
+        let mut children = BTreeMap::<Option<BlockId>, Vec<_>>::new();
+        for membership in page_memberships {
+            children
+                .entry(membership.parent)
+                .or_default()
+                .push(membership);
+        }
+        for siblings in children.values_mut() {
+            siblings.sort_unstable_by(|left, right| {
+                left.order
+                    .cmp(&right.order)
+                    .then_with(|| left.block_id.cmp(&right.block_id))
+            });
+        }
+        let mut outline = Vec::new();
+        let mut pending = children
+            .remove(&None)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .map(|membership| (0_usize, membership))
+            .collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some((depth, membership)) = pending.pop() {
+            if !visited.insert(membership.block_id) {
+                return Err(SyncRuntimeRequestError::ActorRefused(
+                    "clean join semantic comparison found cyclic block structure".into(),
+                ));
+            }
+            let (content, external_uuid) = blocks.get(&membership.block_id).ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(
+                    "clean join semantic comparison found a missing visible block".into(),
+                )
+            })?;
+            outline.push((depth, content.clone(), *external_uuid));
+            if let Some(descendants) = children.remove(&Some(membership.block_id)) {
+                pending.extend(
+                    descendants
+                        .into_iter()
+                        .rev()
+                        .map(|child| (depth.saturating_add(1), child)),
+                );
+            }
+        }
+        if !children.is_empty() {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "clean join semantic comparison found an unreachable block parent".into(),
+            ));
+        }
+        pages.push(CleanJoinUserPage {
+            path: path.as_str().to_owned(),
+            kind,
+            preamble: preambles.get(&page_id).cloned().flatten(),
+            outline,
+        });
+    }
+    if !memberships.is_empty() {
+        return Err(SyncRuntimeRequestError::ActorRefused(
+            "clean join semantic comparison found blocks owned by a missing page".into(),
+        ));
+    }
+    pages.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    Ok(pages)
+}
+
+fn matching_clean_join_head(
+    provider: &SharedProviderTransport,
+    descriptor: &CleanSharedEnrollmentDescriptorV1,
+) -> Result<SharedProviderFrontierHeadV1, SyncRuntimeRequestError> {
+    let descriptor_digest = descriptor
+        .digest()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let mut cursor = provider
+        .head_observation_cursor()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let mut matching = None;
+    loop {
+        match provider
+            .next_observed_path(&mut cursor)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        {
+            SharedProviderObservation::Path(path)
+                if path.starts_with(&format!("{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/")) =>
+            {
+                let bytes = provider
+                    .read_exact(&path)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                    .ok_or_else(|| {
+                        SyncRuntimeRequestError::ActorRefused(format!(
+                            "clean join frontier head disappeared at {path}"
+                        ))
+                    })?;
+                let head = SharedProviderFrontierHeadV1::decode(&path, &bytes)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                if head.workspace_id() == descriptor.workspace_id()
+                    && head.lineage_digest() == descriptor.lineage_digest()
+                    && head.descriptor_digest() == descriptor_digest
+                    && head.author_device_id() == descriptor.initiator_device_id()
+                    && head.accepted_frontier_root() == descriptor.accepted_frontier_digest()
+                {
+                    if matching
+                        .as_ref()
+                        .is_some_and(|prior: &SharedProviderFrontierHeadV1| {
+                            prior.accepted_generation() != head.accepted_generation()
+                                || prior.frontier_tips() != head.frontier_tips()
+                        })
+                    {
+                        return Err(SyncRuntimeRequestError::ActorRefused(
+                            "clean join found conflicting initiator heads for the descriptor frontier"
+                                .into(),
+                        ));
+                    }
+                    matching = Some(head);
+                }
+            }
+            SharedProviderObservation::Path(_) => {}
+            SharedProviderObservation::ChunkBoundary => cursor.begin_next_chunk(),
+            SharedProviderObservation::Complete => break,
+        }
+    }
+    matching.ok_or_else(|| {
+        SyncRuntimeRequestError::ActorRefused(
+            "clean shared baseline is present but its matching initiator frontier head has not arrived"
+                .into(),
+        )
+    })
+}
+
+fn download_clean_join_tail(
+    provider: &SharedProviderTransport,
+    descriptor: &CleanSharedEnrollmentDescriptorV1,
+    store: &ObjectStore,
+    head: &SharedProviderFrontierHeadV1,
+) -> Result<(), SyncRuntimeRequestError> {
+    let mut pending = head.frontier_tips().to_vec();
+    let mut seen = BTreeSet::new();
+    while let Some(batch_id) = pending.pop() {
+        if !seen.insert(batch_id) {
+            continue;
+        }
+        let manifest_path = format!("manifests/{batch_id}.manifest");
+        let manifest_bytes = provider
+            .read_exact(&manifest_path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean join is waiting for provider manifest {batch_id}"
+                ))
+            })?;
+        let manifest = OperationBatch::decode(&manifest_bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if manifest.batch_id() != batch_id
+            || manifest.workspace_id() != descriptor.workspace_id()
+            || manifest.lineage_digest() != descriptor.lineage_digest()
+            || manifest.origin() == BatchOrigin::BootstrapImport
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "clean join provider manifest {batch_id} is outside the descriptor authority"
+            )));
+        }
+        for object in manifest.required_objects() {
+            let path = format!("objects/{}.object", object.content_digest());
+            let bytes = provider
+                .read_exact(&path)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                .ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(format!(
+                        "clean join is waiting for provider object {}",
+                        object.content_digest()
+                    ))
+                })?;
+            if ContentDigest::of(&bytes) != object.content_digest()
+                || store
+                    .stage_object_bytes(&bytes)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                    != object.content_digest()
+            {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean join provider object {} has conflicting bytes",
+                    object.content_digest()
+                )));
+            }
+        }
+        store
+            .stage_manifest_bytes(&manifest_bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        pending.extend(manifest.causal_dependency_heads().iter().copied());
+    }
+    Ok(())
+}
+
+fn prepare_clean_join_candidate(
+    request: &SyncRuntimeOpenRequest,
+    provider: &SharedProviderTransport,
+    descriptor: &CleanSharedEnrollmentDescriptorV1,
+) -> Result<CleanJoinCandidate, SyncRuntimeRequestError> {
+    let staging_root = request
+        .archive_root
+        .join(format!(".clean-join-{}", Uuid::new_v4().simple()));
+    let baseline_directory = staging_root.join("baseline");
+    let operation_archive_directory = staging_root.join("operations");
+    fs::create_dir_all(&baseline_directory)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let result = (|| {
+        let index_path = clean_baseline_index_provider_path(descriptor.baseline_root());
+        let index_bytes = provider
+            .read_exact(&index_path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(
+                    "clean shared descriptor arrived before its baseline index".into(),
+                )
+            })?;
+        if BlobDescription::of(&index_bytes) != descriptor.baseline_index() {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "clean shared baseline index differs from the descriptor".into(),
+            ));
+        }
+        let index = LazyGenesisProviderIndexV1::decode(&index_bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if index.baseline_root() != descriptor.baseline_root() {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "clean shared baseline index names another root".into(),
+            ));
+        }
+        for (file_ordinal, (name, expected)) in index.file_descriptions().into_iter().enumerate() {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(baseline_directory.join(&name))
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            let expected_length = usize::try_from(expected.byte_length()).map_err(|_| {
+                SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean shared baseline file {name} is not addressable"
+                ))
+            })?;
+            let mut written = 0_usize;
+            let mut hasher = Sha256::new();
+            for chunk_ordinal in 0..expected_length.div_ceil(LAZY_GENESIS_PROVIDER_CHUNK_BYTES) {
+                let path = clean_baseline_chunk_provider_path(
+                    descriptor.baseline_root(),
+                    file_ordinal,
+                    chunk_ordinal,
+                );
+                let bytes = provider
+                    .read_exact(&path)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                    .ok_or_else(|| {
+                        SyncRuntimeRequestError::ActorRefused(format!(
+                            "clean join is waiting for baseline chunk {path}"
+                        ))
+                    })?;
+                let remaining = expected_length.saturating_sub(written);
+                let expected_chunk = remaining.min(LAZY_GENESIS_PROVIDER_CHUNK_BYTES);
+                if bytes.len() != expected_chunk {
+                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                        "clean shared baseline chunk {path} has the wrong length"
+                    )));
+                }
+                file.write_all(&bytes)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                hasher.update(&bytes);
+                written = written.saturating_add(bytes.len());
+            }
+            file.sync_all()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            let mut digest = [0_u8; 32];
+            digest.copy_from_slice(&hasher.finalize());
+            if written != expected_length
+                || BlobDescription::from_parts(digest, written as u64) != expected
+            {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean shared baseline file {name} differs from its index"
+                )));
+            }
+        }
+        crate::filesystem_durability::sync_private_tree(&baseline_directory)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let baseline = LazyGenesisCandidate::open_provider_staged(&baseline_directory, &index)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if baseline.workspace_id() != descriptor.workspace_id()
+            || baseline.lineage_digest() != descriptor.lineage_digest()
+            || baseline.catalog_document_id() != descriptor.catalog_document_id()
+            || baseline.source_capture() != descriptor.source_capture()
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "clean shared baseline identity differs from the descriptor".into(),
+            ));
+        }
+        let head = matching_clean_join_head(provider, descriptor)?;
+        let store = ObjectStore::open(&operation_archive_directory, descriptor.workspace_id())
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        download_clean_join_tail(provider, descriptor, &store, &head)?;
+        let mut engine = ShardedHotEngine::new(
+            descriptor.workspace_id(),
+            descriptor.lineage_digest(),
+            descriptor.catalog_document_id(),
+        );
+        engine
+            .configure_reference_catalog_policy(ReferenceCatalogPolicyV1::default())
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        engine
+            .install_lazy_genesis_baseline(Arc::new(baseline))
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let baseline_frontier = engine
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let baseline_frontier_digest =
+            crate::oplog::sqlite::canonical_frontier_root_digest(&baseline_frontier)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        engine
+            .attach_clean_archive_store(store)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        engine
+            .replay_clean_committed_tail()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let root = engine
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if root.acceptance_sequence() != head.accepted_generation()
+            || root.state_digest() != descriptor.accepted_frontier_digest()
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "clean shared baseline and provider tail do not reconstruct the descriptor frontier"
+                    .into(),
+            ));
+        }
+        Ok(CleanJoinCandidate {
+            staging_root: staging_root.clone(),
+            baseline_directory: baseline_directory.clone(),
+            operation_archive_directory: operation_archive_directory.clone(),
+            engine: Some(engine),
+            baseline_frontier_digest,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging_root);
+    }
+    result
+}
+
 fn publish_clean_manifest_exact(
     provider: &mut SharedProviderTransport,
     batch_id: BatchId,
@@ -10887,6 +11290,9 @@ struct RuntimeActor {
     promoted_state_digest: ContentDigest,
     provider_root: PathBuf,
     provider_journal_root: PathBuf,
+    /// Exact private paths needed only for a clean join authority replacement.
+    /// Legacy actors never retain this request.
+    clean_open_request: Option<SyncRuntimeOpenRequest>,
     provider: Option<SharedProviderTransport>,
     shared_descriptor: Option<SharedEnrollmentDescriptorV1>,
     clean_shared_descriptor: Option<CleanSharedEnrollmentDescriptorV1>,
@@ -12487,6 +12893,7 @@ impl RuntimeActor {
             promoted_state_digest,
             binding: actor_binding,
             legacy_binding: Some(binding),
+            clean_open_request: None,
             provider_root: request.provider_root,
             provider_journal_root: request.provider_journal_root,
             provider,
@@ -12669,6 +13076,7 @@ impl RuntimeActor {
             enrollment_root,
             binding,
             legacy_binding: None,
+            clean_open_request: Some(request.clone()),
             session_id: identities.session_id,
             promotion_session_id: identities.session_id,
             promoted_state_digest,
@@ -24629,6 +25037,125 @@ impl RuntimeActor {
         }
     }
 
+    fn install_clean_join_candidate(
+        &mut self,
+        descriptor: &CleanSharedEnrollmentDescriptorV1,
+        mut candidate: CleanJoinCandidate,
+        prior_marker: LazyGenesisActivationMarkerV1,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let request = self
+            .clean_open_request
+            .clone()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+        drop(
+            candidate
+                .engine
+                .take()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+        );
+        let baseline_directory = candidate.baseline_directory.clone();
+        let operation_archive_directory = candidate.operation_archive_directory.clone();
+        let baseline_frontier_digest = candidate.baseline_frontier_digest;
+        let canonical_baseline = clean_baseline_directory(&request.archive_root);
+        let canonical_operations = clean_operation_archive_directory(&request.archive_root);
+        let nonce = Uuid::new_v4().simple().to_string();
+        let prior_baseline = request
+            .archive_root
+            .join(format!(".lazy-genesis.{nonce}.prior"));
+        let prior_operations = request
+            .archive_root
+            .join(format!(".operations.{nonce}.prior"));
+        let replacement_marker = LazyGenesisActivationMarkerV1::new(
+            descriptor.workspace_id(),
+            descriptor.lineage_digest(),
+            descriptor.baseline_root(),
+            descriptor.source_capture(),
+            baseline_frontier_digest,
+            self.graph.cache_generation(),
+        )
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+
+        // The graph is already semantically equal to the provider frontier.
+        // Drop only the old managed runtime, retain the graph itself, then
+        // install both immutable authorities before replacing the marker.
+        self.clean.take();
+        let installation = (|| {
+            fs::rename(&canonical_baseline, &prior_baseline)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            if let Err(error) = fs::rename(&baseline_directory, &canonical_baseline) {
+                let _ = fs::rename(&prior_baseline, &canonical_baseline);
+                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
+            }
+            if let Err(error) = fs::rename(&canonical_operations, &prior_operations) {
+                let _ = fs::rename(&canonical_baseline, &baseline_directory);
+                let _ = fs::rename(&prior_baseline, &canonical_baseline);
+                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
+            }
+            if let Err(error) = fs::rename(&operation_archive_directory, &canonical_operations) {
+                let _ = fs::rename(&prior_operations, &canonical_operations);
+                let _ = fs::rename(&canonical_baseline, &baseline_directory);
+                let _ = fs::rename(&prior_baseline, &canonical_baseline);
+                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
+            }
+            crate::filesystem_durability::sync_reconstructible_directory_path(
+                &request.archive_root,
+            )
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            replace_activation_marker_for_join(
+                &request.enrollment_root,
+                prior_marker,
+                replacement_marker,
+            )
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+        })();
+        if let Err(error) = installation {
+            self.terminal = Some(format!(
+                "clean shared join installation did not settle; restart or Return to Direct Files: {error}"
+            ));
+            return Err(error);
+        }
+
+        let resources = open_clean_runtime_resources(&request)
+            .and_then(|resources| {
+                resources.ok_or_else(|| {
+                    "clean shared join installed no reopenable managed authority".to_owned()
+                })
+            })
+            .map_err(|detail| {
+                self.terminal = Some(format!(
+                    "clean shared join installed exact authority but runtime reopen failed; restart to recover: {detail}"
+                ));
+                SyncRuntimeRequestError::ActorRefused(detail)
+            })?;
+        let CleanRuntimeResources {
+            graph,
+            receipts,
+            runtime,
+        } = resources;
+        self.graph = graph;
+        self.receipts = receipts;
+        self.promoted_state_digest = runtime
+            .engine()
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .state_digest();
+        self.clean = Some(CleanRuntimeActorCore::new(runtime, false));
+        self.last_watcher = self
+            .clean
+            .as_ref()
+            .expect("installed clean runtime")
+            .watcher_status();
+        self.recovery = SyncRuntimeRecovery::CleanManifestReplay;
+        self.stopped_safe = false;
+        self.terminal = None;
+        fs::remove_dir_all(&prior_baseline)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        fs::remove_dir_all(&prior_operations)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        crate::filesystem_durability::sync_reconstructible_directory_path(&request.archive_root)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+    }
+
     fn join_shared_clean(
         &mut self,
         descriptor: CleanSharedEnrollmentDescriptorV1,
@@ -24662,36 +25189,6 @@ impl RuntimeActor {
                 "provider descriptor changed before clean join".into(),
             ));
         }
-        let marker = read_activation_marker(self.enrollment_root.path())
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-            .ok_or_else(|| {
-                SyncRuntimeRequestError::ActorRefused(
-                    "clean join requires a local activation marker".into(),
-                )
-            })?;
-        if marker.baseline_root() != descriptor.baseline_root()
-            || marker.source_capture() != descriptor.source_capture()
-        {
-            return Err(SyncRuntimeRequestError::ActorRefused(
-                format!(
-                    "local clean baseline differs from the shared baseline; provider baseline installation is required (local_root={}, shared_root={}, local_source={:?}, shared_source={:?})",
-                    marker.baseline_root(),
-                    descriptor.baseline_root(),
-                    marker.source_capture(),
-                    descriptor.source_capture(),
-                ),
-            ));
-        }
-        let frontier = self
-            .active_engine()?
-            .accepted_frontier_root()
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        if frontier.state_digest() != descriptor.accepted_frontier_digest() {
-            return Err(SyncRuntimeRequestError::ActorRefused(
-                "local clean accepted tail differs from the descriptor frontier; provider tail ingress is required"
-                    .into(),
-            ));
-        }
         if self.provider.is_none() {
             self.provider = Some(
                 SharedProviderTransport::open(&self.provider_root, &self.provider_journal_root)
@@ -24699,6 +25196,56 @@ impl RuntimeActor {
             );
         }
         self.clean_shutdown()?;
+        let marker = read_activation_marker(self.enrollment_root.path())
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(
+                    "clean join requires a local activation marker".into(),
+                )
+            })?;
+        let frontier = self
+            .active_engine()?
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if marker.baseline_root() != descriptor.baseline_root()
+            || marker.source_capture() != descriptor.source_capture()
+            || frontier.state_digest() != descriptor.accepted_frontier_digest()
+        {
+            let request = self
+                .clean_open_request
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+            let candidate = prepare_clean_join_candidate(
+                request,
+                self.provider
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                &descriptor,
+            )?;
+            let local_snapshot = self
+                .active_engine()?
+                .canonical_snapshot()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            let provider_snapshot = candidate
+                .engine
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .canonical_snapshot()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            let local_semantics = clean_join_user_semantics(local_snapshot)?;
+            let provider_semantics = clean_join_user_semantics(provider_snapshot)?;
+            if local_semantics != provider_semantics {
+                #[cfg(test)]
+                eprintln!(
+                    "clean late-join semantic mismatch\nlocal={local_semantics:#?}\nprovider={provider_semantics:#?}"
+                );
+                return Err(SyncRuntimeRequestError::ActorRefused(
+                    "this device's current Markdown/Org graph contains semantic changes that are not in the shared provider frontier; Tine left both authorities unchanged"
+                        .into(),
+                ));
+            }
+            self.install_clean_join_candidate(&descriptor, candidate, marker)?;
+        }
         let state = CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Joiner)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         publish_clean_shared_state(self.enrollment_root.path(), &state)
@@ -43387,6 +43934,164 @@ mod tests {
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn shared_provider_clean_late_join_installs_provider_history_without_rewriting_graph() {
+        let initiator = ActivationFixture::nested_unicode("late-share-initiator", 0xa176_0000);
+        let mut joiner = ActivationFixture::nested_unicode("late-share-joiner", 0xa176_0000);
+        joiner.request.identities.endpoint_id =
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0xa176_1000));
+        joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(0xa176_1001));
+        joiner.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(0xa176_1002));
+
+        let initiator_handle =
+            SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone())
+                .handle
+                .expect("late-share initiator LocalActive");
+        drive_initial_feed(&initiator_handle);
+        let _ = submit_shared_page(
+            &initiator_handle,
+            0xa176_2000,
+            "Late Shared 計画",
+            "notes/層/late shared.md",
+            "history existed before sharing",
+        );
+        let shared_graph = user_graph_bytes(&initiator.graph_root);
+        let descriptor = initiator_handle
+            .prepare_shared()
+            .expect("late-share descriptor publication");
+        let clean_descriptor = match SharedEnrollmentDescriptor::decode(&descriptor.encoded)
+            .unwrap()
+        {
+            SharedEnrollmentDescriptor::Clean(descriptor) => descriptor,
+            SharedEnrollmentDescriptor::Legacy(_) => panic!("clean runtime emitted legacy share"),
+        };
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &joiner.request.provider_root,
+        );
+        for (relative, bytes) in &shared_graph {
+            let destination = joiner.graph_root.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
+        }
+
+        let joiner_handle = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone())
+            .handle
+            .expect("late-share joiner LocalActive");
+        drive_initial_feed(&joiner_handle);
+        let local_marker = read_activation_marker(&joiner.request.enrollment_root)
+            .unwrap()
+            .expect("joiner initially owns its independent baseline");
+        assert_ne!(
+            local_marker.baseline_root(),
+            clean_descriptor.baseline_root(),
+            "fixture must exercise provider baseline installation rather than equal-genesis join"
+        );
+        joiner_handle
+            .join_shared(descriptor.clone())
+            .expect("semantic-equal late join installs provider baseline and tail");
+        assert_eq!(
+            user_graph_bytes(&joiner.graph_root),
+            shared_graph,
+            "late join must not rewrite already-synchronized user graph bytes"
+        );
+        let installed_marker = read_activation_marker(&joiner.request.enrollment_root)
+            .unwrap()
+            .expect("late join publishes replacement marker");
+        assert_eq!(
+            installed_marker.baseline_root(),
+            clean_descriptor.baseline_root()
+        );
+        assert_eq!(
+            installed_marker.source_capture(),
+            clean_descriptor.source_capture()
+        );
+        drop(joiner_handle);
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&joiner.request)));
+        assert_eq!(
+            reopened.status().unwrap().shared_role,
+            Some(SyncSharedRole::Joiner)
+        );
+        assert_eq!(
+            user_graph_bytes(&joiner.graph_root),
+            shared_graph,
+            "installed late join must cold-reopen without graph churn"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    #[test]
+    fn shared_provider_clean_late_join_refuses_unmatched_local_graph_without_changing_authority() {
+        let initiator = ActivationFixture::nested_unicode("late-refuse-initiator", 0xa177_0000);
+        let mut joiner = ActivationFixture::nested_unicode("late-refuse-joiner", 0xa177_0000);
+        joiner.request.identities.endpoint_id =
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0xa177_1000));
+        joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(0xa177_1001));
+        joiner.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(0xa177_1002));
+
+        let initiator_handle =
+            SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone())
+                .handle
+                .expect("late-refuse initiator LocalActive");
+        drive_initial_feed(&initiator_handle);
+        let _ = submit_shared_page(
+            &initiator_handle,
+            0xa177_2000,
+            "Shared Before Refusal",
+            "notes/shared-before-refusal.md",
+            "provider state",
+        );
+        let descriptor = initiator_handle.prepare_shared().unwrap();
+        let shared_graph = user_graph_bytes(&initiator.graph_root);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &joiner.request.provider_root,
+        );
+        for (relative, bytes) in &shared_graph {
+            let destination = joiner.graph_root.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
+        }
+        fs::write(
+            joiner.graph_root.join("notes/local-only.md"),
+            b"- unmatched local work\n",
+        )
+        .unwrap();
+
+        let joiner_handle = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone())
+            .handle
+            .expect("late-refuse joiner LocalActive");
+        drive_initial_feed(&joiner_handle);
+        let marker_before = read_activation_marker(&joiner.request.enrollment_root)
+            .unwrap()
+            .unwrap();
+        let graph_before = user_graph_bytes(&joiner.graph_root);
+        let refusal = joiner_handle.join_shared(descriptor).unwrap_err();
+        assert!(
+            refusal.to_string().contains("semantic changes"),
+            "{refusal}"
+        );
+        assert_eq!(
+            read_activation_marker(&joiner.request.enrollment_root)
+                .unwrap()
+                .unwrap(),
+            marker_before,
+            "refused join must retain the prior managed authority"
+        );
+        assert_eq!(
+            user_graph_bytes(&joiner.graph_root),
+            graph_before,
+            "refused join must retain every local user byte"
+        );
+        assert!(matches!(
+            joiner_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
         ));
     }
 
