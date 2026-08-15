@@ -17278,17 +17278,16 @@ impl RuntimeActor {
                 target_path,
             ));
         }
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let store = runtime
-            .engine()
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let store = engine
             .archive_store()
             .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
-        let mut query = runtime
-            .database()
-            .frontier_reference_query(runtime.engine(), store)
+        let mut query = self
+            .active_database()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+            .frontier_reference_query(engine, store)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("rename_query"))?;
         let plan = query
             .plan_page_renames(&requests)
@@ -17307,11 +17306,12 @@ impl RuntimeActor {
         page_kind: SyncPageKind,
         expected_path: Option<&str>,
     ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let page_id = match editor_name_state(runtime, &self.graph, name.to_owned(), page_kind)
+        let page_id = match self
+            .active_editor_name_state_for_format(
+                name.to_owned(),
+                page_kind,
+                self.graph.preferred_format(),
+            )
             .map_err(map_editor_application_error)?
         {
             EditorNameState::Exact(page_id) => page_id,
@@ -17342,8 +17342,9 @@ impl RuntimeActor {
             ));
         }
         let path = current.editor.page.path.clone();
-        let accepted_frontier = runtime
-            .engine()
+        let accepted_frontier = self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
             .accepted_frontier_root()
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("delete_frontier"))?;
         let bytes = self
@@ -17387,9 +17388,13 @@ impl RuntimeActor {
             .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
                 "delete_recheck_missing",
             ))?;
-        let after_frontier = runtime.engine().accepted_frontier_root().map_err(|_| {
-            SyncApplicationPageRequestError::ActorRefusedAt("delete_recheck_frontier")
-        })?;
+        let after_frontier = self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+            .accepted_frontier_root()
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("delete_recheck_frontier")
+            })?;
         if after_bytes != bytes
             || after.editor.page.page_id != page_id
             || after.editor.page.path != path
@@ -17561,17 +17566,16 @@ impl RuntimeActor {
                     "merge_rename_source_identity",
                 ));
             }
-            let runtime = self
-                .runtime
-                .as_ref()
-                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-            let store = runtime
-                .engine()
+            let engine = self
+                .active_engine()
+                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+            let store = engine
                 .archive_store()
                 .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
-            let mut query = runtime
-                .database()
-                .frontier_reference_query(runtime.engine(), store)
+            let mut query = self
+                .active_database()
+                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+                .frontier_reference_query(engine, store)
                 .map_err(|_| {
                     SyncApplicationPageRequestError::ActorRefusedAt("merge_rename_query")
                 })?;
@@ -17702,12 +17706,10 @@ impl RuntimeActor {
             .map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt("file_rescue_target_path")
             })?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        if let Some(owner) = runtime
-            .engine()
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        if let Some(owner) = engine
             .current_page_for_logical_name(&new_name)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("file_rescue_target"))?
         {
@@ -17717,8 +17719,7 @@ impl RuntimeActor {
                 ));
             }
         }
-        match runtime
-            .engine()
+        match engine
             .current_page_at_path(&target_path)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("file_rescue_target"))?
         {
@@ -18011,14 +18012,13 @@ impl RuntimeActor {
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("pdf_sidecar_open"))?;
         let key = crate::pdf::asset_key(pdf_filename);
         let name = crate::pdf::hls_page_name(&key);
-        let current = {
-            let runtime = self
-                .runtime
-                .as_ref()
-                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-            editor_name_state(runtime, &self.graph, name.clone(), SyncPageKind::Page)
-                .map_err(map_editor_application_error)?
-        };
+        let current = self
+            .active_editor_name_state_for_format(
+                name.clone(),
+                SyncPageKind::Page,
+                self.graph.preferred_format(),
+            )
+            .map_err(map_editor_application_error)?;
         match current {
             EditorNameState::Exact(_) => return Ok(SyncApplicationPdfOpenOutcome::Ready { state }),
             EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
@@ -18032,14 +18032,13 @@ impl RuntimeActor {
         if self.graph.pdf_legacy_key_is_unambiguous(pdf_filename) {
             let legacy_name =
                 crate::pdf::hls_page_name(&crate::pdf::legacy_asset_key(pdf_filename));
-            let legacy = {
-                let runtime = self
-                    .runtime
-                    .as_ref()
-                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                editor_name_state(runtime, &self.graph, legacy_name, SyncPageKind::Page)
-                    .map_err(map_editor_application_error)?
-            };
+            let legacy = self
+                .active_editor_name_state_for_format(
+                    legacy_name,
+                    SyncPageKind::Page,
+                    self.graph.preferred_format(),
+                )
+                .map_err(map_editor_application_error)?;
             match legacy {
                 EditorNameState::Exact(_) => {
                     return Ok(SyncApplicationPdfOpenOutcome::Ready { state })
@@ -18102,14 +18101,13 @@ impl RuntimeActor {
         }
         let key = crate::pdf::asset_key(pdf_filename);
         let name = crate::pdf::hls_page_name(&key);
-        let current_state = {
-            let runtime = self
-                .runtime
-                .as_ref()
-                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-            editor_name_state(runtime, &self.graph, name.clone(), SyncPageKind::Page)
-                .map_err(map_editor_application_error)?
-        };
+        let current_state = self
+            .active_editor_name_state_for_format(
+                name.clone(),
+                SyncPageKind::Page,
+                self.graph.preferred_format(),
+            )
+            .map_err(map_editor_application_error)?;
         let mut current = match current_state {
             EditorNameState::Exact(page_id) => Some(self.load_application_page_id_ready(page_id)?),
             EditorNameState::Missing { .. } => None,
@@ -18122,14 +18120,13 @@ impl RuntimeActor {
         if current.is_none() && self.graph.pdf_legacy_key_is_unambiguous(pdf_filename) {
             let legacy_name =
                 crate::pdf::hls_page_name(&crate::pdf::legacy_asset_key(pdf_filename));
-            let legacy_state = {
-                let runtime = self
-                    .runtime
-                    .as_ref()
-                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                editor_name_state(runtime, &self.graph, legacy_name, SyncPageKind::Page)
-                    .map_err(map_editor_application_error)?
-            };
+            let legacy_state = self
+                .active_editor_name_state_for_format(
+                    legacy_name,
+                    SyncPageKind::Page,
+                    self.graph.preferred_format(),
+                )
+                .map_err(map_editor_application_error)?;
             current = match legacy_state {
                 EditorNameState::Exact(page_id) => {
                     Some(self.load_application_page_id_ready(page_id)?)
@@ -18288,20 +18285,13 @@ impl RuntimeActor {
         let mut created_pages = Vec::new();
         let mut skipped_pages = Vec::new();
         for planned in plan.pages {
-            let state = {
-                let runtime = self
-                    .runtime
-                    .as_ref()
-                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                editor_name_state_for_format(
-                    runtime,
-                    &self.graph,
+            let state = self
+                .active_editor_name_state_for_format(
                     planned.name.clone(),
                     SyncPageKind::Page,
                     Format::Md,
                 )
-                .map_err(map_editor_application_error)?
-            };
+                .map_err(map_editor_application_error)?;
             let EditorNameState::Missing { .. } = state else {
                 skipped_pages.push(planned.name);
                 continue;
@@ -43689,6 +43679,143 @@ mod tests {
         ));
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys() {
+        let fixture = ActivationFixture::nested_unicode("clean-runtime-app-journeys", 0xa1772);
+        fs::create_dir_all(fixture.graph_root.join("assets")).unwrap();
+        fs::write(
+            fixture.graph_root.join("assets/paper.pdf"),
+            b"test pdf bytes",
+        )
+        .unwrap();
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+
+        let (renamed, _) = accepted_new_application_page(
+            &handle,
+            "Clean Rename Source",
+            vec![BlockDto {
+                id: "temporary-rename".into(),
+                raw: "rename body".into(),
+                ..BlockDto::default()
+            }],
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                    old: "Clean Rename Source".into(),
+                    new: "Clean Rename Target".into(),
+                    expected_path: Some(renamed.path),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let (renamed, _) =
+            load_application_logical(&handle, "Clean Rename Target", SyncPageKind::Page);
+        assert_eq!(renamed.blocks[0].raw, "rename body");
+
+        let (source, _) = accepted_new_application_page(
+            &handle,
+            "Clean Merge Source",
+            vec![BlockDto {
+                id: "temporary-merge-source".into(),
+                raw: "source sees [[Clean Merge Source]]".into(),
+                ..BlockDto::default()
+            }],
+        );
+        let (destination, _) = accepted_new_application_page(
+            &handle,
+            "Clean Merge Destination",
+            vec![BlockDto {
+                id: "temporary-merge-destination".into(),
+                raw: "destination body".into(),
+                ..BlockDto::default()
+            }],
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::MergePages {
+                    source_path: source.path,
+                    destination_path: destination.path,
+                    rename_from: Some("Clean Merge Source".into()),
+                    rename_to: Some("Clean Merge Destination".into()),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let (merged, _) =
+            load_application_logical(&handle, "Clean Merge Destination", SyncPageKind::Page);
+        assert_eq!(merged.blocks.len(), 2);
+        assert!(merged.blocks[1].raw.contains("[[Clean Merge Destination]]"));
+
+        let (stray, _) = accepted_new_application_page(
+            &handle,
+            "Clean Stray",
+            vec![BlockDto {
+                id: "temporary-stray".into(),
+                raw: "rescue body".into(),
+                ..BlockDto::default()
+            }],
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenameFileToPage {
+                    path: stray.path,
+                    new_name: "Clean Rescued".into(),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let (rescued, _) = load_application_logical(&handle, "Clean Rescued", SyncPageKind::Page);
+        assert_eq!(rescued.blocks[0].raw, "rescue body");
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                    name: "Clean Rescued".into(),
+                    page_kind: SyncPageKind::Page,
+                    expected_path: Some(rescued.path),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+
+        assert!(matches!(
+            handle
+                .open_application_pdf("paper.pdf".into(), "Paper".into())
+                .unwrap(),
+            SyncApplicationPdfOpenOutcome::Ready { .. }
+        ));
+        let hls_name = crate::pdf::hls_page_name(&crate::pdf::asset_key("paper.pdf"));
+        let (hls, _) = load_application_logical(&handle, &hls_name, SyncPageKind::Page);
+        assert!(hls
+            .pre_block
+            .as_deref()
+            .is_some_and(|preamble| preamble.contains("../assets/paper.pdf")));
+
+        let SyncApplicationGuideCopyOutcome::Copied { result } = handle
+            .copy_application_guide("Features/Sheets".into())
+            .unwrap()
+        else {
+            panic!("clean guide copy unexpectedly deferred")
+        };
+        assert!(result.created);
+        assert!(result.created_pages.len() > 5);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }
