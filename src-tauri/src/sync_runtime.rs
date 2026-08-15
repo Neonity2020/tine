@@ -110,6 +110,15 @@ impl SparseV2ActivationRecord {
         let private = self.private_root(app)?;
         Ok(SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(SyncLocalActivationIdentities {
+                workspace_id: self.workspace_id,
+                lineage_digest: self.lineage_digest,
+                catalog_document_id: self.catalog_document_id,
+                endpoint_id: self.endpoint_id,
+                device_id: self.device_id,
+                preparation_id: self.preparation_id,
+                session_id: self.activation_session_id,
+            }),
             graph_root: PathBuf::from(&self.graph_root),
             archive_root: private.join("archive"),
             enrollment_root: private.join("enrollment"),
@@ -4260,6 +4269,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tine-sync-facade-legacy-{}", Uuid::new_v4()));
         let opened = facade.open_explicit(SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::LegacyDefault,
+            clean_identities: None,
             graph_root: root.join("missing-graph"),
             enrollment_root: root.join("missing-enrollment"),
             archive_root: root.join("missing-archive"),
@@ -4451,6 +4461,7 @@ mod tests {
         };
         let open_request = SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(request.identities.clone()),
             graph_root: request.graph_root.clone(),
             enrollment_root: request.enrollment_root.clone(),
             archive_root: request.archive_root.clone(),
@@ -4803,6 +4814,7 @@ mod tests {
         };
         let open_request = SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(activation_request.identities.clone()),
             graph_root: activation_request.graph_root.clone(),
             enrollment_root: activation_request.enrollment_root.clone(),
             archive_root: activation_request.archive_root.clone(),

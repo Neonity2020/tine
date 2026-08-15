@@ -2760,6 +2760,7 @@ pub(crate) mod tests {
         pub(crate) fn request(&self) -> crate::sync_runtime::SyncRuntimeOpenRequest {
             crate::sync_runtime::SyncRuntimeOpenRequest {
                 profile: crate::sync_runtime::SyncStorageProfile::ExperimentalLocal,
+                clean_identities: None,
                 graph_root: self.fixture.graph_root.clone(),
                 enrollment_root: self.enrollment_path.clone(),
                 archive_root: self.fixture.archive_root.clone(),

@@ -67,9 +67,10 @@ use crate::oplog::enrollment::{
 use crate::oplog::exact_external_feed::{
     ExactExternalFeedDrain, ExactExternalFeedObserveError, ExactExternalFeedState,
 };
-use crate::oplog::hot_engine::AcceptedFrontierRoot;
+use crate::oplog::hot_engine::{AcceptedFrontierRoot, ShardedHotEngine};
 use crate::oplog::hot_engine::{ProjectionEndpointBinding, ProjectionStorageBinding};
 use crate::oplog::import::{
+    commit_clean_activation, open_clean_activation, prepare_clean_activation,
     prepare_inactive_bootstrap_import_with_progress, publish_install_verify_inactive_bootstrap,
     retain_inactive_bootstrap_accepted_authority, BootstrapPreparationProgress,
     BootstrapPreparationSubphase, BootstrapPreparationSummary,
@@ -87,7 +88,7 @@ use crate::oplog::local_active::{
 use crate::oplog::local_active::{
     activate_verified_local_with_retained_validation, reopen_promoted_local_runtime,
     seal_local_runtime_promotion, take_over_promoted_local_runtime_recovering_projection,
-    InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
+    CleanLocalRuntime, InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
     PromotedLocalRuntime, PromotedRuntimeOpen, PromotedRuntimeRecoveryDiagnostics,
     RuntimeRecoveryState,
 };
@@ -131,11 +132,13 @@ use crate::oplog::shadow_projection::{
     verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence,
     AdjacentTerminalShadowConstruction,
 };
-use crate::oplog::sqlite::ApplicationRuntimeRoot;
 #[cfg(test)]
 use crate::oplog::sqlite::{
     reset_full_digest_scan_instrumentation, take_full_digest_scan_instrumentation,
     BootstrapSqliteRebuildInstrumentation, FullDigestScanInstrumentation,
+};
+use crate::oplog::sqlite::{
+    ApplicationRuntimeRoot, LeasedWorkspaceProjection, WorkspaceRuntimeLease,
 };
 use crate::oplog::sqlite_materialization::MaterializedTaskCandidateBlockRow;
 use crate::oplog::sync_layout::{
@@ -179,9 +182,10 @@ use crate::oplog::{
     ManagedTextKind, MaterializedBlock, MaterializedBlockRow, MaterializedEntityId,
     MaterializedPage, MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit,
     MaterializedTagRow, MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction,
-    PageId, ProjectionEndpointId, ReferenceCatalogPolicyV1, ReferenceFactV1,
-    ReferenceSourceLocatorV1, SemanticOperation, SessionId, SqliteMaterializedRead, WorkspaceId,
-    MANAGED_LOCAL_ANCHOR_V2_BYTES, MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+    PageId, ProjectionClaim, ProjectionEndpointId, RebuildSource, ReferenceCatalogPolicyV1,
+    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
+    SqliteMaterializedRead, WorkspaceId, MANAGED_LOCAL_ANCHOR_V2_BYTES,
+    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
 #[cfg(test)]
 use crate::oplog::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
@@ -189,6 +193,7 @@ use uuid::Uuid;
 
 const ACTOR_CHANNEL_CAPACITY: usize = 64;
 const ACTOR_STACK_BYTES: usize = 16 * 1024 * 1024;
+const CLEAN_OPERATION_ARCHIVE_DIRECTORY: &str = "operations";
 const RUNTIME_OPEN_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);
@@ -1278,6 +1283,11 @@ pub enum SyncStorageProfile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncRuntimeOpenRequest {
     pub profile: SyncStorageProfile,
+    /// Stable identities from the private Tauri binding record. The clean
+    /// marker deliberately contains only durable baseline authority; these
+    /// device-local identities are supplied separately on every cold open.
+    /// Legacy fixtures may omit them until the production cutover is complete.
+    pub clean_identities: Option<SyncLocalActivationIdentities>,
     pub graph_root: PathBuf,
     pub enrollment_root: PathBuf,
     pub archive_root: PathBuf,
@@ -4833,6 +4843,239 @@ fn validate_query_request(
 /// their proof-bearing capabilities outside this module.  Every operation
 /// before the final actor open is explicitly requested by
 /// `SyncLocalActivationRequest`; normal graph startup cannot reach here.
+struct CleanRuntimeResources {
+    graph: Graph,
+    receipts: ProjectionReceiptStore,
+    runtime: CleanLocalRuntime,
+}
+
+fn clean_baseline_directory(archive_root: &Path) -> PathBuf {
+    archive_root.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY)
+}
+
+fn clean_operation_archive_directory(archive_root: &Path) -> PathBuf {
+    archive_root.join(CLEAN_OPERATION_ARCHIVE_DIRECTORY)
+}
+
+/// Construct the production clean runtime directly from one operation-free
+/// baseline episode. Every fallible filesystem capability is opened before
+/// the authority marker where possible; after that marker, any failed
+/// same-process adoption is recoverable through `open_clean_runtime_resources`.
+fn activate_clean_runtime_resources(
+    request: &SyncLocalActivationRequest,
+    graph: Graph,
+    progress: &mut dyn FnMut(SyncLocalActivationProgress),
+) -> Result<CleanRuntimeResources, String> {
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::PrivateSetup,
+    });
+    prepare_activation_private_paths(request)
+        .map_err(|error| format!("prepare clean private activation paths: {error}"))?;
+    fs::create_dir_all(&request.archive_root)
+        .map_err(|error| format!("create clean archive root: {error}"))?;
+    let endpoint = ProjectionEndpointBinding::enroll_graph(
+        &graph,
+        request.identities.endpoint_id,
+        request.identities.device_id,
+    )
+    .map_err(|error| format!("identify clean graph projection endpoint: {error}"))?;
+    let receipts = open_reconstructible_activation_receipts(request, endpoint)?;
+    let operation_archive_path = clean_operation_archive_directory(&request.archive_root);
+    let operation_store =
+        ObjectStore::open(&operation_archive_path, request.identities.workspace_id)
+            .map_err(|error| format!("open clean operation archive: {error}"))?;
+
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::SourceCapture,
+    });
+    let capture = graph
+        .capture_inactive_bootstrap_sources(&request.capture_root)
+        .map_err(display)?;
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::BootstrapImportPreparation,
+    });
+    let preparation = prepare_clean_activation(
+        &graph,
+        capture,
+        request.identities.workspace_id,
+        request.identities.lineage_digest,
+        request.identities.catalog_document_id,
+        &request.preparation_root,
+        &request.database_path,
+        &ReferenceCatalogPolicyV1::default(),
+    )
+    .map_err(display)?;
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::ImmutablePublicationInstall,
+    });
+    let committed = commit_clean_activation(
+        &graph,
+        preparation,
+        &clean_baseline_directory(&request.archive_root),
+        &request.enrollment_root,
+    )
+    .map_err(display)?;
+    let (baseline, projection, accepted_frontier, marker) = committed.into_parts();
+    if marker.workspace_id() != request.identities.workspace_id
+        || marker.lineage_digest() != request.identities.lineage_digest
+    {
+        return Err("clean activation marker differs from explicit identities".into());
+    }
+
+    let mut engine = ShardedHotEngine::new(
+        request.identities.workspace_id,
+        request.identities.lineage_digest,
+        request.identities.catalog_document_id,
+    );
+    engine
+        .configure_reference_catalog_policy(ReferenceCatalogPolicyV1::default())
+        .map_err(display)?;
+    engine
+        .install_lazy_genesis_baseline(Arc::new(baseline))
+        .map_err(display)?;
+    engine
+        .attach_clean_archive_store(operation_store)
+        .map_err(display)?;
+    engine
+        .attach_clean_projection_endpoint(&graph, &receipts)
+        .map_err(display)?;
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::SqliteOpenBuild,
+    });
+    let store = ObjectStore::open(&operation_archive_path, request.identities.workspace_id)
+        .map_err(display)?;
+    let lease =
+        WorkspaceRuntimeLease::acquire(&store, request.identities.workspace_id).map_err(display)?;
+    let projection = LeasedWorkspaceProjection::adopt_clean_genesis(
+        lease,
+        &request.database_path,
+        ProjectionClaim::current(
+            request.identities.workspace_id,
+            request.identities.lineage_digest,
+        ),
+        &accepted_frontier,
+        &store,
+        &engine,
+        projection,
+    )
+    .map_err(|(_, error)| display(error))?;
+    let runtime = CleanLocalRuntime::from_open_parts(
+        request.identities.session_id,
+        endpoint,
+        engine,
+        projection,
+    )
+    .map_err(display)?;
+    Ok(CleanRuntimeResources {
+        graph,
+        receipts,
+        runtime,
+    })
+}
+
+/// Reconstruct the clean runtime from its sole authority marker, immutable
+/// baseline and committed operation manifests. SQLite and Markdown projection
+/// are repaired before mutation authority is returned.
+fn open_clean_runtime_resources(
+    request: &SyncRuntimeOpenRequest,
+) -> Result<Option<CleanRuntimeResources>, String> {
+    let identities = request.clean_identities.as_ref().ok_or_else(|| {
+        "clean managed runtime open has no persisted local identity record".to_owned()
+    })?;
+    let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
+    let endpoint = ProjectionEndpointBinding::enroll_graph(
+        &graph,
+        identities.endpoint_id,
+        identities.device_id,
+    )
+    .map_err(display)?;
+    let receipts = ProjectionReceiptStore::open_for_endpoint(
+        &request.receipt_root,
+        identities.workspace_id,
+        endpoint,
+    )
+    .map_err(display)?;
+    let Some(opened) = open_clean_activation(
+        &request.enrollment_root,
+        &clean_baseline_directory(&request.archive_root),
+        &request.database_path,
+        identities.catalog_document_id,
+        ReferenceCatalogPolicyV1::default(),
+    )
+    .map_err(display)?
+    else {
+        return Ok(None);
+    };
+    if opened.marker().workspace_id() != identities.workspace_id
+        || opened.marker().lineage_digest() != identities.lineage_digest
+    {
+        return Err("clean activation marker differs from persisted local identities".into());
+    }
+    let (mut engine, baseline_projection, _) = opened.into_parts();
+    let operation_archive_path = clean_operation_archive_directory(&request.archive_root);
+    engine
+        .attach_clean_archive_store(
+            ObjectStore::open(&operation_archive_path, identities.workspace_id).map_err(display)?,
+        )
+        .map_err(display)?;
+    let replayed = engine.replay_clean_committed_tail().map_err(display)?;
+    let store =
+        ObjectStore::open(&operation_archive_path, identities.workspace_id).map_err(display)?;
+    let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id).map_err(display)?;
+    let projection = if replayed == 0 {
+        let expected = engine.accepted_frontier_root().map_err(display)?;
+        LeasedWorkspaceProjection::adopt_clean_genesis(
+            lease,
+            &request.database_path,
+            ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
+            &expected,
+            &store,
+            &engine,
+            baseline_projection,
+        )
+        .map_err(|(_, error)| display(error))?
+    } else {
+        drop(baseline_projection);
+        let application_runtime =
+            ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
+                .map_err(display)?;
+        let source = RebuildSource::new(&engine, &store).map_err(display)?;
+        LeasedWorkspaceProjection::open_under(lease, |slot| {
+            let opened = crate::oplog::SqliteFrontier::open_or_rebuild_with_applier_slot(
+                &request.database_path,
+                &application_runtime,
+                ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
+                source,
+                slot,
+            )?;
+            Ok::<_, crate::oplog::SqliteProjectionError>((opened, ()))
+        })
+        .map(|(projection, ())| projection)
+        .map_err(|(_, error)| display(error))?
+    };
+    engine
+        .attach_clean_projection_endpoint(&graph, &receipts)
+        .map_err(display)?;
+    for work in engine.clean_terminal_projection_work().map_err(display)? {
+        crate::oplog::projection::execute_clean_manifested_projection_work(
+            &graph,
+            &receipts,
+            projection.database(),
+            &mut engine,
+            &work,
+        )
+        .map_err(display)?;
+    }
+    let runtime =
+        CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
+            .map_err(display)?;
+    Ok(Some(CleanRuntimeResources {
+        graph,
+        receipts,
+        runtime,
+    }))
+}
+
 /// The one private, process-local activation handoff. It carries every
 /// capability that was proven while building the inactive bootstrap and then
 /// promoted under the same workspace lease. It is deliberately move-only and
@@ -5253,6 +5496,7 @@ fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActi
     let opened = SyncRuntimeHandle::open_with_session(
         SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(request.identities.clone()),
             graph_root: request.graph_root,
             enrollment_root: request.enrollment_root,
             archive_root: request.archive_root,
@@ -5288,6 +5532,7 @@ fn activation_open_same_process_runtime(
     let opened = SyncRuntimeHandle::open_from_same_process_activation(
         SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(request.identities.clone()),
             graph_root: request.graph_root,
             enrollment_root: request.enrollment_root,
             archive_root: request.archive_root,
@@ -25294,6 +25539,7 @@ mod tests {
             root.clone(),
             SyncRuntimeOpenRequest {
                 profile,
+                clean_identities: None,
                 graph_root,
                 enrollment_root: root.join("enrollment"),
                 archive_root: root.join("archive"),
@@ -40140,6 +40386,7 @@ mod tests {
     fn reopen_request(request: &SyncLocalActivationRequest) -> SyncRuntimeOpenRequest {
         SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(request.identities.clone()),
             graph_root: request.graph_root.clone(),
             enrollment_root: request.enrollment_root.clone(),
             archive_root: request.archive_root.clone(),
@@ -40150,6 +40397,114 @@ mod tests {
             provider_root: request.provider_root.clone(),
             provider_journal_root: request.provider_journal_root.clone(),
         }
+    }
+
+    #[test]
+    fn clean_runtime_factories_adopt_marker_and_cold_reopen_without_legacy_enrollment() {
+        let fixture = ActivationFixture::nested_unicode("clean-runtime-factories", 0xa170);
+        let original = user_graph_bytes(&fixture.graph_root);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let mut progress = Vec::new();
+        let mut resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |detail| {
+                progress.push(detail)
+            })
+            .unwrap();
+        assert_eq!(
+            resources.runtime.engine().accepted_batch_count().unwrap(),
+            0
+        );
+        assert_eq!(
+            resources
+                .runtime
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            0
+        );
+        assert!(fixture
+            .request
+            .enrollment_root
+            .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+            .is_file());
+        assert_eq!(user_graph_bytes(&fixture.graph_root), original);
+        assert!(progress.iter().any(|detail| matches!(
+            detail,
+            SyncLocalActivationProgress::Phase {
+                phase: SyncLocalActivationPhase::SourceCapture
+            }
+        )));
+        let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
+        let owner = resources
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&root_path, 2)
+            .unwrap()
+            .pop()
+            .expect("clean SQLite names Root.md");
+        let page = resources
+            .runtime
+            .engine()
+            .materialize_page(owner.page_id)
+            .unwrap();
+        let block = page.blocks.first().expect("Root.md has one block");
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+            },
+            content: "clean factory edit".into(),
+        }])
+        .unwrap();
+        let state = {
+            let mut session = resources
+                .runtime
+                .admit_clean_mutation(&resources.graph)
+                .unwrap();
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &resources.graph,
+                &resources.receipts,
+                &transaction,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            state,
+            crate::oplog::operational_coordinator::CleanLocalMutationState::Complete(_)
+        ));
+        assert_eq!(
+            resources
+                .runtime
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            1
+        );
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("clean factory edit"));
+        let after_edit = user_graph_bytes(&fixture.graph_root);
+        drop(resources);
+
+        let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .expect("clean activation marker cold-opens");
+        assert_eq!(reopened.runtime.engine().accepted_batch_count().unwrap(), 1);
+        assert_eq!(
+            reopened
+                .runtime
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            1
+        );
+        assert_eq!(user_graph_bytes(&fixture.graph_root), after_edit);
     }
 
     #[test]

@@ -33,6 +33,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
     };
     let open_request = SyncRuntimeOpenRequest {
         profile: SyncStorageProfile::ExperimentalLocal,
+        clean_identities: Some(identities.clone()),
         graph_root: graph_root.clone(),
         archive_root: private_root.join("archive"),
         enrollment_root: private_root.join("enrollment"),
