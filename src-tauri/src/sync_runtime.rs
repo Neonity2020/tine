@@ -720,6 +720,8 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
                 SyncRuntimeRecovery::ResumedOwnUnsafe => "resumed_own_unsafe",
                 SyncRuntimeRecovery::AdoptedSafeHandoff => "adopted_safe_handoff",
                 SyncRuntimeRecovery::TookOverCrashedUnsafe => "took_over_crashed_unsafe",
+                SyncRuntimeRecovery::CleanActivation => "clean_activation",
+                SyncRuntimeRecovery::CleanManifestReplay => "clean_manifest_replay",
             }
             .into()
         }),

@@ -184,9 +184,9 @@ use crate::oplog::{
     ManagedTextKind, MaterializedBlock, MaterializedBlockRow, MaterializedEntityId,
     MaterializedPage, MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit,
     MaterializedTagRow, MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction,
-    PageId, ProjectionClaim, ProjectionEndpointId, RebuildSource, ReferenceCatalogPolicyV1,
-    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
-    SqliteMaterializedRead, WorkspaceId, MANAGED_LOCAL_ANCHOR_V2_BYTES,
+    PageId, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
+    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
+    SessionId, SqliteMaterializedRead, WorkspaceId, MANAGED_LOCAL_ANCHOR_V2_BYTES,
     MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
 #[cfg(test)]
@@ -1783,6 +1783,8 @@ pub enum SyncRuntimeRecovery {
     ResumedOwnUnsafe,
     AdoptedSafeHandoff,
     TookOverCrashedUnsafe,
+    CleanActivation,
+    CleanManifestReplay,
 }
 
 /// Ordered startup phases for an existing managed-storage runtime.
@@ -1793,6 +1795,7 @@ pub enum SyncRuntimeRecovery {
 pub enum SyncRuntimeOpenPhase {
     RetainingGraph,
     DiscoveringEnrollment,
+    RecoveringCleanManifestRuntime,
     OpeningActorGraph,
     RevalidatingEnrollment,
     OpeningEnrollment,
@@ -3307,6 +3310,35 @@ impl SyncRuntimeHandle {
         }
 
         let open_started = Instant::now();
+        let mut clean_request = request.clone();
+        let clean_identities = clean_request.clean_identities.as_mut().map(|identities| {
+            identities.session_id = session_id;
+            identities.clone()
+        });
+        if let Some(clean_identities) = clean_identities {
+            progress(SyncRuntimeOpenProgress::Phase {
+                phase: SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime,
+                elapsed: open_started.elapsed(),
+            });
+            match open_clean_runtime_resources(&clean_request) {
+                Ok(Some(resources)) => {
+                    progress(SyncRuntimeOpenProgress::Phase {
+                        phase: SyncRuntimeOpenPhase::AssemblingActor,
+                        elapsed: open_started.elapsed(),
+                    });
+                    return Self::open_from_clean_resources(
+                        clean_request,
+                        clean_identities,
+                        resources,
+                        SyncRuntimeRecovery::CleanManifestReplay,
+                    );
+                }
+                Ok(None) => {}
+                Err(detail) => {
+                    return refused(format!("clean managed runtime open failed: {detail}"))
+                }
+            }
+        }
         progress(SyncRuntimeOpenProgress::Phase {
             phase: SyncRuntimeOpenPhase::RetainingGraph,
             elapsed: open_started.elapsed(),
@@ -3584,6 +3616,110 @@ impl SyncRuntimeHandle {
                 drop(sender);
                 let _ = join.join();
                 refused("sync actor stopped during startup".into())
+            }
+        }
+    }
+
+    fn open_from_clean_resources(
+        request: SyncRuntimeOpenRequest,
+        identities: SyncLocalActivationIdentities,
+        resources: CleanRuntimeResources,
+        recovery: SyncRuntimeRecovery,
+    ) -> SyncRuntimeOpenResult {
+        let graph_resource_id = resources.runtime.endpoint().graph_resource_id();
+        #[cfg(test)]
+        let workspace_id = identities.workspace_id;
+        let initial = SyncRuntimeStatusSnapshot {
+            lifecycle: SyncRuntimeLifecycle::Active,
+            recovery: None,
+            watcher: SyncWatcherStatus::default(),
+            last_tick: None,
+            detail: Some("actor startup is adopting clean manifest authority".into()),
+            shared_role: None,
+            shared_phase: None,
+            provider_pending: 0,
+            managed_local_pending: 0,
+            managed_local_checkpointed_sequence: 0,
+            managed_local_next_sequence: 0,
+            managed_local_stage: None,
+        };
+        let status = Arc::new(RwLock::new(initial));
+        let (sender, receiver) = mpsc::sync_channel(ACTOR_CHANNEL_CAPACITY);
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let actor_status = Arc::clone(&status);
+        let thread_name = format!("tine-sync-{}", &graph_resource_id.to_string()[..12]);
+        let join = match thread::Builder::new()
+            .name(thread_name)
+            .stack_size(ACTOR_STACK_BYTES)
+            .spawn(move || {
+                #[cfg(test)]
+                ACTOR_THREADS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    actor_thread_from_clean_resources(
+                        request,
+                        identities,
+                        resources,
+                        recovery,
+                        receiver,
+                        started_sender,
+                        &actor_status,
+                    )
+                }));
+                if result.is_err() {
+                    *actor_status.write().unwrap() = SyncRuntimeStatusSnapshot {
+                        lifecycle: SyncRuntimeLifecycle::StoppedCrashed,
+                        recovery: None,
+                        watcher: SyncWatcherStatus::default(),
+                        last_tick: None,
+                        detail: Some("clean sync actor panicked".into()),
+                        shared_role: None,
+                        shared_phase: None,
+                        provider_pending: 0,
+                        managed_local_pending: 0,
+                        managed_local_checkpointed_sequence: 0,
+                        managed_local_next_sequence: 0,
+                        managed_local_stage: None,
+                    };
+                }
+                #[cfg(test)]
+                ACTOR_THREADS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }) {
+            Ok(join) => join,
+            Err(error) => return refused(format!("cannot start clean sync actor thread: {error}")),
+        };
+        match started_receiver.recv() {
+            Ok(ActorStartupEvent::Finished(Ok(snapshot))) => {
+                *status.write().unwrap() = snapshot;
+                SyncRuntimeOpenResult {
+                    status: SyncRuntimeOpenStatus::Active,
+                    handle: Some(Self {
+                        inner: Arc::new(HandleInner {
+                            enrollment_operation: Mutex::new(()),
+                            operation: Mutex::new(()),
+                            sender: Mutex::new(Some(sender)),
+                            join: Mutex::new(Some(join)),
+                            status,
+                            application_search_lanes: Mutex::new(HashMap::new()),
+                            #[cfg(test)]
+                            workspace_id,
+                        }),
+                    }),
+                }
+            }
+            Ok(ActorStartupEvent::Finished(Err(detail))) => {
+                drop(sender);
+                let _ = join.join();
+                refused(detail)
+            }
+            Ok(ActorStartupEvent::Phase(_)) | Ok(ActorStartupEvent::RecoveryDiagnostics(_)) => {
+                drop(sender);
+                let _ = join.join();
+                refused("clean sync actor reported an unexpected startup event".into())
+            }
+            Err(_) => {
+                drop(sender);
+                let _ = join.join();
+                refused("clean sync actor stopped during startup".into())
             }
         }
     }
@@ -4859,7 +4995,7 @@ struct CleanRuntimeResources {
 /// In particular it does not recreate the managed-local journal or any
 /// Patricia-backed promotion state merely to fit the old actor shape.
 struct CleanRuntimeActorCore {
-    resources: CleanRuntimeResources,
+    runtime: CleanLocalRuntime,
     pending: Option<CleanPublishedContinuation>,
 }
 
@@ -4888,15 +5024,17 @@ impl From<OperationalCoordinatorError> for CleanActorMutationFailure {
 }
 
 impl CleanRuntimeActorCore {
-    fn new(resources: CleanRuntimeResources) -> Self {
+    fn new(runtime: CleanLocalRuntime) -> Self {
         Self {
-            resources,
+            runtime,
             pending: None,
         }
     }
 
     fn execute_local(
         &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
@@ -4906,38 +5044,28 @@ impl CleanRuntimeActorCore {
             });
         }
         let state = {
-            let mut session = self
-                .resources
-                .runtime
-                .admit_clean_mutation(&self.resources.graph)
-                .map_err(|error| CleanActorMutationFailure {
+            let mut session = self.runtime.admit_clean_mutation(graph).map_err(|error| {
+                CleanActorMutationFailure {
                     phase: OperationalPhase::Bindings,
                     detail: error.to_string(),
-                })?;
-            OperationalCoordinator::execute_clean_local(
-                &mut session,
-                &self.resources.graph,
-                &self.resources.receipts,
-                transaction,
-            )
-            .map_err(CleanActorMutationFailure::from)?
+                }
+            })?;
+            OperationalCoordinator::execute_clean_local(&mut session, graph, receipts, transaction)
+                .map_err(CleanActorMutationFailure::from)?
         };
         Ok(self.retain_outcome(state))
     }
 
-    fn retry_pending(&mut self) -> Option<CleanActorMutationOutcome> {
+    fn retry_pending(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+    ) -> Option<CleanActorMutationOutcome> {
         let pending = self.pending.take()?;
-        let state = match self
-            .resources
-            .runtime
-            .admit_clean_derived_recovery(&self.resources.graph)
-        {
-            Ok(mut session) => OperationalCoordinator::retry_clean_local(
-                &mut session,
-                &self.resources.graph,
-                &self.resources.receipts,
-                pending,
-            ),
+        let state = match self.runtime.admit_clean_derived_recovery(graph) {
+            Ok(mut session) => {
+                OperationalCoordinator::retry_clean_local(&mut session, graph, receipts, pending)
+            }
             Err(_) => {
                 self.pending = Some(pending);
                 let pending = self.pending.as_ref().expect("pending was restored");
@@ -4970,8 +5098,8 @@ impl CleanRuntimeActorCore {
         page_id: PageId,
     ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
         load_current_editor_page_from_projection(
-            self.resources.runtime.engine(),
-            self.resources.runtime.database(),
+            self.runtime.engine(),
+            self.runtime.database(),
             page_id,
         )
     }
@@ -8095,6 +8223,25 @@ fn actor_thread_from_same_process_activation(
     run_actor_loop(actor, receiver, started, shared_status);
 }
 
+fn actor_thread_from_clean_resources(
+    request: SyncRuntimeOpenRequest,
+    identities: SyncLocalActivationIdentities,
+    resources: CleanRuntimeResources,
+    recovery: SyncRuntimeRecovery,
+    receiver: Receiver<ActorRequest>,
+    started: SyncSender<ActorStartupEvent>,
+    shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
+) {
+    let actor = match RuntimeActor::from_clean_resources(request, identities, resources, recovery) {
+        Ok(actor) => actor,
+        Err(error) => {
+            let _ = started.send(ActorStartupEvent::Finished(Err(error)));
+            return;
+        }
+    };
+    run_actor_loop(actor, receiver, started, shared_status);
+}
+
 fn run_actor_loop(
     mut actor: RuntimeActor,
     receiver: Receiver<ActorRequest>,
@@ -9935,9 +10082,82 @@ impl ProviderDependencyIndex {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActorRuntimeBinding {
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    endpoint_id: ProjectionEndpointId,
+    device_id: DeviceId,
+    graph_resource_id: CanonicalGraphResourceId,
+    receipt_store_id: ProjectionReceiptStoreId,
+}
+
+impl ActorRuntimeBinding {
+    fn from_legacy(binding: &EnrollmentBindingV1) -> Self {
+        Self {
+            workspace_id: binding.workspace_id(),
+            lineage_digest: binding.lineage_digest(),
+            catalog_document_id: binding.catalog_document_id(),
+            endpoint_id: binding.endpoint_id(),
+            device_id: binding.device_id(),
+            graph_resource_id: binding.graph_resource_id(),
+            receipt_store_id: binding.receipt_store_id(),
+        }
+    }
+
+    fn from_clean(
+        identities: &SyncLocalActivationIdentities,
+        endpoint: ProjectionEndpointBinding,
+        receipts: &ProjectionReceiptStore,
+    ) -> Self {
+        Self {
+            workspace_id: identities.workspace_id,
+            lineage_digest: identities.lineage_digest,
+            catalog_document_id: identities.catalog_document_id,
+            endpoint_id: identities.endpoint_id,
+            device_id: identities.device_id,
+            graph_resource_id: endpoint.graph_resource_id(),
+            receipt_store_id: receipts.store_id(),
+        }
+    }
+
+    const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    const fn catalog_document_id(&self) -> DocumentId {
+        self.catalog_document_id
+    }
+
+    const fn endpoint_id(&self) -> ProjectionEndpointId {
+        self.endpoint_id
+    }
+
+    const fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    const fn graph_resource_id(&self) -> CanonicalGraphResourceId {
+        self.graph_resource_id
+    }
+
+    const fn receipt_store_id(&self) -> ProjectionReceiptStoreId {
+        self.receipt_store_id
+    }
+}
+
 struct RuntimeActor {
     graph: Graph,
     receipts: ProjectionReceiptStore,
+    /// Present only for the clean baseline-plus-manifest architecture. During
+    /// the bounded cutover the legacy fields remain populated only by legacy
+    /// opens; no request is allowed to combine the two mutation engines.
+    clean: Option<CleanRuntimeActorCore>,
     authority: Option<LocalActiveAuthority>,
     runtime: Option<PromotedLocalRuntime>,
     feed: Option<ExactExternalFeedState>,
@@ -9968,7 +10188,8 @@ struct RuntimeActor {
     terminal: Option<String>,
     stopped_safe: bool,
     enrollment_root: EnrollmentApplicationRoot,
-    binding: EnrollmentBindingV1,
+    binding: ActorRuntimeBinding,
+    legacy_binding: Option<EnrollmentBindingV1>,
     session_id: SessionId,
     promotion_session_id: SessionId,
     promoted_state_digest: ContentDigest,
@@ -11120,6 +11341,26 @@ fn open_managed_local_runtime(
 }
 
 impl RuntimeActor {
+    fn active_engine(&self) -> Result<&ShardedHotEngine, SyncRuntimeRequestError> {
+        if let Some(clean) = self.clean.as_ref() {
+            return Ok(clean.runtime.engine());
+        }
+        self.runtime
+            .as_ref()
+            .map(PromotedLocalRuntime::engine)
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    fn active_database(&self) -> Result<&crate::oplog::SqliteFrontier, SyncRuntimeRequestError> {
+        if let Some(clean) = self.clean.as_ref() {
+            return Ok(clean.runtime.database());
+        }
+        self.runtime
+            .as_ref()
+            .map(PromotedLocalRuntime::database)
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)
+    }
+
     fn open(
         request: SyncRuntimeOpenRequest,
         advisory: LocalActiveAdvisory,
@@ -11450,9 +11691,11 @@ impl RuntimeActor {
         let actor_provider_descriptor_probe = phase_started.elapsed();
         #[cfg(test)]
         let phase_started = Instant::now();
+        let actor_binding = ActorRuntimeBinding::from_legacy(&binding);
         let actor = Self {
             graph,
             receipts,
+            clean: None,
             authority: Some(authority),
             runtime: Some(runtime),
             feed: Some(feed),
@@ -11482,7 +11725,8 @@ impl RuntimeActor {
             session_id,
             promotion_session_id,
             promoted_state_digest,
-            binding,
+            binding: actor_binding,
+            legacy_binding: Some(binding),
             provider_root: request.provider_root,
             provider_journal_root: request.provider_journal_root,
             provider,
@@ -11552,6 +11796,133 @@ impl RuntimeActor {
             },
         );
         Ok(actor)
+    }
+
+    /// Assemble the actor around the clean baseline-plus-manifest runtime.
+    /// Legacy enrollment, promotion, managed-local journal and Patricia
+    /// resources are deliberately absent. Requests that have not yet been cut
+    /// over therefore cannot accidentally fall through into the old engine.
+    fn from_clean_resources(
+        request: SyncRuntimeOpenRequest,
+        identities: SyncLocalActivationIdentities,
+        resources: CleanRuntimeResources,
+        recovery: SyncRuntimeRecovery,
+    ) -> Result<Self, String> {
+        let CleanRuntimeResources {
+            graph,
+            receipts,
+            runtime,
+        } = resources;
+        if runtime.session_id() != identities.session_id
+            || runtime.endpoint().endpoint_id() != identities.endpoint_id
+            || runtime.endpoint().device_id() != identities.device_id
+        {
+            return Err("clean actor identities differ from the retained runtime".into());
+        }
+        let binding = ActorRuntimeBinding::from_clean(&identities, runtime.endpoint(), &receipts);
+        let promoted_state_digest = runtime
+            .engine()
+            .accepted_frontier_root()
+            .map_err(display)?
+            .state_digest();
+        let enrollment_root =
+            open_existing_enrollment_application_root(&request.enrollment_root).map_err(display)?;
+        ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
+            .map_err(display)?;
+        let application_runtime_directory =
+            Dir::open_ambient_dir(&request.application_runtime_root, ambient_authority())
+                .map_err(|error| format!("cannot retain application runtime root: {error}"))?;
+        ensure_directory_nofollow(&application_runtime_directory, "move-episodes")
+            .map_err(display)?;
+        let move_episode_directory =
+            open_dir_nofollow(&application_runtime_directory, "move-episodes").map_err(display)?;
+        Ok(Self {
+            graph,
+            receipts,
+            clean: Some(CleanRuntimeActorCore::new(runtime)),
+            authority: None,
+            runtime: None,
+            feed: None,
+            local_mutation: None,
+            correlated_move_feed_handoffs: BTreeSet::new(),
+            managed_local: None,
+            move_episode_directory,
+            #[cfg(test)]
+            fail_next_move_episode_publication_after_write: false,
+            #[cfg(test)]
+            fail_next_correlated_move_after_blocked: false,
+            #[cfg(test)]
+            forced_next_move_episode_batch_id: None,
+            prepared_application_reply: None,
+            hot_application_save_page: None,
+            #[cfg(test)]
+            managed_application_query_instrumentation: std::cell::Cell::new(
+                ManagedApplicationQueryInstrumentation::default(),
+            ),
+            startup_recovery_diagnostics: None,
+            recovery,
+            last_watcher: SyncWatcherStatus::default(),
+            last_tick: None,
+            terminal: None,
+            stopped_safe: false,
+            enrollment_root,
+            binding,
+            legacy_binding: None,
+            session_id: identities.session_id,
+            promotion_session_id: identities.session_id,
+            promoted_state_digest,
+            provider_root: request.provider_root,
+            provider_journal_root: request.provider_journal_root,
+            provider: None,
+            shared_descriptor: None,
+            shared_role: None,
+            shared_phase: None,
+            provider_exact: VecDeque::new(),
+            provider_rescan_requested: false,
+            provider_rescan_required_for_safe: false,
+            provider_full_scan_requested: false,
+            provider_observation_cursor: None,
+            provider_observation_full: false,
+            provider_scan_valid_heads: 0,
+            provider_scan_invalid_head: false,
+            provider_head_generations: BTreeMap::new(),
+            provider_own_heads: BTreeMap::new(),
+            provider_direct_manifests: VecDeque::new(),
+            provider_direct_queued: BTreeSet::new(),
+            provider_discovery_scan_complete: false,
+            provider_head_dirty: false,
+            provider_current_head: None,
+            provider_head_retirement: VecDeque::new(),
+            provider_intents: BTreeMap::new(),
+            provider_intent_retirement: VecDeque::new(),
+            provider_intent_retirement_scan_active: false,
+            provider_intent_retirement_scan_after: None,
+            provider_pending: ProviderDependencyIndex::default(),
+            provider_dependency_recheck_frontier: None,
+            provider_continuation: None,
+            provider_incomplete: BTreeSet::new(),
+            provider_incomplete_recheck: VecDeque::new(),
+            provider_accepted_archive_loss: BTreeSet::new(),
+            provider_accepted_manifest_audit: None,
+            provider_accepted_manifest_audit_covered_sequence: 0,
+            provider_accepted_manifest_revalidation_next_sequence: 1,
+            provider_accepted_manifest_revalidation_ready: false,
+            provider_accepted_manifest_revalidation_after_external_tick: false,
+            provider_objects_changed: false,
+            provider_publication_probe: false,
+            provider_publication_cursor: None,
+            provider_publication_forced: VecDeque::new(),
+            provider_descriptor_repair_requested: false,
+            provider_namespace_repair_active: false,
+            provider_publication_repair_requested: false,
+            provider_publication_repair_cursor: None,
+            provider_recovery_coverage_root: None,
+            provider_recovery_exact: VecDeque::new(),
+            provider_recovery_backfill_requested: false,
+            provider_recovery_backfill_cursor: None,
+            pending_join: None,
+            _not_send_or_sync: PhantomData,
+        })
     }
 
     fn take_startup_recovery_diagnostics(&mut self) -> Option<SyncRuntimeRecoveryDiagnostics> {
@@ -11947,12 +12318,9 @@ impl RuntimeActor {
         if let Some(detail) = &self.terminal {
             return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
         }
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
+        let engine = self.active_engine()?;
+        let database = self.active_database()?;
+        let read = database
             .materialized_read()
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         match request {
@@ -11974,8 +12342,7 @@ impl RuntimeActor {
             SyncRuntimeQueryRequest::ResolvePageByName { name, page_kind } => {
                 let name = LogicalPageName::parse(name)
                     .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
-                let authenticated_owner = runtime
-                    .engine()
+                let authenticated_owner = engine
                     .resolve_logical_page_name(&name)
                     .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
                 let pages = read
@@ -12085,14 +12452,13 @@ impl RuntimeActor {
             SyncRuntimeQueryRequest::ReferencesToPageName { name, limit } => {
                 let name = crate::oplog::LogicalPageName::parse(name)
                     .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
-                let store = runtime.engine().archive_store().ok_or_else(|| {
+                let store = engine.archive_store().ok_or_else(|| {
                     SyncRuntimeRequestError::ActorRefused(
                         "promoted runtime has no retained archive capability".into(),
                     )
                 })?;
-                let mut query = runtime
-                    .database()
-                    .frontier_reference_query(runtime.engine(), store)
+                let mut query = database
+                    .frontier_reference_query(engine, store)
                     .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
                 Ok(SyncRuntimeQueryReply::References(
                     query
@@ -12108,14 +12474,13 @@ impl RuntimeActor {
                 let uuid = uuid::Uuid::parse_str(&logseq_uuid)
                     .map(LogseqUuid::from_uuid)
                     .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
-                let store = runtime.engine().archive_store().ok_or_else(|| {
+                let store = engine.archive_store().ok_or_else(|| {
                     SyncRuntimeRequestError::ActorRefused(
                         "promoted runtime has no retained archive capability".into(),
                     )
                 })?;
-                let mut query = runtime
-                    .database()
-                    .frontier_reference_query(runtime.engine(), store)
+                let mut query = database
+                    .frontier_reference_query(engine, store)
                     .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
                 Ok(SyncRuntimeQueryReply::References(
                     query
@@ -12370,15 +12735,16 @@ impl RuntimeActor {
     fn application_materialized_read_ready(
         &self,
     ) -> Result<SqliteMaterializedRead<'_>, SyncApplicationPageRequestError> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let database = self
+            .active_database()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = database
             .materialized_read()
             .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
+        ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())
             .map_err(map_editor_application_error)?;
         Ok(read)
     }
@@ -17818,6 +18184,9 @@ impl RuntimeActor {
             PreparedEditorProjection,
         )>,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
+        if self.clean.is_some() {
+            return self.execute_clean_editor_transaction(transaction, page_id, affected_page_ids);
+        }
         let execution = {
             let authority = self
                 .authority
@@ -18130,6 +18499,65 @@ impl RuntimeActor {
                     state: SyncEditorDeferred::Revoked {
                         batch_id: batch_id.map(|id| id.to_string()),
                         phase,
+                    },
+                    affected_page_ids,
+                })
+            }
+        }
+    }
+
+    fn execute_clean_editor_transaction(
+        &mut self,
+        transaction: OperationTransaction,
+        page_id: PageId,
+        affected_page_ids: Vec<String>,
+    ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
+        debug_assert!(self.runtime.is_none());
+        debug_assert!(self.authority.is_none());
+        debug_assert!(self.managed_local.is_none());
+        let outcome = self
+            .clean
+            .as_mut()
+            .expect("clean transaction is routed only to a clean actor")
+            .execute_local(&self.graph, &self.receipts, &transaction)
+            .map_err(|failure| {
+                let code = trusted_local_preparation_refusal_code(failure.phase);
+                if runtime_debug_diagnostics_enabled() {
+                    SyncEditorRequestError::ActorRefusedWithDebugDetail {
+                        code,
+                        debug_detail: failure.detail,
+                    }
+                } else {
+                    SyncEditorRequestError::ActorRefusedWithCode(code)
+                }
+            })?;
+        match outcome {
+            CleanActorMutationOutcome::Durable(batch_id) => {
+                let current = self
+                    .clean
+                    .as_ref()
+                    .expect("clean runtime remains installed")
+                    .load_current_editor_page(page_id)
+                    .map_err(|error| {
+                        editor_refusal_with_code(
+                            error,
+                            SyncEditorRefusalCode::PostCommitCurrentPageLookup,
+                        )
+                    })?
+                    .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
+                        SyncEditorRefusalCode::PostCommitCurrentPageLookup,
+                    ))?;
+                Ok(SyncEditorSaveOutcome::Durable {
+                    batch_id: batch_id.to_string(),
+                    page: current.dto,
+                    affected_page_ids,
+                })
+            }
+            CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
+                Ok(SyncEditorSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::RetryableRetainedPublication {
+                        batch_id: batch_id.to_string(),
+                        phase: map_local_phase(phase),
                     },
                     affected_page_ids,
                 })
@@ -18727,7 +19155,15 @@ impl RuntimeActor {
         // corrupt highest selector was already refused during open.
         let mut active = managed_local_active_anchor_names(&names, device_id)
             .into_iter()
-            .map(|name| decode_managed_local_active_anchor(&directory, &name, &self.binding))
+            .map(|name| {
+                decode_managed_local_active_anchor(
+                    &directory,
+                    &name,
+                    self.legacy_binding
+                        .as_ref()
+                        .expect("managed-local runtime retains its legacy enrollment binding"),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         active.sort_unstable_by(|left, right| right.generation.cmp(&left.generation));
         for anchor in &active {
@@ -18782,7 +19218,9 @@ impl RuntimeActor {
                 }
                 let retained = retained_managed_local_anchor_tuples(
                     &directory,
-                    &self.binding,
+                    self.legacy_binding
+                        .as_ref()
+                        .expect("managed-local runtime retains its legacy enrollment binding"),
                     current_schema2_generation,
                 )?;
                 let retained_refusal = format!(
@@ -18817,8 +19255,13 @@ impl RuntimeActor {
             .cloned()
             .collect::<Vec<_>>();
         for marker_name in marker_names {
-            let retired =
-                decode_managed_local_retired_anchor(&directory, &marker_name, &self.binding)?;
+            let retired = decode_managed_local_retired_anchor(
+                &directory,
+                &marker_name,
+                self.legacy_binding
+                    .as_ref()
+                    .expect("managed-local runtime retains its legacy enrollment binding"),
+            )?;
             let active_names = managed_local_directory_names(
                 &directory,
                 #[cfg(test)]
@@ -18831,7 +19274,9 @@ impl RuntimeActor {
             }
             let retained = retained_managed_local_anchor_tuples(
                 &directory,
-                &self.binding,
+                self.legacy_binding
+                    .as_ref()
+                    .expect("managed-local runtime retains its legacy enrollment binding"),
                 current_schema2_generation,
             )?;
             let retained_refusal = format!(
@@ -18852,7 +19297,9 @@ impl RuntimeActor {
 
         let retained = retained_managed_local_anchor_tuples(
             &directory,
-            &self.binding,
+            self.legacy_binding
+                .as_ref()
+                .expect("managed-local runtime retains its legacy enrollment binding"),
             current_schema2_generation,
         )?;
         let names = managed_local_directory_names(
@@ -18913,7 +19360,9 @@ impl RuntimeActor {
         )?;
         let retained = retained_managed_local_anchor_tuples(
             &directory,
-            &self.binding,
+            self.legacy_binding
+                .as_ref()
+                .expect("managed-local runtime retains its legacy enrollment binding"),
             current_schema2_generation,
         )?;
         let active_names = managed_local_active_anchor_names(&names, device_id);
@@ -19167,7 +19616,9 @@ impl RuntimeActor {
                 drop(prepared);
                 open_exact_managed_local_v2_successor(
                     directory,
-                    &self.binding,
+                    self.legacy_binding
+                        .as_ref()
+                        .expect("managed-local runtime retains its legacy enrollment binding"),
                     selector_generation,
                     &anchor,
                 )
@@ -19182,7 +19633,9 @@ impl RuntimeActor {
                 drop(prepared);
                 open_exact_managed_local_v2_successor(
                     directory,
-                    &self.binding,
+                    self.legacy_binding
+                        .as_ref()
+                        .expect("managed-local runtime retains its legacy enrollment binding"),
                     selector_generation,
                     &anchor,
                 )
@@ -19226,9 +19679,36 @@ impl RuntimeActor {
         outcome
     }
 
+    fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
+        let Some(outcome) = self
+            .clean
+            .as_mut()
+            .expect("clean tick is routed only to a clean actor")
+            .retry_pending(&self.graph, &self.receipts)
+        else {
+            return SyncRuntimeTick::Idle;
+        };
+        match outcome {
+            CleanActorMutationOutcome::Durable(batch_id) => {
+                SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable { batch_id })
+            }
+            CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
+                SyncRuntimeTick::LocalMutation(
+                    SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: Some(batch_id),
+                        phase: map_local_phase(phase),
+                    },
+                )
+            }
+        }
+    }
+
     fn tick_inner(&mut self) -> SyncRuntimeTick {
         if let Some(detail) = &self.terminal {
             return SyncRuntimeTick::Terminal(detail.clone());
+        }
+        if self.clean.is_some() {
+            return self.tick_clean_runtime();
         }
         if let Some(outcome) = self.advance_local_mutation_once() {
             return SyncRuntimeTick::LocalMutation(outcome);
@@ -22340,6 +22820,32 @@ impl RuntimeActor {
                 "clean shutdown refused by terminal runtime: {detail}"
             )));
         }
+        if self.clean.is_some() {
+            for _ in 0..MAX_CLEAN_DRAIN_TURNS {
+                let Some(outcome) = self
+                    .clean
+                    .as_mut()
+                    .expect("clean actor remains installed")
+                    .retry_pending(&self.graph, &self.receipts)
+                else {
+                    self.stopped_safe = true;
+                    return Ok(SyncShutdownOutcome::Safe(self.snapshot()));
+                };
+                if matches!(outcome, CleanActorMutationOutcome::Durable(_)) {
+                    continue;
+                }
+            }
+            let pending = self
+                .clean
+                .as_ref()
+                .and_then(|clean| clean.pending.as_ref())
+                .expect("bounded clean shutdown stopped only with retained work");
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "clean shutdown awaits committed batch {} at {:?}",
+                pending.batch_id(),
+                pending.failure().phase()
+            )));
+        }
         if self.local_mutation.is_some() {
             let outcome = self.advance_local_mutation_once();
             if self.local_mutation.is_some() {
@@ -22685,8 +23191,13 @@ impl RuntimeActor {
         self.runtime.take();
         self.authority.take();
         let namespace = shared_namespace_digest(self.binding.workspace_id());
-        let descriptor = prepare_shared_enrollment(&self.enrollment_root, &self.binding, namespace)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let legacy_binding = self
+            .legacy_binding
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+        let descriptor =
+            prepare_shared_enrollment(&self.enrollment_root, legacy_binding, namespace)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         share_prepared_cut(self.binding.workspace_id())?;
         let mut provider =
             SharedProviderTransport::open(&self.provider_root, &self.provider_journal_root)
@@ -22721,7 +23232,7 @@ impl RuntimeActor {
                 .retire_publication_intent(&path)
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         }
-        activate_shared_initiator(&self.enrollment_root, &self.binding, &descriptor)
+        activate_shared_initiator(&self.enrollment_root, legacy_binding, &descriptor)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         SyncSharedEnrollmentDescriptor::from_core(descriptor)
             .map_err(SyncRuntimeRequestError::ActorRefused)
@@ -23132,7 +23643,9 @@ impl RuntimeActor {
                         {
                             if local_authorship_is_proven(
                                 &self.provider_journal_root,
-                                &self.binding,
+                                self.legacy_binding
+                                    .as_ref()
+                                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
                                 self.promotion_session_id,
                                 self.promoted_state_digest,
                                 self.runtime
@@ -23242,15 +23755,19 @@ impl RuntimeActor {
         self.feed.take();
         self.runtime.take();
         self.authority.take();
+        let legacy_binding = self
+            .legacy_binding
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
         prepare_shared_join(
             &self.enrollment_root,
-            &self.binding,
+            legacy_binding,
             &descriptor,
             archive_digest,
             unique_count,
         )
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        activate_shared_joiner(&self.enrollment_root, &self.binding, &descriptor)
+        activate_shared_joiner(&self.enrollment_root, legacy_binding, &descriptor)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         SyncSharedEnrollmentDescriptor::from_core(descriptor)
             .map(SharedJoinStep::Complete)
@@ -23260,6 +23777,7 @@ impl RuntimeActor {
     fn latch_terminal(&mut self, detail: String) {
         self.terminal = Some(detail);
         self.refresh_watcher();
+        self.clean.take();
         self.feed.take();
         self.authority.take();
         self.runtime.take();
@@ -23307,9 +23825,10 @@ impl RuntimeActor {
                 + usize::from(self.provider_recovery_backfill_requested)
                 + usize::from(self.provider_recovery_backfill_cursor.is_some())
                 + usize::from(
-                    !self
-                        .provider_recovery_coverage_matches_current_frontier()
-                        .unwrap_or(false),
+                    self.shared_phase == Some(SyncSharedPhase::Active)
+                        && !self
+                            .provider_recovery_coverage_matches_current_frontier()
+                            .unwrap_or(false),
                 )
                 + usize::from(self.provider_rescan_required_for_safe)
                 + usize::from(self.provider_observation_cursor.is_some())
@@ -40670,10 +41189,14 @@ mod tests {
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
         let resources =
             activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
-        let mut actor = CleanRuntimeActorCore::new(resources);
+        let CleanRuntimeResources {
+            graph,
+            receipts,
+            runtime,
+        } = resources;
+        let mut actor = CleanRuntimeActorCore::new(runtime);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
-            .resources
             .runtime
             .database()
             .materialized_read()
@@ -40700,7 +41223,9 @@ mod tests {
         let before = fs::read(fixture.graph_root.join("Root.md")).unwrap();
 
         fail_once_at(OperationalFaultPoint::AfterManifest);
-        let pending = actor.execute_local(&transaction).unwrap();
+        let pending = actor
+            .execute_local(&graph, &receipts, &transaction)
+            .unwrap();
         let pending_batch = match pending {
             CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
                 assert_eq!(phase, OperationalPhase::Publication);
@@ -40713,14 +41238,16 @@ mod tests {
             before,
             "manifest commit must not pretend Markdown projection completed"
         );
-        let same_pending = actor.execute_local(&transaction).unwrap();
+        let same_pending = actor
+            .execute_local(&graph, &receipts, &transaction)
+            .unwrap();
         assert!(matches!(
             same_pending,
             CleanActorMutationOutcome::DurablePending { batch_id, .. }
                 if batch_id == pending_batch
         ));
         assert_eq!(
-            actor.retry_pending(),
+            actor.retry_pending(&graph, &receipts),
             Some(CleanActorMutationOutcome::Durable(pending_batch))
         );
         assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
@@ -40746,6 +41273,120 @@ mod tests {
                 .acceptance_sequence(),
             1
         );
+    }
+
+    #[test]
+    fn clean_runtime_actor_assembles_without_legacy_authority_and_saves_one_edit() {
+        let fixture = ActivationFixture::nested_unicode("clean-runtime-actor", 0xa176);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let page_id = resources
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&ManagedPath::parse("Root.md".to_owned()).unwrap(), 2)
+            .unwrap()[0]
+            .page_id;
+        let page = resources
+            .runtime
+            .engine()
+            .materialize_page(page_id)
+            .unwrap();
+        let block = page.blocks.first().unwrap();
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+            },
+            content: "clean production actor save".into(),
+        }])
+        .unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        )
+        .unwrap();
+        assert!(actor.clean.is_some());
+        assert!(actor.runtime.is_none());
+        assert!(actor.authority.is_none());
+        assert!(actor.legacy_binding.is_none());
+        let saved = actor
+            .execute_clean_editor_transaction(transaction, page_id, vec![page_id.to_string()])
+            .unwrap();
+        assert!(matches!(saved, SyncEditorSaveOutcome::Durable { .. }));
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("clean production actor save"));
+    }
+
+    #[test]
+    fn clean_runtime_handle_serves_sqlite_queries_and_stops_without_legacy_handoff() {
+        let fixture = ActivationFixture::nested_unicode("clean-runtime-handle", 0xa177);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("clean actor handle opens");
+        assert_eq!(
+            handle.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::CleanActivation)
+        );
+        let pages = handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: 32,
+            })
+            .unwrap();
+        assert!(matches!(pages, SyncRuntimeQueryReply::Pages(ref pages) if !pages.is_empty()));
+        assert_eq!(handle.tick().unwrap(), SyncRuntimeTick::Idle);
+        let stopped = handle.clean_shutdown().unwrap();
+        assert!(matches!(stopped, SyncShutdownOutcome::Safe(_)));
+    }
+
+    #[test]
+    fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment() {
+        let fixture = ActivationFixture::nested_unicode("clean-public-cold-open", 0xa178);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        drop(resources);
+
+        let mut phases = Vec::new();
+        let opened =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                if let SyncRuntimeOpenProgress::Phase { phase, .. } = progress {
+                    phases.push(phase);
+                }
+            });
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("clean marker cold-opens");
+        assert_eq!(
+            handle.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::CleanManifestReplay)
+        );
+        assert!(phases.contains(&SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime));
+        assert!(
+            !phases.contains(&SyncRuntimeOpenPhase::DiscoveringEnrollment),
+            "clean marker must not enter legacy enrollment discovery"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     #[test]
