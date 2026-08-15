@@ -4332,6 +4332,27 @@ impl CleanLocalRuntime {
         &mut self,
         graph: &Graph,
     ) -> Result<CleanRuntimeSession<'_>, RuntimePromotionError> {
+        self.admit_clean_session(graph, true)
+    }
+
+    /// Admit only the derived-state completion of an already committed clean
+    /// manifest.  The immutable manifest is now the authority, so SQLite is
+    /// expected to be behind until the affine continuation advances it.  This
+    /// boundary retains every graph, endpoint, engine, index-free and workspace
+    /// lease proof from ordinary admission; it relaxes only the equality that
+    /// would make catching the derived projection up impossible.
+    pub(crate) fn admit_clean_derived_recovery(
+        &mut self,
+        graph: &Graph,
+    ) -> Result<CleanRuntimeSession<'_>, RuntimePromotionError> {
+        self.admit_clean_session(graph, false)
+    }
+
+    fn admit_clean_session(
+        &mut self,
+        graph: &Graph,
+        require_sqlite_at_manifest_frontier: bool,
+    ) -> Result<CleanRuntimeSession<'_>, RuntimePromotionError> {
         self.revocation
             .guard(WorkspaceAuthorityBoundary::Admission)?;
         self.projection
@@ -4352,8 +4373,9 @@ impl CleanLocalRuntime {
                 .engine
                 .require_index_free_clean_projection_runtime()
                 .is_err()
-            || !engine_frontier
-                .same_accepted_authority(self.projection.database().required_frontier_root())
+            || (require_sqlite_at_manifest_frontier
+                && !engine_frontier
+                    .same_accepted_authority(self.projection.database().required_frontier_root()))
         {
             return Err(RuntimePromotionError::Activation(
                 LocalActivationError::RuntimeBinding(

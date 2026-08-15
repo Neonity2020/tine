@@ -107,13 +107,15 @@ use crate::oplog::object_store::{
 };
 #[cfg(test)]
 use crate::oplog::operational_coordinator::{
-    fail_repeatedly_at, last_trusted_local_preparation_stage_timings, OperationalFaultPoint,
-    TrustedLocalPreparationStageTimings,
+    fail_once_at, fail_repeatedly_at, last_trusted_local_preparation_stage_timings,
+    OperationalFaultPoint, TrustedLocalPreparationStageTimings,
 };
 use crate::oplog::operational_coordinator::{
-    CorrelatedPublishedLocalResume, LocalMutationBlockReason, LocalMutationCoordinatorState,
-    LocalMutationRecovery, LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
-    PreparedLocalMutationState, ProviderArchiveContinuation, ProviderArchiveIngress,
+    CleanLocalMutationState, CleanPublishedContinuation, CorrelatedPublishedLocalResume,
+    LocalMutationBlockReason, LocalMutationCoordinatorState, LocalMutationRecovery,
+    LocalPublishedContinuation, OperationalCoordinator, OperationalCoordinatorError,
+    OperationalPhase, PreparedLocalMutationState, ProviderArchiveContinuation,
+    ProviderArchiveIngress,
 };
 #[cfg(test)]
 use crate::oplog::projection::{
@@ -4847,6 +4849,132 @@ struct CleanRuntimeResources {
     graph: Graph,
     receipts: ProjectionReceiptStore,
     runtime: CleanLocalRuntime,
+}
+
+/// Actor-owned clean runtime core.
+///
+/// This is deliberately separate from the legacy `RuntimeActor` fields.  It
+/// gives the production actor one small boundary to adopt: one clean runtime,
+/// one graph/receipt pair and at most one affine post-manifest continuation.
+/// In particular it does not recreate the managed-local journal or any
+/// Patricia-backed promotion state merely to fit the old actor shape.
+struct CleanRuntimeActorCore {
+    resources: CleanRuntimeResources,
+    pending: Option<CleanPublishedContinuation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanActorMutationOutcome {
+    Durable(BatchId),
+    DurablePending {
+        batch_id: BatchId,
+        phase: OperationalPhase,
+    },
+}
+
+#[derive(Debug)]
+struct CleanActorMutationFailure {
+    phase: OperationalPhase,
+    detail: String,
+}
+
+impl From<OperationalCoordinatorError> for CleanActorMutationFailure {
+    fn from(error: OperationalCoordinatorError) -> Self {
+        Self {
+            phase: error.phase(),
+            detail: error.detail().to_owned(),
+        }
+    }
+}
+
+impl CleanRuntimeActorCore {
+    fn new(resources: CleanRuntimeResources) -> Self {
+        Self {
+            resources,
+            pending: None,
+        }
+    }
+
+    fn execute_local(
+        &mut self,
+        transaction: &OperationTransaction,
+    ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
+        if let Some(pending) = self.pending.as_ref() {
+            return Ok(CleanActorMutationOutcome::DurablePending {
+                batch_id: pending.batch_id(),
+                phase: pending.failure().phase(),
+            });
+        }
+        let state = {
+            let mut session = self
+                .resources
+                .runtime
+                .admit_clean_mutation(&self.resources.graph)
+                .map_err(|error| CleanActorMutationFailure {
+                    phase: OperationalPhase::Bindings,
+                    detail: error.to_string(),
+                })?;
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &self.resources.graph,
+                &self.resources.receipts,
+                transaction,
+            )
+            .map_err(CleanActorMutationFailure::from)?
+        };
+        Ok(self.retain_outcome(state))
+    }
+
+    fn retry_pending(&mut self) -> Option<CleanActorMutationOutcome> {
+        let pending = self.pending.take()?;
+        let state = match self
+            .resources
+            .runtime
+            .admit_clean_derived_recovery(&self.resources.graph)
+        {
+            Ok(mut session) => OperationalCoordinator::retry_clean_local(
+                &mut session,
+                &self.resources.graph,
+                &self.resources.receipts,
+                pending,
+            ),
+            Err(_) => {
+                self.pending = Some(pending);
+                let pending = self.pending.as_ref().expect("pending was restored");
+                return Some(CleanActorMutationOutcome::DurablePending {
+                    batch_id: pending.batch_id(),
+                    phase: pending.failure().phase(),
+                });
+            }
+        };
+        Some(self.retain_outcome(state))
+    }
+
+    fn retain_outcome(&mut self, state: CleanLocalMutationState) -> CleanActorMutationOutcome {
+        match state {
+            CleanLocalMutationState::Complete(batch_id) => {
+                debug_assert!(self.pending.is_none());
+                CleanActorMutationOutcome::Durable(batch_id)
+            }
+            CleanLocalMutationState::DurablePending(pending) => {
+                let batch_id = pending.batch_id();
+                let phase = pending.failure().phase();
+                self.pending = Some(pending);
+                CleanActorMutationOutcome::DurablePending { batch_id, phase }
+            }
+        }
+    }
+
+    fn load_current_editor_page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
+        load_current_editor_page_from_projection(
+            self.resources.runtime.engine(),
+            self.resources.runtime.database(),
+            page_id,
+        )
+    }
 }
 
 fn clean_baseline_directory(archive_root: &Path) -> PathBuf {
@@ -23985,11 +24113,19 @@ fn load_projected_page_with_block_limit(
     page_id: PageId,
     block_limit: usize,
 ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    let read = runtime
-        .database()
+    load_projected_page_from_projection(runtime.engine(), runtime.database(), page_id, block_limit)
+}
+
+fn load_projected_page_from_projection(
+    engine: &ShardedHotEngine,
+    database: &crate::oplog::SqliteFrontier,
+    page_id: PageId,
+    block_limit: usize,
+) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
+    let read = database
         .materialized_read()
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    ensure_editor_frontier(runtime, read.acceptance_sequence())?;
+    ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())?;
     let page = read
         .page(page_id)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
@@ -24029,7 +24165,17 @@ fn load_current_editor_page(
     runtime: &PromotedLocalRuntime,
     page_id: PageId,
 ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    let Some(mut current) = load_projected_editor_page(runtime, page_id)? else {
+    load_current_editor_page_from_projection(runtime.engine(), runtime.database(), page_id)
+}
+
+fn load_current_editor_page_from_projection(
+    engine: &ShardedHotEngine,
+    database: &crate::oplog::SqliteFrontier,
+    page_id: PageId,
+) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
+    let Some(mut current) =
+        load_projected_page_from_projection(engine, database, page_id, MAX_SYNC_EDITOR_BLOCKS)?
+    else {
         return Ok(None);
     };
     current.dto.revision = existing_editor_revision(&current.page, &current.dto)?;
@@ -24369,11 +24515,22 @@ fn ensure_editor_frontier(
     runtime: &PromotedLocalRuntime,
     sqlite_acceptance_sequence: u64,
 ) -> Result<(), SyncEditorRequestError> {
-    let frontier = runtime
-        .engine()
+    ensure_editor_frontier_parts(
+        runtime.engine(),
+        runtime.database(),
+        sqlite_acceptance_sequence,
+    )
+}
+
+fn ensure_editor_frontier_parts(
+    engine: &ShardedHotEngine,
+    database: &crate::oplog::SqliteFrontier,
+    sqlite_acceptance_sequence: u64,
+) -> Result<(), SyncEditorRequestError> {
+    let frontier = engine
         .accepted_frontier_root()
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    let sqlite_frontier = runtime.database().required_frontier_root();
+    let sqlite_frontier = database.required_frontier_root();
     if frontier.acceptance_sequence() != sqlite_acceptance_sequence
         || !frontier.same_accepted_authority(sqlite_frontier)
     {
@@ -40505,6 +40662,90 @@ mod tests {
             1
         );
         assert_eq!(user_graph_bytes(&fixture.graph_root), after_edit);
+    }
+
+    #[test]
+    fn clean_actor_core_retains_one_manifested_save_until_projection_finishes() {
+        let fixture = ActivationFixture::nested_unicode("clean-actor-save", 0xa175);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let mut actor = CleanRuntimeActorCore::new(resources);
+        let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
+        let owner = actor
+            .resources
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&root_path, 2)
+            .unwrap()
+            .pop()
+            .expect("clean SQLite names Root.md");
+        let current = actor
+            .load_current_editor_page(owner.page_id)
+            .unwrap()
+            .expect("clean actor loads Root.md from SQLite");
+        let first = current.blocks.first().expect("Root.md has one block");
+        let block_id = first.block_id;
+        let home_document_id = first.home_document_id;
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id,
+                home_document_id,
+            },
+            content: "clean actor exact save".into(),
+        }])
+        .unwrap();
+        let before = fs::read(fixture.graph_root.join("Root.md")).unwrap();
+
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let pending = actor.execute_local(&transaction).unwrap();
+        let pending_batch = match pending {
+            CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
+                assert_eq!(phase, OperationalPhase::Publication);
+                batch_id
+            }
+            CleanActorMutationOutcome::Durable(_) => panic!("fault must retain durable work"),
+        };
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Root.md")).unwrap(),
+            before,
+            "manifest commit must not pretend Markdown projection completed"
+        );
+        let same_pending = actor.execute_local(&transaction).unwrap();
+        assert!(matches!(
+            same_pending,
+            CleanActorMutationOutcome::DurablePending { batch_id, .. }
+                if batch_id == pending_batch
+        ));
+        assert_eq!(
+            actor.retry_pending(),
+            Some(CleanActorMutationOutcome::Durable(pending_batch))
+        );
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("clean actor exact save"));
+        let saved = actor
+            .load_current_editor_page(owner.page_id)
+            .unwrap()
+            .expect("clean actor reloads the saved page");
+        assert_eq!(saved.blocks[0].content, "clean actor exact save");
+        drop(actor);
+
+        let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .expect("clean actor save cold-reopens");
+        assert_eq!(reopened.runtime.engine().accepted_batch_count().unwrap(), 1);
+        assert_eq!(
+            reopened
+                .runtime
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            1
+        );
     }
 
     #[test]
