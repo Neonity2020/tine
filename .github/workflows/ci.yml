@@ -365,11 +365,11 @@ jobs:
   # A cross-compile cannot prove Android filesystem semantics. This focused
   # gate runs the real Rust runtime as Tine's app UID, with the graph below
   # shared /sdcard storage and private authority below the app's filesDir.
-  # It deliberately remains outside full release CI until its runtime and
-  # reliability are characterized; dispatch scope=android to exercise it.
+  # It is mandatory for a frozen full release candidate and remains available
+  # as a focused Android lane between releases.
   android-managed-storage-runtime:
-    name: Android runtime / managed activation, share setup, shutdown, and reopen
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'android' || inputs.scope == 'android-runtime')
+    name: Android runtime / managed activation, crash recovery, share setup, shutdown, and reopen
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5

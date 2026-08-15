@@ -30,6 +30,10 @@ may tag, publish, comment, and close issues.
    Tine processes with separate private app data discover/join one synchronized
    graph, exchange edits in both directions, cold-reopen, and prove the explicit
    Return-to-Direct-Files escape path.
+   The frozen candidate's full CI must also pass the Android app-UID managed
+   runtime journey: activate on shared storage, save exact bytes, stop without
+   a clean drain, recover those bytes on reopen, prepare sharing, cleanly stop,
+   and reopen again.
 6. As soon as that frozen candidate passes its local exact-commit gates, deploy
    that exact tested artifact to `~/research/tine` without waiting to be asked.
    Record and compare the staged/deployed SHA-256 so Martin can test the actual

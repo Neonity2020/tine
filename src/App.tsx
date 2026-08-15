@@ -131,7 +131,7 @@ import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
-import { createStartupRecoveryController } from "./startupRecovery";
+import { createStartupRecoveryController, STARTUP_LOOKUP_WATCHDOG_MS } from "./startupRecovery";
 import { writeClipboardTextResilient } from "./clipboard";
 import type { SparseV2CancelResult } from "./types";
 
@@ -711,17 +711,39 @@ export function App(): JSX.Element {
 
   onMount(() => {
     let disposed = false;
+    let started = false;
     let unlisten = () => {};
+    const start = () => {
+      if (disposed || started) return;
+      started = true;
+      startupRecovery.start();
+    };
+    // A broken event bridge must not prevent startup altogether. The ordinary
+    // route starts as soon as subscription succeeds; this deadline preserves
+    // the controller's pre-existing bounded recovery behavior if it never does.
+    const subscriptionDeadline = setTimeout(start, STARTUP_LOOKUP_WATCHDOG_MS);
     void backend().onStartupProgress(startupRecovery.receiveProgress).then((stop) => {
-      if (disposed) stop();
-      else unlisten = stop;
+      clearTimeout(subscriptionDeadline);
+      if (disposed) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      // Native managed-open phases can begin synchronously with the graph-open
+      // command.  Do not start that command until its progress listener is
+      // installed: otherwise Android WebView startup can lose the first (and,
+      // for a long clean-manifest recovery, only) phase receipt.
+      start();
     }).catch(() => {
+      clearTimeout(subscriptionDeadline);
       // The watchdog remains independent of this subscription. If the native
-      // bridge itself is unavailable, the recovery panel still appears.
+      // event bridge itself is unavailable, still attempt startup so the
+      // recovery panel offers the user an actionable escape.
+      start();
     });
-    startupRecovery.start();
     onCleanup(() => {
       disposed = true;
+      clearTimeout(subscriptionDeadline);
       unlisten();
       startupRecovery.dispose();
     });

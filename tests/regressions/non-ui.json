@@ -4057,6 +4057,30 @@
         "failBefore": "field-reproduced"
       },
       "notes": "A physical Android device returned Permission denied (os error 13) while enabling managed storage even though Direct Files worked and a real app-UID emulator journey passed. The first compatibility packet replaced three Tine-core syncfs calls but missed the separately versioned tine-storage immutable-publication batch; its only completion barrier was another syncfs. The exact-tree fallback also ended each reconstructible directory with a strict directory fsync that could reproduce the same capability error. tine-storage v0.3.1 retains and synchronizes every exact batch file before accepting only Android permission/unsupported/invalid-operation results for directory durability; ordinary file and I/O failures remain fatal. Tine applies the same narrow policy only to pre-promotion source-capture, preparation, backup, enrollment-namespace and disposable SQLite-lease directories reconstructible from unchanged Markdown. It keeps post-promotion authority, atomic no-clobber publication, no-follow/type validation and locks strict. Activation now reports private setup before enrollment/runtime/receipts and attaches the last exact phase to Retryable details, so any remaining device-specific refusal is actionable rather than a bare OS error."
+    },
+    {
+      "id": "REG-MANAGED-ANDROID-CRASH-REOPEN-001",
+      "title": "Android managed storage recovers an exact saved edit after the app stops without a clean drain",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/startupRecovery.test.ts",
+          "src-tauri/src/android_managed_storage_smoke.rs",
+          ".github/workflows/ci.yml::android-managed-storage-runtime"
+        ],
+        "scenario": "managed.android-edit-crash-reopen-exact-bytes",
+        "failBefore": "field-reproduced"
+      },
+      "notes": "A physical Android candidate could activate managed storage and save an edit, but force-closing and reopening reached the frontend's 15-second native.unavailable state. Two independent defects made a live recovery look dead: App started the graph-open command before the asynchronous native progress subscription was installed, and clean-manifest recovery emitted one phase before potentially long work but no heartbeat. Startup now begins only after the listener is installed (while retaining the watchdog fallback when the event bridge itself fails), and clean-manifest recovery runs behind a 10-second progress heartbeat without weakening its completion result. The mandatory full-release Android app-UID journey saves exact bytes, stops the actor without a clean drain, reopens and verifies those bytes, then exercises share setup, clean shutdown and another reopen."
     }
   ]
 }

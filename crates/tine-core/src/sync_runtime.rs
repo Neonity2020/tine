@@ -3405,7 +3405,41 @@ impl SyncRuntimeHandle {
                 phase: SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime,
                 elapsed: open_started.elapsed(),
             });
-            match open_clean_runtime_resources(&clean_request) {
+            let recovery_request = clean_request.clone();
+            let (recovery_sender, recovery_receiver) = mpsc::sync_channel(1);
+            let recovery_worker = match thread::Builder::new()
+                .name("tine-clean-runtime-open".into())
+                .spawn(move || {
+                    let _ = recovery_sender.send(open_clean_runtime_resources(&recovery_request));
+                }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    return refused(format!(
+                        "cannot start clean managed runtime recovery worker: {error}"
+                    ))
+                }
+            };
+            let clean_open = loop {
+                match recovery_receiver.recv_timeout(RUNTIME_OPEN_PROGRESS_HEARTBEAT) {
+                    Ok(result) => {
+                        if recovery_worker.join().is_err() {
+                            break Err("clean managed runtime recovery worker panicked".into());
+                        }
+                        break result;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        progress(SyncRuntimeOpenProgress::Waiting {
+                            phase: SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime,
+                            elapsed: open_started.elapsed(),
+                        });
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = recovery_worker.join();
+                        break Err("clean managed runtime recovery worker stopped".into());
+                    }
+                }
+            };
+            match clean_open {
                 Ok(Some(resources)) => {
                     progress(SyncRuntimeOpenProgress::Phase {
                         phase: SyncRuntimeOpenPhase::AssemblingActor,

@@ -97,6 +97,28 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {}
         outcome => return format!("post-activation page save failed: {outcome:?}"),
     }
+    // Match a force-closed app: do not ask the actor for a clean drain.  Drop
+    // the last sender, let the actor stop, and prove the exact durable edit can
+    // be recovered by a fresh runtime open before testing sharing.
+    drop(handle);
+
+    let crashed_reopen = SyncRuntimeHandle::open(open_request.clone());
+    if crashed_reopen.status != SyncRuntimeOpenStatus::Active {
+        return format!("crash-style reopen failed: {:?}", crashed_reopen.status);
+    }
+    let Some(handle) = crashed_reopen.handle else {
+        return "crash-style reopen returned Active without a handle".into();
+    };
+    match handle.load_application_page(SyncApplicationPageLoadRequest {
+        page: SyncApplicationPageSelector::ExactPath {
+            path: "pages/Smoke.md".into(),
+        },
+    }) {
+        Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. })
+            if page.blocks.first().map(|block| block.raw.as_str())
+                == Some("Android managed storage edited") => {}
+        outcome => return format!("crash-style reopened page mismatch: {outcome:?}"),
+    }
     if let Err(error) = handle.prepare_shared() {
         return format!("prepare shared failed: {error}");
     }

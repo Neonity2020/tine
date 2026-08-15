@@ -92,6 +92,8 @@ not a quiet gate expansion during a release.
 - Dispatch `ui-e2e` for Linux/Windows harness or native UI changes.
 - Dispatch manual `ci` with `scope=windows`, `scope=android`, or
   `scope=performance` when that platform boundary is the thing being changed.
+- The frozen `scope=full` release gate includes the Android app-UID managed
+  activation, crash-recovery, sharing, clean-shutdown, and reopen journey.
 - Dispatch the Flatpak workflow for offline packaging changes.
 - Do not dispatch `scope=full` as a routine completion ritual. It is the frozen
   release gate.
