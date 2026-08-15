@@ -409,7 +409,7 @@ assert.equal(
     "run",
     8
   ),
-  "cargo nextest run --profile ci --package tine-core --partition hash:${{ matrix.shard }}/4"
+  "node scripts/tine-core-nextest-contract.mjs --mode linux --run-shard ${{ matrix.shard }}"
 );
 assert.equal(
   yamlScalar(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "uses", 8),
