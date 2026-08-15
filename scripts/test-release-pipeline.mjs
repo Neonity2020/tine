@@ -618,6 +618,11 @@ assert.match(
   "release mode does not block every safety, core-operation, and stateful-UX failure"
 );
 assert.match(
+  e2eRunner,
+  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device", "scripts\/e2e-sparse-v2-two-device\.mjs", \{\}\]/,
+  "the mandatory Linux release catalog does not prove real two-device managed sync"
+);
+assert.match(
   uiE2eWorkflow,
   /Snapshot Linux E2E candidate inputs[\s\S]*?Write Linux E2E candidate receipt[\s\S]*?Snapshot Windows E2E candidate inputs[\s\S]*?Write Windows E2E candidate receipt/,
   "manually dispatched raw Linux and Windows builds do not create receipts"

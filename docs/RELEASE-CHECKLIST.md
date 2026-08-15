@@ -26,6 +26,10 @@ may tag, publish, comment, and close issues.
    against the production-protocol candidate binary. Retain screenshots, DOM,
    console/backend logs, graph diff, JUnit, and JSON on failure. See
    `docs/UI-REGRESSION-TESTING.md` for the exact binary and evidence contract.
+   This catalog must include the two-device managed-storage journey: two real
+   Tine processes with separate private app data discover/join one synchronized
+   graph, exchange edits in both directions, cold-reopen, and prove the explicit
+   Return-to-Direct-Files escape path.
 6. As soon as that frozen candidate passes its local exact-commit gates, deploy
    that exact tested artifact to `~/research/tine` without waiting to be asked.
    Record and compare the staged/deployed SHA-256 so Martin can test the actual
