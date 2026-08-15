@@ -7407,6 +7407,12 @@ impl Default for CommittedLocalOverlay {
 pub(crate) struct LazyGenesisCheckpointBuilder {
     catalog_document_id: DocumentId,
     catalog: LoroDoc,
+    /// Re-importing every checkpoint is a useful constructor oracle, but it is
+    /// not part of activation authority. Production cold open validates the
+    /// sealed baseline before use; repeating that readback here would turn one
+    /// direct construction pass into a second graph-sized CRDT pass.
+    #[cfg(test)]
+    verify_checkpoints: bool,
 }
 
 impl LazyGenesisCheckpointBuilder {
@@ -7418,7 +7424,16 @@ impl LazyGenesisCheckpointBuilder {
         Ok(Self {
             catalog_document_id,
             catalog,
+            #[cfg(test)]
+            verify_checkpoints: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_verifying(catalog_document_id: DocumentId) -> Result<Self, EngineError> {
+        let mut builder = Self::new(catalog_document_id)?;
+        builder.verify_checkpoints = true;
+        Ok(builder)
     }
 
     pub(crate) fn push_page(
@@ -7501,7 +7516,12 @@ impl LazyGenesisCheckpointBuilder {
         let snapshot = document
             .export(ExportMode::all_updates())
             .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
-        verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &snapshot)?;
+        #[cfg(test)]
+        {
+            if self.verify_checkpoints {
+                verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &snapshot)?;
+            }
+        }
         let dependencies = DocumentDependencies::new(
             page.home_document_id,
             canonical_peer_counters(&document.oplog_vv())?,
@@ -7539,6 +7559,7 @@ impl LazyGenesisCheckpointBuilder {
     }
 }
 
+#[cfg(test)]
 fn verify_lazy_genesis_page_checkpoint(
     expected: &LazyGenesisPageInput,
     accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
@@ -45726,9 +45747,9 @@ mod validation_tests {
         }
     }
 
-    /// Isolates the cost which decides whether the new baseline should retain
-    /// directly constructed CRDT checkpoints or add an implicit-genesis causal
-    /// representation. This is intentionally not part of the ordinary suite.
+    /// Isolates the constructor plus its explicit re-importing oracle. The
+    /// production activation builder does not pay the oracle readback; this
+    /// ignored receipt remains available when changing the checkpoint format.
     ///
     /// Run with:
     /// `cargo test --release -p tine-core lazy_genesis_direct_checkpoint_cost_receipt -- --ignored --nocapture`
@@ -45744,7 +45765,7 @@ mod validation_tests {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(10);
         let catalog = DocumentId::from_uuid(Uuid::from_u128(0x7500));
-        let mut builder = LazyGenesisCheckpointBuilder::new(catalog).unwrap();
+        let mut builder = LazyGenesisCheckpointBuilder::new_verifying(catalog).unwrap();
         let started = std::time::Instant::now();
         let mut checkpoint_bytes = 0_u64;
         for page_ordinal in 0..pages {
@@ -45822,9 +45843,12 @@ mod validation_tests {
             );
         }
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
-        assert!(contract.contains("deterministic CRDT checkpoint constructed\ndirectly"));
+        assert!(contract.contains("deterministic CRDT checkpoint constructed directly"));
         assert!(contract.contains("authors no `SemanticOperation`"));
         assert!(contract.contains("remain unopened in the lazy pack"));
+        assert!(source.contains("#[cfg(test)]\nfn verify_lazy_genesis_page_checkpoint"));
+        assert!(source.contains("verify_checkpoints: false"));
+        assert!(source.contains("new_verifying(catalog_document_id"));
     }
 
     /// The exact 25-batch / 400-page / 100-block shape of the release 1M-block
