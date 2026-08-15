@@ -3449,9 +3449,18 @@ impl SyncRuntimeHandle {
                 };
             }
         };
+        #[cfg(not(test))]
+        {
+            let _ = advisory;
+            return refused(
+                "pre-0.7 managed-storage state is no longer a runtime authority; return this graph to Direct Files, then enable managed storage again"
+                    .into(),
+            );
+        }
         #[cfg(test)]
         let workspace_id = advisory.binding.workspace_id();
 
+        #[cfg(test)]
         let initial = SyncRuntimeStatusSnapshot {
             lifecycle: SyncRuntimeLifecycle::Active,
             recovery: None,
@@ -3466,13 +3475,19 @@ impl SyncRuntimeHandle {
             managed_local_next_sequence: 0,
             managed_local_stage: None,
         };
+        #[cfg(test)]
         let status = Arc::new(RwLock::new(initial));
+        #[cfg(test)]
         let (sender, receiver) = mpsc::sync_channel(ACTOR_CHANNEL_CAPACITY);
+        #[cfg(test)]
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        #[cfg(test)]
         let actor_status = Arc::clone(&status);
+        #[cfg(test)]
         let thread_name = format!("tine-sync-{}", &graph_resource_id.to_string()[..12]);
         #[cfg(test)]
         let actor_thread_started = Instant::now();
+        #[cfg(test)]
         let join = match thread::Builder::new()
             .name(thread_name)
             .stack_size(ACTOR_STACK_BYTES)
@@ -3512,7 +3527,9 @@ impl SyncRuntimeHandle {
             Err(error) => return refused(format!("cannot start sync actor thread: {error}")),
         };
 
+        #[cfg(test)]
         let mut phase = SyncRuntimeOpenPhase::OpeningActorGraph;
+        #[cfg(test)]
         loop {
             match started_receiver.recv_timeout(RUNTIME_OPEN_PROGRESS_HEARTBEAT) {
                 Ok(ActorStartupEvent::Phase(next)) => {
@@ -3878,15 +3895,24 @@ impl SyncRuntimeHandle {
                 if !identities_match_binding(&request.identities, &advisory.binding) {
                     return activation_blocked("explicit_identity_binding_mismatch");
                 }
-                progress(SyncLocalActivationProgress::Phase {
-                    phase: SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
-                });
-                if let Err(detail) =
-                    ensure_reconciliation_baseline(&request, &graph, &advisory.binding)
+                #[cfg(not(test))]
+                return activation_retryable(
+                    SyncLocalActivationStage::LocalActive,
+                    "pre-0.7 managed-storage state must return to Direct Files before clean activation"
+                        .into(),
+                );
+                #[cfg(test)]
                 {
-                    return activation_retryable(SyncLocalActivationStage::LocalActive, detail);
+                    progress(SyncLocalActivationProgress::Phase {
+                        phase: SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
+                    });
+                    if let Err(detail) =
+                        ensure_reconciliation_baseline(&request, &graph, &advisory.binding)
+                    {
+                        return activation_retryable(SyncLocalActivationStage::LocalActive, detail);
+                    }
+                    return activation_open_runtime(request);
                 }
-                return activation_open_runtime(request);
             }
             DiscoveryClassification::Blocked(advisory) => {
                 return activation_blocked(advisory.reason_code.clone());
@@ -3982,8 +4008,20 @@ impl SyncRuntimeHandle {
             _ => unreachable!("activation discovery branch already returned"),
         };
 
+        #[cfg(not(test))]
+        {
+            let _ = existing_binding;
+            return activation_retryable(
+                initial_stage,
+                "incomplete pre-0.7 managed-storage state must return to Direct Files before clean activation"
+                    .into(),
+            );
+        }
+
+        #[cfg(test)]
         let result =
             activate_non_active_local(request.clone(), graph, existing_binding, &mut progress);
+        #[cfg(test)]
         match result {
             Ok(handoff) => activation_open_same_process_runtime(request, handoff),
             Err(detail) => {
