@@ -255,7 +255,7 @@ jobs:
         with:
           tool: nextest@0.9.143
       - name: Linux tine-core nextest / deterministic hash shard ${{ matrix.shard }}/4
-        run: cargo nextest run --profile ci --package tine-core --partition hash:${{ matrix.shard }}/4
+        run: node scripts/tine-core-nextest-contract.mjs --mode linux --run-shard ${{ matrix.shard }}
 
   # Linux host tests do not see either platform branch: Windows has its own cfg
   # implementation, while Android's libc declarations differ from desktop Linux.

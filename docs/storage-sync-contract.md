@@ -485,8 +485,20 @@ reopen discards that process-local evidence and uses the independent sealed
 source plus archive reconstruction path; differential and crash-cut tests
 require the two paths to publish identical durable shadow bytes.
 
+The ordinary release suite tests the clean baseline-plus-manifest runtime,
+including activation, cold reopen, editor/application saves, external
+reconciliation, cross-page moves, graph/PDF/guide reads, sharing, late join,
+restart, and clean shutdown. The interleaved pre-0.7 actor scenarios remain a
+differential oracle while their source is physically extracted, but they are
+not allowed to redefine the production contract or make a release depend on
+retired enrollment, Patricia, projection-work, scratch, or shadow mechanics.
+The exact clean-runtime selection is pinned by
+`scripts/tine-core-nextest-contract.mjs`; every other `tine-core` module remains
+fully selected. Adding a new production runtime journey therefore requires an
+explicit contract update rather than being silently included or omitted.
+
 Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
-18. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
+20. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
 SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates
 only that derived representation and costs one rebuild; it must not migrate or
 reinterpret authoritative oplog bytes. Authoritative format changes require an

@@ -4063,10 +4063,11 @@ fn fail_before_projection_crash_windows_recover_without_unauthorized_execution()
         "the startup coordinator must not mistake BatchId enumeration order for causal order"
     );
 
-    // Merely opening the enrolled capabilities must not authorize either the
-    // recovered reference catalog or projection execution. The production
-    // startup coordinator is the only operation below that can cross this
-    // recovery gate.
+    // Merely opening the enrolled capabilities must not authorize projection
+    // execution. The precise unavailable derivative is intentionally not part
+    // of this contract: SQLite replaced the retired Patricia reference
+    // catalog, while the production startup coordinator remains the only
+    // operation below that can cross the durable-history recovery gate.
     let recovery_gated_reader = ObjectStore::open(&archive_path, workspace_id).unwrap();
     let mut recovery_gated_engine = ShardedHotEngine::with_enrolled_projection(
         recovery_gated_reader,
@@ -4075,10 +4076,6 @@ fn fail_before_projection_crash_windows_recover_without_unauthorized_execution()
         &graph,
         &receipts,
     );
-    assert!(matches!(
-        recovery_gated_engine.projection_work_index(),
-        Err(EngineError::ReferenceCatalog(_))
-    ));
     assert!(execute_manifested_projection_work(
         &graph,
         &receipts,

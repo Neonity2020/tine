@@ -2,12 +2,15 @@
 
 import assert from "node:assert/strict";
 import {
+  CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES,
+  LINUX_CORE_RELEASE_FILTERSET,
   LINUX_TINE_CORE_SHARD_COUNT,
   WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
   WINDOWS_CORE_EXACT_TEST_NAMES,
   WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
   WINDOWS_CORE_SMOKE_FILTERSET,
   inventoryFromNextestList,
+  verifyLinuxReleaseSelection,
   verifyLinuxShardCoverage,
   verifyWindowsCoreSmokeSelection,
 } from "./tine-core-nextest-contract.mjs";
@@ -36,6 +39,41 @@ assert.deepEqual(
 assert.throws(
   () => verifyLinuxShardCoverage(fullCore, [shards[0], shards[1], shards[2], listedInventory("tine-core", [])]),
   /selected no non-ignored tests/
+);
+
+const cleanRuntimeFixture = CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES.slice(0, 2);
+const coreWithLegacyOracle = listedInventory("tine-core", [
+  "model::tests::ordinary_semantic_contract",
+  ...CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES,
+  "sync_runtime::tests::legacy_actor_oracle_case",
+]);
+const releaseWithoutLegacyOracle = listedInventory("tine-core", [
+  "model::tests::ordinary_semantic_contract",
+  ...CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES,
+]);
+assert.deepEqual(
+  verifyLinuxReleaseSelection(coreWithLegacyOracle, releaseWithoutLegacyOracle),
+  {
+    coreTestCount: CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES.length + 2,
+    releaseTestCount: CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES.length + 1,
+    legacyOracleTestCount: 1,
+    cleanRuntimeTestCount: CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES.length,
+  }
+);
+assert.throws(
+  () => verifyLinuxReleaseSelection(
+    coreWithLegacyOracle,
+    listedInventory("tine-core", [
+      "model::tests::ordinary_semantic_contract",
+      ...cleanRuntimeFixture,
+    ])
+  ),
+  /omitted required test/
+);
+assert.match(LINUX_CORE_RELEASE_FILTERSET, /not test\(\/sync_runtime::tests::\/\)/);
+assert.match(
+  LINUX_CORE_RELEASE_FILTERSET,
+  /test\(=sync_runtime::tests::public_clean_activation_loads_saves_and_cold_reopens_an_editor_page\)/
 );
 assert.throws(
   () => verifyLinuxShardCoverage(fullCore, [shards[0], shards[1], shards[2], shards[2]]),
@@ -78,7 +116,7 @@ const coreCaptureWitnesses = [
   "model::tests::inactive_bootstrap_capture_is_deterministic_and_chunks_zero_one_and_many_files",
   "model::tests::inactive_bootstrap_capture_preserves_exact_nested_unicode_org_and_semantic_kinds",
   "model::tests::inactive_bootstrap_capture_rejects_bad_logical_name_frames",
-  "model::tests::inactive_bootstrap_capture_rejects_between_pass_and_before_final_proof_mutations",
+  "model::tests::inactive_bootstrap_capture_seals_one_pass_and_final_proof_rejects_later_mutations",
   "model::tests::inactive_bootstrap_capture_rejects_file_cap_before_streaming",
 ];
 assert.deepEqual(WINDOWS_CORE_CAPTURE_WITNESS_NAMES, coreCaptureWitnesses);
