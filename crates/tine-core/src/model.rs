@@ -25514,6 +25514,18 @@ impl BootstrapSourceCapture {
         bootstrap_source_capture_id(self)
     }
 
+    /// Content- and policy-bound identity of a graph capture that is stable
+    /// across devices.  The ordinary capture identity also binds the retained
+    /// graph-root resource, file identities, and link counts because it proves
+    /// one local capture episode.  Those facts must not enter clean shared
+    /// authority: two devices can hold byte-identical synced trees at different
+    /// filesystem resources.  Clean activation therefore uses this portable
+    /// identity for its immutable baseline while retaining the stronger local
+    /// capture checks before that baseline is committed.
+    pub(crate) fn portable_capture_identity(&self) -> io::Result<BlobDescription> {
+        portable_bootstrap_source_capture_id(self)
+    }
+
     /// Final hash-only proof before promotion. It rereads every source through
     /// a fresh retained graph capability and compares the complete canonical
     /// inventory and chunk spools to the sealed initial capture. Parser-owned
@@ -27634,6 +27646,122 @@ fn bootstrap_source_capture_id(capture: &BootstrapSourceCapture) -> io::Result<B
         )
         .into(),
         manifest.len() as u64,
+    ))
+}
+
+fn portable_bootstrap_source_capture_id(
+    capture: &BootstrapSourceCapture,
+) -> io::Result<BlobDescription> {
+    const SCHEMA: u32 = 1;
+    struct PortableHasher {
+        hasher: Sha256,
+        length: u64,
+    }
+    impl PortableHasher {
+        fn raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.length = self.length.checked_add(bytes.len() as u64).ok_or_else(|| {
+                bootstrap_source_capture_error("portable capture length overflow")
+            })?;
+            self.hasher.update(bytes);
+            Ok(())
+        }
+
+        fn u8(&mut self, value: u8) -> io::Result<()> {
+            self.raw(&[value])
+        }
+
+        fn u32(&mut self, value: u32) -> io::Result<()> {
+            self.raw(&value.to_be_bytes())
+        }
+
+        fn u64(&mut self, value: u64) -> io::Result<()> {
+            self.raw(&value.to_be_bytes())
+        }
+
+        fn string(&mut self, value: &str) -> io::Result<()> {
+            let length = u32::try_from(value.len()).map_err(|_| {
+                bootstrap_source_capture_error("portable capture string is too long")
+            })?;
+            self.u32(length)?;
+            self.raw(value.as_bytes())
+        }
+
+        fn description(&mut self, value: BlobDescription) -> io::Result<()> {
+            self.raw(value.sha256())?;
+            self.u64(value.byte_length())
+        }
+    }
+
+    let mut encoded = PortableHasher {
+        hasher: Sha256::new(),
+        length: 0,
+    };
+    encoded
+        .hasher
+        .update(b"tine/portable-bootstrap-source-capture/v1\0");
+    encoded.u32(SCHEMA)?;
+    let scope = capture.binding.scope_binding;
+    encoded.u32(scope.binding_schema_version())?;
+    encoded.u32(scope.policy_version())?;
+    encoded.u32(scope.portable_path_key_version())?;
+    let normalization = scope.normalization_unicode_version();
+    for component in [normalization.0, normalization.1, normalization.2] {
+        encoded.u64(component)?;
+    }
+    let case_fold = scope.case_fold_unicode_version();
+    for component in [case_fold.0, case_fold.1, case_fold.2] {
+        encoded.u64(component)?;
+    }
+    encoded.raw(scope.effective_policy_digest())?;
+    match capture.binding.config_description {
+        Some(description) => {
+            encoded.u8(1)?;
+            encoded.description(description)?;
+        }
+        None => encoded.u8(0)?,
+    }
+    encoded.string(&capture.binding.pages_dir)?;
+    encoded.string(&capture.binding.journals_dir)?;
+    encoded.u8(match capture.binding.file_name_format {
+        FileNameFormat::Legacy => 0,
+        FileNameFormat::TripleLowbar => 1,
+    })?;
+    match &capture.binding.journal_file_name_format {
+        Some(value) => {
+            encoded.u8(1)?;
+            encoded.string(value)?;
+        }
+        None => encoded.u8(0)?,
+    }
+    match &capture.binding.journal_page_title_format {
+        Some(value) => {
+            encoded.u8(1)?;
+            encoded.string(value)?;
+        }
+        None => encoded.u8(0)?,
+    }
+    encoded.u64(capture.source_files)?;
+    let mut entries = capture.entries_cursor()?;
+    let mut observed = 0_u64;
+    while let Some(entry) = entries.next()? {
+        observed = observed.checked_add(1).ok_or_else(|| {
+            bootstrap_source_capture_error("portable capture entry count overflow")
+        })?;
+        encoded.string(entry.path.as_str())?;
+        encoded.u8(managed_text_kind_tag(entry.kind))?;
+        encoded.string(&entry.logical_name)?;
+        encoded.description(entry.description)?;
+        encoded.u32(entry.chunk_count)?;
+        encoded.description(entry.activation_page)?;
+    }
+    if observed != capture.source_files {
+        return Err(bootstrap_source_capture_error(
+            "portable capture entry count differs from sealed capture",
+        ));
+    }
+    Ok(BlobDescription::from_parts(
+        encoded.hasher.finalize().into(),
+        encoded.length,
     ))
 }
 
@@ -48295,6 +48423,64 @@ mod tests {
         assert_eq!(final_proof.parser_calls, 0);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&capture_scratch);
+    }
+
+    #[test]
+    fn portable_bootstrap_identity_ignores_local_filesystem_identity_but_not_content() {
+        let first_root = scratch("portable-bootstrap-identity-first");
+        let second_root = scratch("portable-bootstrap-identity-second");
+        for root in [&first_root, &second_root] {
+            fs::create_dir_all(root.join("logseq")).unwrap();
+            fs::write(
+                root.join("logseq/config.edn"),
+                r#"{:pages-directory "notes" :journals-directory "diary"}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(root.join("notes/層")).unwrap();
+            fs::write(
+                root.join("notes/層/計画.md"),
+                "title:: Shared 計画\n\n- café\n",
+            )
+            .unwrap();
+        }
+        let first_scratch = bootstrap_capture_scratch("portable-identity-first");
+        let second_scratch = bootstrap_capture_scratch("portable-identity-second");
+        let changed_scratch = bootstrap_capture_scratch("portable-identity-changed");
+        let first = Graph::open(&first_root)
+            .capture_inactive_bootstrap_sources(&first_scratch)
+            .unwrap();
+        let second_graph = Graph::open(&second_root);
+        let second = second_graph
+            .capture_inactive_bootstrap_sources(&second_scratch)
+            .unwrap();
+
+        assert_ne!(
+            first.capture_identity().unwrap(),
+            second.capture_identity().unwrap()
+        );
+        assert_eq!(
+            first.portable_capture_identity().unwrap(),
+            second.portable_capture_identity().unwrap()
+        );
+
+        fs::write(
+            second_root.join("notes/層/計画.md"),
+            "title:: Shared 計画\n\n- changed café\n",
+        )
+        .unwrap();
+        let changed = Graph::open(&second_root)
+            .capture_inactive_bootstrap_sources(&changed_scratch)
+            .unwrap();
+        assert_ne!(
+            first.portable_capture_identity().unwrap(),
+            changed.portable_capture_identity().unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&first_root);
+        let _ = fs::remove_dir_all(&second_root);
+        let _ = fs::remove_dir_all(&first_scratch);
+        let _ = fs::remove_dir_all(&second_scratch);
+        let _ = fs::remove_dir_all(&changed_scratch);
     }
 
     #[test]

@@ -4061,7 +4061,7 @@ pub(crate) fn prepare_clean_activation(
         workspace_id,
         lineage_digest,
         catalog_document_id,
-        capture.capture_identity()?,
+        capture.portable_capture_identity()?,
         &working,
         database_path,
         policy,

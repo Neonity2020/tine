@@ -79,6 +79,10 @@ use crate::oplog::import::{
 use crate::oplog::import::{
     BootstrapStreamingImportInstrumentation, InactiveBootstrapOrchestrationInstrumentation,
 };
+use crate::oplog::lazy_genesis::{
+    publish_clean_shared_state, read_activation_marker, read_clean_shared_state,
+    CleanSharedEnrollmentDescriptorV1, CleanSharedRoleV1, CleanSharedStateV1,
+};
 #[cfg(test)]
 use crate::oplog::local_active::{
     act_once_at_resume_lifecycle_cut_for_workspace_for_test,
@@ -184,10 +188,10 @@ use crate::oplog::{
     ManagedTextKind, MaterializedBlock, MaterializedBlockRow, MaterializedEntityId,
     MaterializedPage, MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit,
     MaterializedTagRow, MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction,
-    PageId, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
-    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
-    SessionId, SqliteMaterializedRead, WorkspaceId, MANAGED_LOCAL_ANCHOR_V2_BYTES,
-    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+    PageId, PreparedBatch, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId,
+    RebuildSource, ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1,
+    SemanticOperation, SessionId, SqliteMaterializedRead, WorkspaceId,
+    MANAGED_LOCAL_ANCHOR_V2_BYTES, MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
 #[cfg(test)]
 use crate::oplog::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
@@ -1357,6 +1361,58 @@ pub struct SyncSharedEnrollmentDescriptor {
     pub descriptor_digest: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SharedEnrollmentDescriptor {
+    Legacy(SharedEnrollmentDescriptorV1),
+    Clean(CleanSharedEnrollmentDescriptorV1),
+}
+
+impl SharedEnrollmentDescriptor {
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if let Ok(descriptor) = CleanSharedEnrollmentDescriptorV1::decode(bytes) {
+            return Ok(Self::Clean(descriptor));
+        }
+        SharedEnrollmentDescriptorV1::decode(bytes)
+            .map(Self::Legacy)
+            .map_err(display)
+    }
+
+    const fn workspace_id(&self) -> WorkspaceId {
+        match self {
+            Self::Legacy(descriptor) => descriptor.workspace_id(),
+            Self::Clean(descriptor) => descriptor.workspace_id(),
+        }
+    }
+
+    const fn lineage_digest(&self) -> LineageDigest {
+        match self {
+            Self::Legacy(descriptor) => descriptor.lineage_digest(),
+            Self::Clean(descriptor) => descriptor.lineage_digest(),
+        }
+    }
+
+    const fn catalog_document_id(&self) -> DocumentId {
+        match self {
+            Self::Legacy(descriptor) => descriptor.catalog_document_id(),
+            Self::Clean(descriptor) => descriptor.catalog_document_id(),
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Legacy(descriptor) => descriptor.encode().map_err(display),
+            Self::Clean(descriptor) => descriptor.encode().map_err(display),
+        }
+    }
+
+    fn digest(&self) -> Result<ContentDigest, String> {
+        match self {
+            Self::Legacy(descriptor) => descriptor.digest().map_err(display),
+            Self::Clean(descriptor) => descriptor.digest().map_err(display),
+        }
+    }
+}
+
 /// Structural provider-prefix state observed before cold descriptor discovery.
 /// `Partial` is retryable honest file-sync delivery; `Refused` is an unsafe or
 /// ambiguous shape and deliberately carries no storage authority.
@@ -1381,17 +1437,25 @@ pub fn inspect_shared_provider_cold_prefix(
 
 impl SyncSharedEnrollmentDescriptor {
     fn from_core(descriptor: SharedEnrollmentDescriptorV1) -> Result<Self, String> {
+        Self::from_descriptor(SharedEnrollmentDescriptor::Legacy(descriptor))
+    }
+
+    fn from_clean(descriptor: CleanSharedEnrollmentDescriptorV1) -> Result<Self, String> {
+        Self::from_descriptor(SharedEnrollmentDescriptor::Clean(descriptor))
+    }
+
+    fn from_descriptor(descriptor: SharedEnrollmentDescriptor) -> Result<Self, String> {
         Ok(Self {
-            encoded: descriptor.encode().map_err(display)?,
+            encoded: descriptor.encode()?,
             workspace_id: descriptor.workspace_id(),
             lineage_digest: descriptor.lineage_digest(),
             catalog_document_id: descriptor.catalog_document_id(),
-            descriptor_digest: descriptor.digest().map_err(display)?.to_string(),
+            descriptor_digest: descriptor.digest()?.to_string(),
         })
     }
 
-    fn decode(&self) -> Result<SharedEnrollmentDescriptorV1, String> {
-        SharedEnrollmentDescriptorV1::decode(&self.encoded).map_err(display)
+    fn decode(&self) -> Result<SharedEnrollmentDescriptor, String> {
+        SharedEnrollmentDescriptor::decode(&self.encoded)
     }
 }
 
@@ -1400,9 +1464,9 @@ pub fn inspect_shared_enrollment(
 ) -> Result<Option<SyncSharedEnrollmentDescriptor>, String> {
     inspect_shared_provider_descriptor(provider_root)
         .map_err(display)?
-        .map(|bytes| SharedEnrollmentDescriptorV1::decode(&bytes).map_err(display))
+        .map(|bytes| SharedEnrollmentDescriptor::decode(&bytes))
         .transpose()?
-        .map(SyncSharedEnrollmentDescriptor::from_core)
+        .map(SyncSharedEnrollmentDescriptor::from_descriptor)
         .transpose()
 }
 
@@ -1422,10 +1486,10 @@ pub fn inspect_shared_enrollment_for_cold_discovery(
     // retryable partial arrival.  Filesystem validation failures are local
     // platform errors and must remain visible to the caller instead of being
     // mislabeled as an unfinished sync.
-    let Ok(descriptor) = SharedEnrollmentDescriptorV1::decode(&bytes) else {
+    let Ok(descriptor) = SharedEnrollmentDescriptor::decode(&bytes) else {
         return Ok(None);
     };
-    match SyncSharedEnrollmentDescriptor::from_core(descriptor) {
+    match SyncSharedEnrollmentDescriptor::from_descriptor(descriptor) {
         Ok(descriptor) => Ok(Some(descriptor)),
         Err(_) => Ok(None),
     }
@@ -5168,6 +5232,31 @@ impl CleanRuntimeActorCore {
         Ok(self.retain_outcome(state))
     }
 
+    fn execute_provider(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        prepared: &PreparedBatch,
+    ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
+        if let Some(pending) = self.pending.as_ref() {
+            return Ok(CleanActorMutationOutcome::DurablePending {
+                batch_id: pending.batch_id(),
+                phase: pending.failure().phase(),
+            });
+        }
+        let state = {
+            let mut session = self.runtime.admit_clean_mutation(graph).map_err(|error| {
+                CleanActorMutationFailure {
+                    phase: OperationalPhase::Bindings,
+                    detail: error.to_string(),
+                }
+            })?;
+            OperationalCoordinator::ingest_clean_prepared(&mut session, graph, receipts, prepared)
+                .map_err(CleanActorMutationFailure::from)?
+        };
+        Ok(self.retain_outcome(state))
+    }
+
     fn retry_pending(
         &mut self,
         graph: &Graph,
@@ -5601,7 +5690,14 @@ fn open_clean_runtime_resources(
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
         .map_err(display)?;
-    for work in engine.clean_terminal_projection_work().map_err(display)? {
+    let endpoint = engine
+        .projection_endpoint_binding()
+        .ok_or_else(|| "clean runtime has no projection endpoint".to_owned())?;
+    let terminal_work = engine.clean_terminal_projection_work().map_err(display)?;
+    for work in terminal_work
+        .iter()
+        .filter(|work| work.endpoint_id() == endpoint.endpoint_id())
+    {
         crate::oplog::projection::execute_clean_manifested_projection_work(
             &graph,
             &receipts,
@@ -5610,6 +5706,35 @@ fn open_clean_runtime_resources(
             &work,
         )
         .map_err(display)?;
+    }
+    let foreign = terminal_work
+        .iter()
+        .filter(|work| work.endpoint_id() != endpoint.endpoint_id())
+        .collect::<Vec<_>>();
+    if !foreign.is_empty() {
+        let handoff = graph
+            .mint_handoff_safe(identities.workspace_id, endpoint)
+            .map_err(display)?;
+        handoff
+            .verify_binding(&graph, identities.workspace_id, endpoint)
+            .map_err(display)?;
+        let published = handoff.into_publisher_guard().into_published_latch();
+        for work in foreign {
+            let source = {
+                let archive = engine
+                    .archive_store()
+                    .ok_or_else(|| "clean runtime has no operation archive".to_owned())?;
+                crate::oplog::projection::decode_manifested_projection_work(archive, work)
+                    .map_err(display)?
+                    .manifested()
+                    .clone()
+            };
+            crate::oplog::projection::execute_receiver_local_projection_under_handoff(
+                &graph, &receipts, &engine, &source, &published, true,
+            )
+            .map_err(display)?;
+        }
+        published.complete();
     }
     let runtime =
         CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
@@ -7572,6 +7697,166 @@ fn publish_complete_archive(
     Ok(intents)
 }
 
+/// Publish the complete clean accepted tail without manufacturing legacy
+/// enrollment recovery records.  Objects become visible first and each
+/// manifest remains the commit marker.  The clean enrollment descriptor is
+/// published only after this function returns, so a partially copied prefix
+/// cannot advertise a joinable graph.
+fn publish_complete_clean_archive(
+    store: &ObjectStore,
+    provider: &mut SharedProviderTransport,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+) -> Result<(), SyncRuntimeRequestError> {
+    let manifests = store
+        .committed_manifests()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    for manifest in &manifests {
+        if manifest.workspace_id() != workspace_id || manifest.lineage_digest() != lineage_digest {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "clean accepted manifest {} is outside the sharing namespace",
+                manifest.batch_id()
+            )));
+        }
+        for object in manifest.required_objects() {
+            let bytes = store
+                .read_object_bytes(object.content_digest())
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
+        }
+    }
+    for manifest in manifests {
+        let bytes = store
+            .read_manifest_bytes(manifest.batch_id())
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if OperationBatch::decode(&bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            != manifest
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "clean accepted manifest {} changed during provider publication",
+                manifest.batch_id()
+            )));
+        }
+        publish_clean_manifest_exact(provider, manifest.batch_id(), &bytes)?;
+    }
+    Ok(())
+}
+
+fn publish_clean_manifest_exact(
+    provider: &mut SharedProviderTransport,
+    batch_id: BatchId,
+    bytes: &[u8],
+) -> Result<(), SyncRuntimeRequestError> {
+    let path = format!("manifests/{batch_id}.manifest");
+    match provider
+        .read_exact(&path)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+    {
+        Some(existing) if existing == bytes => Ok(()),
+        Some(_) => Err(SyncRuntimeRequestError::ActorRefused(format!(
+            "clean provider manifest conflicts with accepted bytes at {path}"
+        ))),
+        None => provider
+            .publish_manifest(batch_id, bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string())),
+    }
+}
+
+fn publish_clean_descriptor_exact(
+    provider: &mut SharedProviderTransport,
+    descriptor: &CleanSharedEnrollmentDescriptorV1,
+) -> Result<(), SyncRuntimeRequestError> {
+    let bytes = descriptor
+        .encode()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    match provider
+        .read_exact(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+    {
+        Some(existing) if existing == bytes => Ok(()),
+        Some(_) => Err(SyncRuntimeRequestError::ActorRefused(
+            "clean provider descriptor conflicts with the enrolled authority".into(),
+        )),
+        None => provider
+            .publish_descriptor(&bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string())),
+    }
+}
+
+fn clean_frontier_head(
+    engine: &ShardedHotEngine,
+    descriptor: &CleanSharedEnrollmentDescriptorV1,
+    device_id: DeviceId,
+) -> Result<SharedProviderFrontierHeadV1, SyncRuntimeRequestError> {
+    let root = engine
+        .accepted_frontier_root()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let tips = engine
+        .exact_frontier()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        .documents()
+        .iter()
+        .flat_map(|document| document.direct_dependency_heads().iter().copied())
+        .collect::<Vec<_>>();
+    SharedProviderFrontierHeadV1::new(
+        descriptor.workspace_id(),
+        descriptor.lineage_digest(),
+        descriptor
+            .digest()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
+        device_id,
+        root.acceptance_sequence(),
+        root.state_digest(),
+        tips,
+        None,
+    )
+    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+}
+
+fn publish_clean_archive_batch(
+    store: &ObjectStore,
+    provider: &mut SharedProviderTransport,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    batch_id: BatchId,
+) -> Result<(), SyncRuntimeRequestError> {
+    let validated = match store
+        .inspect_batch(batch_id)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+    {
+        crate::oplog::BatchInspection::Ready(validated) => validated,
+        crate::oplog::BatchInspection::Absent => {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "clean outbound batch {batch_id} is absent"
+            )));
+        }
+        crate::oplog::BatchInspection::Staged { missing, .. } => {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "clean outbound batch {batch_id} is missing {} objects",
+                missing.len()
+            )));
+        }
+    };
+    if validated.manifest().workspace_id() != workspace_id
+        || validated.manifest().lineage_digest() != lineage_digest
+    {
+        return Err(SyncRuntimeRequestError::ActorRefused(format!(
+            "clean outbound batch {batch_id} is outside the sharing namespace"
+        )));
+    }
+    for object in validated.manifest().required_objects() {
+        let bytes = store
+            .read_object_bytes(object.content_digest())
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
+    }
+    let bytes = store
+        .read_manifest_bytes(batch_id)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    publish_clean_manifest_exact(provider, batch_id, &bytes)
+}
+
 fn publish_archive_batch(
     store: &ObjectStore,
     provider: &mut SharedProviderTransport,
@@ -8409,7 +8694,7 @@ enum ActorRequest {
         reply: mpsc::Sender<Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError>>,
     },
     JoinShared {
-        descriptor: SharedEnrollmentDescriptorV1,
+        descriptor: SharedEnrollmentDescriptor,
         reply: mpsc::Sender<Result<SharedJoinStep, SyncRuntimeRequestError>>,
     },
     Tick {
@@ -10506,6 +10791,7 @@ struct RuntimeActor {
     provider_journal_root: PathBuf,
     provider: Option<SharedProviderTransport>,
     shared_descriptor: Option<SharedEnrollmentDescriptorV1>,
+    clean_shared_descriptor: Option<CleanSharedEnrollmentDescriptorV1>,
     shared_role: Option<SyncSharedRole>,
     shared_phase: Option<SyncSharedPhase>,
     provider_exact: VecDeque<String>,
@@ -12107,6 +12393,7 @@ impl RuntimeActor {
             provider_journal_root: request.provider_journal_root,
             provider,
             shared_descriptor,
+            clean_shared_descriptor: None,
             shared_role,
             shared_phase,
             provider_exact: VecDeque::new(),
@@ -12212,6 +12499,41 @@ impl RuntimeActor {
             .map_err(display)?;
         let move_episode_directory =
             open_dir_nofollow(&application_runtime_directory, "move-episodes").map_err(display)?;
+        let marker = read_activation_marker(enrollment_root.path())
+            .map_err(display)?
+            .ok_or_else(|| "clean runtime has no activation marker".to_owned())?;
+        let clean_shared_state =
+            read_clean_shared_state(enrollment_root.path()).map_err(display)?;
+        if let Some(state) = &clean_shared_state {
+            let descriptor = state.descriptor();
+            if descriptor.workspace_id() != binding.workspace_id()
+                || descriptor.lineage_digest() != binding.lineage_digest()
+                || descriptor.catalog_document_id() != binding.catalog_document_id()
+                || descriptor.baseline_root() != marker.baseline_root()
+                || descriptor.source_capture() != marker.source_capture()
+            {
+                return Err("clean shared state differs from its activation authority".into());
+            }
+        }
+        let clean_shared_descriptor = clean_shared_state
+            .as_ref()
+            .map(|state| state.descriptor().clone());
+        let shared_role = clean_shared_state.as_ref().map(|state| match state.role() {
+            CleanSharedRoleV1::Initiator => SyncSharedRole::Initiator,
+            CleanSharedRoleV1::Joiner => SyncSharedRole::Joiner,
+        });
+        let shared_phase = clean_shared_state.as_ref().map(|_| SyncSharedPhase::Active);
+        let provider = if clean_shared_state.is_some() {
+            Some(
+                SharedProviderTransport::open(
+                    &request.provider_root,
+                    &request.provider_journal_root,
+                )
+                .map_err(display)?,
+            )
+        } else {
+            None
+        };
         let clean = CleanRuntimeActorCore::new(
             runtime,
             recovery == SyncRuntimeRecovery::CleanManifestReplay,
@@ -12254,12 +12576,13 @@ impl RuntimeActor {
             promoted_state_digest,
             provider_root: request.provider_root,
             provider_journal_root: request.provider_journal_root,
-            provider: None,
+            provider,
             shared_descriptor: None,
-            shared_role: None,
-            shared_phase: None,
+            clean_shared_descriptor,
+            shared_role,
+            shared_phase,
             provider_exact: VecDeque::new(),
-            provider_rescan_requested: false,
+            provider_rescan_requested: shared_phase == Some(SyncSharedPhase::Active),
             provider_rescan_required_for_safe: false,
             provider_full_scan_requested: false,
             provider_observation_cursor: None,
@@ -12295,7 +12618,7 @@ impl RuntimeActor {
             provider_publication_forced: VecDeque::new(),
             provider_descriptor_repair_requested: false,
             provider_namespace_repair_active: false,
-            provider_publication_repair_requested: false,
+            provider_publication_repair_requested: shared_phase == Some(SyncSharedPhase::Active),
             provider_publication_repair_cursor: None,
             provider_recovery_coverage_root: None,
             provider_recovery_exact: VecDeque::new(),
@@ -18890,6 +19213,7 @@ impl RuntimeActor {
             })?;
         match outcome {
             CleanActorMutationOutcome::Durable(batch_id) => {
+                self.queue_clean_provider_publication(batch_id);
                 let current = self
                     .clean
                     .as_ref()
@@ -20070,7 +20394,11 @@ impl RuntimeActor {
         let paths = {
             let clean = self.clean.as_ref().expect("clean actor remains installed");
             if !clean.watcher.pending() {
-                return SyncRuntimeTick::Idle;
+                return if self.provider_has_work() {
+                    self.tick_clean_provider()
+                } else {
+                    SyncRuntimeTick::Idle
+                };
             }
             if clean.watcher.full_scan {
                 clean.full_scan_changed_paths(&self.graph)
@@ -20105,7 +20433,8 @@ impl RuntimeActor {
                     SyncRuntimeTick::AdmittedNoop { epoch }
                 }
             }
-            Ok(CleanActorExternalOutcome::Durable(_)) => {
+            Ok(CleanActorExternalOutcome::Durable(batch_id)) => {
+                self.queue_clean_provider_publication(batch_id);
                 let clean = self.clean.as_mut().expect("clean actor remains installed");
                 clean.external_change_pending_notification = false;
                 let epoch = clean.watcher.settle();
@@ -20260,10 +20589,7 @@ impl RuntimeActor {
     /// from the configured pathname.
     fn retained_archive_store(&self) -> Result<Arc<ObjectStore>, SyncRuntimeRequestError> {
         let store = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-            .engine()
+            .active_engine()?
             .archive_store_capability()
             .ok_or_else(|| {
                 SyncRuntimeRequestError::ActorRefused(
@@ -20276,6 +20602,420 @@ impl RuntimeActor {
             ));
         }
         Ok(store)
+    }
+
+    fn queue_clean_provider_publication(&mut self, batch_id: BatchId) {
+        if self.shared_phase == Some(SyncSharedPhase::Active)
+            && !self.provider_publication_forced.contains(&batch_id)
+        {
+            self.provider_publication_forced.push_back(batch_id);
+        }
+    }
+
+    fn queue_clean_provider_manifest(&mut self, batch_id: BatchId) {
+        if self.provider_direct_queued.insert(batch_id) {
+            self.provider_direct_manifests.push_back(batch_id);
+        }
+    }
+
+    fn process_clean_provider_path(
+        &mut self,
+        descriptor: &CleanSharedEnrollmentDescriptorV1,
+        path: &str,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let provider = self
+            .provider
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+        if provider_transient_path(path) {
+            return Ok(());
+        }
+        if let Some(canonical) = canonical_generated_provider_conflict(path) {
+            let Some(conflict) = provider
+                .read_exact(path)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            else {
+                return Ok(());
+            };
+            let canonical_bytes = provider
+                .read_exact(&canonical)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                .ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(format!(
+                        "provider conflict copy retained because canonical target is absent at {canonical}"
+                    ))
+                })?;
+            if conflict != canonical_bytes {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "provider conflict copy differs from canonical generated evidence at {path}"
+                )));
+            }
+            provider
+                .remove_identical_generated_conflict(path, &canonical)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            return Ok(());
+        }
+        let bytes = provider
+            .read_exact(path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean provider evidence disappeared at {path}"
+                ))
+            })?;
+        if path == SHARED_ENROLLMENT_DESCRIPTOR_PATH {
+            if SharedEnrollmentDescriptor::decode(&bytes)
+                .map_err(SyncRuntimeRequestError::ActorRefused)?
+                != SharedEnrollmentDescriptor::Clean(descriptor.clone())
+            {
+                return Err(SyncRuntimeRequestError::ActorRefused(
+                    "clean provider descriptor changed".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if provider_frontier_head_path(path) {
+            let head = SharedProviderFrontierHeadV1::decode(path, &bytes)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            if head.workspace_id() != descriptor.workspace_id()
+                || head.lineage_digest() != descriptor.lineage_digest()
+                || head.descriptor_digest()
+                    != descriptor
+                        .digest()
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            {
+                return Err(SyncRuntimeRequestError::ActorRefused(
+                    "clean provider head names another shared authority".into(),
+                ));
+            }
+            for batch_id in head.frontier_tips() {
+                self.queue_clean_provider_manifest(*batch_id);
+            }
+            return Ok(());
+        }
+        if let Some(batch_id) = provider_manifest_id(path) {
+            let manifest = OperationBatch::decode(&bytes)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            if manifest.batch_id() != batch_id
+                || manifest.workspace_id() != descriptor.workspace_id()
+                || manifest.lineage_digest() != descriptor.lineage_digest()
+            {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean provider manifest is invalid at {path}"
+                )));
+            }
+            self.queue_clean_provider_manifest(batch_id);
+            return Ok(());
+        }
+        if let Some(expected) = path
+            .strip_prefix("objects/")
+            .and_then(|name| name.strip_suffix(".object"))
+        {
+            if ContentDigest::of(&bytes).to_string() != expected
+                || OperationObject::decode(&bytes).is_err()
+            {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean provider object is invalid at {path}"
+                )));
+            }
+            return Ok(());
+        }
+        Err(SyncRuntimeRequestError::ActorRefused(format!(
+            "unknown clean provider evidence retained at {path}"
+        )))
+    }
+
+    fn tick_clean_provider(&mut self) -> SyncRuntimeTick {
+        if self.shared_phase != Some(SyncSharedPhase::Active) {
+            return SyncRuntimeTick::Idle;
+        }
+        let Some(descriptor) = self.clean_shared_descriptor.clone() else {
+            return SyncRuntimeTick::Terminal(
+                "clean SharedActive runtime lost its enrollment descriptor".into(),
+            );
+        };
+        let store = match self.retained_archive_store() {
+            Ok(store) => store,
+            Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+        };
+        if self.provider.is_none() {
+            return SyncRuntimeTick::RecoveryBlocked(
+                "clean SharedActive runtime has no provider transport".into(),
+            );
+        }
+        if let Some(batch_id) = self.provider_publication_forced.front().copied() {
+            let engine = match self.active_engine() {
+                Ok(engine) => engine,
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+            let head = match clean_frontier_head(engine, &descriptor, self.binding.device_id()) {
+                Ok(head) => head,
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+            let published = publish_clean_archive_batch(
+                &store,
+                self.provider.as_mut().expect("provider checked"),
+                descriptor.workspace_id(),
+                descriptor.lineage_digest(),
+                batch_id,
+            )
+            .and_then(|()| {
+                self.provider
+                    .as_mut()
+                    .expect("provider checked")
+                    .publish_frontier_head(&head)
+                    .map(|_| ())
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+            });
+            return match published {
+                Ok(()) => {
+                    self.provider_publication_forced.pop_front();
+                    SyncRuntimeTick::Recovering
+                }
+                Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+        }
+        if self.provider_publication_repair_requested {
+            let engine = match self.active_engine() {
+                Ok(engine) => engine,
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+            let head = match clean_frontier_head(engine, &descriptor, self.binding.device_id()) {
+                Ok(head) => head,
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+            let repaired = publish_complete_clean_archive(
+                &store,
+                self.provider.as_mut().expect("provider checked"),
+                descriptor.workspace_id(),
+                descriptor.lineage_digest(),
+            )
+            .and_then(|()| {
+                publish_clean_descriptor_exact(
+                    self.provider.as_mut().expect("provider checked"),
+                    &descriptor,
+                )?;
+                self.provider
+                    .as_mut()
+                    .expect("provider checked")
+                    .publish_frontier_head(&head)
+                    .map(|_| ())
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+            });
+            return match repaired {
+                Ok(()) => {
+                    self.provider_publication_repair_requested = false;
+                    SyncRuntimeTick::Recovering
+                }
+                Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+        }
+
+        if let Some(path) = self.provider_exact.front().cloned() {
+            return match self.process_clean_provider_path(&descriptor, &path) {
+                Ok(()) => {
+                    self.provider_exact.pop_front();
+                    SyncRuntimeTick::Recovering
+                }
+                Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+        }
+
+        if self.provider_observation_cursor.is_none() && self.provider_rescan_requested {
+            match self
+                .provider
+                .as_ref()
+                .expect("provider checked")
+                .head_observation_cursor()
+            {
+                Ok(cursor) => self.provider_observation_cursor = Some(cursor),
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            }
+        }
+        if let Some(cursor) = self.provider_observation_cursor.as_mut() {
+            let observation = match self
+                .provider
+                .as_ref()
+                .expect("provider checked")
+                .next_observed_path(cursor)
+            {
+                Ok(observation) => observation,
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+            match observation {
+                SharedProviderObservation::Path(path) => {
+                    #[cfg(test)]
+                    if provider_frontier_head_path(&path) {
+                        PROVIDER_TRAVERSAL_INSTRUMENTATION
+                            .lock()
+                            .unwrap()
+                            .entry(self.binding.workspace_id())
+                            .or_default()
+                            .head_entries += 1;
+                    }
+                    return match self.process_clean_provider_path(&descriptor, &path) {
+                        Ok(()) => SyncRuntimeTick::Recovering,
+                        Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+                    };
+                }
+                SharedProviderObservation::ChunkBoundary => {
+                    cursor.begin_next_chunk();
+                    return SyncRuntimeTick::Recovering;
+                }
+                SharedProviderObservation::Complete => {
+                    self.provider_observation_cursor = None;
+                    self.provider_rescan_requested = false;
+                    self.provider_rescan_required_for_safe = false;
+                    return SyncRuntimeTick::Recovering;
+                }
+            }
+        }
+
+        if let Some(batch_id) = self.provider_direct_manifests.front().copied() {
+            let accepted = self.active_engine().and_then(|engine| {
+                engine
+                    .accepted_frontier_contains_batch_effects(batch_id)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+            });
+            match accepted {
+                Ok(true) => {
+                    self.provider_direct_manifests.pop_front();
+                    self.provider_direct_queued.remove(&batch_id);
+                    return SyncRuntimeTick::Recovering;
+                }
+                Ok(false) => {}
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            }
+            let path = format!("manifests/{batch_id}.manifest");
+            #[cfg(test)]
+            {
+                PROVIDER_TRAVERSAL_INSTRUMENTATION
+                    .lock()
+                    .unwrap()
+                    .entry(self.binding.workspace_id())
+                    .or_default()
+                    .exact_manifests += 1;
+            }
+            let manifest_bytes = match self
+                .provider
+                .as_ref()
+                .expect("provider checked")
+                .read_exact(&path)
+            {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    return SyncRuntimeTick::RecoveryBlocked(format!(
+                        "clean provider head names absent manifest {batch_id}"
+                    ));
+                }
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+            let manifest = match OperationBatch::decode(&manifest_bytes) {
+                Ok(manifest)
+                    if manifest.batch_id() == batch_id
+                        && manifest.workspace_id() == descriptor.workspace_id()
+                        && manifest.lineage_digest() == descriptor.lineage_digest() =>
+                {
+                    manifest
+                }
+                Ok(_) => {
+                    return SyncRuntimeTick::RecoveryBlocked(format!(
+                        "clean provider manifest {batch_id} names another authority"
+                    ));
+                }
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+            let mut missing_dependency = false;
+            for dependency in manifest.causal_dependency_heads().iter().rev() {
+                let retained = match store.inspect_batch(*dependency) {
+                    Ok(crate::oplog::BatchInspection::Ready(_)) => true,
+                    Ok(
+                        crate::oplog::BatchInspection::Absent
+                        | crate::oplog::BatchInspection::Staged { .. },
+                    ) => false,
+                    Err(error) => {
+                        return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+                    }
+                };
+                let accepted = self.active_engine().and_then(|engine| {
+                    engine
+                        .accepted_frontier_contains_batch_effects(*dependency)
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+                });
+                match accepted {
+                    Ok(true) if retained => {}
+                    Ok(true) | Ok(false) => {
+                        if self.provider_direct_queued.insert(*dependency) {
+                            self.provider_direct_manifests.push_front(*dependency);
+                        }
+                        missing_dependency = true;
+                    }
+                    Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+                }
+            }
+            if missing_dependency {
+                return SyncRuntimeTick::Recovering;
+            }
+            let mut objects = Vec::with_capacity(manifest.required_objects().len());
+            for descriptor in manifest.required_objects() {
+                let object_path = format!("objects/{}.object", descriptor.content_digest());
+                let bytes = match self
+                    .provider
+                    .as_ref()
+                    .expect("provider checked")
+                    .read_exact(&object_path)
+                {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        return SyncRuntimeTick::RecoveryBlocked(format!(
+                            "clean provider manifest {batch_id} is missing {}",
+                            descriptor.content_digest()
+                        ));
+                    }
+                    Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+                };
+                let object = match OperationObject::decode(&bytes) {
+                    Ok(object) if ContentDigest::of(&bytes) == descriptor.content_digest() => {
+                        object
+                    }
+                    Ok(_) => {
+                        return SyncRuntimeTick::RecoveryBlocked(format!(
+                            "clean provider object digest changed at {object_path}"
+                        ));
+                    }
+                    Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+                };
+                objects.push(object);
+            }
+            #[cfg(test)]
+            {
+                PROVIDER_TRAVERSAL_INSTRUMENTATION
+                    .lock()
+                    .unwrap()
+                    .entry(self.binding.workspace_id())
+                    .or_default()
+                    .exact_objects += objects.len();
+            }
+            let prepared = match PreparedBatch::new(manifest, objects) {
+                Ok(prepared) => prepared,
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+            let outcome = self
+                .clean
+                .as_mut()
+                .expect("clean provider work requires clean actor")
+                .execute_provider(&self.graph, &self.receipts, &prepared);
+            return match outcome {
+                Ok(CleanActorMutationOutcome::Durable(_))
+                | Ok(CleanActorMutationOutcome::DurablePending { .. }) => {
+                    self.provider_direct_manifests.pop_front();
+                    self.provider_direct_queued.remove(&batch_id);
+                    SyncRuntimeTick::Recovering
+                }
+                Err(error) => SyncRuntimeTick::RecoveryBlocked(error.detail),
+            };
+        }
+        SyncRuntimeTick::Idle
     }
 
     fn tick_provider(&mut self) -> SyncRuntimeTick {
@@ -22823,6 +23563,30 @@ impl RuntimeActor {
                 .unwrap_or((None, SyncLocalMutationPhase::Bindings));
             return SyncLocalMutationOutcome::Revoked { batch_id, phase };
         }
+        if self.clean.is_some() {
+            let outcome = self
+                .clean
+                .as_mut()
+                .expect("clean mutation is routed only to a clean actor")
+                .execute_local(&self.graph, &self.receipts, &transaction);
+            return match outcome {
+                Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
+                    self.queue_clean_provider_publication(batch_id);
+                    SyncLocalMutationOutcome::Durable { batch_id }
+                }
+                Ok(CleanActorMutationOutcome::DurablePending { batch_id, phase }) => {
+                    SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: Some(batch_id),
+                        phase: map_local_phase(phase),
+                    }
+                }
+                Err(failure) => SyncLocalMutationOutcome::Blocked {
+                    batch_id: None,
+                    phase: map_local_phase(failure.phase),
+                    reason: SyncLocalMutationBlock::Prepublication,
+                },
+            };
+        }
         if self.shared_phase == Some(SyncSharedPhase::Active) {
             for _ in 0..MAX_CLEAN_DRAIN_TURNS {
                 if self.current_provider_recovery_root().is_ok_and(|current| {
@@ -23253,13 +24017,15 @@ impl RuntimeActor {
                 let settled = self
                     .clean
                     .as_ref()
-                    .is_some_and(|clean| clean.pending.is_none() && !clean.watcher.pending());
+                    .is_some_and(|clean| clean.pending.is_none() && !clean.watcher.pending())
+                    && !self.provider_has_work();
                 if settled {
                     self.stopped_safe = true;
                     return Ok(SyncShutdownOutcome::Safe(self.snapshot()));
                 }
                 match self.tick_clean_runtime() {
                     SyncRuntimeTick::Idle
+                    | SyncRuntimeTick::Recovering
                     | SyncRuntimeTick::AdmittedNoop { .. }
                     | SyncRuntimeTick::AdmittedComplete { .. }
                     | SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable {
@@ -23608,6 +24374,73 @@ impl RuntimeActor {
     fn prepare_shared(
         &mut self,
     ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
+        if self.clean.is_some() {
+            return self.prepare_shared_clean();
+        }
+        self.prepare_shared_legacy()
+    }
+
+    fn prepare_shared_clean(
+        &mut self,
+    ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
+        if let Some(detail) = &self.terminal {
+            return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
+        }
+        self.clean_shutdown()?;
+        if let Some(descriptor) = self.clean_shared_descriptor.clone() {
+            return SyncSharedEnrollmentDescriptor::from_clean(descriptor)
+                .map_err(SyncRuntimeRequestError::ActorRefused);
+        }
+        let marker = read_activation_marker(self.enrollment_root.path())
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(
+                    "clean sharing requires an authoritative activation marker".into(),
+                )
+            })?;
+        let frontier = self
+            .active_engine()?
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let descriptor = CleanSharedEnrollmentDescriptorV1::new(
+            marker,
+            self.binding.catalog_document_id(),
+            frontier.state_digest(),
+            self.binding.device_id(),
+            shared_namespace_digest(self.binding.workspace_id()),
+        )
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let store = self.retained_archive_store()?;
+        let mut provider =
+            SharedProviderTransport::open(&self.provider_root, &self.provider_journal_root)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        publish_complete_clean_archive(
+            &store,
+            &mut provider,
+            self.binding.workspace_id(),
+            self.binding.lineage_digest(),
+        )?;
+        publish_clean_descriptor_exact(&mut provider, &descriptor)?;
+        let head =
+            clean_frontier_head(self.active_engine()?, &descriptor, self.binding.device_id())?;
+        provider
+            .publish_frontier_head(&head)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let state = CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Initiator)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        publish_clean_shared_state(self.enrollment_root.path(), &state)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        self.provider = Some(provider);
+        self.clean_shared_descriptor = Some(descriptor.clone());
+        self.shared_role = Some(SyncSharedRole::Initiator);
+        self.shared_phase = Some(SyncSharedPhase::Active);
+        SyncSharedEnrollmentDescriptor::from_clean(descriptor)
+            .map_err(SyncRuntimeRequestError::ActorRefused)
+    }
+
+    fn prepare_shared_legacy(
+        &mut self,
+    ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
         if let Some(detail) = &self.terminal {
             return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
         }
@@ -23687,6 +24520,98 @@ impl RuntimeActor {
     }
 
     fn join_shared(
+        &mut self,
+        descriptor: SharedEnrollmentDescriptor,
+    ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
+        match descriptor {
+            SharedEnrollmentDescriptor::Legacy(descriptor) => self.join_shared_legacy(descriptor),
+            SharedEnrollmentDescriptor::Clean(descriptor) => self.join_shared_clean(descriptor),
+        }
+    }
+
+    fn join_shared_clean(
+        &mut self,
+        descriptor: CleanSharedEnrollmentDescriptorV1,
+    ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
+        if let Some(detail) = &self.terminal {
+            return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
+        }
+        if self.clean.is_none() {
+            return Err(SyncRuntimeRequestError::ActorUnavailable);
+        }
+        if descriptor.workspace_id() != self.binding.workspace_id()
+            || descriptor.lineage_digest() != self.binding.lineage_digest()
+            || descriptor.catalog_document_id() != self.binding.catalog_document_id()
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "clean shared descriptor names another managed graph".into(),
+            ));
+        }
+        let expected = inspect_shared_provider_descriptor(&self.provider_root)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(
+                    "clean shared enrollment descriptor is not provider-visible".into(),
+                )
+            })?;
+        if SharedEnrollmentDescriptor::decode(&expected)
+            .map_err(SyncRuntimeRequestError::ActorRefused)?
+            != SharedEnrollmentDescriptor::Clean(descriptor.clone())
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "provider descriptor changed before clean join".into(),
+            ));
+        }
+        let marker = read_activation_marker(self.enrollment_root.path())
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(
+                    "clean join requires a local activation marker".into(),
+                )
+            })?;
+        if marker.baseline_root() != descriptor.baseline_root()
+            || marker.source_capture() != descriptor.source_capture()
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                format!(
+                    "local clean baseline differs from the shared baseline; provider baseline installation is required (local_root={}, shared_root={}, local_source={:?}, shared_source={:?})",
+                    marker.baseline_root(),
+                    descriptor.baseline_root(),
+                    marker.source_capture(),
+                    descriptor.source_capture(),
+                ),
+            ));
+        }
+        let frontier = self
+            .active_engine()?
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if frontier.state_digest() != descriptor.accepted_frontier_digest() {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "local clean accepted tail differs from the descriptor frontier; provider tail ingress is required"
+                    .into(),
+            ));
+        }
+        if self.provider.is_none() {
+            self.provider = Some(
+                SharedProviderTransport::open(&self.provider_root, &self.provider_journal_root)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
+            );
+        }
+        self.clean_shutdown()?;
+        let state = CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Joiner)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        publish_clean_shared_state(self.enrollment_root.path(), &state)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        self.clean_shared_descriptor = Some(descriptor.clone());
+        self.shared_role = Some(SyncSharedRole::Joiner);
+        self.shared_phase = Some(SyncSharedPhase::Active);
+        SyncSharedEnrollmentDescriptor::from_clean(descriptor)
+            .map(SharedJoinStep::Complete)
+            .map_err(SyncRuntimeRequestError::ActorRefused)
+    }
+
+    fn join_shared_legacy(
         &mut self,
         descriptor: SharedEnrollmentDescriptorV1,
     ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
@@ -24276,6 +25201,7 @@ impl RuntimeActor {
                 + usize::from(self.provider_recovery_backfill_cursor.is_some())
                 + usize::from(
                     self.shared_phase == Some(SyncSharedPhase::Active)
+                        && self.clean.is_none()
                         && !self
                             .provider_recovery_coverage_matches_current_frontier()
                             .unwrap_or(false),
@@ -29371,7 +30297,7 @@ mod tests {
         let manifests = fixture.manifest_count();
         handle.force_next_move_episode_batch_id(collision).unwrap();
         let mut observed_collision = false;
-        for _ in 0..16 {
+        for _ in 0..256 {
             match handle.move_application_subtrees(request.clone()).unwrap() {
                 SyncApplicationMoveSubtreesOutcome::NoCommit {
                     reason: SyncApplicationMoveConflict::BatchCollision,
@@ -42477,10 +43403,11 @@ mod tests {
         // A partition leaves the joiner unchanged. Restart it, then deliver
         // the provider tree twice to prove delayed duplicate convergence.
         assert!(!joiner.graph_root.join("notes/層/共有 計画.md").exists());
-        assert!(matches!(
-            joiner_reopened.clean_shutdown(),
-            Ok(SyncShutdownOutcome::Safe(_))
-        ));
+        let pre_delivery_shutdown = joiner_reopened.clean_shutdown();
+        assert!(
+            matches!(pre_delivery_shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "clean joiner shutdown before delayed delivery failed: {pre_delivery_shutdown:?}"
+        );
         copy_provider_tree(
             &initiator.request.provider_root,
             &joiner.request.provider_root,
@@ -42503,7 +43430,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(joiner_rejoined.status().unwrap().provider_pending, 0);
+        let joiner_status = joiner_rejoined.status().unwrap();
+        assert_eq!(
+            joiner_status.provider_pending, 0,
+            "clean provider did not settle: {joiner_status:?}; ticks={provider_ticks:?}"
+        );
         let tail_traversal =
             provider_traversal_instrumentation(joiner.request.identities.workspace_id);
         assert_eq!(tail_traversal.full_scan_entries, 0, "{tail_traversal:?}");
@@ -42613,8 +43544,10 @@ mod tests {
             )
             .unwrap();
         let mut conflict_block = None;
-        for _ in 0..16 {
+        let mut conflict_ticks = Vec::new();
+        for _ in 0..256 {
             let tick = conflicted.tick().unwrap();
+            conflict_ticks.push(tick.clone());
             if matches!(tick, SyncRuntimeTick::RecoveryBlocked(_)) {
                 conflict_block = Some(tick);
                 break;
@@ -42627,8 +43560,10 @@ mod tests {
                     if detail.contains("conflicting provider object retained")
                         || detail.contains("unknown shared provider evidence retained")
                         || detail.contains("ambiguous provider conflict copy retained")
+                        || detail.contains("clean provider object is invalid")
             ),
-            "unexpected retained provider conflict outcome: {conflict_block:?}"
+            "unexpected retained provider conflict outcome: {conflict_block:?}; status={:?}; ticks={conflict_ticks:?}",
+            conflicted.status().unwrap(),
         );
         assert_eq!(fs::read(&conflict_path).unwrap(), conflict_bytes);
         assert_eq!(

@@ -8292,6 +8292,7 @@ impl ShardedHotEngine {
         let manifests = store
             .committed_manifests()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let mut pending = BTreeMap::new();
         for manifest in &manifests {
             let validated = match store
                 .inspect_batch(manifest.batch_id())
@@ -8312,14 +8313,50 @@ impl ShardedHotEngine {
                     )));
                 }
             };
-            let outcome = self.stage_ready(validated);
-            if matches!(
-                outcome.disposition(),
-                BatchDisposition::Rejected { .. } | BatchDisposition::Quarantined
-            ) {
+            pending.insert(manifest.batch_id(), validated);
+        }
+        while !pending.is_empty() {
+            let mut ready = None;
+            for (batch_id, batch) in &pending {
+                let mut dependencies_ready = true;
+                for dependency in batch.manifest().causal_dependency_heads() {
+                    if !self.accepted_frontier_contains_batch_effects(*dependency)? {
+                        dependencies_ready = false;
+                        break;
+                    }
+                }
+                if dependencies_ready {
+                    ready = Some(*batch_id);
+                    break;
+                }
+            }
+            let Some(batch_id) = ready else {
+                let mut blocked = Vec::new();
+                for batch in pending.values() {
+                    let mut missing = Vec::new();
+                    for dependency in batch.manifest().causal_dependency_heads() {
+                        if !self.accepted_frontier_contains_batch_effects(*dependency)? {
+                            missing.push(dependency.to_string());
+                        }
+                    }
+                    blocked.push(format!(
+                        "{} -> [{}]",
+                        batch.manifest().batch_id(),
+                        missing.join(",")
+                    ));
+                }
                 return Err(EngineError::Archive(format!(
-                    "manifest-committed clean operation {} did not validate as accepted: {:?}",
-                    manifest.batch_id(),
+                    "manifest-committed clean tail has no causally ready operation: {}",
+                    blocked.join("; ")
+                )));
+            };
+            let validated = pending
+                .remove(&batch_id)
+                .expect("ready clean replay batch remains pending");
+            let outcome = self.stage_ready(validated);
+            if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
+                return Err(EngineError::Archive(format!(
+                    "manifest-committed clean operation {batch_id} did not validate as accepted: {:?}",
                     outcome.disposition()
                 )));
             }
@@ -8409,7 +8446,7 @@ impl ShardedHotEngine {
                         "clean accepted operation disappeared from the run-local archive".into(),
                     )
                 })?;
-            self.projection_work_rows_for_batch(accepted, endpoint)?
+            self.clean_projection_locators_for_batch(accepted, endpoint)?
         } else {
             Vec::new()
         };
@@ -8466,7 +8503,7 @@ impl ShardedHotEngine {
                     "accepted clean batch {batch_id} is absent from the run-local archive"
                 ))
             })?;
-            for work in self.projection_work_rows_for_batch(batch, endpoint)? {
+            for work in self.clean_projection_locators_for_batch(batch, endpoint)? {
                 heads.insert(work.path().clone(), work);
             }
         }
@@ -17763,7 +17800,7 @@ impl ShardedHotEngine {
         };
         if self.clean_projection_heads.get(path) != Some(work)
             || !self
-                .clean_projection_work_for_batch(work.batch_id())?
+                .clean_projection_locators_for_committed_batch(work.batch_id())?
                 .iter()
                 .any(|derived| derived == work)
         {
@@ -20642,6 +20679,64 @@ impl ShardedHotEngine {
         Ok(work)
     }
 
+    /// Derive run-local locators for every accepted projection intent, not
+    /// only work authored by this endpoint.  A foreign locator is never fed to
+    /// the source-endpoint projection executor; it merely lets clean restart
+    /// and external reconciliation find the immutable intent that explains a
+    /// receiver-local file.  The map is rebuilt from manifests on every open.
+    fn clean_projection_locators_for_batch(
+        &self,
+        batch: &ValidatedBatch,
+        receiver: ProjectionEndpointBinding,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
+        let batch_id = batch.manifest().batch_id();
+        let projection = super::projection_manifest::validate_projection_object_set(
+            batch.manifest(),
+            batch.objects(),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let mut locators = Vec::new();
+        for intent in projection.intents() {
+            if intent.source_endpoint_id() == receiver.endpoint_id
+                && intent.source_author_device_id() != receiver.device_id
+            {
+                return Err(EngineError::ProjectionManifest(
+                    "source endpoint is not bound to the author device".into(),
+                ));
+            }
+            let descriptor = batch
+                .manifest()
+                .required_objects()
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind() == ObjectKind::ProjectionIntent
+                        && descriptor.document_id() == intent.descriptor_document_id()
+                })
+                .ok_or_else(|| {
+                    EngineError::ProjectionManifest(
+                        "projection intent descriptor disappeared".into(),
+                    )
+                })?;
+            let target = intent
+                .target()
+                .description()
+                .map_or(ProjectionWorkTarget::Absent, ProjectionWorkTarget::Present);
+            locators.push(ProjectionWork::new(
+                self.workspace_id,
+                intent.source_endpoint_id(),
+                receiver.graph_resource_id,
+                batch_id,
+                intent.page_id(),
+                intent.path().clone(),
+                intent.portable_path_index_root(),
+                ManifestObjectRef::from_descriptor(descriptor),
+                intent.post_frontier().clone(),
+                target,
+            ));
+        }
+        Ok(locators)
+    }
+
     fn prepare_projection_work_rows(
         &self,
         batch: &ValidatedBatch,
@@ -20753,6 +20848,38 @@ impl ShardedHotEngine {
             )));
         }
         self.projection_work_rows_for_batch(batch, endpoint)
+    }
+
+    fn clean_projection_locators_for_committed_batch(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
+        let (store, endpoint) = self.clean_projection_runtime_binding()?;
+        let manifest = store
+            .read_manifest(batch_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "clean projection batch {batch_id} has no committed manifest"
+                ))
+            })?;
+        let evidence = self.accepted_batch_evidence(batch_id)?;
+        if evidence.manifest_fingerprint() != batch_fingerprint_from_manifest(&manifest) {
+            return Err(EngineError::Archive(format!(
+                "clean projection batch {batch_id} manifest differs from accepted evidence"
+            )));
+        }
+        let batch = self.archive.get(&batch_id).ok_or_else(|| {
+            EngineError::Archive(format!(
+                "clean projection batch {batch_id} is not retained by the accepted runtime"
+            ))
+        })?;
+        if batch.manifest() != &manifest {
+            return Err(EngineError::Archive(format!(
+                "clean projection batch {batch_id} runtime manifest differs from committed bytes"
+            )));
+        }
+        self.clean_projection_locators_for_batch(batch, endpoint)
     }
 
     /// Rebuild the run-local terminal projection plan from accepted manifests.

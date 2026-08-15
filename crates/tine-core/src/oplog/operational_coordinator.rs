@@ -1498,6 +1498,103 @@ impl OperationalCoordinator {
         }
     }
 
+    /// Validate and commit one provider-delivered clean batch without first
+    /// placing its manifest in the accepted archive. Provider bytes are only
+    /// transport evidence; the manifest becomes authority at the same
+    /// commit-last boundary used by local and external authoring.
+    pub(crate) fn ingest_clean_prepared(
+        session: &mut CleanRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        prepared: &PreparedBatch,
+    ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
+        let (admission, engine, database) = session.parts().map_err(|refusal| {
+            OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+        })?;
+        authorize_coordinator(&admission, graph, engine)?;
+        let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Bindings,
+                "clean engine has no projection endpoint",
+            )
+        })?;
+        verify_projection_bindings(graph, receipts, engine, endpoint)?;
+        let archive = engine.archive_store_capability().ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::ArchiveStage,
+                "clean runtime has no retained operation archive",
+            )
+        })?;
+        let handoff = graph
+            .mint_handoff_safe(engine.workspace_id(), endpoint)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+            })?;
+        handoff
+            .verify_binding(graph, engine.workspace_id(), endpoint)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+            })?;
+        let identity = database
+            .preflight_prepared_identity_transition(engine, prepared)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Finalize, error.to_string())
+            })?;
+        reprove_workspace_authority(
+            &admission,
+            WorkspaceAuthorityBoundary::Publication,
+            OperationalPhase::Publication,
+        )?;
+        let published = handoff.into_publisher_guard().into_published_latch();
+        let batch_id = prepared.manifest().batch_id();
+        let outcome = match engine.commit_clean_prepared(prepared) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let failure = OperationalCoordinatorError::new(
+                    OperationalPhase::Publication,
+                    error.to_string(),
+                );
+                if matches!(archive.inspect_batch(batch_id), Ok(BatchInspection::Absent)) {
+                    published.cancel_prepublication();
+                    return Err(failure);
+                }
+                return Ok(CleanLocalMutationState::DurablePending(
+                    CleanPublishedContinuation {
+                        guard: published,
+                        batch_id,
+                        identity,
+                        failure,
+                    },
+                ));
+            }
+        };
+        if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::ArchiveStage,
+                "clean provider manifest did not leave one accepted operation",
+            ));
+        }
+        let mut continuation = CleanPublishedContinuation {
+            guard: published,
+            batch_id,
+            identity,
+            failure: OperationalCoordinatorError::new(
+                OperationalPhase::SqliteDrain,
+                "durable clean provider operation is awaiting derived-state application",
+            ),
+        };
+        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+            Ok(()) => {
+                continuation.guard.complete();
+                Ok(CleanLocalMutationState::Complete(batch_id))
+            }
+            Err(error) => {
+                continuation.failure = error;
+                Ok(CleanLocalMutationState::DurablePending(continuation))
+            }
+        }
+    }
+
     /// Reconcile exact externally changed graph paths through the clean
     /// baseline-plus-manifest authority.  Planning reuses the established
     /// structural matcher, but its predecessor evidence is reconstructed from
@@ -2705,29 +2802,32 @@ fn resume_clean_published(
     continuation: &CleanPublishedContinuation,
 ) -> Result<(), OperationalCoordinatorError> {
     authorize_coordinator(admission, graph, engine)?;
-    let archive = engine.archive_store().ok_or_else(|| {
+    let event = AcceptedBatchEvent::from_accepted(
+        engine,
+        engine.archive_store().ok_or_else(|| {
+            OperationalCoordinatorError::retained_block(
+                OperationalPhase::ArchiveStage,
+                "clean committed operation has no retained archive",
+                RetainedBlockReason::PublishedAuthentication,
+            )
+        })?,
+        continuation.batch_id,
+    )
+    .map_err(|error| {
         OperationalCoordinatorError::retained_block(
             OperationalPhase::ArchiveStage,
-            "clean committed operation has no retained archive",
+            error.to_string(),
+            RetainedBlockReason::PublishedAuthentication,
+        )
+    })?
+    .with_prepared_identity_transition(continuation.identity.clone())
+    .map_err(|error| {
+        OperationalCoordinatorError::retained_block(
+            OperationalPhase::SqliteDrain,
+            error.to_string(),
             RetainedBlockReason::PublishedAuthentication,
         )
     })?;
-    let event = AcceptedBatchEvent::from_accepted(engine, archive, continuation.batch_id)
-        .map_err(|error| {
-            OperationalCoordinatorError::retained_block(
-                OperationalPhase::ArchiveStage,
-                error.to_string(),
-                RetainedBlockReason::PublishedAuthentication,
-            )
-        })?
-        .with_prepared_identity_transition(continuation.identity.clone())
-        .map_err(|error| {
-            OperationalCoordinatorError::retained_block(
-                OperationalPhase::SqliteDrain,
-                error.to_string(),
-                RetainedBlockReason::PublishedAuthentication,
-            )
-        })?;
     let applied = database.frontier_root().map_err(|error| {
         OperationalCoordinatorError::new(OperationalPhase::SqliteDrain, error.to_string())
     })?;
@@ -2775,6 +2875,89 @@ fn resume_clean_published(
         .map_err(|error| {
             OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
         })?;
+    }
+
+    // Projection intents authored by another endpoint describe accepted
+    // semantic state, not bytes that this receiver may copy verbatim.  Once
+    // SQLite has advanced to the accepted frontier, render each foreign
+    // intent again against this endpoint's exact local base and record the
+    // result in its private receipt store.  Keeping this in the resumable
+    // published continuation makes provider ingress crash-safe: a retry may
+    // observe the manifest and SQLite transition already complete, but it
+    // must still finish the receiver-local Markdown projection.
+    let receiver_endpoint = engine
+        .projection_endpoint_binding()
+        .ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::ProjectionDrain,
+                "clean provider receiver has no enrolled projection endpoint",
+            )
+        })?
+        .endpoint_id();
+    let batch = match engine
+        .archive_store()
+        .ok_or_else(|| {
+            OperationalCoordinatorError::retained_block(
+                OperationalPhase::ArchiveStage,
+                "clean committed operation has no retained archive",
+                RetainedBlockReason::PublishedAuthentication,
+            )
+        })?
+        .inspect_batch(continuation.batch_id)
+        .map_err(|error| {
+            OperationalCoordinatorError::retained_block(
+                OperationalPhase::ProjectionDrain,
+                error.to_string(),
+                RetainedBlockReason::PublishedAuthentication,
+            )
+        })? {
+        BatchInspection::Ready(batch) => batch,
+        BatchInspection::Absent | BatchInspection::Staged { .. } => {
+            return Err(OperationalCoordinatorError::retained_block(
+                OperationalPhase::ProjectionDrain,
+                "clean accepted batch became partial before receiver-local projection",
+                RetainedBlockReason::PublishedAuthentication,
+            ));
+        }
+    };
+    let projection = super::projection_manifest::validate_projection_object_set(
+        batch.manifest(),
+        batch.objects(),
+    )
+    .map_err(|error| {
+        OperationalCoordinatorError::retained_block(
+            OperationalPhase::ProjectionDrain,
+            error.to_string(),
+            RetainedBlockReason::PublishedAuthentication,
+        )
+    })?;
+    for source in projection
+        .intents()
+        .iter()
+        .filter(|source| source.source_endpoint_id() != receiver_endpoint)
+    {
+        reprove_workspace_authority(
+            admission,
+            WorkspaceAuthorityBoundary::ProjectionDrain,
+            OperationalPhase::ProjectionDrain,
+        )?;
+        let completed = super::projection::execute_receiver_local_projection_under_handoff(
+            graph,
+            receipts,
+            engine,
+            source,
+            &continuation.guard,
+            true,
+        )
+        .map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
+        })?;
+        if completed.is_none() {
+            return Err(OperationalCoordinatorError::continuation_required(
+                OperationalPhase::ProjectionDrain,
+                "clean receiver-local projection requires a continuation",
+            ));
+        }
     }
     Ok(())
 }
