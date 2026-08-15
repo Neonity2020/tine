@@ -17,7 +17,7 @@ object ManagedStorageSmoke {
 @RunWith(AndroidJUnit4::class)
 class ManagedStorageSmokeTest {
   @Test
-  fun activationShareSetupCleanShutdownAndReopenWorkAsTheAppUidOnSharedStorage() {
+  fun activationEditShareSetupCleanShutdownAndReopenWorkAsTheAppUidOnSharedStorage() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val nonce = UUID.randomUUID().toString()
     val graphRoot = File(
@@ -42,7 +42,7 @@ class ManagedStorageSmokeTest {
       )
       assertEquals("ok", result)
       assertEquals(
-        "- Android managed storage smoke\n",
+        "- Android managed storage edited\n",
         File(graphRoot, "pages/Smoke.md").readText(),
       )
     } finally {
@@ -67,6 +67,7 @@ class ManagedStorageSmokeTest {
     File(graphRoot, "journals").mkdirs()
     File(graphRoot, "logseq").mkdirs()
     File(graphRoot, "pages/Resume.md").writeText("- Android interrupted activation resume\n")
+    File(graphRoot, "pages/Smoke.md").writeText("- Android managed storage smoke\n")
     File(graphRoot, "logseq/config.edn").writeText("{}\n")
     // This is deliberately not a valid receipt store. It represents bytes
     // left by a killed, pre-promotion candidate; the Markdown graph is still

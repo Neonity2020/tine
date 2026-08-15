@@ -13,6 +13,8 @@ use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
 use tine_core::sync_runtime::{
+    SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
+    SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
     SyncLocalActivationIdentities, SyncLocalActivationRequest, SyncLocalActivationStatus,
     SyncRuntimeHandle, SyncRuntimeOpenRequest, SyncRuntimeOpenStatus, SyncShutdownOutcome,
     SyncStorageProfile,
@@ -73,6 +75,28 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
     let Some(handle) = activation.handle else {
         return "activation returned Active without a handle".into();
     };
+    let (mut page, revision) = match handle.load_application_page(SyncApplicationPageLoadRequest {
+        page: SyncApplicationPageSelector::ExactPath {
+            path: "pages/Smoke.md".into(),
+        },
+    }) {
+        Ok(SyncApplicationPageLoadOutcome::Loaded { page, revision }) => (page, revision),
+        outcome => return format!("post-activation page load failed: {outcome:?}"),
+    };
+    let Some(first) = page.blocks.first_mut() else {
+        return "post-activation page has no editable block".into();
+    };
+    first.raw = "Android managed storage edited".into();
+    match handle.save_application_page(SyncApplicationPageSaveRequest {
+        target: SyncApplicationPageSaveTarget::Existing {
+            path: page.path.clone(),
+            revision,
+        },
+        page,
+    }) {
+        Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {}
+        outcome => return format!("post-activation page save failed: {outcome:?}"),
+    }
     if let Err(error) = handle.prepare_shared() {
         return format!("prepare shared failed: {error}");
     }
