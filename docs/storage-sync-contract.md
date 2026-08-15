@@ -317,6 +317,19 @@ projection which is replayed/rebuilt. A SQLite failure after the append does
 not turn the accepted edit into a retryable save or permit a duplicate write.
 SQLite must never publish `F+1` before semantic history does.
 
+Application protocols which need retry-stable identity, currently cross-page
+subtree moves, supply one deterministic `BatchId` to the same clean commit
+pipeline. Their immutable episode record and manifest fingerprint are
+published before the operation manifest. A failed episode publication cannot
+reach the manifest; after the manifest exists, cold replay plus that record
+turns a repeated request into one recovered result rather than a second edit.
+
+An unrelated accepted batch may advance a page's causal frontier without
+changing its rendered bytes. In that case the latest clean projection manifest
+remains valid predecessor evidence only after the projection planner replays
+the current semantic page and proves equality except for that frontier. Exact
+bytes, path, page identity, claims and layout annotations must still match.
+
 For a valid clean marker, the immutable baseline plus committed ordinary
 manifests is the complete semantic authority. The runtime reconstructs any
 current projection-head map in process memory from those manifests; it neither

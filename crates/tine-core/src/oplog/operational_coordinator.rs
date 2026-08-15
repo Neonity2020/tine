@@ -1362,6 +1362,116 @@ impl ProviderArchiveContinuation {
     }
 }
 
+fn execute_clean_local_inner(
+    session: &mut CleanRuntimeSession<'_>,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    transaction: &OperationTransaction,
+    batch_id: Option<BatchId>,
+    persist_fingerprint: Option<&mut dyn FnMut(ContentDigest) -> Result<(), String>>,
+) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
+    let (admission, engine, database) = session.parts().map_err(|refusal| {
+        OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+    })?;
+    let mut prepared = match prepare_local_inner(
+        &admission,
+        graph,
+        receipts,
+        engine,
+        None,
+        LocalDraftSource::Promoted { batch_id },
+        LocalPreparationBinding::TrustedLocal,
+        transaction,
+        None,
+    )? {
+        PreparedLocalMutationState::Prepared(prepared) => prepared,
+        PreparedLocalMutationState::ReconciliationRequired(_) => {
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::Planning,
+                "clean local mutation requires external reconciliation before publication",
+            ));
+        }
+    };
+    prepared.preflight_identity(database, engine)?;
+    if let Some(persist_fingerprint) = persist_fingerprint {
+        let manifest_bytes = prepared.prepared.manifest().encode().map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Finalize, error.to_string())
+        })?;
+        persist_fingerprint(ContentDigest::of(&manifest_bytes)).map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Publication, error)
+        })?;
+    }
+    let PreparedLocalMutation {
+        endpoint: _,
+        archive: _,
+        guard,
+        prepared,
+        batch_id,
+        identity,
+    } = prepared;
+    let identity = identity.expect("clean local publication requires identity preflight");
+    reprove_workspace_authority(
+        &admission,
+        WorkspaceAuthorityBoundary::Publication,
+        OperationalPhase::Publication,
+    )?;
+    let archive = engine.archive_store_capability().ok_or_else(|| {
+        OperationalCoordinatorError::new(
+            OperationalPhase::ArchiveStage,
+            "clean runtime has no retained operation archive",
+        )
+    })?;
+    let published = guard.into_published_latch();
+    let outcome = match engine.commit_clean_prepared(&prepared) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let failure =
+                OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string());
+            if matches!(archive.inspect_batch(batch_id), Ok(BatchInspection::Absent)) {
+                published.cancel_prepublication();
+                return Err(failure);
+            }
+            return Ok(CleanLocalMutationState::DurablePending(
+                CleanPublishedContinuation {
+                    guard: published,
+                    batch_id,
+                    identity,
+                    failure,
+                },
+            ));
+        }
+    };
+    if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
+        return Err(OperationalCoordinatorError::new(
+            OperationalPhase::ArchiveStage,
+            "clean manifest commit did not leave one accepted operation",
+        ));
+    }
+    let mut continuation = CleanPublishedContinuation {
+        guard: published,
+        batch_id,
+        identity,
+        failure: OperationalCoordinatorError::new(
+            OperationalPhase::SqliteDrain,
+            "durable clean operation is awaiting derived-state application",
+        ),
+    };
+    if let Err(error) = fault(OperationalFaultPoint::AfterManifest) {
+        continuation.failure = error;
+        return Ok(CleanLocalMutationState::DurablePending(continuation));
+    }
+    match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+        Ok(()) => {
+            continuation.guard.complete();
+            Ok(CleanLocalMutationState::Complete(batch_id))
+        }
+        Err(error) => {
+            continuation.failure = error;
+            Ok(CleanLocalMutationState::DurablePending(continuation))
+        }
+    }
+}
+
 impl OperationalCoordinator {
     /// Execute one local semantic operation through the clean
     /// baseline-plus-manifest runtime. Validation, exact graph capture and the
@@ -1375,100 +1485,29 @@ impl OperationalCoordinator {
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
     ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
-        let (admission, engine, database) = session.parts().map_err(|refusal| {
-            OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
-        })?;
-        let mut prepared = match prepare_local_inner(
-            &admission,
+        execute_clean_local_inner(session, graph, receipts, transaction, None, None)
+    }
+
+    /// Execute one clean local mutation with a stable application-owned batch
+    /// identity. The immutable episode record is published before the manifest
+    /// commit, so a crash can distinguish a retry of the same move from an
+    /// unrelated batch collision without creating a second semantic edit.
+    pub(crate) fn execute_clean_local_correlated(
+        session: &mut CleanRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        batch_id: BatchId,
+        transaction: &OperationTransaction,
+        mut persist_fingerprint: impl FnMut(ContentDigest) -> Result<(), String>,
+    ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
+        execute_clean_local_inner(
+            session,
             graph,
             receipts,
-            engine,
-            None,
-            LocalDraftSource::Promoted { batch_id: None },
-            LocalPreparationBinding::TrustedLocal,
             transaction,
-            None,
-        )? {
-            PreparedLocalMutationState::Prepared(prepared) => prepared,
-            PreparedLocalMutationState::ReconciliationRequired(_) => {
-                return Err(OperationalCoordinatorError::new(
-                    OperationalPhase::Planning,
-                    "clean local mutation requires external reconciliation before publication",
-                ));
-            }
-        };
-        prepared.preflight_identity(database, engine)?;
-        let PreparedLocalMutation {
-            endpoint: _,
-            archive: _,
-            guard,
-            prepared,
-            batch_id,
-            identity,
-        } = prepared;
-        let identity = identity.expect("clean local publication requires identity preflight");
-        reprove_workspace_authority(
-            &admission,
-            WorkspaceAuthorityBoundary::Publication,
-            OperationalPhase::Publication,
-        )?;
-        let archive = engine.archive_store_capability().ok_or_else(|| {
-            OperationalCoordinatorError::new(
-                OperationalPhase::ArchiveStage,
-                "clean runtime has no retained operation archive",
-            )
-        })?;
-        let published = guard.into_published_latch();
-        let outcome = match engine.commit_clean_prepared(&prepared) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let failure = OperationalCoordinatorError::new(
-                    OperationalPhase::Publication,
-                    error.to_string(),
-                );
-                if matches!(archive.inspect_batch(batch_id), Ok(BatchInspection::Absent)) {
-                    published.cancel_prepublication();
-                    return Err(failure);
-                }
-                return Ok(CleanLocalMutationState::DurablePending(
-                    CleanPublishedContinuation {
-                        guard: published,
-                        batch_id,
-                        identity,
-                        failure,
-                    },
-                ));
-            }
-        };
-        if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
-            return Err(OperationalCoordinatorError::new(
-                OperationalPhase::ArchiveStage,
-                "clean manifest commit did not leave one accepted operation",
-            ));
-        }
-        let mut continuation = CleanPublishedContinuation {
-            guard: published,
-            batch_id,
-            identity,
-            failure: OperationalCoordinatorError::new(
-                OperationalPhase::SqliteDrain,
-                "durable clean operation is awaiting derived-state application",
-            ),
-        };
-        if let Err(error) = fault(OperationalFaultPoint::AfterManifest) {
-            continuation.failure = error;
-            return Ok(CleanLocalMutationState::DurablePending(continuation));
-        }
-        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
-            Ok(()) => {
-                continuation.guard.complete();
-                Ok(CleanLocalMutationState::Complete(batch_id))
-            }
-            Err(error) => {
-                continuation.failure = error;
-                Ok(CleanLocalMutationState::DurablePending(continuation))
-            }
-        }
+            Some(batch_id),
+            Some(&mut persist_fingerprint),
+        )
     }
 
     pub(crate) fn retry_clean_local(
@@ -1519,12 +1558,6 @@ impl OperationalCoordinator {
             )
         })?;
         verify_projection_bindings(graph, receipts, engine, endpoint)?;
-        let archive = engine.archive_store_capability().ok_or_else(|| {
-            OperationalCoordinatorError::new(
-                OperationalPhase::ArchiveStage,
-                "clean runtime has no retained operation archive",
-            )
-        })?;
         let handoff = graph
             .mint_handoff_safe(engine.workspace_id(), endpoint)
             .map_err(|error| {
@@ -1545,9 +1578,15 @@ impl OperationalCoordinator {
             WorkspaceAuthorityBoundary::Publication,
             OperationalPhase::Publication,
         )?;
+        let archive = engine.archive_store_capability().ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::ArchiveStage,
+                "clean runtime has no retained operation archive",
+            )
+        })?;
         let published = handoff.into_publisher_guard().into_published_latch();
         let batch_id = prepared.manifest().batch_id();
-        let outcome = match engine.commit_clean_prepared(prepared) {
+        let outcome = match engine.commit_clean_prepared(&prepared) {
             Ok(outcome) => outcome,
             Err(error) => {
                 let failure = OperationalCoordinatorError::new(

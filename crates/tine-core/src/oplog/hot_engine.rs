@@ -17735,7 +17735,6 @@ impl ShardedHotEngine {
         if work.page_id() != page_id
             || before.page.page_id != page_id
             || before.page.path != *path
-            || before.frontier != *work.post_frontier()
             || !matches!(work.target(), ProjectionWorkTarget::Present(_))
         {
             return Err(EngineError::ProjectionManifest(format!(
@@ -17750,7 +17749,7 @@ impl ShardedHotEngine {
                 "clean manifest predecessor for {path} unexpectedly has an absent target"
             ))
         })?;
-        let intent = decoded.receiver_local_intent().clone();
+        let retained_intent = decoded.receiver_local_intent();
         let replay = super::projection::plan_projection_with_layout_annotations(
             self.workspace_id,
             before,
@@ -17760,14 +17759,16 @@ impl ShardedHotEngine {
                 .map(AnnotatedProjectionBase::annotations),
         )
         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        if replay.target() != bytes || replay.intent() != &intent {
+        if replay.target() != bytes
+            || !retained_intent.matches_replay_except_frontier(replay.intent())
+        {
             return Err(EngineError::ProjectionManifest(format!(
                 "clean manifest predecessor for {path} is not its deterministic current rendering"
             )));
         }
         Ok(Some(CapabilityCapturedPriorProjection {
             bytes: bytes.to_vec(),
-            intent,
+            intent: replay.intent().clone(),
             completion: None,
             bootstrap_owner_binding: None,
             managed_local_authority: None,
@@ -17832,7 +17833,9 @@ impl ShardedHotEngine {
         let (archive, _) = self.clean_projection_runtime_binding()?;
         let decoded = super::projection::decode_manifested_projection_work(&archive, work)
             .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        if decoded.receiver_local_intent() != &prior.intent
+        if !decoded
+            .receiver_local_intent()
+            .matches_replay_except_frontier(&prior.intent)
             || decoded.target_bytes() != Some(prior.bytes.as_slice())
         {
             return Err(EngineError::ProjectionManifest(

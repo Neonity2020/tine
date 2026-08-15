@@ -5274,6 +5274,40 @@ impl CleanRuntimeActorCore {
         Ok(self.retain_outcome(state))
     }
 
+    fn execute_local_correlated(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        batch_id: BatchId,
+        transaction: &OperationTransaction,
+        persist_fingerprint: impl FnMut(ContentDigest) -> Result<(), String>,
+    ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
+        if let Some(pending) = self.pending.as_ref() {
+            return Ok(CleanActorMutationOutcome::DurablePending {
+                batch_id: pending.batch_id(),
+                phase: pending.failure().phase(),
+            });
+        }
+        let state = {
+            let mut session = self.runtime.admit_clean_mutation(graph).map_err(|error| {
+                CleanActorMutationFailure {
+                    phase: OperationalPhase::Bindings,
+                    detail: error.to_string(),
+                }
+            })?;
+            OperationalCoordinator::execute_clean_local_correlated(
+                &mut session,
+                graph,
+                receipts,
+                batch_id,
+                transaction,
+                persist_fingerprint,
+            )
+            .map_err(CleanActorMutationFailure::from)?
+        };
+        Ok(self.retain_outcome(state))
+    }
+
     fn execute_provider(
         &mut self,
         graph: &Graph,
@@ -16390,10 +16424,8 @@ impl RuntimeActor {
         episode: &ApplicationMoveEpisodeRecord,
     ) -> Result<bool, SyncApplicationMoveConflict> {
         let evidence = match self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationMoveConflict::EpisodeNotCommitted)?
-            .engine()
+            .active_engine()
+            .map_err(|_| SyncApplicationMoveConflict::EpisodeNotCommitted)?
             .accepted_batch_evidence(episode.batch_id)
         {
             Ok(evidence) => evidence,
@@ -16456,9 +16488,8 @@ impl RuntimeActor {
         };
         if matches!(existing_episode, ApplicationMoveEpisodeLookup::Missing)
             && self
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.engine().accepted_batch_evidence(batch_id).is_ok())
+                .active_engine()
+                .is_ok_and(|engine| engine.accepted_batch_evidence(batch_id).is_ok())
         {
             return Ok(no_commit(SyncApplicationMoveConflict::BatchCollision));
         }
@@ -16771,6 +16802,21 @@ impl RuntimeActor {
             )
         })?;
         let request_digest = application_move_request_digest(&request)?;
+        if self.clean.is_some() {
+            if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+                return Ok(SyncApplicationMoveSubtreesOutcome::Deferred { episode_id, state });
+            }
+            if let Ok(ApplicationMoveEpisodeLookup::Complete(record)) =
+                self.load_application_move_episode(parsed_episode_id, request_digest)?
+            {
+                match self.application_move_accepted(&record) {
+                    Ok(true) => return self.application_move_committed_outcome(&record, true),
+                    Ok(false) => {}
+                    Err(reason) => return Ok(no_commit(reason)),
+                }
+            }
+            return self.settle_live_application_move_subtrees(request);
+        }
         let episode = match self.load_application_move_episode(parsed_episode_id, request_digest)? {
             Ok(ApplicationMoveEpisodeLookup::Complete(record)) => record,
             // X1.5's same-actor sidecar-publication retry predates manifest
@@ -24197,6 +24243,62 @@ impl RuntimeActor {
             std::mem::take(&mut self.fail_next_move_episode_publication_after_write);
         #[cfg(not(test))]
         let fail_episode_publication = false;
+        if self.clean.is_some() {
+            let outcome = {
+                let episode_directory = &self.move_episode_directory;
+                let clean = self.clean.as_mut().expect("clean actor remains installed");
+                match correlated_batch_id {
+                    Some(batch_id) => {
+                        let Some(episode) = application_move_episode.as_ref() else {
+                            return SyncLocalMutationOutcome::Blocked {
+                                batch_id: Some(batch_id),
+                                phase: SyncLocalMutationPhase::Bindings,
+                                reason: SyncLocalMutationBlock::Prepublication,
+                            };
+                        };
+                        clean.execute_local_correlated(
+                            &self.graph,
+                            &self.receipts,
+                            batch_id,
+                            &transaction,
+                            |manifest_fingerprint| {
+                                persist_application_move_episode(
+                                    episode_directory,
+                                    &episode.finish(manifest_fingerprint),
+                                    fail_episode_publication,
+                                )
+                            },
+                        )
+                    }
+                    None => clean.execute_local(&self.graph, &self.receipts, &transaction),
+                }
+            };
+            return match outcome {
+                Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
+                    self.queue_clean_provider_publication(batch_id);
+                    SyncLocalMutationOutcome::Durable { batch_id }
+                }
+                Ok(CleanActorMutationOutcome::DurablePending { batch_id, phase }) => {
+                    SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: Some(batch_id),
+                        phase: map_local_phase(phase),
+                    }
+                }
+                Err(failure) => {
+                    if runtime_debug_diagnostics_enabled() {
+                        eprintln!(
+                            "[tine] clean local transaction failed during {:?}: {}",
+                            failure.phase, failure.detail
+                        );
+                    }
+                    SyncLocalMutationOutcome::Blocked {
+                        batch_id: correlated_batch_id,
+                        phase: map_local_phase(failure.phase),
+                        reason: SyncLocalMutationBlock::Prepublication,
+                    }
+                }
+            };
+        }
         let state = {
             let episode_directory = &self.move_episode_directory;
             let Some(authority) = self.authority.as_mut() else {
@@ -43510,6 +43612,63 @@ mod tests {
         assert_eq!(handle.tick().unwrap(), SyncRuntimeTick::Idle);
         let stopped = handle.clean_shutdown().unwrap();
         assert!(matches!(stopped, SyncShutdownOutcome::Safe(_)));
+    }
+
+    #[test]
+    fn clean_runtime_cross_page_move_commits_once_and_cold_reopens() {
+        let fixture = ActivationFixture::nested_unicode("clean-runtime-cross-page-move", 0xa1771);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request.clone(),
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+        let request = simple_application_move_request(&handle, "Clean Cross Page");
+        handle
+            .install_move_episode_publication_after_write_fault()
+            .unwrap();
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+        match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: false,
+                source,
+                destination,
+                ..
+            } => {
+                assert!(source.page.blocks.is_empty());
+                assert_eq!(destination.page.blocks.len(), 2);
+            }
+            other => panic!("clean cross-page move did not commit: {other:?}"),
+        }
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let reopened = SyncRuntimeHandle::open(open_request);
+        let reopened = reopened.handle.expect("clean move cold-reopens");
+        let observation = reopened.resolve_application_move_subtrees(request).unwrap();
+        assert!(matches!(
+            observation.move_outcome,
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     #[test]
