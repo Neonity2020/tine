@@ -2241,10 +2241,12 @@ impl ObjectStore {
             });
         }
         for object in batch.objects() {
-            self.stage_object_bytes(&object.encode()?)?;
+            self.stage_object_bytes(&object.encode()?)
+                .map_err(|error| publication_stage_error("publish operation object", error))?;
         }
         publish_after_objects_hook()?;
-        self.stage_manifest_bytes_impl(&batch.manifest().encode()?, allow_bootstrap)?;
+        self.stage_manifest_bytes_impl(&batch.manifest().encode()?, allow_bootstrap)
+            .map_err(|error| publication_stage_error("publish operation manifest", error))?;
         Ok(())
     }
 
@@ -8264,8 +8266,22 @@ fn publish_immutable(
     bytes: &[u8],
     collision: Collision,
 ) -> Result<(), StoreError> {
-    tine_storage::publish_immutable_exact(dir, filename, bytes)
+    // ObjectStore is rooted in the app-private archive and is only mutated
+    // while the managed runtime owns its sole-writer lease. This is distinct
+    // from shared/provider publication, which must retain strict no-replace
+    // behavior across processes.
+    tine_storage::publish_immutable_exact_single_writer(dir, filename, bytes)
         .map_err(|error| publication_error(error, collision))
+}
+
+fn publication_stage_error(stage: &'static str, error: StoreError) -> StoreError {
+    match error {
+        StoreError::Io(error) => StoreError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{stage}: {error}"),
+        )),
+        error => error,
+    }
 }
 
 pub(crate) fn publish_immutable_exact(
