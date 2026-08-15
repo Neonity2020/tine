@@ -1210,6 +1210,9 @@ impl SyncRuntimeFacade {
 fn managed_open_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str {
     match phase {
         SyncRuntimeOpenPhase::RetainingGraph => "managed_open.retaining_graph",
+        SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime => {
+            "managed_open.recovering_clean_manifest_runtime"
+        }
         SyncRuntimeOpenPhase::DiscoveringEnrollment => "managed_open.discovering_enrollment",
         SyncRuntimeOpenPhase::OpeningActorGraph => "managed_open.opening_actor_graph",
         SyncRuntimeOpenPhase::RevalidatingEnrollment => "managed_open.revalidating_enrollment",
@@ -1230,6 +1233,9 @@ fn managed_open_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str {
 fn managed_open_waiting_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str {
     match phase {
         SyncRuntimeOpenPhase::RetainingGraph => "managed_open.waiting_retaining_graph",
+        SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime => {
+            "managed_open.waiting_recovering_clean_manifest_runtime"
+        }
         SyncRuntimeOpenPhase::DiscoveringEnrollment => {
             "managed_open.waiting_discovering_enrollment"
         }
