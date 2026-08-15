@@ -3596,6 +3596,7 @@ impl SyncRuntimeHandle {
     /// only by the uninterrupted `VerifiedLocal -> LocalActive -> promoted`
     /// transaction, so this path must not rediscover or reopen the retained
     /// graph, receipt store, engine, SQLite projection, or baseline.
+    #[cfg(test)]
     fn open_from_same_process_activation(
         request: SyncRuntimeOpenRequest,
         handoff: SameProcessActivationHandoff,
@@ -5794,6 +5795,7 @@ fn open_clean_runtime_resources(
 /// state, a failed proof never reaches it, and its graph, archive, SQLite,
 /// receipt, enrollment, and binding-generation facts remain inseparable until
 /// the actor accepts ownership.
+#[cfg(test)]
 struct SameProcessActivationHandoff {
     graph: Graph,
     receipts: ProjectionReceiptStore,
@@ -5807,6 +5809,7 @@ struct SameProcessActivationHandoff {
     promoted_state_digest: ContentDigest,
 }
 
+#[cfg(test)]
 fn activate_non_active_local(
     request: SyncLocalActivationRequest,
     graph: Graph,
@@ -6268,6 +6271,7 @@ fn activation_open_clean_resources(
     }
 }
 
+#[cfg(test)]
 fn activation_open_same_process_runtime(
     request: SyncLocalActivationRequest,
     handoff: SameProcessActivationHandoff,
@@ -9277,6 +9281,7 @@ enum ActorRequest {
     },
 }
 
+#[cfg(test)]
 fn actor_thread(
     request: SyncRuntimeOpenRequest,
     advisory: LocalActiveAdvisory,
@@ -9301,6 +9306,7 @@ fn actor_thread(
     run_actor_loop(actor, receiver, started, shared_status);
 }
 
+#[cfg(test)]
 fn actor_thread_from_same_process_activation(
     request: SyncRuntimeOpenRequest,
     handoff: SameProcessActivationHandoff,
@@ -12702,6 +12708,7 @@ impl RuntimeActor {
     /// promotion binding, SQLite frontier proof, and baseline open all hold.
     /// A process restart cannot construct it; its only route remains `open`,
     /// above, which deliberately performs complete recovery.
+    #[cfg(test)]
     fn open_from_same_process_activation(
         request: SyncRuntimeOpenRequest,
         handoff: SameProcessActivationHandoff,
@@ -28142,6 +28149,24 @@ mod tests {
         assert!(contract.contains("Before an enrollment binding exists"));
         assert!(contract.contains("receipts.pre-promotion-failed"));
         assert!(contract.contains("Once enrollment has promoted"));
+    }
+
+    #[test]
+    fn pre_07_activation_oracle_has_no_production_entry_point() {
+        let source = include_str!("sync_runtime.rs");
+        for test_only_entry in [
+            "#[cfg(test)]\nstruct SameProcessActivationHandoff",
+            "#[cfg(test)]\nfn activate_non_active_local(",
+            "#[cfg(test)]\nfn activation_open_same_process_runtime(",
+            "#[cfg(test)]\nfn actor_thread(",
+            "#[cfg(test)]\nfn actor_thread_from_same_process_activation(",
+            "    #[cfg(test)]\n    fn open_from_same_process_activation(",
+        ] {
+            assert!(
+                source.contains(test_only_entry),
+                "legacy activation entry escaped its test-only oracle boundary: {test_only_entry}"
+            );
+        }
     }
 
     #[test]

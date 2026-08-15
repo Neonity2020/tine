@@ -13,10 +13,13 @@ definition-free compatibility surface in
 literal. Format/schema constants remain beside their codecs and are likewise
 certified through `tine_storage::formats`.
 
-[ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the production
-activation format for a graph with no legacy enrollment. Existing legacy
-enrollments still open through the multipart-bootstrap runtime while its final
-deletion is in progress; no new activation creates that format. A partially
+[ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the sole production
+activation format. Existing pre-0.7 enrollment and multipart-bootstrap state
+is refused as authority and the product offers Return to Direct Files before a
+fresh clean activation. The old constructor and same-process handoff remain
+callable only under `cfg(test)` as a bounded differential oracle while their
+source modules are physically retired; no production open, activation, or
+actor thread can enter them. A partially
 implemented genesis artifact is never authoritative: only the final clean
 activation marker selects the baseline-plus-manifest runtime. The exact
 removal/replacement ledger is
@@ -27,9 +30,9 @@ candidate into the shadow engine constructs a sequence-zero accepted frontier
 whose constant-size genesis binding commits the sealed manifest root. Its
 accepted-document map is an initially empty overlay containing only causal rows
 superseded by later operations; it does not copy the graph-sized genesis map.
-Subsequent accepted operations must preserve the genesis binding. This is the
-test oracle for the eventual production switch, not an alternate activation
-marker or permission to admit a partially constructed candidate.
+Subsequent accepted operations must preserve the genesis binding. Test-only
+legacy fixtures are not an alternate activation marker or permission to admit
+a partially constructed candidate.
 
 ## 1. On-disk layout
 
