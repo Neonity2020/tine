@@ -1982,6 +1982,20 @@ pub(crate) struct CleanGenesisProjectionBuilder {
     pending: super::sqlite_materialization::TerminalMaterializationChunk,
     observed_pages: usize,
     expected_pages: usize,
+    instrumentation: CleanGenesisProjectionInstrumentation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CleanGenesisProjectionInstrumentation {
+    pub(crate) reference_extract_micros: u64,
+    pub(crate) chunk_lowering_micros: u64,
+    pub(crate) chunk_insert_micros: u64,
+    pub(crate) seed_frontier_micros: u64,
+    pub(crate) deferred_indexes_and_stamp_micros: u64,
+    pub(crate) fts_validation_micros: u64,
+    pub(crate) candidate_commit_micros: u64,
+    pub(crate) terminal_validation_micros: u64,
+    pub(crate) checkpoint_micros: u64,
 }
 
 pub(crate) struct CleanGenesisSqliteCandidate {
@@ -1989,6 +2003,7 @@ pub(crate) struct CleanGenesisSqliteCandidate {
     target: PathBuf,
     claim: ProjectionClaim,
     root: AcceptedFrontierRoot,
+    instrumentation: CleanGenesisProjectionInstrumentation,
 }
 
 impl CleanGenesisProjectionBuilder {
@@ -2010,7 +2025,12 @@ impl CleanGenesisProjectionBuilder {
             pending: super::sqlite_materialization::TerminalMaterializationChunk::default(),
             observed_pages: 0,
             expected_pages,
+            instrumentation: CleanGenesisProjectionInstrumentation::default(),
         })
+    }
+
+    pub(crate) const fn instrumentation(&self) -> CleanGenesisProjectionInstrumentation {
+        self.instrumentation
     }
 
     pub(crate) fn push_page(
@@ -2023,9 +2043,14 @@ impl CleanGenesisProjectionBuilder {
                 "clean SQLite genesis exceeded its declared page count".into(),
             ));
         }
+        let reference_started = std::time::Instant::now();
         let mut reference_rows = ReferenceCatalogSourceRows::default();
         let posting = parser_derived_reference_source_posting(policy, &page)?;
         append_reference_fact_rows(posting.facts(), page.page_id, &mut reference_rows)?;
+        self.instrumentation.reference_extract_micros = self
+            .instrumentation
+            .reference_extract_micros
+            .saturating_add(reference_started.elapsed().as_micros() as u64);
         self.pending.pages.push(page);
         self.pending.postings.extend(reference_rows.postings);
         self.pending.aliases.extend(reference_rows.aliases);
@@ -2041,11 +2066,21 @@ impl CleanGenesisProjectionBuilder {
             return Ok(());
         }
         let chunk = std::mem::take(&mut self.pending);
+        let lowering_started = std::time::Instant::now();
         let physical_chunk = super::sqlite_materialization::lower_terminal_chunk(chunk)?;
+        self.instrumentation.chunk_lowering_micros = self
+            .instrumentation
+            .chunk_lowering_micros
+            .saturating_add(lowering_started.elapsed().as_micros() as u64);
+        let insert_started = std::time::Instant::now();
         self.physical
             .as_mut()
             .ok_or_else(|| ProjectionError::Corrupt("clean SQLite builder is closed".into()))?
             .seed_terminal_bootstrap_chunk(&physical_chunk)?;
+        self.instrumentation.chunk_insert_micros = self
+            .instrumentation
+            .chunk_insert_micros
+            .saturating_add(insert_started.elapsed().as_micros() as u64);
         Ok(())
     }
 
@@ -2078,7 +2113,11 @@ impl CleanGenesisProjectionBuilder {
             .take()
             .ok_or_else(|| ProjectionError::Corrupt("clean SQLite builder is closed".into()))?;
         let physical_root = lower_physical_frontier_root(root)?;
+        let seed_frontier_started = std::time::Instant::now();
         physical.seed_lazy_genesis_frontier(&physical_root)?;
+        self.instrumentation.seed_frontier_micros =
+            seed_frontier_started.elapsed().as_micros() as u64;
+        let deferred_started = std::time::Instant::now();
         physical.finish_terminal_graph_projection_construction(
             &[],
             storage_frontier::PhysicalTerminalProjectionStamp {
@@ -2086,8 +2125,15 @@ impl CleanGenesisProjectionBuilder {
                 frontier_root_digest: canonical_frontier_root_digest(root)?,
             },
         )?;
+        self.instrumentation.deferred_indexes_and_stamp_micros =
+            deferred_started.elapsed().as_micros() as u64;
+        let fts_started = std::time::Instant::now();
         physical.finalize_fresh_bootstrap()?;
+        self.instrumentation.fts_validation_micros = fts_started.elapsed().as_micros() as u64;
+        let commit_started = std::time::Instant::now();
         physical.finish_candidate_build()?;
+        self.instrumentation.candidate_commit_micros = commit_started.elapsed().as_micros() as u64;
+        let validation_started = std::time::Instant::now();
         let stored = read_frontier_root(&physical)?;
         if stored != *root {
             return Err(ProjectionError::FrontierRegression);
@@ -2096,13 +2142,18 @@ impl CleanGenesisProjectionBuilder {
         if materialized.acceptance_sequence() != 0 {
             return Err(ProjectionError::FrontierRegression);
         }
+        self.instrumentation.terminal_validation_micros =
+            validation_started.elapsed().as_micros() as u64;
+        let checkpoint_started = std::time::Instant::now();
         physical.checkpoint_truncate_and_disable_wal()?;
+        self.instrumentation.checkpoint_micros = checkpoint_started.elapsed().as_micros() as u64;
         drop(physical);
         Ok(CleanGenesisSqliteCandidate {
             files: self.files.take(),
             target: self.target.clone(),
             claim: self.claim,
             root: root.clone(),
+            instrumentation: self.instrumentation,
         })
     }
 }
@@ -2119,6 +2170,10 @@ impl Drop for CleanGenesisProjectionBuilder {
 impl CleanGenesisSqliteCandidate {
     pub(crate) fn target_path(&self) -> &Path {
         &self.target
+    }
+
+    pub(crate) const fn instrumentation(&self) -> CleanGenesisProjectionInstrumentation {
+        self.instrumentation
     }
 
     pub(crate) fn publish(mut self) -> Result<PhysicalSqliteDatabase, ProjectionError> {

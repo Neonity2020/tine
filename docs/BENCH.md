@@ -382,7 +382,7 @@ post-commit proof reopen. Both corpora use nested Unicode paths and content plus
 ordinary page references, block properties, and TODO/DONE tasks. The command was:
 
 ```bash
-rtk proxy cargo test -p tine-core activation_scaled_manual_phase_receipt -- --ignored --nocapture
+rtk proxy cargo test -p tine-core --lib activation_scaled_manual_phase_receipt -- --ignored --nocapture
 ```
 
 | input | files | bytes | blocks | capture | prepare | publish/install | backup | SQLite | shadow/bytes | promote/receipts | baseline/actor | total |

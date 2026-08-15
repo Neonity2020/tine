@@ -3845,6 +3845,21 @@ pub(crate) struct CleanActivationInstrumentation {
     pub(crate) identity_scan_micros: u64,
     pub(crate) activation_record_micros: u64,
     pub(crate) candidate_fanout_micros: u64,
+    pub(crate) candidate: CleanCandidateFanoutInstrumentation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CleanCandidateFanoutInstrumentation {
+    pub(crate) identity_claim_scan_micros: u64,
+    pub(crate) record_and_input_micros: u64,
+    pub(crate) checkpoint: super::hot_engine::LazyGenesisCheckpointInstrumentation,
+    pub(crate) baseline_pack_micros: u64,
+    pub(crate) sqlite_push_micros: u64,
+    pub(crate) sqlite: super::sqlite::CleanGenesisProjectionInstrumentation,
+    pub(crate) checkpoint_finish_micros: u64,
+    pub(crate) baseline_finish_micros: u64,
+    pub(crate) frontier_finish_micros: u64,
+    pub(crate) sqlite_finish_micros: u64,
 }
 
 /// Move-only clean activation preparation. It retains the exact initial source
@@ -3915,8 +3930,17 @@ fn build_clean_activation_candidates(
     working: &Path,
     database_path: &Path,
     policy: &ReferenceCatalogPolicyV1,
-) -> Result<CleanActivationCandidates, BootstrapStreamingImportError> {
+) -> Result<
+    (
+        CleanActivationCandidates,
+        CleanCandidateFanoutInstrumentation,
+    ),
+    BootstrapStreamingImportError,
+> {
+    let mut instrumentation = CleanCandidateFanoutInstrumentation::default();
+    let identity_started = Instant::now();
     let accepted_external_uuids = unique_baseline_external_uuids(pages)?;
+    instrumentation.identity_claim_scan_micros = elapsed_micros(identity_started);
     let mut baseline = LazyGenesisPackBuilder::new(
         workspace_id,
         lineage_digest,
@@ -3932,6 +3956,7 @@ fn build_clean_activation_candidates(
     )?;
 
     for page_id in pages.path_order() {
+        let record_started = Instant::now();
         let record = pages.page(*page_id)?.ok_or_else(|| {
             BootstrapStreamingImportError::InvalidOperation(
                 "canonical activation page order names a missing page".into(),
@@ -3949,21 +3974,48 @@ fn build_clean_activation_candidates(
             })
             .collect();
         let mut capsule = lazy_genesis_page_input(&record);
-        let (checkpoint, dependencies) = checkpoints.push_page(&capsule, &page_assignments)?;
+        instrumentation.record_and_input_micros = instrumentation
+            .record_and_input_micros
+            .saturating_add(elapsed_micros(record_started));
+        let (checkpoint, dependencies) = checkpoints.push_page_with_instrumentation(
+            &capsule,
+            &page_assignments,
+            &mut instrumentation.checkpoint,
+        )?;
         capsule.document_checkpoint = checkpoint;
         capsule.document_dependencies = Some(dependencies);
+        let baseline_started = Instant::now();
         baseline.push(capsule)?;
+        instrumentation.baseline_pack_micros = instrumentation
+            .baseline_pack_micros
+            .saturating_add(elapsed_micros(baseline_started));
+        let sqlite_started = Instant::now();
         sqlite.push_page(record.sqlite_page(), policy)?;
+        instrumentation.sqlite_push_micros = instrumentation
+            .sqlite_push_micros
+            .saturating_add(elapsed_micros(sqlite_started));
     }
+    let checkpoint_finish_started = Instant::now();
     let (catalog_checkpoint, catalog_dependencies) = checkpoints.finish()?;
+    instrumentation.checkpoint_finish_micros = elapsed_micros(checkpoint_finish_started);
+    let baseline_finish_started = Instant::now();
     let baseline = baseline.finish(catalog_checkpoint, catalog_dependencies)?;
+    instrumentation.baseline_finish_micros = elapsed_micros(baseline_finish_started);
+    let frontier_finish_started = Instant::now();
     let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline)?;
+    instrumentation.frontier_finish_micros = elapsed_micros(frontier_finish_started);
+    let sqlite_finish_started = Instant::now();
     let sqlite = sqlite.finish(&accepted_frontier)?;
-    Ok(CleanActivationCandidates {
-        baseline,
-        sqlite,
-        accepted_frontier,
-    })
+    instrumentation.sqlite_finish_micros = elapsed_micros(sqlite_finish_started);
+    instrumentation.sqlite = sqlite.instrumentation();
+    Ok((
+        CleanActivationCandidates {
+            baseline,
+            sqlite,
+            accepted_frontier,
+        },
+        instrumentation,
+    ))
 }
 
 fn derive_clean_activation_import_id(
@@ -4056,7 +4108,7 @@ pub(crate) fn prepare_clean_activation(
     let activation_record_micros = elapsed_micros(started);
 
     let started = Instant::now();
-    let candidates = build_clean_activation_candidates(
+    let (candidates, candidate) = build_clean_activation_candidates(
         &pages,
         workspace_id,
         lineage_digest,
@@ -4076,6 +4128,7 @@ pub(crate) fn prepare_clean_activation(
         identity_scan_micros,
         activation_record_micros,
         candidate_fanout_micros,
+        candidate,
     };
     Ok(CleanActivationPreparation {
         capture,
@@ -13127,7 +13180,7 @@ mod tests {
                 let lineage = LineageDigest::of(b"inactive-streaming-bootstrap-test");
                 let catalog = DocumentId::from_uuid(Uuid::from_u128(0x5a02));
                 let policy = ReferenceCatalogPolicyV1::default();
-                let candidates = build_clean_activation_candidates(
+                let (candidates, _) = build_clean_activation_candidates(
                     pages,
                     workspace,
                     lineage,
@@ -13204,7 +13257,7 @@ mod tests {
         let working = root.path().join("clean-sqlite-differential");
         fs::create_dir(&working).unwrap();
         let policy = ReferenceCatalogPolicyV1::default();
-        let candidates = build_clean_activation_candidates(
+        let (candidates, _) = build_clean_activation_candidates(
             pages,
             workspace,
             lineage,

@@ -7415,6 +7415,15 @@ pub(crate) struct LazyGenesisCheckpointBuilder {
     verify_checkpoints: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LazyGenesisCheckpointInstrumentation {
+    pub(crate) catalog_micros: u64,
+    pub(crate) page_document_micros: u64,
+    pub(crate) export_micros: u64,
+    pub(crate) verification_micros: u64,
+    pub(crate) dependencies_micros: u64,
+}
+
 impl LazyGenesisCheckpointBuilder {
     pub(crate) fn new(catalog_document_id: DocumentId) -> Result<Self, EngineError> {
         let catalog = LoroDoc::new();
@@ -7441,6 +7450,25 @@ impl LazyGenesisCheckpointBuilder {
         page: &LazyGenesisPageInput,
         accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
     ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+        self.push_page_instrumented(page, accepted_external_uuids, None)
+    }
+
+    pub(crate) fn push_page_with_instrumentation(
+        &mut self,
+        page: &LazyGenesisPageInput,
+        accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
+        instrumentation: &mut LazyGenesisCheckpointInstrumentation,
+    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+        self.push_page_instrumented(page, accepted_external_uuids, Some(instrumentation))
+    }
+
+    fn push_page_instrumented(
+        &mut self,
+        page: &LazyGenesisPageInput,
+        accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
+        instrumentation: Option<&mut LazyGenesisCheckpointInstrumentation>,
+    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+        let catalog_started = std::time::Instant::now();
         if page.home_document_id == self.catalog_document_id
             || read_page_state(&self.catalog, page.page_id)?.is_some()
         {
@@ -7460,7 +7488,9 @@ impl LazyGenesisCheckpointBuilder {
                 kind: page.kind,
             },
         )?;
+        let catalog_micros = catalog_started.elapsed().as_micros() as u64;
 
+        let page_document_started = std::time::Instant::now();
         let document = LoroDoc::new();
         document
             .set_peer_id(LAZY_GENESIS_PEER_ID)
@@ -7513,15 +7543,21 @@ impl LazyGenesisCheckpointBuilder {
             }
         }
         document.commit();
+        let page_document_micros = page_document_started.elapsed().as_micros() as u64;
+        let export_started = std::time::Instant::now();
         let snapshot = document
             .export(ExportMode::all_updates())
             .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        let export_micros = export_started.elapsed().as_micros() as u64;
+        let verification_started = std::time::Instant::now();
         #[cfg(test)]
         {
             if self.verify_checkpoints {
                 verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &snapshot)?;
             }
         }
+        let verification_micros = verification_started.elapsed().as_micros() as u64;
+        let dependencies_started = std::time::Instant::now();
         let dependencies = DocumentDependencies::new(
             page.home_document_id,
             canonical_peer_counters(&document.oplog_vv())?,
@@ -7533,6 +7569,23 @@ impl LazyGenesisCheckpointBuilder {
                 page.page_id
             ))
         })?;
+        let dependencies_micros = dependencies_started.elapsed().as_micros() as u64;
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.catalog_micros = instrumentation
+                .catalog_micros
+                .saturating_add(catalog_micros);
+            instrumentation.page_document_micros = instrumentation
+                .page_document_micros
+                .saturating_add(page_document_micros);
+            instrumentation.export_micros =
+                instrumentation.export_micros.saturating_add(export_micros);
+            instrumentation.verification_micros = instrumentation
+                .verification_micros
+                .saturating_add(verification_micros);
+            instrumentation.dependencies_micros = instrumentation
+                .dependencies_micros
+                .saturating_add(dependencies_micros);
+        }
         Ok((snapshot, dependencies))
     }
 
