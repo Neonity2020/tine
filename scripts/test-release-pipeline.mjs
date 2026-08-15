@@ -426,12 +426,21 @@ assert.doesNotMatch(
 );
 assert.doesNotMatch(fullLinux.join("\n"), /cargo test -p tine-core/, "Linux full evidence still has a monolithic core run");
 const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
+const androidManagedRuntime = yamlBlock(ciJobs, "android-managed-storage-runtime", 2);
 const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
 const performanceBench = yamlBlock(ciJobs, "bench", 2);
 assert.equal(yamlScalar(fullLinux, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
 assert.equal(
   yamlScalar(androidCompile, "if", 4),
   "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')"
+);
+assert.equal(
+  yamlScalar(androidManagedRuntime, "name", 4),
+  "Android runtime / managed activation, crash recovery, share setup, shutdown, and reopen"
+);
+assert.equal(
+  yamlScalar(androidManagedRuntime, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')"
 );
 assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
 assert.equal(
