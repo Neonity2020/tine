@@ -1899,28 +1899,15 @@ fn verify_sqlite_identity_transition_against_legacy(
     })
 }
 
-/// Make clean SQLite-owned identity rows -- never Patricia's rows -- the
-/// production input for the F -> F+1 transaction. Fresh local publication
-/// additionally carries the exact transition prepared at F; the post-accept
-/// recomputation must equal it. Provider/recovery events are deterministically
-/// recomputed here until their own pre-acceptance hook is wired. Patricia is
-/// consulted only by the differential verifier immediately before this call.
+/// Install SQLite-owned identity rows -- never Patricia's rows -- in the same
+/// F -> F+1 transaction as the ordinary materialization. Fresh local
+/// publication carries the exact transition prepared at F. Provider/recovery
+/// events still use a post-acceptance compatibility derivation until their own
+/// pre-acceptance hook is wired.
 fn install_clean_identity_transition(
-    event: &AcceptedBatchEvent,
     change: super::MaterializationChange,
-    recomputed: PreparedSqliteIdentityTransition,
+    selected: &PreparedSqliteIdentityTransition,
 ) -> Result<super::MaterializationChange, ProjectionError> {
-    let selected = if let Some(prepared) = event.prepared_identity_transition() {
-        if prepared != &recomputed {
-            return Err(ProjectionError::Materialization(
-                "prepared SQLite identity transition changed between preflight and acceptance"
-                    .into(),
-            ));
-        }
-        prepared
-    } else {
-        &recomputed
-    };
     change
         .with_identity_projection_records(
             selected.page_names.clone(),
@@ -4992,15 +4979,17 @@ impl SqliteFrontier {
             prior_digest,
         )?;
         let prior = super::SqliteMaterializedRead::from_storage(prior);
-        let recomputed = verify_sqlite_identity_transition_against_legacy(
-            engine,
-            event,
-            &prior,
-            &materialization,
-        )?;
+        let identity = match event.prepared_identity_transition() {
+            Some(prepared) => prepared.clone(),
+            None => verify_sqlite_identity_transition_against_legacy(
+                engine,
+                event,
+                &prior,
+                &materialization,
+            )?,
+        };
         drop(prior);
-        let materialization =
-            install_clean_identity_transition(event, materialization, recomputed)?;
+        let materialization = install_clean_identity_transition(materialization, &identity)?;
         let (disposition, apply_stats) = self.apply_internal_with_materialization_and_stats(
             event,
             ApplyFault::None,
@@ -5028,15 +5017,17 @@ impl SqliteFrontier {
             prior_digest,
         )?;
         let prior = super::SqliteMaterializedRead::from_storage(prior);
-        let recomputed = verify_sqlite_identity_transition_against_legacy(
-            engine,
-            event,
-            &prior,
-            &materialization,
-        )?;
+        let identity = match event.prepared_identity_transition() {
+            Some(prepared) => prepared.clone(),
+            None => verify_sqlite_identity_transition_against_legacy(
+                engine,
+                event,
+                &prior,
+                &materialization,
+            )?,
+        };
         drop(prior);
-        let materialization =
-            install_clean_identity_transition(event, materialization, recomputed)?;
+        let materialization = install_clean_identity_transition(materialization, &identity)?;
         self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
     }
 
@@ -5320,6 +5311,7 @@ impl SqliteFrontier {
             &provenance,
             &mut instrumentation,
             &mut bootstrap,
+            false,
             Some(material),
             terminal_projection_sink,
         )?;
@@ -5553,6 +5545,7 @@ impl SqliteFrontier {
                 &provenance,
                 &mut instrumentation,
                 &mut bootstrap,
+                matches!(source.loader, RebuildLoader::LazyGenesisAnchored { .. }),
                 None,
                 terminal_projection_sink,
             )
@@ -5563,8 +5556,19 @@ impl SqliteFrontier {
             })?;
         trace_terminal_phase("archive terminal row seed", rows_started);
         let cursor_probe = super::hot_engine::take_current_path_cursor_probe();
-        bootstrap.terminal_catalog_rows_authenticated = cursor_probe.rows;
-        bootstrap.terminal_catalog_document_validations = cursor_probe.catalog_document_validations;
+        if matches!(source.loader, RebuildLoader::LazyGenesisAnchored { .. }) {
+            bootstrap.terminal_catalog_rows_authenticated = usize::try_from(coverage_count)
+                .map_err(|_| {
+                    ProjectionError::Rebuild(
+                        "clean terminal page count exceeds platform usize".into(),
+                    )
+                })?;
+            bootstrap.terminal_catalog_document_validations = usize::from(coverage_count != 0);
+        } else {
+            bootstrap.terminal_catalog_rows_authenticated = cursor_probe.rows;
+            bootstrap.terminal_catalog_document_validations =
+                cursor_probe.catalog_document_validations;
+        }
 
         if instrumentation.cleanup_page_attempts != 0
             || instrumentation.cleanup_owned_rows != 0
@@ -5636,21 +5640,11 @@ impl SqliteFrontier {
         provenance: &[storage_frontier::PhysicalTerminalConstructionBatch],
         instrumentation: &mut RebuildInstrumentation,
         bootstrap: &mut BootstrapSqliteRebuildInstrumentation,
+        clean_lazy_genesis: bool,
         terminal_material: Option<&TerminalBootstrapConstructionMaterial>,
         terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<u64, ProjectionError> {
-        let binding = engine
-            .current_path_catalog_binding()
-            .map_err(ProjectionError::materialization_from_engine)?;
-        if binding.workspace_id() != engine.workspace_id()
-            || binding.lineage_digest() != engine.lineage_digest()
-            || binding.accepted_frontier() != terminal_root.state_digest()
-        {
-            return Err(ProjectionError::Rebuild(
-                "current-path catalog is not bound to the terminal accepted frontier".into(),
-            ));
-        }
-        let materializer = (binding.catalog_rows() != 0)
+        let clean_materializer = clean_lazy_genesis
             .then(|| {
                 engine
                     .bootstrap_bulk_materializer_with_session_budget(
@@ -5660,33 +5654,66 @@ impl SqliteFrontier {
                     .map_err(ProjectionError::materialization_from_engine)
             })
             .transpose()?;
+        let (binding, mut pending) = if let Some(materializer) = clean_materializer.as_ref() {
+            (
+                None,
+                materializer
+                    .terminal_current_path_rows()
+                    .map_err(ProjectionError::materialization_from_engine)?,
+            )
+        } else {
+            let binding = engine
+                .current_path_catalog_binding()
+                .map_err(ProjectionError::materialization_from_engine)?;
+            if binding.workspace_id() != engine.workspace_id()
+                || binding.lineage_digest() != engine.lineage_digest()
+                || binding.accepted_frontier() != terminal_root.state_digest()
+            {
+                return Err(ProjectionError::Rebuild(
+                    "current-path catalog is not bound to the terminal accepted frontier".into(),
+                ));
+            }
+            let mut cursor = Some(
+                engine
+                    .begin_current_path_cursor()
+                    .map_err(ProjectionError::materialization_from_engine)?,
+            );
+            let mut pending = Vec::new();
+            while let Some(token) = cursor.take() {
+                let cursor_started = std::time::Instant::now();
+                let page = engine
+                    .current_path_cursor_page(
+                        token,
+                        TERMINAL_CATALOG_CURSOR_PAGE_ROWS
+                            .min(super::hot_engine::MAX_CURRENT_PATH_CURSOR_PAGE_ROWS),
+                    )
+                    .map_err(ProjectionError::materialization_from_engine)?;
+                bootstrap.terminal_catalog_cursor_micros = bootstrap
+                    .terminal_catalog_cursor_micros
+                    .saturating_add(cursor_started.elapsed().as_micros());
+                let (rows, next) = page.into_parts();
+                cursor = next;
+                pending.extend(rows);
+            }
+            (Some(binding), pending)
+        };
+        let materializer = match clean_materializer {
+            Some(materializer) => Some(materializer),
+            None if pending.is_empty() => None,
+            None => Some(
+                engine
+                    .bootstrap_bulk_materializer_with_session_budget(
+                        terminal_root,
+                        super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+                    )
+                    .map_err(ProjectionError::materialization_from_engine)?,
+            ),
+        };
         bootstrap.terminal_materializations = 1;
         instrumentation.accepted_root_authentications += usize::from(materializer.is_some());
         instrumentation.exact_catalog_loads += usize::from(materializer.is_some());
-        let mut cursor = Some(
-            engine
-                .begin_current_path_cursor()
-                .map_err(ProjectionError::materialization_from_engine)?,
-        );
-        let mut pending: Vec<super::hot_engine::CurrentPathCatalogRow> = Vec::new();
         let mut observed_rows = 0_u64;
         let mut seen_pages = BTreeSet::new();
-        while let Some(token) = cursor.take() {
-            let cursor_started = std::time::Instant::now();
-            let page = engine
-                .current_path_cursor_page(
-                    token,
-                    TERMINAL_CATALOG_CURSOR_PAGE_ROWS
-                        .min(super::hot_engine::MAX_CURRENT_PATH_CURSOR_PAGE_ROWS),
-                )
-                .map_err(ProjectionError::materialization_from_engine)?;
-            bootstrap.terminal_catalog_cursor_micros = bootstrap
-                .terminal_catalog_cursor_micros
-                .saturating_add(cursor_started.elapsed().as_micros());
-            let (rows, next) = page.into_parts();
-            cursor = next;
-            pending.extend(rows);
-        }
         // The authenticated cursor is keyed by its compact index, while the
         // sealed source stream is lexical by path.  Retain only these compact
         // catalog rows, sort them once, and materialize bounded page chunks in
@@ -5741,15 +5768,26 @@ impl SqliteFrontier {
                 external_exact,
             );
         }
-        let current = engine
-            .current_path_catalog_binding()
-            .map_err(ProjectionError::materialization_from_engine)?;
-        if current != binding
-            || observed_rows != binding.catalog_rows()
-            || seen_pages.len() as u64 != binding.catalog_rows()
+        if let Some(binding) = binding {
+            let current = engine
+                .current_path_catalog_binding()
+                .map_err(ProjectionError::materialization_from_engine)?;
+            if current != binding
+                || observed_rows != binding.catalog_rows()
+                || seen_pages.len() as u64 != binding.catalog_rows()
+            {
+                return Err(ProjectionError::Rebuild(
+                    "terminal current-path catalog changed or is incompletely covered".into(),
+                ));
+            }
+        } else if engine
+            .accepted_frontier_root()
+            .map_err(ProjectionError::materialization_from_engine)?
+            != *terminal_root
+            || observed_rows != seen_pages.len() as u64
         {
             return Err(ProjectionError::Rebuild(
-                "terminal current-path catalog changed or is incompletely covered".into(),
+                "clean terminal catalog changed or is incompletely covered".into(),
             ));
         }
         let stamp = storage_frontier::PhysicalTerminalProjectionStamp {
@@ -5762,7 +5800,7 @@ impl SqliteFrontier {
         bootstrap.terminal_finish_micros = bootstrap
             .terminal_finish_micros
             .saturating_add(finish_started.elapsed().as_micros());
-        Ok(0)
+        Ok(observed_rows)
     }
 
     #[allow(clippy::too_many_arguments)]

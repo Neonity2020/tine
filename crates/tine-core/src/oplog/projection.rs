@@ -28,7 +28,7 @@ use super::{
     ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
     ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionWork,
     ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget,
-    ReceiptError, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
+    ReceiptError, ShardedHotEngine, SqliteFrontier, StructuralLocator, StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
@@ -1880,9 +1880,11 @@ pub fn execute_manifested_projection_work(
     execute_manifested_projection_work_with_runtime(
         graph,
         receipts,
-        &archive,
         engine,
-        &work_index,
+        ManifestedProjectionRuntime::Legacy {
+            archive: &archive,
+            work_index: &work_index,
+        },
         work,
         None,
     )
@@ -1899,12 +1901,54 @@ pub(crate) fn execute_manifested_projection_work_under_handoff(
     execute_manifested_projection_work_with_runtime(
         graph,
         receipts,
-        &archive,
         engine,
-        &work_index,
+        ManifestedProjectionRuntime::Legacy {
+            archive: &archive,
+            work_index: &work_index,
+        },
         work,
         Some(handoff),
     )
+}
+
+/// Execute one clean-runtime work row derived from an accepted immutable
+/// manifest. SQLite supplies only current path ownership/current-frontier
+/// evidence; it is disposable and never becomes a second work-status store.
+pub(crate) fn execute_clean_manifested_projection_work(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    projection: &SqliteFrontier,
+    engine: &mut ShardedHotEngine,
+    work: &ProjectionWork,
+) -> Result<(), ProjectionError> {
+    execute_manifested_projection_work_with_runtime(
+        graph,
+        receipts,
+        engine,
+        ManifestedProjectionRuntime::Clean { projection },
+        work,
+        None,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ManifestedProjectionRuntime<'a> {
+    Legacy {
+        archive: &'a ObjectStore,
+        work_index: &'a ProjectionWorkIndex,
+    },
+    Clean {
+        projection: &'a SqliteFrontier,
+    },
+}
+
+impl<'a> ManifestedProjectionRuntime<'a> {
+    const fn work_index(self) -> Option<&'a ProjectionWorkIndex> {
+        match self {
+            Self::Legacy { work_index, .. } => Some(work_index),
+            Self::Clean { .. } => None,
+        }
+    }
 }
 
 fn block_manifested_projection_work(
@@ -2063,9 +2107,8 @@ pub(crate) fn decode_manifested_projection_work(
 fn execute_manifested_projection_work_with_runtime(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
-    archive: &ObjectStore,
     engine: &mut ShardedHotEngine,
-    work_index: &ProjectionWorkIndex,
+    runtime: ManifestedProjectionRuntime<'_>,
     work: &ProjectionWork,
     handoff: Option<&crate::model::PublishedHandoffLatch>,
 ) -> Result<(), ProjectionError> {
@@ -2075,7 +2118,10 @@ fn execute_manifested_projection_work_with_runtime(
     let receipt_store_id = engine
         .projection_receipt_store_id()
         .ok_or(ProjectionError::EndpointBindingMismatch)?;
-    if receipts.store_id() != receipt_store_id || work_index.receipt_store_id() != receipt_store_id
+    if receipts.store_id() != receipt_store_id
+        || runtime
+            .work_index()
+            .is_some_and(|index| index.receipt_store_id() != receipt_store_id)
     {
         return Err(ProjectionError::EndpointBindingMismatch);
     }
@@ -2084,29 +2130,60 @@ fn execute_manifested_projection_work_with_runtime(
         return Err(ProjectionError::EndpointBindingMismatch);
     }
     retire_pending_projection_recovery(graph, receipts)?;
-    engine
-        .authorize_projection_work(work_index, work)
-        .map_err(ProjectionError::Engine)?;
-    // A journal drain has no affine process-memory continuation after a
-    // restart. Re-entering with the exact already-completed work must therefore
-    // authenticate the same archive/intent/receipt authority below and adopt
-    // it idempotently. `mark_completed` already performs that exact terminal
-    // comparison; blocked, superseded, absent, and merely reserved work remain
-    // refusals.
-    if !matches!(
-        work_index
-            .status(work.work_id())
-            .map_err(|error| ProjectionError::Work(error.to_string()))?,
-        Some(ProjectionWorkStatus::Ready | ProjectionWorkStatus::Completed)
-    ) {
-        return Err(ProjectionError::WorkNotReady);
-    }
+    let clean_archive = match runtime {
+        ManifestedProjectionRuntime::Legacy { work_index, .. } => {
+            engine
+                .authorize_projection_work(work_index, work)
+                .map_err(ProjectionError::Engine)?;
+            // A journal drain has no affine process-memory continuation after a
+            // restart. Re-entering with the exact already-completed work must
+            // authenticate the same archive/intent/receipt authority below.
+            if !matches!(
+                work_index
+                    .status(work.work_id())
+                    .map_err(|error| ProjectionError::Work(error.to_string()))?,
+                Some(ProjectionWorkStatus::Ready | ProjectionWorkStatus::Completed)
+            ) {
+                return Err(ProjectionError::WorkNotReady);
+            }
+            None
+        }
+        ManifestedProjectionRuntime::Clean { projection } => engine
+            .authorize_clean_projection_work(projection, work)
+            .map_err(ProjectionError::Engine)?
+            .into(),
+    };
+    let archive = match runtime {
+        ManifestedProjectionRuntime::Legacy { archive, .. } => archive,
+        ManifestedProjectionRuntime::Clean { .. } => clean_archive
+            .as_deref()
+            .expect("clean projection authorization returns its archive"),
+    };
     let decoded = decode_manifested_projection_work(archive, work)?;
     let manifested = decoded.manifested();
     let target = decoded.target_bytes();
     let expected_base = decoded.annotated_base();
     let guarded_layout = decoded.guarded_layout();
     let local_attempt_intent = decoded.receiver_local_intent().clone();
+    if matches!(runtime, ManifestedProjectionRuntime::Clean { .. }) {
+        if let Some(target) = target {
+            let current = engine
+                .authorize_projection_write(work.page_id())
+                .map_err(ProjectionError::Engine)?;
+            let replay = plan_projection_with_layout_annotations(
+                engine.workspace_id(),
+                current.state(),
+                expected_base.map(AnnotatedProjectionBase::bytes),
+                expected_base.map(AnnotatedProjectionBase::annotations),
+            )?;
+            if replay.target() != target
+                || replay.guarded_layout() != guarded_layout
+                || !local_attempt_intent.matches_replay_except_frontier(replay.intent())
+            {
+                return Err(ProjectionError::WorkNotReady);
+            }
+        }
+    }
     // Projecting one document costs ~95ms uniformly (F46), which is far too slow
     // for ~1.2KB of bytes and points at durable-write barriers rather than work.
     // This is the first of several durable receipt steps per document; time it to
@@ -2124,10 +2201,12 @@ fn execute_manifested_projection_work_with_runtime(
     }
     if receipts.load_completion(&local_attempt_intent)?.is_some() {
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
-        let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
-        work_index
-            .mark_completed(authority)
-            .map_err(|error| ProjectionError::Work(error.to_string()))?;
+        if let Some(work_index) = runtime.work_index() {
+            let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
+            work_index
+                .mark_completed(authority)
+                .map_err(|error| ProjectionError::Work(error.to_string()))?;
+        }
         return Ok(());
     }
     let attempts = receipts.load_attempt_reservations(&local_attempt_intent)?;
@@ -2188,13 +2267,15 @@ fn execute_manifested_projection_work_with_runtime(
             None
         }
         Some((Err(error), _)) if crate::model::is_projection_semantic_refusal(&error) => {
-            block_manifested_projection_work(
-                graph,
-                receipts,
-                work_index,
-                work,
-                local_attempt_intent.id()?,
-            )?;
+            if let Some(work_index) = runtime.work_index() {
+                block_manifested_projection_work(
+                    graph,
+                    receipts,
+                    work_index,
+                    work,
+                    local_attempt_intent.id()?,
+                )?;
+            }
             return Err(ProjectionError::GuardedConflict(error));
         }
         Some((Err(error), _)) => return Err(error.into()),
@@ -2306,13 +2387,15 @@ fn execute_manifested_projection_work_with_runtime(
                         io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
                     ) || crate::model::is_projection_semantic_refusal(&error) =>
                 {
-                    block_manifested_projection_work(
-                        graph,
-                        receipts,
-                        work_index,
-                        work,
-                        local_attempt_intent.id()?,
-                    )?;
+                    if let Some(work_index) = runtime.work_index() {
+                        block_manifested_projection_work(
+                            graph,
+                            receipts,
+                            work_index,
+                            work,
+                            local_attempt_intent.id()?,
+                        )?;
+                    }
                     return Err(ProjectionError::GuardedConflict(error));
                 }
                 Err(error) => return Err(error.into()),
@@ -2321,10 +2404,12 @@ fn execute_manifested_projection_work_with_runtime(
     };
     receipts.publish_completion(authority, &local_attempt_intent, &proof)?;
     retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
-    let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
-    work_index
-        .mark_completed(authority)
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    if let Some(work_index) = runtime.work_index() {
+        let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
+        work_index
+            .mark_completed(authority)
+            .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    }
     Ok(())
 }
 

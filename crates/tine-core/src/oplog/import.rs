@@ -13072,6 +13072,32 @@ mod tests {
                 .acceptance_sequence(),
             1
         );
+        let clean_work = clean_engine
+            .clean_projection_work_for_batch(edit_batch)
+            .unwrap();
+        assert_eq!(
+            clean_work.len(),
+            1,
+            "the accepted manifest itself must derive the one local projection row"
+        );
+        let projection_fault =
+            crate::oplog::projection::fail_next_manifested_projection_during_write_for_harness();
+        assert!(
+            crate::oplog::projection::execute_clean_manifested_projection_work(
+                &graph,
+                &receipts,
+                leased_projection.database(),
+                &mut clean_engine,
+                &clean_work[0],
+            )
+            .is_err()
+        );
+        drop(projection_fault);
+        assert_eq!(
+            std::fs::read_to_string(graph.resolve_rel("pages/alpha.md").unwrap()).unwrap(),
+            "- alpha [[Beta]]\n",
+            "the injected cut is after durable acceptance but before the Markdown mutation"
+        );
         drop(leased_projection);
         drop(clean_engine);
         fs::write(&database, b"corrupt disposable SQLite after durable edit").unwrap();
@@ -13126,11 +13152,24 @@ mod tests {
             &baseline_frontier,
             "cold manifest replay must retain the lazy-genesis frontier as event F"
         );
+        let cold_materialization =
+            crate::oplog::sqlite::materialize_accepted_event(&rebuilt_engine, &replayed_event)
+                .unwrap();
+        assert_eq!(
+            cold_materialization
+                .replacements()
+                .iter()
+                .map(|page| page.page_id)
+                .collect::<Vec<_>>(),
+            vec![clean_work[0].page_id()],
+            "cold manifest replay must rematerialize the edited baseline-backed page"
+        );
+        assert!(cold_materialization.deletions().is_empty());
         let rebuilt_lease = WorkspaceRuntimeLease::acquire(&rebuilt_store, workspace).unwrap();
         let application_runtime =
             ApplicationRuntimeRoot::open_for_test(&root.path().join("clean-runtime")).unwrap();
         let rebuilt_source = RebuildSource::new(&rebuilt_engine, &rebuilt_store).unwrap();
-        let (rebuilt_projection, ()) =
+        let (mut rebuilt_projection, ()) =
             LeasedWorkspaceProjection::open_under(rebuilt_lease, |slot| {
                 let opened = SqliteFrontier::open_or_rebuild_with_applier_slot(
                     &database,
@@ -13154,6 +13193,121 @@ mod tests {
                 .acceptance_sequence(),
             1,
             "missing/corrupt SQLite rebuilds through the manifest-committed edit"
+        );
+        rebuilt_engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+        let terminal_work = rebuilt_engine.clean_terminal_projection_work().unwrap();
+        assert_eq!(
+            terminal_work, clean_work,
+            "cold open must reconstruct the exact terminal path plan from manifests alone"
+        );
+        let cold_path_owners = rebuilt_projection
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(terminal_work[0].path(), 2)
+            .unwrap();
+        assert_eq!(
+            cold_path_owners
+                .iter()
+                .map(|owner| (owner.page_id, owner.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![(terminal_work[0].page_id(), terminal_work[0].path().clone())]
+        );
+        crate::oplog::projection::execute_clean_manifested_projection_work(
+            &graph,
+            &receipts,
+            rebuilt_projection.database(),
+            &mut rebuilt_engine,
+            &terminal_work[0],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(graph.resolve_rel("pages/alpha.md").unwrap()).unwrap(),
+            "- edited after clean activation\n",
+            "cold manifest-derived recovery must finish the interrupted Markdown projection"
+        );
+        crate::oplog::projection::execute_clean_manifested_projection_work(
+            &graph,
+            &receipts,
+            rebuilt_projection.database(),
+            &mut rebuilt_engine,
+            &terminal_work[0],
+        )
+        .unwrap();
+
+        let delete_batch = BatchId::from_uuid(Uuid::from_u128(0x5a30));
+        let delete = OperationTransaction::new(vec![SemanticOperation::DeletePage {
+            page_id: terminal_work[0].page_id(),
+        }])
+        .unwrap();
+        let delete_draft = rebuilt_engine
+            .draft_author_transaction(
+                AuthorBatch {
+                    batch_id: delete_batch,
+                    author_device_id: endpoint.device_id,
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5a31)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0x5a32),
+                },
+                BatchOrigin::LocalMutation,
+                &delete,
+            )
+            .unwrap();
+        let delete_prepared = rebuilt_engine
+            .finalize_author_transaction(delete_draft, &graph, &receipts, endpoint)
+            .unwrap();
+        let delete_identity = rebuilt_projection
+            .database()
+            .preflight_prepared_identity_transition(&rebuilt_engine, &delete_prepared)
+            .unwrap();
+        rebuilt_engine
+            .commit_clean_local_prepared(&delete_prepared)
+            .unwrap();
+        let delete_event =
+            AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, delete_batch)
+                .unwrap()
+                .with_prepared_identity_transition(delete_identity)
+                .unwrap();
+        rebuilt_projection
+            .database_and_lease_identity()
+            .0
+            .apply_engine_owned_accepted(&delete_event, &rebuilt_engine)
+            .unwrap();
+        let delete_work = rebuilt_engine
+            .clean_projection_work_for_batch(delete_batch)
+            .unwrap();
+        assert!(matches!(
+            delete_work.as_slice(),
+            [work] if matches!(work.target(), crate::oplog::ProjectionWorkTarget::Absent)
+        ));
+        crate::oplog::projection::execute_clean_manifested_projection_work(
+            &graph,
+            &receipts,
+            rebuilt_projection.database(),
+            &mut rebuilt_engine,
+            &delete_work[0],
+        )
+        .unwrap();
+        assert!(
+            !graph.resolve_rel("pages/alpha.md").unwrap().exists(),
+            "manifest-derived clean deletion must remove the exact prior projection"
+        );
+        assert_eq!(
+            rebuilt_engine.clean_terminal_projection_work().unwrap(),
+            delete_work,
+            "the run-local terminal plan keeps only the latest accepted row for a path"
+        );
+        assert!(
+            crate::oplog::projection::execute_clean_manifested_projection_work(
+                &graph,
+                &receipts,
+                rebuilt_projection.database(),
+                &mut rebuilt_engine,
+                &terminal_work[0],
+            )
+            .is_err(),
+            "an older accepted Present row must not regain write authority after a later deletion"
         );
     }
 

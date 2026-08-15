@@ -3487,6 +3487,10 @@ struct CapabilityCapturedPriorProjection {
     pub(crate) completion: Option<ProjectionCompletion>,
     pub(crate) bootstrap_owner_binding: Option<ContentDigest>,
     pub(crate) managed_local_authority: Option<(u64, BatchId)>,
+    /// The exact latest source-endpoint work row reconstructed from accepted
+    /// clean manifests. It is a run-local proof handle, not durable queue
+    /// state; finalization re-derives and compares the current head.
+    pub(crate) clean_manifest_authority: Option<ProjectionWork>,
     /// This predecessor was reproved from the authenticated completed-path
     /// authority and the live file, rather than from an old receipt base.
     /// Finalization repeats the same live-layout proof, not a canonical
@@ -3501,15 +3505,17 @@ impl CapabilityCapturedPriorProjection {
             &self.completion,
             self.bootstrap_owner_binding,
             self.managed_local_authority,
+            &self.clean_manifest_authority,
             self.receipt_backed_live_authority,
             &self.correlated_authority,
         ) {
-            (Some(completion), None, None, _, None) => completion
+            (Some(completion), None, None, None, _, None) => completion
                 .validate_against(&self.intent)
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string())),
-            (None, Some(_), None, false, None)
-            | (None, None, Some(_), false, None)
-            | (None, None, None, false, Some(_)) => Ok(()),
+            (None, Some(_), None, None, false, None)
+            | (None, None, Some(_), None, false, None)
+            | (None, None, None, Some(_), false, None)
+            | (None, None, None, None, false, Some(_)) => Ok(()),
             _ => Err(EngineError::ProjectionManifest(
                 "captured prior projection has ambiguous authority".into(),
             )),
@@ -3608,6 +3614,7 @@ impl CapabilityCapturedProjectionInput {
                     completion: Some(prior_completion.clone()),
                     bootstrap_owner_binding: None,
                     managed_local_authority: None,
+                    clean_manifest_authority: None,
                     receipt_backed_live_authority: false,
                     correlated_authority: None,
                 }),
@@ -3791,6 +3798,7 @@ impl CaptureSealedPendingLocalPredecessor {
         };
         if prior.completion.is_some()
             || prior.bootstrap_owner_binding.is_some()
+            || prior.clean_manifest_authority.is_some()
             || prior.receipt_backed_live_authority
             || prior.correlated_authority.is_some()
             || before.page.page_id != requirement.page_id
@@ -4887,6 +4895,36 @@ impl BootstrapBulkMaterializer<'_> {
                     session.borrow().stats()
                 }),
         )
+    }
+
+    /// Enumerate compact current path rows from the catalog this terminal
+    /// materializer has already authenticated and decoded. Clean lazy-genesis
+    /// rebuilds use this instead of retaining or rebuilding the legacy
+    /// current-path Patricia catalog merely to discover which pages to lower
+    /// into disposable SQLite.
+    pub(crate) fn terminal_current_path_rows(
+        &self,
+    ) -> Result<Vec<CurrentPathCatalogRow>, EngineError> {
+        if DecodedDocumentVersion::of(&self.catalog) != self.catalog_version {
+            return Err(EngineError::Archive(
+                "terminal catalog changed while deriving current path rows".into(),
+            ));
+        }
+        read_all_pages(&self.catalog).map(|pages| {
+            pages
+                .into_iter()
+                .filter_map(|(page_id, state)| {
+                    current_path_catalog_row_from_page_state(&state).map(|state| {
+                        CurrentPathCatalogRow {
+                            page_id,
+                            path: state.path,
+                            kind: state.kind,
+                            accepted_name_digest: state.accepted_name_digest,
+                        }
+                    })
+                })
+                .collect()
+        })
     }
 
     fn materialize_chunk(&self, page_ids: &[PageId]) -> Result<BootstrapBulkChunk, EngineError> {
@@ -7561,6 +7599,11 @@ pub struct ShardedHotEngine {
     projection_endpoint: Option<ProjectionEndpointBinding>,
     projection_receipt_store_id: Option<super::ProjectionReceiptStoreId>,
     projection_work_index: Option<Arc<ProjectionWorkIndex>>,
+    /// Latest source-endpoint projection row per exact path for the clean
+    /// runtime. This is reconstructed from accepted immutable manifests when
+    /// an endpoint attaches and advanced only after a new manifest commits;
+    /// it is never persisted as a second projection-work authority.
+    clean_projection_heads: BTreeMap<ManagedPath, ProjectionWork>,
     /// Runtime-only exact Blocked batches transferred by correlated local
     /// recovery into the existing external feed. This is repopulated from
     /// authenticated accepted work on every cold reopen; it is not a durable
@@ -7811,6 +7854,7 @@ impl ShardedHotEngine {
             projection_endpoint: None,
             projection_receipt_store_id: None,
             projection_work_index: None,
+            clean_projection_heads: BTreeMap::new(),
             external_reconciliation_blocked_batches: BTreeMap::new(),
             scratch: None,
             retained_scratch: None,
@@ -8332,6 +8376,20 @@ impl ShardedHotEngine {
             };
         }
 
+        let projection_updates = if let Some(endpoint) = self.projection_endpoint {
+            let accepted = self
+                .archive
+                .get(&prepared.manifest().batch_id())
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "clean accepted operation disappeared from the run-local archive".into(),
+                    )
+                })?;
+            self.projection_work_rows_for_batch(accepted, endpoint)?
+        } else {
+            Vec::new()
+        };
+
         if let Err(error) = store.publish_prepared(prepared) {
             let error = EngineError::Archive(format!(
                 "clean accepted operation {} could not publish its manifest: {error}",
@@ -8339,6 +8397,10 @@ impl ShardedHotEngine {
             ));
             self.history_failure = Some(error.clone());
             return Err(error);
+        }
+        for work in projection_updates {
+            self.clean_projection_heads
+                .insert(work.path().clone(), work);
         }
         Ok(outcome)
     }
@@ -8373,8 +8435,20 @@ impl ShardedHotEngine {
         self.archive_store.as_ref().ok_or_else(|| {
             EngineError::ProjectionWork("clean runtime has no operation archive".into())
         })?;
+        let mut heads = BTreeMap::new();
+        for batch_id in self.accepted_sequence.values().copied() {
+            let batch = self.archive.get(&batch_id).ok_or_else(|| {
+                EngineError::ProjectionWork(format!(
+                    "accepted clean batch {batch_id} is absent from the run-local archive"
+                ))
+            })?;
+            for work in self.projection_work_rows_for_batch(batch, endpoint)? {
+                heads.insert(work.path().clone(), work);
+            }
+        }
         self.projection_endpoint = Some(endpoint);
         self.projection_receipt_store_id = Some(receipts.store_id());
+        self.clean_projection_heads = heads;
         Ok(())
     }
 
@@ -17395,6 +17469,7 @@ impl ShardedHotEngine {
             completion: None,
             bootstrap_owner_binding: None,
             managed_local_authority: Some((entry.sequence, entry.batch_id)),
+            clean_manifest_authority: None,
             receipt_backed_live_authority: false,
             correlated_authority: None,
         }))
@@ -17461,6 +17536,65 @@ impl ShardedHotEngine {
             // the intent above supplies the exact page/path/byte binding.
             bootstrap_owner_binding: Some(genesis.root()),
             managed_local_authority: None,
+            clean_manifest_authority: None,
+            receipt_backed_live_authority: false,
+            correlated_authority: None,
+        }))
+    }
+
+    /// Reprove the current exact graph file from the latest accepted clean
+    /// manifest after the page has moved beyond its lazy-genesis baseline.
+    /// `clean_projection_heads` is only a run-local locator; the immutable
+    /// work object and current semantic state are both revalidated here.
+    fn clean_manifest_projection_predecessor(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+        before: &ProjectionPageState,
+    ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
+        let Some(work) = self.clean_projection_heads.get(path).cloned() else {
+            return Ok(None);
+        };
+        if work.page_id() != page_id
+            || before.page.page_id != page_id
+            || before.page.path != *path
+            || before.frontier != *work.post_frontier()
+            || !matches!(work.target(), ProjectionWorkTarget::Present(_))
+        {
+            return Err(EngineError::ProjectionManifest(format!(
+                "clean manifest predecessor for {path} is not the current semantic page"
+            )));
+        }
+        let (archive, _) = self.clean_projection_runtime_binding()?;
+        let decoded = super::projection::decode_manifested_projection_work(&archive, &work)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let bytes = decoded.target_bytes().ok_or_else(|| {
+            EngineError::ProjectionManifest(format!(
+                "clean manifest predecessor for {path} unexpectedly has an absent target"
+            ))
+        })?;
+        let intent = decoded.receiver_local_intent().clone();
+        let replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            before,
+            decoded.annotated_base().map(AnnotatedProjectionBase::bytes),
+            decoded
+                .annotated_base()
+                .map(AnnotatedProjectionBase::annotations),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if replay.target() != bytes || replay.intent() != &intent {
+            return Err(EngineError::ProjectionManifest(format!(
+                "clean manifest predecessor for {path} is not its deterministic current rendering"
+            )));
+        }
+        Ok(Some(CapabilityCapturedPriorProjection {
+            bytes: bytes.to_vec(),
+            intent,
+            completion: None,
+            bootstrap_owner_binding: None,
+            managed_local_authority: None,
+            clean_manifest_authority: Some(work),
             receipt_backed_live_authority: false,
             correlated_authority: None,
         }))
@@ -17496,6 +17630,36 @@ impl ShardedHotEngine {
         {
             return Err(EngineError::ProjectionManifest(
                 "managed-local predecessor authority does not bind the captured exact target"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_clean_manifest_projection_authority(
+        &self,
+        path: &ManagedPath,
+        prior: &CapabilityCapturedPriorProjection,
+    ) -> Result<(), EngineError> {
+        let Some(work) = &prior.clean_manifest_authority else {
+            return Ok(());
+        };
+        if self.clean_projection_heads.get(path) != Some(work)
+            || !self
+                .clean_projection_work_for_batch(work.batch_id())?
+                .iter()
+                .any(|derived| derived == work)
+        {
+            return Err(EngineError::AuthorDraftStale);
+        }
+        let (archive, _) = self.clean_projection_runtime_binding()?;
+        let decoded = super::projection::decode_manifested_projection_work(&archive, work)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if decoded.receiver_local_intent() != &prior.intent
+            || decoded.target_bytes() != Some(prior.bytes.as_slice())
+        {
+            return Err(EngineError::ProjectionManifest(
+                "clean manifest predecessor authority does not bind the captured exact target"
                     .into(),
             ));
         }
@@ -17574,6 +17738,7 @@ impl ShardedHotEngine {
             completion: None,
             bootstrap_owner_binding: None,
             managed_local_authority: None,
+            clean_manifest_authority: None,
             receipt_backed_live_authority: false,
             correlated_authority: Some(capability),
         }))
@@ -17758,6 +17923,24 @@ impl ShardedHotEngine {
                 })
                 .transpose()?
                 .flatten();
+            let clean_manifest_prior = if work_index.is_none() {
+                roles
+                    .semantic_predecessor
+                    .and_then(|requirement_index| {
+                        let requirement = &draft.requirements[requirement_index];
+                        draft.pages[&requirement.page_id]
+                            .before
+                            .as_ref()
+                            .map(|before| (requirement.page_id, before))
+                    })
+                    .map(|(page_id, before)| {
+                        self.clean_manifest_projection_predecessor(path, page_id, before)
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
             let correlated_prior = if external {
                 roles
                     .semantic_predecessor
@@ -17777,6 +17960,9 @@ impl ShardedHotEngine {
                 None
             };
             let prior = if let Some(prior) = managed_prior {
+                authority_matches = true;
+                Some(prior)
+            } else if let Some(prior) = clean_manifest_prior {
                 authority_matches = true;
                 Some(prior)
             } else if let Some(requirement_index) = roles.semantic_predecessor {
@@ -17818,6 +18004,7 @@ impl ShardedHotEngine {
                         completion: Some(live.completion().clone()),
                         bootstrap_owner_binding: None,
                         managed_local_authority: None,
+                        clean_manifest_authority: None,
                         receipt_backed_live_authority: true,
                         correlated_authority: None,
                     })
@@ -17867,6 +18054,7 @@ impl ShardedHotEngine {
                             completion: Some(completion),
                             bootstrap_owner_binding: None,
                             managed_local_authority: None,
+                            clean_manifest_authority: None,
                             receipt_backed_live_authority: false,
                             correlated_authority: None,
                         })
@@ -17937,6 +18125,7 @@ impl ShardedHotEngine {
                                 completion: None,
                                 bootstrap_owner_binding: Some(baseline.owner_binding()),
                                 managed_local_authority: None,
+                                clean_manifest_authority: None,
                                 receipt_backed_live_authority: false,
                                 correlated_authority: None,
                             })
@@ -18276,6 +18465,7 @@ impl ShardedHotEngine {
             if let Some(prior) = prior {
                 prior.validate_authority()?;
                 self.validate_managed_local_projection_authority(path, prior)?;
+                self.validate_clean_manifest_projection_authority(path, prior)?;
                 self.validate_correlated_projection_authority(path, prior)?;
                 let before = roles
                     .semantic_predecessor
@@ -20271,6 +20461,19 @@ impl ShardedHotEngine {
         ) else {
             return Ok(());
         };
+        let work = self.projection_work_rows_for_batch(batch, endpoint)?;
+        self.prepare_projection_work_rows(batch, index, work, reconstructible_bootstrap)
+    }
+
+    /// Derive the exact source-endpoint projection rows carried by one
+    /// validated operation. The rows are a view of immutable manifest/object
+    /// evidence, not durable queue state. Both the legacy queue adapter and the
+    /// clean manifest-only runtime use this singular lowering.
+    fn projection_work_rows_for_batch(
+        &self,
+        batch: &ValidatedBatch,
+        endpoint: ProjectionEndpointBinding,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
         let batch_id = batch.manifest().batch_id();
         let projection = super::projection_manifest::validate_projection_object_set(
             batch.manifest(),
@@ -20278,7 +20481,6 @@ impl ShardedHotEngine {
         )
         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
         let mut work = Vec::new();
-        let mut superseded = Vec::new();
         for intent in projection
             .intents()
             .iter()
@@ -20318,18 +20520,32 @@ impl ShardedHotEngine {
                 intent.post_frontier().clone(),
                 target,
             );
+            work.push(row);
+        }
+        Ok(work)
+    }
+
+    fn prepare_projection_work_rows(
+        &self,
+        batch: &ValidatedBatch,
+        index: &ProjectionWorkIndex,
+        work: Vec<ProjectionWork>,
+        reconstructible_bootstrap: bool,
+    ) -> Result<(), EngineError> {
+        let batch_id = batch.manifest().batch_id();
+        let mut superseded = Vec::new();
+        for row in &work {
             if !self.authenticated_history_replay {
                 for older in index
-                    .pending_for_path(intent.path())
+                    .pending_for_path(row.path())
                     .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
                 {
                     if older.work_id() == row.work_id() {
                         continue;
                     }
-                    if self.projection_frontier_dominates(
-                        intent.post_frontier(),
-                        older.post_frontier(),
-                    )? {
+                    if self
+                        .projection_frontier_dominates(row.post_frontier(), older.post_frontier())?
+                    {
                         superseded.push(older.work_id());
                     }
                 }
@@ -20359,7 +20575,6 @@ impl ShardedHotEngine {
                     }
                 }
             }
-            work.push(row);
         }
         if self.authenticated_history_replay {
             match index.require_replayed_prepared_batch(batch_id, batch_fingerprint(batch), &work) {
@@ -20384,6 +20599,113 @@ impl ShardedHotEngine {
         index
             .prepare_batch(batch_id, batch_fingerprint(batch), &work, &superseded)
             .map_err(|error| EngineError::ProjectionWork(error.to_string()))
+    }
+
+    /// Reconstruct the projection rows of one manifest-committed accepted
+    /// operation in the clean runtime. No queue/status/index is consulted or
+    /// created: the immutable manifest is the commit marker, accepted engine
+    /// evidence authenticates it, and the projection object set is lowered by
+    /// the same function used by the legacy adapter.
+    pub(crate) fn clean_projection_work_for_batch(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
+        let (store, endpoint) = self.clean_projection_runtime_binding()?;
+        let manifest = store
+            .read_manifest(batch_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "clean projection batch {batch_id} has no committed manifest"
+                ))
+            })?;
+        let evidence = self.accepted_batch_evidence(batch_id)?;
+        if evidence.manifest_fingerprint() != batch_fingerprint_from_manifest(&manifest) {
+            return Err(EngineError::Archive(format!(
+                "clean projection batch {batch_id} manifest differs from accepted evidence"
+            )));
+        }
+        let batch = self.archive.get(&batch_id).ok_or_else(|| {
+            EngineError::Archive(format!(
+                "clean projection batch {batch_id} is not retained by the accepted runtime"
+            ))
+        })?;
+        if batch.manifest() != &manifest {
+            return Err(EngineError::Archive(format!(
+                "clean projection batch {batch_id} runtime manifest differs from committed bytes"
+            )));
+        }
+        self.projection_work_rows_for_batch(batch, endpoint)
+    }
+
+    /// Rebuild the run-local terminal projection plan from accepted manifests.
+    /// Only the latest accepted row for each exact path can affect the final
+    /// Markdown/Org tree; older rows remain immutable history but are not a
+    /// durable queue to recover. The returned map is ordinary process memory
+    /// and is reconstructed on every cold open that needs reconciliation.
+    pub(crate) fn clean_terminal_projection_work(
+        &self,
+    ) -> Result<Vec<ProjectionWork>, EngineError> {
+        self.clean_projection_runtime_binding()?;
+        Ok(self.clean_projection_heads.values().cloned().collect())
+    }
+
+    /// Authorize one clean-runtime projection directly from the immutable
+    /// accepted manifest and the disposable SQLite current-state projection.
+    /// This deliberately has no persistent Ready/Completed/Superseded state:
+    /// stale work is rejected by current path ownership and, in the writer,
+    /// by replaying the current semantic page against the manifested target.
+    pub(crate) fn authorize_clean_projection_work(
+        &mut self,
+        projection: &super::SqliteFrontier,
+        work: &ProjectionWork,
+    ) -> Result<Arc<ObjectStore>, EngineError> {
+        self.begin_point_operation();
+        let (store, endpoint) = self.clean_projection_runtime_binding()?;
+        if work.workspace_id() != self.workspace_id
+            || work.endpoint_id() != endpoint.endpoint_id
+            || work.graph_resource_id() != endpoint.graph_resource_id
+        {
+            return Err(EngineError::ProjectionWork(
+                "clean projection work endpoint/workspace binding mismatch".into(),
+            ));
+        }
+        let current_root = self.accepted_frontier_root()?;
+        let projected_root = projection
+            .frontier_root()
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        if projected_root != current_root {
+            return Err(EngineError::ProjectionWork(
+                "clean SQLite projection is not at the engine's accepted frontier".into(),
+            ));
+        }
+        let derived = self.clean_projection_work_for_batch(work.batch_id())?;
+        if !derived.iter().any(|candidate| candidate == work) {
+            return Err(EngineError::ProjectionWork(
+                "clean projection work is not carried by its accepted manifest".into(),
+            ));
+        }
+        let read = projection
+            .materialized_read()
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        let owners = read
+            .pages_by_path(work.path(), 2)
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        match work.target() {
+            ProjectionWorkTarget::Present(_) if !matches!(owners.as_slice(), [owner] if owner.page_id == work.page_id()) =>
+            {
+                return Err(EngineError::ProjectionWork(
+                    "clean projection path is not currently owned by its page".into(),
+                ));
+            }
+            ProjectionWorkTarget::Absent if !owners.is_empty() => {
+                return Err(EngineError::ProjectionWork(
+                    "clean projection deletion path is currently owned".into(),
+                ));
+            }
+            ProjectionWorkTarget::Absent | ProjectionWorkTarget::Present(_) => {}
+        }
+        Ok(store)
     }
 
     fn activate_projection_work(
