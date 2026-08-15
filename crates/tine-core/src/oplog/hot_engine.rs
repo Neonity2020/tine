@@ -984,11 +984,10 @@ struct PortablePathPublicationCandidate {
     conflicts: Vec<PortablePathConflict>,
 }
 
-/// Opaque causal point records read from the exact post-acceptance Patricia
-/// roots while SQLite runs as a differential shadow. The final cutover keeps
-/// this shape but derives it directly from the baseline/oplog transition
-/// machine and deletes the Patricia source.
+/// Test-only differential-oracle rows read from the retired Patricia roots.
+/// Production identity replay is derived from SQLite plus the accepted event.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct AcceptedIdentityProjectionRecords {
     pub(crate) page_names: Vec<(ContentDigest, Vec<u8>)>,
     pub(crate) portable_paths: Vec<(ContentDigest, Vec<u8>)>,
@@ -13684,11 +13683,9 @@ impl ShardedHotEngine {
         Ok(AcceptedBatchCausalContainment { batch_id, clock })
     }
 
-    /// Read the exact post-acceptance causal identity records touched by one
-    /// accepted semantic effect. During the differential phase the old
-    /// Patricia roots are the oracle; SQLite receives the same canonical point
-    /// values. The clean cutover replaces this reader with the baseline/oplog
-    /// transition machine and removes the roots.
+    /// Read the retired Patricia result for bounded differential tests. No
+    /// production runtime or SQLite rebuild calls this oracle.
+    #[cfg(test)]
     pub(crate) fn accepted_identity_projection_records(
         &self,
         batch_id: BatchId,

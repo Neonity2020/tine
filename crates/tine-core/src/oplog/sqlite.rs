@@ -1591,7 +1591,6 @@ fn effective_transition_index(
 fn attach_parser_derived_graph_facts(
     engine: &ShardedHotEngine,
     change: super::MaterializationChange,
-    semantic_effect: &[u8],
 ) -> Result<super::MaterializationChange, ProjectionError> {
     let policy = engine
         .reference_catalog_policy()
@@ -1613,37 +1612,8 @@ fn attach_parser_derived_graph_facts(
             },
         )
         .collect();
-    let effect = SemanticEffect::decode(semantic_effect)
-        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-    let identity = engine
-        .accepted_identity_projection_records(change.batch_id(), &effect)
-        .map_err(ProjectionError::materialization_from_engine)?;
     change
         .with_derived_graph_facts(rows.postings, rows.aliases, portable_path_claims)
-        .and_then(|change| {
-            change.with_identity_projection_records(
-                identity
-                    .page_names
-                    .into_iter()
-                    .map(|(key_digest, record)| {
-                        super::sqlite_materialization::MaterializedIdentityRecord {
-                            key_digest,
-                            record,
-                        }
-                    })
-                    .collect(),
-                identity
-                    .portable_paths
-                    .into_iter()
-                    .map(|(key_digest, record)| {
-                        super::sqlite_materialization::MaterializedIdentityRecord {
-                            key_digest,
-                            record,
-                        }
-                    })
-                    .collect(),
-            )
-        })
         .map_err(Into::into)
 }
 
@@ -1734,15 +1704,18 @@ fn prepare_clean_identity_transition_from_observations(
     Ok((names, paths, name_records, path_records))
 }
 
-/// Differentially prove that SQLite's clean identity transition machine makes
-/// the same ownership decision as the temporary Patricia oracle. The oracle
-/// still supplies production rows during this phase; this function has no
-/// write side effect and cannot change accepted behavior.
-fn verify_sqlite_identity_transition_against_legacy(
+/// Reconstruct the clean identity transition for an already accepted event at
+/// exact SQLite frontier F. Local/provider publication prepares the same rows
+/// before its manifest commit; this path is used when disposable SQLite is
+/// rebuilt from the immutable baseline and operation tail after restart.
+///
+/// The retired Patricia indexes are deliberately absent from this derivation:
+/// SQLite's prior rows plus the accepted event's authenticated before/after
+/// observations are the complete current-state input.
+fn prepare_accepted_sqlite_identity_transition(
     engine: &ShardedHotEngine,
     event: &AcceptedBatchEvent,
     prior: &super::SqliteMaterializedRead<'_>,
-    oracle: &super::MaterializationChange,
 ) -> Result<PreparedSqliteIdentityTransition, ProjectionError> {
     let authored = SemanticEffect::decode(event.authored_semantic_effect())
         .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -1799,78 +1772,16 @@ fn verify_sqlite_identity_transition_against_legacy(
             event.causal_dependency_heads(),
         )
         .map_err(ProjectionError::materialization_from_engine)?;
-    let (names, paths, mut name_records, mut path_records) =
-        prepare_clean_identity_transition_from_observations(
-            prior,
-            event.batch_id(),
-            event.causal_dot(),
-            &authored,
-            &exact_before,
-            &current,
-            &prospective,
-            &containment,
-        )?;
-    name_records.extend(names.changed.clone());
-    path_records.extend(paths.changed.clone());
-
-    let oracle_names = oracle
-        .page_name_identity_records()
-        .iter()
-        .map(|record| (record.key_digest, &record.record))
-        .collect::<BTreeMap<_, _>>();
-    let oracle_paths = oracle
-        .portable_path_identity_records()
-        .iter()
-        .map(|record| (record.key_digest, &record.record))
-        .collect::<BTreeMap<_, _>>();
-    for key in names.changed.keys() {
-        if !oracle_names.contains_key(&ContentDigest::from_bytes(*key.as_bytes())) {
-            return Err(ProjectionError::Materialization(
-                "clean page-name transition changed a key absent from the legacy oracle".into(),
-            ));
-        }
-    }
-    for (digest, bytes) in oracle_names {
-        let Some((key, clean)) = name_records
-            .iter()
-            .find(|(key, _)| ContentDigest::from_bytes(*key.as_bytes()) == digest)
-        else {
-            return Err(ProjectionError::Materialization(
-                "legacy page-name oracle returned a key absent from clean observations".into(),
-            ));
-        };
-        let legacy = super::sqlite_identity::PageNameIdentityRecordV1::decode(*key, bytes)
-            .map_err(ProjectionError::Materialization)?;
-        if !clean.equivalent_to_legacy_oracle(&legacy) {
-            return Err(ProjectionError::Materialization(
-                "clean page-name identity transition differs from the legacy oracle".into(),
-            ));
-        }
-    }
-    for key in paths.changed.keys() {
-        if !oracle_paths.contains_key(&ContentDigest::from_bytes(*key.as_bytes())) {
-            return Err(ProjectionError::Materialization(
-                "clean portable-path transition changed a key absent from the legacy oracle".into(),
-            ));
-        }
-    }
-    for (digest, bytes) in oracle_paths {
-        let Some((key, clean)) = path_records
-            .iter()
-            .find(|(key, _)| ContentDigest::from_bytes(*key.as_bytes()) == digest)
-        else {
-            return Err(ProjectionError::Materialization(
-                "legacy portable-path oracle returned a key absent from clean observations".into(),
-            ));
-        };
-        let legacy = super::sqlite_identity::PortablePathIdentityRecordV1::decode(*key, bytes)
-            .map_err(ProjectionError::Materialization)?;
-        if !clean.equivalent_to_legacy_oracle(&legacy) {
-            return Err(ProjectionError::Materialization(
-                "clean portable-path identity transition differs from the legacy oracle".into(),
-            ));
-        }
-    }
+    let (names, paths, _, _) = prepare_clean_identity_transition_from_observations(
+        prior,
+        event.batch_id(),
+        event.causal_dot(),
+        &authored,
+        &exact_before,
+        &current,
+        &prospective,
+        &containment,
+    )?;
     let page_names = names
         .changed
         .into_iter()
@@ -1899,11 +1810,10 @@ fn verify_sqlite_identity_transition_against_legacy(
     })
 }
 
-/// Install SQLite-owned identity rows -- never Patricia's rows -- in the same
-/// F -> F+1 transaction as the ordinary materialization. Fresh local
-/// publication carries the exact transition prepared at F. Provider/recovery
-/// events still use a post-acceptance compatibility derivation until their own
-/// pre-acceptance hook is wired.
+/// Install SQLite-owned identity rows in the same F -> F+1 transaction as the
+/// ordinary materialization. Fresh local/provider publication carries the
+/// exact transition prepared at F; rebuild derives the identical rows from
+/// the accepted event and SQLite's exact prior frontier.
 fn install_clean_identity_transition(
     change: super::MaterializationChange,
     selected: &PreparedSqliteIdentityTransition,
@@ -5024,10 +4934,19 @@ impl SqliteFrontier {
         if !self.runtime_authority.matches(engine.runtime_authority()) {
             return Err(ProjectionError::AuthorityMismatch);
         }
+        let applied = self.frontier_root()?;
+        if event.acceptance_sequence() <= applied.acceptance_sequence() {
+            authenticate_event_for_engine(engine, event)?;
+            self.validate_applied_tail_duplicate(event, &applied)?;
+            return Ok((
+                ApplyDisposition::Duplicate,
+                EventMaterializationInstrumentation::default(),
+                Default::default(),
+            ));
+        }
         let (materialization, materialization_stats) =
             materialize_accepted_event_with_stats(engine, event)?;
-        let materialization =
-            attach_parser_derived_graph_facts(engine, materialization, event.semantic_effect())?;
+        let materialization = attach_parser_derived_graph_facts(engine, materialization)?;
         let prior_digest = canonical_frontier_root_digest(event.prior_frontier_root())?;
         let prior = self.physical.materialized_read(
             event.prior_frontier_root().acceptance_sequence(),
@@ -5036,12 +4955,7 @@ impl SqliteFrontier {
         let prior = super::SqliteMaterializedRead::from_storage(prior);
         let identity = match event.prepared_identity_transition() {
             Some(prepared) => prepared.clone(),
-            None => verify_sqlite_identity_transition_against_legacy(
-                engine,
-                event,
-                &prior,
-                &materialization,
-            )?,
+            None => prepare_accepted_sqlite_identity_transition(engine, event, &prior)?,
         };
         drop(prior);
         let materialization = install_clean_identity_transition(materialization, &identity)?;
@@ -5064,8 +4978,7 @@ impl SqliteFrontier {
             return Err(ProjectionError::AuthorityMismatch);
         }
         authenticate_event_for_engine(engine, event)?;
-        let materialization =
-            attach_parser_derived_graph_facts(engine, materialization, event.semantic_effect())?;
+        let materialization = attach_parser_derived_graph_facts(engine, materialization)?;
         let prior_digest = canonical_frontier_root_digest(event.prior_frontier_root())?;
         let prior = self.physical.materialized_read(
             event.prior_frontier_root().acceptance_sequence(),
@@ -5074,12 +4987,7 @@ impl SqliteFrontier {
         let prior = super::SqliteMaterializedRead::from_storage(prior);
         let identity = match event.prepared_identity_transition() {
             Some(prepared) => prepared.clone(),
-            None => verify_sqlite_identity_transition_against_legacy(
-                engine,
-                event,
-                &prior,
-                &materialization,
-            )?,
+            None => prepare_accepted_sqlite_identity_transition(engine, event, &prior)?,
         };
         drop(prior);
         let materialization = install_clean_identity_transition(materialization, &identity)?;
@@ -5159,8 +5067,7 @@ impl SqliteFrontier {
                     ))
                 })?;
             if let Some(engine) = reference_engine {
-                change =
-                    attach_parser_derived_graph_facts(engine, change, &stored.semantic_effect)?;
+                change = attach_parser_derived_graph_facts(engine, change)?;
             }
             let input_digest =
                 change.validate_against_stored(stored.batch_id, &stored.semantic_effect)?;
@@ -6038,11 +5945,8 @@ impl SqliteFrontier {
             let apply_stats = if inactive_bulk {
                 let (materialization, materialization_stats) =
                     materialize_inactive_bootstrap_event_bulk(source.engine, &event)?;
-                let materialization = attach_parser_derived_graph_facts(
-                    source.engine,
-                    materialization,
-                    event.semantic_effect(),
-                )?;
+                let materialization =
+                    attach_parser_derived_graph_facts(source.engine, materialization)?;
                 instrumentation.record_materialization(materialization_stats);
                 intermediate_page_materializations += 1;
                 self.apply_candidate_with_materialization_and_stats(
@@ -10229,10 +10133,11 @@ mod tests {
         let outcome = engine
             .stage_archive_batch(prepared.manifest().batch_id())
             .unwrap();
-        assert!(matches!(
-            outcome.disposition,
-            BatchDisposition::Accepted { .. }
-        ));
+        assert!(
+            matches!(outcome.disposition, BatchDisposition::Accepted { .. }),
+            "archive stage returned {:?}",
+            outcome.disposition
+        );
     }
 
     fn enrolled_test_engine(dir: &TestDir, ids: TestIds) -> (ObjectStore, ShardedHotEngine) {
@@ -11117,7 +11022,18 @@ mod tests {
             ..ids
         };
         let dir = TestDir::new("frontier-reference-query");
-        let (mut database, mut engine, store) = open_empty(&dir, ids);
+        let store_path = dir.path().join("objects");
+        let engine_store = ObjectStore::open(&store_path, ids.workspace).unwrap();
+        let store = ObjectStore::open(&store_path, ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut database = open_test_projection(
+            &dir.path().join("frontier.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
 
         let target_path = "nested/owners/target.md";
         let target = engine
@@ -11126,7 +11042,7 @@ mod tests {
                 &root_transaction_named(ids, target_path, "Target", "aliases:: Old Target"),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &target);
+        publish_and_stage_archive(&mut engine, &store, &target);
         let target_event =
             AcceptedBatchEvent::from_accepted(&engine, &store, target.manifest().batch_id())
                 .unwrap();
@@ -11154,7 +11070,7 @@ mod tests {
                 &root_transaction_named(source_ids, source_path, "Source", &source_content),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &source);
+        publish_and_stage_archive(&mut engine, &store, &source);
         let source_event =
             AcceptedBatchEvent::from_accepted(&engine, &store, source.manifest().batch_id())
                 .unwrap();
@@ -11275,7 +11191,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &delete);
+        publish_and_stage_archive(&mut engine, &store, &delete);
         let delete_event =
             AcceptedBatchEvent::from_accepted(&engine, &store, delete.manifest().batch_id())
                 .unwrap();
@@ -11308,7 +11224,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &recreate);
+        publish_and_stage_archive(&mut engine, &store, &recreate);
         let recreate_event =
             AcceptedBatchEvent::from_accepted(&engine, &store, recreate.manifest().batch_id())
                 .unwrap();
@@ -12649,18 +12565,8 @@ mod tests {
         assert_eq!(create_stats.accepted_root_authentications, 1);
         assert_eq!(create_stats.exact_catalog_loads, 1);
         assert_eq!(
-            attach_parser_derived_graph_facts(
-                &engine,
-                scoped_create.clone(),
-                create_event.semantic_effect(),
-            )
-            .unwrap(),
-            attach_parser_derived_graph_facts(
-                &engine,
-                point_create,
-                create_event.semantic_effect(),
-            )
-            .unwrap(),
+            attach_parser_derived_graph_facts(&engine, scoped_create.clone()).unwrap(),
+            attach_parser_derived_graph_facts(&engine, point_create).unwrap(),
             "aliases and raw reference evidence must be identical"
         );
 
