@@ -111,11 +111,11 @@ use crate::oplog::operational_coordinator::{
     OperationalFaultPoint, TrustedLocalPreparationStageTimings,
 };
 use crate::oplog::operational_coordinator::{
-    CleanLocalMutationState, CleanPublishedContinuation, CorrelatedPublishedLocalResume,
-    LocalMutationBlockReason, LocalMutationCoordinatorState, LocalMutationRecovery,
-    LocalPublishedContinuation, OperationalCoordinator, OperationalCoordinatorError,
-    OperationalPhase, PreparedLocalMutationState, ProviderArchiveContinuation,
-    ProviderArchiveIngress,
+    CleanExternalMutationState, CleanLocalMutationState, CleanPublishedContinuation,
+    CorrelatedPublishedLocalResume, LocalMutationBlockReason, LocalMutationCoordinatorState,
+    LocalMutationRecovery, LocalPublishedContinuation, OperationalCoordinator,
+    OperationalCoordinatorError, OperationalPhase, PreparedLocalMutationState,
+    ProviderArchiveContinuation, ProviderArchiveIngress,
 };
 #[cfg(test)]
 use crate::oplog::projection::{
@@ -5037,10 +5037,76 @@ struct CleanRuntimeResources {
 struct CleanRuntimeActorCore {
     runtime: CleanLocalRuntime,
     pending: Option<CleanPublishedContinuation>,
+    watcher: CleanWatcherState,
+    /// An externally authored manifest has committed, but its derived graph
+    /// projection has not yet completed.  Keep the watcher admission open
+    /// until the continuation succeeds, then report one observable change
+    /// after any observations accumulated behind it are reconciled as well.
+    external_change_pending_notification: bool,
+}
+
+#[derive(Default)]
+struct CleanWatcherState {
+    exact: BTreeSet<ManagedPath>,
+    full_scan: bool,
+    latest_enqueue: u64,
+    acknowledged: u64,
+}
+
+impl CleanWatcherState {
+    fn enqueue(&mut self, observation: SyncWatcherObservation) {
+        self.latest_enqueue = self.latest_enqueue.saturating_add(1);
+        match observation {
+            SyncWatcherObservation::ManagedPath(path) if !self.full_scan => {
+                self.exact.insert(path);
+            }
+            SyncWatcherObservation::ManagedPath(_)
+            | SyncWatcherObservation::UnknownPath
+            | SyncWatcherObservation::NotifyError
+            | SyncWatcherObservation::RescanRequired => {
+                self.full_scan = true;
+                self.exact.clear();
+            }
+        }
+    }
+
+    fn seed_full_scan(&mut self) {
+        self.enqueue(SyncWatcherObservation::RescanRequired);
+    }
+
+    fn pending(&self) -> bool {
+        self.full_scan || !self.exact.is_empty()
+    }
+
+    fn status(&self) -> SyncWatcherStatus {
+        SyncWatcherStatus {
+            latest_enqueue: self.latest_enqueue,
+            acknowledged: self.acknowledged,
+            pending: self.pending(),
+            pending_requires_full_scan: self.full_scan,
+            ..SyncWatcherStatus::default()
+        }
+    }
+
+    fn settle(&mut self) -> u64 {
+        self.acknowledged = self.latest_enqueue;
+        self.full_scan = false;
+        self.exact.clear();
+        self.acknowledged
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CleanActorMutationOutcome {
+    Durable(BatchId),
+    DurablePending {
+        batch_id: BatchId,
+        phase: OperationalPhase,
+    },
+}
+
+enum CleanActorExternalOutcome {
+    Noop,
     Durable(BatchId),
     DurablePending {
         batch_id: BatchId,
@@ -5064,10 +5130,16 @@ impl From<OperationalCoordinatorError> for CleanActorMutationFailure {
 }
 
 impl CleanRuntimeActorCore {
-    fn new(runtime: CleanLocalRuntime) -> Self {
+    fn new(runtime: CleanLocalRuntime, seed_full_scan: bool) -> Self {
+        let mut watcher = CleanWatcherState::default();
+        if seed_full_scan {
+            watcher.seed_full_scan();
+        }
         Self {
             runtime,
             pending: None,
+            watcher,
+            external_change_pending_notification: false,
         }
     }
 
@@ -5116,6 +5188,183 @@ impl CleanRuntimeActorCore {
             }
         };
         Some(self.retain_outcome(state))
+    }
+
+    fn observe(&mut self, observations: Vec<SyncWatcherObservation>) {
+        for observation in observations {
+            self.watcher.enqueue(observation);
+        }
+    }
+
+    fn watcher_status(&self) -> SyncWatcherStatus {
+        self.watcher.status()
+    }
+
+    fn full_scan_changed_paths(
+        &self,
+        graph: &Graph,
+    ) -> Result<BTreeSet<ManagedPath>, CleanActorMutationFailure> {
+        let disk = graph
+            .fresh_initial_shadow_raw_managed_text_inventory()
+            .map_err(|error| CleanActorMutationFailure {
+                phase: OperationalPhase::Planning,
+                detail: format!("clean watcher full graph capture failed: {error}"),
+            })?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let read = self
+            .runtime
+            .database()
+            .materialized_read()
+            .map_err(|error| CleanActorMutationFailure {
+                phase: OperationalPhase::Planning,
+                detail: format!("clean watcher SQLite inventory failed: {error}"),
+            })?;
+        let mut candidates = disk.keys().cloned().collect::<BTreeSet<_>>();
+        let mut cursor = None;
+        loop {
+            let pages = read
+                .page_inventory_after(
+                    cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
+                    None,
+                    512,
+                )
+                .map_err(|error| CleanActorMutationFailure {
+                    phase: OperationalPhase::Planning,
+                    detail: format!("clean watcher page inventory failed: {error}"),
+                })?;
+            if pages.is_empty() {
+                break;
+            }
+            for page in &pages {
+                candidates.insert(page.path.clone());
+            }
+            let last = pages.last().expect("nonempty page inventory batch");
+            cursor = Some((last.path.clone(), last.page_id));
+            if pages.len() < 512 {
+                break;
+            }
+        }
+        candidates.extend(
+            self.runtime
+                .engine()
+                .clean_manifest_projection_paths()
+                .map_err(|error| CleanActorMutationFailure {
+                    phase: OperationalPhase::Planning,
+                    detail: format!("clean watcher manifest path inventory failed: {error}"),
+                })?,
+        );
+        let mut changed = BTreeSet::new();
+        for path in candidates {
+            let owners =
+                read.pages_by_path(&path, 2)
+                    .map_err(|error| CleanActorMutationFailure {
+                        phase: OperationalPhase::Planning,
+                        detail: format!("clean watcher SQLite owner for {path} failed: {error}"),
+                    })?;
+            let sqlite_owner = match owners.as_slice() {
+                [] => None,
+                [owner] => Some(owner.page_id),
+                _ => {
+                    return Err(CleanActorMutationFailure {
+                        phase: OperationalPhase::Planning,
+                        detail: format!(
+                            "clean watcher SQLite contains more than one owner for {path}"
+                        ),
+                    });
+                }
+            };
+            let predecessor = self
+                .runtime
+                .engine()
+                .clean_import_projection_predecessor(&path, sqlite_owner)
+                .map_err(|error| CleanActorMutationFailure {
+                    phase: OperationalPhase::Planning,
+                    detail: format!("clean watcher predecessor for {path} failed: {error}"),
+                })?;
+            let differs = match (disk.get(&path), &predecessor) {
+                (None, None)
+                | (
+                    None,
+                    Some(crate::oplog::hot_engine::CleanImportProjectionPredecessor::Released {
+                        ..
+                    }),
+                ) => false,
+                (
+                    Some(bytes),
+                    Some(crate::oplog::hot_engine::CleanImportProjectionPredecessor::Present {
+                        bytes: prior,
+                        ..
+                    }),
+                ) => bytes != prior,
+                _ => true,
+            };
+            if differs {
+                if std::env::var_os("TINE_CLEAN_WATCHER_TRACE").is_some() {
+                    eprintln!(
+                        "clean watcher changed path {path}: disk={} predecessor={}",
+                        disk.get(&path).map_or_else(
+                            || "absent".to_owned(),
+                            |bytes| format!(
+                                "{}:{:?}",
+                                bytes.len(),
+                                crate::oplog::BlobDescription::of(bytes)
+                            )
+                        ),
+                        match &predecessor {
+                            None => "absent".to_owned(),
+                            Some(crate::oplog::hot_engine::CleanImportProjectionPredecessor::Present { bytes, .. }) => format!("present:{}:{:?}", bytes.len(), crate::oplog::BlobDescription::of(bytes)),
+                            Some(crate::oplog::hot_engine::CleanImportProjectionPredecessor::Released { .. }) => "released".to_owned(),
+                        }
+                    );
+                }
+                changed.insert(path);
+            }
+        }
+        Ok(changed)
+    }
+
+    fn execute_external_paths(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        paths: &BTreeSet<ManagedPath>,
+    ) -> Result<CleanActorExternalOutcome, CleanActorMutationFailure> {
+        if let Some(pending) = self.pending.as_ref() {
+            return Ok(CleanActorExternalOutcome::DurablePending {
+                batch_id: pending.batch_id(),
+                phase: pending.failure().phase(),
+            });
+        }
+        let requested = paths.iter().map(ManagedPath::as_str).collect::<Vec<_>>();
+        let state = {
+            let mut session = self.runtime.admit_clean_mutation(graph).map_err(|error| {
+                CleanActorMutationFailure {
+                    phase: OperationalPhase::Bindings,
+                    detail: error.to_string(),
+                }
+            })?;
+            OperationalCoordinator::execute_clean_external(
+                &mut session,
+                graph,
+                receipts,
+                &requested,
+            )
+            .map_err(CleanActorMutationFailure::from)?
+        };
+        Ok(match state {
+            CleanExternalMutationState::Noop => CleanActorExternalOutcome::Noop,
+            CleanExternalMutationState::Complete(batch_id) => {
+                CleanActorExternalOutcome::Durable(batch_id)
+            }
+            CleanExternalMutationState::DurablePending(pending) => {
+                let batch_id = pending.batch_id();
+                let phase = pending.failure().phase();
+                self.pending = Some(pending);
+                self.external_change_pending_notification = true;
+                CleanActorExternalOutcome::DurablePending { batch_id, phase }
+            }
+        })
     }
 
     fn retain_outcome(&mut self, state: CleanLocalMutationState) -> CleanActorMutationOutcome {
@@ -11963,10 +12212,15 @@ impl RuntimeActor {
             .map_err(display)?;
         let move_episode_directory =
             open_dir_nofollow(&application_runtime_directory, "move-episodes").map_err(display)?;
+        let clean = CleanRuntimeActorCore::new(
+            runtime,
+            recovery == SyncRuntimeRecovery::CleanManifestReplay,
+        );
+        let last_watcher = clean.watcher_status();
         Ok(Self {
             graph,
             receipts,
-            clean: Some(CleanRuntimeActorCore::new(runtime)),
+            clean: Some(clean),
             authority: None,
             runtime: None,
             feed: None,
@@ -11988,7 +12242,7 @@ impl RuntimeActor {
             ),
             startup_recovery_diagnostics: None,
             recovery,
-            last_watcher: SyncWatcherStatus::default(),
+            last_watcher,
             last_tick: None,
             terminal: None,
             stopped_safe: false,
@@ -12301,6 +12555,17 @@ impl RuntimeActor {
     ) -> Result<(), SyncRuntimeRequestError> {
         if let Some(detail) = &self.terminal {
             return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
+        }
+        if self.clean.is_some() {
+            if observations.is_empty() {
+                return Ok(());
+            }
+            self.clean
+                .as_mut()
+                .expect("clean actor remains installed")
+                .observe(observations);
+            self.refresh_watcher();
+            return Ok(());
         }
         let mut retained = Vec::with_capacity(observations.len());
         for observation in observations {
@@ -19772,25 +20037,96 @@ impl RuntimeActor {
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
-        let Some(outcome) = self
+        let clean = self
             .clean
             .as_mut()
-            .expect("clean tick is routed only to a clean actor")
-            .retry_pending(&self.graph, &self.receipts)
-        else {
-            return SyncRuntimeTick::Idle;
-        };
-        match outcome {
-            CleanActorMutationOutcome::Durable(batch_id) => {
-                SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable { batch_id })
+            .expect("clean tick is routed only to a clean actor");
+        if let Some(outcome) = clean.retry_pending(&self.graph, &self.receipts) {
+            match outcome {
+                CleanActorMutationOutcome::Durable(batch_id)
+                    if !clean.external_change_pending_notification =>
+                {
+                    return SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable {
+                        batch_id,
+                    });
+                }
+                CleanActorMutationOutcome::Durable(_) => {
+                    // The externally authored manifest is now reflected in
+                    // SQLite and Markdown. Reconcile any observations that
+                    // queued behind it before acknowledging the watcher epoch.
+                }
+                CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
+                    self.refresh_watcher();
+                    return SyncRuntimeTick::LocalMutation(
+                        SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                            batch_id: Some(batch_id),
+                            phase: map_local_phase(phase),
+                        },
+                    );
+                }
             }
-            CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
+        }
+
+        let paths = {
+            let clean = self.clean.as_ref().expect("clean actor remains installed");
+            if !clean.watcher.pending() {
+                return SyncRuntimeTick::Idle;
+            }
+            if clean.watcher.full_scan {
+                clean.full_scan_changed_paths(&self.graph)
+            } else {
+                Ok(clean.watcher.exact.clone())
+            }
+        };
+        let paths = match paths {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.refresh_watcher();
+                return SyncRuntimeTick::Failed(format!(
+                    "clean external reconciliation failed during {:?}: {}",
+                    error.phase, error.detail
+                ));
+            }
+        };
+        let outcome = self
+            .clean
+            .as_mut()
+            .expect("clean actor remains installed")
+            .execute_external_paths(&self.graph, &self.receipts, &paths);
+        match outcome {
+            Ok(CleanActorExternalOutcome::Noop) => {
+                let clean = self.clean.as_mut().expect("clean actor remains installed");
+                let observable = std::mem::take(&mut clean.external_change_pending_notification);
+                let epoch = clean.watcher.settle();
+                self.refresh_watcher();
+                if observable {
+                    SyncRuntimeTick::AdmittedComplete { epoch }
+                } else {
+                    SyncRuntimeTick::AdmittedNoop { epoch }
+                }
+            }
+            Ok(CleanActorExternalOutcome::Durable(_)) => {
+                let clean = self.clean.as_mut().expect("clean actor remains installed");
+                clean.external_change_pending_notification = false;
+                let epoch = clean.watcher.settle();
+                self.refresh_watcher();
+                SyncRuntimeTick::AdmittedComplete { epoch }
+            }
+            Ok(CleanActorExternalOutcome::DurablePending { batch_id, phase }) => {
+                self.refresh_watcher();
                 SyncRuntimeTick::LocalMutation(
                     SyncLocalMutationOutcome::RetryableRetainedRecovery {
                         batch_id: Some(batch_id),
                         phase: map_local_phase(phase),
                     },
                 )
+            }
+            Err(error) => {
+                self.refresh_watcher();
+                SyncRuntimeTick::Failed(format!(
+                    "clean external reconciliation failed during {:?}: {}",
+                    error.phase, error.detail
+                ))
             }
         }
     }
@@ -22914,29 +23250,49 @@ impl RuntimeActor {
         }
         if self.clean.is_some() {
             for _ in 0..MAX_CLEAN_DRAIN_TURNS {
-                let Some(outcome) = self
+                let settled = self
                     .clean
-                    .as_mut()
-                    .expect("clean actor remains installed")
-                    .retry_pending(&self.graph, &self.receipts)
-                else {
+                    .as_ref()
+                    .is_some_and(|clean| clean.pending.is_none() && !clean.watcher.pending());
+                if settled {
                     self.stopped_safe = true;
                     return Ok(SyncShutdownOutcome::Safe(self.snapshot()));
-                };
-                if matches!(outcome, CleanActorMutationOutcome::Durable(_)) {
-                    continue;
+                }
+                match self.tick_clean_runtime() {
+                    SyncRuntimeTick::Idle
+                    | SyncRuntimeTick::AdmittedNoop { .. }
+                    | SyncRuntimeTick::AdmittedComplete { .. }
+                    | SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable {
+                        ..
+                    })
+                    | SyncRuntimeTick::LocalMutation(
+                        SyncLocalMutationOutcome::RetryableRetainedRecovery { .. },
+                    ) => {}
+                    SyncRuntimeTick::Failed(detail)
+                    | SyncRuntimeTick::Blocked(detail)
+                    | SyncRuntimeTick::RecoveryBlocked(detail)
+                    | SyncRuntimeTick::Terminal(detail) => {
+                        return Err(SyncRuntimeRequestError::ActorRefused(detail));
+                    }
+                    other => {
+                        return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                            "clean shutdown received unexpected runtime progress: {other:?}"
+                        )));
+                    }
                 }
             }
-            let pending = self
-                .clean
-                .as_ref()
-                .and_then(|clean| clean.pending.as_ref())
-                .expect("bounded clean shutdown stopped only with retained work");
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "clean shutdown awaits committed batch {} at {:?}",
-                pending.batch_id(),
-                pending.failure().phase()
-            )));
+            let clean = self.clean.as_ref().expect("clean actor remains installed");
+            let detail = clean.pending.as_ref().map_or_else(
+                || "clean shutdown awaits retained external reconciliation".to_owned(),
+                |pending| {
+                    format!(
+                        "clean shutdown awaits committed batch {} at {:?}",
+                        pending.batch_id(),
+                        pending.failure().phase()
+                    )
+                },
+            );
+            return Err(SyncRuntimeRequestError::ActorRefused(format!("{detail}")));
         }
         if self.local_mutation.is_some() {
             let outcome = self.advance_local_mutation_once();
@@ -23876,7 +24232,9 @@ impl RuntimeActor {
     }
 
     fn refresh_watcher(&mut self) {
-        if let Some(runtime) = &self.runtime {
+        if let Some(clean) = &self.clean {
+            self.last_watcher = clean.watcher_status();
+        } else if let Some(runtime) = &self.runtime {
             self.last_watcher = map_watcher(runtime.watcher_status());
         }
     }
@@ -41393,7 +41751,7 @@ mod tests {
             receipts,
             runtime,
         } = resources;
-        let mut actor = CleanRuntimeActorCore::new(runtime);
+        let mut actor = CleanRuntimeActorCore::new(runtime, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
             .runtime
@@ -41735,6 +42093,273 @@ mod tests {
             .contains(SAVED_RAW));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn public_clean_runtime_reconciles_an_exact_external_edit_and_reopens_it() {
+        const EXTERNAL: &str = "externally edited through the clean watcher";
+        let fixture = ActivationFixture::nested_unicode("clean-external-edit", 0xa17c);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        let page_id = match handle
+            .query(SyncRuntimeQueryRequest::ResolvePage {
+                path: "Root.md".into(),
+                name: "Root logical".into(),
+                page_kind: SyncPageKind::Page,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Page(Some(page)) => page.page_id,
+            other => panic!("clean Root.md resolution failed: {other:?}"),
+        };
+        fs::write(
+            fixture.graph_root.join("Root.md"),
+            format!("title:: Root logical\r\n\r\n- {EXTERNAL}\r\n"),
+        )
+        .unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            ticks
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::AdmittedComplete { .. })),
+            "clean external edit did not produce an observable admission: {ticks:?}"
+        );
+        let loaded = handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId {
+                    page_id: page_id.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            loaded,
+            SyncEditorLoadOutcome::Loaded { page }
+                if page.page_id == page_id && page.blocks[0].content == EXTERNAL
+        ));
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("external edit cold-reopens");
+        drive_initial_feed(&reopened);
+        let loaded = reopened
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId { page_id },
+            })
+            .unwrap();
+        assert!(matches!(
+            loaded,
+            SyncEditorLoadOutcome::Loaded { page } if page.blocks[0].content == EXTERNAL
+        ));
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn public_clean_cold_open_discovers_an_external_edit_while_tine_was_closed() {
+        const EXTERNAL: &str = "changed while the clean runtime was closed";
+        let fixture = ActivationFixture::nested_unicode("clean-cold-external", 0xa17d);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        let page_id = match handle
+            .query(SyncRuntimeQueryRequest::ResolvePage {
+                path: "Root.md".into(),
+                name: "Root logical".into(),
+                page_kind: SyncPageKind::Page,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Page(Some(page)) => page.page_id,
+            other => panic!("clean Root.md resolution failed: {other:?}"),
+        };
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        fs::write(
+            fixture.graph_root.join("Root.md"),
+            format!("title:: Root logical\n\n- {EXTERNAL}\n"),
+        )
+        .unwrap();
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("clean runtime cold-reopens");
+        assert!(
+            reopened
+                .status()
+                .unwrap()
+                .watcher
+                .pending_requires_full_scan
+        );
+        let ticks = drain_until_settled(&reopened);
+        assert!(
+            ticks
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::AdmittedComplete { .. })),
+            "cold-open scan did not admit the closed-session edit: {ticks:?}"
+        );
+        let loaded = reopened
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId { page_id },
+            })
+            .unwrap();
+        assert!(matches!(
+            loaded,
+            SyncEditorLoadOutcome::Loaded { page } if page.blocks[0].content == EXTERNAL
+        ));
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn public_clean_runtime_reconciles_external_create_delete_and_rename_as_one_batch() {
+        const OLD_PATH: &str = "Root.md";
+        const NEW_PATH: &str = "notes/Root renamed externally.md";
+        const DELETED_PATH: &str = "diary/nested/25-07-2026.org";
+        const CREATED_PATH: &str = "pages/Created externally.md";
+        let fixture = ActivationFixture::nested_unicode("clean-external-shapes", 0xa17e);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        let pages = match handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: 32,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages,
+            other => panic!("clean page inventory returned the wrong reply: {other:?}"),
+        };
+        let renamed_page_id = pages
+            .iter()
+            .find(|page| page.path == OLD_PATH)
+            .expect("fixture contains Root.md")
+            .page_id
+            .clone();
+        let deleted_page_id = pages
+            .iter()
+            .find(|page| page.path == DELETED_PATH)
+            .expect("fixture contains the journal page")
+            .page_id
+            .clone();
+        let original_block_key = match handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId {
+                    page_id: renamed_page_id.clone(),
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::Loaded { page } => page.blocks[0].key.clone(),
+            other => panic!("Root.md did not load before rename: {other:?}"),
+        };
+
+        fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+        fs::write(
+            fixture.graph_root.join(CREATED_PATH),
+            b"- Created by an external application\n",
+        )
+        .unwrap();
+        fs::rename(
+            fixture.graph_root.join(OLD_PATH),
+            fixture.graph_root.join(NEW_PATH),
+        )
+        .unwrap();
+        fs::remove_file(fixture.graph_root.join(DELETED_PATH)).unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(CREATED_PATH).unwrap(),
+                SyncWatcherObservation::managed_path(DELETED_PATH).unwrap(),
+                SyncWatcherObservation::managed_path(NEW_PATH).unwrap(),
+                SyncWatcherObservation::managed_path(OLD_PATH).unwrap(),
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            ticks
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::AdmittedComplete { .. })),
+            "external create/delete/rename did not commit: {ticks:?}"
+        );
+        let pages = match handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: 32,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages,
+            other => panic!("clean page inventory returned the wrong reply: {other:?}"),
+        };
+        assert!(pages.iter().any(|page| page.path == CREATED_PATH));
+        assert!(!pages.iter().any(|page| page.path == OLD_PATH));
+        assert!(!pages.iter().any(|page| page.path == DELETED_PATH));
+        assert!(pages
+            .iter()
+            .any(|page| page.path == NEW_PATH && page.page_id == renamed_page_id));
+        let renamed = handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId {
+                    page_id: renamed_page_id.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            renamed,
+            SyncEditorLoadOutcome::Loaded { page }
+                if page.path == NEW_PATH && page.blocks[0].key == original_block_key
+        ));
+        assert!(matches!(
+            handle
+                .load_editor_page(SyncEditorLoadRequest {
+                    page: SyncEditorPageSelector::PageId {
+                        page_id: deleted_page_id,
+                    },
+                })
+                .unwrap(),
+            SyncEditorLoadOutcome::MissingPage
+        ));
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("shape batch cold-reopens");
+        drive_initial_feed(&reopened);
+        let renamed = reopened
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId {
+                    page_id: renamed_page_id,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            renamed,
+            SyncEditorLoadOutcome::Loaded { page }
+                if page.path == NEW_PATH && page.blocks[0].key == original_block_key
+        ));
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }

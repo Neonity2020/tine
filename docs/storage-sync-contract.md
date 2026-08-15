@@ -13,11 +13,13 @@ definition-free compatibility surface in
 literal. Format/schema constants remain beside their codecs and are likewise
 certified through `tine_storage::formats`.
 
-[ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the accepted next
-activation format. Until its production-switch gates pass, the layout and
-lifecycle below describe the current multipart-bootstrap runtime; acceptance
-of the ADR alone does not make partially implemented genesis artifacts
-authoritative. The exact removal/replacement ledger is
+[ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the production
+activation format for a graph with no legacy enrollment. Existing legacy
+enrollments still open through the multipart-bootstrap runtime while its final
+deletion is in progress; no new activation creates that format. A partially
+implemented genesis artifact is never authoritative: only the final clean
+activation marker selects the baseline-plus-manifest runtime. The exact
+removal/replacement ledger is
 [managed-activation-authority-census.md](managed-activation-authority-census.md).
 Every constructed lazy-genesis candidate nevertheless carries the exact causal
 `DocumentDependencies` for its catalog and page checkpoints. Installing that
@@ -242,7 +244,7 @@ fallback.
    exact immutable collisions or inconsistent stable cuts block. A retry
    resumes from durable observations rather than inventing state.
 
-### 2.4 Next-generation lazy activation boundary (inactive until cutover)
+### 2.4 Lazy activation and clean runtime boundary
 
 The accepted next activation generation has one authority-changing record:
 **one final lazy-genesis authority marker**. The Tauri binding records opt-in
@@ -292,6 +294,27 @@ commit SQLite at `F+1`. A crash after the durable append leaves a stale
 projection which is replayed/rebuilt. A SQLite failure after the append does
 not turn the accepted edit into a retryable save or permit a duplicate write.
 SQLite must never publish `F+1` before semantic history does.
+
+For a valid clean marker, the immutable baseline plus committed ordinary
+manifests is the complete semantic authority. The runtime reconstructs any
+current projection-head map in process memory from those manifests; it neither
+opens nor updates a persistent projection-work index. SQLite owns current exact
+path identity. External reconciliation reads the affected path owners from the
+frontier-matched SQLite projection, reproves the corresponding baseline or
+latest-manifest bytes against the engine, and then uses the same structural
+page/block matcher as the established importer. It must not ask a native
+Patricia path index to duplicate SQLite ownership.
+
+An exact watcher callback queues only the named managed paths. An imprecise
+callback, and every cold open of a clean marker, queues one full comparison of
+current Markdown/Org paths, SQLite paths, and released paths named by accepted
+manifests. Equal bytes acknowledge the watcher epoch without an operation;
+changed, created, deleted, and jointly observed renamed paths become one
+external-reconciliation operation. A manifest-committed operation whose SQLite
+or Markdown derivative is interrupted retains one affine continuation. The
+watcher epoch remains unacknowledged until that continuation and any
+observations queued behind it are reconciled, and clean shutdown drains this
+work before reporting `StoppedSafe`.
 
 SQLite schema 20 provides the physical replacement for all four native
 identity-index families. Page-name and portable-path rows contain one complete,

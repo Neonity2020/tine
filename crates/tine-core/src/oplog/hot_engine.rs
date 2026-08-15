@@ -3499,6 +3499,27 @@ struct CapabilityCapturedPriorProjection {
     pub(crate) correlated_authority: Option<CorrelatedProjectionImportBase>,
 }
 
+/// Exact current graph-projection predecessor for the clean
+/// baseline-plus-manifest runtime.  The value is reconstructed from immutable
+/// authority on demand; it is deliberately not a second persistent path
+/// index.  External reconciliation consumes it to preserve the established
+/// page/block matching semantics without reopening `ProjectionWorkIndex`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CleanImportProjectionPredecessor {
+    Present {
+        page: MaterializedPage,
+        bytes: Vec<u8>,
+        intent: ProjectionIntent,
+        completion: ProjectionCompletion,
+        from_baseline: bool,
+    },
+    Released {
+        prior_page_id: PageId,
+        intent: ProjectionIntent,
+        completion: ProjectionCompletion,
+    },
+}
+
 impl CapabilityCapturedPriorProjection {
     fn validate_authority(&self) -> Result<(), EngineError> {
         match (
@@ -8331,7 +8352,7 @@ impl ShardedHotEngine {
     /// archive commit. Callers must not expose the speculative state until the
     /// method succeeds. If publication fails, the engine is poisoned and must
     /// be discarded; cold open reconstructs the last manifest-committed state.
-    pub(crate) fn commit_clean_local_prepared(
+    pub(crate) fn commit_clean_prepared(
         &mut self,
         prepared: &PreparedBatch,
     ) -> Result<StageOutcome, EngineError> {
@@ -8339,10 +8360,13 @@ impl ShardedHotEngine {
             || self.scratch.is_some()
             || self.history_store.is_some()
             || self.has_native_semantic_index_stores()
-            || prepared.manifest().origin() != BatchOrigin::LocalMutation
+            || !matches!(
+                prepared.manifest().origin(),
+                BatchOrigin::LocalMutation | BatchOrigin::ExternalReconciliation { .. }
+            )
         {
             return Err(EngineError::Archive(
-                "clean local commit requires an index-free baseline runtime and a local mutation"
+                "clean commit requires an index-free baseline runtime and an ordinary local or external mutation"
                     .into(),
             ));
         }
@@ -8356,7 +8380,7 @@ impl ShardedHotEngine {
             .is_some()
         {
             return Err(EngineError::Archive(format!(
-                "clean local batch {} is already manifest-committed",
+                "clean batch {} is already manifest-committed",
                 prepared.manifest().batch_id()
             )));
         }
@@ -8370,7 +8394,7 @@ impl ShardedHotEngine {
             return match outcome.disposition() {
                 BatchDisposition::Rejected { error } => Err(error),
                 other => Err(EngineError::Archive(format!(
-                    "clean local candidate {} did not validate as one accepted operation: {other:?}",
+                    "clean candidate {} did not validate as one accepted operation: {other:?}",
                     prepared.manifest().batch_id()
                 ))),
             };
@@ -8480,6 +8504,92 @@ impl ShardedHotEngine {
 
     pub(crate) fn require_index_free_clean_projection_runtime(&self) -> Result<(), EngineError> {
         self.clean_projection_runtime_binding().map(|_| ())
+    }
+
+    /// Reconstruct the exact current projection predecessor required by a
+    /// clean-runtime external import.  Present baseline pages come directly
+    /// from the immutable lazy-genesis capsule; later present or released
+    /// paths come from the latest accepted manifest selected by the run-local
+    /// head map rebuilt during open.
+    pub(crate) fn clean_import_projection_predecessor(
+        &self,
+        path: &ManagedPath,
+        sqlite_owner: Option<PageId>,
+    ) -> Result<Option<CleanImportProjectionPredecessor>, EngineError> {
+        self.require_index_free_clean_projection_runtime()?;
+        match sqlite_owner {
+            Some(page_id) => {
+                let current = self.authorize_projection_write(page_id)?;
+                if current.state().page.path != *path {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean SQLite path owner for {path} differs from its materialized page"
+                    )));
+                }
+                let (prior, from_baseline) = if let Some(prior) =
+                    self.clean_manifest_projection_predecessor(path, page_id, current.state())?
+                {
+                    (prior, false)
+                } else {
+                    let prior = self
+                        .lazy_genesis_projection_predecessor(path, page_id, current.state())?
+                        .ok_or_else(|| {
+                            EngineError::ProjectionManifest(format!(
+                                "clean import has no baseline or manifest predecessor for {path}"
+                            ))
+                        })?;
+                    (prior, true)
+                };
+                prior.validate_authority()?;
+                let completion = ProjectionCompletion::for_intent(&prior.intent, &prior.bytes)
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                Ok(Some(CleanImportProjectionPredecessor::Present {
+                    page: current.state().page.clone(),
+                    bytes: prior.bytes,
+                    intent: prior.intent,
+                    completion,
+                    from_baseline,
+                }))
+            }
+            None => {
+                let Some(work) = self.clean_projection_heads.get(path) else {
+                    return Ok(None);
+                };
+                if work.path() != path {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean released path {path} differs from its accepted manifest head"
+                    )));
+                }
+                if !matches!(work.target(), ProjectionWorkTarget::Absent) {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean SQLite has no owner for present manifest path {path}"
+                    )));
+                }
+                let (archive, _) = self.clean_projection_runtime_binding()?;
+                let decoded = super::projection::decode_manifested_projection_work(&archive, work)
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                if decoded.target_bytes().is_some() {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean released path {path} has a present manifested target"
+                    )));
+                }
+                let intent = decoded.receiver_local_intent().clone();
+                if intent.page_id() != work.page_id()
+                    || intent.path() != path
+                    || intent.target() != BlobDescription::of(&[])
+                {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean released path {path} has a mismatched manifested intent"
+                    )));
+                }
+                let completion = ProjectionCompletion::for_intent(&intent, &[])
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                Ok(Some(CleanImportProjectionPredecessor::Released {
+                    prior_page_id: work.page_id(),
+                    intent,
+                    completion,
+                }))
+            }
+        }
     }
 
     fn has_native_semantic_index_stores(&self) -> bool {
@@ -17948,7 +18058,7 @@ impl ShardedHotEngine {
             } else {
                 None
             };
-            let correlated_prior = if external {
+            let correlated_prior = if external && work_index.is_some() {
                 roles
                     .semantic_predecessor
                     .and_then(|requirement_index| {
@@ -20657,6 +20767,14 @@ impl ShardedHotEngine {
         Ok(self.clean_projection_heads.values().cloned().collect())
     }
 
+    /// Exact paths mentioned by the accepted clean tail.  This is a bounded
+    /// copy of the run-local manifest-derived head map, used only to include
+    /// released paths in a cold-open graph comparison.
+    pub(crate) fn clean_manifest_projection_paths(&self) -> Result<Vec<ManagedPath>, EngineError> {
+        self.clean_projection_runtime_binding()?;
+        Ok(self.clean_projection_heads.keys().cloned().collect())
+    }
+
     /// Authorize one clean-runtime projection directly from the immutable
     /// accepted manifest and the disposable SQLite current-state projection.
     /// This deliberately has no persistent Ready/Completed/Superseded state:
@@ -21260,25 +21378,29 @@ impl ShardedHotEngine {
             }
         }
         if accepted_heads == 0 {
-            // A clean activation baseline is semantic authority without a
-            // fabricated bootstrap operation. Its page/catalog frontier has
-            // no direct batch heads by construction, so the legacy
-            // "at least one accepted head" rule cannot authorize its initial
-            // exact projection. Prove the complete requested frontier against
-            // the marker-bound immutable baseline instead.
-            let baseline_root = &self.accepted_frontier_root;
-            let baseline_is_exact = baseline_root.acceptance_sequence() == 0
-                && baseline_root.genesis().is_some()
-                && self.lazy_genesis.as_ref().is_some_and(|baseline| {
-                    accepted_frontier_root_for_lazy_genesis(baseline)
-                        .is_ok_and(|root| root == *baseline_root)
+            // A clean baseline is semantic authority without fabricated
+            // bootstrap operations. An untouched page therefore still has no
+            // direct batch heads after unrelated tail operations have advanced
+            // the graph-wide frontier. Prove each requested document against
+            // both the immutable baseline and the current accepted frontier;
+            // requiring the *whole* frontier to remain at sequence zero would
+            // make every untouched page unauthorizable after the first edit.
+            let baseline_is_exact = self.lazy_genesis.as_ref().is_some_and(|baseline| {
+                accepted_frontier_root_for_lazy_genesis(baseline).is_ok_and(|baseline_root| {
+                    state.frontier.documents().iter().all(|document| {
+                        document.direct_dependency_heads().is_empty()
+                            && self
+                                .accepted_frontier_document(&baseline_root, document.document_id())
+                                .is_ok_and(|accepted| accepted.as_ref() == Some(document))
+                            && self
+                                .accepted_frontier_document(
+                                    &self.accepted_frontier_root,
+                                    document.document_id(),
+                                )
+                                .is_ok_and(|accepted| accepted.as_ref() == Some(document))
+                    })
                 })
-                && state.frontier.documents().iter().all(|document| {
-                    document.direct_dependency_heads().is_empty()
-                        && self
-                            .accepted_frontier_document(baseline_root, document.document_id())
-                            .is_ok_and(|accepted| accepted.as_ref() == Some(document))
-                });
+            });
             if !baseline_is_exact {
                 return Err(EngineError::ProjectionAuthorizationUnavailable);
             }

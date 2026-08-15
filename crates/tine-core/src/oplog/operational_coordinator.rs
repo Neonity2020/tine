@@ -16,7 +16,7 @@ use crate::Graph;
 
 use super::enrollment::{EnrollmentError, VerifiedLocalCompositionError};
 use super::hot_engine::{EngineError, LocalAuthorCapture, ReconciliationNeeded};
-use super::import::plan_affected_import_with_bootstrap;
+use super::import::{plan_affected_import_with_bootstrap, plan_clean_affected_import};
 use super::local_active::{
     CleanRuntimeSession, LocalRuntimeAdmission, PromotedRuntimeSession, RuntimePromotionError,
     RuntimeRevocation, WorkspaceAuthorityBoundary, WorkspaceAuthorityRefusal,
@@ -1320,6 +1320,12 @@ pub(crate) enum CleanLocalMutationState {
     DurablePending(CleanPublishedContinuation),
 }
 
+pub(crate) enum CleanExternalMutationState {
+    Noop,
+    Complete(BatchId),
+    DurablePending(CleanPublishedContinuation),
+}
+
 pub(crate) struct CleanPublishedContinuation {
     guard: PublishedHandoffLatch,
     batch_id: BatchId,
@@ -1413,7 +1419,7 @@ impl OperationalCoordinator {
             )
         })?;
         let published = guard.into_published_latch();
-        let outcome = match engine.commit_clean_local_prepared(&prepared) {
+        let outcome = match engine.commit_clean_prepared(&prepared) {
             Ok(outcome) => outcome,
             Err(error) => {
                 let failure = OperationalCoordinatorError::new(
@@ -1488,6 +1494,160 @@ impl OperationalCoordinator {
             Err(error) => {
                 continuation.failure = error;
                 CleanLocalMutationState::DurablePending(continuation)
+            }
+        }
+    }
+
+    /// Reconcile exact externally changed graph paths through the clean
+    /// baseline-plus-manifest authority.  Planning reuses the established
+    /// structural matcher, but its predecessor evidence is reconstructed from
+    /// the lazy-genesis baseline and accepted manifests rather than the
+    /// persistent Patricia work index.
+    pub(crate) fn execute_clean_external(
+        session: &mut CleanRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        requested_paths: &[&str],
+    ) -> Result<CleanExternalMutationState, OperationalCoordinatorError> {
+        let (admission, engine, database) = session.parts().map_err(|refusal| {
+            OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+        })?;
+        authorize_coordinator(&admission, graph, engine)?;
+        let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Bindings,
+                "clean engine has no projection endpoint",
+            )
+        })?;
+        verify_projection_bindings(graph, receipts, engine, endpoint)?;
+        let archive = engine.archive_store_capability().ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::ArchiveStage,
+                "clean runtime has no retained operation archive",
+            )
+        })?;
+        let handoff = graph
+            .mint_handoff_safe(engine.workspace_id(), endpoint)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+            })?;
+        handoff
+            .verify_binding(graph, engine.workspace_id(), endpoint)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+            })?;
+        let plan = plan_clean_affected_import(graph, engine, database, requested_paths);
+        match plan.status() {
+            ImportPlanStatus::Noop => {
+                handoff.cancel();
+                return Ok(CleanExternalMutationState::Noop);
+            }
+            ImportPlanStatus::Blocked => {
+                handoff.cancel();
+                let detail = plan
+                    .blocks()
+                    .first()
+                    .map(|blocked| blocked.detail.clone())
+                    .unwrap_or_else(|| "clean external reconciliation was blocked".into());
+                return Err(OperationalCoordinatorError::new(
+                    OperationalPhase::Planning,
+                    detail,
+                ));
+            }
+            ImportPlanStatus::Reconcile => {}
+        }
+        let guard = handoff.into_publisher_guard();
+        guard
+            .verify_binding(graph, engine.workspace_id(), endpoint)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+            })?;
+        let material = plan.into_execution_material().map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Planning, error.to_string())
+        })?;
+        let import_id = material.import_id();
+        let (author, draft) =
+            draft_with_bounded_peer_candidates(engine, endpoint, &material, |attempt| {
+                CrdtPeerId::external_import_candidate(engine.workspace_id(), import_id, attempt)
+            })?;
+        let captured = engine
+            .capture_external_author_transaction(draft, graph, receipts, endpoint, None)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Capture, error.to_string())
+            })?;
+        let prepared = engine
+            .finalize_captured_author_transaction(captured, receipts)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Finalize, error.to_string())
+            })?;
+        if prepared.manifest().batch_id() != author.batch_id
+            || prepared.manifest().origin() != (BatchOrigin::ExternalReconciliation { import_id })
+        {
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::Finalize,
+                "clean external batch lost its import identity",
+            ));
+        }
+        let identity = database
+            .preflight_prepared_identity_transition(engine, &prepared)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Finalize, error.to_string())
+            })?;
+        reprove_workspace_authority(
+            &admission,
+            WorkspaceAuthorityBoundary::Publication,
+            OperationalPhase::Publication,
+        )?;
+        let published = guard.into_published_latch();
+        let batch_id = author.batch_id;
+        let outcome = match engine.commit_clean_prepared(&prepared) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let failure = OperationalCoordinatorError::new(
+                    OperationalPhase::Publication,
+                    error.to_string(),
+                );
+                if matches!(archive.inspect_batch(batch_id), Ok(BatchInspection::Absent)) {
+                    published.cancel_prepublication();
+                    return Err(failure);
+                }
+                return Ok(CleanExternalMutationState::DurablePending(
+                    CleanPublishedContinuation {
+                        guard: published,
+                        batch_id,
+                        identity,
+                        failure,
+                    },
+                ));
+            }
+        };
+        if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::ArchiveStage,
+                "clean external manifest did not leave one accepted operation",
+            ));
+        }
+        let mut continuation = CleanPublishedContinuation {
+            guard: published,
+            batch_id,
+            identity,
+            failure: OperationalCoordinatorError::new(
+                OperationalPhase::SqliteDrain,
+                "durable clean external operation is awaiting derived-state application",
+            ),
+        };
+        if let Err(error) = fault(OperationalFaultPoint::AfterManifest) {
+            continuation.failure = error;
+            return Ok(CleanExternalMutationState::DurablePending(continuation));
+        }
+        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+            Ok(()) => {
+                continuation.guard.complete();
+                Ok(CleanExternalMutationState::Complete(batch_id))
+            }
+            Err(error) => {
+                continuation.failure = error;
+                Ok(CleanExternalMutationState::DurablePending(continuation))
             }
         }
     }

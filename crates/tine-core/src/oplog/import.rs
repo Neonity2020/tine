@@ -1,7 +1,9 @@
 //! Exact, read-only external inventory and conservative identity matching.
 //!
 //! This module plans reconciliation only. It does not publish semantic
-//! operations, write a graph, consult SQLite, or activate managed sync.
+//! operations, write a graph, or activate managed sync. The clean runtime
+//! reads its disposable SQLite path ownership instead of recreating a native
+//! path index beside SQLite.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -37,9 +39,10 @@ use super::external_import::{
     ExternalImportObservationMaterialError, ExternalImportObservationState,
 };
 use super::hot_engine::{
-    AcceptedFrontierRoot, AuthorBatch, DetachedBootstrapAcceptedEngineMaterial,
-    DetachedBootstrapAuthoringSession, DetachedBootstrapCandidate, DetachedBootstrapReplayIdentity,
-    LazyGenesisCheckpointBuilder, ProjectionStorageBinding, MAX_TRANSACTION_OPERATIONS,
+    AcceptedFrontierRoot, AuthorBatch, CleanImportProjectionPredecessor,
+    DetachedBootstrapAcceptedEngineMaterial, DetachedBootstrapAuthoringSession,
+    DetachedBootstrapCandidate, DetachedBootstrapReplayIdentity, LazyGenesisCheckpointBuilder,
+    ProjectionStorageBinding, MAX_TRANSACTION_OPERATIONS,
 };
 use super::identity::BootstrapPartId;
 use super::lazy_genesis::{
@@ -63,8 +66,8 @@ use super::{
     ManagedTextKind, ObjectKind, OperationBatch, OperationObject, OperationTransaction, PageId,
     ProjectionCompletedReceipt, ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore,
     ProjectionStoreError, ProjectionWorkId, ProjectionWorkTarget, ReferenceCatalogPolicyV1,
-    SemanticOperation, SessionId, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
-    DIFF_SCHEMA_VERSION,
+    SemanticOperation, SessionId, ShardedHotEngine, SqliteFrontier, StructuralLocator,
+    StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
 };
 use crate::model::{
     path_is_sync_conflict, resolve_external_document_identity, AcceptedExternalDocumentIdentity,
@@ -6012,6 +6015,8 @@ struct AffectedReceiptEntry {
 enum ReceiptBaseSource {
     Completed,
     Bootstrap,
+    CleanBaseline,
+    CleanManifest,
     CorrelatedBlocked {
         work_id: ProjectionWorkId,
         observed: BlobDescription,
@@ -6513,6 +6518,101 @@ pub fn plan_affected_import(
     plan_affected_import_with_bootstrap(graph, receipts, engine, None, requested_paths)
 }
 
+/// Plan one exact external reconciliation against the clean
+/// baseline-plus-manifest runtime.  This preserves the established structural
+/// page/block matcher, but obtains every predecessor from the immutable clean
+/// baseline or accepted manifests rather than the persistent Patricia
+/// `ProjectionWorkIndex` and completed-receipt catalog.
+pub(crate) fn plan_clean_affected_import(
+    graph: &Graph,
+    engine: &ShardedHotEngine,
+    database: &SqliteFrontier,
+    requested_paths: &[&str],
+) -> ImportPlan {
+    let mut instrumentation = ImportInstrumentation {
+        requested_paths: requested_paths.len(),
+        ..ImportInstrumentation::default()
+    };
+    let paths = match parse_requested_paths(requested_paths) {
+        Ok(paths) => paths,
+        Err(error) => return blocked_inventory_error(error, instrumentation),
+    };
+    instrumentation.path_bytes = paths.iter().map(|path| path.as_str().len() as u64).sum();
+    let accepted_frontier = match engine.accepted_frontier_root() {
+        Ok(root) => root,
+        Err(error) => {
+            return blocked_authority_error(
+                None,
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    None,
+                    error.to_string(),
+                ),
+                instrumentation,
+            )
+        }
+    };
+    let (inventory, inventory_fingerprints, first_raw_bytes) =
+        match capture_inventory(graph, &paths, true, 0, &mut instrumentation) {
+            Ok((Some(inventory), fingerprints, raw_bytes)) => (inventory, fingerprints, raw_bytes),
+            Ok((None, _, _)) => unreachable!("retaining capture returns inventory"),
+            Err(error) => return blocked_inventory_error(error, instrumentation),
+        };
+    let (scope, predecessor_authority) = match capture_clean_import_scope(
+        graph,
+        engine,
+        database,
+        &paths,
+        &inventory,
+        &mut instrumentation,
+    ) {
+        Ok(scope) => scope,
+        Err(block) => return blocked_authority_error(Some(inventory), block, instrumentation),
+    };
+    snapshot_revalidation_hook();
+    let (_, second_fingerprints, _) =
+        match capture_inventory(graph, &paths, false, first_raw_bytes, &mut instrumentation) {
+            Ok(capture) => capture,
+            Err(error) => {
+                return blocked_authority_error(
+                    Some(inventory),
+                    authority_block(ImportBlockReason::StaleScope, None, error.to_string()),
+                    instrumentation,
+                )
+            }
+        };
+    let post_predecessor_authority =
+        match clean_import_predecessor_authority(engine, database, &paths) {
+            Ok(authority) => authority,
+            Err(block) => return blocked_authority_error(Some(inventory), block, instrumentation),
+        };
+    let post_frontier = match post_snapshot_frontier(engine) {
+        Ok(root) => root,
+        Err(error) => {
+            return blocked_authority_error(
+                Some(inventory),
+                authority_block(ImportBlockReason::StaleScope, None, error.to_string()),
+                instrumentation,
+            )
+        }
+    };
+    if inventory_fingerprints != second_fingerprints
+        || predecessor_authority != post_predecessor_authority
+        || accepted_frontier != post_frontier
+    {
+        return blocked_authority_error(
+            Some(inventory),
+            authority_block(
+                ImportBlockReason::StaleScope,
+                None,
+                "inventory, clean manifest predecessor, or accepted frontier changed between snapshot passes",
+            ),
+            instrumentation,
+        );
+    }
+    plan_import(graph, inventory, scope, engine, instrumentation)
+}
+
 pub(crate) fn plan_affected_import_with_bootstrap(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
@@ -6753,6 +6853,298 @@ fn capture_inventory(
     }
     let inventory = entries.map(RawInventory::from_entries).transpose()?;
     Ok((inventory, fingerprints, raw_bytes))
+}
+
+fn clean_sqlite_path_owner(
+    database: &SqliteFrontier,
+    path: &ManagedPath,
+) -> Result<Option<PageId>, ImportBlock> {
+    let read = database.materialized_read().map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            Some(path),
+            format!("clean SQLite path authority is unavailable: {error}"),
+        )
+    })?;
+    let owners = read.pages_by_path(path, 2).map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            Some(path),
+            format!("clean SQLite path lookup failed: {error}"),
+        )
+    })?;
+    match owners.as_slice() {
+        [] => Ok(None),
+        [owner] => Ok(Some(owner.page_id)),
+        _ => Err(authority_block(
+            ImportBlockReason::CorruptBase,
+            Some(path),
+            "clean SQLite contains more than one exact path owner",
+        )),
+    }
+}
+
+fn clean_import_predecessor_authority(
+    engine: &ShardedHotEngine,
+    database: &SqliteFrontier,
+    paths: &[ManagedPath],
+) -> Result<CatalogAuthority, ImportBlock> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tine/clean-import-predecessor-snapshot/v1\0");
+    for path in paths {
+        hasher.update((path.as_str().len() as u64).to_be_bytes());
+        hasher.update(path.as_str().as_bytes());
+        let sqlite_owner = clean_sqlite_path_owner(database, path)?;
+        let predecessor = engine
+            .clean_import_projection_predecessor(path, sqlite_owner)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    Some(path),
+                    format!("clean projection predecessor is unavailable: {error}"),
+                )
+            })?;
+        match predecessor {
+            None => hasher.update(b"unowned\0"),
+            Some(CleanImportProjectionPredecessor::Present {
+                page,
+                bytes,
+                intent,
+                completion,
+                from_baseline,
+            }) => {
+                hasher.update(if from_baseline {
+                    b"baseline-present\0".as_slice()
+                } else {
+                    b"manifest-present\0".as_slice()
+                });
+                hasher.update(page.page_id.as_uuid().as_bytes());
+                hasher.update(BlobDescription::of(&bytes).sha256());
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                let intent = intent.encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                let completion = completion.encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                hasher.update((intent.len() as u64).to_be_bytes());
+                hasher.update(intent);
+                hasher.update((completion.len() as u64).to_be_bytes());
+                hasher.update(completion);
+            }
+            Some(CleanImportProjectionPredecessor::Released {
+                prior_page_id,
+                intent,
+                completion,
+            }) => {
+                hasher.update(b"manifest-released\0");
+                hasher.update(prior_page_id.as_uuid().as_bytes());
+                let intent = intent.encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                let completion = completion.encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                hasher.update((intent.len() as u64).to_be_bytes());
+                hasher.update(intent);
+                hasher.update((completion.len() as u64).to_be_bytes());
+                hasher.update(completion);
+            }
+        }
+    }
+    Ok(CatalogAuthority {
+        digest: ContentDigest::from_bytes(hasher.finalize().into()),
+    })
+}
+
+fn capture_clean_import_scope(
+    graph: &Graph,
+    engine: &ShardedHotEngine,
+    database: &SqliteFrontier,
+    requested_paths: &[ManagedPath],
+    inventory: &RawInventory,
+    instrumentation: &mut ImportInstrumentation,
+) -> Result<(ImportScopeSnapshot, CatalogAuthority), ImportBlock> {
+    let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            "clean import authority has no projection endpoint",
+        )
+    })?;
+    if graph.canonical_resource_id().map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            error.to_string(),
+        )
+    })? != endpoint.graph_resource_id()
+        || engine
+            .require_index_free_clean_projection_runtime()
+            .is_err()
+    {
+        return Err(authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            "graph or clean index-free engine binding differs",
+        ));
+    }
+
+    let mut paths = BTreeMap::new();
+    let mut path_identities = BTreeMap::new();
+    for path in requested_paths {
+        let entry = graph
+            .managed_entry_for_managed_path(path)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::UnsafeInput,
+                    Some(path),
+                    format!("managed path cannot be decoded with Graph loading semantics: {error}"),
+                )
+            })?;
+        let decoded_name = LogicalPageName::parse(entry.name).map_err(|error| {
+            authority_block(
+                ImportBlockReason::UnsafeInput,
+                Some(path),
+                format!("managed path has an invalid logical page name: {error}"),
+            )
+        })?;
+        let decoded_kind = match entry.kind {
+            PageKind::Page => ManagedTextKind::Page,
+            PageKind::Journal => ManagedTextKind::Journal,
+        };
+        instrumentation.catalog_path_lookups =
+            instrumentation.catalog_path_lookups.saturating_add(1);
+        let sqlite_owner = clean_sqlite_path_owner(database, path)?;
+        match engine
+            .clean_import_projection_predecessor(path, sqlite_owner)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    Some(path),
+                    format!("clean projection predecessor is unavailable: {error}"),
+                )
+            })? {
+            None => {
+                path_identities.insert(
+                    path.clone(),
+                    ImportedPathIdentity {
+                        name: decoded_name,
+                        kind: decoded_kind,
+                    },
+                );
+                paths.insert(path.clone(), ScopedPathEvidence::New);
+            }
+            Some(CleanImportProjectionPredecessor::Released {
+                prior_page_id: _,
+                intent,
+                completion,
+            }) => {
+                completion.validate_against(&intent).map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                path_identities.insert(
+                    path.clone(),
+                    ImportedPathIdentity {
+                        name: decoded_name,
+                        kind: decoded_kind,
+                    },
+                );
+                paths.insert(
+                    path.clone(),
+                    ScopedPathEvidence::Released(completion.logical_completion_id()),
+                );
+            }
+            Some(CleanImportProjectionPredecessor::Present {
+                page,
+                bytes,
+                intent,
+                completion,
+                from_baseline,
+            }) => {
+                completion.validate_against(&intent).map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                if intent.workspace_id() != engine.workspace_id()
+                    || intent.page_id() != page.page_id
+                    || intent.path() != path
+                    || intent.target() != BlobDescription::of(&bytes)
+                    || page.path != *path
+                {
+                    return Err(authority_block(
+                        ImportBlockReason::ConflictingLocalTail,
+                        Some(path),
+                        "clean projection predecessor differs from current accepted page",
+                    ));
+                }
+                instrumentation.catalog_entries = instrumentation.catalog_entries.saturating_add(1);
+                instrumentation.catalog_bytes_hashed = instrumentation
+                    .catalog_bytes_hashed
+                    .saturating_add(bytes.len() as u64);
+                path_identities.insert(
+                    path.clone(),
+                    ImportedPathIdentity {
+                        name: page.name.clone(),
+                        kind: page.kind,
+                    },
+                );
+                paths.insert(
+                    path.clone(),
+                    ScopedPathEvidence::Existing(ReceiptBackedPage {
+                        replayed_target: ExactBytes::from_description(bytes, intent.target()),
+                        page,
+                        source: if from_baseline {
+                            ReceiptBaseSource::CleanBaseline
+                        } else {
+                            ReceiptBaseSource::CleanManifest
+                        },
+                        intent,
+                        completion,
+                    }),
+                );
+            }
+        }
+    }
+    if paths.len() != inventory.entries().len() {
+        return Err(authority_block(
+            ImportBlockReason::StaleScope,
+            None,
+            "clean predecessor and retained inventory path sets differ",
+        ));
+    }
+    let authority = clean_import_predecessor_authority(engine, database, requested_paths)?;
+    Ok((
+        ImportScopeSnapshot {
+            workspace_id: engine.workspace_id(),
+            paths,
+            path_identities,
+        },
+        authority,
+    ))
 }
 
 /// Capture only the durable receipts reachable from the enrolled completed-work
@@ -7219,7 +7611,10 @@ fn capture_affected_catalog(
                     hasher.update(observed.byte_length().to_be_bytes());
                 }
                 ReceiptBaseSource::CorrelatedReady { .. } => hasher.update(b"ready\0"),
-                ReceiptBaseSource::Completed | ReceiptBaseSource::Bootstrap => unreachable!(),
+                ReceiptBaseSource::Completed
+                | ReceiptBaseSource::Bootstrap
+                | ReceiptBaseSource::CleanBaseline
+                | ReceiptBaseSource::CleanManifest => unreachable!(),
             }
             hasher.update((intent_bytes.len() as u64).to_be_bytes());
             hasher.update(intent_bytes);
@@ -13305,7 +13700,7 @@ mod tests {
             .preflight_prepared_identity_transition(&rebuilt_engine, &delete_prepared)
             .unwrap();
         rebuilt_engine
-            .commit_clean_local_prepared(&delete_prepared)
+            .commit_clean_prepared(&delete_prepared)
             .unwrap();
         let delete_event =
             AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, delete_batch)
@@ -15436,6 +15831,35 @@ mod tests {
         assert!(identities
             .get(&duplicate_block.block_id.to_string())
             .is_none());
+    }
+
+    #[test]
+    fn clean_external_planning_uses_sqlite_path_ownership_without_a_native_index() {
+        let source = include_str!("import.rs");
+        let entry = source
+            .split_once("pub(crate) fn plan_clean_affected_import(")
+            .and_then(|(_, tail)| {
+                tail.split_once("pub(crate) fn plan_affected_import_with_bootstrap(")
+            })
+            .map(|(body, _)| body)
+            .expect("clean external planner must remain identifiable");
+        assert!(entry.contains("database: &SqliteFrontier"));
+        assert!(entry.contains("capture_clean_import_scope("));
+        assert!(entry.contains("database,"));
+
+        let authority = source
+            .split_once("fn clean_sqlite_path_owner(")
+            .and_then(|(_, tail)| tail.split_once("fn capture_affected_catalog("))
+            .map(|(body, _)| body)
+            .expect("clean SQLite predecessor authority must remain identifiable");
+        assert!(authority.contains("materialized_read()"));
+        assert!(authority.contains("pages_by_path(path, 2)"));
+        assert!(!authority.contains("current_page_at_path"));
+        assert!(!authority.contains("projection_work_index"));
+
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("SQLite owns current exact\npath identity"));
+        assert!(contract.contains("must not ask a native\nPatricia path index"));
     }
 
     fn orchestration_binding(
