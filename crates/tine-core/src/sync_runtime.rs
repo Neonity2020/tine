@@ -77,7 +77,8 @@ use crate::oplog::import::{
 };
 #[cfg(test)]
 use crate::oplog::import::{
-    BootstrapStreamingImportInstrumentation, InactiveBootstrapOrchestrationInstrumentation,
+    BootstrapStreamingImportInstrumentation, CleanActivationInstrumentation,
+    InactiveBootstrapOrchestrationInstrumentation,
 };
 use crate::oplog::lazy_genesis::{
     publish_clean_shared_state, read_activation_marker, read_clean_shared_state,
@@ -367,6 +368,23 @@ fn take_activation_construction_instrumentation() -> ActivationConstructionInstr
         slot.borrow_mut()
             .take()
             .expect("activation construction instrumentation was recorded")
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_CLEAN_ACTIVATION_INSTRUMENTATION:
+        std::cell::RefCell<Option<CleanActivationInstrumentation>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
+#[cfg(test)]
+fn take_clean_activation_instrumentation() -> CleanActivationInstrumentation {
+    LAST_CLEAN_ACTIVATION_INSTRUMENTATION.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("clean activation instrumentation was recorded")
     })
 }
 
@@ -5615,6 +5633,10 @@ fn activate_clean_runtime_resources(
         &ReferenceCatalogPolicyV1::default(),
     )
     .map_err(display)?;
+    #[cfg(test)]
+    LAST_CLEAN_ACTIVATION_INSTRUMENTATION.with(|slot| {
+        *slot.borrow_mut() = Some(preparation.instrumentation().clone());
+    });
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::ImmutablePublicationInstall,
     });
@@ -52056,8 +52078,10 @@ mod tests {
         blocks: usize,
         total_ms: u128,
         phase_ms: Vec<(SyncLocalActivationPhase, u128)>,
-        construction: ActivationConstructionInstrumentation,
-        full_digest_scans: FullDigestScanInstrumentation,
+        clean: CleanActivationInstrumentation,
+        clean_marker_present: bool,
+        retired_artifacts: Vec<String>,
+        operation_batches: usize,
     }
 
     fn activation_source_counts(root: &Path) -> (usize, usize, usize) {
@@ -52096,8 +52120,6 @@ mod tests {
     fn activate_with_scale_receipt(fixture: &ActivationFixture) -> ActivationScaleReceipt {
         let (source_files, source_bytes, blocks) = activation_source_counts(&fixture.graph_root);
         let before = user_graph_bytes(&fixture.graph_root);
-        let workspace_id = fixture.request.identities.workspace_id;
-        reset_full_digest_scan_instrumentation(workspace_id);
         let started = std::time::Instant::now();
         let mut transitions = Vec::new();
         let activated = SyncRuntimeHandle::activate_or_resume_local_with_progress(
@@ -52118,11 +52140,7 @@ mod tests {
             SyncLocalActivationPhase::SourceCapture,
             SyncLocalActivationPhase::BootstrapImportPreparation,
             SyncLocalActivationPhase::ImmutablePublicationInstall,
-            SyncLocalActivationPhase::BackupProof,
             SyncLocalActivationPhase::SqliteOpenBuild,
-            SyncLocalActivationPhase::ShadowReconstructionByteVerification,
-            SyncLocalActivationPhase::PromotionReceiptConfirmation,
-            SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
         ];
         assert_eq!(
             transitions
@@ -52143,16 +52161,48 @@ mod tests {
             })
             .collect();
         drop(activated.handle);
-        let construction = take_activation_construction_instrumentation();
-        let full_digest_scans = take_full_digest_scan_instrumentation(workspace_id);
+        let clean = take_clean_activation_instrumentation();
+        let clean_marker_present = fixture
+            .request
+            .enrollment_root
+            .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+            .is_file();
+        let mut retired_artifacts = [
+            "bootstrap-v1",
+            "engine-history",
+            "projection-work-index-v1",
+            "reference-catalog-v2",
+            "managed-local-journal-v1",
+            "inactive-bootstrap-publication-v1",
+        ]
+        .iter()
+        .filter(|name| fixture.request.archive_root.join(name).exists())
+        .map(|name| format!("archive/{name}"))
+        .collect::<Vec<_>>();
+        for (label, root) in [
+            ("migration backup", &fixture.request.migration_backup_root),
+            ("capture scratch", &fixture.request.capture_root),
+            ("preparation scratch", &fixture.request.preparation_root),
+        ] {
+            if !recursive_file_bytes(root).is_empty() {
+                retired_artifacts.push(label.to_owned());
+            }
+        }
+        let operation_batches = fs::read_dir(
+            clean_operation_archive_directory(&fixture.request.archive_root).join("batches"),
+        )
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
         ActivationScaleReceipt {
             source_files,
             source_bytes,
             blocks,
             total_ms: total.as_millis(),
             phase_ms,
-            construction,
-            full_digest_scans,
+            clean,
+            clean_marker_present,
+            retired_artifacts,
+            operation_batches,
         }
     }
 
@@ -52202,65 +52252,18 @@ mod tests {
                 SyncLocalActivationPhase::SourceCapture,
                 SyncLocalActivationPhase::BootstrapImportPreparation,
                 SyncLocalActivationPhase::ImmutablePublicationInstall,
-                SyncLocalActivationPhase::BackupProof,
                 SyncLocalActivationPhase::SqliteOpenBuild,
-                SyncLocalActivationPhase::ShadowReconstructionByteVerification,
-                SyncLocalActivationPhase::PromotionReceiptConfirmation,
-                SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
             ]
         );
-        let subphases = updates
-            .iter()
-            .filter_map(|update| match update {
-                SyncLocalActivationProgress::BootstrapPreparationSubphase { subphase } => {
-                    Some(*subphase)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            subphases,
-            vec![
-                SyncBootstrapPreparationSubphase::SourceProtocol,
-                SyncBootstrapPreparationSubphase::OperationSpool,
-                SyncBootstrapPreparationSubphase::Partition,
-                SyncBootstrapPreparationSubphase::DetachedAuthoring,
-                SyncBootstrapPreparationSubphase::Sealing,
-            ]
+        assert!(
+            !updates.iter().any(|update| matches!(
+                update,
+                SyncLocalActivationProgress::BootstrapPreparationSubphase { .. }
+                    | SyncLocalActivationProgress::BootstrapDetachedAuthoring { .. }
+                    | SyncLocalActivationProgress::BootstrapPreparationSummary { .. }
+            )),
+            "clean activation must not report the retired operation-spool, partition, detached-authoring, or sealing pipeline"
         );
-        let authored = updates
-            .iter()
-            .filter_map(|update| match update {
-                SyncLocalActivationProgress::BootstrapDetachedAuthoring { completed, total } => {
-                    Some((*completed, *total))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let total = authored.first().expect("initial part progress").1;
-        assert_eq!(
-            authored,
-            (0..=total)
-                .map(|completed| (completed, total))
-                .collect::<Vec<_>>()
-        );
-        let summary = updates
-            .iter()
-            .find_map(|update| match update {
-                SyncLocalActivationProgress::BootstrapPreparationSummary { summary } => {
-                    Some(summary)
-                }
-                _ => None,
-            })
-            .expect("final preparation summary");
-        assert_eq!(summary.parts, total);
-        assert_eq!(summary.source_files, 3);
-        assert!(summary.source_bytes > 0);
-        assert!(summary.parser_nodes > 0);
-        assert!(summary.operations > 0);
-        assert!(summary.prepared_bytes > 0);
-        assert!(summary.operation_builder_retained_bytes > 0);
-        assert!(!summary.operation_builder_spilled);
         drop(activated.handle);
     }
 
@@ -52275,142 +52278,44 @@ mod tests {
         assert_eq!(large_receipt.source_files, small_receipt.source_files + 4);
         assert!(large_receipt.source_bytes > small_receipt.source_bytes);
         assert!(large_receipt.blocks > small_receipt.blocks);
-        assert_eq!(small_receipt.phase_ms.len(), 9);
-        assert_eq!(large_receipt.phase_ms.len(), 9);
+        assert_eq!(small_receipt.phase_ms.len(), 5);
+        assert_eq!(large_receipt.phase_ms.len(), 5);
         for receipt in [&small_receipt, &large_receipt] {
             assert_eq!(
-                receipt.full_digest_scans,
-                FullDigestScanInstrumentation {
-                    semantic_projection_scans: 1,
-                    materialized_row_scans: 1,
-                },
-                "one uninterrupted activation must execute each full SQLite digest proof exactly once"
+                receipt.clean.source_files, receipt.source_files as u64,
+                "the clean builder must consume one activation record per source page"
             );
             assert_eq!(
-                receipt.construction.preparation.page_declarations,
-                receipt.source_files as u64
-            );
-            assert_eq!(
-                receipt.construction.preparation.page_capsules,
-                receipt.source_files as u64
-            );
-            assert_eq!(receipt.construction.preparation.huge_page_splits, 0);
-            assert_eq!(
-                receipt.construction.preparation.capture_passes, 1,
-                "successful activation must capture the live source once before the final pre-promotion revalidation"
-            );
-            assert_eq!(
-                receipt.construction.preparation.source_bytes_read,
+                receipt.clean.source_bytes,
                 (receipt.source_bytes as u64).saturating_mul(2),
-                "preparation must account for one live capture read and one sealed-snapshot lowering read, with no later live-graph reread"
-            );
-            assert_eq!(
-                receipt.construction.preparation.external_sort_runs, 0,
-                "ordinary activation must remain on the in-memory sort path"
+                "the clean builder must account for the initial capture plus one sealed-source lowering read"
             );
             assert!(
-                !receipt.construction.preparation.operation_builder_spilled,
-                "ordinary activation must not write and reread an operation spool"
+                receipt.clean.parser_nodes >= receipt.blocks as u64,
+                "the parser-owned activation record must cover every outline block"
             );
             assert!(
-                receipt
-                    .construction
-                    .preparation
-                    .operation_builder_retained_bytes
-                    <= crate::oplog::import::BOOTSTRAP_OPERATION_MEMORY_BYTES as u64
+                receipt.clean.activation_record_bytes > 0,
+                "the clean builder must retain a bounded parser-owned record stream"
             );
-            assert!(receipt.construction.preparation.max_part_documents <= 65);
             assert!(
-                receipt.construction.preparation.max_part_manifest_bytes
-                    < crate::oplog::batch::MAX_MANIFEST_BYTES as u64
+                !receipt.clean.activation_records_spilled,
+                "the small structural fixture must remain on the bounded in-memory record path"
             );
-            assert_eq!(receipt.construction.publication.durability_syncs, 2);
-            // The uninterrupted same-process activation builds SQLite from the
-            // retained terminal accepted state: no physical bootstrap part is
-            // reloaded, no intermediate page/reference replacement is applied
-            // through ordinary event DML, and exactly one bounded terminal
-            // materialization covers every accepted page.
-            assert_eq!(receipt.construction.sqlite.terminal_constructions, 1);
-            assert_eq!(
-                receipt.construction.sqlite.terminal_construction_refusals,
-                0
-            );
-            assert_eq!(receipt.construction.sqlite.bootstrap_part_reads, 0);
-            assert_eq!(receipt.construction.sqlite.bootstrap_object_reads, 0);
-            assert_eq!(
-                receipt
-                    .construction
-                    .sqlite
-                    .intermediate_page_materializations,
-                0
-            );
-            assert_eq!(receipt.construction.sqlite.terminal_materializations, 1);
-            assert_eq!(
-                receipt.construction.sqlite.terminal_pages_materialized,
-                receipt.source_files
-            );
-            assert_eq!(
-                receipt.construction.sqlite.terminal_projection_hint_hits,
-                receipt.source_files
-            );
-            assert_eq!(
-                receipt.construction.sqlite.terminal_projection_hint_misses,
-                0
-            );
-            assert!(receipt.construction.sqlite.terminal_materialization_chunks > 0);
             assert!(
-                receipt.construction.sqlite.peak_terminal_bulk_pages
-                    <= crate::oplog::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES
+                receipt.clean_marker_present,
+                "clean activation must publish its sole authority marker last"
             );
-            receipt
-                .construction
-                .sqlite
-                .assert_catalog_authority_is_window_bounded();
-            assert_eq!(
-                receipt.construction.shadow.catalog_rows,
-                receipt.source_files as u64
-            );
-            assert_eq!(
-                receipt.construction.shadow.projection_plans,
-                receipt.source_files as u64
-            );
-            assert_eq!(
-                receipt.construction.shadow.manifest_entries,
-                receipt.source_files as u64
-            );
-            assert_eq!(receipt.construction.shadow.payload_bytes_written, 0);
-            assert_eq!(receipt.construction.shadow.payload_bytes_read, 0);
-            assert_eq!(receipt.construction.shadow.source_revalidations, 1);
-            assert_eq!(receipt.construction.shadow.adjacent_terminal_streams, 1);
-            assert_eq!(
-                receipt.construction.shadow.bulk_pages_materialized,
-                receipt.source_files as u64
-            );
-            assert!(receipt.construction.shadow.bulk_materialization_chunks > 0);
             assert!(
-                receipt.construction.shadow.peak_bulk_pages
-                    <= crate::oplog::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES as u64
+                receipt.retired_artifacts.is_empty(),
+                "clean activation retained retired bootstrap, Patricia, journal, shadow, backup, or capture artifacts: {:?}",
+                receipt.retired_artifacts
             );
             assert_eq!(
-                receipt.construction.shadow.source_bytes_read,
-                receipt.source_bytes as u64
+                receipt.operation_batches, 0,
+                "operation-free genesis must not fabricate an edit batch per imported page"
             );
         }
-        // Growing the graph must not buy the terminal builder a single extra
-        // catalog-document shape proof: its catalog authority is priced per
-        // bounded read window, not per page. This is the structural reason the
-        // graph-sized traversal is linear rather than quadratic in pages.
-        assert!(large_receipt.source_files > small_receipt.source_files);
-        assert_eq!(
-            large_receipt
-                .construction
-                .sqlite
-                .terminal_catalog_document_validations,
-            small_receipt
-                .construction
-                .sqlite
-                .terminal_catalog_document_validations
-        );
         assert_activation_near_linear(&small_receipt, &large_receipt);
     }
 
@@ -52429,42 +52334,18 @@ mod tests {
         let fixture = ActivationFixture::copied_graph("managed-activation-real", 0xa0d4, &source);
         let receipt = activate_with_scale_receipt(&fixture);
         eprintln!(
-            "managed_activation_real total_ms={} source_files={} source_bytes={} blocks={} phases={:?} construction={:?}",
+            "managed_activation_real total_ms={} source_files={} source_bytes={} blocks={} phases={:?} clean={:?}",
             receipt.total_ms,
             receipt.source_files,
             receipt.source_bytes,
             receipt.blocks,
             receipt.phase_ms,
-            receipt.construction,
+            receipt.clean,
         );
-        assert_eq!(receipt.construction.sqlite.terminal_constructions, 1);
-        assert_eq!(receipt.construction.sqlite.terminal_archive_replays, 0);
-        assert_eq!(
-            receipt.construction.sqlite.terminal_construction_refusals,
-            0
-        );
-        assert_eq!(
-            receipt
-                .construction
-                .sqlite
-                .intermediate_page_materializations,
-            0
-        );
-        assert_eq!(
-            receipt.construction.sqlite.terminal_pages_materialized,
-            receipt.source_files
-        );
-        assert_eq!(
-            receipt
-                .construction
-                .sqlite
-                .terminal_reference_index_traversals,
-            1
-        );
-        receipt
-            .construction
-            .sqlite
-            .assert_catalog_authority_is_window_bounded();
+        assert_eq!(receipt.clean.source_files, receipt.source_files as u64);
+        assert!(receipt.clean_marker_present);
+        assert!(receipt.retired_artifacts.is_empty(), "{receipt:?}");
+        assert_eq!(receipt.operation_batches, 0);
         assert!(
             receipt.total_ms < 10_000,
             "real-graph managed activation exceeded 10 seconds: {receipt:?}"
@@ -52607,11 +52488,11 @@ mod tests {
             fs::write(fixture.graph_root.join("pages/single-page-scale.md"), body).unwrap();
             let receipt = activate_with_scale_receipt(&fixture);
             eprintln!(
-                "activation_single_page blocks={blocks} total_ms={} source_bytes={} phases={:?} construction={:?}",
+                "activation_single_page blocks={blocks} total_ms={} source_bytes={} phases={:?} clean={:?}",
                 receipt.total_ms,
                 receipt.source_bytes,
                 receipt.phase_ms,
-                receipt.construction,
+                receipt.clean,
             );
             assert_eq!(receipt.source_files, 1, "{receipt:?}");
             assert_eq!(receipt.blocks, blocks, "{receipt:?}");
@@ -52672,12 +52553,12 @@ mod tests {
             assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
             let cold_ms = cold_started.elapsed().as_millis();
             eprintln!(
-                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} source_bytes={} blocks={} phases={:?} construction={:?}",
+                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} source_bytes={} blocks={} phases={:?} clean={:?}",
                 receipt.total_ms,
                 receipt.source_bytes,
                 receipt.blocks,
                 receipt.phase_ms,
-                receipt.construction,
+                receipt.clean,
             );
             drop(reopened.handle);
         }

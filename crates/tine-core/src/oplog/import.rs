@@ -4173,6 +4173,11 @@ pub(crate) fn commit_clean_activation(
         super::sqlite::remove_disposable_projection(&database_path)?;
         return Err(error.into());
     }
+    // The marker makes the baseline's exact source bytes authoritative. The
+    // sealed capture is now only a disposable construction duplicate. Cleanup
+    // is best-effort because no post-marker failure may revoke the committed
+    // activation; a later private-state sweep may remove any residue.
+    let _ = capture.discard();
     Ok(CommittedCleanActivation {
         baseline: baseline.retain_as_authoritative(),
         projection,

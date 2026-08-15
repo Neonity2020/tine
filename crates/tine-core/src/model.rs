@@ -25569,6 +25569,20 @@ impl BootstrapSourceCapture {
         verify_capture_file(&path, description)?;
         fs::read(path)
     }
+
+    /// Consume and remove the sealed private capture after another authority
+    /// has committed the same exact source bytes. Cleanup is deliberately a
+    /// separate, post-commit operation: failure can leave only disposable
+    /// evidence and must never revoke the authority that was just published.
+    pub(crate) fn discard(self) -> io::Result<()> {
+        let scratch_directory = self.scratch_directory.clone();
+        drop(self);
+        match fs::remove_dir_all(scratch_directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
