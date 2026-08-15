@@ -36,6 +36,7 @@ cap-fs-ext = "=4.0.2"
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_SystemInformation",
