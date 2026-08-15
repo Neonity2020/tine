@@ -44,7 +44,7 @@ interpret the mere presence of the directory as an opt-in marker.
 | Relative path under `shared/` | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `inbox/`, `outbox/` | transport scaffold | `SharedProviderTransport` | directories | created on explicit activation/join; retained |
-| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | canonical JSON descriptor v1 | immutable identity for the shared graph |
+| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | legacy canonical JSON descriptor v1 or clean magic-prefixed descriptor v1 during cutover | immutable identity for the shared graph |
 | `{inbox,outbox}/objects/<digest>.object` | publishing device | peer ingress/replay | immutable oplog object envelope | append-only; digest-addressed |
 | `{inbox,outbox}/manifests/<batch>.manifest` | publishing device | peer ingress/replay | canonical batch manifest | append-only commit object |
 | `{inbox,outbox}/frontier-heads-v1/<device>-<digest>.head` | each device | peer discovery | canonical JSON frontier head v1 | immutable heads; newer generations supersede discovery relevance |
@@ -66,6 +66,14 @@ an admission rule. Tine instead requires capability-relative no-follow opens,
 the expected directory/regular-file kind, bounded names and sizes, immutable
 content validation, and the protocol's exact descriptor/frontier relationships.
 
+The clean shared descriptor names the immutable lazy-genesis baseline root,
+source capture and accepted manifest frontier directly. It contains no legacy
+enrollment head, promotion proof, Patricia root, SQLite identity or persistent
+projection-work state. The matching private `lazy-genesis.shared` record says
+only which exact descriptor this device joined and whether it initiated or
+joined the graph. Current semantic facts remain in disposable SQLite; durable
+history remains the baseline plus manifest-committed operation tail.
+
 ### 1.2 Device-private app data
 
 Local managed state is deliberately outside the graph. The Tauri shell derives
@@ -76,6 +84,7 @@ from the immutable archive.
 | Path below the graph's private root | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; deleted on Return to Direct Files |
+| private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
 | `archive/lineage.claim` | object store initialization | every archive open | fixed binary claim | durable authority identity |
 | `archive/archive-instance-v1.claim` | object store initialization | archive reopen | fixed binary claim v1 | durable local archive identity |

@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    BlobDescription, BlockId, ContentDigest, DocumentDependencies, DocumentId, LineageDigest,
-    LogseqUuid, ManagedPath, ManagedTextKind, PageId, WorkspaceId,
+    BlobDescription, BlockId, ContentDigest, DeviceId, DocumentDependencies, DocumentId,
+    LineageDigest, LogseqUuid, ManagedPath, ManagedTextKind, PageId, WorkspaceId,
+    OPLOG_PROTOCOL_VERSION,
 };
 
 const LAZY_GENESIS_SCHEMA_VERSION: u32 = 4;
@@ -34,6 +35,203 @@ const MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_LAZY_GENESIS_PAGES: usize = 1_000_000;
 const MAX_LAZY_GENESIS_BLOCKS: u64 = 100_000_000;
 const LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION: u32 = 1;
+const CLEAN_SHARED_ENROLLMENT_SCHEMA_VERSION: u32 = 1;
+const CLEAN_SHARED_STATE_SCHEMA_VERSION: u32 = 1;
+const CLEAN_SHARED_ENROLLMENT_MAGIC: &[u8] = b"TINE-CLEAN-SHARED-ENROLLMENT\0";
+const CLEAN_SHARED_STATE_MAGIC: &[u8] = b"TINE-CLEAN-SHARED-STATE\0";
+pub(crate) const CLEAN_SHARED_STATE_FILE: &str = "lazy-genesis.shared";
+
+/// Provider-visible identity of one clean shared graph.
+///
+/// The immutable baseline and accepted operation manifests are the durable
+/// semantic authority.  This descriptor names that authority; it deliberately
+/// carries no legacy enrollment head, promotion proof, Patricia root or
+/// projection-work checkpoint.  SQLite remains a device-local derivative.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CleanSharedEnrollmentDescriptorV1 {
+    schema_version: u32,
+    oplog_protocol_version: u32,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    baseline_root: ContentDigest,
+    source_capture: BlobDescription,
+    accepted_frontier_digest: ContentDigest,
+    initiator_device_id: DeviceId,
+    object_store_namespace: ContentDigest,
+}
+
+impl CleanSharedEnrollmentDescriptorV1 {
+    pub(crate) fn new(
+        marker: LazyGenesisActivationMarkerV1,
+        catalog_document_id: DocumentId,
+        accepted_frontier_digest: ContentDigest,
+        initiator_device_id: DeviceId,
+        object_store_namespace: ContentDigest,
+    ) -> io::Result<Self> {
+        let descriptor = Self {
+            schema_version: CLEAN_SHARED_ENROLLMENT_SCHEMA_VERSION,
+            oplog_protocol_version: OPLOG_PROTOCOL_VERSION,
+            workspace_id: marker.workspace_id(),
+            lineage_digest: marker.lineage_digest(),
+            catalog_document_id,
+            baseline_root: marker.baseline_root(),
+            source_capture: marker.source_capture(),
+            accepted_frontier_digest,
+            initiator_device_id,
+            object_store_namespace,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    pub(crate) fn encode(&self) -> io::Result<Vec<u8>> {
+        self.validate()?;
+        let body = postcard::to_allocvec(self).map_err(|error| invalid(error.to_string()))?;
+        let mut bytes = Vec::with_capacity(CLEAN_SHARED_ENROLLMENT_MAGIC.len() + body.len());
+        bytes.extend_from_slice(CLEAN_SHARED_ENROLLMENT_MAGIC);
+        bytes.extend_from_slice(&body);
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let body = bytes
+            .strip_prefix(CLEAN_SHARED_ENROLLMENT_MAGIC)
+            .ok_or_else(|| invalid("clean shared enrollment descriptor has invalid magic"))?;
+        let descriptor: Self =
+            postcard::from_bytes(body).map_err(|error| invalid(error.to_string()))?;
+        descriptor.validate()?;
+        if descriptor.encode()? != bytes {
+            return Err(invalid(
+                "clean shared enrollment descriptor is not canonically encoded",
+            ));
+        }
+        Ok(descriptor)
+    }
+
+    pub(crate) fn digest(&self) -> io::Result<ContentDigest> {
+        Ok(ContentDigest::of(&self.encode()?))
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.schema_version != CLEAN_SHARED_ENROLLMENT_SCHEMA_VERSION
+            || self.oplog_protocol_version != OPLOG_PROTOCOL_VERSION
+        {
+            return Err(invalid(
+                "clean shared enrollment descriptor has an unsupported schema or protocol",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    pub(crate) const fn catalog_document_id(&self) -> DocumentId {
+        self.catalog_document_id
+    }
+
+    pub(crate) const fn baseline_root(&self) -> ContentDigest {
+        self.baseline_root
+    }
+
+    pub(crate) const fn source_capture(&self) -> BlobDescription {
+        self.source_capture
+    }
+
+    pub(crate) const fn accepted_frontier_digest(&self) -> ContentDigest {
+        self.accepted_frontier_digest
+    }
+
+    pub(crate) const fn initiator_device_id(&self) -> DeviceId {
+        self.initiator_device_id
+    }
+
+    pub(crate) const fn object_store_namespace(&self) -> ContentDigest {
+        self.object_store_namespace
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CleanSharedRoleV1 {
+    Initiator,
+    Joiner,
+}
+
+/// The only device-private state added by clean sharing.  It records the
+/// descriptor and this device's role; provider ingress and current projection
+/// state are reconstructed from the descriptor, accepted manifests and
+/// SQLite rather than another lifecycle/history tree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CleanSharedStateV1 {
+    schema_version: u32,
+    descriptor: CleanSharedEnrollmentDescriptorV1,
+    descriptor_digest: ContentDigest,
+    role: CleanSharedRoleV1,
+}
+
+impl CleanSharedStateV1 {
+    pub(crate) fn new(
+        descriptor: CleanSharedEnrollmentDescriptorV1,
+        role: CleanSharedRoleV1,
+    ) -> io::Result<Self> {
+        let descriptor_digest = descriptor.digest()?;
+        let state = Self {
+            schema_version: CLEAN_SHARED_STATE_SCHEMA_VERSION,
+            descriptor,
+            descriptor_digest,
+            role,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    fn encode(&self) -> io::Result<Vec<u8>> {
+        self.validate()?;
+        let body = postcard::to_allocvec(self).map_err(|error| invalid(error.to_string()))?;
+        let mut bytes = Vec::with_capacity(CLEAN_SHARED_STATE_MAGIC.len() + body.len());
+        bytes.extend_from_slice(CLEAN_SHARED_STATE_MAGIC);
+        bytes.extend_from_slice(&body);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let body = bytes
+            .strip_prefix(CLEAN_SHARED_STATE_MAGIC)
+            .ok_or_else(|| invalid("clean shared state has invalid magic"))?;
+        let state: Self = postcard::from_bytes(body).map_err(|error| invalid(error.to_string()))?;
+        state.validate()?;
+        if state.encode()? != bytes {
+            return Err(invalid("clean shared state is not canonically encoded"));
+        }
+        Ok(state)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.schema_version != CLEAN_SHARED_STATE_SCHEMA_VERSION
+            || self.descriptor.digest()? != self.descriptor_digest
+        {
+            return Err(invalid("clean shared state is malformed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn descriptor(&self) -> &CleanSharedEnrollmentDescriptorV1 {
+        &self.descriptor
+    }
+
+    pub(crate) const fn role(&self) -> CleanSharedRoleV1 {
+        self.role
+    }
+}
 
 /// Constant-size durable identity of the immutable baseline carried by an
 /// accepted frontier. The manifest root transitively binds the source capture,
@@ -1008,6 +1206,62 @@ pub(crate) fn publish_activation_marker(
     result
 }
 
+pub(crate) fn read_clean_shared_state(
+    enrollment_root: &Path,
+) -> io::Result<Option<CleanSharedStateV1>> {
+    let path = enrollment_root.join(CLEAN_SHARED_STATE_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 16 * 1024 {
+        return Err(invalid("clean shared state is not a bounded regular file"));
+    }
+    CleanSharedStateV1::decode(&fs::read(path)?).map(Some)
+}
+
+/// Publish the clean shared role only after the provider descriptor and any
+/// baseline tail are completely visible.  Repeating the same transition is
+/// idempotent; changing either the descriptor or the role requires an explicit
+/// future leave/rejoin transition rather than overwriting lifecycle evidence.
+pub(crate) fn publish_clean_shared_state(
+    enrollment_root: &Path,
+    state: &CleanSharedStateV1,
+) -> io::Result<()> {
+    fs::create_dir_all(enrollment_root)?;
+    let bytes = state.encode()?;
+    let destination = enrollment_root.join(CLEAN_SHARED_STATE_FILE);
+    if destination.exists() {
+        if read_clean_shared_state(enrollment_root)?.as_ref() == Some(state) {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a different clean shared state already exists",
+        ));
+    }
+    let temporary = enrollment_root.join(format!(
+        ".{CLEAN_SHARED_STATE_FILE}.{}",
+        Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &destination)?;
+        crate::filesystem_durability::sync_reconstructible_directory_path(enrollment_root)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn read_bounded(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > cap as u64 {
@@ -1172,6 +1426,69 @@ mod tests {
         assert!(contract.contains("one final lazy-genesis authority marker"));
         assert!(contract.contains("SQLite identity is deliberately absent"));
         assert!(contract.contains("Tauri binding records opt-in\nintent"));
+    }
+
+    #[test]
+    fn clean_shared_descriptor_and_private_role_bind_only_clean_authority() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-clean-shared-state-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let marker = LazyGenesisActivationMarkerV1::new(
+            WorkspaceId::from_uuid(Uuid::from_u128(1)),
+            LineageDigest::of(b"clean-shared-lineage"),
+            ContentDigest::of(b"baseline"),
+            BlobDescription::of(b"source capture"),
+            ContentDigest::of(b"baseline frontier"),
+            9,
+        )
+        .unwrap();
+        let descriptor = CleanSharedEnrollmentDescriptorV1::new(
+            marker,
+            catalog_document_id(),
+            ContentDigest::of(b"accepted baseline plus tail"),
+            DeviceId::from_uuid(Uuid::from_u128(2)),
+            ContentDigest::of(b"provider namespace"),
+        )
+        .unwrap();
+        let encoded = descriptor.encode().unwrap();
+        assert_eq!(
+            CleanSharedEnrollmentDescriptorV1::decode(&encoded).unwrap(),
+            descriptor
+        );
+        assert_eq!(descriptor.baseline_root(), marker.baseline_root());
+        assert_eq!(descriptor.source_capture(), marker.source_capture());
+        assert_eq!(
+            descriptor.accepted_frontier_digest(),
+            ContentDigest::of(b"accepted baseline plus tail")
+        );
+
+        let state =
+            CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Initiator).unwrap();
+        publish_clean_shared_state(&root, &state).unwrap();
+        publish_clean_shared_state(&root, &state).unwrap();
+        assert_eq!(read_clean_shared_state(&root).unwrap(), Some(state));
+        let conflicting = CleanSharedStateV1::new(descriptor, CleanSharedRoleV1::Joiner).unwrap();
+        assert!(publish_clean_shared_state(&root, &conflicting).is_err());
+        fs::remove_dir_all(root).unwrap();
+
+        let source = include_str!("lazy_genesis.rs");
+        let descriptor_source = source
+            .split_once("pub(crate) struct CleanSharedEnrollmentDescriptorV1")
+            .and_then(|(_, tail)| tail.split_once("impl CleanSharedEnrollmentDescriptorV1"))
+            .map(|(body, _)| body)
+            .expect("clean shared descriptor definition remains identifiable");
+        for forbidden in [
+            "patricia",
+            "projection_work",
+            "sqlite",
+            "verification_digest",
+        ] {
+            assert!(
+                !descriptor_source.to_ascii_lowercase().contains(forbidden),
+                "clean shared descriptor unexpectedly retained {forbidden}"
+            );
+        }
     }
 
     #[test]
