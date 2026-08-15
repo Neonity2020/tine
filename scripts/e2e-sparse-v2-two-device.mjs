@@ -359,7 +359,12 @@ try {
   await clickButtonAndConfirm("Enable Tine-managed storage...", "device-a-enable-managed");
   await assertBody("Tine-managed storage active", "device A managed activation", 120_000);
   await clickButtonAndConfirm("Set up sync with another device...", "device-a-prepare-share");
-  await assertBody("Tine-managed storage active", "device A shared activation", 120_000);
+  // "Tine-managed storage active" is already visible before sharing starts.
+  // The provider tree is safe to copy only after the frontend receives the
+  // native SharedActive result. Its success notice is the user-visible proof
+  // that asynchronous share preparation completed; checking the pre-existing
+  // generic "active" label raced a partial provider snapshot.
+  await assertBody("Sync is ready to use on another device.", "device A shared activation", 120_000);
   await stopCurrent();
   copyProvider(GRAPH_A, GRAPH_B);
 
@@ -367,9 +372,11 @@ try {
   await connect("device-b-join", GRAPH_B, XDG_B);
   await assertPageContains(MARKER, "device B source page");
   await openSyncSettings();
-  await assertBody("Join this synced graph...", "device B joinable state");
-  await clickButtonAndConfirm("Join this synced graph...", "device-b-join");
-  await assertBody("Tine-managed storage active", "device B joined state", 120_000);
+  // Opening an ordinary Direct Files graph is intentionally not an implicit
+  // managed-storage/provider probe. The explicit Join action performs cold
+  // discovery and then transitions this fresh installation to SharedActive.
+  await clickButtonAndConfirm("Join an existing synced graph...", "device-b-join");
+  await assertBody("This device joined the synced graph.", "device B joined state", 120_000);
   await leaseCurrentGraph(GRAPH_B);
   receipt.milestones.join = { openedWithoutLocalBinding: true, joined: true };
   const fromB = `${MARKER} edited on device B`;
@@ -444,7 +451,7 @@ try {
     testedCommit: receipt.testedCommit,
     journey: "sparse-v2-two-device",
     phase,
-    expected: "A fresh second device opens Joinable, can Join, exchanges edits in both directions, and can instead return to writable Direct Files.",
+    expected: "A fresh second device can explicitly discover and join the synchronized graph, exchange edits in both directions, and instead return to writable Direct Files.",
     observed: String(error).split("\n").slice(0, 4).join(" | "),
     classification: /HARNESS UNAVAILABLE|tauri-driver|WebKit|xdotool|window manager|DISPLAY/i.test(String(error))
       ? "infrastructure"

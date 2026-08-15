@@ -10103,6 +10103,14 @@ fn publish_journal_destination(
         destination_path,
     )?;
     let mut destination = if let Some(existing) = existing {
+        // File-sync providers commonly install an unchanged file through a
+        // temp-file + rename, so its inode/file ID may change while its exact
+        // immutable bytes do not. Exact destination bytes already satisfy a
+        // Put; the private authenticated journal remains the retry authority.
+        if existing.bytes == expected {
+            cleanup_journal_staging(journal, gate, record, staging, tree)?;
+            return Ok(());
+        }
         let identity = record
             .destination_identity
             .as_ref()
@@ -10111,10 +10119,6 @@ fn publish_journal_destination(
             return Err(ScenarioError::ProviderConflictingBytes(
                 destination_path.into(),
             ));
-        }
-        if existing.bytes == expected {
-            cleanup_journal_staging(journal, gate, record, staging, tree)?;
-            return Ok(());
         }
         open_provider_file_write_nofollow(destination_dir, destination_name).map_err(|error| {
             ScenarioError::UnsafeProviderEntry(format!("{destination_path}: {error}"))
@@ -10215,7 +10219,11 @@ fn validate_put_destination(
     expected: &[u8],
     record: &ProviderJournalRecord,
 ) -> Result<(), ScenarioError> {
-    let identity = record
+    // The recorded identity authorizes resuming a partial destination that
+    // this process created. Once the immutable destination is byte-exact, a
+    // file-sync provider's inode replacement is benign and must not poison the
+    // local retry journal.
+    record
         .destination_identity
         .as_ref()
         .ok_or_else(|| ScenarioError::UnsafeProviderJournal(record.operation_id.clone()))?;
@@ -10226,9 +10234,7 @@ fn validate_put_destination(
         destination_path,
     )?
     .ok_or_else(|| ScenarioError::UnsafeProviderEntry(destination_path.into()))?;
-    if destination.bytes != expected
-        || !provider_file_matches_identity(&destination.file, identity)?
-    {
+    if destination.bytes != expected {
         return Err(ScenarioError::ProviderConflictingBytes(
             destination_path.into(),
         ));
@@ -12911,6 +12917,48 @@ mod tests {
                 "{boundary:?}"
             );
         }
+    }
+
+    #[test]
+    fn provider_put_accepts_exact_bytes_after_file_sync_replaces_the_inode() {
+        let bytes = b"immutable bytes replaced by a file-sync provider";
+        let mut simulator = simulator_with_provider_item(bytes);
+        let copy = ScheduledActionKind::ProviderCopy {
+            source: ProviderSource::Mailbox {
+                item_id: "fixture-object".into(),
+            },
+            destination: location("objects/destination"),
+        };
+        FAIL_PROVIDER_JOURNAL_AFTER_PHASE
+            .with(|hook| hook.replace(Some(ProviderJournalPhase::Published)));
+        assert!(matches!(
+            simulator.run_action(&action(1, copy.clone())),
+            Err(ScenarioError::Io(message)) if message.contains("journal crash after Published")
+        ));
+        let inbox = simulator
+            .provider_tree_path("beta", ProviderTree::Inbox)
+            .unwrap();
+        let destination = inbox.join("objects/destination");
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+
+        // Syncthing/Dropbox-style delivery commonly installs even unchanged
+        // bytes through a same-directory temp + rename, changing the inode.
+        let replacement = inbox.join("objects/destination.provider-replacement");
+        std::fs::write(&replacement, bytes).unwrap();
+        std::fs::rename(&replacement, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+
+        simulator.device_mut("beta").unwrap().crash();
+        simulator
+            .run_action(&action(
+                2,
+                ScheduledActionKind::Restart {
+                    device: "beta".into(),
+                },
+            ))
+            .unwrap();
+        simulator.run_action(&action(1, copy)).unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), bytes);
     }
 
     #[test]

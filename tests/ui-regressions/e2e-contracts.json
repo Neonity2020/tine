@@ -837,13 +837,13 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "userOutcome": "Two installations with separate private app data can discover and join one filesystem-synchronized managed graph, exchange managed edits in both directions, and the receiving device can instead explicitly return to writable Direct Files without deleting managed evidence.",
+     "userOutcome": "Two installations with separate private app data can explicitly discover and join one filesystem-synchronized managed graph, exchange managed edits in both directions, and the receiving device can instead explicitly return to writable Direct Files without deleting managed evidence.",
      "blocking": true,
      "authority": "Tine cross-device managed-storage enrollment, provider synchronization, and Direct Files recovery contract"
     },
     {
      "class": "core-operation",
-     "userOutcome": "A provider-synchronized graph opens on a fresh second device as Joinable before that device has any local managed-storage binding.",
+     "userOutcome": "A fresh second device remains in Direct Files until the user explicitly asks to join, then discovers the provider state and becomes a writable managed-sync member.",
      "blocking": true
     }
    ],
