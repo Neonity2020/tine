@@ -34,6 +34,13 @@ Subsequent accepted operations must preserve the genesis binding. Test-only
 legacy fixtures are not an alternate activation marker or permission to admit
 a partially constructed candidate.
 
+Production sharing likewise has one route: clean activation publishes a clean
+baseline descriptor and clean joining installs that exact baseline plus its
+manifest tail. The pre-0.7 share and join implementations compile only in
+tests. A production decoder may still recognize an old descriptor so it can
+give a bounded migration refusal, but it cannot use that descriptor to reopen
+the retired runtime; the user must Return to Direct Files and share again.
+
 ## 1. On-disk layout
 
 ### 1.1 Shared graph-local provider
@@ -47,7 +54,7 @@ interpret the mere presence of the directory as an opt-in marker.
 | Relative path under `shared/` | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `inbox/`, `outbox/` | transport scaffold | `SharedProviderTransport` | directories | created on explicit activation/join; retained |
-| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | legacy canonical JSON descriptor v1 or clean magic-prefixed descriptor v1 during cutover | immutable identity for the shared graph |
+| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | clean magic-prefixed descriptor v1; legacy JSON is recognized only to refuse pre-0.7 state | immutable identity for the shared graph |
 | `{inbox,outbox}/clean-baselines-v1/<root>.index` | initiator | clean joiner | canonical lazy-genesis provider index v1 | immutable; descriptor-bound; published after every baseline chunk |
 | `{inbox,outbox}/clean-baselines-v1/<root>.<file>.<chunk>.chunk` | initiator | clean joiner | fixed-size exact chunk of a sealed lazy-genesis file | immutable; reassembled only through the descriptor-bound index |
 | `{inbox,outbox}/objects/<digest>.object` | publishing device | peer ingress/replay | immutable oplog object envelope | append-only; digest-addressed |

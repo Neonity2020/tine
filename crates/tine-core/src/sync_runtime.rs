@@ -24992,7 +24992,12 @@ impl RuntimeActor {
         if self.clean.is_some() {
             return self.prepare_shared_clean();
         }
-        self.prepare_shared_legacy()
+        #[cfg(test)]
+        {
+            return self.prepare_shared_legacy();
+        }
+        #[cfg(not(test))]
+        Err(SyncRuntimeRequestError::ActorUnavailable)
     }
 
     fn prepare_shared_clean(
@@ -25055,6 +25060,7 @@ impl RuntimeActor {
             .map_err(SyncRuntimeRequestError::ActorRefused)
     }
 
+    #[cfg(test)]
     fn prepare_shared_legacy(
         &mut self,
     ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
@@ -25141,7 +25147,20 @@ impl RuntimeActor {
         descriptor: SharedEnrollmentDescriptor,
     ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
         match descriptor {
-            SharedEnrollmentDescriptor::Legacy(descriptor) => self.join_shared_legacy(descriptor),
+            SharedEnrollmentDescriptor::Legacy(descriptor) => {
+                #[cfg(test)]
+                {
+                    return self.join_shared_legacy(descriptor);
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = descriptor;
+                    Err(SyncRuntimeRequestError::ActorRefused(
+                        "pre-0.7 shared enrollment is no longer supported; Return to Direct Files and share the graph again"
+                            .into(),
+                    ))
+                }
+            }
             SharedEnrollmentDescriptor::Clean(descriptor) => self.join_shared_clean(descriptor),
         }
     }
@@ -25367,6 +25386,7 @@ impl RuntimeActor {
             .map_err(SyncRuntimeRequestError::ActorRefused)
     }
 
+    #[cfg(test)]
     fn join_shared_legacy(
         &mut self,
         descriptor: SharedEnrollmentDescriptorV1,
@@ -28263,6 +28283,8 @@ mod tests {
             "#[cfg(test)]\nfn actor_thread(",
             "#[cfg(test)]\nfn actor_thread_from_same_process_activation(",
             "    #[cfg(test)]\n    fn open_from_same_process_activation(",
+            "    #[cfg(test)]\n    fn prepare_shared_legacy(",
+            "    #[cfg(test)]\n    fn join_shared_legacy(",
         ] {
             assert!(
                 source.contains(test_only_entry),
