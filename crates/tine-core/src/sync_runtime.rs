@@ -11229,6 +11229,7 @@ struct ActorRuntimeBinding {
 }
 
 impl ActorRuntimeBinding {
+    #[cfg(test)]
     fn from_legacy(binding: &EnrollmentBindingV1) -> Self {
         Self {
             workspace_id: binding.workspace_id(),
@@ -12567,6 +12568,7 @@ impl RuntimeActor {
             .map(|current| current.map(|current| current.editor))
     }
 
+    #[cfg(test)]
     fn open(
         request: SyncRuntimeOpenRequest,
         advisory: LocalActiveAdvisory,
@@ -12789,6 +12791,7 @@ impl RuntimeActor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn from_proven_resources(
         request: SyncRuntimeOpenRequest,
         graph: Graph,
@@ -28273,6 +28276,8 @@ mod tests {
             "#[cfg(test)]\nfn actor_thread(",
             "#[cfg(test)]\nfn actor_thread_from_same_process_activation(",
             "    #[cfg(test)]\n    fn open_from_same_process_activation(",
+            "    #[cfg(test)]\n    fn open(",
+            "    #[cfg(test)]\n    fn from_proven_resources(",
             "    #[cfg(test)]\n    fn prepare_shared_legacy(",
             "    #[cfg(test)]\n    fn join_shared_legacy(",
         ] {
