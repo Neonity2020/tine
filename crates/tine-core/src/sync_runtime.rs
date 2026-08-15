@@ -82,6 +82,7 @@ use crate::oplog::import::{
 use crate::oplog::lazy_genesis::{
     publish_clean_shared_state, read_activation_marker, read_clean_shared_state,
     CleanSharedEnrollmentDescriptorV1, CleanSharedRoleV1, CleanSharedStateV1,
+    LAZY_GENESIS_PROVIDER_CHUNK_BYTES,
 };
 #[cfg(test)]
 use crate::oplog::local_active::{
@@ -172,26 +173,27 @@ use crate::oplog::wire::{
     SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
     SharedProviderObservationCursor, SharedProviderPublicationCursor,
     SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
-    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
-    SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE,
+    SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE, SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
     SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
     SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
 };
 pub use crate::oplog::ManagedStorageRefusalScenario;
 use crate::oplog::{
     classify_managed_local_anchor, decode_managed_local_record, managed_local_v2_anchor_name,
-    parse_managed_local_v2_anchor_name, BatchId, BatchOrigin, BlockId, BlockLocation,
-    CanonicalGraphResourceId, ContentDigest, CurrentPageAtPath, DeviceId, DocumentId,
-    FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin, LogseqUuid,
-    ManagedLocalAnchorEncoding, ManagedLocalAppendError, ManagedLocalGenerationAnchorV2,
-    ManagedLocalJournal, ManagedLocalJournalPayloadKind, ManagedLocalJournalProtocol, ManagedPath,
-    ManagedTextKind, MaterializedBlock, MaterializedBlockRow, MaterializedEntityId,
-    MaterializedPage, MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit,
-    MaterializedTagRow, MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction,
-    PageId, PreparedBatch, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId,
-    RebuildSource, ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1,
-    SemanticOperation, SessionId, SqliteMaterializedRead, WorkspaceId,
-    MANAGED_LOCAL_ANCHOR_V2_BYTES, MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+    parse_managed_local_v2_anchor_name, BatchId, BatchOrigin, BlobDescription, BlockId,
+    BlockLocation, CanonicalGraphResourceId, ContentDigest, CurrentPageAtPath, DeviceId,
+    DocumentId, FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin,
+    LogseqUuid, ManagedLocalAnchorEncoding, ManagedLocalAppendError,
+    ManagedLocalGenerationAnchorV2, ManagedLocalJournal, ManagedLocalJournalPayloadKind,
+    ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind, MaterializedBlock,
+    MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
+    MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
+    OperationBatch, OperationObject, OperationTransaction, PageId, PreparedBatch, ProjectionClaim,
+    ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource, ReferenceCatalogPolicyV1,
+    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
+    SqliteMaterializedRead, WorkspaceId, MANAGED_LOCAL_ANCHOR_V2_BYTES,
+    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
 #[cfg(test)]
 use crate::oplog::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
@@ -7779,6 +7781,64 @@ fn publish_complete_clean_archive(
         publish_clean_manifest_exact(provider, manifest.batch_id(), &bytes)?;
     }
     Ok(())
+}
+
+fn clean_baseline_index_provider_path(root: ContentDigest) -> String {
+    format!("{SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE}/{root}.index")
+}
+
+fn clean_baseline_chunk_provider_path(
+    root: ContentDigest,
+    file_ordinal: usize,
+    chunk_ordinal: usize,
+) -> String {
+    format!(
+        "{SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE}/{root}.{file_ordinal:08}.{chunk_ordinal:08}.chunk"
+    )
+}
+
+/// Publish one exact lazy-genesis pack without routing its potentially large
+/// files through an unbounded provider-journal blob. Every file is split into
+/// fixed-size exact chunks; the small index is published last and is itself
+/// bound into the shared descriptor, which remains the final joinability
+/// marker.
+fn publish_complete_clean_baseline(
+    engine: &ShardedHotEngine,
+    provider: &mut SharedProviderTransport,
+) -> Result<BlobDescription, SyncRuntimeRequestError> {
+    let index = engine
+        .clean_baseline_provider_index()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    for (file_ordinal, (name, expected)) in index.file_descriptions().into_iter().enumerate() {
+        let bytes = engine
+            .clean_baseline_provider_file(&name)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if BlobDescription::of(&bytes) != expected {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "clean baseline file {name} changed during provider publication"
+            )));
+        }
+        for (chunk_ordinal, chunk) in bytes.chunks(LAZY_GENESIS_PROVIDER_CHUNK_BYTES).enumerate() {
+            let path = clean_baseline_chunk_provider_path(
+                index.baseline_root(),
+                file_ordinal,
+                chunk_ordinal,
+            );
+            provider
+                .publish_clean_baseline_part(&path, chunk)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        }
+    }
+    let bytes = index
+        .encode()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    provider
+        .publish_clean_baseline_part(
+            &clean_baseline_index_provider_path(index.baseline_root()),
+            &bytes,
+        )
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    Ok(BlobDescription::of(&bytes))
 }
 
 fn publish_clean_manifest_exact(
@@ -24440,18 +24500,20 @@ impl RuntimeActor {
             .active_engine()?
             .accepted_frontier_root()
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let store = self.retained_archive_store()?;
+        let mut provider =
+            SharedProviderTransport::open(&self.provider_root, &self.provider_journal_root)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let baseline_index = publish_complete_clean_baseline(self.active_engine()?, &mut provider)?;
         let descriptor = CleanSharedEnrollmentDescriptorV1::new(
             marker,
+            baseline_index,
             self.binding.catalog_document_id(),
             frontier.state_digest(),
             self.binding.device_id(),
             shared_namespace_digest(self.binding.workspace_id()),
         )
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        let store = self.retained_archive_store()?;
-        let mut provider =
-            SharedProviderTransport::open(&self.provider_root, &self.provider_journal_root)
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         publish_complete_clean_archive(
             &store,
             &mut provider,
@@ -43346,6 +43408,33 @@ mod tests {
         let descriptor = initiator_handle
             .prepare_shared()
             .expect("initiator commit-last share");
+        let baseline_provider = initiator
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE);
+        let baseline_provider_entries = fs::read_dir(&baseline_provider)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            baseline_provider_entries
+                .iter()
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".index"))
+                .count(),
+            1,
+            "clean share must publish exactly one descriptor-bound baseline index"
+        );
+        assert!(
+            baseline_provider_entries
+                .iter()
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".chunk")),
+            "clean share must publish the sealed baseline before its descriptor"
+        );
+        assert!(baseline_provider_entries.iter().all(|entry| {
+            !entry.file_name().to_string_lossy().ends_with(".chunk")
+                || entry.metadata().unwrap().len() <= LAZY_GENESIS_PROVIDER_CHUNK_BYTES as u64
+        }));
         assert_eq!(
             user_graph_bytes(&initiator.graph_root),
             initiator_bytes,

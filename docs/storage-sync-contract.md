@@ -45,6 +45,8 @@ interpret the mere presence of the directory as an opt-in marker.
 | --- | --- | --- | --- | --- |
 | `inbox/`, `outbox/` | transport scaffold | `SharedProviderTransport` | directories | created on explicit activation/join; retained |
 | `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | legacy canonical JSON descriptor v1 or clean magic-prefixed descriptor v1 during cutover | immutable identity for the shared graph |
+| `{inbox,outbox}/clean-baselines-v1/<root>.index` | initiator | clean joiner | canonical lazy-genesis provider index v1 | immutable; descriptor-bound; published after every baseline chunk |
+| `{inbox,outbox}/clean-baselines-v1/<root>.<file>.<chunk>.chunk` | initiator | clean joiner | fixed-size exact chunk of a sealed lazy-genesis file | immutable; reassembled only through the descriptor-bound index |
 | `{inbox,outbox}/objects/<digest>.object` | publishing device | peer ingress/replay | immutable oplog object envelope | append-only; digest-addressed |
 | `{inbox,outbox}/manifests/<batch>.manifest` | publishing device | peer ingress/replay | canonical batch manifest | append-only commit object |
 | `{inbox,outbox}/frontier-heads-v1/<device>-<digest>.head` | each device | peer discovery | canonical JSON frontier head v1 | immutable heads; newer generations supersede discovery relevance |
@@ -67,7 +69,7 @@ the expected directory/regular-file kind, bounded names and sizes, immutable
 content validation, and the protocol's exact descriptor/frontier relationships.
 
 The clean shared descriptor names the immutable lazy-genesis baseline root,
-source capture and accepted manifest frontier directly. It contains no legacy
+its exact provider index, source capture and accepted manifest frontier directly. It contains no legacy
 enrollment head, promotion proof, Patricia root, SQLite identity or persistent
 projection-work state. The matching private `lazy-genesis.shared` record says
 only which exact descriptor this device joined and whether it initiated or
@@ -237,8 +239,11 @@ fallback.
 
 ### 2.3 Sharing lifecycle
 
-1. **LocalActive → SharePrepared (initiator).** The initiator seals and
-   publishes the one shared descriptor, then records the matching local phase.
+1. **LocalActive → SharePrepared (initiator).** The initiator publishes every
+   exact chunk of the sealed lazy-genesis baseline, publishes the small index
+   that binds those chunks, publishes the accepted operation tail, and only
+   then publishes the one shared descriptor and records the matching local
+   phase.
 2. **Direct/explicit join → Joining (joiner).** The joiner reads that exact
    descriptor, observes two stable bounded provider cuts, validates every
    required manifest/object/recovery link, and constructs its private archive.

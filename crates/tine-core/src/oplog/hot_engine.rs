@@ -31,6 +31,7 @@ use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
 use super::lazy_genesis::{
     LazyGenesisCandidate, LazyGenesisFrontierBindingV1, LazyGenesisPageInput,
+    LazyGenesisProviderIndexV1,
 };
 use super::object_store::{
     BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
@@ -8023,6 +8024,28 @@ impl ShardedHotEngine {
             .as_deref()
             .map(accepted_frontier_root_for_lazy_genesis)
             .transpose()
+    }
+
+    pub(crate) fn clean_baseline_provider_index(
+        &self,
+    ) -> Result<LazyGenesisProviderIndexV1, EngineError> {
+        self.lazy_genesis
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::Archive("clean runtime has no lazy-genesis baseline".into())
+            })?
+            .provider_index()
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    pub(crate) fn clean_baseline_provider_file(&self, name: &str) -> Result<Vec<u8>, EngineError> {
+        self.lazy_genesis
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::Archive("clean runtime has no lazy-genesis baseline".into())
+            })?
+            .read_provider_file(name)
+            .map_err(|error| EngineError::Archive(error.to_string()))
     }
 
     /// Enumerate the exact sparse document overlay only for the clean

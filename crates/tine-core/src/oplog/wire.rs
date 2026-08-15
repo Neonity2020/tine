@@ -104,6 +104,7 @@ pub const MAX_TRANSFER_BYTES: usize = 1024 * 1024;
 pub const MAX_PROVIDER_RESCAN_ENTRIES: usize = 4_096;
 pub const MAX_PROVIDER_RESCAN_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PROVIDER_RESCAN_DEPTH: usize = 16;
+pub(crate) const SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE: &str = "clean-baselines-v1";
 pub const MAX_PROVIDER_RESIDUE_ENTRIES: usize = 512;
 pub const MAX_PROVIDER_PATH_BYTES: usize = 512;
 pub const MAX_PROVIDER_JOURNAL_PENDING: usize = 4;
@@ -1955,6 +1956,7 @@ impl ProviderRuntime {
                 SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
                 SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
                 SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+                SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE,
                 PROVIDER_TEMP_NAMESPACE,
                 PROVIDER_REMOVED_NAMESPACE,
                 PROVIDER_RENAME_EVIDENCE_NAMESPACE,
@@ -2896,6 +2898,23 @@ impl SharedProviderTransport {
         )
     }
 
+    pub(crate) fn publish_clean_baseline_part(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), ScenarioError> {
+        if !path.starts_with(&format!("{SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE}/"))
+            || bytes.len() > super::lazy_genesis::MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES
+        {
+            return Err(ScenarioError::InvalidProviderPath(path.into()));
+        }
+        self.publish_exact(
+            path,
+            bytes,
+            super::lazy_genesis::MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES,
+        )
+    }
+
     pub(crate) fn publish_manifest_recovery(
         &mut self,
         link: &SharedProviderManifestRecoveryLinkV1,
@@ -3089,6 +3108,9 @@ impl SharedProviderTransport {
             {
                 super::MAX_MANIFEST_BYTES
             }
+            None if path.starts_with(&format!("{SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE}/")) => {
+                super::lazy_genesis::MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES
+            }
             None => MAX_PROVIDER_RESCAN_BYTES,
         };
         let (parent, name) = self
@@ -3160,6 +3182,7 @@ impl SharedProviderTransport {
                         | SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE
                         | SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE
                         | SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE
+                        | SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE
                         | PROVIDER_TEMP_NAMESPACE
                         | PROVIDER_REMOVED_NAMESPACE
                         | PROVIDER_RENAME_EVIDENCE_NAMESPACE

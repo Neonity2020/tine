@@ -22,8 +22,10 @@ use super::{
 
 const LAZY_GENESIS_SCHEMA_VERSION: u32 = 4;
 const LAZY_GENESIS_COMMIT_SCHEMA_VERSION: u32 = 1;
+const LAZY_GENESIS_PROVIDER_INDEX_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_ACTIVATION_MARKER_MAGIC: &[u8] = b"TINE-LAZY-GENESIS-ACTIVATION\0";
+const LAZY_GENESIS_PROVIDER_INDEX_MAGIC: &[u8] = b"TINE-LAZY-GENESIS-PROVIDER-INDEX\0";
 const LAZY_GENESIS_MANIFEST_FILE: &str = "manifest.postcard";
 const LAZY_GENESIS_COMMIT_FILE: &str = "commit.postcard";
 pub(crate) const LAZY_GENESIS_BASELINE_DIRECTORY: &str = "lazy-genesis";
@@ -32,6 +34,8 @@ const MAX_LAZY_GENESIS_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
 const LAZY_GENESIS_SEGMENT_TARGET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_LAZY_GENESIS_CAPSULE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const LAZY_GENESIS_PROVIDER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LAZY_GENESIS_PAGES: usize = 1_000_000;
 const MAX_LAZY_GENESIS_BLOCKS: u64 = 100_000_000;
 const LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION: u32 = 1;
@@ -56,6 +60,7 @@ pub(crate) struct CleanSharedEnrollmentDescriptorV1 {
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     baseline_root: ContentDigest,
+    baseline_index: BlobDescription,
     source_capture: BlobDescription,
     accepted_frontier_digest: ContentDigest,
     initiator_device_id: DeviceId,
@@ -65,6 +70,7 @@ pub(crate) struct CleanSharedEnrollmentDescriptorV1 {
 impl CleanSharedEnrollmentDescriptorV1 {
     pub(crate) fn new(
         marker: LazyGenesisActivationMarkerV1,
+        baseline_index: BlobDescription,
         catalog_document_id: DocumentId,
         accepted_frontier_digest: ContentDigest,
         initiator_device_id: DeviceId,
@@ -77,6 +83,7 @@ impl CleanSharedEnrollmentDescriptorV1 {
             lineage_digest: marker.lineage_digest(),
             catalog_document_id,
             baseline_root: marker.baseline_root(),
+            baseline_index,
             source_capture: marker.source_capture(),
             accepted_frontier_digest,
             initiator_device_id,
@@ -117,6 +124,8 @@ impl CleanSharedEnrollmentDescriptorV1 {
     fn validate(&self) -> io::Result<()> {
         if self.schema_version != CLEAN_SHARED_ENROLLMENT_SCHEMA_VERSION
             || self.oplog_protocol_version != OPLOG_PROTOCOL_VERSION
+            || self.baseline_index.byte_length() == 0
+            || self.baseline_index.byte_length() > MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES as u64
         {
             return Err(invalid(
                 "clean shared enrollment descriptor has an unsupported schema or protocol",
@@ -139,6 +148,10 @@ impl CleanSharedEnrollmentDescriptorV1 {
 
     pub(crate) const fn baseline_root(&self) -> ContentDigest {
         self.baseline_root
+    }
+
+    pub(crate) const fn baseline_index(&self) -> BlobDescription {
+        self.baseline_index
     }
 
     pub(crate) const fn source_capture(&self) -> BlobDescription {
@@ -429,6 +442,94 @@ struct LazyGenesisManifestV1 {
     segments: Vec<BlobDescription>,
     page_count: u64,
     block_count: u64,
+}
+
+/// Small provider-visible inventory for one immutable lazy-genesis pack.
+///
+/// Large pack files are transported as independently exact bounded chunks;
+/// this record binds their complete byte descriptions without duplicating the
+/// page catalog carried by the manifest itself. The clean shared descriptor
+/// binds this index before it advertises a joinable graph.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LazyGenesisProviderIndexV1 {
+    schema_version: u32,
+    baseline_root: ContentDigest,
+    manifest: BlobDescription,
+    commit: BlobDescription,
+    catalog: BlobDescription,
+    segments: Vec<BlobDescription>,
+    chunk_bytes: u32,
+}
+
+impl LazyGenesisProviderIndexV1 {
+    pub(crate) fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES {
+            return Err(invalid("lazy genesis provider index exceeds its fixed cap"));
+        }
+        let body = bytes
+            .strip_prefix(LAZY_GENESIS_PROVIDER_INDEX_MAGIC)
+            .ok_or_else(|| invalid("lazy genesis provider index has invalid magic"))?;
+        let index: Self = postcard::from_bytes(body).map_err(|error| invalid(error.to_string()))?;
+        index.validate()?;
+        if index.encode()? != bytes {
+            return Err(invalid(
+                "lazy genesis provider index is not canonically encoded",
+            ));
+        }
+        Ok(index)
+    }
+
+    pub(crate) fn encode(&self) -> io::Result<Vec<u8>> {
+        self.validate()?;
+        let body = postcard::to_allocvec(self).map_err(|error| invalid(error.to_string()))?;
+        let mut bytes = Vec::with_capacity(LAZY_GENESIS_PROVIDER_INDEX_MAGIC.len() + body.len());
+        bytes.extend_from_slice(LAZY_GENESIS_PROVIDER_INDEX_MAGIC);
+        bytes.extend_from_slice(&body);
+        if bytes.len() > MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES {
+            return Err(invalid("lazy genesis provider index exceeds its fixed cap"));
+        }
+        Ok(bytes)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.schema_version != LAZY_GENESIS_PROVIDER_INDEX_SCHEMA_VERSION
+            || self.chunk_bytes as usize != LAZY_GENESIS_PROVIDER_CHUNK_BYTES
+            || self.manifest.byte_length() == 0
+            || self.manifest.byte_length() > MAX_LAZY_GENESIS_MANIFEST_BYTES as u64
+            || self.commit.byte_length() == 0
+            || self.commit.byte_length() > 1024
+            || self.catalog.byte_length() == 0
+            || self.catalog.byte_length() > MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES as u64
+            || self.segments.len() > MAX_LAZY_GENESIS_PAGES
+            || self.segments.iter().any(|segment| {
+                segment.byte_length() == 0
+                    || segment.byte_length()
+                        > (MAX_LAZY_GENESIS_CAPSULE_BYTES as u64).saturating_add(8)
+            })
+        {
+            return Err(invalid("lazy genesis provider index is malformed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn baseline_root(&self) -> ContentDigest {
+        self.baseline_root
+    }
+
+    pub(crate) fn file_descriptions(&self) -> Vec<(String, BlobDescription)> {
+        let mut files = Vec::with_capacity(self.segments.len().saturating_add(3));
+        files.push((LAZY_GENESIS_MANIFEST_FILE.into(), self.manifest));
+        files.push((LAZY_GENESIS_COMMIT_FILE.into(), self.commit));
+        files.push(("catalog.snapshot".into(), self.catalog));
+        files.extend(
+            self.segments
+                .iter()
+                .enumerate()
+                .map(|(index, description)| (format!("segment-{index:08}.pack"), *description)),
+        );
+        files
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -819,6 +920,48 @@ impl LazyGenesisCandidate {
 
     pub(crate) fn manifest_bytes(&self) -> &[u8] {
         &self.manifest_bytes
+    }
+
+    pub(crate) fn provider_index(&self) -> io::Result<LazyGenesisProviderIndexV1> {
+        let commit_bytes = read_bounded(&self.scratch.join(LAZY_GENESIS_COMMIT_FILE), 1024)?;
+        let commit = LazyGenesisCommitV1::decode(&commit_bytes)?;
+        if commit.root() != self.root
+            || commit.manifest != BlobDescription::of(&self.manifest_bytes)
+            || commit.workspace_id != self.manifest.workspace_id
+            || commit.lineage_digest != self.manifest.lineage_digest
+            || commit.source_capture != self.manifest.source_capture
+        {
+            return Err(invalid(
+                "lazy genesis sealed files no longer match their provider inventory",
+            ));
+        }
+        let index = LazyGenesisProviderIndexV1 {
+            schema_version: LAZY_GENESIS_PROVIDER_INDEX_SCHEMA_VERSION,
+            baseline_root: self.root,
+            manifest: BlobDescription::of(&self.manifest_bytes),
+            commit: BlobDescription::of(&commit_bytes),
+            catalog: self.manifest.catalog_checkpoint,
+            segments: self.manifest.segments.clone(),
+            chunk_bytes: LAZY_GENESIS_PROVIDER_CHUNK_BYTES as u32,
+        };
+        index.validate()?;
+        Ok(index)
+    }
+
+    pub(crate) fn read_provider_file(&self, name: &str) -> io::Result<Vec<u8>> {
+        let index = self.provider_index()?;
+        let expected = index
+            .file_descriptions()
+            .into_iter()
+            .find_map(|(candidate, description)| (candidate == name).then_some(description))
+            .ok_or_else(|| invalid("lazy genesis provider requested an unknown pack file"))?;
+        let limit = usize::try_from(expected.byte_length())
+            .map_err(|_| invalid("lazy genesis provider file length is not addressable"))?;
+        let bytes = read_bounded(&self.scratch.join(name), limit)?;
+        if BlobDescription::of(&bytes) != expected {
+            return Err(invalid("lazy genesis provider pack file changed"));
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn page_count(&self) -> usize {
@@ -1445,6 +1588,7 @@ mod tests {
         .unwrap();
         let descriptor = CleanSharedEnrollmentDescriptorV1::new(
             marker,
+            BlobDescription::of(b"provider baseline index"),
             catalog_document_id(),
             ContentDigest::of(b"accepted baseline plus tail"),
             DeviceId::from_uuid(Uuid::from_u128(2)),
@@ -1457,6 +1601,10 @@ mod tests {
             descriptor
         );
         assert_eq!(descriptor.baseline_root(), marker.baseline_root());
+        assert_eq!(
+            descriptor.baseline_index(),
+            BlobDescription::of(b"provider baseline index")
+        );
         assert_eq!(descriptor.source_capture(), marker.source_capture());
         assert_eq!(
             descriptor.accepted_frontier_digest(),
