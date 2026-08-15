@@ -8456,6 +8456,9 @@ impl ShardedHotEngine {
         &self,
     ) -> Result<(Arc<ObjectStore>, ProjectionEndpointBinding), EngineError> {
         self.ensure_not_blocked()?;
+        if let Some(error) = &self.history_failure {
+            return Err(error.clone());
+        }
         let archive = self.archive_store.as_ref().ok_or_else(|| {
             EngineError::ProjectionWork("clean runtime has no operation archive".into())
         })?;
@@ -8473,6 +8476,10 @@ impl ShardedHotEngine {
             ));
         }
         Ok((Arc::clone(archive), endpoint))
+    }
+
+    pub(crate) fn require_index_free_clean_projection_runtime(&self) -> Result<(), EngineError> {
+        self.clean_projection_runtime_binding().map(|_| ())
     }
 
     fn has_native_semantic_index_stores(&self) -> bool {

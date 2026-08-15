@@ -1210,6 +1210,7 @@ impl AdmittedLocalAuthorAuthority<'_> {
 
 enum AdmissionProvenance<'a> {
     Promoted(&'a PromotedRuntimeAdmission<'a>),
+    Clean(&'a CleanRuntimeAdmission<'a>),
     UnenrolledPreActivation,
 }
 
@@ -1252,6 +1253,7 @@ impl LocalRuntimeAdmission<'_> {
     ) -> Result<(), RuntimePromotionError> {
         match &self.provenance {
             AdmissionProvenance::Promoted(admission) => admission.authorize_engine(graph, engine),
+            AdmissionProvenance::Clean(admission) => admission.authorize_engine(graph, engine),
             AdmissionProvenance::UnenrolledPreActivation => {
                 // A promoted engine is a real activated user graph. The
                 // pre-activation hatch exists only for fixtures whose engines
@@ -1285,16 +1287,28 @@ impl LocalRuntimeAdmission<'_> {
         endpoint: ProjectionEndpointBinding,
     ) -> Result<AdmittedLocalAuthorAuthority<'a>, RuntimePromotionError> {
         self.authorize(graph, engine)?;
-        let AdmissionProvenance::Promoted(admission) = &self.provenance else {
-            return Err(RuntimePromotionError::Activation(
-                LocalActivationError::RuntimeBinding(
-                    "local author identity requires a live promoted runtime session".into(),
-                ),
-            ));
+        let (admitted_endpoint, admitted_workspace, session_id) = match &self.provenance {
+            AdmissionProvenance::Promoted(admission) => (
+                admission.permit.endpoint(),
+                admission.state.workspace_id,
+                admission.permit.session_id(),
+            ),
+            AdmissionProvenance::Clean(admission) => (
+                admission.endpoint,
+                admission.workspace_id,
+                admission.session_id,
+            ),
+            AdmissionProvenance::UnenrolledPreActivation => {
+                return Err(RuntimePromotionError::Activation(
+                    LocalActivationError::RuntimeBinding(
+                        "local author identity requires a live managed runtime session".into(),
+                    ),
+                ));
+            }
         };
-        if endpoint != admission.permit.endpoint()
-            || endpoint.device_id() != admission.permit.endpoint().device_id()
-            || engine.workspace_id() != admission.state.workspace_id
+        if endpoint != admitted_endpoint
+            || endpoint.device_id() != admitted_endpoint.device_id()
+            || engine.workspace_id() != admitted_workspace
         {
             return Err(RuntimePromotionError::Activation(
                 LocalActivationError::RuntimeBinding(
@@ -1306,7 +1320,7 @@ impl LocalRuntimeAdmission<'_> {
         Ok(AdmittedLocalAuthorAuthority {
             workspace_id: engine.workspace_id(),
             device_id: endpoint.device_id(),
-            session_id: admission.permit.session_id(),
+            session_id,
             generation: engine
                 .local_author_generation()
                 .map_err(RuntimePromotionError::Engine)?,
@@ -1336,6 +1350,7 @@ impl LocalRuntimeAdmission<'_> {
     ) -> Result<(), WorkspaceAuthorityRefusal> {
         match &self.provenance {
             AdmissionProvenance::Promoted(admission) => admission.reprove(boundary),
+            AdmissionProvenance::Clean(admission) => admission.reprove(boundary),
             AdmissionProvenance::UnenrolledPreActivation => Ok(()),
         }
     }
@@ -4175,6 +4190,234 @@ impl PromotedRuntimeAdmission<'_> {
             ArchiveAuthentication::Carried,
         )
         .map(|_| ())
+    }
+}
+
+/// One mutation window for the clean baseline-plus-manifest runtime.
+///
+/// Unlike [`PromotedRuntimeAdmission`], this carries no enrollment/history or
+/// bootstrap-Patricia proof. Its authority is exactly the live engine
+/// identity, source endpoint, graph resource and the while-held archive-rooted
+/// SQLite workspace lease. The accepted manifest and SQLite frontier are
+/// checked by [`CleanLocalRuntime::admit_clean_mutation`] before the fields are
+/// split.
+pub(crate) struct CleanRuntimeAdmission<'a> {
+    workspace_id: WorkspaceId,
+    session_id: SessionId,
+    endpoint: ProjectionEndpointBinding,
+    engine_authority: super::hot_engine::EngineAuthority,
+    workspace: WorkspaceLeaseIdentity<'a>,
+    revocation: &'a RuntimeRevocationLatch,
+    _seal: seal::Seal,
+}
+
+impl CleanRuntimeAdmission<'_> {
+    fn reprove(
+        &self,
+        boundary: WorkspaceAuthorityBoundary,
+    ) -> Result<(), WorkspaceAuthorityRefusal> {
+        self.revocation
+            .reprove_with(boundary, || self.workspace.revalidate())
+    }
+
+    fn authorize_engine(
+        &self,
+        graph: &Graph,
+        engine: &ShardedHotEngine,
+    ) -> Result<(), RuntimePromotionError> {
+        self.revocation
+            .guard(WorkspaceAuthorityBoundary::WindowAuthorization)?;
+        self.workspace.revalidate().map_err(|cause| {
+            RuntimePromotionError::from(
+                self.revocation
+                    .refuse_cause(WorkspaceAuthorityBoundary::WindowAuthorization, cause),
+            )
+        })?;
+        let graph_resource_id = graph.canonical_resource_id().map_err(|error| {
+            RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(
+                error.to_string(),
+            ))
+        })?;
+        if !self.engine_authority.matches(engine.runtime_authority())
+            || engine.workspace_id() != self.workspace_id
+            || graph_resource_id != self.endpoint.graph_resource_id()
+            || engine.projection_endpoint_binding() != Some(self.endpoint)
+        {
+            return Err(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(
+                    "clean runtime admission no longer matches its engine, graph, or endpoint"
+                        .into(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Production runtime shape for the clean managed-storage architecture.
+/// Durable authority lives in the immutable lazy-genesis baseline plus
+/// committed operation manifests; SQLite and this value are disposable
+/// process state. No history/status Patricia or persistent projection queue is
+/// opened by this runtime.
+pub(crate) struct CleanLocalRuntime {
+    session_id: SessionId,
+    endpoint: ProjectionEndpointBinding,
+    engine: Box<ShardedHotEngine>,
+    projection: LeasedWorkspaceProjection,
+    revocation: RuntimeRevocationLatch,
+}
+
+impl CleanLocalRuntime {
+    pub(crate) fn from_open_parts(
+        session_id: SessionId,
+        endpoint: ProjectionEndpointBinding,
+        engine: ShardedHotEngine,
+        projection: LeasedWorkspaceProjection,
+    ) -> Result<Self, RuntimePromotionError> {
+        if engine.projection_endpoint_binding() != Some(endpoint)
+            || engine
+                .require_index_free_clean_projection_runtime()
+                .is_err()
+        {
+            return Err(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(
+                    "clean runtime parts are not index-free or endpoint-bound".into(),
+                ),
+            ));
+        }
+        projection
+            .revalidate_workspace_lease_identity()
+            .map_err(RuntimePromotionError::Sqlite)?;
+        let engine_frontier = engine
+            .accepted_frontier_root()
+            .map_err(RuntimePromotionError::Engine)?;
+        if !engine_frontier.same_accepted_authority(projection.database().required_frontier_root())
+        {
+            return Err(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(
+                    "clean runtime SQLite is not at the accepted manifest frontier".into(),
+                ),
+            ));
+        }
+        Ok(Self {
+            session_id,
+            endpoint,
+            engine: Box::new(engine),
+            projection,
+            revocation: RuntimeRevocationLatch::default(),
+        })
+    }
+
+    pub(crate) fn engine(&self) -> &ShardedHotEngine {
+        &self.engine
+    }
+
+    pub(crate) const fn database(&self) -> &SqliteFrontier {
+        self.projection.database()
+    }
+
+    pub(crate) const fn endpoint(&self) -> ProjectionEndpointBinding {
+        self.endpoint
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) fn workspace_authority_revocation(&self) -> Option<RuntimeRevocation> {
+        self.revocation.latched()
+    }
+
+    pub(crate) fn admit_clean_mutation(
+        &mut self,
+        graph: &Graph,
+    ) -> Result<CleanRuntimeSession<'_>, RuntimePromotionError> {
+        self.revocation
+            .guard(WorkspaceAuthorityBoundary::Admission)?;
+        self.projection
+            .revalidate_workspace_lease_identity()
+            .map_err(RuntimePromotionError::Sqlite)?;
+        let graph_resource_id = graph.canonical_resource_id().map_err(|error| {
+            RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(
+                error.to_string(),
+            ))
+        })?;
+        let engine_frontier = self
+            .engine
+            .accepted_frontier_root()
+            .map_err(RuntimePromotionError::Engine)?;
+        if graph_resource_id != self.endpoint.graph_resource_id()
+            || self.engine.projection_endpoint_binding() != Some(self.endpoint)
+            || self
+                .engine
+                .require_index_free_clean_projection_runtime()
+                .is_err()
+            || !engine_frontier
+                .same_accepted_authority(self.projection.database().required_frontier_root())
+        {
+            return Err(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(
+                    "clean runtime graph, endpoint, engine, or SQLite binding changed".into(),
+                ),
+            ));
+        }
+        let Self {
+            session_id,
+            endpoint,
+            engine,
+            projection,
+            revocation,
+        } = self;
+        let (database, workspace) = projection.database_and_lease_identity();
+        let admission = CleanRuntimeAdmission {
+            workspace_id: engine.workspace_id(),
+            session_id: *session_id,
+            endpoint: *endpoint,
+            engine_authority: engine.runtime_authority().clone(),
+            workspace,
+            revocation,
+            _seal: seal::Seal,
+        };
+        Ok(CleanRuntimeSession {
+            admission,
+            engine,
+            database,
+        })
+    }
+}
+
+pub(crate) struct CleanRuntimeSession<'a> {
+    admission: CleanRuntimeAdmission<'a>,
+    engine: &'a mut ShardedHotEngine,
+    database: &'a mut SqliteFrontier,
+}
+
+impl CleanRuntimeSession<'_> {
+    pub(crate) const fn admission(&self) -> LocalRuntimeAdmission<'_> {
+        LocalRuntimeAdmission {
+            provenance: AdmissionProvenance::Clean(&self.admission),
+        }
+    }
+
+    pub(crate) fn parts(
+        &mut self,
+    ) -> Result<
+        (
+            LocalRuntimeAdmission<'_>,
+            &mut ShardedHotEngine,
+            &mut SqliteFrontier,
+        ),
+        WorkspaceAuthorityRefusal,
+    > {
+        self.admission
+            .reprove(WorkspaceAuthorityBoundary::MutableParts)?;
+        Ok((
+            LocalRuntimeAdmission {
+                provenance: AdmissionProvenance::Clean(&self.admission),
+            },
+            self.engine,
+            self.database,
+        ))
     }
 }
 

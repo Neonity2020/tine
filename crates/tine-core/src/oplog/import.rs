@@ -10283,6 +10283,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::oplog::local_active::CleanLocalRuntime;
+    use crate::oplog::operational_coordinator::{
+        fail_next_clean_after_manifest_for_harness, CleanLocalMutationState, OperationalCoordinator,
+    };
     use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
         execute_manifested_projection_work, write_projection_exact, AcceptedBatchEvent,
@@ -13009,7 +13013,6 @@ mod tests {
             0
         );
 
-        let edit_batch = BatchId::from_uuid(Uuid::from_u128(0x5a20));
         let endpoint = ProjectionEndpointBinding::enroll_graph(
             &graph,
             ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5a21)),
@@ -13030,49 +13033,97 @@ mod tests {
             content: "edited after clean activation".into(),
         }])
         .unwrap();
-        let draft = clean_engine
-            .draft_author_transaction(
-                AuthorBatch {
-                    batch_id: edit_batch,
-                    author_device_id: endpoint.device_id,
-                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5a23)),
-                    crdt_peer_id: CrdtPeerId::from_u64(0x5a24),
-                },
-                BatchOrigin::LocalMutation,
+        let mut clean_runtime = CleanLocalRuntime::from_open_parts(
+            SessionId::from_uuid(Uuid::from_u128(0x5a23)),
+            endpoint,
+            clean_engine,
+            leased_projection,
+        )
+        .unwrap();
+        let projection_fault =
+            crate::oplog::projection::fail_next_manifested_projection_during_write_for_harness();
+        let state = {
+            let mut session = clean_runtime.admit_clean_mutation(&graph).unwrap();
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &graph,
+                &receipts,
                 &transaction,
             )
-            .unwrap();
-        let prepared = clean_engine
-            .finalize_author_transaction(draft, &graph, &receipts, endpoint)
-            .unwrap();
-        let identity = leased_projection
-            .database()
-            .preflight_prepared_identity_transition(&clean_engine, &prepared)
-            .unwrap();
-        let outcome = clean_engine.commit_clean_local_prepared(&prepared).unwrap();
-        assert!(matches!(
-            outcome.disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert_eq!(runtime_store.committed_manifests().unwrap().len(), 1);
-        let event = AcceptedBatchEvent::from_accepted(&clean_engine, &runtime_store, edit_batch)
             .unwrap()
-            .with_prepared_identity_transition(identity)
-            .unwrap();
-        leased_projection
-            .database_and_lease_identity()
-            .0
-            .apply_engine_owned_accepted(&event, &clean_engine)
-            .unwrap();
+        };
+        let pending = match state {
+            CleanLocalMutationState::DurablePending(pending) => pending,
+            CleanLocalMutationState::Complete(_) => {
+                panic!("injected projection failure unexpectedly completed clean mutation")
+            }
+        };
+        drop(projection_fault);
+        let first_batch = pending.batch_id();
+        assert_eq!(runtime_store.committed_manifests().unwrap().len(), 1);
         assert_eq!(
-            leased_projection
+            clean_runtime
                 .database()
                 .materialized_read()
                 .unwrap()
                 .acceptance_sequence(),
-            1
+            1,
+            "SQLite is applied before the deliberately failed Markdown projection"
         );
-        let clean_work = clean_engine
+        let retry = {
+            let mut session = clean_runtime.admit_clean_mutation(&graph).unwrap();
+            OperationalCoordinator::retry_clean_local(&mut session, &graph, &receipts, pending)
+        };
+        match retry {
+            CleanLocalMutationState::Complete(batch_id) => assert_eq!(batch_id, first_batch),
+            CleanLocalMutationState::DurablePending(pending) => {
+                panic!(
+                    "clean continuation retry remained pending: {}",
+                    pending.failure()
+                )
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(graph.resolve_rel("pages/alpha.md").unwrap()).unwrap(),
+            "- edited after clean activation\n",
+            "the clean runtime continuation must finish the exact durable operation"
+        );
+
+        let interrupted = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: edited_block,
+            content: "edited after clean runtime crash".into(),
+        }])
+        .unwrap();
+        fail_next_clean_after_manifest_for_harness();
+        let state = {
+            let mut session = clean_runtime.admit_clean_mutation(&graph).unwrap();
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &graph,
+                &receipts,
+                &interrupted,
+            )
+            .unwrap()
+        };
+        let pending = match state {
+            CleanLocalMutationState::DurablePending(pending) => pending,
+            CleanLocalMutationState::Complete(_) => {
+                panic!("post-manifest cut unexpectedly completed clean projection")
+            }
+        };
+        let edit_batch = pending.batch_id();
+        assert_eq!(runtime_store.committed_manifests().unwrap().len(), 2);
+        assert_eq!(
+            clean_runtime
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            1,
+            "the second deliberate cut is immediately after manifest commit and before SQLite"
+        );
+        let clean_work = clean_runtime
+            .engine()
             .clean_projection_work_for_batch(edit_batch)
             .unwrap();
         assert_eq!(
@@ -13080,26 +13131,15 @@ mod tests {
             1,
             "the accepted manifest itself must derive the one local projection row"
         );
-        let projection_fault =
-            crate::oplog::projection::fail_next_manifested_projection_during_write_for_harness();
-        assert!(
-            crate::oplog::projection::execute_clean_manifested_projection_work(
-                &graph,
-                &receipts,
-                leased_projection.database(),
-                &mut clean_engine,
-                &clean_work[0],
-            )
-            .is_err()
-        );
-        drop(projection_fault);
         assert_eq!(
             std::fs::read_to_string(graph.resolve_rel("pages/alpha.md").unwrap()).unwrap(),
-            "- alpha [[Beta]]\n",
-            "the injected cut is after durable acceptance but before the Markdown mutation"
+            "- edited after clean activation\n",
+            "the second cut leaves the prior committed projection visible"
         );
-        drop(leased_projection);
-        drop(clean_engine);
+        drop(pending);
+        drop(clean_runtime);
+        drop(graph);
+        let graph = Graph::open(&root.path().join("graph"));
         fs::write(&database, b"corrupt disposable SQLite after durable edit").unwrap();
         let rebuilt = open_clean_activation(
             &clean_enrollment,
@@ -13135,22 +13175,25 @@ mod tests {
                 ObjectStore::open(&operation_archive_path, workspace).unwrap(),
             )
             .unwrap();
-        assert_eq!(rebuilt_engine.replay_clean_committed_tail().unwrap(), 1);
+        assert_eq!(rebuilt_engine.replay_clean_committed_tail().unwrap(), 2);
         assert_eq!(
             rebuilt_engine
                 .accepted_frontier_root()
                 .unwrap()
                 .acceptance_sequence(),
-            1,
+            2,
             "cold replay derives accepted state from manifests without a history Patricia"
         );
         let rebuilt_store = ObjectStore::open(&operation_archive_path, workspace).unwrap();
+        let first_event =
+            AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, first_batch)
+                .unwrap();
         let replayed_event =
             AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, edit_batch).unwrap();
         assert_eq!(
             replayed_event.prior_frontier_root(),
-            &baseline_frontier,
-            "cold manifest replay must retain the lazy-genesis frontier as event F"
+            first_event.post_frontier_root(),
+            "cold manifest replay must retain the first committed edit as the second event's F"
         );
         let cold_materialization =
             crate::oplog::sqlite::materialize_accepted_event(&rebuilt_engine, &replayed_event)
@@ -13191,7 +13234,7 @@ mod tests {
                 .materialized_read()
                 .unwrap()
                 .acceptance_sequence(),
-            1,
+            2,
             "missing/corrupt SQLite rebuilds through the manifest-committed edit"
         );
         rebuilt_engine
@@ -13225,7 +13268,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(graph.resolve_rel("pages/alpha.md").unwrap()).unwrap(),
-            "- edited after clean activation\n",
+            "- edited after clean runtime crash\n",
             "cold manifest-derived recovery must finish the interrupted Markdown projection"
         );
         crate::oplog::projection::execute_clean_manifested_projection_work(

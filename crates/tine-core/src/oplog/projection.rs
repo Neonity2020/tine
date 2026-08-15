@@ -1931,6 +1931,24 @@ pub(crate) fn execute_clean_manifested_projection_work(
     )
 }
 
+pub(crate) fn execute_clean_manifested_projection_work_under_handoff(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    projection: &SqliteFrontier,
+    engine: &mut ShardedHotEngine,
+    work: &ProjectionWork,
+    handoff: &crate::model::PublishedHandoffLatch,
+) -> Result<(), ProjectionError> {
+    execute_manifested_projection_work_with_runtime(
+        graph,
+        receipts,
+        engine,
+        ManifestedProjectionRuntime::Clean { projection },
+        work,
+        Some(handoff),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum ManifestedProjectionRuntime<'a> {
     Legacy {
