@@ -324,6 +324,9 @@ impl MaterializationChange {
         let mut input_budget = MaterializationInputBudget::default();
         input_budget.add_pages(replacements.len())?;
         input_budget.add_pages(deletions.len())?;
+        for page in &mut replacements {
+            canonicalize_page_blocks(page);
+        }
         replacements.sort_unstable_by_key(|page| page.page_id);
         deletions.sort_unstable();
         let change = Self {
@@ -761,6 +764,12 @@ impl MaterializationChange {
         }
         Ok(())
     }
+}
+
+fn canonicalize_page_blocks(page: &mut MaterializedPageInput) {
+    page.blocks.sort_unstable_by(|left, right| {
+        (&left.order, left.block_id).cmp(&(&right.order, right.block_id))
+    });
 }
 
 #[derive(Default)]
@@ -1514,6 +1523,9 @@ pub(crate) struct TerminalMaterializationChunk {
 pub(crate) fn lower_terminal_chunk(
     mut chunk: TerminalMaterializationChunk,
 ) -> Result<storage::PhysicalTerminalMaterializationChunk, MaterializationError> {
+    for page in &mut chunk.pages {
+        canonicalize_page_blocks(page);
+    }
     chunk.pages.sort_unstable_by_key(|page| page.page_id);
     chunk.postings.sort_unstable();
     chunk.aliases.sort_unstable();
@@ -3142,6 +3154,81 @@ mod tests {
         }
     }
 
+    fn block_input(
+        block_id: BlockId,
+        home_document_id: DocumentId,
+        parent: Option<BlockId>,
+        order: &str,
+    ) -> MaterializedBlockInput {
+        MaterializedBlockInput {
+            block_id,
+            home_document_id,
+            parent,
+            order: order.into(),
+            content: block_id.to_string(),
+            searchable_text: block_id.to_string(),
+            heading_level: None,
+            collapsed: false,
+            logseq_uuid: None,
+            logseq_identity_origin: None,
+            references: Vec::new(),
+            properties: Vec::new(),
+            tags: Vec::new(),
+            task: None,
+        }
+    }
+
+    #[test]
+    fn materialization_boundaries_canonicalize_nested_outline_traversal_rows() {
+        let page_id = page_id(310_000);
+        let home_document_id = document_id(310_001);
+        let root = block_id(310_030);
+        let child = block_id(310_020);
+        let sibling = block_id(310_010);
+        let mut page = page_input(page_id, "nested traversal".into());
+        page.home_document_id = home_document_id;
+        page.blocks = vec![
+            block_input(root, home_document_id, None, "0000000000"),
+            block_input(child, home_document_id, Some(root), "0000000000"),
+            block_input(sibling, home_document_id, None, "0000000001"),
+        ];
+
+        let change = MaterializationChange::new(batch_id(310_002), vec![page.clone()], Vec::new())
+            .expect("nested traversal order is a valid materialization input");
+        assert_eq!(
+            change.replacements()[0]
+                .blocks
+                .iter()
+                .map(|block| block.block_id)
+                .collect::<Vec<_>>(),
+            vec![child, root, sibling]
+        );
+        assert_eq!(change.replacements()[0].blocks[0].parent, Some(root));
+
+        let physical = lower_terminal_chunk(TerminalMaterializationChunk {
+            pages: vec![page],
+            postings: Vec::new(),
+            aliases: Vec::new(),
+        })
+        .expect("terminal bootstrap accepts the same nested traversal order");
+        assert_eq!(
+            physical.pages[0]
+                .blocks
+                .iter()
+                .map(|block| block.block_id)
+                .collect::<Vec<_>>(),
+            vec![
+                child.as_uuid().into_bytes(),
+                root.as_uuid().into_bytes(),
+                sibling.as_uuid().into_bytes(),
+            ]
+        );
+        assert_eq!(
+            physical.pages[0].blocks[0].parent,
+            Some(root.as_uuid().into_bytes())
+        );
+    }
+
     #[test]
     fn terminal_lowering_seeds_true_baseline_identity_records() {
         let page_id = page_id(311_000);
@@ -3396,7 +3483,7 @@ mod tests {
 
     #[test]
     fn materialization_input_schema_refuses_prior_and_future_before_sqlite_write() {
-        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 5);
+        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 6);
         let current = MaterializationChange::new(
             batch_id(500_000),
             vec![page_input(page_id(500_001), "current".into())],

@@ -13239,7 +13239,7 @@ mod tests {
             &[
                 (
                     "pages/alpha.md",
-                    "title:: Alpha\nalias:: A\n\n- TODO [#A] one [[Beta]] #work\n  id:: 00000000-0000-0000-0000-000000000041\n",
+                    "title:: Alpha\nalias:: A\n\n- TODO [#A] one [[Beta]] #work\n  id:: 00000000-0000-0000-0000-000000000041\n  - nested child\n- root sibling\n",
                 ),
                 (
                     "pages/beta.md",
