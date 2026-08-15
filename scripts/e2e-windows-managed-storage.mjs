@@ -201,23 +201,41 @@ async function clickButton(text) {
 }
 
 async function clickButtonAndConfirm(text) {
-  // WebDriver cannot address native Windows dialogs. Start a hidden helper
-  // before the click because the click command itself waits while the modal is
-  // open; Enter accepts the dialog's default affirmative button without
-  // depending on a localized mnemonic.
+  // WebDriver cannot address native Windows dialogs. Start a UI Automation
+  // helper before the click because the click command itself waits while the
+  // modal is open. The helper proves that it found Tine's dialog with the
+  // expected message before invoking the affirmative button; keyboard focus
+  // and runner timing are deliberately irrelevant.
+  const applicationPid = webviewTarget.applicationProcess?.pid;
+  if (!applicationPid) throw new Error(`native confirmation requires the Tine process id for ${text}`);
+  let helperStdout = "";
+  let helperStderr = "";
   const confirmer = spawn("powershell.exe", [
     "-NoProfile",
     "-NonInteractive",
-    "-Command",
-    "Start-Sleep -Milliseconds 750; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')",
-  ], { windowsHide: true, stdio: "ignore" });
+    "-File",
+    path.resolve("scripts/windows-confirm-dialog.ps1"),
+    "-ProcessId",
+    String(applicationPid),
+    "-ExpectedText",
+    text.replace(/\.\.\.$/, ""),
+    "-TimeoutSeconds",
+    "20",
+  ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  confirmer.stdout.on("data", (chunk) => { helperStdout += chunk; });
+  confirmer.stderr.on("data", (chunk) => { helperStderr += chunk; });
   const completed = new Promise((resolve) => {
     confirmer.once("exit", (code) => resolve(code));
     confirmer.once("error", () => resolve(-1));
   });
   await clickButton(text);
   const exitCode = await completed;
-  if (exitCode !== 0) throw new Error(`native confirmation helper failed for ${text}: exit ${exitCode}`);
+  if (exitCode !== 0) {
+    throw new Error(
+      `native confirmation helper failed for ${text}: exit ${exitCode}; ` +
+      `stdout=${helperStdout.trim()}; stderr=${helperStderr.trim()}`
+    );
+  }
 }
 
 async function openManagedSettings(expectedAction) {
