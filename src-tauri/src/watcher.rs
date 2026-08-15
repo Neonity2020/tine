@@ -901,6 +901,12 @@ fn sparse_provider_observations(
     (exact, imprecise)
 }
 
+fn sparse_provider_lane_is_active(
+    shared_phase: Option<tine_core::sync_runtime::SyncSharedPhase>,
+) -> bool {
+    shared_phase == Some(tine_core::sync_runtime::SyncSharedPhase::Active)
+}
+
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
 /// them into the cache, emitting `graph-changed` so the UI can reload. Two
 /// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
@@ -1159,6 +1165,21 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let retry_due = graph.retry.take_due(Instant::now());
                 let initial_tick = std::mem::take(&mut graph.initial_tick);
                 let poll_cycle = !inotify && !retry_due;
+                // A graph may contain another device's shared provider tree
+                // while this device has enabled only local managed storage.
+                // Provider callbacks are advisory and belong exclusively to a
+                // SharedActive actor; routing poll/event noise to a local-only
+                // actor makes the actor correctly refuse it, but then turns a
+                // harmless on-disk namespace into an endless retry/toast loop.
+                // Ignore provider observations until this device has actually
+                // joined or initiated sharing. The SharedActive transition
+                // schedules its own initial provider scan, and later poll or
+                // exact events continue through this lane.
+                let provider_lane_active = graph
+                    .handle
+                    .status()
+                    .map(|status| sparse_provider_lane_is_active(status.shared_phase))
+                    .unwrap_or(false);
                 // The actor's startup scan can finish before this thread has
                 // replaced the legacy directory watches with the recursive
                 // graph-root watch. One scan after watch installation closes
@@ -1172,7 +1193,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 );
                 let (provider_paths, provider_imprecise) =
                     sparse_provider_observations(&graph.root, &paths, &full_paths);
-                let provider_poll = poll_cycle;
+                let provider_poll = poll_cycle && provider_lane_active;
                 if observations.is_empty()
                     && provider_paths.is_empty()
                     && !provider_imprecise
@@ -1185,7 +1206,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 }
 
                 let result = (|| {
-                    if !provider_paths.is_empty() || provider_imprecise || provider_poll {
+                    if provider_lane_active
+                        && (!provider_paths.is_empty() || provider_imprecise || provider_poll)
+                    {
                         graph.handle.observe_provider_paths(
                             provider_paths,
                             provider_imprecise || provider_poll,
@@ -1646,6 +1669,22 @@ mod tests {
             sparse_provider_observations(&root, &HashSet::new(), &HashSet::new());
         assert!(provider_paths.is_empty());
         assert!(!imprecise);
+    }
+
+    #[test]
+    fn provider_events_are_routed_only_after_this_device_activates_sharing() {
+        use tine_core::sync_runtime::SyncSharedPhase;
+
+        assert!(!sparse_provider_lane_is_active(None));
+        assert!(!sparse_provider_lane_is_active(Some(
+            SyncSharedPhase::SharePrepared
+        )));
+        assert!(!sparse_provider_lane_is_active(Some(
+            SyncSharedPhase::Joining
+        )));
+        assert!(sparse_provider_lane_is_active(Some(
+            SyncSharedPhase::Active
+        )));
     }
 
     #[test]
