@@ -10285,10 +10285,11 @@ mod tests {
     use super::*;
     use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
-        execute_manifested_projection_work, write_projection_exact, ApplicationRuntimeRoot,
-        AuthorBatch, BatchDisposition, BatchId, BlockLocation, CrdtPeerId, DeviceId, DocumentId,
-        LineageDigest, ManagedTextKind, ObjectStore, OperationTransaction, PortablePathIndexRoot,
-        PreparedBatch, ProjectionClaim, ProjectionEndpointBinding, ProjectionEndpointId,
+        execute_manifested_projection_work, write_projection_exact, AcceptedBatchEvent,
+        ApplicationRuntimeRoot, AuthorBatch, BatchDisposition, BatchId, BatchOrigin, BlockLocation,
+        CrdtPeerId, DeviceId, DocumentId, LineageDigest, ManagedTextKind, ObjectStore,
+        OperationTransaction, PortablePathIndexRoot, PreparedBatch, ProjectionClaim,
+        ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore,
         ProjectionRecovery, RebuildSource, SemanticEffect, SemanticOperation, SessionId,
         SqliteFrontier, MAX_MATERIALIZATION_QUERY_ROWS,
     };
@@ -12886,6 +12887,26 @@ mod tests {
 
         assert_eq!(preparation.instrumentation().source_files, 2);
         assert_eq!(preparation.candidates().baseline().page_count(), 2);
+        let first_page = preparation
+            .candidates()
+            .baseline()
+            .page_ids()
+            .next()
+            .expect("clean baseline has a page");
+        let first_page = preparation
+            .candidates()
+            .baseline()
+            .page(first_page)
+            .unwrap()
+            .expect("clean baseline page remains addressable");
+        let first_block = first_page
+            .blocks
+            .first()
+            .expect("clean baseline page has a block");
+        let edited_block = BlockLocation {
+            block_id: first_block.block_id,
+            home_document_id: first_block.home_document_id,
+        };
         assert_eq!(
             preparation
                 .candidates()
@@ -12913,10 +12934,10 @@ mod tests {
             crate::oplog::lazy_genesis::read_activation_marker(&clean_enrollment).unwrap(),
             Some(committed.marker())
         );
-        let (baseline, physical, root, marker) = committed.into_parts();
+        let (baseline, physical, baseline_frontier, marker) = committed.into_parts();
         assert_eq!(
             crate::oplog::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline).unwrap(),
-            root
+            baseline_frontier
         );
         assert_eq!(baseline.root(), marker.baseline_root());
         assert!(physical.load_all_batches().unwrap().is_empty());
@@ -12936,7 +12957,7 @@ mod tests {
         assert_eq!(reopened.marker(), marker);
         assert_eq!(
             reopened.engine().accepted_frontier_root().unwrap(),
-            root,
+            baseline_frontier,
             "cold open derives the exact sequence-zero frontier from the baseline"
         );
         assert_eq!(
@@ -12966,7 +12987,7 @@ mod tests {
                 workspace,
                 LineageDigest::of(b"inactive-streaming-bootstrap-test"),
             ),
-            &root,
+            &baseline_frontier,
             &runtime_store,
             &clean_engine,
             clean_projection,
@@ -12975,7 +12996,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             leased_projection.database().frontier_root().unwrap(),
-            root,
+            baseline_frontier,
             "lease-bound clean projection must retain the exact baseline frontier"
         );
         let (database_handle, lease_identity) = leased_projection.database_and_lease_identity();
@@ -12987,9 +13008,73 @@ mod tests {
                 .acceptance_sequence(),
             0
         );
+
+        let edit_batch = BatchId::from_uuid(Uuid::from_u128(0x5a20));
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5a21)),
+            DeviceId::from_uuid(Uuid::from_u128(0x5a22)),
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &root.path().join("clean-receipts"),
+            workspace,
+            endpoint,
+        )
+        .unwrap();
+        clean_engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: edited_block,
+            content: "edited after clean activation".into(),
+        }])
+        .unwrap();
+        let draft = clean_engine
+            .draft_author_transaction(
+                AuthorBatch {
+                    batch_id: edit_batch,
+                    author_device_id: endpoint.device_id,
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5a23)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0x5a24),
+                },
+                BatchOrigin::LocalMutation,
+                &transaction,
+            )
+            .unwrap();
+        let prepared = clean_engine
+            .finalize_author_transaction(draft, &graph, &receipts, endpoint)
+            .unwrap();
+        let identity = leased_projection
+            .database()
+            .preflight_prepared_identity_transition(&clean_engine, &prepared)
+            .unwrap();
+        let outcome = clean_engine.commit_clean_local_prepared(&prepared).unwrap();
+        assert!(matches!(
+            outcome.disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert_eq!(runtime_store.committed_manifests().unwrap().len(), 1);
+        let event = AcceptedBatchEvent::from_accepted(&clean_engine, &runtime_store, edit_batch)
+            .unwrap()
+            .with_prepared_identity_transition(identity)
+            .unwrap();
+        leased_projection
+            .database_and_lease_identity()
+            .0
+            .apply_engine_owned_accepted(&event, &clean_engine)
+            .unwrap();
+        assert_eq!(
+            leased_projection
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            1
+        );
         drop(leased_projection);
         drop(clean_engine);
-        fs::write(&database, b"corrupt disposable SQLite").unwrap();
+        fs::write(&database, b"corrupt disposable SQLite after durable edit").unwrap();
         let rebuilt = open_clean_activation(
             &clean_enrollment,
             &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
@@ -13000,20 +13085,75 @@ mod tests {
         .unwrap()
         .expect("corrupt SQLite rebuilds from the baseline");
         assert_eq!(rebuilt.marker(), marker);
-        assert_eq!(rebuilt.engine().accepted_frontier_root().unwrap(), root);
+        assert_eq!(
+            rebuilt.engine().accepted_frontier_root().unwrap(),
+            baseline_frontier
+        );
         assert_eq!(
             rebuilt
                 .engine()
                 .lazy_genesis_resident_page_documents_for_test(),
             0
         );
-        let (_, rebuilt_projection, _) = rebuilt.into_parts();
+        let (mut rebuilt_engine, rebuilt_projection, _) = rebuilt.into_parts();
         assert_eq!(
             rebuilt_projection
                 .materialized_row_digests_by_table()
                 .unwrap(),
             original_projection_rows,
-            "SQLite rebuilt from exact baseline bytes must reproduce every physical row family"
+            "the clean activation opener first reconstructs the exact sequence-zero projection"
+        );
+        drop(rebuilt_projection);
+        rebuilt_engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&operation_archive_path, workspace).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(rebuilt_engine.replay_clean_committed_tail().unwrap(), 1);
+        assert_eq!(
+            rebuilt_engine
+                .accepted_frontier_root()
+                .unwrap()
+                .acceptance_sequence(),
+            1,
+            "cold replay derives accepted state from manifests without a history Patricia"
+        );
+        let rebuilt_store = ObjectStore::open(&operation_archive_path, workspace).unwrap();
+        let replayed_event =
+            AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, edit_batch).unwrap();
+        assert_eq!(
+            replayed_event.prior_frontier_root(),
+            &baseline_frontier,
+            "cold manifest replay must retain the lazy-genesis frontier as event F"
+        );
+        let rebuilt_lease = WorkspaceRuntimeLease::acquire(&rebuilt_store, workspace).unwrap();
+        let application_runtime =
+            ApplicationRuntimeRoot::open_for_test(&root.path().join("clean-runtime")).unwrap();
+        let rebuilt_source = RebuildSource::new(&rebuilt_engine, &rebuilt_store).unwrap();
+        let (rebuilt_projection, ()) =
+            LeasedWorkspaceProjection::open_under(rebuilt_lease, |slot| {
+                let opened = SqliteFrontier::open_or_rebuild_with_applier_slot(
+                    &database,
+                    &application_runtime,
+                    ProjectionClaim::current(
+                        workspace,
+                        LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+                    ),
+                    rebuilt_source,
+                    slot,
+                )?;
+                Ok::<_, crate::oplog::sqlite::ProjectionError>((opened, ()))
+            })
+            .map_err(|(_, error)| error)
+            .unwrap();
+        assert_eq!(
+            rebuilt_projection
+                .database()
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            1,
+            "missing/corrupt SQLite rebuilds through the manifest-committed edit"
         );
     }
 

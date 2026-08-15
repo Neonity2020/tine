@@ -744,6 +744,13 @@ pub struct RebuildSource<'a> {
 
 enum RebuildLoader<'a> {
     Ordinary,
+    /// A sequence-zero lazy-genesis baseline followed only by ordinary
+    /// manifest-committed operations. SQLite is rebuilt once from the exact
+    /// terminal state rather than replaying page rows at every intermediate
+    /// event.
+    LazyGenesisAnchored {
+        baseline: AcceptedFrontierRoot,
+    },
     InactiveBootstrap {
         publication: &'a ValidatedBootstrapPublicationV1,
     },
@@ -811,10 +818,16 @@ impl<'a> RebuildSource<'a> {
         let accepted_batch_count = engine
             .accepted_batch_count()
             .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+        let loader = engine
+            .lazy_genesis_baseline_frontier_root()
+            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?
+            .map_or(RebuildLoader::Ordinary, |baseline| {
+                RebuildLoader::LazyGenesisAnchored { baseline }
+            });
         Ok(Self {
             engine,
             store,
-            loader: RebuildLoader::Ordinary,
+            loader,
             runtime_authority: engine.runtime_authority().clone(),
             exact_frontier_root,
             accepted_batch_count,
@@ -900,7 +913,7 @@ impl<'a> RebuildSource<'a> {
         indexed_evidence: Option<&super::AcceptedBatchEvidence>,
     ) -> Result<(AcceptedBatchEvent, Option<usize>), ProjectionError> {
         match &self.loader {
-            RebuildLoader::Ordinary => {
+            RebuildLoader::Ordinary | RebuildLoader::LazyGenesisAnchored { .. } => {
                 let event = match indexed_evidence {
                     Some(evidence) => AcceptedBatchEvent::from_indexed(
                         self.engine,
@@ -4488,9 +4501,18 @@ impl SqliteFrontier {
             source,
             None,
             terminal_projection_sink,
-        )?;
+        )
+        .map_err(|error| {
+            ProjectionError::Rebuild(format!(
+                "fresh SQLite candidate construction failed: {error}"
+            ))
+        })?;
         built.2.terminal_construction_refusals = refused;
-        Self::publish_candidate(path, claim, lease, source, built)
+        Self::publish_candidate(path, claim, lease, source, built).map_err(|error| {
+            ProjectionError::Rebuild(format!(
+                "fresh SQLite candidate publication failed: {error}"
+            ))
+        })
     }
 
     fn build_candidate(
@@ -4515,8 +4537,19 @@ impl SqliteFrontier {
             claim,
             lease,
             source.runtime_authority.clone(),
-        )?;
-        candidate.require_frontier(&source.exact_frontier_root)?;
+        )
+        .map_err(|error| {
+            ProjectionError::Rebuild(format!(
+                "fresh SQLite candidate initialization failed: {error}"
+            ))
+        })?;
+        candidate
+            .require_frontier(&source.exact_frontier_root)
+            .map_err(|error| {
+                ProjectionError::Rebuild(format!(
+                    "fresh SQLite candidate could not bind its required frontier: {error}"
+                ))
+            })?;
         let streamed = match terminal {
             Some(material) => candidate.terminal_stream(source, material, terminal_projection_sink),
             None => candidate.rebuild_stream(source, terminal_projection_sink),
@@ -4778,7 +4811,7 @@ impl SqliteFrontier {
 
     /// Apply one accepted event using only projection data derived by the
     /// bound engine at the event's authenticated accepted root.
-    fn apply_engine_owned_accepted(
+    pub(crate) fn apply_engine_owned_accepted(
         &mut self,
         event: &AcceptedBatchEvent,
         engine: &ShardedHotEngine,
@@ -5254,7 +5287,11 @@ impl SqliteFrontier {
             instrumentation.accepted_events_applied += 1;
             maybe_abort_rebuild_test(instrumentation.accepted_events_applied);
         }
-        let reached = read_frontier_root(&self.physical)?;
+        let reached = read_frontier_root(&self.physical).map_err(|error| {
+            ProjectionError::Rebuild(format!(
+                "terminal replay could not read its reached frontier: {error}"
+            ))
+        })?;
         if reached != source.exact_frontier_root
             || reached.acceptance_sequence() != source.accepted_batch_count
         {
@@ -5266,7 +5303,12 @@ impl SqliteFrontier {
         let terminal_physical_root = lower_physical_frontier_root(&reached)?;
         let terminal_documents = terminal_documents.into_values().collect::<Vec<_>>();
         self.physical
-            .seed_terminal_frontier_documents(&terminal_physical_root, &terminal_documents)?;
+            .seed_terminal_frontier_documents(&terminal_physical_root, &terminal_documents)
+            .map_err(|error| {
+                ProjectionError::Rebuild(format!(
+                    "terminal replay could not seed the authenticated document frontier: {error}"
+                ))
+            })?;
         bootstrap.terminal_frontier_bulk_seeds = 1;
         bootstrap.terminal_frontier_documents_seeded = terminal_documents.len();
         trace_terminal_phase("accepted prefix seed", prefix_started);
@@ -5363,6 +5405,7 @@ impl SqliteFrontier {
             source.loader,
             RebuildLoader::InactiveBootstrap { .. }
                 | RebuildLoader::PromotedBootstrapAnchored { .. }
+                | RebuildLoader::LazyGenesisAnchored { .. }
         ) {
             return Err(ProjectionError::Rebuild(
                 "terminal archive replay requires bootstrap-anchored authority".into(),
@@ -5373,17 +5416,44 @@ impl SqliteFrontier {
         let writes_before = self.physical.write_instrumentation();
         self.physical.begin_candidate_build()?;
         self.physical.begin_terminal_bootstrap_construction()?;
+        if let RebuildLoader::LazyGenesisAnchored { baseline } = &source.loader {
+            self.physical
+                .seed_lazy_genesis_frontier(&lower_physical_frontier_root(baseline)?)
+                .map_err(|error| {
+                    ProjectionError::Rebuild(format!(
+                        "lazy-genesis SQLite rebuild could not install its sequence-zero anchor: {error}"
+                    ))
+                })?;
+        }
         let prefix_started = std::time::Instant::now();
         let mut provenance = Vec::new();
         let mut terminal_documents = BTreeMap::new();
         let mut cursor = source.cursor()?;
-        while let Some(event) = cursor.next_event()? {
+        while let Some(event) = cursor.next_event().map_err(|error| {
+            ProjectionError::Rebuild(format!(
+                "terminal replay could not reconstruct its next accepted event: {error}"
+            ))
+        })? {
             instrumentation.accepted_events_validated += 1;
             instrumentation.max_live_events = instrumentation.max_live_events.max(1);
             instrumentation.max_live_evidence_records =
                 instrumentation.max_live_evidence_records.max(1);
-            authenticate_event_for_engine(engine, &event)?;
-            let (_, apply_stats) = self.apply_terminal_prefix_candidate_with_stats(&event)?;
+            authenticate_event_for_engine(engine, &event).map_err(|error| {
+                ProjectionError::Rebuild(format!(
+                    "terminal replay could not authenticate accepted batch {} at sequence {} against the clean engine: {error}",
+                    event.batch_id(),
+                    event.acceptance_sequence(),
+                ))
+            })?;
+            let (_, apply_stats) = self
+                .apply_terminal_prefix_candidate_with_stats(&event)
+                .map_err(|error| {
+                    ProjectionError::Rebuild(format!(
+                        "lazy/bootstrap terminal replay could not apply accepted batch {} at sequence {}: {error}",
+                        event.batch_id(),
+                        event.acceptance_sequence(),
+                    ))
+                })?;
             for document in event.affected_documents() {
                 terminal_documents.insert(
                     document.document_id().as_uuid().into_bytes(),
@@ -5417,7 +5487,11 @@ impl SqliteFrontier {
         let mut bootstrap = cursor.bootstrap_instrumentation();
         bootstrap.terminal_archive_replays = 1;
 
-        let reached = read_frontier_root(&self.physical)?;
+        let reached = read_frontier_root(&self.physical).map_err(|error| {
+            ProjectionError::Rebuild(format!(
+                "terminal archive replay could not read its reached frontier: {error}"
+            ))
+        })?;
         if reached != source.exact_frontier_root
             || reached.acceptance_sequence() != source.accepted_batch_count
         {
@@ -5426,24 +5500,67 @@ impl SqliteFrontier {
             ));
         }
         let terminal_physical_root = lower_physical_frontier_root(&reached)?;
-        let terminal_documents = terminal_documents.into_values().collect::<Vec<_>>();
-        self.physical
-            .seed_terminal_frontier_documents(&terminal_physical_root, &terminal_documents)?;
+        // A lazy-genesis frontier is sparse by design: immutable baseline
+        // documents remain in the baseline pack and this authenticated map
+        // contains only current dependencies that differ from the baseline.
+        // Reconstruct it from the exact terminal engine state rather than the
+        // union of event effects: a later event may restore a document exactly
+        // to its baseline state. The derived page/query rows seeded below still
+        // cover the complete current graph.
+        let terminal_documents =
+            if matches!(source.loader, RebuildLoader::LazyGenesisAnchored { .. }) {
+                source
+                    .engine
+                    .clean_current_frontier_overlay_documents(&reached)
+                    .map_err(ProjectionError::materialization_from_engine)?
+                    .into_iter()
+                    .map(|document| {
+                        Ok(storage_frontier::PhysicalFrontierDocument {
+                            document_id: document.document_id().as_uuid().into_bytes(),
+                            canonical_bytes: encode_frontier_document(&document)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ProjectionError>>()?
+            } else {
+                terminal_documents.into_values().collect::<Vec<_>>()
+            };
+        let expected_terminal_frontier_documents = terminal_documents.len();
+        let seeded_frontier = if matches!(source.loader, RebuildLoader::LazyGenesisAnchored { .. })
+        {
+            self.physical.seed_sparse_terminal_frontier_documents(
+                &terminal_physical_root,
+                &terminal_documents,
+            )
+        } else {
+            self.physical
+                .seed_terminal_frontier_documents(&terminal_physical_root, &terminal_documents)
+        };
+        seeded_frontier.map_err(|error| {
+            ProjectionError::Rebuild(format!(
+                "terminal archive replay could not seed the authenticated document frontier: {error}"
+            ))
+        })?;
         bootstrap.terminal_frontier_bulk_seeds = 1;
         bootstrap.terminal_frontier_documents_seeded = terminal_documents.len();
         trace_terminal_phase("archive accepted prefix seed", prefix_started);
 
         let _ = super::hot_engine::take_current_path_cursor_probe();
         let rows_started = std::time::Instant::now();
-        let coverage_count = self.seed_terminal_rows(
-            engine,
-            &source.exact_frontier_root,
-            &provenance,
-            &mut instrumentation,
-            &mut bootstrap,
-            None,
-            terminal_projection_sink,
-        )?;
+        let coverage_count = self
+            .seed_terminal_rows(
+                engine,
+                &source.exact_frontier_root,
+                &provenance,
+                &mut instrumentation,
+                &mut bootstrap,
+                None,
+                terminal_projection_sink,
+            )
+            .map_err(|error| {
+                ProjectionError::Rebuild(format!(
+                    "terminal replay could not seed derived SQLite rows: {error}"
+                ))
+            })?;
         trace_terminal_phase("archive terminal row seed", rows_started);
         let cursor_probe = super::hot_engine::take_current_path_cursor_probe();
         bootstrap.terminal_catalog_rows_authenticated = cursor_probe.rows;
@@ -5455,11 +5572,15 @@ impl SqliteFrontier {
             || bootstrap.intermediate_page_materializations != 0
             || bootstrap.terminal_frontier_bulk_seeds != 1
             || bootstrap.terminal_frontier_documents_seeded
-                != usize::try_from(source.exact_frontier_root.document_count()).map_err(|_| {
-                    ProjectionError::Rebuild(
-                        "terminal frontier document count exceeds platform usize".into(),
-                    )
-                })?
+                != if matches!(source.loader, RebuildLoader::LazyGenesisAnchored { .. }) {
+                    expected_terminal_frontier_documents
+                } else {
+                    usize::try_from(source.exact_frontier_root.document_count()).map_err(|_| {
+                        ProjectionError::Rebuild(
+                            "terminal frontier document count exceeds platform usize".into(),
+                        )
+                    })?
+                }
             || bootstrap.terminal_materializations != 1
             || bootstrap.terminal_reference_index_traversals != 0
             || bootstrap.terminal_reference_index_entries != 0
@@ -5485,8 +5606,17 @@ impl SqliteFrontier {
                 cursor_probe.catalog_entries_validated,
             )));
         }
-        self.finish_fresh_candidate(source, coverage_count, &mut instrumentation)?;
-        self.physical.finish_candidate_build()?;
+        self.finish_fresh_candidate(source, coverage_count, &mut instrumentation)
+            .map_err(|error| {
+                ProjectionError::Rebuild(format!(
+                    "terminal replay candidate failed its closing proof: {error}"
+                ))
+            })?;
+        self.physical.finish_candidate_build().map_err(|error| {
+            ProjectionError::Rebuild(format!(
+                "terminal replay candidate could not commit: {error}"
+            ))
+        })?;
         record_candidate_write_instrumentation(
             &mut instrumentation,
             writes_before,
@@ -5780,10 +5910,22 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
+        if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+            eprintln!(
+                "sqlite rebuild loader: {}",
+                match source.loader {
+                    RebuildLoader::Ordinary => "ordinary",
+                    RebuildLoader::LazyGenesisAnchored { .. } => "lazy-genesis",
+                    RebuildLoader::InactiveBootstrap { .. } => "inactive-bootstrap",
+                    RebuildLoader::PromotedBootstrapAnchored { .. } => "promoted-bootstrap",
+                }
+            );
+        }
         if matches!(
             source.loader,
             RebuildLoader::InactiveBootstrap { .. }
                 | RebuildLoader::PromotedBootstrapAnchored { .. }
+                | RebuildLoader::LazyGenesisAnchored { .. }
         ) {
             return self.terminal_archive_stream(source, terminal_projection_sink);
         }

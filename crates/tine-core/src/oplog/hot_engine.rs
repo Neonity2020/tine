@@ -7951,6 +7951,66 @@ impl ShardedHotEngine {
         Ok(())
     }
 
+    pub(crate) fn lazy_genesis_baseline_frontier_root(
+        &self,
+    ) -> Result<Option<AcceptedFrontierRoot>, EngineError> {
+        self.lazy_genesis
+            .as_deref()
+            .map(accepted_frontier_root_for_lazy_genesis)
+            .transpose()
+    }
+
+    /// Enumerate the exact sparse document overlay only for the clean
+    /// in-memory runtime. Immutable baseline documents remain in the
+    /// lazy-genesis pack; only documents whose current dependencies differ
+    /// from that baseline belong in the accepted frontier's authenticated map.
+    /// This is used while rebuilding disposable SQLite in one terminal pass;
+    /// it is not a persistent index or a normal query path.
+    pub(crate) fn clean_current_frontier_overlay_documents(
+        &self,
+        root: &AcceptedFrontierRoot,
+    ) -> Result<Vec<DocumentDependencies>, EngineError> {
+        self.authenticate_accepted_frontier_root(root)?;
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || root != &self.accepted_frontier_root
+            || self.accepted_frontier.len() as u64 != root.document_count()
+        {
+            return Err(EngineError::Archive(
+                "clean terminal frontier enumeration is unavailable or incomplete".into(),
+            ));
+        }
+        let baseline = self.lazy_genesis.as_ref().ok_or_else(|| {
+            EngineError::Archive("clean terminal frontier has no lazy-genesis baseline".into())
+        })?;
+        let documents = self
+            .accepted_frontier
+            .values()
+            .filter(|document| {
+                baseline.frontier_document(document.document_id()).as_ref() != Some(*document)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let (root_key, root_digest) = authenticated_document_map_root(&documents)?;
+        if root_key != root.document_map_root_key()
+            || root_digest != root.document_map_root_digest()
+        {
+            return Err(EngineError::Archive(
+                "clean terminal overlay does not authenticate to its accepted frontier".into(),
+            ));
+        }
+        for document in &documents {
+            if self
+                .accepted_frontier_document(root, document.document_id())?
+                .as_ref()
+                != Some(document)
+            {
+                return Err(EngineError::FrontierVectorMismatch(document.document_id()));
+            }
+        }
+        Ok(documents)
+    }
+
     fn lazy_genesis_checkpoint(
         &self,
         document_id: DocumentId,
@@ -8096,10 +8156,12 @@ impl ShardedHotEngine {
     /// Construct the archive-backed engine used by the clean-baseline runtime.
     ///
     /// Unlike the legacy constructor, this does not open or create the native
-    /// block, external-UUID, path, or page-name semantic indexes.  Those facts
-    /// are owned by the disposable SQLite projection.  The archive remains the
-    /// durable home for ordinary post-baseline operations and scratch remains
-    /// available for bounded document materialization.
+    /// block, external-UUID, path, page-name, or accepted-status Patricia
+    /// indexes. Those facts are respectively owned by the disposable SQLite
+    /// projection and by the accepted operation manifests themselves. Page
+    /// documents are point-loaded from the immutable baseline/tail and evicted
+    /// normally; the old persistent staging scratch is not part of this
+    /// runtime.
     pub(crate) fn with_clean_archive_store(
         store: ObjectStore,
         lineage_digest: LineageDigest,
@@ -8111,7 +8173,7 @@ impl ShardedHotEngine {
         Ok(engine)
     }
 
-    /// Attach durable operation storage to an already-open clean baseline
+    /// Attach accepted operation storage to an already-open clean baseline
     /// without changing its run-local engine identity.
     ///
     /// Keeping the identity is load-bearing: the SQLite genesis candidate was
@@ -8131,12 +8193,212 @@ impl ShardedHotEngine {
                     .into(),
             ));
         }
-        let scratch = store
-            .start_clean_engine_scratch()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.scratch = Some(scratch);
         self.archive_store = Some(Arc::new(store));
         Ok(())
+    }
+
+    /// Replay the complete manifest-committed accepted tail over a clean
+    /// sequence-zero baseline.
+    ///
+    /// The private clean archive admits only fully validated accepted
+    /// operations. Its immutable manifest is published after every object and
+    /// is therefore the durable membership/commit marker. BatchId directory
+    /// order is deliberately not causal; ordinary dependency staging reaches
+    /// a fixed point, after which every committed manifest must be accepted.
+    /// A rejected, quarantined, incomplete, or missing-object terminal state is
+    /// archive corruption, not an alternative status stored in a second
+    /// persistent index.
+    pub(crate) fn replay_clean_committed_tail(&mut self) -> Result<usize, EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.has_native_semantic_index_stores()
+            || self.accepted_frontier_root.acceptance_sequence() != 0
+            || self.next_acceptance_sequence != 0
+        {
+            return Err(EngineError::Archive(
+                "clean tail replay requires an index-free sequence-zero baseline".into(),
+            ));
+        }
+        let store =
+            self.archive_store.as_ref().cloned().ok_or_else(|| {
+                EngineError::Archive("clean runtime has no operation archive".into())
+            })?;
+        let manifests = store
+            .committed_manifests()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        for manifest in &manifests {
+            let validated = match store
+                .inspect_batch(manifest.batch_id())
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+            {
+                BatchInspection::Ready(batch) => batch,
+                BatchInspection::Absent => {
+                    return Err(EngineError::Archive(format!(
+                        "clean accepted manifest {} disappeared during replay",
+                        manifest.batch_id()
+                    )));
+                }
+                BatchInspection::Staged { missing, .. } => {
+                    return Err(EngineError::Archive(format!(
+                        "clean accepted manifest {} is missing {} immutable objects",
+                        manifest.batch_id(),
+                        missing.len()
+                    )));
+                }
+            };
+            let outcome = self.stage_ready(validated);
+            if matches!(
+                outcome.disposition(),
+                BatchDisposition::Rejected { .. } | BatchDisposition::Quarantined
+            ) {
+                return Err(EngineError::Archive(format!(
+                    "manifest-committed clean operation {} did not validate as accepted: {:?}",
+                    manifest.batch_id(),
+                    outcome.disposition()
+                )));
+            }
+        }
+        for manifest in &manifests {
+            self.accepted_batch_evidence(manifest.batch_id())
+                .map_err(|error| {
+                    EngineError::Archive(format!(
+                        "manifest-committed clean operation {} did not reach the accepted fixed point: {error}",
+                        manifest.batch_id()
+                    ))
+                })?;
+        }
+        let accepted = self.accepted_batch_count()?;
+        let expected = u64::try_from(manifests.len()).map_err(|_| {
+            EngineError::Archive("clean accepted manifest count exceeds u64".into())
+        })?;
+        if accepted != expected {
+            return Err(EngineError::Archive(format!(
+                "clean accepted tail contains {expected} manifests but replay produced {accepted} accepted operations"
+            )));
+        }
+        Ok(manifests.len())
+    }
+
+    /// Validate one local candidate completely, then publish its manifest as
+    /// the durable accepted-operation commit point.
+    ///
+    /// This method mutates only this encapsulated run-local engine before the
+    /// archive commit. Callers must not expose the speculative state until the
+    /// method succeeds. If publication fails, the engine is poisoned and must
+    /// be discarded; cold open reconstructs the last manifest-committed state.
+    pub(crate) fn commit_clean_local_prepared(
+        &mut self,
+        prepared: &PreparedBatch,
+    ) -> Result<StageOutcome, EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.has_native_semantic_index_stores()
+            || prepared.manifest().origin() != BatchOrigin::LocalMutation
+        {
+            return Err(EngineError::Archive(
+                "clean local commit requires an index-free baseline runtime and a local mutation"
+                    .into(),
+            ));
+        }
+        let store =
+            self.archive_store.as_ref().cloned().ok_or_else(|| {
+                EngineError::Archive("clean runtime has no operation archive".into())
+            })?;
+        if store
+            .read_manifest(prepared.manifest().batch_id())
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .is_some()
+        {
+            return Err(EngineError::Archive(format!(
+                "clean local batch {} is already manifest-committed",
+                prepared.manifest().batch_id()
+            )));
+        }
+
+        let outcome = self.stage_ready(ValidatedBatch::new(prepared.clone()));
+        let accepted_exactly_once =
+            matches!(outcome.disposition(), BatchDisposition::Accepted { .. })
+                && outcome.newly_accepted().len() == 1
+                && outcome.newly_accepted()[0].batch_id == prepared.manifest().batch_id();
+        if !accepted_exactly_once {
+            return match outcome.disposition() {
+                BatchDisposition::Rejected { error } => Err(error),
+                other => Err(EngineError::Archive(format!(
+                    "clean local candidate {} did not validate as one accepted operation: {other:?}",
+                    prepared.manifest().batch_id()
+                ))),
+            };
+        }
+
+        if let Err(error) = store.publish_prepared(prepared) {
+            let error = EngineError::Archive(format!(
+                "clean accepted operation {} could not publish its manifest: {error}",
+                prepared.manifest().batch_id()
+            ));
+            self.history_failure = Some(error.clone());
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    /// Attach only the graph/receipt identities required by ordinary clean
+    /// runtime authoring. Projection work is derived from accepted manifests;
+    /// this path deliberately does not open the legacy Patricia work queue or
+    /// any enrollment/history/semantic index.
+    pub(crate) fn attach_clean_projection_endpoint(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+    ) -> Result<(), EngineError> {
+        let endpoint = receipts.endpoint_binding().ok_or_else(|| {
+            EngineError::ProjectionWork(
+                "clean projection receipt namespace has no endpoint enrollment".into(),
+            )
+        })?;
+        if receipts.workspace_id() != self.workspace_id
+            || self.projection_endpoint.is_some()
+            || self.projection_receipt_store_id.is_some()
+            || self.projection_work_index.is_some()
+            || graph
+                .canonical_resource_id()
+                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
+                != endpoint.graph_resource_id
+        {
+            return Err(EngineError::ProjectionWork(
+                "clean projection endpoint does not match the runtime graph/workspace".into(),
+            ));
+        }
+        self.archive_store.as_ref().ok_or_else(|| {
+            EngineError::ProjectionWork("clean runtime has no operation archive".into())
+        })?;
+        self.projection_endpoint = Some(endpoint);
+        self.projection_receipt_store_id = Some(receipts.store_id());
+        Ok(())
+    }
+
+    fn clean_projection_runtime_binding(
+        &self,
+    ) -> Result<(Arc<ObjectStore>, ProjectionEndpointBinding), EngineError> {
+        self.ensure_not_blocked()?;
+        let archive = self.archive_store.as_ref().ok_or_else(|| {
+            EngineError::ProjectionWork("clean runtime has no operation archive".into())
+        })?;
+        let endpoint = self.projection_endpoint.ok_or_else(|| {
+            EngineError::ProjectionWork("clean runtime has no projection endpoint".into())
+        })?;
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.projection_work_index.is_some()
+            || self.projection_receipt_store_id.is_none()
+        {
+            return Err(EngineError::ProjectionWork(
+                "runtime is not an index-free clean projection runtime".into(),
+            ));
+        }
+        Ok((Arc::clone(archive), endpoint))
     }
 
     fn has_native_semantic_index_stores(&self) -> bool {
@@ -17138,6 +17400,72 @@ impl ShardedHotEngine {
         }))
     }
 
+    /// Reprove one exact graph file directly from the immutable lazy-genesis
+    /// baseline.  A clean activation has no fabricated bootstrap operation and
+    /// therefore no per-page completion receipt to consult for the first edit.
+    /// The sealed baseline root is the aggregate owner; the ordinary exact
+    /// source planner still has to prove that the named bytes encode the whole
+    /// current semantic page before they may become an edit precondition.
+    fn lazy_genesis_projection_predecessor(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+        before: &ProjectionPageState,
+    ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
+        let Some(genesis) = &self.lazy_genesis else {
+            return Ok(None);
+        };
+        let page = genesis
+            .page(page_id)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+            .ok_or_else(|| {
+                EngineError::ProjectionManifest(format!(
+                    "lazy-genesis predecessor for {path} has no page {page_id}"
+                ))
+            })?;
+        if page.path != *path
+            || page.page_id != before.page.page_id
+            || page.home_document_id != before.page.home_document_id
+            || page.kind != before.page.kind
+        {
+            return Err(EngineError::ProjectionManifest(format!(
+                "lazy-genesis predecessor for {path} is stale or mismatched"
+            )));
+        }
+        let replay = super::projection::plan_projection_adopting_exact_source(
+            self.workspace_id,
+            before,
+            &page.exact_source_bytes,
+        )
+        .map_err(|error| {
+            EngineError::ProjectionManifest(format!(
+                "lazy-genesis predecessor semantic proof for {path} failed: {error:?}"
+            ))
+        })?;
+        if replay.target() != page.exact_source_bytes
+            || replay.intent().workspace_id() != self.workspace_id
+            || replay.intent().page_id() != page_id
+            || replay.intent().path() != path
+            || replay.intent().frontier() != &before.frontier
+            || replay.intent().claim_evidence() != before.claim_evidence
+        {
+            return Err(EngineError::ProjectionManifest(format!(
+                "lazy-genesis predecessor for {path} did not bind its current semantic state"
+            )));
+        }
+        Ok(Some(CapabilityCapturedPriorProjection {
+            bytes: page.exact_source_bytes,
+            intent: replay.intent().clone(),
+            completion: None,
+            // The baseline root transitively authenticates this page capsule;
+            // the intent above supplies the exact page/path/byte binding.
+            bootstrap_owner_binding: Some(genesis.root()),
+            managed_local_authority: None,
+            receipt_backed_live_authority: false,
+            correlated_authority: None,
+        }))
+    }
+
     fn validate_managed_local_projection_authority(
         &self,
         path: &ManagedPath,
@@ -17314,10 +17642,19 @@ impl ShardedHotEngine {
         {
             return Err(EngineError::AuthorDraftStale);
         }
-        let (_, work_index) = self.enrolled_projection_runtime()?;
+        let work_index = match self.enrolled_projection_runtime() {
+            Ok((_, work_index)) => Some(work_index),
+            Err(_) => {
+                self.clean_projection_runtime_binding()?;
+                None
+            }
+        };
         if receipts.workspace_id() != self.workspace_id
             || receipts.endpoint_binding() != Some(source)
-            || receipts.store_id() != work_index.receipt_store_id()
+            || Some(receipts.store_id()) != self.projection_receipt_store_id
+            || work_index
+                .as_ref()
+                .is_some_and(|index| receipts.store_id() != index.receipt_store_id())
         {
             return Err(EngineError::ProjectionManifest(
                 "draft capture is not bound to the enrolled projection runtime".into(),
@@ -17396,8 +17733,11 @@ impl ShardedHotEngine {
                 )?;
             }
             let completed = work_index
-                .completed_receipts_for_path(path)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+                .as_ref()
+                .map(|index| index.completed_receipts_for_path(path))
+                .transpose()
+                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
+                .unwrap_or_default();
             let mut authority_matches = true;
             let managed_prior = roles
                 .semantic_predecessor
@@ -17445,14 +17785,15 @@ impl ShardedHotEngine {
                     .before
                     .as_ref()
                     .expect("prior requirement was selected from a semantic pre-state");
-                let receipt_backed_live = current
-                    .as_deref()
-                    .map(|live_bytes| {
+                let receipt_backed_live = work_index
+                    .as_ref()
+                    .zip(current.as_deref())
+                    .map(|(work_index, live_bytes)| {
                         super::projection::receipt_backed_live_projection_predecessor(
                             self.workspace_id,
                             source,
                             receipts,
-                            &work_index,
+                            work_index,
                             before,
                             live_bytes,
                         )
@@ -17534,12 +17875,25 @@ impl ShardedHotEngine {
                     authority_matches = true;
                     Some(prior)
                 } else if completed.is_empty() {
+                    let lazy_genesis_prior = if bootstrap.is_none() {
+                        self.lazy_genesis_projection_predecessor(path, requirement.page_id, before)?
+                    } else {
+                        None
+                    };
                     let baseline = bootstrap
                         .map(|bootstrap| bootstrap.baseline_at(path))
                         .transpose()
                         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
                         .flatten();
-                    if let Some(baseline) = baseline {
+                    if let Some(prior) = lazy_genesis_prior {
+                        charge_preauthoring_capture_bytes(
+                            &mut retained_bytes,
+                            prior.bytes.len(),
+                            "lazy-genesis projection bytes",
+                        )?;
+                        authority_matches = true;
+                        Some(prior)
+                    } else if let Some(baseline) = baseline {
                         let before = draft.pages[&requirement.page_id]
                             .before
                             .as_ref()
@@ -17815,11 +18169,20 @@ impl ShardedHotEngine {
                 "captured author token requirement binding changed".into(),
             ));
         }
-        let (_, work_index) = self.enrolled_projection_runtime()?;
+        let work_index = match self.enrolled_projection_runtime() {
+            Ok((_, work_index)) => Some(work_index),
+            Err(_) => {
+                self.clean_projection_runtime_binding()?;
+                None
+            }
+        };
         for input in &captured_inputs {
             let expected = work_index
-                .completed_receipts_for_path(&input.path)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+                .as_ref()
+                .map(|index| index.completed_receipts_for_path(&input.path))
+                .transpose()
+                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
+                .unwrap_or_default();
             if input.draft_completed_path.as_ref() != Some(&expected) {
                 return Err(EngineError::ProjectionManifest(format!(
                     "captured path {} no longer has its draft-owned completion authority",
@@ -20568,7 +20931,28 @@ impl ShardedHotEngine {
             }
         }
         if accepted_heads == 0 {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
+            // A clean activation baseline is semantic authority without a
+            // fabricated bootstrap operation. Its page/catalog frontier has
+            // no direct batch heads by construction, so the legacy
+            // "at least one accepted head" rule cannot authorize its initial
+            // exact projection. Prove the complete requested frontier against
+            // the marker-bound immutable baseline instead.
+            let baseline_root = &self.accepted_frontier_root;
+            let baseline_is_exact = baseline_root.acceptance_sequence() == 0
+                && baseline_root.genesis().is_some()
+                && self.lazy_genesis.as_ref().is_some_and(|baseline| {
+                    accepted_frontier_root_for_lazy_genesis(baseline)
+                        .is_ok_and(|root| root == *baseline_root)
+                })
+                && state.frontier.documents().iter().all(|document| {
+                    document.direct_dependency_heads().is_empty()
+                        && self
+                            .accepted_frontier_document(baseline_root, document.document_id())
+                            .is_ok_and(|accepted| accepted.as_ref() == Some(document))
+                });
+            if !baseline_is_exact {
+                return Err(EngineError::ProjectionAuthorizationUnavailable);
+            }
         }
         Ok(ProjectionWriteAuthorization {
             state,
@@ -26409,7 +26793,14 @@ impl ShardedHotEngine {
                     );
                 }
             }
-            let document = LoroDoc::new();
+            // A clean runtime's sequence-zero state lives in the immutable
+            // lazy-genesis checkpoint rather than in a fabricated bootstrap
+            // operation.  Replay only the accepted manifest tail on top of
+            // that checkpoint.  Pages created after activation legitimately
+            // have no baseline checkpoint and start empty.
+            let document = self
+                .lazy_genesis_document(document_id, 1)?
+                .unwrap_or_else(LoroDoc::new);
             import_complete(document_id, &document, &updates)?;
             let actual = canonical_peer_counters(&document.oplog_vv())?;
             if actual != dependencies.peer_counters() {
