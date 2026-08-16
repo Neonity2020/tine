@@ -29,7 +29,7 @@ export interface StartupRecoveryDeps {
   lookupGraphPath(attempt: number): Promise<string | null>;
   injectedGraphPath(): string;
   persistedGraphPath(): string;
-  openGraph(path: string): Promise<LoadGraphPathOutcome>;
+  openGraph(path: string, supersedeCurrent?: boolean): Promise<LoadGraphPathOutcome>;
   pickGraph(): Promise<LoadGraphPathOutcome>;
   coldReturn(path: string, attempt: number): Promise<SparseV2CancelResult>;
   acceptColdReturn(result: SparseV2CancelResult): void;
@@ -216,7 +216,12 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
     deps.completeFirstLoad();
   };
 
-  const completeOpen = async (attempt: number, target: string, startedAt: number) => {
+  const completeOpen = async (
+    attempt: number,
+    target: string,
+    startedAt: number,
+    supersedeCurrent = false,
+  ) => {
     if (attempt !== sequence || disposed) return;
     setSnapshot((current) => ({
       ...current,
@@ -233,7 +238,9 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
       "Native recovery is unavailable or has stopped reporting progress. You can retry, choose another graph, or close and relaunch Tine; managed files have not been discarded.",
     );
     try {
-      const outcome = await deps.openGraph(target);
+      const outcome = supersedeCurrent
+        ? await deps.openGraph(target, true)
+        : await deps.openGraph(target);
       if (attempt !== sequence || disposed) return;
       if (outcome.kind === "loaded" || outcome.kind === "already_current") {
         finish(attempt);
@@ -365,7 +372,10 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
       const result = await deps.coldReturn(previous.target, previous.nativeAttempt);
       if (attempt !== sequence || disposed) return;
       deps.acceptColdReturn(result);
-      await completeOpen(attempt, previous.target, startedAt);
+      // Native emergency return has already selected and published Direct
+      // Files. Supersede the obsolete managed-open frontend continuation so it
+      // cannot keep the whole app in a transition or repaint recovery later.
+      await completeOpen(attempt, previous.target, startedAt, true);
     } catch (error) {
       recover(attempt, "graph.failed", previous.target, error instanceof Error ? error.message : String(error), startedAt);
     }

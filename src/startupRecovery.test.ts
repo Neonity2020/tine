@@ -245,6 +245,7 @@ describe("cold-start recovery controller", () => {
 
     await controller.returnToDirectFiles();
     expect(coldReturn).toHaveBeenCalledWith("/graphs/alpha", 1);
+    expect(openGraph).toHaveBeenNthCalledWith(2, "/graphs/alpha", true);
     expect(controller.snapshot().mode).toBe("idle");
 
     firstOpen.resolve({ kind: "loaded", root: "/graphs/alpha" });
@@ -306,6 +307,7 @@ describe("cold-start recovery controller", () => {
 
     returnResult.resolve(fakeCancelResult());
     await returning;
+    expect(openGraph).toHaveBeenNthCalledWith(2, "/graphs/alpha", true);
     expect(controller.snapshot().mode).toBe("idle");
     expect(deps.completeFirstLoad).toHaveBeenCalledOnce();
 

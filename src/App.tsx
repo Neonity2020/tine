@@ -608,7 +608,7 @@ export function App(): JSX.Element {
     lookupGraphPath: (attempt) => backend().startupGraphPath(attempt),
     injectedGraphPath: () => (window as any).__GRAPH_PATH__ ?? "",
     persistedGraphPath,
-    openGraph: (path) => loadGraphPath(path),
+    openGraph: (path, supersedeCurrent) => loadGraphPath(path, { supersedeCurrent }),
     pickGraph: switchGraph,
     coldReturn: (path, attempt) => backend().cancelSparseV2Cold(path, attempt),
     acceptColdReturn: acceptColdReturnManagedStorage,

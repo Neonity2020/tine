@@ -53,6 +53,12 @@ export type LoadGraphPathOutcome =
   | { kind: "loaded" | "already_current"; root: string }
   | { kind: "focused_existing" | "aborted" };
 
+// Frontend continuations may overlap while native storage recovery is being
+// superseded (most importantly, emergency Direct Files during a managed open).
+// This is not storage authority: it only prevents an obsolete promise from
+// repainting/resetting the UI after a newer native operation has won.
+let graphLoadContinuation = 0;
+
 /** Establish the one exceptional filesystem capability Tine supports: a graph
  * may point `assets` at an external directory, but only after this installation
  * shows the resolved target and receives explicit consent. */
@@ -78,11 +84,18 @@ export async function authorizeGraphAccess(path: string): Promise<boolean> {
 
 export async function loadGraphPath(
   path: string,
-  options: { forceRefresh?: boolean; transitionHeld?: boolean } = {}
+  options: {
+    forceRefresh?: boolean;
+    transitionHeld?: boolean;
+    supersedeCurrent?: boolean;
+  } = {}
 ): Promise<LoadGraphPathOutcome> {
   const startedAt = performance.now();
   const ownsTransition = !options.transitionHeld;
-  if (graphTransitioning() && ownsTransition) return { kind: "aborted" };
+  if (graphTransitioning() && ownsTransition && !options.supersedeCurrent) {
+    return { kind: "aborted" };
+  }
+  const continuation = ++graphLoadContinuation;
   if (ownsTransition) {
     setGraphTransitioning(true);
     const active = document.activeElement;
@@ -124,6 +137,7 @@ export async function loadGraphPath(
     retirePdfOwnership();
     closePdf();
   }
+  if (continuation !== graphLoadContinuation) return { kind: "aborted" };
 
   let result;
   // Native graph replacement is asynchronous. Stop accepting watcher events
@@ -134,6 +148,7 @@ export async function loadGraphPath(
   try {
     result = await backend().loadGraph(path);
   } catch (error) {
+    if (continuation !== graphLoadContinuation) return { kind: "aborted" };
     // load_graph failed before installing a replacement binding.  Publish a new
     // local generation for the still-bound old graph; the retired viewer stays
     // closed, so no callback can regain its former authority.
@@ -141,6 +156,7 @@ export async function loadGraphPath(
     if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     throw error;
   }
+  if (continuation !== graphLoadContinuation) return { kind: "aborted" };
   console.info(`[tine] frontend graph open: native binding ready at ${Math.round(performance.now() - startedAt)} ms`);
   if (result.kind === "focused_existing") {
     if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
@@ -221,7 +237,9 @@ export async function loadGraphPath(
   console.info(`[tine] frontend graph open: interactive at ${Math.round(performance.now() - startedAt)} ms`);
   return { kind: result.kind, root: meta.root };
   } finally {
-    if (ownsTransition) setGraphTransitioning(false);
+    if (ownsTransition && continuation === graphLoadContinuation) {
+      setGraphTransitioning(false);
+    }
   }
 }
 

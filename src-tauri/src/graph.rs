@@ -809,6 +809,19 @@ pub(crate) fn load_graph_for_label(
                 .unwrap()
                 .bind(window_label.to_string(), Arc::clone(&slot))
         }) {
+            // A newer operation (especially emergency Direct Files or a graph
+            // switch) owns publication now. Completing this stale managed
+            // worker is not a user-visible graph-open failure: report the
+            // binding that actually won, if one is already installed.
+            if !state.storage_supervisor.operation_is_current(managed_id) {
+                if let Ok(current) = slot_for_window(state, window_label) {
+                    return Ok(LoadGraphResult::AlreadyCurrent {
+                        meta: current.graph_meta(),
+                        binding_generation: current.binding_generation,
+                        application_page_admission: current.application_page_admission(),
+                    });
+                }
+            }
             let _ = state.storage_supervisor.finish_transition(
                 app,
                 managed_id,
