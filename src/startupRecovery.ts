@@ -78,6 +78,11 @@ export function startupPhaseLabel(phase: string): string {
     "picker.open": "Waiting for a workspace selection",
     "direct.confirm": "Waiting for confirmation",
     "direct.archive": "Archiving managed state before Direct Files",
+    "cold_return.waiting_for_graph_transition": "Finishing the current storage operation before Direct Files",
+    "cold_return.verifying_target": "Verifying the workspace before Direct Files",
+    "cold_return.archiving_managed_state": "Archiving managed state before Direct Files",
+    "cold_return.opening_direct_files": "Opening Direct Files",
+    "cold_return.complete": "Direct Files return complete",
   };
   if (known[phase]) return known[phase];
   if (phase.startsWith("managed_open.")) {
@@ -101,7 +106,8 @@ const LOOKUP_PROGRESS_PHASES = new Set([
 export function validStartupProgress(progress: StartupProgressEvent): boolean {
   const phase = progress.phase as string;
   const validPhase = LOOKUP_PROGRESS_PHASES.has(phase)
-    || /^managed_open\.[a-z0-9_]{1,64}$/u.test(phase);
+    || /^managed_open\.[a-z0-9_]{1,64}$/u.test(phase)
+    || /^cold_return\.[a-z0-9_]{1,64}$/u.test(phase);
   return validPhase
     && Number.isSafeInteger(progress.elapsed_ms)
     && progress.elapsed_ms >= 0
@@ -391,9 +397,11 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
       if (current.mode === "idle") return current;
       const lookup = progress.phase.startsWith("lookup.");
       const managed = progress.phase.startsWith("managed_open.");
+      const coldReturn = progress.phase.startsWith("cold_return.");
       if (lookup && current.operation !== "lookup") return current;
-      if (managed && current.operation !== "graph_open" && current.operation !== "cold_return") return current;
-      if (managed) {
+      if (managed && current.operation !== "graph_open") return current;
+      if (coldReturn && current.operation !== "cold_return") return current;
+      if (managed || coldReturn) {
         armActionWatchdog(
           current.attempt,
           current.target,
@@ -403,7 +411,7 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
       }
       return {
         ...current,
-        mode: managed && current.mode === "recovery" && current.phase === "native.unavailable"
+        mode: (managed || coldReturn) && current.mode === "recovery" && current.phase === "native.unavailable"
           ? "working"
           : current.mode,
         nativePhase: progress.phase,

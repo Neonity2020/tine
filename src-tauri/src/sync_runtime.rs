@@ -6,7 +6,7 @@
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
@@ -2396,11 +2396,82 @@ pub(crate) async fn cancel_sparse_v2_cold(
     window: tauri::WebviewWindow,
 ) -> Result<SparseV2ColdCancelResult, String> {
     let label = window.label().to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        cancel_sparse_v2_cold_blocking(&app, &label, path, attempt)
+    let reporter = crate::graph::StartupProgressReporter::for_window(&app, &label);
+    reporter.phase("cold_return.waiting_for_graph_transition");
+    let worker_reporter = reporter.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        cancel_sparse_v2_cold_blocking(&app, &label, path, attempt, &worker_reporter)
     })
     .await
-    .map_err(|_| "Cold Direct Files recovery worker stopped before completion.".to_string())?
+    .map_err(|_| "Cold Direct Files recovery worker stopped before completion.".to_string())?;
+    reporter.terminal(
+        "cold_return.complete",
+        if result.is_ok() { "ok" } else { "error" },
+    );
+    result
+}
+
+/// A cold return can legitimately wait behind a graph open and can spend more
+/// than the frontend inactivity window archiving retained state. Keep that
+/// serialized transition observable without turning elapsed time into success.
+struct ColdReturnProgress {
+    control: Arc<(Mutex<(bool, &'static str)>, Condvar)>,
+    join: Option<JoinHandle<()>>,
+    reporter: crate::graph::StartupProgressReporter,
+}
+
+impl ColdReturnProgress {
+    fn start(reporter: crate::graph::StartupProgressReporter, phase: &'static str) -> Self {
+        let control = Arc::new((Mutex::new((false, phase)), Condvar::new()));
+        let worker_control = Arc::clone(&control);
+        let worker_reporter = reporter.clone();
+        let join = std::thread::Builder::new()
+            .name("tine-cold-return-progress".into())
+            .spawn(move || loop {
+                let (lock, changed) = &*worker_control;
+                let state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (state, timeout) = changed
+                    .wait_timeout(state, Duration::from_secs(5))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.0 {
+                    break;
+                }
+                if !timeout.timed_out() {
+                    continue;
+                }
+                let phase = state.1;
+                drop(state);
+                worker_reporter.phase(phase);
+            })
+            .ok();
+        Self {
+            control,
+            join,
+            reporter,
+        }
+    }
+
+    fn phase(&self, phase: &'static str) {
+        let (lock, changed) = &*self.control;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.1 = phase;
+        drop(state);
+        self.reporter.phase(phase);
+        changed.notify_all();
+    }
+}
+
+impl Drop for ColdReturnProgress {
+    fn drop(&mut self) {
+        let (lock, changed) = &*self.control;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.0 = true;
+        drop(state);
+        changed.notify_all();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 fn cancel_sparse_v2_cold_blocking(
@@ -2408,6 +2479,7 @@ fn cancel_sparse_v2_cold_blocking(
     label: &str,
     path: String,
     attempt: u64,
+    reporter: &crate::graph::StartupProgressReporter,
 ) -> Result<SparseV2ColdCancelResult, String> {
     // Canonicalization is read-only.  It happens before `graph_load` only to
     // compare the submitted target with native authority; every state/storage
@@ -2417,7 +2489,10 @@ fn cancel_sparse_v2_cold_blocking(
             .to_string()
     })?;
     let state = app.state::<crate::state::AppState>();
+    let progress =
+        ColdReturnProgress::start(reporter.clone(), "cold_return.waiting_for_graph_transition");
     let _transition = state.graph_load.lock().unwrap();
+    progress.phase("cold_return.verifying_target");
 
     // Re-read both the native attempt and exact canonical target *after*
     // acquiring the open lock.  A late result, picker, normal open, or another
@@ -2449,6 +2524,7 @@ fn cancel_sparse_v2_cold_blocking(
     let private_root = sparse_private_root(app, &submitted_root)?;
     let recovery_root = sparse_recovery_root(app)?;
     let approved_assets = crate::settings::approved_external_assets(app, &submitted_root);
+    progress.phase("cold_return.archiving_managed_state");
     cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
         &state,
         label,
@@ -2458,6 +2534,7 @@ fn cancel_sparse_v2_cold_blocking(
         approved_assets.as_deref(),
         archive_private_root,
         |direct_root, _| {
+            progress.phase("cold_return.opening_direct_files");
             crate::graph::open_and_publish_direct_files(
                 app,
                 label,
@@ -3381,6 +3458,10 @@ mod tests {
                 .expect("next managed command")];
         for required in [
             "state.graph_load.lock()",
+            "cold_return.waiting_for_graph_transition",
+            "cold_return.verifying_target",
+            "cold_return.archiving_managed_state",
+            "cold_return.opening_direct_files",
             "authorized_startup_recovery_target",
             "startup_recovery_target_is_remembered",
             "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",

@@ -6,6 +6,14 @@ exclusive `Legacy(Graph)` runtime before graph open. When Direct Files is
 selected, no code below may inspect or modify `.tine-sync`, open an oplog,
 create managed scratch state, or start managed recovery.
 
+Return to Direct Files is a priority recovery action. If a managed open already
+owns the serialized graph transition, the return waits for that operation to
+reach its safe handoff rather than racing its private state. That wait and the
+subsequent archive/direct-open phases remain explicitly reported; progress from
+the superseded managed open must never be presented as progress of the return,
+and frontend inactivity alone must not convert an active native transition into
+a terminal refusal.
+
 The authoritative layout names live in the pinned
 `tine_storage::formats` manifest. Core code imports them through the
 definition-free compatibility surface in

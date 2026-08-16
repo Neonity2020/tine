@@ -253,6 +253,68 @@ describe("cold-start recovery controller", () => {
     controller.dispose();
   });
 
+  it("ignores superseded managed-open progress and keeps a live cold return out of recovery", async () => {
+    vi.useFakeTimers();
+    const firstOpen = deferred<Awaited<ReturnType<StartupRecoveryDeps["openGraph"]>>>();
+    const returnResult = deferred<SparseV2CancelResult>();
+    const openGraph = vi.fn()
+      .mockImplementationOnce(() => firstOpen.promise)
+      .mockResolvedValueOnce({ kind: "already_current", root: "/graphs/alpha" });
+    const deps = dependencies({
+      openGraph,
+      coldReturn: vi.fn(() => returnResult.promise),
+      actionWatchdogMs: 500,
+    });
+    const controller = createStartupRecoveryController(deps);
+    controller.start();
+    await settle();
+
+    const returning = controller.returnToDirectFiles();
+    await settle();
+    expect(controller.snapshot()).toMatchObject({
+      mode: "working",
+      operation: "cold_return",
+      phase: "direct.archive",
+      nativePhase: null,
+    });
+
+    controller.receiveProgress({
+      phase: "managed_open.complete",
+      elapsed_ms: 30_059,
+      terminal: true,
+      outcome: "ok",
+    });
+    expect(controller.snapshot()).toMatchObject({
+      mode: "working",
+      operation: "cold_return",
+      nativePhase: null,
+    });
+
+    for (let heartbeat = 0; heartbeat < 3; heartbeat++) {
+      await vi.advanceTimersByTimeAsync(400);
+      controller.receiveProgress({
+        phase: "cold_return.archiving_managed_state",
+        elapsed_ms: (heartbeat + 1) * 400,
+        terminal: false,
+      });
+    }
+    expect(controller.snapshot()).toMatchObject({
+      mode: "working",
+      operation: "cold_return",
+      nativePhase: "cold_return.archiving_managed_state",
+    });
+
+    returnResult.resolve(fakeCancelResult());
+    await returning;
+    expect(controller.snapshot().mode).toBe("idle");
+    expect(deps.completeFirstLoad).toHaveBeenCalledOnce();
+
+    firstOpen.resolve({ kind: "loaded", root: "/graphs/alpha" });
+    await settle();
+    expect(deps.completeFirstLoad).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
   it("restarts an invalidated managed open when cold Return confirmation is declined", async () => {
     vi.useFakeTimers();
     const firstOpen = deferred<Awaited<ReturnType<StartupRecoveryDeps["openGraph"]>>>();

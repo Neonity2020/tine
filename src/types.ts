@@ -435,7 +435,8 @@ export type StartupProgressPhase =
   | "lookup.settings_read"
   | "lookup.settings_parse"
   | "lookup.complete"
-  | `managed_open.${string}`;
+  | `managed_open.${string}`
+  | `cold_return.${string}`;
 
 export interface StartupProgressEvent {
   phase: StartupProgressPhase;

@@ -4175,6 +4175,26 @@
         "failBefore": "proven"
       },
       "notes": "The real Linux two-app journey delivered A's edit into a stopped B and reopened B. B's SQLite-backed get_page result and Markdown projection both contained the edit, but the restored live page stayed stale. Tick tracing showed provider traversal and ingestion as Recovering turns followed by a quiet AdmittedNoop; no turn told the watcher that a provider batch had become reader-visible. A second exact rerun proved why the first repair was incomplete: an interleaved application-page read could finish the retained provider projection between watcher turns and strand the pending notification. The focused fail-before test now forces that ordering. Provider admission retains the exact batch identity until one later ProviderMutation is emitted after SQLite and projection are visible; traversal-only Recovering and quiet AdmittedNoop remain non-content progress, so the repair does not restore the earlier false-conflict wakeups."
+    },
+    {
+      "id": "REG-MANAGED-COLD-RETURN-INFLIGHT-OPEN-001",
+      "title": "Return to Direct Files remains live and accurately reported while an in-flight managed open releases the graph transition",
+      "family": "managed-storage-recovery",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-ui-lifecycle",
+      "status": "planned",
+      "coverage": {
+        "tests": [],
+        "scenario": "managed.cold-return-during-inflight-open",
+        "failBefore": "field-reproduced"
+      },
+      "notes": "On Android, a user requested Return to Direct Files while cold managed recovery still owned the serialized graph transition. The native return queued correctly, but the frontend attributed the old worker's managed_open progress to cold_return; after managed open completed, the actual archive/direct-open work emitted no progress and the 15-second inactivity watchdog falsely declared native.unavailable. Coverage must prove that the serialized handoff remains observable, stale managed-open phases cannot replace the cold-return phase, archiving and Direct Files publication do not trip the watchdog, and exact Markdown bytes remain available after restart."
     }
   ]
 }
