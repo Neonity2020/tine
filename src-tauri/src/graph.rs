@@ -683,20 +683,15 @@ pub(crate) fn load_graph_for_label(
         .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
     let root_key = canonical_graph_root(&root)?;
     graph_load_phase(started, &mut previous, "canonical graph root");
+    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root_key);
+    let _load = transition_gate.lock().unwrap();
+    graph_load_phase(started, &mut previous, "serialized graph-open lock");
     let lookup_id = state.storage_supervisor.begin_transition(
         app,
         window_label,
         Some(root_key.clone()),
         StorageTransitionKind::Lookup,
     )?;
-    state.storage_supervisor.advance_transition(
-        app,
-        lookup_id,
-        StorageTransitionPhase::WaitingForTransition,
-    )?;
-    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root_key);
-    let _load = transition_gate.lock().unwrap();
-    graph_load_phase(started, &mut previous, "serialized graph-open lock");
     state.storage_supervisor.advance_transition(
         app,
         lookup_id,
