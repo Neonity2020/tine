@@ -126,7 +126,10 @@
       "family": "sync-data-safety",
       "sources": {
         "issues": [],
-        "commits": []
+        "commits": [
+          "c12d07840948fffd435eb1b5cd706977a0785610",
+          "380bd9b8c3fa491b0c95fa4fb095d522d3f45d69"
+        ]
       },
       "platforms": [
         "all"
@@ -4188,13 +4191,18 @@
         "all"
       ],
       "layer": "native-ui-lifecycle",
-      "status": "planned",
+      "status": "covered",
       "coverage": {
-        "tests": [],
+        "tests": [
+          "src/startupRecovery.test.ts",
+          "src-tauri/src/state.rs::tests::queued_cold_return_keeps_its_native_authority_until_it_completes",
+          "src-tauri/src/sync_runtime.rs::tests::cold_return_requires_native_lock_attempt_target_and_full_direct_lifecycle",
+          "scripts/e2e-managed-force-close-recovery.mjs"
+        ],
         "scenario": "managed.cold-return-during-inflight-open",
         "failBefore": "field-reproduced"
       },
-      "notes": "On Android, a user requested Return to Direct Files while cold managed recovery still owned the serialized graph transition. The native return queued correctly, but the frontend attributed the old worker's managed_open progress to cold_return; after managed open completed, the actual archive/direct-open work emitted no progress and the 15-second inactivity watchdog falsely declared native.unavailable. Coverage must prove that the serialized handoff remains observable, stale managed-open phases cannot replace the cold-return phase, archiving and Direct Files publication do not trip the watchdog, and exact Markdown bytes remain available after restart."
+      "notes": "On Android, a user requested Return to Direct Files while cold managed recovery still owned the serialized graph transition. The frontend attributed the old worker's managed_open progress to cold_return, the queued return emitted no heartbeat, and managed-open completion revoked the startup authority token before the return acquired the lock. The exact Linux real-app regression at commit 380bd9b8 copied the 1,046-file anonymized graph, activated managed storage, edited and verified Markdown, waited 10 seconds, SIGKILLed Tine, requested Direct Files during the recovering managed open, verified Direct mode, made and projected a Direct edit, cleanly restarted, and verified the edit and Direct mode again. The first exact run also caught a harness evidence-lifetime bug: the final Direct restart correctly replaced the earlier managed-recovery log, so the harness now records managed-open evidence at the recovery boundary rather than asserting against the final process log."
     }
   ]
 }

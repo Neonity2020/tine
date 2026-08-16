@@ -75,6 +75,7 @@ let bindingGeneration;
 let wm;
 let wmLog;
 let phase = "setup";
+let observedManagedRecovery = false;
 let selected;
 
 function gitRevision() {
@@ -506,6 +507,9 @@ try {
     receipt.reopenMs ??= reopenMs;
     receipt.reopenDurationsMs.push(reopenMs);
     receipt.milestones[`${reopenLabel}-proof`] = { visibleUi: true, markdownProjection: true };
+    const recoveryDebugLog = fs.existsSync(path.join(ARTIFACTS, "tine-debug.log"))
+      ? fs.readFileSync(path.join(ARTIFACTS, "tine-debug.log"), "utf8") : "";
+    observedManagedRecovery ||= /managed storage open:.*(begin|completed)/s.test(recoveryDebugLog);
     if (RETURN_DURING_OPEN) {
       phase = "direct-edit-after-cold-return";
       await editSelectedPage(DIRECT_MARKER, "direct-edit-after-cold-return");
@@ -529,9 +533,7 @@ try {
       restart: true,
     };
   }
-  const debugLog = fs.existsSync(path.join(ARTIFACTS, "tine-debug.log"))
-    ? fs.readFileSync(path.join(ARTIFACTS, "tine-debug.log"), "utf8") : "";
-  if (!/managed storage open:.*(begin|completed)/s.test(debugLog)) {
+  if (!observedManagedRecovery) {
     throw new Error("crash recovery produced no observable managed-storage open progress in the native log");
   }
   receipt.milestones.cleanShutdown = true;
