@@ -42744,6 +42744,27 @@ mod tests {
             }
         }
 
+        fn nested_unicode_with_unbulleted_heading(label: &str, seed: u128) -> Self {
+            let fixture = Self::nested_unicode(label, seed);
+            fs::write(
+                fixture.graph_root.join("notes/Unbulleted Layout.md"),
+                b"## Heading before sync\n\t- nested child\n- sibling\n",
+            )
+            .unwrap();
+            fixture
+        }
+
+        fn nested_unicode_with_receiver_crlf_heading(label: &str, seed: u128) -> Self {
+            let fixture = Self::nested_unicode(label, seed);
+            let bytes = if label.ends_with("-receiver") {
+                b"## Heading before sync\r\n\t- nested child\r\n- sibling\r\n".as_slice()
+            } else {
+                b"## Heading before sync\n\t- nested child\n- sibling\n".as_slice()
+            };
+            fs::write(fixture.graph_root.join("notes/Unbulleted Layout.md"), bytes).unwrap();
+            fixture
+        }
+
         fn empty(label: &str, seed: u128) -> Self {
             let fixture = Self::nested_unicode(label, seed);
             for path in [
@@ -44817,6 +44838,233 @@ mod tests {
             conflicted.clean_shutdown().is_err(),
             "a retained provider conflict must remain visibly retryable"
         );
+    }
+
+    #[test]
+    fn shared_receiver_preserves_exact_markdown_layout_and_can_author_successor() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair_with_fixture(
+                "shared-exact-layout",
+                0xa1b0_0000,
+                ActivationFixture::nested_unicode_with_unbulleted_heading,
+            );
+        let path = "notes/Unbulleted Layout.md";
+        let page_id = match initiator_handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_MATERIALIZATION_QUERY_ROWS,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages
+                .into_iter()
+                .find(|page| page.path == path)
+                .and_then(|page| parse_page_id(&page.page_id).ok())
+                .expect("unbulleted fixture page is materialized"),
+            other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+        };
+
+        let mut authored = load_editor_id(&initiator_handle, page_id);
+        authored
+            .blocks
+            .iter_mut()
+            .find(|block| block.content.contains("Heading before sync"))
+            .expect("fixture heading block")
+            .content
+            .push_str(" from initiator");
+        let authored_batch = match initiator_handle
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: authored.page_id.clone(),
+                    revision: authored.revision.clone(),
+                },
+                preamble: authored.preamble.clone(),
+                blocks: authored.blocks,
+            })
+            .unwrap()
+        {
+            SyncEditorSaveOutcome::Durable { batch_id, .. } => {
+                BatchId::from_uuid(Uuid::parse_str(&batch_id).unwrap())
+            }
+            other => panic!("initiator layout edit was not durable: {other:?}"),
+        };
+        publish_shared_batch(&initiator_handle, &initiator, authored_batch);
+        settle_shared_provider(&initiator_handle);
+        let authored_bytes = fs::read(initiator.graph_root.join(path)).unwrap();
+        assert!(
+            authored_bytes.starts_with(b"## Heading before sync from initiator\n"),
+            "the author endpoint must retain the non-bulleted heading: {:?}",
+            String::from_utf8_lossy(&authored_bytes)
+        );
+
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            authored_bytes,
+            "the receiver must reproduce the author's exact accepted Markdown bytes"
+        );
+
+        let mut successor = load_editor_id(&receiver_handle, page_id);
+        successor
+            .blocks
+            .iter_mut()
+            .find(|block| block.content.contains("Heading before sync"))
+            .expect("received heading block")
+            .content
+            .push_str(" then receiver");
+        let successor_batch = match receiver_handle
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: successor.page_id.clone(),
+                    revision: successor.revision.clone(),
+                },
+                preamble: successor.preamble.clone(),
+                blocks: successor.blocks,
+            })
+            .unwrap()
+        {
+            SyncEditorSaveOutcome::Durable { batch_id, .. } => {
+                BatchId::from_uuid(Uuid::parse_str(&batch_id).unwrap())
+            }
+            other => panic!("receiver successor edit was not durable: {other:?}"),
+        };
+        publish_shared_batch(&receiver_handle, &receiver, successor_batch);
+        settle_shared_provider(&receiver_handle);
+        let successor_bytes = fs::read(receiver.graph_root.join(path)).unwrap();
+        assert!(
+            successor_bytes.starts_with(b"## Heading before sync from initiator then receiver\n")
+        );
+
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+        assert_eq!(
+            fs::read(initiator.graph_root.join(path)).unwrap(),
+            successor_bytes,
+            "both endpoints must converge exactly after the receiver authors a successor"
+        );
+
+        assert!(matches!(
+            initiator_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            receiver_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    #[test]
+    fn shared_receiver_local_crlf_layout_survives_reopen_and_successor_edit() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair_with_fixture(
+                "shared-crlf-layout",
+                0xa1b1_0000,
+                ActivationFixture::nested_unicode_with_receiver_crlf_heading,
+            );
+        let path = "notes/Unbulleted Layout.md";
+        let page_id = match initiator_handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_MATERIALIZATION_QUERY_ROWS,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages
+                .into_iter()
+                .find(|page| page.path == path)
+                .and_then(|page| parse_page_id(&page.page_id).ok())
+                .expect("CRLF fixture page is materialized"),
+            other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+        };
+
+        let mut authored = load_editor_id(&initiator_handle, page_id);
+        authored
+            .blocks
+            .iter_mut()
+            .find(|block| block.content.contains("Heading before sync"))
+            .expect("fixture heading block")
+            .content
+            .push_str(" from initiator");
+        let authored_batch = match initiator_handle
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: authored.page_id.clone(),
+                    revision: authored.revision.clone(),
+                },
+                preamble: authored.preamble.clone(),
+                blocks: authored.blocks,
+            })
+            .unwrap()
+        {
+            SyncEditorSaveOutcome::Durable { batch_id, .. } => {
+                BatchId::from_uuid(Uuid::parse_str(&batch_id).unwrap())
+            }
+            other => panic!("initiator CRLF-source edit was not durable: {other:?}"),
+        };
+        publish_shared_batch(&initiator_handle, &initiator, authored_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        let received = fs::read(receiver.graph_root.join(path)).unwrap();
+        assert!(
+            received.starts_with(b"## Heading before sync from initiator\r\n"),
+            "the receiver must retain its CRLF and non-bulleted layout: {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        assert!(!received.starts_with(b"- "));
+
+        assert!(matches!(
+            receiver_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        let receiver_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        let mut successor = load_editor_id(&receiver_handle, page_id);
+        successor
+            .blocks
+            .iter_mut()
+            .find(|block| block.content.contains("Heading before sync"))
+            .expect("reopened received heading block")
+            .content
+            .push_str(" then receiver");
+        assert!(matches!(
+            receiver_handle
+                .save_editor_page(SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::Existing {
+                        page_id: successor.page_id.clone(),
+                        revision: successor.revision.clone(),
+                    },
+                    preamble: successor.preamble.clone(),
+                    blocks: successor.blocks,
+                })
+                .unwrap(),
+            SyncEditorSaveOutcome::Durable { .. }
+        ));
+        let successor = fs::read(receiver.graph_root.join(path)).unwrap();
+        assert!(successor.starts_with(b"## Heading before sync from initiator then receiver\r\n"));
+        assert!(!successor.starts_with(b"- "));
+
+        assert!(matches!(
+            initiator_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            receiver_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
     }
 
     #[test]

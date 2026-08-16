@@ -1529,6 +1529,22 @@ pub fn derive_receiver_local_projection(
     receiver_endpoint_id: ProjectionEndpointId,
     exact_local_base: Option<&[u8]>,
 ) -> Result<ProjectionPlan, ProjectionError> {
+    derive_receiver_local_projection_with_layout(
+        engine,
+        source,
+        receiver_endpoint_id,
+        exact_local_base,
+        None,
+    )
+}
+
+fn derive_receiver_local_projection_with_layout(
+    engine: &ShardedHotEngine,
+    source: &ManifestedProjectionIntent,
+    receiver_endpoint_id: ProjectionEndpointId,
+    exact_local_base: Option<&[u8]>,
+    source_layout_annotations: Option<&[AnnotatedIdentity]>,
+) -> Result<ProjectionPlan, ProjectionError> {
     if source.workspace_id() != engine.workspace_id() {
         return Err(ProjectionError::ReceiverSourceMismatch);
     }
@@ -1543,17 +1559,57 @@ pub fn derive_receiver_local_projection(
         source.post_frontier(),
         source.claim_evidence(),
     )?;
-    plan_projection(
+    plan_projection_with_layout_annotations(
         engine.workspace_id(),
         authorization.state(),
         exact_local_base,
+        source_layout_annotations,
     )
+}
+
+/// Load only the authenticated structural identity map that the source author
+/// used as its render base. Receiver-local bytes remain the mutation
+/// precondition and are rendered again, so line endings and harmless local
+/// trivia remain local. The identity map is what lets an edited block retain
+/// non-canonical but parser-owned structure such as an unbulleted heading.
+fn authenticated_source_layout_base(
+    engine: &ShardedHotEngine,
+    source: &ManifestedProjectionIntent,
+) -> Result<Option<AnnotatedProjectionBase>, ProjectionError> {
+    let reference = source
+        .render_base()
+        .or_else(|| source.precondition().base());
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let archive = engine.archive_store().ok_or_else(|| {
+        ProjectionError::Archive("receiver projection has no accepted archive".into())
+    })?;
+    let object = archive
+        .read_object(reference.content_digest())
+        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+    if object.kind() != ObjectKind::AnnotatedBaseBlob
+        || object.document_id() != reference.document_id()
+        || !object.descriptor().is_ok_and(|descriptor| {
+            descriptor.content_digest() == reference.content_digest()
+                && descriptor.encoded_byte_length() == reference.encoded_byte_length()
+        })
+    {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    let base = AnnotatedProjectionBase::decode(object.payload())
+        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+    if base.workspace_id() != source.workspace_id() {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    Ok(Some(base))
 }
 
 /// Derive and execute a receiver-local projection from one accepted foreign
 /// endpoint intent. The foreign target bytes grant no authority: rendering is
 /// repeated from accepted semantic state and the receiver's exact current
-/// bytes, then committed through the receiver's private receipt store.
+/// bytes. Authenticated source-base identities preserve the same blocks'
+/// structural layout across an edit without copying source-local trivia.
 pub(crate) fn execute_receiver_local_projection_under_handoff(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
@@ -1609,6 +1665,11 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         .map(|candidate| candidate.source())
         .unwrap_or(source);
     let local_base = graph.read_projection_input(projection_source.path())?;
+    let source_layout_base = if source_absent {
+        None
+    } else {
+        authenticated_source_layout_base(engine, projection_source)?
+    };
     let mut effective_prior_completion = None;
     let plan = if source_absent {
         receiver_tombstone_plan(
@@ -1640,11 +1701,14 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         effective_prior_completion = Some((completed_intent, completion));
         plan
     } else {
-        derive_receiver_local_projection(
+        derive_receiver_local_projection_with_layout(
             engine,
             source,
             endpoint.endpoint_id,
             local_base.as_deref(),
+            source_layout_base
+                .as_ref()
+                .map(AnnotatedProjectionBase::annotations),
         )?
     };
     receipts.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;

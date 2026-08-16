@@ -8777,8 +8777,8 @@ impl ShardedHotEngine {
                         "clean SQLite path owner for {path} differs from its materialized page"
                     )));
                 }
-                let (prior, from_baseline) = if let Some(prior) =
-                    self.clean_manifest_projection_predecessor(path, page_id, current.state())?
+                let (prior, from_baseline) = if let Some(prior) = self
+                    .clean_manifest_projection_predecessor(path, page_id, current.state(), None)?
                 {
                     (prior, false)
                 } else {
@@ -18004,6 +18004,7 @@ impl ShardedHotEngine {
         path: &ManagedPath,
         page_id: PageId,
         before: &ProjectionPageState,
+        exact_local_bytes: Option<&[u8]>,
     ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
         let Some(work) = self.clean_projection_heads.get(path).cloned() else {
             return Ok(None);
@@ -18042,9 +18043,28 @@ impl ShardedHotEngine {
                 "clean manifest predecessor for {path} is not its deterministic current rendering"
             )));
         }
+        let (bytes, intent) = match exact_local_bytes {
+            Some(local) if local != bytes => {
+                let local = match super::projection::plan_projection_adopting_exact_source(
+                    self.workspace_id,
+                    before,
+                    local,
+                ) {
+                    Ok(local) => local,
+                    Err(super::projection::ExactSourceProjectionError::Semantic(_)) => {
+                        return Ok(None);
+                    }
+                    Err(super::projection::ExactSourceProjectionError::Projection(error)) => {
+                        return Err(EngineError::ProjectionManifest(error.to_string()));
+                    }
+                };
+                (local.target().to_vec(), local.intent().clone())
+            }
+            _ => (bytes.to_vec(), replay.intent().clone()),
+        };
         Ok(Some(CapabilityCapturedPriorProjection {
-            bytes: bytes.to_vec(),
-            intent: replay.intent().clone(),
+            bytes,
+            intent,
             completion: None,
             bootstrap_owner_binding: None,
             managed_local_authority: None,
@@ -18109,13 +18129,53 @@ impl ShardedHotEngine {
         let (archive, _) = self.clean_projection_runtime_binding()?;
         let decoded = super::projection::decode_manifested_projection_work(&archive, work)
             .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        if !decoded
-            .receiver_local_intent()
-            .matches_replay_except_frontier(&prior.intent)
-            || decoded.target_bytes() != Some(prior.bytes.as_slice())
+        let current = self.authorize_projection_write(prior.intent.page_id())?;
+        if current.state().page.path != *path
+            || current.state().frontier != *work.post_frontier()
+            || current.state().claim_evidence != prior.intent.claim_evidence()
         {
             return Err(EngineError::ProjectionManifest(
-                "clean manifest predecessor authority does not bind the captured exact target"
+                "clean manifest predecessor authority is not the current semantic page".into(),
+            ));
+        }
+        let source_replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            current.state(),
+            decoded.annotated_base().map(AnnotatedProjectionBase::bytes),
+            decoded
+                .annotated_base()
+                .map(AnnotatedProjectionBase::annotations),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if source_replay.target() != decoded.target_bytes().unwrap_or_default()
+            || !decoded
+                .receiver_local_intent()
+                .matches_replay_except_frontier(source_replay.intent())
+        {
+            return Err(EngineError::ProjectionManifest(
+                "clean manifest predecessor authority has an invalid source projection".into(),
+            ));
+        }
+        if decoded.target_bytes() == Some(prior.bytes.as_slice())
+            && decoded
+                .receiver_local_intent()
+                .matches_replay_except_frontier(&prior.intent)
+        {
+            return Ok(());
+        }
+        let local = super::projection::plan_projection_adopting_exact_source(
+            self.workspace_id,
+            current.state(),
+            &prior.bytes,
+        )
+        .map_err(|error| {
+            EngineError::ProjectionManifest(format!(
+                "clean receiver-local predecessor semantic proof failed: {error:?}"
+            ))
+        })?;
+        if local.intent() != &prior.intent || local.target() != prior.bytes {
+            return Err(EngineError::ProjectionManifest(
+                "clean manifest predecessor authority does not bind the receiver-local exact target"
                     .into(),
             ));
         }
@@ -18390,7 +18450,12 @@ impl ShardedHotEngine {
                             .map(|before| (requirement.page_id, before))
                     })
                     .map(|(page_id, before)| {
-                        self.clean_manifest_projection_predecessor(path, page_id, before)
+                        self.clean_manifest_projection_predecessor(
+                            path,
+                            page_id,
+                            before,
+                            current.as_deref(),
+                        )
                     })
                     .transpose()?
                     .flatten()

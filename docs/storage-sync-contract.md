@@ -264,7 +264,13 @@ fallback.
 4. **SharedActive operation.** A local edit is durably journaled, authored into
    the oplog, accepted locally, projected, then published as objects → intent →
    manifest/recovery copy → covering frontier head. Peers admit only complete,
-   validated batches and apply them in causal order.
+   validated batches and apply them in causal order. A peer renders accepted
+   semantics against its own exact current bytes, using the source operation's
+   authenticated render-base block identities. It therefore retains harmless
+   receiver-local representation such as CRLF while preserving parser-owned
+   structural layout, including non-bulleted Markdown headings whose content
+   changed. The source endpoint's target bytes do not become receiver write
+   authority.
 5. **Interrupted transfer.** Missing/temporary/reordered bytes remain pending;
    exact immutable collisions or inconsistent stable cuts block. A retry
    resumes from durable observations rather than inventing state.
@@ -332,6 +338,17 @@ changing its rendered bytes. In that case the latest clean projection manifest
 remains valid predecessor evidence only after the projection planner replays
 the current semantic page and proves equality except for that frontier. Exact
 bytes, path, page identity, claims and layout annotations must still match.
+
+A receiver-local projection can legitimately differ byte-for-byte from the
+source target while expressing the same accepted semantic page. On a later
+local edit, the current accepted manifest head remains the semantic authority,
+but not an assertion that the receiver copied its target bytes. Capture must
+reprove the receiver's live Markdown/Org as an exact source for that accepted
+page and bind the resulting annotations and bytes to the current manifest
+head. A semantic mismatch enters external reconciliation; it may not be hidden
+by canonical rendering or bypassed by trusting live bytes alone. This proof is
+reconstructed from the manifest plus live file on reopen and therefore does
+not require another persistent page/layout index.
 
 For a valid clean marker, the immutable baseline plus committed ordinary
 manifests is the complete semantic authority. The runtime reconstructs any

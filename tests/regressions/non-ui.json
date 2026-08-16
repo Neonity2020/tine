@@ -4103,6 +4103,29 @@
         "failBefore": "field-reproduced"
       },
       "notes": "A physical Android candidate could activate managed storage and save an edit, but force-closing and reopening reached the frontend's 15-second native.unavailable state. Two independent defects made a live recovery look dead: App started the graph-open command before the asynchronous native progress subscription was installed, and clean-manifest recovery emitted one phase before potentially long work but no heartbeat. Startup now begins only after the listener is installed (while retaining the watchdog fallback when the event bridge itself fails), and clean-manifest recovery runs behind a 10-second progress heartbeat without weakening its completion result. The mandatory full-release Android app-UID journey saves exact bytes, stops the actor without a clean drain, reopens and verifies those bytes, then exercises share setup, clean shutdown and another reopen."
+    },
+    {
+      "id": "REG-MANAGED-SYNC-EXACT-LAYOUT-001",
+      "title": "A sync receiver preserves the author's exact accepted Markdown layout and can author the next edit",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::shared_receiver_preserves_exact_markdown_layout_and_can_author_successor",
+          "crates/tine-core/src/sync_runtime.rs::shared_receiver_local_crlf_layout_survives_reopen_and_successor_edit"
+        ],
+        "scenario": "managed.sync-receiver-exact-layout-successor",
+        "failBefore": "proven"
+      },
+      "notes": "The local Linux two-real-app journey proved activation/share, join, remote editing, process kills, restart and provider delivery, then found that a receiver rewrote an accepted top-level non-bulleted Markdown heading with a leading bullet. The semantic content arrived, but the receiver-local projector deliberately discarded the author's exact target layout and re-rendered from receiver-local bytes. The next receiver edit was then refused because its projected file no longer matched the accepted manifest predecessor. The regression begins both devices from the same non-bulleted nested layout, requires exact bytes after the first delivery, authors a successor on the receiver, and requires exact convergence back to the initiator. Corpus contents remain private."
     }
   ]
 }
