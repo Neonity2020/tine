@@ -760,6 +760,9 @@ pub(crate) fn tick_dto(tick: SyncRuntimeTick) -> SparseV2TickDto {
         SyncRuntimeTick::LocalMutation(outcome) => {
             tick_value("local_mutation", Some(format!("{outcome:?}")), None)
         }
+        SyncRuntimeTick::ProviderMutation { batch_id } => {
+            tick_value("provider_mutation", Some(batch_id.to_string()), None)
+        }
         SyncRuntimeTick::RecoveryBlocked(detail) => {
             tick_value("recovery_blocked", Some(detail), None)
         }

@@ -282,6 +282,15 @@ before an inotify watch existed; graph-local text scanning alone cannot prove
 that shared transport is current. Local-only managed storage never performs
 this provider adoption merely because another device's namespace is present.
 
+Provider traversal and incomplete projection recovery may span several actor
+turns. `Recovering` reports bounded progress only; it is not itself a content
+notification. When an inbound provider batch becomes visible in SQLite and the
+receiver's Markdown/Org projection, the actor emits one `ProviderMutation`
+tick naming that batch. The production watcher treats that tick as an
+observable graph change and schedules a continuation for any remaining
+provider work. A terminal quiet watcher admission remains `AdmittedNoop` and
+must not manufacture a frontend refresh or conflict.
+
 ### 2.4 Lazy activation and clean runtime boundary
 
 The accepted next activation generation has one authority-changing record:

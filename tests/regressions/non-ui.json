@@ -4149,6 +4149,31 @@
         "failBefore": "proven"
       },
       "notes": "The local Linux two-real-app journey proved activation/share, join, remote editing, process kills, restart and provider delivery, then found that a receiver rewrote an accepted top-level non-bulleted Markdown heading with a leading bullet. The semantic content arrived, but the receiver-local projector deliberately discarded the author's exact target layout and re-rendered from receiver-local bytes. The next receiver edit was then refused because its projected file no longer matched the accepted manifest predecessor. The regression begins both devices from the same non-bulleted nested layout, requires exact bytes after the first delivery, authors a successor on the receiver, and requires exact convergence back to the initiator. Corpus contents remain private."
+    },
+    {
+      "id": "REG-MANAGED-SYNC-PROVIDER-VISIBLE-EVENT-001",
+      "title": "A provider-delivered edit that reaches SQLite and Markdown also refreshes the live page",
+      "family": "managed-storage-ui-consistency",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::shared_provider_clean_two_device_unicode_join_and_restart",
+          "crates/tine-core/src/sync_runtime.rs::only_a_committing_tick_reports_an_observable_change",
+          "src-tauri/src/watcher.rs::tests::shared_actor_first_watcher_turn_rescans_provider_bytes_delivered_while_stopped",
+          "scripts/e2e-sparse-v2-two-device.mjs"
+        ],
+        "scenario": "managed.sync-provider-commit-refreshes-live-page",
+        "failBefore": "proven"
+      },
+      "notes": "The real Linux two-app journey delivered A's edit into a stopped B and reopened B. B's SQLite-backed get_page result and Markdown projection both contained the edit, but the restored live page stayed stale. Tick tracing showed provider traversal and ingestion as Recovering turns followed by a quiet AdmittedNoop; no turn told the watcher that a provider batch had become reader-visible. The focused fail-before test reproduced the exact missing observable-change tick. Provider admission now emits ProviderMutation only after the batch is reflected in SQLite and projection; traversal-only Recovering and quiet AdmittedNoop remain non-content progress, so the repair does not restore the earlier false-conflict wakeups."
     }
   ]
 }

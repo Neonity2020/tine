@@ -2022,13 +2022,23 @@ pub struct SyncWatcherStatus {
 pub enum SyncRuntimeTick {
     Idle,
     LocalMutation(SyncLocalMutationOutcome),
+    /// A provider-authored batch is now reflected in the receiver's SQLite
+    /// projection and graph bytes. Unlike traversal-only `Recovering`, this is
+    /// a reader-visible change and must wake live views.
+    ProviderMutation {
+        batch_id: BatchId,
+    },
     RecoveryBlocked(String),
     Recovering,
     RetryFull,
     Blocked(String),
     Failed(String),
-    AdmittedNoop { epoch: u64 },
-    AdmittedComplete { epoch: u64 },
+    AdmittedNoop {
+        epoch: u64,
+    },
+    AdmittedComplete {
+        epoch: u64,
+    },
     Terminal(String),
 }
 
@@ -2046,7 +2056,10 @@ impl SyncRuntimeTick {
     /// real progress for the queue epoch and still updates status.
     #[must_use]
     pub const fn committed_observable_change(&self) -> bool {
-        matches!(self, Self::AdmittedComplete { .. })
+        matches!(
+            self,
+            Self::AdmittedComplete { .. } | Self::ProviderMutation { .. }
+        )
     }
 }
 
@@ -5201,6 +5214,10 @@ struct CleanRuntimeActorCore {
     /// until the continuation succeeds, then report one observable change
     /// after any observations accumulated behind it are reconciled as well.
     external_change_pending_notification: bool,
+    /// A provider batch has committed, but its derived projection may still be
+    /// completing. This is separate from the graph-watcher epoch above: the
+    /// provider queue has no graph-watcher epoch to acknowledge.
+    provider_change_pending_notification: bool,
 }
 
 #[derive(Default)]
@@ -5298,6 +5315,7 @@ impl CleanRuntimeActorCore {
             pending: None,
             watcher,
             external_change_pending_notification: false,
+            provider_change_pending_notification: false,
         }
     }
 
@@ -5382,7 +5400,9 @@ impl CleanRuntimeActorCore {
             OperationalCoordinator::ingest_clean_prepared(&mut session, graph, receipts, prepared)
                 .map_err(CleanActorMutationFailure::from)?
         };
-        Ok(self.retain_outcome(state))
+        let outcome = self.retain_outcome(state);
+        self.provider_change_pending_notification = true;
+        Ok(outcome)
     }
 
     fn retry_pending(
@@ -19321,7 +19341,8 @@ impl RuntimeActor {
                 | SyncRuntimeTick::RetryFull
                 | SyncRuntimeTick::Failed(_)
                 | SyncRuntimeTick::AdmittedNoop { .. }
-                | SyncRuntimeTick::AdmittedComplete { .. } => {}
+                | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::ProviderMutation { .. } => {}
                 SyncRuntimeTick::LocalMutation(outcome) => {
                     return EditorTurnReadiness::Deferred(editor_deferred_from_local(outcome))
                 }
@@ -19629,7 +19650,8 @@ impl RuntimeActor {
                         | SyncRuntimeTick::Idle
                         | SyncRuntimeTick::RetryFull
                         | SyncRuntimeTick::AdmittedNoop { .. }
-                        | SyncRuntimeTick::AdmittedComplete { .. } => {}
+                        | SyncRuntimeTick::AdmittedComplete { .. }
+                        | SyncRuntimeTick::ProviderMutation { .. } => {}
                         SyncRuntimeTick::RecoveryBlocked(_)
                         | SyncRuntimeTick::Blocked(_)
                         | SyncRuntimeTick::Failed(_)
@@ -20967,6 +20989,7 @@ impl RuntimeActor {
         let outcome = self.tick_inner();
         let label = match &outcome {
             SyncRuntimeTick::LocalMutation(_) => "LocalMutation",
+            SyncRuntimeTick::ProviderMutation { .. } => "ProviderMutation",
             SyncRuntimeTick::Idle => "Idle",
             SyncRuntimeTick::AdmittedNoop { .. } => "AdmittedNoop",
             SyncRuntimeTick::AdmittedComplete { .. } => "AdmittedComplete",
@@ -20991,6 +21014,12 @@ impl RuntimeActor {
             .expect("clean tick is routed only to a clean actor");
         if let Some(outcome) = clean.retry_pending(&self.graph, &self.receipts) {
             match outcome {
+                CleanActorMutationOutcome::Durable(batch_id)
+                    if clean.provider_change_pending_notification =>
+                {
+                    clean.provider_change_pending_notification = false;
+                    return SyncRuntimeTick::ProviderMutation { batch_id };
+                }
                 CleanActorMutationOutcome::Durable(batch_id)
                     if !clean.external_change_pending_notification =>
                 {
@@ -21630,8 +21659,16 @@ impl RuntimeActor {
                 .expect("clean provider work requires clean actor")
                 .execute_provider(&self.graph, &self.receipts, &prepared);
             return match outcome {
-                Ok(CleanActorMutationOutcome::Durable(_))
-                | Ok(CleanActorMutationOutcome::DurablePending { .. }) => {
+                Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
+                    self.provider_direct_manifests.pop_front();
+                    self.provider_direct_queued.remove(&batch_id);
+                    self.clean
+                        .as_mut()
+                        .expect("clean provider work requires clean actor")
+                        .provider_change_pending_notification = false;
+                    SyncRuntimeTick::ProviderMutation { batch_id }
+                }
+                Ok(CleanActorMutationOutcome::DurablePending { .. }) => {
                     self.provider_direct_manifests.pop_front();
                     self.provider_direct_queued.remove(&batch_id);
                     SyncRuntimeTick::Recovering
@@ -24768,7 +24805,8 @@ impl RuntimeActor {
                 | SyncRuntimeTick::Idle
                 | SyncRuntimeTick::RetryFull
                 | SyncRuntimeTick::AdmittedNoop { .. }
-                | SyncRuntimeTick::AdmittedComplete { .. } => {}
+                | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::ProviderMutation { .. } => {}
                 SyncRuntimeTick::RecoveryBlocked(detail)
                 | SyncRuntimeTick::Blocked(detail)
                 | SyncRuntimeTick::Failed(detail) => {
@@ -24809,6 +24847,7 @@ impl RuntimeActor {
                 }
                 SyncRuntimeTick::AdmittedNoop { .. }
                 | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::ProviderMutation { .. }
                 | SyncRuntimeTick::LocalMutation(_)
                 | SyncRuntimeTick::RetryFull => {
                     return Err(SyncRuntimeRequestError::ActorRefused(
@@ -24824,6 +24863,7 @@ impl RuntimeActor {
                 SyncRuntimeTick::Idle if !self.last_watcher.pending => break,
                 SyncRuntimeTick::AdmittedNoop { .. }
                 | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::ProviderMutation { .. }
                 | SyncRuntimeTick::LocalMutation(_)
                 | SyncRuntimeTick::Recovering
                 | SyncRuntimeTick::RetryFull
@@ -24956,6 +24996,7 @@ impl RuntimeActor {
                 }
                 SyncRuntimeTick::AdmittedNoop { .. }
                 | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::ProviderMutation { .. }
                 | SyncRuntimeTick::LocalMutation(_)
                 | SyncRuntimeTick::RetryFull => {
                     return Err(SyncRuntimeRequestError::ActorRefused(
@@ -25039,6 +25080,7 @@ impl RuntimeActor {
                 }
                 SyncRuntimeTick::AdmittedNoop { .. }
                 | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::ProviderMutation { .. }
                 | SyncRuntimeTick::LocalMutation(_)
                 | SyncRuntimeTick::RetryFull => {
                     return Err(SyncRuntimeRequestError::ActorRefused(
@@ -44684,8 +44726,10 @@ mod tests {
             active_handle(SyncRuntimeHandle::open(reopen_request(&joiner.request)));
         joiner_rejoined.observe_provider().unwrap();
         let mut provider_ticks = Vec::new();
+        let mut provider_observable_change = false;
         for _ in 0..256 {
             let tick = joiner_rejoined.tick().unwrap();
+            provider_observable_change |= tick.committed_observable_change();
             provider_ticks.push(tick.clone());
             if joiner_rejoined.status().unwrap().provider_pending == 0
                 && matches!(tick, SyncRuntimeTick::Idle)
@@ -44697,6 +44741,10 @@ mod tests {
         assert_eq!(
             joiner_status.provider_pending, 0,
             "clean provider did not settle: {joiner_status:?}; ticks={provider_ticks:?}"
+        );
+        assert!(
+            provider_observable_change,
+            "a provider-delivered graph mutation must produce one observable-change tick for the live UI: {provider_ticks:?}"
         );
         let tail_traversal =
             provider_traversal_instrumentation(joiner.request.identities.workspace_id);
@@ -55237,6 +55285,13 @@ mod tests {
     #[test]
     fn only_a_committing_tick_reports_an_observable_change() {
         assert!(SyncRuntimeTick::AdmittedComplete { epoch: 7 }.committed_observable_change());
+        assert!(
+            SyncRuntimeTick::ProviderMutation {
+                batch_id: BatchId::from_uuid(Uuid::from_u128(7)),
+            }
+            .committed_observable_change(),
+            "a provider batch reflected in SQLite and Markdown must wake live readers"
+        );
         assert!(
             !SyncRuntimeTick::AdmittedNoop { epoch: 7 }.committed_observable_change(),
             "an admission that took no completed batch is not a content change"

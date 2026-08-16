@@ -934,6 +934,7 @@ fn sparse_tick_needs_continuation(tick: &SyncRuntimeTick, provider_rescan_queued
     matches!(
         tick,
         SyncRuntimeTick::LocalMutation(_)
+            | SyncRuntimeTick::ProviderMutation { .. }
             | SyncRuntimeTick::Recovering
             | SyncRuntimeTick::RetryFull
     ) || (provider_rescan_queued
@@ -1734,6 +1735,12 @@ mod tests {
         assert!(sparse_tick_needs_continuation(
             &SyncRuntimeTick::AdmittedComplete { epoch: 8 },
             true,
+        ));
+        assert!(sparse_tick_needs_continuation(
+            &SyncRuntimeTick::ProviderMutation {
+                batch_id: tine_core::oplog::BatchId::from_uuid(uuid::Uuid::from_u128(8)),
+            },
+            false,
         ));
         assert!(
             !sparse_tick_needs_continuation(&SyncRuntimeTick::AdmittedNoop { epoch: 9 }, false,),
