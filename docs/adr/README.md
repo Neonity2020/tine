@@ -81,3 +81,4 @@ see the project `CLAUDE.md`.
 | [0052](0052-ios-plugin-platform-apple-4-7-2.md) | The plugin API may never re-export native surface (Apple 4.7.2); read before widening `PLUGIN_CAPABILITIES` | Accepted |
 | [0053](0053-enrollment-checkpoint-integrity.md) | Current enrollment checkpoints provide versioned integrity; legacy HMAC is verification-only | Accepted |
 | [0054](0054-lazy-genesis-managed-activation.md) | Managed activation imports one lazy genesis and derives disposable projections once | Accepted — implementation gated |
+| [0055](0055-native-storage-mode-supervisor.md) | One native supervisor owns storage-mode transitions and an always-available emergency Direct Files escape | Accepted — implementation in progress |

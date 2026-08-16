@@ -29,6 +29,7 @@ mod plugins;
 mod settings;
 mod spellcheck;
 mod state;
+mod storage_mode_supervisor;
 mod sync_runtime;
 mod watcher;
 
@@ -646,7 +647,7 @@ pub fn run() {
         })
         .manage(AppState {
             graphs: RwLock::new(state::GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),

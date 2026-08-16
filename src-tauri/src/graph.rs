@@ -636,7 +636,7 @@ pub(crate) fn load_graph_for_label(
         .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
     let root_key = canonical_graph_root(&root)?;
     graph_load_phase(started, &mut previous, "canonical graph root");
-    let _load = state.graph_load.lock().unwrap();
+    let _load = state.storage_supervisor.legacy_transition_guard();
     graph_load_phase(started, &mut previous, "serialized graph-open lock");
     if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
         if owner == window_label {
@@ -978,7 +978,7 @@ mod tests {
     fn direct_test_state() -> AppState {
         AppState {
             graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
-            graph_load: std::sync::Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: std::sync::Mutex::new(None),
             last_focused: std::sync::Mutex::new(None),
             capture_graph: std::sync::Mutex::new(None),

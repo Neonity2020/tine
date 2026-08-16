@@ -546,9 +546,9 @@ impl GraphRegistry {
 
 pub(crate) struct AppState {
     pub(crate) graphs: RwLock<GraphRegistry>,
-    // Serializes open/switch/window-create decisions. Existing commands never
-    // take this lock, so a slow graph open cannot stall another graph's editor.
-    pub(crate) graph_load: Mutex<()>,
+    /// Sole owner of serialized open/switch/storage-mode transitions and their
+    /// typed native operation model.
+    pub(crate) storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor,
     pub(crate) watch_ctl: Mutex<Option<Sender<()>>>,
     pub(crate) last_focused: Mutex<Option<WindowKey>>,
     pub(crate) capture_graph: Mutex<Option<CaptureGraphBinding>>,
@@ -620,7 +620,7 @@ impl AppState {
     }
 
     /// Claim the current startup authority for a queued Direct Files return.
-    /// The claim is made before waiting for `graph_load`, so the managed open
+    /// The claim is made before waiting for the supervisor transition guard, so the managed open
     /// ahead of it cannot erase the authority when it publishes its slot.
     pub(crate) fn request_startup_cold_return(
         &self,
@@ -662,7 +662,7 @@ impl AppState {
 
     /// A normal graph-open completion retires an unclaimed startup action. A
     /// cold return that already claimed the same native attempt survives until
-    /// it acquires `graph_load`; a newer `begin_startup_recovery_attempt`
+    /// it acquires the supervisor transition guard; a newer `begin_startup_recovery_attempt`
     /// remains the way another user action supersedes it.
     pub(crate) fn clear_startup_recovery_target(&self, window: &str) {
         let mut targets = self.startup_recovery.lock().unwrap();
@@ -843,7 +843,7 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     let label = ctx.window.label().to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
     // Serialize the whole operation with graph loads and sparse-v2 promotion.
-    let _transition = ctx.state.graph_load.lock().unwrap();
+    let _transition = ctx.state.storage_supervisor.legacy_transition_guard();
     let old = slot_for_window(&ctx.state, &label)?;
     if old.is_sparse_v2() {
         // A managed binding has no legacy graph to reopen, and the reopen below
@@ -1106,7 +1106,7 @@ mod tests {
     fn explicit_graph_activation_updates_capture_routing_idempotently() {
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("graph-1".into())),
             capture_graph: Mutex::new(None),
@@ -1125,7 +1125,7 @@ mod tests {
     fn queued_cold_return_keeps_its_native_authority_until_it_completes() {
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),
@@ -1162,7 +1162,7 @@ mod tests {
     fn capture_binding_retains_the_selected_graph_lease() {
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),
@@ -1222,7 +1222,7 @@ mod tests {
         let new_root = base.join("new");
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),

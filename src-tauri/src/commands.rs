@@ -2570,7 +2570,7 @@ mod capture_quick_switch_tests {
         }
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),

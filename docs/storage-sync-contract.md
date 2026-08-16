@@ -6,13 +6,25 @@ exclusive `Legacy(Graph)` runtime before graph open. When Direct Files is
 selected, no code below may inspect or modify `.tine-sync`, open an oplog,
 create managed scratch state, or start managed recovery.
 
-Return to Direct Files is a priority recovery action. If a managed open already
-owns the serialized graph transition, the return waits for that operation to
-reach its safe handoff rather than racing its private state. That wait and the
-subsequent archive/direct-open phases remain explicitly reported; progress from
-the superseded managed open must never be presented as progress of the return,
-and frontend inactivity alone must not convert an active native transition into
-a terminal refusal.
+One native `StorageModeSupervisor` owns storage-transition identity, priority,
+serialization, and terminal outcomes. A transition has a monotonically
+increasing operation ID, exact window and canonical graph root, typed kind and
+phase, and exactly one native terminal outcome. Late work may publish only while
+its operation remains current. The frontend renders events for the current
+operation ID; phase-name prefixes, frontend attempt tokens, and inactivity
+timers are not storage authority.
+
+Return to Direct Files has two meanings. A graceful return drains a healthy
+managed actor and confirms its committed projection before selecting Direct
+Files. An emergency return is always available from managed startup/refusal:
+it atomically retires the private managed selector and opens the current
+Markdown/Org tree without first opening, repairing, draining, archiving, or
+recovering managed state. Managed evidence remains quarantined for inspection,
+and the UI warns that it may contain operations newer than Markdown. Re-enabling
+managed storage after emergency return starts from the then-live Markdown tree;
+quarantined authority is never silently resurrected. Emergency return
+supersedes in-flight managed open/activation/join at native safe checkpoints,
+and an older operation cannot publish a managed slot afterwards.
 
 The authoritative layout names live in the pinned
 `tine_storage::formats` manifest. Core code imports them through the

@@ -1541,7 +1541,7 @@ fn recover_managed_application_subtrees_with(
     request: SyncApplicationMoveSubtreesRequest,
     reopen: impl FnOnce(&Path) -> Result<(SparseV2Binding, tine_core::model::GraphMeta), String>,
 ) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
-    let _transition = state.graph_load.lock().unwrap();
+    let _transition = state.storage_supervisor.legacy_transition_guard();
     let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?;
     let root = predecessor.root_key.clone();
     let action = predecessor
@@ -1666,7 +1666,7 @@ fn activate_sparse_v2_blocking(
     let started = Instant::now();
     let state = app.state::<crate::state::AppState>();
     crate::debug::diag("sparse-v2 activation requested");
-    let _transition = state.graph_load.lock().unwrap();
+    let _transition = state.storage_supervisor.legacy_transition_guard();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     let root = slot.root_key.clone();
 
@@ -2492,7 +2492,7 @@ fn cancel_sparse_v2_cold_blocking(
     state.request_startup_cold_return(label, attempt, &submitted_root)?;
     let progress =
         ColdReturnProgress::start(reporter.clone(), "cold_return.waiting_for_graph_transition");
-    let _transition = state.graph_load.lock().unwrap();
+    let _transition = state.storage_supervisor.legacy_transition_guard();
     progress.phase("cold_return.verifying_target");
 
     // Re-read both the native attempt and exact canonical target *after*
@@ -2569,7 +2569,7 @@ fn cancel_sparse_v2_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2CancelResult, String> {
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.graph_load.lock().unwrap();
+    let _transition = state.storage_supervisor.legacy_transition_guard();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     let private_root = sparse_private_root(&app, &slot.root_key)?;
     let recovery_root = sparse_recovery_root(&app)?;
@@ -2605,7 +2605,7 @@ fn prepare_sparse_v2_share_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.graph_load.lock().unwrap();
+    let _transition = state.storage_supervisor.legacy_transition_guard();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     let record = state
         .sync_runtime
@@ -2673,7 +2673,7 @@ fn join_sparse_v2_shared_blocking(
     }
 
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.graph_load.lock().unwrap();
+    let _transition = state.storage_supervisor.legacy_transition_guard();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     let descriptor =
         inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))
@@ -3282,7 +3282,8 @@ mod tests {
             ));
             let state = crate::state::AppState {
                 graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
-                graph_load: Mutex::new(()),
+                storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(
+                ),
                 watch_ctl: Mutex::new(None),
                 last_focused: Mutex::new(None),
                 capture_graph: Mutex::new(None),
@@ -3462,7 +3463,7 @@ mod tests {
                 .map(|end| start + end)
                 .expect("next managed command")];
         for required in [
-            "state.graph_load.lock()",
+            "state.storage_supervisor.legacy_transition_guard()",
             "cold_return.waiting_for_graph_transition",
             "cold_return.verifying_target",
             "cold_return.archiving_managed_state",
@@ -4934,7 +4935,7 @@ mod tests {
         ));
         let state = crate::state::AppState {
             graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
-            graph_load: Mutex::new(()),
+            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),
