@@ -4105,6 +4105,29 @@
       "notes": "A physical Android candidate could activate managed storage and save an edit, but force-closing and reopening reached the frontend's 15-second native.unavailable state. Two independent defects made a live recovery look dead: App started the graph-open command before the asynchronous native progress subscription was installed, and clean-manifest recovery emitted one phase before potentially long work but no heartbeat. Startup now begins only after the listener is installed (while retaining the watchdog fallback when the event bridge itself fails), and clean-manifest recovery runs behind a 10-second progress heartbeat without weakening its completion result. The mandatory full-release Android app-UID journey saves exact bytes, stops the actor without a clean drain, reopens and verifies those bytes, then exercises share setup, clean shutdown and another reopen."
     },
     {
+      "id": "REG-MANAGED-SYNC-COLD-PROVIDER-SCAN-001",
+      "title": "A reopened shared actor imports provider bytes delivered while Tine was stopped without test-driven ticks",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/watcher.rs::tests::shared_actor_first_watcher_turn_rescans_provider_bytes_delivered_while_stopped",
+          "scripts/e2e-sparse-v2-two-device.mjs"
+        ],
+        "scenario": "managed.sync-cold-reopen-provider-delivery-production-watcher",
+        "failBefore": "field-reproduced"
+      },
+      "notes": "The local two-real-app journey originally called sparse_v2_tick while waiting for peer delivery. Removing that diagnostic shortcut exposed the production failure: B published a complete manifest, objects and frontier head; those files were delivered into A while A was stopped; A reopened SharedActive and remained on the old page indefinitely. Its first watcher turn scanned graph text but supplied no provider observation because delivery predated the inotify watch. The repair gives only a SharedActive actor one imprecise provider scan on its initial watcher turn, after which the existing Recovering retry schedule drains bounded work and exact callbacks resume. Local-only managed storage still ignores a graph-local shared namespace. The final E2E must use external file delivery and production watcher progress only; internal actor ticks are forbidden from its acceptance path."
+    },
+    {
       "id": "REG-MANAGED-SYNC-EXACT-LAYOUT-001",
       "title": "A sync receiver preserves the author's exact accepted Markdown layout and can author the next edit",
       "family": "managed-storage-data-safety",

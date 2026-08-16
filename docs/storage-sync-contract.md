@@ -275,6 +275,13 @@ fallback.
    exact immutable collisions or inconsistent stable cuts block. A retry
    resumes from durable observations rather than inventing state.
 
+On every cold installation of a `SharedActive` actor, the first production
+watcher turn performs one imprecise provider scan before relying on exact
+filesystem callbacks. Provider bytes may have arrived while Tine was stopped,
+before an inotify watch existed; graph-local text scanning alone cannot prove
+that shared transport is current. Local-only managed storage never performs
+this provider adoption merely because another device's namespace is present.
+
 ### 2.4 Lazy activation and clean runtime boundary
 
 The accepted next activation generation has one authority-changing record:

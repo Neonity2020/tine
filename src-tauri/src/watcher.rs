@@ -907,6 +907,24 @@ fn sparse_provider_lane_is_active(
     shared_phase == Some(tine_core::sync_runtime::SyncSharedPhase::Active)
 }
 
+/// Does this watcher turn owe the shared provider an imprecise observation?
+///
+/// Exact notify paths are sufficient while the app is running. They are not
+/// sufficient for the first turn after a SharedActive actor is installed: a
+/// file-sync provider may have delivered bytes while Tine was stopped, before
+/// an inotify watch existed. That first turn must therefore scan the provider
+/// namespace just as poll mode does. Local-only managed storage deliberately
+/// remains outside the provider lane even if another device's namespace is
+/// present in the graph.
+fn sparse_provider_rescan_required(
+    provider_lane_active: bool,
+    initial_tick: bool,
+    provider_imprecise: bool,
+    provider_poll: bool,
+) -> bool {
+    provider_lane_active && (initial_tick || provider_imprecise || provider_poll)
+}
+
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
 /// them into the cache, emitting `graph-changed` so the UI can reload. Two
 /// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
@@ -1194,6 +1212,12 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let (provider_paths, provider_imprecise) =
                     sparse_provider_observations(&graph.root, &paths, &full_paths);
                 let provider_poll = poll_cycle && provider_lane_active;
+                let provider_rescan = sparse_provider_rescan_required(
+                    provider_lane_active,
+                    initial_tick,
+                    provider_imprecise,
+                    provider_poll,
+                );
                 if observations.is_empty()
                     && provider_paths.is_empty()
                     && !provider_imprecise
@@ -1206,13 +1230,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 }
 
                 let result = (|| {
-                    if provider_lane_active
-                        && (!provider_paths.is_empty() || provider_imprecise || provider_poll)
-                    {
-                        graph.handle.observe_provider_paths(
-                            provider_paths,
-                            provider_imprecise || provider_poll,
-                        )?;
+                    if provider_lane_active && (!provider_paths.is_empty() || provider_rescan) {
+                        graph
+                            .handle
+                            .observe_provider_paths(provider_paths, provider_rescan)?;
                     }
                     if !observations.is_empty() {
                         graph.handle.observe_watcher(observations)?;
@@ -1669,6 +1690,22 @@ mod tests {
             sparse_provider_observations(&root, &HashSet::new(), &HashSet::new());
         assert!(provider_paths.is_empty());
         assert!(!imprecise);
+    }
+
+    #[test]
+    fn shared_actor_first_watcher_turn_rescans_provider_bytes_delivered_while_stopped() {
+        assert!(sparse_provider_rescan_required(true, true, false, false));
+        assert!(sparse_provider_rescan_required(true, false, true, false));
+        assert!(sparse_provider_rescan_required(true, false, false, true));
+
+        assert!(
+            !sparse_provider_rescan_required(false, true, true, true),
+            "local-only managed storage must not adopt a graph-local provider namespace",
+        );
+        assert!(
+            !sparse_provider_rescan_required(true, false, false, false),
+            "a steady exact-event turn must not broaden into a full provider scan",
+        );
     }
 
     #[test]
