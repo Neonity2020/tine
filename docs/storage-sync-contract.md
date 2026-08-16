@@ -286,8 +286,11 @@ Provider traversal and incomplete projection recovery may span several actor
 turns. `Recovering` reports bounded progress only; it is not itself a content
 notification. When an inbound provider batch becomes visible in SQLite and the
 receiver's Markdown/Org projection, the actor emits one `ProviderMutation`
-tick naming that batch. The production watcher treats that tick as an
-observable graph change and schedules a continuation for any remaining
+tick naming that batch. If an interleaved serialized application request
+finishes a retained provider projection between watcher ticks, the actor keeps
+that batch identity until the next tick emits the same notification; a read
+must not consume the live-view wake-up. The production watcher treats that tick
+as an observable graph change and schedules a continuation for any remaining
 provider work. A terminal quiet watcher admission remains `AdmittedNoop` and
 must not manufacture a frontend refresh or conflict.
 

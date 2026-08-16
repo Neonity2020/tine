@@ -5215,9 +5215,10 @@ struct CleanRuntimeActorCore {
     /// after any observations accumulated behind it are reconciled as well.
     external_change_pending_notification: bool,
     /// A provider batch has committed, but its derived projection may still be
-    /// completing. This is separate from the graph-watcher epoch above: the
-    /// provider queue has no graph-watcher epoch to acknowledge.
-    provider_change_pending_notification: bool,
+    /// completing. Retain its identity until a later actor tick publishes the
+    /// live-view notification, even if an interleaved application read owns the
+    /// serialized actor and finishes the retained projection first.
+    provider_change_pending_notification: Option<BatchId>,
 }
 
 #[derive(Default)]
@@ -5315,7 +5316,7 @@ impl CleanRuntimeActorCore {
             pending: None,
             watcher,
             external_change_pending_notification: false,
-            provider_change_pending_notification: false,
+            provider_change_pending_notification: None,
         }
     }
 
@@ -5401,7 +5402,10 @@ impl CleanRuntimeActorCore {
                 .map_err(CleanActorMutationFailure::from)?
         };
         let outcome = self.retain_outcome(state);
-        self.provider_change_pending_notification = true;
+        self.provider_change_pending_notification = Some(match outcome {
+            CleanActorMutationOutcome::Durable(batch_id)
+            | CleanActorMutationOutcome::DurablePending { batch_id, .. } => batch_id,
+        });
         Ok(outcome)
     }
 
@@ -21015,9 +21019,9 @@ impl RuntimeActor {
         if let Some(outcome) = clean.retry_pending(&self.graph, &self.receipts) {
             match outcome {
                 CleanActorMutationOutcome::Durable(batch_id)
-                    if clean.provider_change_pending_notification =>
+                    if clean.provider_change_pending_notification == Some(batch_id) =>
                 {
-                    clean.provider_change_pending_notification = false;
+                    clean.provider_change_pending_notification = None;
                     return SyncRuntimeTick::ProviderMutation { batch_id };
                 }
                 CleanActorMutationOutcome::Durable(batch_id)
@@ -21042,6 +21046,13 @@ impl RuntimeActor {
                     );
                 }
             }
+        }
+        if let Some(batch_id) = clean.provider_change_pending_notification.take() {
+            // A serialized application request may have completed the retained
+            // provider projection between watcher ticks. The durable content is
+            // already reader-visible, but the live UI still needs exactly one
+            // aggregate change notification.
+            return SyncRuntimeTick::ProviderMutation { batch_id };
         }
 
         let paths = {
@@ -21662,10 +21673,13 @@ impl RuntimeActor {
                 Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
                     self.provider_direct_manifests.pop_front();
                     self.provider_direct_queued.remove(&batch_id);
-                    self.clean
+                    let notification = self
+                        .clean
                         .as_mut()
                         .expect("clean provider work requires clean actor")
-                        .provider_change_pending_notification = false;
+                        .provider_change_pending_notification
+                        .take();
+                    debug_assert_eq!(notification, Some(batch_id));
                     SyncRuntimeTick::ProviderMutation { batch_id }
                 }
                 Ok(CleanActorMutationOutcome::DurablePending { .. }) => {
@@ -44566,6 +44580,93 @@ mod tests {
             joiner_handle.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+    }
+
+    #[test]
+    fn provider_projection_completed_by_application_read_still_notifies_live_views() {
+        let (author, receiver, author_handle, receiver_handle) =
+            joined_shared_pair("provider-read-completes-projection", 0xa179_0000);
+        let (outbound_batch, _, _, _) = submit_shared_page(
+            &author_handle,
+            0xa179_1000,
+            "Provider Read Completion",
+            "notes/provider-read-completion.md",
+            "provider read completion payload",
+        );
+        publish_shared_batch(&author_handle, &author, outbound_batch);
+        settle_shared_provider(&author_handle);
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+
+        // The provider batch is durable before its derived SQLite/Markdown
+        // projection finishes. A real frontend page poll can own the serialized
+        // actor between watcher ticks and finish that retained projection.
+        receiver_handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        let request = SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::Logical {
+                name: "Provider Read Completion".into(),
+                page_kind: SyncPageKind::Page,
+            },
+        };
+        let mut before_read = Vec::new();
+        let mut loaded = false;
+        for _ in 0..256 {
+            let tick = receiver_handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "provider delivery failed before the interleaved page read: {tick:?}"
+            );
+            before_read.push(tick);
+            if matches!(
+                receiver_handle
+                    .load_application_page(request.clone())
+                    .unwrap(),
+                SyncApplicationPageLoadOutcome::Loaded { .. }
+            ) {
+                loaded = true;
+                break;
+            }
+        }
+        assert!(
+            loaded,
+            "the interleaved application read never completed the retained provider projection: {before_read:?}"
+        );
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/provider-read-completion.md")
+                .is_file(),
+            "the application read claimed readiness before Markdown projection"
+        );
+
+        let mut after_read = Vec::new();
+        let mut notified = false;
+        for _ in 0..32 {
+            let tick = receiver_handle.tick().unwrap();
+            notified |= matches!(
+                tick,
+                SyncRuntimeTick::ProviderMutation { batch_id } if batch_id == outbound_batch
+            );
+            after_read.push(tick.clone());
+            if notified {
+                break;
+            }
+        }
+        assert!(
+            notified,
+            "an application read completed the provider projection but stranded its live-view notification: before={before_read:?}; after={after_read:?}"
+        );
     }
 
     #[test]

@@ -1644,6 +1644,11 @@ impl OperationalCoordinator {
                 "durable clean provider operation is awaiting derived-state application",
             ),
         };
+        #[cfg(test)]
+        if let Err(error) = fault(OperationalFaultPoint::AfterManifest) {
+            continuation.failure = error;
+            return Ok(CleanLocalMutationState::DurablePending(continuation));
+        }
         match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
             Ok(()) => {
                 continuation.guard.complete();
