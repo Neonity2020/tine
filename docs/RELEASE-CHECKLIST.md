@@ -34,6 +34,21 @@ may tag, publish, comment, and close issues.
    runtime journey: activate on shared storage, save exact bytes, stop without
    a clean drain, recover those bytes on reopen, prepare sharing, cleanly stop,
    and reopen again.
+   Also run the private-corpus Linux managed-storage gate locally against the
+   same exact candidate and receipt (never in GitHub Actions, and never against
+   the source corpus itself):
+
+   ```bash
+   TINE_MANAGED_REAL_GRAPH=/path/to/read-only/real-scale-anonymized-graph \
+   TINE_APP=/path/to/exact-candidate/tine \
+   TINE_E2E_BUILD_RECEIPT=/path/to/exact-candidate/tine.build.json \
+     npm run e2e:linux:managed-real-release
+   ```
+
+   It copies the corpus into disposable roots, proves two consecutive visible
+   edit / ten-second settle / SIGKILL / same-state reopen cycles, then proves a
+   fresh second installation can join and exchange visible edits in both
+   directions without manual actor ticks. Retain both scenario receipts.
 6. As soon as that frozen candidate passes its local exact-commit gates, deploy
    that exact tested artifact to `~/research/tine` without waiting to be asked.
    Record and compare the staged/deployed SHA-256 so Martin can test the actual

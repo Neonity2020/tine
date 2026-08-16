@@ -91,6 +91,19 @@ const suites = {
     ["sparse-v2-recovery", "scripts/e2e-sparse-v2-recovery.mjs", {}],
     ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
   ],
+  // Release-only local proof on a copied private corpus. This suite is kept
+  // separate from hosted coverage so neither the source graph nor a derivative
+  // can enter GitHub Actions artifacts.
+  "linux-managed-real-release": [
+    ["managed-force-close-recovery", "scripts/e2e-managed-force-close-recovery.mjs", {
+      TINE_MANAGED_RECOVERY_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
+      TINE_MANAGED_RECOVERY_SETTLE_MS: "10000",
+      TINE_MANAGED_RECOVERY_KILL_CYCLES: "2",
+    }],
+    ["sparse-v2-two-device-real", "scripts/e2e-sparse-v2-two-device.mjs", {
+      TINE_MANAGED_SYNC_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
+    }],
+  ],
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
@@ -164,6 +177,14 @@ const suites = {
 if (!suites[suiteName]) {
   console.error(`unknown suite ${suiteName}; choose ${Object.keys(suites).join(", ")}`);
   process.exit(2);
+}
+if (suiteName === "linux-managed-real-release") {
+  if (e2eMode !== "release") {
+    throw new Error("linux-managed-real-release must run with TINE_E2E_MODE=release");
+  }
+  if (!process.env.TINE_MANAGED_REAL_GRAPH) {
+    throw new Error("linux-managed-real-release requires TINE_MANAGED_REAL_GRAPH pointing at a read-only local corpus");
+  }
 }
 
 function loadSelectedContracts(scenarios) {

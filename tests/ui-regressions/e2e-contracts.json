@@ -672,6 +672,28 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-managed-force-close-recovery.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "On a real-scale graph, an existing-page edit saved through the visible managed editor survives a ten-second settle, SIGKILL of the actual Tine process, and restart with the same graph and private state; managed storage reopens actively and the exact edit remains in both UI and Markdown.",
+     "blocking": true,
+     "authority": "Tine managed-storage process-crash recovery and Markdown projection contract"
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "Native recovery remains visibly observable and reaches a usable graph without native.unavailable, a refusal loop, a silent hang, or recurring error notifications.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Activation, driver startup, and recovery durations may vary with corpus size and machine speed while progress remains observable and recovery completes within the scenario timeout."
+   ],
+   "nonRequirements": [
+    "Exact progress wording, phase count, toast styling, DOM structure, process ID, or millisecond timing."
+   ],
+   "stability": "burn-in"
+  },
   "scripts/e2e-search-parity.mjs": {
    "contracts": [
     {

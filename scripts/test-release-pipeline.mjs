@@ -38,6 +38,7 @@ const flatpakMetadataWorkflow = fs.readFileSync(
 );
 const preflight = fs.readFileSync(path.join(process.cwd(), "scripts/check-release-preflight.mjs"), "utf8");
 const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"), "utf8");
+const packageJson = fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
 const windowsWebviewDriverInstaller = fs.readFileSync(
@@ -631,6 +632,23 @@ assert.match(
   /"linux-release": \[[\s\S]*?\["sparse-v2-two-device", "scripts\/e2e-sparse-v2-two-device\.mjs", \{\}\]/,
   "the mandatory Linux release catalog does not prove real two-device managed sync"
 );
+assert.match(
+  e2eRunner,
+  /"linux-managed-real-release": \[[\s\S]*?TINE_MANAGED_RECOVERY_KILL_CYCLES: "2"[\s\S]*?\["sparse-v2-two-device-real", "scripts\/e2e-sparse-v2-two-device\.mjs"/,
+  "the local private-corpus release suite does not prove repeated forced-close recovery and real two-device sync"
+);
+assert.match(
+  packageJson,
+  /"e2e:linux:managed-real-release": "TINE_E2E_MODE=release E2E_SCENARIO_TIMEOUT_MS=1800000 node scripts\/run-e2e\.mjs linux-managed-real-release"/,
+  "the private-corpus managed release suite is not exposed as a strict local command"
+);
+for (const workflow of [ciWorkflow, uiE2eWorkflow, releaseWorkflow]) {
+  assert.doesNotMatch(
+    workflow,
+    /TINE_MANAGED_REAL_GRAPH|linux-managed-real-release/,
+    "a hosted workflow must not reference the private-corpus managed release gate"
+  );
+}
 assert.match(
   uiE2eWorkflow,
   /Snapshot Linux E2E candidate inputs[\s\S]*?Write Linux E2E candidate receipt[\s\S]*?Snapshot Windows E2E candidate inputs[\s\S]*?Write Windows E2E candidate receipt/,

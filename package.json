@@ -38,6 +38,7 @@
     "e2e:outline-guide": "node scripts/e2e-outline-guide.mjs",
     "e2e:linux:smoke": "node scripts/run-e2e.mjs linux-smoke",
     "e2e:linux:release": "node scripts/run-e2e.mjs linux-release",
+    "e2e:linux:managed-real-release": "TINE_E2E_MODE=release E2E_SCENARIO_TIMEOUT_MS=1800000 node scripts/run-e2e.mjs linux-managed-real-release",
     "e2e:windows:smoke": "node scripts/run-e2e.mjs windows-smoke",
     "screenshot": "node scripts/screenshot.mjs",
     "bench": "node scripts/bench.mjs",
