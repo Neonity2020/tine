@@ -31,6 +31,7 @@ const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4724);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4725);
 const SETTLE_MS = Number(process.env.TINE_MANAGED_RECOVERY_SETTLE_MS || 10_000);
 const KILL_CYCLES = Number(process.env.TINE_MANAGED_RECOVERY_KILL_CYCLES || 1);
+const RETURN_DURING_OPEN = process.env.TINE_MANAGED_RECOVERY_RETURN_DURING_OPEN === "1";
 if (!Number.isSafeInteger(KILL_CYCLES) || KILL_CYCLES < 1 || KILL_CYCLES > 3) {
   throw new Error("TINE_MANAGED_RECOVERY_KILL_CYCLES must be an integer from 1 through 3");
 }
@@ -39,6 +40,7 @@ const GRAPH = path.join(TMP, "graph");
 const XDG = path.join(TMP, "xdg");
 const ARTIFACTS = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(TMP, "artifacts"));
 const MARKER = `managed force-close recovery ${Date.now()}`;
+const DIRECT_MARKER = `direct return after managed recovery ${Date.now()}`;
 
 if (!fs.existsSync(APP)) throw new Error(`HARNESS UNAVAILABLE: candidate is missing at ${APP}`);
 fs.cpSync(SOURCE, GRAPH, { recursive: true });
@@ -102,6 +104,7 @@ const receipt = {
   markers: [],
   settleMs: SETTLE_MS,
   killCycles: KILL_CYCLES,
+  returnDuringOpen: RETURN_DURING_OPEN,
   activationMs: null,
   reopenMs: null,
   reopenDurationsMs: [],
@@ -315,12 +318,12 @@ async function closeSettings() {
   await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 30_000 });
 }
 
-async function acceptNativeConfirmation(label, before) {
-  const dialog = await waitFor(() => windowIds("^Tine$").find((id) => !before.has(id)), 30_000,
+async function acceptNativeConfirmation(label, before, pattern = "^Tine$") {
+  const dialog = await waitFor(() => windowIds(pattern).find((id) => !before.has(id)), 30_000,
     `${label} did not show its native confirmation`);
   xdo("windowactivate", "--sync", dialog);
   xdo("key", "--clearmodifiers", "alt+y");
-  await waitFor(() => !windowIds("^Tine$").includes(dialog), 30_000, `${label} confirmation did not close`);
+  await waitFor(() => !windowIds(pattern).includes(dialog), 30_000, `${label} confirmation did not close`);
 }
 
 async function enableManagedStorage() {
@@ -346,7 +349,13 @@ async function assertManagedStorageActive() {
   await closeSettings();
 }
 
-async function connect(label, timeoutMs = 300_000) {
+async function assertDirectFilesActive() {
+  await openStorageSettings();
+  await waitForBody("Enable Tine-managed storage...", 60_000, "Direct Files status after recovery return");
+  await closeSettings();
+}
+
+async function connect(label, timeoutMs = 300_000, lease = true) {
   driverLog = fs.openSync(path.join(ARTIFACTS, `${label}-tauri-driver.log`), "w");
   driver = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD], {
     env,
@@ -365,13 +374,30 @@ async function connect(label, timeoutMs = 300_000) {
   });
   await browser.waitUntil(async () => {
     const text = await bodyText();
-    return text.includes("Journals") || text.includes("Startup:") || text.includes("Native recovery");
+    const startupVisible = !lease && await browser.$(".startup-recovery-overlay").isExisting();
+    return startupVisible || text.includes("Journals") || text.includes("Startup:") || text.includes("Native recovery");
   }, { timeout: timeoutMs, interval: 250, timeoutMsg: `${label} painted no startup or graph UI` });
   const window = await waitFor(() => windowIds()[0], 30_000, `${label} native window was absent`);
   appPid = Number(xdo("getwindowpid", window));
   if (!Number.isInteger(appPid) || appPid <= 0) throw new Error(`${label} exposed invalid app pid ${appPid}`);
-  await leaseCurrentGraph();
+  if (lease) await leaseCurrentGraph();
   receipt.milestones[label] = { pid: appPid, graph: GRAPH, xdg: XDG };
+}
+
+async function returnToDirectFilesDuringOpen() {
+  const button = await waitFor(
+    () => buttonContaining("to Direct Files"),
+    60_000,
+    "startup did not expose Return to Direct Files while managed open was active",
+  );
+  const dialogPattern = "^Return to Direct Files\\?$";
+  const before = new Set(windowIds(dialogPattern));
+  await button.click();
+  await acceptNativeConfirmation("cold Return to Direct Files", before, dialogPattern);
+  await browser.$(".startup-recovery-overlay").waitForExist({ reverse: true, timeout: 300_000 });
+  await waitForBody("Journals", 60_000, "Direct Files graph after cold return");
+  await leaseCurrentGraph();
+  await assertDirectFilesActive();
 }
 
 async function stopDriver() {
@@ -464,7 +490,11 @@ try {
 
     phase = `crash-reopen-${cycle}`;
     const reopenedAt = Date.now();
-    await connect(reopenLabel);
+    await connect(reopenLabel, 300_000, !RETURN_DURING_OPEN);
+    if (RETURN_DURING_OPEN) {
+      phase = "cold-return-during-managed-open";
+      await returnToDirectFilesDuringOpen();
+    }
     await openPageThroughSwitcher(selected.entry.name);
     for (const expected of receipt.markers) {
       await waitForBody(expected, 300_000, `crash-reopened exact edit after cycle ${cycle}`);
@@ -476,11 +506,29 @@ try {
     receipt.reopenMs ??= reopenMs;
     receipt.reopenDurationsMs.push(reopenMs);
     receipt.milestones[`${reopenLabel}-proof`] = { visibleUi: true, markdownProjection: true };
+    if (RETURN_DURING_OPEN) {
+      phase = "direct-edit-after-cold-return";
+      await editSelectedPage(DIRECT_MARKER, "direct-edit-after-cold-return");
+      break;
+    }
     await assertManagedStorageActive();
   }
 
   phase = "clean-shutdown-after-recovery";
   await cleanQuit();
+  if (RETURN_DURING_OPEN) {
+    phase = "direct-reopen-after-cold-return";
+    await connect("direct-reopen-after-cold-return");
+    await openPageThroughSwitcher(selected.entry.name);
+    await waitForBody(DIRECT_MARKER, 60_000, "Direct Files edit after cold-return restart");
+    await assertDirectFilesActive();
+    await cleanQuit();
+    receipt.milestones.coldReturnDuringManagedOpen = {
+      directMode: true,
+      postReturnSave: true,
+      restart: true,
+    };
+  }
   const debugLog = fs.existsSync(path.join(ARTIFACTS, "tine-debug.log"))
     ? fs.readFileSync(path.join(ARTIFACTS, "tine-debug.log"), "utf8") : "";
   if (!/managed storage open:.*(begin|completed)/s.test(debugLog)) {
