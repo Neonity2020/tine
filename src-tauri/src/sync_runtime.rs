@@ -1541,9 +1541,15 @@ fn recover_managed_application_subtrees_with(
     request: SyncApplicationMoveSubtreesRequest,
     reopen: impl FnOnce(&Path) -> Result<(SparseV2Binding, tine_core::model::GraphMeta), String>,
 ) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
-    let _transition = state.storage_supervisor.legacy_transition_guard();
+    let root = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let _transition = transition_gate.lock().unwrap();
     let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?;
-    let root = predecessor.root_key.clone();
+    if predecessor.root_key != root {
+        return Err("graph changed while move recovery waited for its transition lane".into());
+    }
     let action = predecessor
         .sparse_binding()
         .ok_or_else(|| "managed cross-page move recovery requires managed storage".to_owned())?
@@ -1666,9 +1672,15 @@ fn activate_sparse_v2_blocking(
     let started = Instant::now();
     let state = app.state::<crate::state::AppState>();
     crate::debug::diag("sparse-v2 activation requested");
-    let _transition = state.storage_supervisor.legacy_transition_guard();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let _transition = transition_gate.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
-    let root = slot.root_key.clone();
+    if slot.root_key != root {
+        return Err("graph changed while activation waited for its transition lane".into());
+    }
 
     if let Some(binding) = slot.sparse_binding() {
         let action = binding.action();
@@ -2492,7 +2504,10 @@ fn cancel_sparse_v2_cold_blocking(
     state.request_startup_cold_return(label, attempt, &submitted_root)?;
     let progress =
         ColdReturnProgress::start(reporter.clone(), "cold_return.waiting_for_graph_transition");
-    let _transition = state.storage_supervisor.legacy_transition_guard();
+    let transition_gate = state
+        .storage_supervisor
+        .legacy_transition_gate(&submitted_root);
+    let _transition = transition_gate.lock().unwrap();
     progress.phase("cold_return.verifying_target");
 
     // Re-read both the native attempt and exact canonical target *after*
@@ -2569,8 +2584,15 @@ fn cancel_sparse_v2_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2CancelResult, String> {
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.storage_supervisor.legacy_transition_guard();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let _transition = transition_gate.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    if slot.root_key != root {
+        return Err("graph changed while return waited for its transition lane".into());
+    }
     let private_root = sparse_private_root(&app, &slot.root_key)?;
     let recovery_root = sparse_recovery_root(&app)?;
     let approved_assets = crate::settings::approved_external_assets(&app, &slot.root_key);
@@ -2605,8 +2627,15 @@ fn prepare_sparse_v2_share_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.storage_supervisor.legacy_transition_guard();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let _transition = transition_gate.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    if slot.root_key != root {
+        return Err("graph changed while share setup waited for its transition lane".into());
+    }
     let record = state
         .sync_runtime
         .binding_record(&app, &slot.root_key)?
@@ -2673,8 +2702,15 @@ fn join_sparse_v2_shared_blocking(
     }
 
     let state = app.state::<crate::state::AppState>();
-    let _transition = state.storage_supervisor.legacy_transition_guard();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let _transition = transition_gate.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    if slot.root_key != root {
+        return Err("graph changed while join waited for its transition lane".into());
+    }
     let descriptor =
         inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))
             .map_err(|error| join_failure("provider discovery", error))?
@@ -3463,7 +3499,7 @@ mod tests {
                 .map(|end| start + end)
                 .expect("next managed command")];
         for required in [
-            "state.storage_supervisor.legacy_transition_guard()",
+            "legacy_transition_gate(&submitted_root)",
             "cold_return.waiting_for_graph_transition",
             "cold_return.verifying_target",
             "cold_return.archiving_managed_state",

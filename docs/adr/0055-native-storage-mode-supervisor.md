@@ -22,11 +22,15 @@ experimental.
 
 ## Decision
 
-One native `StorageModeSupervisor` owns the serialized graph transition, native
-operation IDs, priority, typed phases, cancellation/supersession, stable-mode
-publication, and exactly one terminal outcome. Operations name their exact
-window, canonical graph root, and kind. Late work may mutate state only while
-its operation ID is current. The frontend subscribes before starting work,
+One native `StorageModeSupervisor` owns native operation IDs, priority, typed
+phases, cancellation/supersession, stable-mode publication, and exactly one
+terminal outcome. Operations name their exact window, canonical graph root,
+and kind. There is no app-global long-lived transition lock: work on different
+canonical roots has independent lanes, while final registry publication is a
+short compare-and-publish against the current operation ID. A stuck recovery
+for graph A cannot delay opening graph B or later overwrite it, even when both
+requests came from the same window. Late work may mutate state only while its
+operation ID is current. The frontend subscribes before starting work,
 renders only the current operation ID, and sends actions back to the supervisor;
 it does not infer authority from phase strings or inactivity.
 

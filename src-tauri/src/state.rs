@@ -843,8 +843,16 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     let label = ctx.window.label().to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
     // Serialize the whole operation with graph loads and sparse-v2 promotion.
-    let _transition = ctx.state.storage_supervisor.legacy_transition_guard();
+    let root_hint = slot_for_window(&ctx.state, &label)?.root_key.clone();
+    let transition_gate = ctx
+        .state
+        .storage_supervisor
+        .legacy_transition_gate(&root_hint);
+    let _transition = transition_gate.lock().unwrap();
     let old = slot_for_window(&ctx.state, &label)?;
+    if old.root_key != root_hint {
+        return Err("graph changed while refresh waited for its transition lane".into());
+    }
     if old.is_sparse_v2() {
         // A managed binding has no legacy graph to reopen, and the reopen below
         // would install one as a second writer. What the callers actually need

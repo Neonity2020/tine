@@ -10,7 +10,10 @@ One native `StorageModeSupervisor` owns storage-transition identity, priority,
 serialization, and terminal outcomes. A transition has a monotonically
 increasing operation ID, exact window and canonical graph root, typed kind and
 phase, and exactly one native terminal outcome. Late work may publish only while
-its operation remains current. The frontend renders events for the current
+its operation remains current. Long work is never serialized app-wide:
+different canonical roots have independent lanes, and graph-slot publication is
+a short current-operation compare-and-publish. A stuck graph cannot block an
+unrelated graph or later overwrite the newer selection in the same window. The frontend renders events for the current
 operation ID; phase-name prefixes, frontend attempt tokens, and inactivity
 timers are not storage authority.
 

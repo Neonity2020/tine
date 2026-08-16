@@ -6,6 +6,9 @@ use crate::state::{
     canonical_graph_root, poke_watcher, slot_for_window, AppState, ApplicationPageAdmission,
     GraphSlot,
 };
+use crate::storage_mode_supervisor::{
+    StableStorageMode, StorageTransitionKind, StorageTransitionOutcome, StorageTransitionPhase,
+};
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -181,18 +184,53 @@ pub(crate) async fn startup_graph_path(
     let label = window.label().to_string();
     let state = app.state::<AppState>();
     state.begin_startup_recovery_attempt(&label, attempt);
+    let lookup_id = match state.storage_supervisor.begin_transition(
+        &app,
+        &label,
+        None,
+        StorageTransitionKind::Lookup,
+    ) {
+        Ok(operation_id) => operation_id,
+        Err(error) => {
+            crate::debug::diag(error);
+            return None;
+        }
+    };
     let reporter = StartupProgressReporter::for_window(&app, &label);
     let worker_app = app.clone();
     let worker_reporter = reporter.clone();
     let worker_label = label.clone();
     match tauri::async_runtime::spawn_blocking(move || {
+        let worker_state = worker_app.state::<AppState>();
+        if let Err(error) = worker_state.storage_supervisor.advance_transition(
+            &worker_app,
+            lookup_id,
+            StorageTransitionPhase::LookingUpSelection,
+        ) {
+            crate::debug::diag(error);
+        }
         let result = startup_graph_path_blocking(&worker_app, &worker_reporter);
         let canonical_target = result
             .as_deref()
             .and_then(|path| canonical_graph_root(path).ok());
-        worker_app
-            .state::<AppState>()
-            .authorize_startup_recovery_target(&worker_label, attempt, canonical_target);
+        if let Some(root) = canonical_target.clone() {
+            if let Err(error) = worker_state
+                .storage_supervisor
+                .bind_transition_root(lookup_id, root)
+            {
+                crate::debug::diag(error);
+            }
+        }
+        worker_state.authorize_startup_recovery_target(&worker_label, attempt, canonical_target);
+        if let Err(error) = worker_state.storage_supervisor.finish_transition(
+            &worker_app,
+            lookup_id,
+            StorageTransitionOutcome::Succeeded,
+            None,
+            None,
+        ) {
+            crate::debug::diag(error);
+        }
         result
     })
     .await
@@ -200,6 +238,15 @@ pub(crate) async fn startup_graph_path(
         Ok(result) => result,
         Err(_) => {
             reporter.terminal("lookup.complete", "error");
+            if let Err(error) = state.storage_supervisor.finish_transition(
+                &app,
+                lookup_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("worker_join_failed".into()),
+            ) {
+                crate::debug::diag(error);
+            }
             None
         }
     }
@@ -636,12 +683,36 @@ pub(crate) fn load_graph_for_label(
         .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
     let root_key = canonical_graph_root(&root)?;
     graph_load_phase(started, &mut previous, "canonical graph root");
-    let _load = state.storage_supervisor.legacy_transition_guard();
+    let lookup_id = state.storage_supervisor.begin_transition(
+        app,
+        window_label,
+        Some(root_key.clone()),
+        StorageTransitionKind::Lookup,
+    )?;
+    state.storage_supervisor.advance_transition(
+        app,
+        lookup_id,
+        StorageTransitionPhase::WaitingForTransition,
+    )?;
+    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root_key);
+    let _load = transition_gate.lock().unwrap();
     graph_load_phase(started, &mut previous, "serialized graph-open lock");
+    state.storage_supervisor.advance_transition(
+        app,
+        lookup_id,
+        StorageTransitionPhase::LookingUpSelection,
+    )?;
     if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)?;
             state.clear_startup_recovery_target(window_label);
+            state.storage_supervisor.finish_transition(
+                app,
+                lookup_id,
+                StorageTransitionOutcome::Succeeded,
+                None,
+                None,
+            )?;
             return Ok(LoadGraphResult::AlreadyCurrent {
                 meta: slot.graph_meta(),
                 binding_generation: slot.binding_generation,
@@ -664,28 +735,101 @@ pub(crate) fn load_graph_for_label(
             }
         }
         state.clear_startup_recovery_target(window_label);
+        state.storage_supervisor.finish_transition(
+            app,
+            lookup_id,
+            StorageTransitionOutcome::Succeeded,
+            None,
+            None,
+        )?;
         return Ok(LoadGraphResult::FocusedExisting {
             window_label: owner,
         });
     }
-    let binding_record = state.sync_runtime.binding_record(app, &root_key)?;
+    let binding_record = match state.sync_runtime.binding_record(app, &root_key) {
+        Ok(binding_record) => binding_record,
+        Err(error) => {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                lookup_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("private_storage_discovery_failed".into()),
+            );
+            return Err(error);
+        }
+    };
     graph_load_phase(started, &mut previous, "private storage discovery");
     if let Some(record) = binding_record {
+        state.storage_supervisor.finish_transition(
+            app,
+            lookup_id,
+            StorageTransitionOutcome::Succeeded,
+            None,
+            None,
+        )?;
+        let managed_id = state.storage_supervisor.begin_transition(
+            app,
+            window_label,
+            Some(root_key.clone()),
+            StorageTransitionKind::OpenManaged,
+        )?;
+        state.storage_supervisor.advance_transition(
+            app,
+            managed_id,
+            StorageTransitionPhase::ValidatingTarget,
+        )?;
+        state.storage_supervisor.advance_transition(
+            app,
+            managed_id,
+            StorageTransitionPhase::OpeningManaged,
+        )?;
         let meta = crate::sync_runtime::SyncRuntimeFacade::graph_meta(&record);
-        let binding = state
+        let binding = match state
             .sync_runtime
-            .open_record_for_window(app, window_label, &record)?;
+            .open_record_for_window(app, window_label, &record)
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                let _ = state.storage_supervisor.finish_transition(
+                    app,
+                    managed_id,
+                    StorageTransitionOutcome::Failed,
+                    None,
+                    Some("managed_open_failed".into()),
+                );
+                return Err(error);
+            }
+        };
         graph_load_phase(started, &mut previous, "managed storage recovery");
         let slot = Arc::new(GraphSlot::from_sparse_v2(
             binding,
             root_key.clone(),
             meta.clone(),
         ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(window_label.to_string(), Arc::clone(&slot))?;
+        if let Err(error) = state.storage_supervisor.commit_if_current(managed_id, || {
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(window_label.to_string(), Arc::clone(&slot))
+        }) {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                managed_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("managed_publish_failed".into()),
+            );
+            return Err(error);
+        }
+        state.storage_supervisor.finish_transition(
+            app,
+            managed_id,
+            StorageTransitionOutcome::Succeeded,
+            Some(StableStorageMode::Managed),
+            None,
+        )?;
         state.note_focused(window_label);
         poke_watcher(state);
         remember_graph(app, &meta.root)?;
@@ -703,9 +847,60 @@ pub(crate) fn load_graph_for_label(
             application_page_admission: slot.application_page_admission(),
         });
     }
-    refuse_unclaimed_sparse_archive(&root_key)?;
+    if let Err(error) = refuse_unclaimed_sparse_archive(&root_key) {
+        let _ = state.storage_supervisor.finish_transition(
+            app,
+            lookup_id,
+            StorageTransitionOutcome::Failed,
+            None,
+            Some("unclaimed_managed_archive".into()),
+        );
+        return Err(error);
+    }
     graph_load_phase(started, &mut previous, "shared storage discovery");
-    let direct = open_and_publish_direct_files(app, window_label, state, root_key)?;
+    state.storage_supervisor.finish_transition(
+        app,
+        lookup_id,
+        StorageTransitionOutcome::Succeeded,
+        None,
+        None,
+    )?;
+    let direct_id = state.storage_supervisor.begin_transition(
+        app,
+        window_label,
+        Some(root_key.clone()),
+        StorageTransitionKind::OpenDirect,
+    )?;
+    state.storage_supervisor.advance_transition(
+        app,
+        direct_id,
+        StorageTransitionPhase::ValidatingTarget,
+    )?;
+    state.storage_supervisor.advance_transition(
+        app,
+        direct_id,
+        StorageTransitionPhase::OpeningDirect,
+    )?;
+    let direct = match open_and_publish_direct_files(app, window_label, state, root_key) {
+        Ok(direct) => direct,
+        Err(error) => {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                direct_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("direct_open_failed".into()),
+            );
+            return Err(error);
+        }
+    };
+    state.storage_supervisor.finish_transition(
+        app,
+        direct_id,
+        StorageTransitionOutcome::Succeeded,
+        Some(StableStorageMode::Direct),
+        None,
+    )?;
     graph_load_phase(started, &mut previous, "Direct Files open and publish");
     Ok(LoadGraphResult::Loaded {
         meta: direct.meta,

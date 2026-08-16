@@ -1,6 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
+use tauri::Emitter;
+
+pub(crate) const STORAGE_TRANSITION_EVENT: &str = "storage-transition";
 
 pub(crate) type StorageOperationId = u64;
 
@@ -68,7 +72,7 @@ pub(crate) enum StorageTransitionOutcome {
 pub(crate) struct StorageTransitionOperation {
     pub(crate) operation_id: StorageOperationId,
     pub(crate) window: String,
-    pub(crate) canonical_root: PathBuf,
+    pub(crate) canonical_root: Option<PathBuf>,
     pub(crate) kind: StorageTransitionKind,
     pub(crate) phase: StorageTransitionPhase,
 }
@@ -78,7 +82,8 @@ pub(crate) struct StorageTransitionOperation {
 pub(crate) struct StorageTransitionEvent {
     pub(crate) operation_id: StorageOperationId,
     pub(crate) window: String,
-    pub(crate) canonical_root: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) canonical_root: Option<PathBuf>,
     pub(crate) kind: StorageTransitionKind,
     pub(crate) phase: StorageTransitionPhase,
     pub(crate) elapsed_ms: u64,
@@ -141,14 +146,16 @@ impl StorageSupervisorModel {
     pub(crate) fn begin(
         &mut self,
         window: impl Into<String>,
-        canonical_root: PathBuf,
+        canonical_root: Option<PathBuf>,
         kind: StorageTransitionKind,
         now_ms: u64,
     ) -> Result<BegunStorageTransition, StorageSupervisorError> {
         let window = window.into();
-        if let Some(owner) = self.active_root_owner.get(&canonical_root) {
-            if owner != &window {
-                return Err(StorageSupervisorError::RootBusy);
+        if let Some(canonical_root) = canonical_root.as_ref() {
+            if let Some(owner) = self.active_root_owner.get(canonical_root) {
+                if owner != &window {
+                    return Err(StorageSupervisorError::RootBusy);
+                }
             }
         }
         if self.active_by_window.get(&window).is_some_and(|active| {
@@ -172,8 +179,10 @@ impl StorageSupervisorModel {
             kind,
             phase: StorageTransitionPhase::Requested,
         };
-        self.active_root_owner
-            .insert(canonical_root, window.clone());
+        if let Some(canonical_root) = canonical_root {
+            self.active_root_owner
+                .insert(canonical_root, window.clone());
+        }
         self.active_by_window.insert(
             window,
             ActiveStorageTransition {
@@ -185,6 +194,40 @@ impl StorageSupervisorModel {
             operation,
             superseded,
         })
+    }
+
+    pub(crate) fn bind_root(
+        &mut self,
+        operation_id: StorageOperationId,
+        canonical_root: PathBuf,
+    ) -> Result<(), StorageSupervisorError> {
+        if self.terminal_operations.contains(&operation_id) {
+            return Err(StorageSupervisorError::AlreadyTerminal);
+        }
+        let (window, previous_root) = {
+            let active = self.active_mut(operation_id)?;
+            (
+                active.operation.window.clone(),
+                active.operation.canonical_root.clone(),
+            )
+        };
+        if previous_root.as_ref() == Some(&canonical_root) {
+            return Ok(());
+        }
+        if previous_root.is_some() {
+            return Err(StorageSupervisorError::MismatchedStableMode);
+        }
+        if self
+            .active_root_owner
+            .get(&canonical_root)
+            .is_some_and(|owner| owner != &window)
+        {
+            return Err(StorageSupervisorError::RootBusy);
+        }
+        self.active_root_owner
+            .insert(canonical_root.clone(), window);
+        self.active_mut(operation_id)?.operation.canonical_root = Some(canonical_root);
+        Ok(())
     }
 
     pub(crate) fn advance(
@@ -226,21 +269,25 @@ impl StorageSupervisorModel {
                 (active.operation.operation_id == operation_id).then(|| window.clone())
             })
             .ok_or(StorageSupervisorError::StaleOperation)?;
-        let active = self.active_by_window.remove(&window).unwrap();
-        self.active_root_owner
-            .remove(&active.operation.canonical_root);
-
+        let active = self.active_by_window.get(&window).unwrap();
         if outcome == StorageTransitionOutcome::Succeeded {
             let expected = active.operation.kind.stable_mode();
             if stable_mode != expected && expected.is_some() {
-                self.active_root_owner
-                    .insert(active.operation.canonical_root.clone(), window.clone());
-                self.active_by_window.insert(window, active);
                 return Err(StorageSupervisorError::MismatchedStableMode);
             }
+            if stable_mode.is_some() && active.operation.canonical_root.is_none() {
+                return Err(StorageSupervisorError::MismatchedStableMode);
+            }
+        }
+        let active = self.active_by_window.remove(&window).unwrap();
+        if let Some(root) = active.operation.canonical_root.as_ref() {
+            self.active_root_owner.remove(root);
+        }
+
+        if outcome == StorageTransitionOutcome::Succeeded {
             if let Some(mode) = stable_mode {
-                self.stable_modes
-                    .insert(active.operation.canonical_root.clone(), mode);
+                let root = active.operation.canonical_root.clone().unwrap();
+                self.stable_modes.insert(root, mode);
             }
         }
         self.terminal_operations.insert(operation_id);
@@ -277,8 +324,9 @@ impl StorageSupervisorModel {
         outcome: StorageTransitionOutcome,
     ) -> Option<StorageTransitionEvent> {
         let active = self.active_by_window.remove(window)?;
-        self.active_root_owner
-            .remove(&active.operation.canonical_root);
+        if let Some(root) = active.operation.canonical_root.as_ref() {
+            self.active_root_owner.remove(root);
+        }
         self.terminal_operations
             .insert(active.operation.operation_id);
         Some(event(&active, now_ms, true, Some(outcome), None))
@@ -382,20 +430,167 @@ fn legal_phase_transition(
     )
 }
 
-/// The only native owner of the serialized workspace storage transition.
+/// The only native owner of workspace storage-transition identity and lanes.
 ///
-/// S1 introduces the tested transition model and centralizes the existing lock.
-/// Subsequent packets route commands through `model`; until then the lock method
-/// is explicitly named as a migration bridge so it cannot become the new API.
-#[derive(Debug, Default)]
+/// S1 introduces the tested transition model and replaces the app-global lock
+/// with root-local migration gates. Subsequent packets route commands through
+/// operation IDs and short compare-and-publish sections; until then the gate is
+/// explicitly named as a legacy bridge so it cannot become the final API.
+#[derive(Debug)]
 pub(crate) struct StorageModeSupervisor {
-    transition: Mutex<()>,
-    pub(crate) model: Mutex<StorageSupervisorModel>,
+    root_transitions: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    model: Mutex<StorageSupervisorModel>,
+    clock_origin: Instant,
+}
+
+impl Default for StorageModeSupervisor {
+    fn default() -> Self {
+        Self {
+            root_transitions: Mutex::new(HashMap::new()),
+            model: Mutex::new(StorageSupervisorModel::default()),
+            clock_origin: Instant::now(),
+        }
+    }
 }
 
 impl StorageModeSupervisor {
-    pub(crate) fn legacy_transition_guard(&self) -> MutexGuard<'_, ()> {
-        self.transition.lock().unwrap()
+    pub(crate) fn legacy_transition_gate(&self, canonical_root: &Path) -> Arc<Mutex<()>> {
+        let mut gates = self.root_transitions.lock().unwrap();
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(canonical_root).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(canonical_root.to_path_buf(), Arc::downgrade(&gate));
+        gate
+    }
+
+    pub(crate) fn begin_transition(
+        &self,
+        app: &tauri::AppHandle,
+        window: &str,
+        canonical_root: Option<PathBuf>,
+        kind: StorageTransitionKind,
+    ) -> Result<StorageOperationId, String> {
+        let now_ms = self.now_ms();
+        let begun = self
+            .model
+            .lock()
+            .unwrap()
+            .begin(window, canonical_root, kind, now_ms)
+            .map_err(|error| format!("storage transition refused: {error:?}"))?;
+        if let Some(superseded) = begun.superseded {
+            self.emit(app, superseded);
+        }
+        let event = StorageTransitionEvent {
+            operation_id: begun.operation.operation_id,
+            window: begun.operation.window.clone(),
+            canonical_root: begun.operation.canonical_root.clone(),
+            kind: begun.operation.kind,
+            phase: begun.operation.phase,
+            elapsed_ms: 0,
+            terminal: false,
+            outcome: None,
+            outcome_code: None,
+        };
+        self.emit(app, event);
+        Ok(begun.operation.operation_id)
+    }
+
+    pub(crate) fn bind_transition_root(
+        &self,
+        operation_id: StorageOperationId,
+        canonical_root: PathBuf,
+    ) -> Result<(), String> {
+        self.model
+            .lock()
+            .unwrap()
+            .bind_root(operation_id, canonical_root)
+            .map_err(|error| format!("storage transition root refused: {error:?}"))
+    }
+
+    pub(crate) fn advance_transition(
+        &self,
+        app: &tauri::AppHandle,
+        operation_id: StorageOperationId,
+        phase: StorageTransitionPhase,
+    ) -> Result<(), String> {
+        let event = self
+            .model
+            .lock()
+            .unwrap()
+            .advance(operation_id, phase, self.now_ms())
+            .map_err(|error| format!("storage transition progress refused: {error:?}"))?;
+        self.emit(app, event);
+        Ok(())
+    }
+
+    pub(crate) fn finish_transition(
+        &self,
+        app: &tauri::AppHandle,
+        operation_id: StorageOperationId,
+        outcome: StorageTransitionOutcome,
+        stable_mode: Option<StableStorageMode>,
+        outcome_code: Option<String>,
+    ) -> Result<(), String> {
+        let event = self
+            .model
+            .lock()
+            .unwrap()
+            .finish(
+                operation_id,
+                outcome,
+                stable_mode,
+                outcome_code,
+                self.now_ms(),
+            )
+            .map_err(|error| format!("storage transition completion refused: {error:?}"))?;
+        self.emit(app, event);
+        Ok(())
+    }
+
+    pub(crate) fn operation_is_current(&self, operation_id: StorageOperationId) -> bool {
+        self.model
+            .lock()
+            .unwrap()
+            .active_by_window
+            .values()
+            .any(|active| active.operation.operation_id == operation_id)
+    }
+
+    pub(crate) fn commit_if_current<T>(
+        &self,
+        operation_id: StorageOperationId,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let model = self.model.lock().unwrap();
+        if !model
+            .active_by_window
+            .values()
+            .any(|active| active.operation.operation_id == operation_id)
+        {
+            return Err("storage transition was superseded before publication".into());
+        }
+        publish()
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.clock_origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn emit(&self, app: &tauri::AppHandle, event: StorageTransitionEvent) {
+        crate::debug::diag(format!(
+            "storage transition: id={}; window={}; kind={:?}; phase={:?}; elapsed_ms={}; terminal={}; outcome={:?}",
+            event.operation_id,
+            event.window,
+            event.kind,
+            event.phase,
+            event.elapsed_ms,
+            event.terminal,
+            event.outcome,
+        ));
+        let window = event.window.clone();
+        let _ = app.emit_to(&window, STORAGE_TRANSITION_EVENT, event);
     }
 }
 
@@ -409,7 +604,7 @@ mod tests {
 
     fn run_path(kind: StorageTransitionKind, phases: &[StorageTransitionPhase]) {
         let mut model = StorageSupervisorModel::default();
-        let begun = model.begin("main", root(), kind, 10).unwrap();
+        let begun = model.begin("main", Some(root()), kind, 10).unwrap();
         let id = begun.operation.operation_id;
         for (index, phase) in phases.iter().copied().enumerate() {
             let update = model.advance(id, phase, 11 + index as u64).unwrap();
@@ -482,12 +677,12 @@ mod tests {
     fn stale_results_cannot_advance_finish_or_change_mode() {
         let mut model = StorageSupervisorModel::default();
         let old = model
-            .begin("main", root(), StorageTransitionKind::OpenManaged, 0)
+            .begin("main", Some(root()), StorageTransitionKind::OpenManaged, 0)
             .unwrap();
         let newer = model
             .begin(
                 "main",
-                PathBuf::from("/other"),
+                Some(PathBuf::from("/other")),
                 StorageTransitionKind::OpenDirect,
                 1,
             )
@@ -524,17 +719,22 @@ mod tests {
     fn emergency_return_supersedes_managed_work_and_cannot_be_displaced() {
         let mut model = StorageSupervisorModel::default();
         let managed = model
-            .begin("main", root(), StorageTransitionKind::OpenManaged, 0)
+            .begin("main", Some(root()), StorageTransitionKind::OpenManaged, 0)
             .unwrap();
         let emergency = model
-            .begin("main", root(), StorageTransitionKind::ReturnEmergency, 1)
+            .begin(
+                "main",
+                Some(root()),
+                StorageTransitionKind::ReturnEmergency,
+                1,
+            )
             .unwrap();
         assert_eq!(
             emergency.superseded.unwrap().operation_id,
             managed.operation.operation_id
         );
         assert_eq!(
-            model.begin("main", root(), StorageTransitionKind::OpenManaged, 2),
+            model.begin("main", Some(root()), StorageTransitionKind::OpenManaged, 2),
             Err(StorageSupervisorError::EmergencyReturnOwnsTransition)
         );
         model
@@ -574,10 +774,10 @@ mod tests {
     fn another_window_cannot_compete_for_the_same_root() {
         let mut model = StorageSupervisorModel::default();
         model
-            .begin("main", root(), StorageTransitionKind::OpenDirect, 0)
+            .begin("main", Some(root()), StorageTransitionKind::OpenDirect, 0)
             .unwrap();
         assert_eq!(
-            model.begin("second", root(), StorageTransitionKind::OpenDirect, 1),
+            model.begin("second", Some(root()), StorageTransitionKind::OpenDirect, 1),
             Err(StorageSupervisorError::RootBusy)
         );
     }
@@ -586,7 +786,12 @@ mod tests {
     fn illegal_phase_does_not_mutate_the_operation() {
         let mut model = StorageSupervisorModel::default();
         let begun = model
-            .begin("main", root(), StorageTransitionKind::ReturnEmergency, 0)
+            .begin(
+                "main",
+                Some(root()),
+                StorageTransitionKind::ReturnEmergency,
+                0,
+            )
             .unwrap();
         assert!(matches!(
             model.advance(
@@ -616,13 +821,15 @@ mod tests {
         ] {
             for cut in 0..=phases.len() {
                 let mut model = StorageSupervisorModel::default();
-                let managed = model.begin("main", root(), kind, 0).unwrap();
+                let managed = model.begin("main", Some(root()), kind, 0).unwrap();
                 for phase in phases.iter().take(cut).copied() {
                     model
                         .advance(managed.operation.operation_id, phase, 1)
                         .unwrap();
                 }
-                let emergency = model.begin("main", root(), K::ReturnEmergency, 2).unwrap();
+                let emergency = model
+                    .begin("main", Some(root()), K::ReturnEmergency, 2)
+                    .unwrap();
                 assert_eq!(
                     emergency.superseded.unwrap().outcome,
                     Some(StorageTransitionOutcome::Superseded)
@@ -645,7 +852,7 @@ mod tests {
     fn operation_ids_are_native_monotonic_and_terminal_outcomes_are_unique() {
         let mut model = StorageSupervisorModel::default();
         let first = model
-            .begin("main", root(), StorageTransitionKind::Lookup, 0)
+            .begin("main", Some(root()), StorageTransitionKind::Lookup, 0)
             .unwrap();
         let first_terminal = model
             .finish(
@@ -657,7 +864,7 @@ mod tests {
             )
             .unwrap();
         let second = model
-            .begin("main", root(), StorageTransitionKind::OpenDirect, 2)
+            .begin("main", Some(root()), StorageTransitionKind::OpenDirect, 2)
             .unwrap();
         assert!(second.operation.operation_id > first.operation.operation_id);
         assert_eq!(
@@ -686,5 +893,65 @@ mod tests {
         assert!(!runtime.contains(".graph_load.lock()"));
         assert!(state
             .contains("storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor"));
+        let global_lock_field = ["transition", "Mutex<()>"].join(": ");
+        assert!(!include_str!("storage_mode_supervisor.rs").contains(&global_lock_field));
+    }
+
+    #[test]
+    fn a_stuck_root_lane_does_not_delay_an_unrelated_graph() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let supervisor = Arc::new(StorageModeSupervisor::default());
+        let graph_a = supervisor.legacy_transition_gate(Path::new("/graph-a"));
+        let held_a = graph_a.lock().unwrap();
+        let (sent, received) = mpsc::channel();
+
+        let other = Arc::clone(&supervisor);
+        let sent_b = sent.clone();
+        let graph_b_worker = std::thread::spawn(move || {
+            let graph_b = other.legacy_transition_gate(Path::new("/graph-b"));
+            let _held_b = graph_b.lock().unwrap();
+            sent_b.send("b").unwrap();
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "b");
+
+        let same = Arc::clone(&supervisor);
+        let same_root_worker = std::thread::spawn(move || {
+            let graph_a = same.legacy_transition_gate(Path::new("/graph-a"));
+            let _held_a = graph_a.lock().unwrap();
+            sent.send("a").unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+        drop(held_a);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "a");
+        graph_b_worker.join().unwrap();
+        same_root_worker.join().unwrap();
+    }
+
+    #[test]
+    fn superseded_operations_cannot_enter_the_publication_closure() {
+        let supervisor = StorageModeSupervisor::default();
+        let mut model = supervisor.model.lock().unwrap();
+        let old = model
+            .begin("main", Some(root()), StorageTransitionKind::OpenManaged, 0)
+            .unwrap();
+        model
+            .begin(
+                "main",
+                Some(PathBuf::from("/other")),
+                StorageTransitionKind::OpenDirect,
+                1,
+            )
+            .unwrap();
+        drop(model);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        assert!(supervisor
+            .commit_if_current(old.operation.operation_id, || {
+                published.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })
+            .is_err());
+        assert!(!published.load(std::sync::atomic::Ordering::Acquire));
     }
 }
