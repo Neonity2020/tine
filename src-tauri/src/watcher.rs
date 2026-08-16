@@ -925,6 +925,26 @@ fn sparse_provider_rescan_required(
     provider_lane_active && (initial_tick || provider_imprecise || provider_poll)
 }
 
+/// A graph reconciliation and a provider rescan may be queued in the same
+/// watcher turn. The actor deliberately admits graph bytes first, so an
+/// `Admitted*` result from that turn does not mean the provider obligation was
+/// consumed. Schedule exactly one continuation; once provider work begins its
+/// ordinary `Recovering` result owns subsequent continuation turns.
+fn sparse_tick_needs_continuation(tick: &SyncRuntimeTick, provider_rescan_queued: bool) -> bool {
+    matches!(
+        tick,
+        SyncRuntimeTick::LocalMutation(_)
+            | SyncRuntimeTick::Recovering
+            | SyncRuntimeTick::RetryFull
+    ) || (provider_rescan_queued
+        && matches!(
+            tick,
+            SyncRuntimeTick::Idle
+                | SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. }
+        ))
+}
+
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
 /// them into the cache, emitting `graph-changed` so the UI can reload. Two
 /// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
@@ -1247,11 +1267,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         // the step that took no completed batch.
                         let changed = tick.committed_observable_change();
                         match &tick {
-                            SyncRuntimeTick::LocalMutation(_)
-                            | SyncRuntimeTick::Recovering
-                            | SyncRuntimeTick::RetryFull => graph.retry.progressed(Instant::now()),
                             SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Failed(_) => {
                                 graph.retry.failed(Instant::now())
+                            }
+                            tick if sparse_tick_needs_continuation(tick, provider_rescan) => {
+                                graph.retry.progressed(Instant::now())
                             }
                             _ => graph.retry.succeeded(),
                         }
@@ -1705,6 +1725,26 @@ mod tests {
         assert!(
             !sparse_provider_rescan_required(true, false, false, false),
             "a steady exact-event turn must not broaden into a full provider scan",
+        );
+
+        assert!(sparse_tick_needs_continuation(
+            &SyncRuntimeTick::AdmittedNoop { epoch: 7 },
+            true,
+        ));
+        assert!(sparse_tick_needs_continuation(
+            &SyncRuntimeTick::AdmittedComplete { epoch: 8 },
+            true,
+        ));
+        assert!(
+            !sparse_tick_needs_continuation(&SyncRuntimeTick::AdmittedNoop { epoch: 9 }, false,),
+            "ordinary quiet graph admission must not become an idle hot loop",
+        );
+        assert!(
+            !sparse_tick_needs_continuation(
+                &SyncRuntimeTick::RecoveryBlocked("waiting for provider bytes".into()),
+                true,
+            ),
+            "blocked provider work keeps the existing backoff policy",
         );
     }
 
