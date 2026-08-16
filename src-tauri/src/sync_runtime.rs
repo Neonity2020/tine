@@ -4,6 +4,9 @@
 //! Ordinary graph loading never creates it. Once present, startup discovers
 //! sparse state and never falls back to a legacy `Graph` writer.
 
+use crate::storage_mode_supervisor::{
+    StableStorageMode, StorageTransitionKind, StorageTransitionOutcome, StorageTransitionPhase,
+};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -37,6 +40,18 @@ use uuid::Uuid;
 
 const BINDING_SCHEMA_VERSION: u32 = 2;
 static BINDING_WRITE: Mutex<()> = Mutex::new(());
+const DIRECT_SELECTION_SCHEMA_VERSION: u32 = 1;
+const DIRECT_SELECTION_DIR: &str = "storage-mode-selections";
+const DIRECT_SELECTION_FILE_SUFFIX: &str = ".direct-v1.json";
+static DIRECT_SELECTION_WRITE: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct DirectSelectionReceipt {
+    schema_version: u32,
+    graph_root: String,
+    reason: String,
+}
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -161,20 +176,108 @@ impl SparseV2ActivationRecord {
     }
 }
 
+fn graph_private_key(graph_root: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"tine/sparse-v2/app-binding/v1\0");
+    digest.update(graph_root.as_os_str().as_encoded_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 fn sparse_private_root(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
     let app_data = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("couldn't resolve private app-data directory: {error}"))?;
-    let mut digest = Sha256::new();
-    digest.update(b"tine/sparse-v2/app-binding/v1\0");
-    digest.update(graph_root.as_os_str().as_encoded_bytes());
-    let key = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(app_data.join(SPARSE_BINDING_DIR).join(key))
+    Ok(app_data
+        .join(SPARSE_BINDING_DIR)
+        .join(graph_private_key(graph_root)))
+}
+
+fn direct_selection_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("couldn't resolve private app-data directory: {error}"))?;
+    Ok(direct_selection_path_at(&app_data, graph_root))
+}
+
+fn direct_selection_path_at(app_data: &Path, graph_root: &Path) -> PathBuf {
+    app_data.join(DIRECT_SELECTION_DIR).join(format!(
+        "{}{}",
+        graph_private_key(graph_root),
+        DIRECT_SELECTION_FILE_SUFFIX
+    ))
+}
+
+fn direct_selection_is_active(app: &tauri::AppHandle, graph_root: &Path) -> Result<bool, String> {
+    let path = direct_selection_path(app, graph_root)?;
+    direct_selection_is_active_at(&path, graph_root)
+}
+
+fn direct_selection_is_active_at(path: &Path, graph_root: &Path) -> Result<bool, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Couldn't read Direct Files selection: {error}")),
+    };
+    match serde_json::from_slice::<DirectSelectionReceipt>(&bytes) {
+        Ok(receipt)
+            if receipt.schema_version == DIRECT_SELECTION_SCHEMA_VERSION
+                && Path::new(&receipt.graph_root) == graph_root =>
+        {
+            Ok(true)
+        }
+        Ok(_) | Err(_) => {
+            // The digest-addressed receipt can only have been written for this
+            // canonical root. A torn/corrupt app-private receipt fails toward
+            // Direct Files; it must never resurrect the managed selector.
+            crate::debug::diag(format!(
+                "Direct Files selection receipt is malformed at {}; retaining Direct selection",
+                path.display()
+            ));
+            Ok(true)
+        }
+    }
+}
+
+fn publish_direct_selection(
+    app: &tauri::AppHandle,
+    graph_root: &Path,
+    reason: &str,
+) -> Result<(), String> {
+    let path = direct_selection_path(app, graph_root)?;
+    publish_direct_selection_at(&path, graph_root, reason)
+}
+
+fn publish_direct_selection_at(path: &Path, graph_root: &Path, reason: &str) -> Result<(), String> {
+    let receipt = DirectSelectionReceipt {
+        schema_version: DIRECT_SELECTION_SCHEMA_VERSION,
+        graph_root: graph_root.display().to_string(),
+        reason: reason.to_owned(),
+    };
+    let encoded = serde_json::to_string_pretty(&receipt)
+        .map(|mut value| {
+            value.push('\n');
+            value
+        })
+        .map_err(|error| error.to_string())?;
+    tine_core::model::atomic_update(path, &DIRECT_SELECTION_WRITE, |_| Ok(encoded.clone()))
+        .map_err(|error| format!("Couldn't select Direct Files for this graph: {error}"))
+}
+
+fn retire_direct_selection(app: &tauri::AppHandle, graph_root: &Path) -> Result<(), String> {
+    let path = direct_selection_path(app, graph_root)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Couldn't retire the prior Direct Files selection: {error}"
+        )),
+    }
 }
 
 fn binding_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
@@ -1004,6 +1107,9 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         graph_root: &Path,
     ) -> Result<Option<SparseV2ActivationRecord>, String> {
+        if direct_selection_is_active(app, graph_root)? {
+            return Ok(None);
+        }
         let private = sparse_private_root(app, graph_root)?;
         let record = read_binding_at(&private.join(SPARSE_BINDING_FILE), graph_root)?;
         if record.is_none() && std::fs::symlink_metadata(&private).is_ok() {
@@ -1021,6 +1127,22 @@ impl SyncRuntimeFacade {
         graph_root: &Path,
         graph_meta: GraphMeta,
     ) -> Result<SparseV2ActivationRecord, String> {
+        if direct_selection_is_active(app, graph_root)? {
+            let private = sparse_private_root(app, graph_root)?;
+            if std::fs::symlink_metadata(&private).is_ok() {
+                let recovery = sparse_recovery_root(app)?;
+                archive_private_root(&private, &recovery).map_err(|error| {
+                    format!(
+                        "Couldn't quarantine prior managed-storage evidence before fresh activation: {error}"
+                    )
+                })?;
+            }
+            return Ok(SparseV2ActivationRecord::new(
+                graph_root,
+                graph_meta,
+                DeviceId::from_uuid(crate::settings::managed_sync_device_id(app)?),
+            ));
+        }
         match self.binding_record(app, graph_root)? {
             Some(record) => Ok(record),
             None => Ok(SparseV2ActivationRecord::new(
@@ -1037,7 +1159,16 @@ impl SyncRuntimeFacade {
         record: &SparseV2ActivationRecord,
     ) -> Result<(), String> {
         let root = Path::new(&record.graph_root);
-        persist_binding_at(&binding_path(app, root)?, record)
+        persist_binding_at(&binding_path(app, root)?, record)?;
+        retire_direct_selection(app, root)
+    }
+
+    pub(crate) fn direct_selection_is_active(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> Result<bool, String> {
+        direct_selection_is_active(app, graph_root)
     }
 
     pub(crate) fn graph_meta(record: &SparseV2ActivationRecord) -> GraphMeta {
@@ -2409,7 +2540,7 @@ pub(crate) async fn cancel_sparse_v2_cold(
 ) -> Result<SparseV2ColdCancelResult, String> {
     let label = window.label().to_string();
     let reporter = crate::graph::StartupProgressReporter::for_window(&app, &label);
-    reporter.phase("cold_return.waiting_for_graph_transition");
+    reporter.phase("cold_return.verifying_target");
     let worker_reporter = reporter.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         cancel_sparse_v2_cold_blocking(&app, &label, path, attempt, &worker_reporter)
@@ -2493,77 +2624,116 @@ fn cancel_sparse_v2_cold_blocking(
     attempt: u64,
     reporter: &crate::graph::StartupProgressReporter,
 ) -> Result<SparseV2ColdCancelResult, String> {
-    // Canonicalization is read-only.  It happens before `graph_load` only to
-    // compare the submitted target with native authority; every state/storage
-    // mutation remains inside the serialized transition below.
+    // Canonicalization is read-only. Emergency return intentionally does not
+    // wait for the managed root lane: its first durable mutation selects the
+    // current Markdown tree as Direct Files, and stale managed workers are
+    // barred from later publication by the supervisor operation ID.
     let submitted_root = crate::state::canonical_graph_root(&path).map_err(|_| {
         "The selected recovery folder is unavailable. Retry graph lookup or choose another graph."
             .to_string()
     })?;
     let state = app.state::<crate::state::AppState>();
     state.request_startup_cold_return(label, attempt, &submitted_root)?;
-    let progress =
-        ColdReturnProgress::start(reporter.clone(), "cold_return.waiting_for_graph_transition");
-    let transition_gate = state
-        .storage_supervisor
-        .legacy_transition_gate(&submitted_root);
-    let _transition = transition_gate.lock().unwrap();
-    progress.phase("cold_return.verifying_target");
-
-    // Re-read both the native attempt and exact canonical target *after*
-    // acquiring the open lock.  A late result, picker, normal open, or another
-    // recovery action cannot turn a stale frontend token into archive authority.
-    let authorized_root = match state.authorized_startup_recovery_target(label, attempt) {
-        Ok(root) => root,
-        Err(_) if state.startup_recovery_attempt_is_current(label, attempt) => {
-            // A lookup watchdog is observational: it cannot let a locally
-            // cached path archive anything by itself.  The only timeout route
-            // independently rereads native settings under this same lock and
-            // accepts an exact canonical remembered/known graph only.
-            if !crate::settings::startup_recovery_target_is_remembered(app, &submitted_root) {
-                return Err(
-                    "Tine could not verify this recovery target in its remembered graphs. Nothing was changed; retry graph lookup or choose another graph."
-                        .into(),
-                );
-            }
-            state.authorize_startup_recovery_target(label, attempt, Some(submitted_root.clone()));
-            submitted_root.clone()
-        }
-        Err(error) => return Err(error),
-    };
-    if authorized_root != submitted_root {
-        return Err(
-            "The selected recovery target no longer matches Tine's remembered graph. Retry graph lookup before returning to Direct files."
-                .into(),
-        );
-    }
-    let private_root = sparse_private_root(app, &submitted_root)?;
-    let recovery_root = sparse_recovery_root(app)?;
-    let approved_assets = crate::settings::approved_external_assets(app, &submitted_root);
-    progress.phase("cold_return.archiving_managed_state");
-    let result = cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
-        &state,
+    let operation_id = state.storage_supervisor.begin_transition(
+        app,
         label,
-        submitted_root,
-        &private_root,
-        &recovery_root,
-        approved_assets.as_deref(),
-        archive_private_root,
-        |direct_root, _| {
-            progress.phase("cold_return.opening_direct_files");
-            crate::graph::open_and_publish_direct_files(
+        Some(submitted_root.clone()),
+        StorageTransitionKind::ReturnEmergency,
+    )?;
+    let progress = ColdReturnProgress::start(reporter.clone(), "cold_return.verifying_target");
+    let mut failure_code = "target_validation_failed";
+    let result = (|| {
+        state.storage_supervisor.advance_transition(
+            app,
+            operation_id,
+            StorageTransitionPhase::ValidatingTarget,
+        )?;
+        progress.phase("cold_return.verifying_target");
+
+        // Re-read the exact native target without waiting for managed work.
+        // A late lookup, picker, normal open, or another recovery action cannot
+        // turn a stale frontend token into selector authority.
+        let authorized_root = match state.authorized_startup_recovery_target(label, attempt) {
+            Ok(root) => root,
+            Err(_) if state.startup_recovery_attempt_is_current(label, attempt) => {
+                if !crate::settings::startup_recovery_target_is_remembered(app, &submitted_root) {
+                    return Err(
+                        "Tine could not verify this recovery target in its remembered graphs. Nothing was changed; retry graph lookup or choose another graph."
+                            .into(),
+                    );
+                }
+                state.authorize_startup_recovery_target(
+                    label,
+                    attempt,
+                    Some(submitted_root.clone()),
+                );
+                submitted_root.clone()
+            }
+            Err(error) => return Err(error),
+        };
+        if authorized_root != submitted_root {
+            return Err(
+                "The selected recovery target no longer matches Tine's remembered graph. Retry graph lookup before returning to Direct files."
+                    .into(),
+            );
+        }
+
+        failure_code = "direct_selection_failed";
+        state.storage_supervisor.advance_transition(
+            app,
+            operation_id,
+            StorageTransitionPhase::QuarantiningManagedSelection,
+        )?;
+        progress.phase("cold_return.quarantining_managed_selection");
+        publish_direct_selection(app, &submitted_root, "emergency_return")?;
+
+        failure_code = "direct_open_failed";
+        state.storage_supervisor.advance_transition(
+            app,
+            operation_id,
+            StorageTransitionPhase::PublishingDirect,
+        )?;
+        progress.phase("cold_return.opening_direct_files");
+        if !state.storage_supervisor.operation_is_current(operation_id) {
+            return Err(
+                "The Direct Files return was superseded by a newer graph selection.".into(),
+            );
+        }
+        crate::graph::open_and_publish_direct_files(app, label, &state, submitted_root.clone())
+            .map_err(|error| {
+                format!(
+                    "Direct Files was selected and managed evidence remains preserved, but the Markdown/Org graph could not open: {error}. Retry opening this graph or choose another graph."
+                )
+            })
+    })();
+
+    match result {
+        Ok(direct) => {
+            state.storage_supervisor.finish_transition(
                 app,
-                label,
-                &state,
-                direct_root.to_path_buf(),
-            )
-            .map(|direct| direct.binding_generation)
-        },
-    );
-    if result.is_ok() {
-        state.complete_startup_cold_return(label, attempt);
+                operation_id,
+                StorageTransitionOutcome::Succeeded,
+                Some(StableStorageMode::Direct),
+                None,
+            )?;
+            state.complete_startup_cold_return(label, attempt);
+            Ok(SparseV2CancelResult {
+                binding_generation: direct.binding_generation,
+                status: SparseV2StatusDto::legacy(direct.binding_generation),
+                recovery_statement: "Direct Files is active from the current Markdown/Org tree. Managed-storage evidence was left untouched and may contain operations newer than Markdown; it will never be silently reopened or merged.".into(),
+            })
+        }
+        Err(error) => {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                operation_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some(failure_code.into()),
+            );
+            Err(error)
+        }
     }
-    result
 }
 
 #[tauri::command]
@@ -3055,6 +3225,30 @@ mod tests {
     };
 
     #[test]
+    fn emergency_direct_selection_is_atomic_sticky_and_graph_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph");
+        std::fs::create_dir_all(&graph).unwrap();
+        let receipt = direct_selection_path_at(temp.path(), &graph);
+        assert!(!direct_selection_is_active_at(&receipt, &graph).unwrap());
+        publish_direct_selection_at(&receipt, &graph, "emergency_return").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+        let other = temp.path().join("other");
+        let other_receipt = direct_selection_path_at(temp.path(), &other);
+        assert!(!direct_selection_is_active_at(&other_receipt, &other).unwrap());
+    }
+
+    #[test]
+    fn malformed_emergency_receipt_fails_toward_direct_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph");
+        let receipt = direct_selection_path_at(temp.path(), &graph);
+        std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        std::fs::write(&receipt, b"{").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+    }
+
+    #[test]
     fn activation_command_owns_the_complete_transition_inside_spawn_blocking() {
         let source = include_str!("sync_runtime.rs");
         let start = source
@@ -3488,7 +3682,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_return_requires_native_lock_attempt_target_and_full_direct_lifecycle() {
+    fn cold_emergency_return_has_no_managed_runtime_or_archive_dependency() {
         let source = include_str!("sync_runtime.rs");
         let start = source
             .find("fn cancel_sparse_v2_cold_blocking(")
@@ -3499,21 +3693,33 @@ mod tests {
                 .map(|end| start + end)
                 .expect("next managed command")];
         for required in [
-            "legacy_transition_gate(&submitted_root)",
-            "cold_return.waiting_for_graph_transition",
             "cold_return.verifying_target",
-            "cold_return.archiving_managed_state",
+            "cold_return.quarantining_managed_selection",
             "cold_return.opening_direct_files",
             "request_startup_cold_return",
             "complete_startup_cold_return",
             "authorized_startup_recovery_target",
             "startup_recovery_target_is_remembered",
-            "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",
+            "StorageTransitionKind::ReturnEmergency",
+            "publish_direct_selection",
+            "operation_is_current",
             "open_and_publish_direct_files",
         ] {
             assert!(
                 command.contains(required),
                 "cold recovery must retain `{required}`"
+            );
+        }
+        for forbidden in [
+            "legacy_transition_gate",
+            "archive_private_root",
+            "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",
+            "shutdown_for_direct_files_escape",
+            "sparse_private_root",
+        ] {
+            assert!(
+                !command.contains(forbidden),
+                "emergency return must not depend on `{forbidden}`"
             );
         }
     }

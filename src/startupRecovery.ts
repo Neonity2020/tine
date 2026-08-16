@@ -80,6 +80,7 @@ export function startupPhaseLabel(phase: string): string {
     "direct.archive": "Archiving managed state before Direct Files",
     "cold_return.waiting_for_graph_transition": "Finishing the current storage operation before Direct Files",
     "cold_return.verifying_target": "Verifying the workspace before Direct Files",
+    "cold_return.quarantining_managed_selection": "Selecting the current Markdown tree as Direct Files",
     "cold_return.archiving_managed_state": "Archiving managed state before Direct Files",
     "cold_return.opening_direct_files": "Opening Direct Files",
     "cold_return.complete": "Direct Files return complete",

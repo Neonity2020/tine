@@ -132,6 +132,13 @@ and manifest tail.
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
 | device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
 
+Emergency return publishes the sibling app-private selector
+`storage-mode-selections/<graph-digest>.direct-v1.json`. Ordinary startup checks
+this before managed binding discovery, so retained managed bytes cannot
+resurrect themselves. The receipt is retired only after an explicit fresh
+managed activation has quarantined the former private root and published its
+new binding.
+
 The following path families are **retired pre-0.7 artifacts**, not an alternate
 production layout: `archive/bootstrap-v1/`, `archive/engine-history/`,
 `archive/promoted-runtime.state`, the block/name/path/UUID Patricia indexes,

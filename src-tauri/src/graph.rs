@@ -847,15 +847,20 @@ pub(crate) fn load_graph_for_label(
             application_page_admission: slot.application_page_admission(),
         });
     }
-    if let Err(error) = refuse_unclaimed_sparse_archive(&root_key) {
-        let _ = state.storage_supervisor.finish_transition(
-            app,
-            lookup_id,
-            StorageTransitionOutcome::Failed,
-            None,
-            Some("unclaimed_managed_archive".into()),
-        );
-        return Err(error);
+    let explicit_direct = state
+        .sync_runtime
+        .direct_selection_is_active(app, &root_key)?;
+    if !explicit_direct {
+        if let Err(error) = refuse_unclaimed_sparse_archive(&root_key) {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                lookup_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("unclaimed_managed_archive".into()),
+            );
+            return Err(error);
+        }
     }
     graph_load_phase(started, &mut previous, "shared storage discovery");
     state.storage_supervisor.finish_transition(
