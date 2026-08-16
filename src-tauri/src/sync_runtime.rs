@@ -2489,6 +2489,7 @@ fn cancel_sparse_v2_cold_blocking(
             .to_string()
     })?;
     let state = app.state::<crate::state::AppState>();
+    state.request_startup_cold_return(label, attempt, &submitted_root)?;
     let progress =
         ColdReturnProgress::start(reporter.clone(), "cold_return.waiting_for_graph_transition");
     let _transition = state.graph_load.lock().unwrap();
@@ -2525,7 +2526,7 @@ fn cancel_sparse_v2_cold_blocking(
     let recovery_root = sparse_recovery_root(app)?;
     let approved_assets = crate::settings::approved_external_assets(app, &submitted_root);
     progress.phase("cold_return.archiving_managed_state");
-    cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
+    let result = cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
         &state,
         label,
         submitted_root,
@@ -2543,7 +2544,11 @@ fn cancel_sparse_v2_cold_blocking(
             )
             .map(|direct| direct.binding_generation)
         },
-    )
+    );
+    if result.is_ok() {
+        state.complete_startup_cold_return(label, attempt);
+    }
+    result
 }
 
 #[tauri::command]
@@ -3462,6 +3467,8 @@ mod tests {
             "cold_return.verifying_target",
             "cold_return.archiving_managed_state",
             "cold_return.opening_direct_files",
+            "request_startup_cold_return",
+            "complete_startup_cold_return",
             "authorized_startup_recovery_target",
             "startup_recovery_target_is_remembered",
             "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",

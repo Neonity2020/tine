@@ -99,6 +99,7 @@ pub(crate) struct CaptureGraphBinding {
 pub(crate) struct StartupRecoveryTarget {
     attempt: u64,
     canonical_root: Option<PathBuf>,
+    cold_return_requested: bool,
 }
 
 /// The single **write** authority retained for one graph/window binding.
@@ -566,6 +567,7 @@ impl AppState {
             StartupRecoveryTarget {
                 attempt,
                 canonical_root: None,
+                cold_return_requested: false,
             },
         );
     }
@@ -617,11 +619,59 @@ impl AppState {
             .is_some_and(|target| target.attempt == attempt)
     }
 
-    /// Starting a normal graph open supersedes any startup recovery action for
-    /// that window, so a delayed button click cannot mutate a graph after the
-    /// user chose another recovery route.
+    /// Claim the current startup authority for a queued Direct Files return.
+    /// The claim is made before waiting for `graph_load`, so the managed open
+    /// ahead of it cannot erase the authority when it publishes its slot.
+    pub(crate) fn request_startup_cold_return(
+        &self,
+        window: &str,
+        attempt: u64,
+        submitted_root: &Path,
+    ) -> Result<(), String> {
+        let mut targets = self.startup_recovery.lock().unwrap();
+        let Some(target) = targets.get_mut(window) else {
+            return Err(
+                "This recovery action is no longer current. Retry graph lookup before returning to Direct files."
+                    .into(),
+            );
+        };
+        if target.attempt != attempt
+            || target
+                .canonical_root
+                .as_ref()
+                .is_some_and(|root| root != submitted_root)
+        {
+            return Err(
+                "This recovery action is no longer current. Retry graph lookup before returning to Direct files."
+                    .into(),
+            );
+        }
+        target.cold_return_requested = true;
+        Ok(())
+    }
+
+    pub(crate) fn complete_startup_cold_return(&self, window: &str, attempt: u64) {
+        let mut targets = self.startup_recovery.lock().unwrap();
+        if targets
+            .get(window)
+            .is_some_and(|target| target.attempt == attempt && target.cold_return_requested)
+        {
+            targets.remove(window);
+        }
+    }
+
+    /// A normal graph-open completion retires an unclaimed startup action. A
+    /// cold return that already claimed the same native attempt survives until
+    /// it acquires `graph_load`; a newer `begin_startup_recovery_attempt`
+    /// remains the way another user action supersedes it.
     pub(crate) fn clear_startup_recovery_target(&self, window: &str) {
-        self.startup_recovery.lock().unwrap().remove(window);
+        let mut targets = self.startup_recovery.lock().unwrap();
+        if targets
+            .get(window)
+            .is_none_or(|target| !target.cold_return_requested)
+        {
+            targets.remove(window);
+        }
     }
 
     /// Record the graph window that commands such as quick capture should use.
@@ -1069,6 +1119,43 @@ mod tests {
         assert!(state.note_focused("main"));
         assert_eq!(state.last_focused.lock().unwrap().as_deref(), Some("main"));
         assert!(!state.note_focused("main"));
+    }
+
+    #[test]
+    fn queued_cold_return_keeps_its_native_authority_until_it_completes() {
+        let state = AppState {
+            graphs: RwLock::new(GraphRegistry::default()),
+            graph_load: Mutex::new(()),
+            watch_ctl: Mutex::new(None),
+            last_focused: Mutex::new(None),
+            capture_graph: Mutex::new(None),
+            startup_recovery: Mutex::new(HashMap::new()),
+            sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
+            #[cfg(desktop)]
+            next_window: AtomicU64::new(2),
+        };
+        let root = PathBuf::from("/graphs/alpha");
+
+        state.begin_startup_recovery_attempt("main", 7);
+        state.authorize_startup_recovery_target("main", 7, Some(root.clone()));
+        state.request_startup_cold_return("main", 7, &root).unwrap();
+
+        // This is what the managed open ahead of the queued return does when
+        // it publishes. It must not revoke the already-claimed return.
+        state.clear_startup_recovery_target("main");
+        assert_eq!(
+            state.authorized_startup_recovery_target("main", 7),
+            Ok(root.clone())
+        );
+
+        state.complete_startup_cold_return("main", 7);
+        assert!(state.authorized_startup_recovery_target("main", 7).is_err());
+
+        // A newer startup attempt is still allowed to supersede an abandoned
+        // queued return.
+        state.begin_startup_recovery_attempt("main", 8);
+        assert!(!state.startup_recovery_attempt_is_current("main", 7));
+        assert!(state.startup_recovery_attempt_is_current("main", 8));
     }
 
     #[test]
