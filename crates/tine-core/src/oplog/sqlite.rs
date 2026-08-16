@@ -60,7 +60,8 @@ use tine_storage::sqlite::{
 use uuid::Uuid;
 
 use super::hot_engine::{
-    AcceptedFrontierRoot, EngineAuthority, EngineError, RetainedScratchResumeFailure,
+    AcceptedFrontierRoot, EngineAuthority, EngineError, RebuildProjectionClaimSnapshot,
+    RetainedScratchResumeFailure,
 };
 
 pub(crate) type CleanGenesisPhysicalProjection = PhysicalSqliteDatabase;
@@ -70,6 +71,21 @@ use super::import::{
     InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
     TerminalBootstrapConstructionMaterial,
 };
+
+pub(crate) fn clean_genesis_materialized_read<'a>(
+    physical: &'a CleanGenesisPhysicalProjection,
+    root: &AcceptedFrontierRoot,
+) -> Result<super::SqliteMaterializedRead<'a>, ProjectionError> {
+    if root.acceptance_sequence() != 0 || root.genesis().is_none() {
+        return Err(ProjectionError::InvalidFrontier(
+            "clean genesis materialized read requires a sequence-zero baseline".into(),
+        ));
+    }
+    physical
+        .materialized_read(0, canonical_frontier_root_digest(root)?)
+        .map(super::SqliteMaterializedRead::from_storage)
+        .map_err(Into::into)
+}
 use super::object_store::ValidatedBootstrapPublicationV1;
 use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
 use super::sync_layout::{
@@ -5274,6 +5290,7 @@ impl SqliteFrontier {
             &mut instrumentation,
             &mut bootstrap,
             false,
+            None,
             Some(material),
             terminal_projection_sink,
         )?;
@@ -5500,6 +5517,22 @@ impl SqliteFrontier {
 
         let _ = super::hot_engine::take_current_path_cursor_probe();
         let rows_started = std::time::Instant::now();
+        let clean_lazy_genesis = matches!(source.loader, RebuildLoader::LazyGenesisAnchored { .. });
+        let baseline_claim_source = if clean_lazy_genesis {
+            Some(
+                source
+                    .engine
+                    .clean_transient_projection_claim_snapshot()
+                    .map_err(ProjectionError::materialization_from_engine)?
+                    .ok_or_else(|| {
+                        ProjectionError::Rebuild(
+                            "clean terminal rebuild lacks its lazy-genesis UUID candidates".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let coverage_count = self
             .seed_terminal_rows(
                 engine,
@@ -5507,7 +5540,8 @@ impl SqliteFrontier {
                 &provenance,
                 &mut instrumentation,
                 &mut bootstrap,
-                matches!(source.loader, RebuildLoader::LazyGenesisAnchored { .. }),
+                clean_lazy_genesis,
+                baseline_claim_source,
                 None,
                 terminal_projection_sink,
             )
@@ -5603,15 +5637,22 @@ impl SqliteFrontier {
         instrumentation: &mut RebuildInstrumentation,
         bootstrap: &mut BootstrapSqliteRebuildInstrumentation,
         clean_lazy_genesis: bool,
+        baseline_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
         terminal_material: Option<&TerminalBootstrapConstructionMaterial>,
         terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<u64, ProjectionError> {
         let clean_materializer = clean_lazy_genesis
             .then(|| {
+                let claim_source = baseline_claim_source.clone().ok_or_else(|| {
+                    ProjectionError::Rebuild(
+                        "clean terminal rebuild lacks its sequence-zero UUID candidates".into(),
+                    )
+                })?;
                 engine
-                    .bootstrap_bulk_materializer_with_session_budget(
+                    .bootstrap_bulk_materializer_with_rebuild_claims(
                         terminal_root,
                         super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+                        claim_source,
                     )
                     .map_err(ProjectionError::materialization_from_engine)
             })

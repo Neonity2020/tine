@@ -4059,6 +4059,28 @@
       "notes": "A physical Android device returned Permission denied (os error 13) while enabling managed storage even though Direct Files worked and a real app-UID emulator journey passed. The first compatibility packet replaced three Tine-core syncfs calls but missed the separately versioned tine-storage immutable-publication batch; its only completion barrier was another syncfs. The exact-tree fallback also ended each reconstructible directory with a strict directory fsync that could reproduce the same capability error. tine-storage v0.3.1 retains and synchronizes every exact batch file before accepting only Android permission/unsupported/invalid-operation results for directory durability; ordinary file and I/O failures remain fatal. Tine applies the same narrow policy only to pre-promotion source-capture, preparation, backup, enrollment-namespace and disposable SQLite-lease directories reconstructible from unchanged Markdown. It keeps post-promotion authority, atomic no-clobber publication, no-follow/type validation and locks strict. Activation now reports private setup before enrollment/runtime/receipts and attaches the last exact phase to Retryable details, so any remaining device-specific refusal is actionable rather than a bare OS error."
     },
     {
+      "id": "REG-MANAGED-CLEAN-UUID-PROJECTION-001",
+      "title": "Clean managed activation preserves a uniquely claimed Logseq block UUID as projection authority during the first watcher scan",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "reproduced",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/import.rs::tests::clean_activation_prepares_both_candidates_and_final_scan_without_operations"
+        ],
+        "scenario": "managed.clean-activation-logseq-uuid-projection-authority",
+        "failBefore": "field-reproduced"
+      },
+      "notes": "The Linux real-app recovery journey activated a 1,046-file anonymized graph successfully, then the first clean watcher scan repeatedly failed before the requested edit: a page containing one ordinary id:: UUID materialized the UUID on one block while the index-free clean engine had no baseline candidate authority. The repair makes exact-frontier SQLite the bounded baseline candidate source for watcher planning, local/external draft preparation, commit validation and cold committed-tail replay; CRDT documents remain semantic proof. A corrupt/missing terminal SQLite rebuild derives one disposable candidate snapshot from the immutable lazy-genesis capsules and drops it after publication rather than restoring a runtime Patricia or handwritten index. The focused regression now proves first watcher authorization, local edits, a post-manifest interruption, cold tail replay, corrupt-SQLite terminal reconstruction, and that duplicate baseline UUID claimants remain unresolved. Corpus contents and UUID values remain private."
+    },
+    {
       "id": "REG-MANAGED-ANDROID-CRASH-REOPEN-001",
       "title": "Android managed storage recovers an exact saved edit after the app stops without a clean drain",
       "family": "managed-storage-data-safety",

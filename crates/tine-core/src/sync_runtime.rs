@@ -5494,7 +5494,7 @@ impl CleanRuntimeActorCore {
             let predecessor = self
                 .runtime
                 .engine()
-                .clean_import_projection_predecessor(&path, sqlite_owner)
+                .clean_import_projection_predecessor(&path, sqlite_owner, &read)
                 .map_err(|error| CleanActorMutationFailure {
                     phase: OperationalPhase::Planning,
                     detail: format!("clean watcher predecessor for {path} failed: {error}"),
@@ -5784,7 +5784,14 @@ fn open_clean_runtime_resources(
             ObjectStore::open(&operation_archive_path, identities.workspace_id).map_err(display)?,
         )
         .map_err(display)?;
-    let replayed = engine.replay_clean_committed_tail().map_err(display)?;
+    let baseline_root = engine.accepted_frontier_root().map_err(display)?;
+    let baseline_claim_source =
+        crate::oplog::sqlite::clean_genesis_materialized_read(&baseline_projection, &baseline_root)
+            .map_err(display)?;
+    let replayed = engine
+        .replay_clean_committed_tail(&baseline_claim_source)
+        .map_err(display)?;
+    drop(baseline_claim_source);
     let store =
         ObjectStore::open(&operation_archive_path, identities.workspace_id).map_err(display)?;
     let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id).map_err(display)?;
@@ -8310,9 +8317,18 @@ fn prepare_clean_join_candidate(
         engine
             .attach_clean_archive_store(store)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let baseline_claim_source = engine
+            .clean_transient_projection_claim_snapshot()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(
+                    "clean join candidate has no lazy-genesis UUID candidates".into(),
+                )
+            })?;
         engine
-            .replay_clean_committed_tail()
+            .replay_clean_committed_tail(baseline_claim_source.as_ref())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        drop(baseline_claim_source);
         let root = engine
             .accepted_frontier_root()
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;

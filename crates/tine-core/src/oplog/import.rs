@@ -6914,16 +6914,9 @@ fn capture_inventory(
 }
 
 fn clean_sqlite_path_owner(
-    database: &SqliteFrontier,
+    read: &super::SqliteMaterializedRead<'_>,
     path: &ManagedPath,
 ) -> Result<Option<PageId>, ImportBlock> {
-    let read = database.materialized_read().map_err(|error| {
-        authority_block(
-            ImportBlockReason::AuthorityUnavailable,
-            Some(path),
-            format!("clean SQLite path authority is unavailable: {error}"),
-        )
-    })?;
     let owners = read.pages_by_path(path, 2).map_err(|error| {
         authority_block(
             ImportBlockReason::AuthorityUnavailable,
@@ -6947,14 +6940,21 @@ fn clean_import_predecessor_authority(
     database: &SqliteFrontier,
     paths: &[ManagedPath],
 ) -> Result<CatalogAuthority, ImportBlock> {
+    let read = database.materialized_read().map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            format!("clean SQLite predecessor authority is unavailable: {error}"),
+        )
+    })?;
     let mut hasher = Sha256::new();
     hasher.update(b"tine/clean-import-predecessor-snapshot/v1\0");
     for path in paths {
         hasher.update((path.as_str().len() as u64).to_be_bytes());
         hasher.update(path.as_str().as_bytes());
-        let sqlite_owner = clean_sqlite_path_owner(database, path)?;
+        let sqlite_owner = clean_sqlite_path_owner(&read, path)?;
         let predecessor = engine
-            .clean_import_projection_predecessor(path, sqlite_owner)
+            .clean_import_projection_predecessor(path, sqlite_owner, &read)
             .map_err(|error| {
                 authority_block(
                     ImportBlockReason::AuthorityUnavailable,
@@ -7039,6 +7039,13 @@ fn capture_clean_import_scope(
     inventory: &RawInventory,
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<(ImportScopeSnapshot, CatalogAuthority), ImportBlock> {
+    let read = database.materialized_read().map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            format!("clean SQLite scope authority is unavailable: {error}"),
+        )
+    })?;
     let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
         authority_block(
             ImportBlockReason::AuthorityUnavailable,
@@ -7089,9 +7096,9 @@ fn capture_clean_import_scope(
         };
         instrumentation.catalog_path_lookups =
             instrumentation.catalog_path_lookups.saturating_add(1);
-        let sqlite_owner = clean_sqlite_path_owner(database, path)?;
+        let sqlite_owner = clean_sqlite_path_owner(&read, path)?;
         match engine
-            .clean_import_projection_predecessor(path, sqlite_owner)
+            .clean_import_projection_predecessor(path, sqlite_owner, &read)
             .map_err(|error| {
                 authority_block(
                     ImportBlockReason::AuthorityUnavailable,
@@ -13323,8 +13330,22 @@ mod tests {
         let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
             "clean-activation-entry",
             &[
-                ("pages/alpha.md", "- alpha [[Beta]]\n"),
-                ("pages/beta.md", "- beta\n"),
+                (
+                    "pages/alpha.md",
+                    "- alpha [[Beta]] ((00000000-0000-0000-0000-000000000042)) ((00000000-0000-0000-0000-000000000043))\n",
+                ),
+                (
+                    "pages/beta.md",
+                    "- beta\n  id:: 00000000-0000-0000-0000-000000000042\n  collapsed:: true\n  - nested child\n",
+                ),
+                (
+                    "pages/gamma.md",
+                    "- gamma\n  id:: 00000000-0000-0000-0000-000000000043\n",
+                ),
+                (
+                    "pages/delta.md",
+                    "- delta\n  id:: 00000000-0000-0000-0000-000000000043\n",
+                ),
             ],
         );
         let graph = Graph::open(&root.path().join("graph"));
@@ -13342,8 +13363,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(preparation.instrumentation().source_files, 2);
-        assert_eq!(preparation.candidates().baseline().page_count(), 2);
+        assert_eq!(preparation.instrumentation().source_files, 4);
+        assert_eq!(preparation.candidates().baseline().page_count(), 4);
         let first_page = preparation
             .candidates()
             .baseline()
@@ -13364,6 +13385,35 @@ mod tests {
             block_id: first_block.block_id,
             home_document_id: first_block.home_document_id,
         };
+        let beta_page_id = preparation
+            .candidates()
+            .baseline()
+            .page_ids()
+            .find(|page_id| {
+                preparation
+                    .candidates()
+                    .baseline()
+                    .page(*page_id)
+                    .unwrap()
+                    .is_some_and(|page| page.path.as_str() == "pages/beta.md")
+            })
+            .expect("clean baseline contains beta");
+        let duplicate_uuid_pages = preparation
+            .candidates()
+            .baseline()
+            .page_ids()
+            .filter(|page_id| {
+                preparation
+                    .candidates()
+                    .baseline()
+                    .page(*page_id)
+                    .unwrap()
+                    .is_some_and(|page| {
+                        matches!(page.path.as_str(), "pages/gamma.md" | "pages/delta.md")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate_uuid_pages.len(), 2);
         assert_eq!(
             preparation
                 .candidates()
@@ -13481,6 +13531,15 @@ mod tests {
         clean_engine
             .attach_clean_projection_endpoint(&graph, &receipts)
             .unwrap();
+        let claim_source = database_handle.materialized_read().unwrap();
+        clean_engine
+            .clean_import_projection_predecessor(
+                &ManagedPath::parse("pages/beta.md").unwrap(),
+                Some(beta_page_id),
+                &claim_source,
+            )
+            .expect("first clean watcher scan can authorize an unchanged id:: page");
+        drop(claim_source);
         let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
             block: edited_block,
             content: "edited after clean activation".into(),
@@ -13622,13 +13681,24 @@ mod tests {
             original_projection_rows,
             "the clean activation opener first reconstructs the exact sequence-zero projection"
         );
-        drop(rebuilt_projection);
         rebuilt_engine
             .attach_clean_archive_store(
                 ObjectStore::open(&operation_archive_path, workspace).unwrap(),
             )
             .unwrap();
-        assert_eq!(rebuilt_engine.replay_clean_committed_tail().unwrap(), 2);
+        let baseline_claim_source = crate::oplog::sqlite::clean_genesis_materialized_read(
+            &rebuilt_projection,
+            &baseline_frontier,
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt_engine
+                .replay_clean_committed_tail(&baseline_claim_source)
+                .unwrap(),
+            2
+        );
+        drop(baseline_claim_source);
+        drop(rebuilt_projection);
         assert_eq!(
             rebuilt_engine
                 .accepted_frontier_root()
@@ -13690,6 +13760,20 @@ mod tests {
             2,
             "missing/corrupt SQLite rebuilds through the manifest-committed edit"
         );
+        let rebuilt_read = rebuilt_projection.database().materialized_read().unwrap();
+        for page_id in duplicate_uuid_pages {
+            assert_eq!(
+                rebuilt_read
+                    .blocks_on_page(page_id, 2)
+                    .unwrap()
+                    .into_iter()
+                    .map(|block| block.logseq_uuid)
+                    .collect::<Vec<_>>(),
+                vec![None],
+                "ambiguous baseline UUID claims must remain candidates, not become block identity during terminal SQLite rebuild"
+            );
+        }
+        drop(rebuilt_read);
         rebuilt_engine
             .attach_clean_projection_endpoint(&graph, &receipts)
             .unwrap();
@@ -13757,9 +13841,11 @@ mod tests {
             .database()
             .preflight_prepared_identity_transition(&rebuilt_engine, &delete_prepared)
             .unwrap();
+        let delete_claim_source = rebuilt_projection.database().materialized_read().unwrap();
         rebuilt_engine
-            .commit_clean_prepared(&delete_prepared)
+            .commit_clean_prepared(&delete_prepared, &delete_claim_source)
             .unwrap();
+        drop(delete_claim_source);
         let delete_event =
             AcceptedBatchEvent::from_accepted(&rebuilt_engine, &rebuilt_store, delete_batch)
                 .unwrap()

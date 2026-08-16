@@ -365,6 +365,17 @@ index. The old Patricia values remain only as a differential oracle until the
 single production cutover, and are then deleted rather than retained as a
 second ready route.
 
+The clean engine does not hydrate those baseline UUID introductions into a
+resident identity map. During ordinary operation the exact-frontier SQLite
+projection supplies bounded baseline candidates, the engine unions them with
+post-baseline introductions from committed manifests, and current CRDT block
+state decides whether a candidate is live and unique. If disposable SQLite is
+missing or corrupt, terminal reconstruction derives one rebuild-scoped
+candidate snapshot from the immutable lazy-genesis capsules, including every
+ambiguous claimant, and drops it when SQLite publication finishes. That
+snapshot is a construction input, not a runtime index or semantic authority;
+ambiguous baseline claims remain unresolved after reconstruction.
+
 ## 3. Invariants and versioning
 
 1. The threat is crash, power loss, torn write, and interrupted/reordered file

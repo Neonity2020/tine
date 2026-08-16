@@ -27,6 +27,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Experimental managed storage now preserves baseline `id::` block identity through editing, crash replay, and disposable-SQLite reconstruction.** Exact-frontier SQLite supplies bounded baseline UUID candidates while current CRDT documents remain semantic authority; committed-tail claims are combined with that baseline, and a missing or corrupt projection uses only a rebuild-scoped snapshot rather than restoring a resident Patricia or handwritten identity index. Ambiguous baseline UUID claims remain unresolved.
+
 - Android managed-storage activation now uses the ordinary app-private
   `mkdirat`/`openat`/`renameat` boundary throughout reconstructible projection
   receipt initialization, rather than re-entering capability preflights after

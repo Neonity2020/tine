@@ -1373,6 +1373,12 @@ fn execute_clean_local_inner(
     let (admission, engine, database) = session.parts().map_err(|refusal| {
         OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
     })?;
+    let claim_source = database.materialized_read().map_err(|error| {
+        OperationalCoordinatorError::new(
+            OperationalPhase::Draft,
+            format!("clean SQLite identity candidates are unavailable: {error}"),
+        )
+    })?;
     let mut prepared = match prepare_local_inner(
         &admission,
         graph,
@@ -1383,6 +1389,7 @@ fn execute_clean_local_inner(
         LocalPreparationBinding::TrustedLocal,
         transaction,
         None,
+        Some(&claim_source),
     )? {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
         PreparedLocalMutationState::ReconciliationRequired(_) => {
@@ -1392,6 +1399,7 @@ fn execute_clean_local_inner(
             ));
         }
     };
+    drop(claim_source);
     prepared.preflight_identity(database, engine)?;
     if let Some(persist_fingerprint) = persist_fingerprint {
         let manifest_bytes = prepared.prepared.manifest().encode().map_err(|error| {
@@ -1422,7 +1430,13 @@ fn execute_clean_local_inner(
         )
     })?;
     let published = guard.into_published_latch();
-    let outcome = match engine.commit_clean_prepared(&prepared) {
+    let commit_claim_source = database.materialized_read().map_err(|error| {
+        OperationalCoordinatorError::new(
+            OperationalPhase::Publication,
+            format!("clean SQLite identity candidates are unavailable: {error}"),
+        )
+    })?;
+    let outcome = match engine.commit_clean_prepared(&prepared, &commit_claim_source) {
         Ok(outcome) => outcome,
         Err(error) => {
             let failure =
@@ -1441,6 +1455,7 @@ fn execute_clean_local_inner(
             ));
         }
     };
+    drop(commit_claim_source);
     if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
         return Err(OperationalCoordinatorError::new(
             OperationalPhase::ArchiveStage,
@@ -1586,7 +1601,13 @@ impl OperationalCoordinator {
         })?;
         let published = handoff.into_publisher_guard().into_published_latch();
         let batch_id = prepared.manifest().batch_id();
-        let outcome = match engine.commit_clean_prepared(&prepared) {
+        let commit_claim_source = database.materialized_read().map_err(|error| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Publication,
+                format!("clean SQLite identity candidates are unavailable: {error}"),
+            )
+        })?;
+        let outcome = match engine.commit_clean_prepared(&prepared, &commit_claim_source) {
             Ok(outcome) => outcome,
             Err(error) => {
                 let failure = OperationalCoordinatorError::new(
@@ -1607,6 +1628,7 @@ impl OperationalCoordinator {
                 ));
             }
         };
+        drop(commit_claim_source);
         if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
             return Err(OperationalCoordinatorError::new(
                 OperationalPhase::ArchiveStage,
@@ -1702,10 +1724,22 @@ impl OperationalCoordinator {
             OperationalCoordinatorError::new(OperationalPhase::Planning, error.to_string())
         })?;
         let import_id = material.import_id();
-        let (author, draft) =
-            draft_with_bounded_peer_candidates(engine, endpoint, &material, |attempt| {
+        let claim_source = database.materialized_read().map_err(|error| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Draft,
+                format!("clean SQLite identity candidates are unavailable: {error}"),
+            )
+        })?;
+        let (author, draft) = draft_with_bounded_peer_candidates(
+            engine,
+            endpoint,
+            &material,
+            Some(&claim_source),
+            |attempt| {
                 CrdtPeerId::external_import_candidate(engine.workspace_id(), import_id, attempt)
-            })?;
+            },
+        )?;
+        drop(claim_source);
         let captured = engine
             .capture_external_author_transaction(draft, graph, receipts, endpoint, None)
             .map_err(|error| {
@@ -1736,7 +1770,13 @@ impl OperationalCoordinator {
         )?;
         let published = guard.into_published_latch();
         let batch_id = author.batch_id;
-        let outcome = match engine.commit_clean_prepared(&prepared) {
+        let commit_claim_source = database.materialized_read().map_err(|error| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Publication,
+                format!("clean SQLite identity candidates are unavailable: {error}"),
+            )
+        })?;
+        let outcome = match engine.commit_clean_prepared(&prepared, &commit_claim_source) {
             Ok(outcome) => outcome,
             Err(error) => {
                 let failure = OperationalCoordinatorError::new(
@@ -1757,6 +1797,7 @@ impl OperationalCoordinator {
                 ));
             }
         };
+        drop(commit_claim_source);
         if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
             return Err(OperationalCoordinatorError::new(
                 OperationalPhase::ArchiveStage,
@@ -2280,7 +2321,7 @@ impl OperationalCoordinator {
             ));
         }
         let (author, draft) =
-            draft_with_bounded_peer_candidates(engine, endpoint, &material, |attempt| {
+            draft_with_bounded_peer_candidates(engine, endpoint, &material, None, |attempt| {
                 CrdtPeerId::external_import_candidate(engine.workspace_id(), import_id, attempt)
             })?;
         fault(OperationalFaultPoint::AfterDraft)?;
@@ -2375,6 +2416,7 @@ impl OperationalCoordinator {
             LocalPreparationBinding::TrustedLocal,
             transaction,
             prepared_editor_projection,
+            None,
         )?;
         match prepared {
             PreparedLocalMutationState::Prepared(mut prepared) => {
@@ -2451,6 +2493,7 @@ impl OperationalCoordinator {
             },
             LocalPreparationBinding::SlowPipeline,
             transaction,
+            None,
             None,
         ) {
             Ok(PreparedLocalMutationState::Prepared(prepared)) => prepared,
@@ -2558,6 +2601,7 @@ impl OperationalCoordinator {
             LocalPreparationBinding::TrustedLocal,
             transaction,
             None,
+            None,
         )
     }
 }
@@ -2649,6 +2693,7 @@ fn prepare_local_inner(
     binding: LocalPreparationBinding,
     transaction: &OperationTransaction,
     prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+    claim_source: Option<&dyn super::hot_engine::ProjectionClaimSource>,
 ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
     #[cfg(test)]
     let bindings_started = Instant::now();
@@ -2705,11 +2750,13 @@ fn prepare_local_inner(
                     batch_id,
                     transaction,
                     prepared_editor_projection,
+                    claim_source,
                 ),
                 None => engine.draft_admitted_local_author_transaction(
                     &authority,
                     transaction,
                     prepared_editor_projection,
+                    claim_source,
                 ),
             }
             .map_err(|error| {
@@ -2819,6 +2866,7 @@ fn execute_local_inner(
         source,
         LocalPreparationBinding::SlowPipeline,
         transaction,
+        None,
         None,
     )? {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
@@ -3202,6 +3250,7 @@ fn draft_with_bounded_peer_candidates(
     engine: &ShardedHotEngine,
     endpoint: ProjectionEndpointBinding,
     material: &super::import::ImportExecutionMaterial,
+    claim_source: Option<&dyn super::hot_engine::ProjectionClaimSource>,
     mut candidate_at: impl FnMut(u64) -> CrdtPeerId,
 ) -> Result<(AuthorBatch, super::AuthorTransactionDraft), OperationalCoordinatorError> {
     for attempt in 0..CRDT_PEER_PROBE_BUDGET {
@@ -3218,7 +3267,13 @@ fn draft_with_bounded_peer_candidates(
             ),
             crdt_peer_id,
         };
-        match engine.draft_external_import_transaction(author, material.clone()) {
+        let drafted = match claim_source {
+            Some(source) => {
+                engine.draft_clean_external_import_transaction(author, material.clone(), source)
+            }
+            None => engine.draft_external_import_transaction(author, material.clone()),
+        };
+        match drafted {
             Ok(draft) => return Ok((author, draft)),
             Err(super::EngineError::CrdtPeerCollision(collision)) if collision == crdt_peer_id => {}
             Err(error) => {
@@ -6640,20 +6695,26 @@ mod tests {
         let material = plan.into_execution_material().unwrap();
         let endpoint = fixture.engine.projection_endpoint_binding().unwrap();
         let candidates = [0, 12, 13];
-        let (author, _) =
-            draft_with_bounded_peer_candidates(&fixture.engine, endpoint, &material, |attempt| {
-                CrdtPeerId::from_u64(candidates[usize::try_from(attempt).unwrap().min(2)])
-            })
-            .unwrap();
+        let (author, _) = draft_with_bounded_peer_candidates(
+            &fixture.engine,
+            endpoint,
+            &material,
+            None,
+            |attempt| CrdtPeerId::from_u64(candidates[usize::try_from(attempt).unwrap().min(2)]),
+        )
+        .unwrap();
         assert_eq!(author.crdt_peer_id, CrdtPeerId::from_u64(13));
 
-        let exhausted =
-            match draft_with_bounded_peer_candidates(&fixture.engine, endpoint, &material, |_| {
-                CrdtPeerId::from_u64(12)
-            }) {
-                Err(error) => error,
-                Ok(_) => panic!("colliding bounded peer probe unexpectedly succeeded"),
-            };
+        let exhausted = match draft_with_bounded_peer_candidates(
+            &fixture.engine,
+            endpoint,
+            &material,
+            None,
+            |_| CrdtPeerId::from_u64(12),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("colliding bounded peer probe unexpectedly succeeded"),
+        };
         assert_eq!(exhausted.phase(), OperationalPhase::Draft);
         assert!(exhausted.detail().contains("bounded 8-candidate probe"));
         fixture.graph.probe_managed_text_writer().unwrap();

@@ -4881,6 +4881,9 @@ pub(crate) struct BootstrapBulkMaterializer<'engine> {
     /// engine's current claim authority. Historical roots can reuse document
     /// loading, but must resolve claims through the current fallback.
     current_claim_root_proven: bool,
+    /// Sequence-zero candidates retained only while rebuilding disposable
+    /// SQLite for a clean lazy-genesis runtime.
+    rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
     catalog: LoroDoc,
     catalog_version: DecodedDocumentVersion,
     catalog_dependencies: DocumentDependencies,
@@ -5158,16 +5161,12 @@ impl BootstrapBulkMaterializer<'_> {
         if !self.current_claim_root_proven {
             return self.resolve_logseq_uuid_for_projection_current(logseq_uuid);
         }
-        let record = self
-            .engine
-            .logseq_claim_record(self.engine.logseq_claim_root, logseq_uuid)?;
-        let participants: Vec<_> = record
-            .introductions
-            .iter()
-            .map(|claim| ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let participants = self.engine.projection_claim_participants(
+            logseq_uuid,
+            self.rebuild_claim_source
+                .as_deref()
+                .map(|source| source as &dyn ProjectionClaimSource),
+        )?;
         if participants.is_empty() {
             return Ok((LogseqUuidResolution::Unclaimed, None, BTreeMap::new()));
         }
@@ -5237,9 +5236,15 @@ impl BootstrapBulkMaterializer<'_> {
                 catalog_document_id: self.engine.catalog_document_id,
                 document: &self.catalog,
             });
+        let participants = self.engine.projection_claim_participants(
+            logseq_uuid,
+            self.rebuild_claim_source
+                .as_deref()
+                .map(|source| source as &dyn ProjectionClaimSource),
+        )?;
         let (resolution, evidence, homes) = self
             .engine
-            .resolve_logseq_uuid_current_in_catalog_window(logseq_uuid, catalog)?;
+            .resolve_logseq_uuid_current_from_participants(logseq_uuid, participants, catalog)?;
         let dependencies = homes
             .into_iter()
             .map(|(home_document_id, home)| {
@@ -5553,6 +5558,103 @@ pub struct ProjectionPageState {
     pub page: MaterializedPage,
     pub frontier: FrontierV2,
     pub claim_evidence: Vec<ProjectionClaimEvidence>,
+}
+
+/// Candidate source for the current external-UUID identity frontier.
+///
+/// The clean runtime deliberately has no native Patricia identity indexes.
+/// Its disposable SQLite projection therefore supplies bounded candidates;
+/// the engine still loads and validates the current CRDT documents before a
+/// candidate can authorize projection or publication.
+pub(crate) trait ProjectionClaimSource {
+    fn participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<Vec<ProjectionClaimParticipant>, EngineError>;
+}
+
+/// Rebuild-local copy of the sequence-zero external-UUID candidate rows.
+///
+/// Clean lazy genesis deliberately omits a resident identity index. A terminal
+/// SQLite rebuild still needs the complete baseline candidate set while it
+/// lowers authenticated CRDT pages, including ambiguous claims that must not
+/// authorize either block. This snapshot exists only for that one rebuild and
+/// is dropped with its materializer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RebuildProjectionClaimSnapshot {
+    participants: BTreeMap<LogseqUuid, Vec<ProjectionClaimParticipant>>,
+}
+
+impl RebuildProjectionClaimSnapshot {
+    fn from_lazy_genesis(candidate: &LazyGenesisCandidate) -> Result<Self, EngineError> {
+        let mut participants = BTreeMap::<LogseqUuid, BTreeSet<ProjectionClaimParticipant>>::new();
+        for page_id in candidate.page_ids() {
+            let page = candidate
+                .page(page_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "lazy-genesis page disappeared while deriving rebuild UUID candidates"
+                            .into(),
+                    )
+                })?;
+            for block in page.blocks {
+                for logseq_uuid in block.external_uuid_claims {
+                    participants.entry(logseq_uuid).or_default().insert(
+                        ProjectionClaimParticipant::new(block.block_id, block.home_document_id),
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            participants: participants
+                .into_iter()
+                .map(|(uuid, participants)| (uuid, participants.into_iter().collect()))
+                .collect(),
+        })
+    }
+}
+
+impl ProjectionClaimSource for RebuildProjectionClaimSnapshot {
+    fn participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<Vec<ProjectionClaimParticipant>, EngineError> {
+        Ok(self
+            .participants
+            .get(&logseq_uuid)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+impl ProjectionClaimSource for super::SqliteMaterializedRead<'_> {
+    fn participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<Vec<ProjectionClaimParticipant>, EngineError> {
+        let rows = self
+            .logseq_uuid_introductions(
+                logseq_uuid,
+                super::sqlite_materialization::MAX_MATERIALIZATION_QUERY_ROWS,
+            )
+            .map_err(|error| {
+                EngineError::ProjectionManifest(format!(
+                    "clean SQLite Logseq UUID candidate lookup failed: {error}"
+                ))
+            })?;
+        if rows.len() == super::sqlite_materialization::MAX_MATERIALIZATION_QUERY_ROWS {
+            return Err(EngineError::ProjectionManifest(
+                "clean SQLite Logseq UUID candidate lookup reached its bounded row limit".into(),
+            ));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| ProjectionClaimParticipant::new(row.block_id, row.home_document_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
 }
 
 /// Engine-issued proof that projection state came from accepted durable
@@ -8099,6 +8201,16 @@ impl ShardedHotEngine {
             .transpose()
     }
 
+    pub(crate) fn clean_transient_projection_claim_snapshot(
+        &self,
+    ) -> Result<Option<Arc<RebuildProjectionClaimSnapshot>>, EngineError> {
+        self.lazy_genesis
+            .as_deref()
+            .map(RebuildProjectionClaimSnapshot::from_lazy_genesis)
+            .transpose()
+            .map(|snapshot| snapshot.map(Arc::new))
+    }
+
     pub(crate) fn clean_baseline_provider_index(
         &self,
     ) -> Result<LazyGenesisProviderIndexV1, EngineError> {
@@ -8369,7 +8481,10 @@ impl ShardedHotEngine {
     /// A rejected, quarantined, incomplete, or missing-object terminal state is
     /// archive corruption, not an alternative status stored in a second
     /// persistent index.
-    pub(crate) fn replay_clean_committed_tail(&mut self) -> Result<usize, EngineError> {
+    pub(crate) fn replay_clean_committed_tail(
+        &mut self,
+        baseline_claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<usize, EngineError> {
         if self.lazy_genesis.is_none()
             || self.scratch.is_some()
             || self.history_store.is_some()
@@ -8449,7 +8564,7 @@ impl ShardedHotEngine {
             let validated = pending
                 .remove(&batch_id)
                 .expect("ready clean replay batch remains pending");
-            let outcome = self.stage_ready(validated);
+            let outcome = self.stage_ready_with_claim_source(validated, baseline_claim_source);
             if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
                 return Err(EngineError::Archive(format!(
                     "manifest-committed clean operation {batch_id} did not validate as accepted: {:?}",
@@ -8488,6 +8603,7 @@ impl ShardedHotEngine {
     pub(crate) fn commit_clean_prepared(
         &mut self,
         prepared: &PreparedBatch,
+        claim_source: &dyn ProjectionClaimSource,
     ) -> Result<StageOutcome, EngineError> {
         if self.lazy_genesis.is_none()
             || self.scratch.is_some()
@@ -8518,7 +8634,8 @@ impl ShardedHotEngine {
             )));
         }
 
-        let outcome = self.stage_ready(ValidatedBatch::new(prepared.clone()));
+        let outcome =
+            self.stage_ready_with_claim_source(ValidatedBatch::new(prepared.clone()), claim_source);
         let accepted_exactly_once =
             matches!(outcome.disposition(), BatchDisposition::Accepted { .. })
                 && outcome.newly_accepted().len() == 1
@@ -8648,11 +8765,13 @@ impl ShardedHotEngine {
         &self,
         path: &ManagedPath,
         sqlite_owner: Option<PageId>,
+        claim_source: &dyn ProjectionClaimSource,
     ) -> Result<Option<CleanImportProjectionPredecessor>, EngineError> {
         self.require_index_free_clean_projection_runtime()?;
         match sqlite_owner {
             Some(page_id) => {
-                let current = self.authorize_projection_write(page_id)?;
+                let current =
+                    self.authorize_projection_write_with_claim_source(page_id, claim_source)?;
                 if current.state().page.path != *path {
                     return Err(EngineError::ProjectionManifest(format!(
                         "clean SQLite path owner for {path} differs from its materialized page"
@@ -12769,6 +12888,7 @@ impl ShardedHotEngine {
         self.bootstrap_bulk_materializer_with_lookup_budget(
             root,
             BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+            None,
         )
     }
 
@@ -12777,13 +12897,27 @@ impl ShardedHotEngine {
         root: &AcceptedFrontierRoot,
         budget_bytes_per_root: usize,
     ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
-        self.bootstrap_bulk_materializer_with_lookup_budget(root, budget_bytes_per_root)
+        self.bootstrap_bulk_materializer_with_lookup_budget(root, budget_bytes_per_root, None)
+    }
+
+    pub(crate) fn bootstrap_bulk_materializer_with_rebuild_claims(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes_per_root: usize,
+        claim_source: Arc<RebuildProjectionClaimSnapshot>,
+    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
+        self.bootstrap_bulk_materializer_with_lookup_budget(
+            root,
+            budget_bytes_per_root,
+            Some(claim_source),
+        )
     }
 
     fn bootstrap_bulk_materializer_with_lookup_budget(
         &self,
         root: &AcceptedFrontierRoot,
         budget_bytes_per_root: usize,
+        rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
     ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
         self.begin_point_operation();
         self.authenticate_accepted_frontier_root(root)?;
@@ -12827,6 +12961,7 @@ impl ShardedHotEngine {
             engine: self,
             root: root.clone(),
             current_claim_root_proven,
+            rebuild_claim_source,
             catalog,
             catalog_version,
             catalog_dependencies,
@@ -14329,6 +14464,7 @@ impl ShardedHotEngine {
             true,
             Some(history_record),
             None,
+            None,
         );
         self.resolve_pending_author(batch_id, &outcome.disposition);
         self.prune_persisted_archive_cache();
@@ -14345,7 +14481,7 @@ impl ShardedHotEngine {
         let bounded = budget.is_some();
         if recovery_history_record.is_none() && bounded {
             if let Some(batch) = self.bounded_staging_cache.get(&batch_id).cloned() {
-                let outcome = self.stage_ready_internal(batch, true, None, budget);
+                let outcome = self.stage_ready_internal(batch, true, None, budget, None);
                 self.resolve_pending_author(batch_id, &outcome.disposition);
                 self.prune_persisted_archive_cache();
                 if !self.has_durable_stage_work() {
@@ -14404,7 +14540,7 @@ impl ShardedHotEngine {
                     self.bounded_staging_cache.insert(batch_id, batch.clone());
                 }
                 let outcome =
-                    self.stage_ready_internal(batch, true, recovery_history_record, budget);
+                    self.stage_ready_internal(batch, true, recovery_history_record, budget, None);
                 self.resolve_pending_author(batch_id, &outcome.disposition);
                 self.prune_persisted_archive_cache();
                 if bounded && !self.has_durable_stage_work() {
@@ -14440,7 +14576,21 @@ impl ShardedHotEngine {
         if let Err(error) = self.ensure_terminal_staging_authority() {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
         }
-        let outcome = self.stage_ready_internal(batch, false, None, None);
+        let outcome = self.stage_ready_internal(batch, false, None, None, None);
+        self.resolve_pending_author(batch_id, &outcome.disposition);
+        outcome
+    }
+
+    fn stage_ready_with_claim_source(
+        &mut self,
+        batch: ValidatedBatch,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> StageOutcome {
+        let batch_id = batch.manifest().batch_id();
+        if let Err(error) = self.ensure_terminal_staging_authority() {
+            return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
+        }
+        let outcome = self.stage_ready_internal(batch, false, None, None, Some(claim_source));
         self.resolve_pending_author(batch_id, &outcome.disposition);
         outcome
     }
@@ -14476,6 +14626,7 @@ impl ShardedHotEngine {
         persisted: bool,
         recovery_history_record: Option<ColdHistoryRecord>,
         budget: Option<&mut StageWorkBudget>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> StageOutcome {
         self.begin_point_operation();
         // Staging may alter accepted, staged, rejected, or quarantined state.
@@ -14564,7 +14715,7 @@ impl ShardedHotEngine {
             if matches!(self.statuses.get(&batch_id), Some(ArchiveStatus::Staged))
                 && self.is_blocked()
             {
-                self.drain_blocked_evidence();
+                self.drain_blocked_evidence(claim_source);
             }
             let disposition = match self.statuses.get(&batch_id).cloned() {
                 Some(ArchiveStatus::Rejected(error)) => BatchDisposition::Rejected { error },
@@ -14601,10 +14752,10 @@ impl ShardedHotEngine {
             self.persisted_staged.insert(batch_id);
         }
         let accepted = if self.is_blocked() {
-            self.drain_blocked_evidence();
+            self.drain_blocked_evidence(claim_source);
             Vec::new()
         } else {
-            self.drain_staged()
+            self.drain_staged(claim_source)
         };
         if let Some(error) = self.precommit_history_publication_failure.take() {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
@@ -15355,6 +15506,7 @@ impl ShardedHotEngine {
                             allow_publication,
                             Some(causal_roots),
                             Some(ready_record.event_binding_digest()),
+                            None,
                         ) {
                             Ok(BatchApplication::Accepted { no_op, evidence }) => {
                                 accepted.push(AcceptedBatch { batch_id, no_op });
@@ -15623,6 +15775,7 @@ impl ShardedHotEngine {
             true,
             Some(causal_roots),
             Some(event_binding_digest),
+            None,
         )? {
             BatchApplication::Accepted { no_op, evidence } => (no_op, evidence),
             BatchApplication::Quarantined => {
@@ -16151,12 +16304,14 @@ impl ShardedHotEngine {
         authority: &super::local_active::AdmittedLocalAuthorAuthority<'_>,
         transaction: &OperationTransaction,
         prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
         self.draft_admitted_local_author_transaction_with_batch_id(
             authority,
             BatchId::new(),
             transaction,
             prepared_editor_projection,
+            claim_source,
         )
     }
 
@@ -16170,6 +16325,7 @@ impl ShardedHotEngine {
         batch_id: BatchId,
         transaction: &OperationTransaction,
         prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
         if authority.workspace_id() != self.workspace_id
             || authority.generation().generation != self.history_generation
@@ -16201,6 +16357,7 @@ impl ShardedHotEngine {
                 transaction,
                 None,
                 prepared_editor_projection.take(),
+                claim_source,
             ) {
                 Ok(draft) => {
                     #[cfg(test)]
@@ -16234,7 +16391,14 @@ impl ShardedHotEngine {
                 "raw local author identity is unavailable on a promoted production runtime".into(),
             ));
         }
-        self.draft_author_transaction_with_observation(author, origin, transaction, None, None)
+        self.draft_author_transaction_with_observation(
+            author,
+            origin,
+            transaction,
+            None,
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -16250,6 +16414,7 @@ impl ShardedHotEngine {
             transaction,
             None,
             Some(prepared_editor_projection),
+            None,
         )
     }
 
@@ -17094,8 +17259,14 @@ impl ShardedHotEngine {
             .get()
             .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(true);
-        let oracle =
-            self.draft_author_transaction_with_observation(author, origin, transaction, None, None);
+        let oracle = self.draft_author_transaction_with_observation(
+            author,
+            origin,
+            transaction,
+            None,
+            None,
+            None,
+        );
         let oracle_copies = self.prospective_catalog_document_copies() - oracle_copies;
         let oracle_shape_visits = self
             .history_work
@@ -17109,8 +17280,14 @@ impl ShardedHotEngine {
             .get()
             .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(false);
-        let optimized =
-            self.draft_author_transaction_with_observation(author, origin, transaction, None, None);
+        let optimized = self.draft_author_transaction_with_observation(
+            author,
+            origin,
+            transaction,
+            None,
+            None,
+            None,
+        );
         let optimized_copies = self.prospective_catalog_document_copies() - optimized_copies;
         let optimized_shape_visits = self
             .history_work
@@ -17199,6 +17376,24 @@ impl ShardedHotEngine {
         author: AuthorBatch,
         material: ImportExecutionMaterial,
     ) -> Result<AuthorTransactionDraft, EngineError> {
+        self.draft_external_import_transaction_inner(author, material, None)
+    }
+
+    pub(crate) fn draft_clean_external_import_transaction(
+        &self,
+        author: AuthorBatch,
+        material: ImportExecutionMaterial,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<AuthorTransactionDraft, EngineError> {
+        self.draft_external_import_transaction_inner(author, material, Some(claim_source))
+    }
+
+    fn draft_external_import_transaction_inner(
+        &self,
+        author: AuthorBatch,
+        material: ImportExecutionMaterial,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<AuthorTransactionDraft, EngineError> {
         let (import_id, transaction, observation) = material.into_parts();
         if author.batch_id != import_id.batch_id() {
             return Err(EngineError::InvalidTransaction(
@@ -17211,6 +17406,7 @@ impl ShardedHotEngine {
             &transaction,
             Some(observation),
             None,
+            claim_source,
         )
     }
 
@@ -17221,6 +17417,7 @@ impl ShardedHotEngine {
         transaction: &OperationTransaction,
         observation: Option<ExternalImportObservationMaterial>,
         mut prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<AuthorTransactionDraft, EngineError> {
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
@@ -17251,6 +17448,7 @@ impl ShardedHotEngine {
                 &parts.semantic_effect,
                 parts.projection_before_snapshots.as_ref(),
                 prepared_editor_projection.as_mut(),
+                claim_source,
             )?;
             #[cfg(test)]
             note_local_mutation_detail(|detail| {
@@ -17304,6 +17502,7 @@ impl ShardedHotEngine {
                         &parts.prospective_documents,
                         &parts.semantic_effect,
                         before.as_ref(),
+                        claim_source,
                     )?
                 }
                 None => self.prospective_projection_page(
@@ -17312,6 +17511,7 @@ impl ShardedHotEngine {
                     &parts.prospective_documents,
                     &parts.semantic_effect,
                     before.as_ref(),
+                    claim_source,
                 )?,
             };
             let post_frontier = match &after {
@@ -17383,6 +17583,7 @@ impl ShardedHotEngine {
         effect: &SemanticEffect,
         before_snapshots: Option<&BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
         prepared_editor_projection: Option<&mut super::projection::PreparedEditorProjection>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
         let affine =
             if origin == BatchOrigin::LocalMutation && before_projection_affine_reuse_enabled() {
@@ -17438,7 +17639,11 @@ impl ShardedHotEngine {
                 .before_projection_full_materializations
                 .saturating_add(1);
         });
-        match self.materialize_page_for_projection(page_id) {
+        let materialized = match claim_source {
+            Some(source) => self.materialize_page_for_projection_with_claim_source(page_id, source),
+            None => self.materialize_page_for_projection(page_id),
+        };
+        match materialized {
             Ok(state) => Ok(Some(state)),
             Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => Ok(None),
             Err(error) => Err(error),
@@ -20025,6 +20230,7 @@ impl ShardedHotEngine {
         prospective: &BTreeMap<DocumentId, LoroDoc>,
         effect: &SemanticEffect,
         prior: Option<&ProjectionPageState>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
         // A changed catalog must be read from the transaction's prospective
         // state. An unchanged catalog already has a fixed-depth, authenticated
@@ -20112,14 +20318,10 @@ impl ShardedHotEngine {
             .collect::<BTreeMap<_, _>>();
         let mut claim_evidence = Vec::new();
         for logseq_uuid in requested {
-            let record = self.logseq_claim_record(self.logseq_claim_root, logseq_uuid)?;
-            let mut participants = record
-                .introductions
-                .iter()
-                .map(|claim| {
-                    ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id)
-                })
-                .collect::<BTreeSet<_>>();
+            let mut participants: BTreeSet<ProjectionClaimParticipant> = self
+                .projection_claim_participants(logseq_uuid, claim_source)?
+                .into_iter()
+                .collect();
             if let Some(participant) = introduced.get(&logseq_uuid) {
                 participants.insert(*participant);
             }
@@ -20238,6 +20440,7 @@ impl ShardedHotEngine {
         effect: &SemanticEffect,
         after: &BTreeMap<DocumentId, EngineDocument>,
         updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(), EngineError> {
         let batch = &self.archive[&batch_id];
         let projection = super::projection_manifest::validate_projection_object_set(
@@ -20358,6 +20561,7 @@ impl ShardedHotEngine {
                         effect,
                         &page,
                         &documents,
+                        claim_source,
                     )?;
                     if expected_evidence != intent.claim_evidence() {
                         return Err(EngineError::ProjectionClaimEvidenceMismatch);
@@ -20444,7 +20648,7 @@ impl ShardedHotEngine {
                         )));
                     }
                 } else {
-                    self.validate_manifested_base(base)?;
+                    self.validate_manifested_base(base, claim_source)?;
                 }
             } else if external_observation.as_ref().is_some_and(|observation| {
                 observation
@@ -20465,7 +20669,7 @@ impl ShardedHotEngine {
                     .ok_or_else(|| {
                         EngineError::ProjectionManifest("render base is unavailable".into())
                     })?;
-                self.validate_manifested_base(base)?;
+                self.validate_manifested_base(base, claim_source)?;
             }
         }
         Ok(())
@@ -20548,15 +20752,26 @@ impl ShardedHotEngine {
         ))
     }
 
-    fn validate_manifested_base(&self, base: &AnnotatedProjectionBase) -> Result<(), EngineError> {
+    fn validate_manifested_base(
+        &self,
+        base: &AnnotatedProjectionBase,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<(), EngineError> {
         let state = match self.authorize_projection_recovery_inner(
             base.source_page_id(),
             base.prior_frontier(),
             base.claim_evidence(),
+            claim_source,
         ) {
             Ok(authorization) => authorization.into_state(),
             Err(EngineError::ProjectionAuthorizationUnavailable) if self.scratch.is_none() => {
-                self.materialize_page_for_projection(base.source_page_id())?
+                match claim_source {
+                    Some(source) => self.materialize_page_for_projection_with_claim_source(
+                        base.source_page_id(),
+                        source,
+                    )?,
+                    None => self.materialize_page_for_projection(base.source_page_id())?,
+                }
             }
             Err(error) => return Err(error),
         };
@@ -20647,6 +20862,7 @@ impl ShardedHotEngine {
         effect: &SemanticEffect,
         page: &MaterializedPage,
         documents: &BTreeMap<DocumentId, LoroDoc>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Vec<ProjectionClaimEvidence>, EngineError> {
         let mut requested =
             page_logseq_references(&page.path, page.preamble.as_deref(), &page.blocks);
@@ -20669,10 +20885,16 @@ impl ShardedHotEngine {
         }
         let mut evidence = Vec::new();
         for uuid in requested {
-            let mut participants: BTreeSet<ProjectionClaimParticipant> = self
-                .logseq_claim_evidence_at_frontier(uuid, dependency_frontier)?
-                .map(|evidence| evidence.participants().iter().copied().collect())
-                .unwrap_or_default();
+            let mut participants: BTreeSet<ProjectionClaimParticipant> = match claim_source {
+                Some(source) => self
+                    .projection_claim_participants(uuid, Some(source))?
+                    .into_iter()
+                    .collect(),
+                None => self
+                    .logseq_claim_evidence_at_frontier(uuid, dependency_frontier)?
+                    .map(|evidence| evidence.participants().iter().copied().collect())
+                    .unwrap_or_default(),
+            };
             participants.extend(additions.remove(&uuid).unwrap_or_default());
             if participants.is_empty() {
                 continue;
@@ -21551,7 +21773,7 @@ impl ShardedHotEngine {
     }
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {
-        self.materialize_page_inner(page_id, false)
+        self.materialize_page_inner(page_id, false, None)
             .map(|(page, _, _, _)| page)
     }
 
@@ -21560,7 +21782,24 @@ impl ShardedHotEngine {
         page_id: PageId,
     ) -> Result<ProjectionPageState, EngineError> {
         let (page, frontier, claim_evidence, effective_closure) =
-            self.materialize_page_inner(page_id, true)?;
+            self.materialize_page_inner(page_id, true, None)?;
+        if effective_closure.is_some() {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        Ok(ProjectionPageState {
+            page,
+            frontier: frontier.expect("projection materialization requested a frontier"),
+            claim_evidence,
+        })
+    }
+
+    fn materialize_page_for_projection_with_claim_source(
+        &self,
+        page_id: PageId,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<ProjectionPageState, EngineError> {
+        let (page, frontier, claim_evidence, effective_closure) =
+            self.materialize_page_inner(page_id, true, Some(claim_source))?;
         if effective_closure.is_some() {
             return Err(EngineError::ProjectionAuthorizationUnavailable);
         }
@@ -21575,11 +21814,32 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
+        self.authorize_projection_write_inner(page_id, None)
+    }
+
+    fn authorize_projection_write_with_claim_source(
+        &self,
+        page_id: PageId,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<ProjectionWriteAuthorization, EngineError> {
+        self.authorize_projection_write_inner(page_id, Some(claim_source))
+    }
+
+    fn authorize_projection_write_inner(
+        &self,
+        page_id: PageId,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<ProjectionWriteAuthorization, EngineError> {
         let store = self
             .archive_store
             .as_ref()
             .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let state = self.materialize_page_for_projection(page_id)?;
+        let state = match claim_source {
+            Some(source) => {
+                self.materialize_page_for_projection_with_claim_source(page_id, source)?
+            }
+            None => self.materialize_page_for_projection(page_id)?,
+        };
         let mut accepted_heads = 0_usize;
         for document in state.frontier.documents() {
             for batch_id in document.direct_dependency_heads() {
@@ -21642,7 +21902,7 @@ impl ShardedHotEngine {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
         let (page, frontier, claim_evidence, effective_closure) =
-            self.materialize_page_inner(page_id, true)?;
+            self.materialize_page_inner(page_id, true, None)?;
         let effective_closure =
             effective_closure.ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
         let source = effective_closure.transition.selected_intent.clone();
@@ -22001,7 +22261,7 @@ impl ShardedHotEngine {
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
-        self.authorize_projection_recovery_inner(page_id, frontier, expected_claim_evidence)
+        self.authorize_projection_recovery_inner(page_id, frontier, expected_claim_evidence, None)
     }
 
     fn authorize_projection_recovery_inner(
@@ -22009,6 +22269,7 @@ impl ShardedHotEngine {
         page_id: PageId,
         frontier: &FrontierV2,
         expected_claim_evidence: &[ProjectionClaimEvidence],
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
         let store = self
             .archive_store
@@ -22026,7 +22287,26 @@ impl ShardedHotEngine {
         requested.extend(page.blocks.iter().filter_map(|block| block.logseq_uuid));
         let mut actual_evidence = Vec::new();
         for logseq_uuid in requested {
-            let evidence = self.logseq_claim_evidence_at_frontier(logseq_uuid, frontier)?;
+            let evidence = match claim_source {
+                Some(source) => {
+                    let participants =
+                        self.projection_claim_participants(logseq_uuid, Some(source))?;
+                    let expected = expected_claim_evidence
+                        .binary_search_by_key(&logseq_uuid, ProjectionClaimEvidence::logseq_uuid)
+                        .ok()
+                        .map(|index| &expected_claim_evidence[index]);
+                    match (participants.is_empty(), expected) {
+                        (true, None) => None,
+                        (false, Some(expected))
+                            if participants.as_slice() == expected.participants() =>
+                        {
+                            Some(expected.clone())
+                        }
+                        _ => return Err(EngineError::ProjectionClaimEvidenceMismatch),
+                    }
+                }
+                None => self.logseq_claim_evidence_at_frontier(logseq_uuid, frontier)?,
+            };
             if let Some(evidence) = evidence {
                 let resolution =
                     self.resolve_logseq_uuid_from_documents(logseq_uuid, &evidence, &documents)?;
@@ -22148,6 +22428,23 @@ impl ShardedHotEngine {
         })
     }
 
+    fn projection_claim_participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+        source: Option<&dyn ProjectionClaimSource>,
+    ) -> Result<Vec<ProjectionClaimParticipant>, EngineError> {
+        let mut participants = self
+            .logseq_claim_record(self.logseq_claim_root, logseq_uuid)?
+            .introductions
+            .iter()
+            .map(|claim| ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id))
+            .collect::<BTreeSet<_>>();
+        if let Some(source) = source {
+            participants.extend(source.participants(logseq_uuid)?);
+        }
+        Ok(participants.into_iter().collect())
+    }
+
     fn resolve_logseq_uuid_current(
         &self,
         logseq_uuid: LogseqUuid,
@@ -22182,6 +22479,41 @@ impl ShardedHotEngine {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        self.resolve_logseq_uuid_current_from_participants(logseq_uuid, participants, catalog)
+    }
+
+    fn resolve_logseq_uuid_current_from_source(
+        &self,
+        logseq_uuid: LogseqUuid,
+        source: &dyn ProjectionClaimSource,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, LoroDoc>,
+        ),
+        EngineError,
+    > {
+        self.resolve_logseq_uuid_current_from_participants(
+            logseq_uuid,
+            self.projection_claim_participants(logseq_uuid, Some(source))?,
+            None,
+        )
+    }
+
+    fn resolve_logseq_uuid_current_from_participants(
+        &self,
+        logseq_uuid: LogseqUuid,
+        participants: Vec<ProjectionClaimParticipant>,
+        catalog: Option<ValidatedCatalogDocument<'_>>,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, LoroDoc>,
+        ),
+        EngineError,
+    > {
         if participants.is_empty() {
             return Ok((LogseqUuidResolution::Unclaimed, None, BTreeMap::new()));
         }
@@ -22483,6 +22815,7 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
         include_frontier: bool,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<
         (
             MaterializedPage,
@@ -22609,8 +22942,12 @@ impl ShardedHotEngine {
             let mut referenced = page_logseq_references(&path, preamble.as_deref(), &blocks);
             referenced.extend(block_claims.keys().copied());
             for logseq_uuid in referenced {
-                let (resolution, evidence, homes) =
-                    self.resolve_logseq_uuid_current(logseq_uuid)?;
+                let (resolution, evidence, homes) = match claim_source {
+                    Some(source) => {
+                        self.resolve_logseq_uuid_current_from_source(logseq_uuid, source)?
+                    }
+                    None => self.resolve_logseq_uuid_current(logseq_uuid)?,
+                };
                 if let Some((block_id, home_document_id, origin)) =
                     block_claims.get(&logseq_uuid).copied()
                 {
@@ -23228,7 +23565,10 @@ impl ShardedHotEngine {
             })
     }
 
-    fn drain_staged(&mut self) -> Vec<AcceptedBatch> {
+    fn drain_staged(
+        &mut self,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+    ) -> Vec<AcceptedBatch> {
         let mut accepted = Vec::new();
         'drain: loop {
             if self.is_blocked() || self.history_failure.is_some() {
@@ -23287,7 +23627,7 @@ impl ShardedHotEngine {
                         }
                     }
                 }
-                match self.validate_and_apply(batch_id, true, None, None) {
+                match self.validate_and_apply(batch_id, true, None, None, claim_source) {
                     Ok(BatchApplication::Accepted { no_op, evidence }) => {
                         let manifest_fingerprint = self.archive_fingerprints[&batch_id];
                         self.set_final_status(
@@ -23330,7 +23670,7 @@ impl ShardedHotEngine {
             }
         }
         if self.is_blocked() {
-            self.drain_blocked_evidence();
+            self.drain_blocked_evidence(claim_source);
         }
         accepted
     }
@@ -23338,7 +23678,7 @@ impl ShardedHotEngine {
     /// Validate already offered Ready batches after the terminal latch without
     /// publishing any replacement. Accepted and validated-unpublished parents
     /// are both eligible, and the loop reaches a deterministic fixed point.
-    fn drain_blocked_evidence(&mut self) {
+    fn drain_blocked_evidence(&mut self, claim_source: Option<&dyn ProjectionClaimSource>) {
         loop {
             if self.history_failure.is_some() {
                 break;
@@ -23396,7 +23736,7 @@ impl ShardedHotEngine {
                         }
                     }
                 }
-                match self.validate_and_apply(batch_id, false, None, None) {
+                match self.validate_and_apply(batch_id, false, None, None, claim_source) {
                     Ok(_) => {
                         self.set_final_status(batch_id, ArchiveStatus::Quarantined);
                     }
@@ -24876,6 +25216,7 @@ impl ShardedHotEngine {
         allow_publication: bool,
         candidate_roots: Option<ScratchRoots>,
         event_binding_digest: Option<ContentDigest>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<BatchApplication, EngineError> {
         let mut phase_started = self.replay_timing_started();
         let batch = self
@@ -24950,6 +25291,7 @@ impl ShardedHotEngine {
                 &updates,
                 &declared_effect,
                 pending_documents,
+                claim_source,
             ) {
                 Ok(Some(application)) => return Ok(application),
                 Err(error) if self.precommit_history_publication_failure.is_some() => {
@@ -25103,6 +25445,7 @@ impl ShardedHotEngine {
             &declared_effect,
             &after,
             &updates,
+            claim_source,
         )?;
         Self::record_validation_phase(&mut self.validation_phase_nanos, 5, &mut phase_started);
         // Prepare every current-state replacement first. No visible document is
@@ -27138,6 +27481,7 @@ impl ShardedHotEngine {
         updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
         declared_effect: &SemanticEffect,
         pending_documents: BTreeMap<DocumentId, LoroDoc>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<BatchApplication>, EngineError> {
         if !self.dependency_witnesses_are_current(frontier, updates, self.is_blocked())?
             || pending_documents
@@ -27190,6 +27534,7 @@ impl ShardedHotEngine {
             &declared_effect,
             &pending_engine_documents,
             updates,
+            claim_source,
         )?;
 
         let mut new_exact_shards = BTreeSet::new();
@@ -46111,7 +46456,7 @@ mod replay_benchmark {
             let validation_started = Instant::now();
             assert!(matches!(
                 replay
-                    .stage_ready_internal(batch, true, None, None)
+                    .stage_ready_internal(batch, true, None, None, None)
                     .disposition(),
                 BatchDisposition::Accepted { .. }
             ));
