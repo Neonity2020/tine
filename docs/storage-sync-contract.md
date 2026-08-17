@@ -402,6 +402,20 @@ dependencies whose bytes have not been delivered — is paced by the ordinary
 retry backoff rather than the progress cadence, so a blocked dependency cannot
 become a poll loop.
 
+**A causal dependency is never queued behind its dependent.** The direct
+provider manifest lane advances only its front entry. A batch whose dependency
+sits behind it in that same queue therefore deadlocks the pair: the front batch
+re-inspects the dependency every turn while the dependency never reaches the
+front, and — by the rule above — no later filesystem event breaks the tie, so a
+peer's edit is stranded while the actor honestly reports runnable work forever.
+Membership in the lane's dedupe set does not by itself mean a dependency will be
+admitted in time; position is part of the contract. Whenever admission blocks on
+a dependency, that dependency is moved to the front of the lane (restoring the
+deque/set invariant if they disagree). Queue order otherwise follows provider
+scan order, which is why this state reproduces only intermittently in journeys —
+`a_dependency_queued_behind_its_dependent_is_promoted_ahead_of_it` pins the rule
+deterministically.
+
 ### 2.4 Lazy activation and clean runtime boundary
 
 The accepted next activation generation has one authority-changing record:

@@ -48,6 +48,10 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::provider_arrival_while_active_becomes_scheduled_work",
   "sync_runtime::tests::multiple_delivered_provider_items_drain_to_zero_without_starving_reads",
   "sync_runtime::tests::a_quiet_shared_actor_names_no_runnable_work",
+  // The direct provider lane advances only its front entry, so a batch whose
+  // causal dependency is queued behind it deadlocks the pair and strands a
+  // peer's edit. Deterministic ordering guard for that rule.
+  "sync_runtime::tests::a_dependency_queued_behind_its_dependent_is_promoted_ahead_of_it",
 ]);
 
 // Architectural/contract guards that happen to live in `sync_runtime::tests`

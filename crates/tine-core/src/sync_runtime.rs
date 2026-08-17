@@ -8772,6 +8772,32 @@ fn provider_manifest_recovery_blob_digest(path: &str) -> Option<&str> {
     .then_some(digest)
 }
 
+/// Place `dependency` ahead of the batch that is waiting for it in the direct
+/// provider manifest lane.
+///
+/// The lane only ever advances its front entry, so a batch whose causal
+/// dependency is queued BEHIND it deadlocks the pair: the front batch stalls on
+/// the dependency every turn while the dependency never reaches the front.
+/// Delivered provider bytes produce no further filesystem event, so nothing
+/// breaks that tie and a peer's edit is stranded. Membership in `queued` alone
+/// therefore does not mean "will be admitted in time" — the position matters,
+/// and this moves the dependency to the front either way (restoring the
+/// deque/set invariant if they ever disagree).
+fn promote_provider_dependency(
+    manifests: &mut VecDeque<BatchId>,
+    queued: &mut BTreeSet<BatchId>,
+    dependency: BatchId,
+) {
+    queued.insert(dependency);
+    if let Some(position) = manifests.iter().position(|batch| *batch == dependency) {
+        if position == 0 {
+            return;
+        }
+        manifests.remove(position);
+    }
+    manifests.push_front(dependency);
+}
+
 fn provider_frontier_head_path(path: &str) -> bool {
     let Some(name) = path
         .strip_prefix(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE)
@@ -21841,10 +21867,19 @@ impl RuntimeActor {
                 });
                 match accepted {
                     Ok(true) if retained => {}
-                    Ok(true) | Ok(false) => {
-                        if self.provider_direct_queued.insert(*dependency) {
-                            self.provider_direct_manifests.push_front(*dependency);
-                        }
+                    Ok(_) => {
+                        // This batch cannot be admitted before its dependency, and
+                        // the lane only ever advances its front. A dependency that
+                        // is already queued BEHIND us therefore deadlocks the pair:
+                        // we stall on it every turn while it never reaches the
+                        // front. Delivered provider bytes generate no further
+                        // filesystem event, so nothing breaks the tie. Promote it
+                        // ahead of us instead of trusting the dedupe set alone.
+                        promote_provider_dependency(
+                            &mut self.provider_direct_manifests,
+                            &mut self.provider_direct_queued,
+                            *dependency,
+                        );
                         missing_dependency = true;
                     }
                     Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
@@ -46994,6 +47029,53 @@ mod tests {
         );
     }
 
+    /// The direct provider lane only ever advances its front entry, so a batch
+    /// whose causal dependency sits BEHIND it in the same queue can never make
+    /// progress: it stalls on the dependency every turn while the dependency
+    /// never reaches the front, and delivered bytes produce no further
+    /// filesystem event to break the tie. Observed as a receiving device that
+    /// held a peer's edit forever with the actor reporting runnable work on
+    /// every turn. Queue order comes from provider scan order, so the journey
+    /// only reproduces it sometimes; this pins the rule itself.
+    #[test]
+    fn a_dependency_queued_behind_its_dependent_is_promoted_ahead_of_it() {
+        let dependent = BatchId::new();
+        let dependency = BatchId::new();
+        let unrelated = BatchId::new();
+
+        let mut manifests = VecDeque::from(vec![dependent, dependency, unrelated]);
+        let mut queued = BTreeSet::from([dependent, dependency, unrelated]);
+        promote_provider_dependency(&mut manifests, &mut queued, dependency);
+        assert_eq!(
+            manifests.front().copied(),
+            Some(dependency),
+            "a dependency already queued behind its dependent must be promoted ahead of it",
+        );
+        assert_eq!(
+            manifests
+                .iter()
+                .filter(|batch| **batch == dependency)
+                .count(),
+            1,
+            "promotion must move the dependency, never duplicate it",
+        );
+        assert_eq!(manifests.len(), 3, "promotion must not drop queued work");
+
+        // A dependency that is not queued at all is still admitted first, and a
+        // dependency already at the front stays put.
+        let mut manifests = VecDeque::from(vec![dependent]);
+        let mut queued = BTreeSet::from([dependent]);
+        promote_provider_dependency(&mut manifests, &mut queued, dependency);
+        assert_eq!(manifests.front().copied(), Some(dependency));
+        assert!(queued.contains(&dependency));
+        promote_provider_dependency(&mut manifests, &mut queued, dependency);
+        assert_eq!(
+            manifests,
+            VecDeque::from(vec![dependency, dependent]),
+            "re-promoting the front dependency must be a no-op",
+        );
+    }
+
     /// Several delivered items must drain to zero under the same one-turn-per-
     /// continuation budget, and ordinary page reads must interleave with that
     /// drain rather than queue behind the whole backlog.
@@ -47056,7 +47138,16 @@ mod tests {
             if !production_scheduler_continues(&tick, runnable) {
                 break;
             }
-            assert!(turn < 1_024, "the delivered backlog never drained");
+            // Three delivered items settle in well under this budget. The bound
+            // is deliberately tight: a lane that stalls — for example a batch
+            // waiting on a dependency queued behind it — must fail here rather
+            // than spin, because in production that state is a peer edit that
+            // never arrives.
+            assert!(
+                turn < 128,
+                "the delivered backlog never drained: {:?}",
+                reopened.status().unwrap()
+            );
         }
 
         for path in paths {
