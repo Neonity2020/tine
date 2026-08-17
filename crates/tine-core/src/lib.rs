@@ -3,6 +3,7 @@
 //! testable without the Tauri shell.
 
 pub mod concord_ledger;
+pub mod concord_queue;
 pub mod config;
 pub mod date;
 mod direct_projection;
