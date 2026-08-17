@@ -625,3 +625,23 @@ SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates
 only that derived representation and costs one rebuild; it must not migrate or
 reinterpret authoritative oplog bytes. Authoritative format changes require an
 explicit versioned migration and cannot be treated as a cache rebuild.
+
+## 4. Concord base ledger (Direct Files)
+
+The Concord base ledger (ADR 0056) is **disposable state**, in the invariant-3
+sense: app-private, derived, safe to delete wholesale at any time. It lives
+outside every graph tree at `<app_data>/concord-ledger/<root-id>/` (the
+backups' root-id convention) and stores, per graph-relative page path, the
+last text Tine successfully read from or wrote to disk — sha256-addressed
+blobs plus a path→hash index and conflict-copy pins (schema
+`concord_ledger::LEDGER_SCHEMA`, currently 1).
+
+It is never an authority: nothing validates against it, no refusal scenario
+consults it (§3.1 is unchanged by its existence), and its loss or corruption
+changes exactly one behavior — sync-conflict diffs degrade from 3-way with
+pre-selected suggestions back to the plain 2-way diff until the ledger
+repopulates from ordinary saves and admissions. Ledger updates are best-effort
+background work off the save critical path; they may not block or fail an
+open, save, or reload. It attaches only to Direct Files graphs; a managed
+binding never attaches one (the oplog owns managed merge confidence,
+invariant 8 stays intact).

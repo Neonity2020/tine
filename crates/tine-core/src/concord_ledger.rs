@@ -38,7 +38,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Mutex;
 
-const LEDGER_SCHEMA: u32 = 1;
+/// On-disk schema of index/pin entries; named by `docs/storage-sync-contract.md`
+/// §4 (a doc-code consistency test below keeps the two in step). Bumping it
+/// invalidates the disposable ledger (entries with another schema read as
+/// "no base") and costs nothing but a repopulation.
+pub const LEDGER_SCHEMA: u32 = 1;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -402,6 +406,20 @@ mod tests {
             std::env::temp_dir().join(format!("tine-concord-ledger-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// Doc-code consistency (house rule: living contracts carry tested values):
+    /// the storage contract's §4 must keep describing the ledger as disposable,
+    /// non-authoritative, Direct-Files-only, and at the current schema.
+    #[test]
+    fn storage_contract_names_the_concord_ledger_and_its_schema() {
+        let contract = include_str!("../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("## 4. Concord base ledger (Direct Files)"));
+        assert!(contract.contains("concord-ledger/<root-id>"));
+        assert!(contract.contains(&format!("currently {LEDGER_SCHEMA}")));
+        assert!(contract.contains("It is never an authority"));
+        assert!(contract.contains("safe to delete wholesale at any time"));
+        assert!(contract.contains("a managed\nbinding never attaches one"));
     }
 
     #[test]

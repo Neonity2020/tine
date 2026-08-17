@@ -10,6 +10,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Sync-conflict merges now come with per-block suggestions.** Tine keeps a
+  private per-page record of the last version it agreed on with the disk (the
+  Concord base ledger — stored in app data, never inside your graph, always
+  safe to delete). When you review a Syncthing/Dropbox/Seafile conflict copy,
+  Tine compares both sides against that remembered version: blocks only one
+  side changed arrive with the right choice pre-selected and labeled
+  *suggested*, and only blocks both sides changed still need a real decision.
+  Nothing is merged without your confirm, exactly as before; with no
+  remembered version the diff simply looks the way it always did.
+  (ADR 0056; part of Concord P3, GH #337.)
+- **A path-free block-diff command pair (`text_block_diff` /
+  `text_block_diff3`)** diffs two or three raw page texts with the same
+  block-tree engine the conflict merge uses — the seam the upcoming in-page
+  conflict review builds on.
+
 - **The file watcher now keeps always-on latency receipts for external-change batches.** Each batch that surfaces a change (or an error scheduling a retry) records how long it spent between the OS callback, the post-debounce reconcile, and the `graph-changed` events reaching the UI, logs one structured line, and lands in a small in-memory ring the new `watcher_latency_recent` debug command returns — so slow-external-change reports (GH #337's 5–20 s) can be diagnosed from the reporter's machine instead of guessed at. Works in both inotify and poll watch modes.
 
 - **Managed-storage activation no longer rejects a complete graph because Direct Files or the startup path catalog retained a different one-page inventory.** Readiness is now proved inside the candidate managed generation by opening its transactionally complete, exact-frontier-stamped SQLite inventory and a real page; the candidate remains unpublished until that proof succeeds.
