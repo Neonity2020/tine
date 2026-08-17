@@ -946,6 +946,17 @@ fn sparse_tick_needs_continuation(tick: &SyncRuntimeTick, provider_rescan_queued
         ))
 }
 
+const SPARSE_INITIAL_RECONCILE_GRACE: Duration = Duration::from_millis(750);
+
+fn take_due_sparse_initial_tick(due: &mut Option<Instant>, now: Instant) -> bool {
+    if due.is_some_and(|due| due <= now) {
+        *due = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
 /// them into the cache, emitting `graph-changed` so the UI can reload. Two
 /// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
@@ -985,7 +996,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             binding_generation: u64,
             last_error: Option<String>,
             retry: RetrySchedule,
-            initial_tick: bool,
+            initial_tick_at: Option<Instant>,
         }
 
         let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
@@ -1022,7 +1033,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                     binding_generation: slot.binding_generation,
                                     last_error: None,
                                     retry: RetrySchedule::default(),
-                                    initial_tick: true,
+                                    // Activation has already proved the exact
+                                    // managed inventory. Keep the mandatory
+                                    // watcher-handoff scan, but do not let it
+                                    // seize the actor lane ahead of the first
+                                    // renderer inventory/page reads.
+                                    initial_tick_at: Some(
+                                        Instant::now() + SPARSE_INITIAL_RECONCILE_GRACE,
+                                    ),
                                 },
                             );
                         }
@@ -1202,7 +1220,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             }
             for (label, graph) in sparse_graphs.iter_mut() {
                 let retry_due = graph.retry.take_due(Instant::now());
-                let initial_tick = std::mem::take(&mut graph.initial_tick);
+                let initial_tick =
+                    take_due_sparse_initial_tick(&mut graph.initial_tick_at, Instant::now());
                 let poll_cycle = !inotify && !retry_due;
                 // A graph may contain another device's shared provider tree
                 // while this device has enabled only local managed storage.
@@ -1367,6 +1386,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             .values()
                             .filter_map(|graph| graph.retry.remaining(now)),
                     )
+                    .chain(sparse_graphs.values().filter_map(|graph| {
+                        graph
+                            .initial_tick_at
+                            .map(|due| due.saturating_duration_since(now))
+                    }))
                     .min();
                 let wait_for =
                     inotify_cycle_wait(retry_wait, desired.difference(&watched).next().is_some());
@@ -1389,6 +1413,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let retry_wait = sparse_graphs
                     .values()
                     .filter_map(|graph| graph.retry.remaining(now))
+                    .chain(sparse_graphs.values().filter_map(|graph| {
+                        graph
+                            .initial_tick_at
+                            .map(|due| due.saturating_duration_since(now))
+                    }))
                     .min()
                     .unwrap_or(Duration::from_secs(3))
                     .min(Duration::from_secs(3));
@@ -1753,6 +1782,19 @@ mod tests {
             ),
             "blocked provider work keeps the existing backoff policy",
         );
+    }
+
+    #[test]
+    fn managed_slot_handoff_scan_yields_once_to_first_application_reads() {
+        let now = Instant::now();
+        let scheduled = now + SPARSE_INITIAL_RECONCILE_GRACE;
+        let mut due = Some(scheduled);
+
+        assert!(!take_due_sparse_initial_tick(&mut due, now));
+        assert_eq!(due, Some(scheduled));
+        assert!(take_due_sparse_initial_tick(&mut due, scheduled));
+        assert_eq!(due, None);
+        assert!(!take_due_sparse_initial_tick(&mut due, scheduled));
     }
 
     #[test]

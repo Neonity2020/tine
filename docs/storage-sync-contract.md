@@ -44,6 +44,10 @@ Reactivation of retained clean state separately reports marker/baseline/index
 open, committed-tail replay, projection repair, and actor open. After native
 success the frontend names its new-generation page-list/page-open observation.
 These progress values are observational and cannot authorize publication.
+After managed slot publication, the watcher still performs one full handoff-gap
+reconciliation. It is scheduled after a short grace interval so the first
+renderer inventory/page observations can use the actor lane before graph-wide
+reconciliation; deferral changes priority, not coverage.
 
 Return to Direct Files has two meanings. A graceful return drains a healthy
 managed actor and confirms its committed projection before selecting Direct
