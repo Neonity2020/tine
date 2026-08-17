@@ -105,6 +105,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("capture_target", NoGraphSlot),
     ("clipboard_files", NoGraphSlot),
     ("close_graph_window", NoGraphSlot),
+    ("conflict_queue", Filesystem),
     ("copy_guide_into_graph", ManagedRouted),
     ("copy_image_to_clipboard", NoGraphSlot),
     ("create_graph", NoGraphSlot),
@@ -189,6 +190,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("resolve_block", ManagedRouted),
     ("resolve_blocks", ManagedRouted),
     ("resolve_sync_conflict", ManagedRouted),
+    ("resolve_vcs_marker_conflict", LegacyOnly),
     ("restore_backup", LegacyOnly),
     ("retire_editor_activation", LegacyOnly),
     ("run_advanced_query", ManagedRouted),
@@ -239,6 +241,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("trash_journal_file", ManagedRouted),
     ("trash_sync_conflict", TrashWrite),
     ("uninstall_plugin", NoGraphSlot),
+    ("vcs_marker_conflict_diff", Filesystem),
     ("verify_plugin_registry", NoGraphSlot),
     ("warm_done", NoGraphSlot),
     ("watcher_latency_recent", NoGraphSlot),
@@ -259,6 +262,11 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "present_conflict_override",
         "managed conflicts use actor-issued observations, not Direct Files editor activations",
+    ),
+    (
+        "resolve_vcs_marker_conflict",
+        "VCS merge markers are a Direct Files phenomenon: an external tool wrote \
+         them into the graph's own files, which managed storage does not have",
     ),
     (
         "restore_backup",
