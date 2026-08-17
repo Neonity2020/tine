@@ -19,6 +19,52 @@ struct GraphChange {
     removed: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Bulk external revisions (Concord P2, GH #337 / spec L6)
+// ---------------------------------------------------------------------------
+// A VCS checkout, branch switch, or first big sync under a running Tine dumps
+// one file event per touched page. Two per-file costs amplify that: the
+// incremental reconcile branch pays two full reads + a parse per evented path
+// (deliberately no stat shortcut, see `incremental_reconcile`), and the emit
+// side sends one `graph-changed` per changed page, which the frontend answers
+// with one dataRev bump and up to one `getPage` IPC each. Above the threshold
+// both stop scaling per-file: the drained batch escalates to the stat-diff
+// full branch (one consistent snapshot; an unchanged file costs one stat), and
+// the changed pages are announced as ONE `graph-changed-bulk` event.
+
+/// Boundary between "a burst of ordinary edits" and "an external revision".
+///
+/// Sizing: one atomic save produces at most 2 paths; a human-scale sync delta
+/// (Syncthing propagating a session of edits) is single digits to low tens; a
+/// checkout or big sync is typically hundreds. 32 sits between those clusters,
+/// inside the 24–64 band the P2 design allows. The cost of escalating a batch
+/// of 33 is one stat per unwatched-change file (microseconds each, ~2 ms even
+/// on a 1,000-file graph) — cheaper than a single page's double-read — so the
+/// exact value only needs to keep ordinary edits per-file, not be optimal.
+const BULK_CHANGE_THRESHOLD: usize = 32;
+
+/// Does a drained batch of this many owned event paths escalate to the full
+/// stat-diff branch?
+fn burst_escalates(owned_paths: usize) -> bool {
+    owned_paths > BULK_CHANGE_THRESHOLD
+}
+
+/// Does a reconcile cycle that changed this many pages coalesce its frontend
+/// notification into one aggregate event? Same boundary as `burst_escalates`,
+/// deliberately: below it nothing about today's behavior changes.
+fn emit_as_bulk(changed_pages: usize) -> bool {
+    changed_pages > BULK_CHANGE_THRESHOLD
+}
+
+/// One aggregate frontend notification for a reconcile cycle that changed more
+/// than `BULK_CHANGE_THRESHOLD` pages. Carries the full per-page change list so
+/// the frontend can reload visible pages, run the dirty-page safety machinery,
+/// and summarize the rest — without N events.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct GraphChangedBulk {
+    changes: Vec<GraphChange>,
+}
+
 /// Every sparse-runtime watcher event is scoped to the graph binding that
 /// produced it. A window can be rebound to another graph while a watcher cycle
 /// is in flight; the frontend must be able to drop that older cycle instead of
@@ -148,8 +194,9 @@ pub(crate) struct WatcherLatencyReceipt {
     pages: usize,
     /// Exact event paths this graph owned in the batch (0 for a pure full diff).
     event_paths: usize,
-    /// Whether a full stat-diff was forced (poll cycle, unclassifiable event,
-    /// kernel queue overflow, retry).
+    /// Whether the full stat-diff branch was taken (poll cycle, unclassifiable
+    /// event, kernel queue overflow, retry, or a burst-escalated batch above
+    /// `BULK_CHANGE_THRESHOLD`).
     full_diff: bool,
     /// Reconcile errors in this batch (each schedules a backoff retry — a
     /// latency source worth seeing in a receipt trail).
@@ -713,7 +760,7 @@ fn reconcile_pending(
     need_full: bool,
     poll_mode: bool,
 ) -> (Vec<GraphChange>, bool, bool, Vec<String>) {
-    if need_full || paths.is_empty() {
+    if need_full || paths.is_empty() || burst_escalates(paths.len()) {
         let snapshot = collect_graph_text_files(graph);
         if poll_mode {
             publish_poll_observation(graph, snap, &snapshot);
@@ -1337,7 +1384,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 if need_full || !owned.is_empty() {
                     attempted = true;
                     let reconcile_started = Instant::now();
-                    let (changes, conflicts_dirty, _, errors) = reconcile_pending(
+                    let (changes, conflicts_dirty, used_full, errors) = reconcile_pending(
                         &graph.legacy_graph,
                         &mut graph.snap,
                         &owned,
@@ -1345,8 +1392,16 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         !inotify,
                     );
                     let pages = changes.len();
-                    for change in changes {
-                        let _ = app.emit_to(label, "graph-changed", change);
+                    if emit_as_bulk(pages) {
+                        // One epoch, one notification: the frontend answers with
+                        // one dataRev bump and reloads only visible pages,
+                        // instead of N events → N bumps → up to N getPage IPCs.
+                        let _ =
+                            app.emit_to(label, "graph-changed-bulk", GraphChangedBulk { changes });
+                    } else {
+                        for change in changes {
+                            let _ = app.emit_to(label, "graph-changed", change);
+                        }
                     }
                     // Receipts only for batches that surfaced something: a
                     // change reaching the frontend, or an error scheduling a
@@ -1359,7 +1414,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             inotify,
                             pages,
                             owned.len(),
-                            need_full,
+                            // The branch actually taken — a burst-escalated
+                            // batch reads as full_diff in the receipt trail.
+                            used_full,
                             errors.len(),
                             if initial_cycle { None } else { first_event_at },
                             reconcile_started,
@@ -3064,6 +3121,203 @@ mod tests {
                     ],
                 )
             },
+        );
+    }
+
+    #[test]
+    fn bulk_threshold_boundary_is_exclusive_on_both_sides() {
+        assert!(!burst_escalates(0));
+        assert!(!burst_escalates(BULK_CHANGE_THRESHOLD));
+        assert!(burst_escalates(BULK_CHANGE_THRESHOLD + 1));
+        assert!(!emit_as_bulk(BULK_CHANGE_THRESHOLD));
+        assert!(emit_as_bulk(BULK_CHANGE_THRESHOLD + 1));
+    }
+
+    /// `graph-changed-bulk` is a frontend wire contract: the aggregate carries
+    /// the same per-page change shape the `graph-changed` event carries.
+    #[test]
+    fn graph_changed_bulk_wire_shape_is_stable() {
+        let wire = serde_json::to_value(GraphChangedBulk {
+            changes: vec![GraphChange {
+                name: "Page".to_owned(),
+                kind: PageKind::Page,
+                created: true,
+                removed: false,
+            }],
+        })
+        .unwrap();
+        let changes = wire.get("changes").and_then(|value| value.as_array());
+        let first = changes.and_then(|list| list.first()).expect("one change");
+        for key in ["name", "kind", "created", "removed"] {
+            assert!(first.get(key).is_some(), "missing bulk change field {key}");
+        }
+    }
+
+    #[test]
+    fn a_drained_batch_above_the_threshold_escalates_to_the_full_branch() {
+        // Concord P2 (GH #337 / spec L6): a VCS checkout or first big sync dumps
+        // N file events; processing them per-file costs two reads + a parse per
+        // path with deliberately no stat shortcut. Above the threshold the batch
+        // must take the stat-diff full branch instead.
+        let tg = TempGraph::new("burst-escalation");
+        tg.write("pages/Seed.md", "- seed\n");
+        let graph = Graph::open(&tg.root);
+        warm_cache(&graph);
+        let mut snap = collect_graph_text_files(&graph).files;
+
+        let mut paths = HashSet::new();
+        for index in 0..(BULK_CHANGE_THRESHOLD + 1) {
+            let rel = format!("pages/Bulk {index}.md");
+            tg.write(&rel, &format!("- bulk {index}\n"));
+            paths.insert(tg.path(&rel));
+        }
+
+        let (changes, _, used_full, errors) =
+            reconcile_pending(&graph, &mut snap, &paths, false, false);
+        assert!(
+            used_full,
+            "a batch of {} paths (> {BULK_CHANGE_THRESHOLD}) must escalate to the full stat-diff branch",
+            paths.len()
+        );
+        assert!(errors.is_empty());
+        assert_eq!(changes.len(), BULK_CHANGE_THRESHOLD + 1);
+    }
+
+    #[test]
+    fn a_drained_batch_at_the_threshold_stays_incremental() {
+        // The complement: ordinary bursts (a save, a small sync delta) keep the
+        // per-file branch, whose explicit-event semantics deliberately bypass
+        // the stat shortcut (see `explicit_event_reconciles_even_when_snapshot_
+        // metadata_is_equal`).
+        let tg = TempGraph::new("burst-no-escalation");
+        tg.write("pages/Seed.md", "- seed\n");
+        let graph = Graph::open(&tg.root);
+        warm_cache(&graph);
+        let mut snap = collect_graph_text_files(&graph).files;
+
+        let mut paths = HashSet::new();
+        for index in 0..BULK_CHANGE_THRESHOLD {
+            let rel = format!("pages/Bulk {index}.md");
+            tg.write(&rel, &format!("- bulk {index}\n"));
+            paths.insert(tg.path(&rel));
+        }
+
+        let (changes, _, used_full, errors) =
+            reconcile_pending(&graph, &mut snap, &paths, false, false);
+        assert!(
+            !used_full,
+            "a batch of exactly {BULK_CHANGE_THRESHOLD} paths must keep the incremental branch"
+        );
+        assert!(errors.is_empty());
+        assert_eq!(changes.len(), BULK_CHANGE_THRESHOLD);
+    }
+
+    /// The correctness invariant behind the escalation: whichever branch a burst
+    /// takes, the result is the same. Same family as
+    /// `incremental_burst_union_matches_full_diff`, sized across the threshold.
+    #[test]
+    fn incremental_burst_above_threshold_union_matches_full_diff() {
+        assert_incremental_matches_full(
+            "burst-union-above-threshold",
+            |tg| {
+                for index in 0..BULK_CHANGE_THRESHOLD {
+                    tg.write(&format!("pages/Edit {index}.md"), "- before\n");
+                }
+                tg.write("pages/Delete.md", "- delete\n");
+                tg.write("pages/Keep.md", "- keep\n");
+            },
+            |tg| {
+                std::thread::sleep(Duration::from_millis(20));
+                let mut rels: Vec<String> = Vec::new();
+                for index in 0..BULK_CHANGE_THRESHOLD {
+                    let rel = format!("pages/Edit {index}.md");
+                    tg.write(&rel, "- after\n");
+                    rels.push(rel);
+                }
+                tg.remove("pages/Delete.md");
+                rels.push("pages/Delete.md".to_owned());
+                for index in 0..4 {
+                    let rel = format!("pages/sub/Created {index}.md");
+                    tg.write(&rel, "- created\n");
+                    rels.push(rel);
+                }
+                rels.iter().map(|rel| tg.path(rel)).collect()
+            },
+        );
+    }
+
+    /// Bulk-change measurement + generous regression gate (Concord P2).
+    ///
+    /// Ignored: the fixture is a few hundred generated files — deliberately NOT
+    /// part of the fast unit corpus. Run explicitly:
+    ///   cargo nextest run -p tine --run-ignored ignored-only -E 'test(bulk_reconcile)'
+    ///
+    /// Measures a checkout-shaped change (many files replaced at once under a
+    /// running watcher) through both reconcile branches, prints the numbers, and
+    /// asserts only an order-of-magnitude ceiling — never a tight timing bound.
+    #[test]
+    #[ignore = "bulk fixture (hundreds of generated files); run explicitly"]
+    fn bulk_reconcile_bench_and_gate() {
+        const TOTAL: usize = 800;
+        const CHANGED: usize = 400;
+
+        let tg = TempGraph::new("bulk-bench");
+        for index in 0..TOTAL {
+            tg.write(
+                &format!("pages/Bulk {index}.md"),
+                &format!("- bulk page {index}\n- second line {index}\n"),
+            );
+        }
+        let inc_graph = Graph::open(&tg.root);
+        let full_graph = Graph::open(&tg.root);
+        warm_cache(&inc_graph);
+        warm_cache(&full_graph);
+        let mut inc_snap = collect_graph_text_files(&inc_graph).files;
+        let mut full_snap = inc_snap.clone();
+
+        // The external revision: a checkout replaces CHANGED files' contents.
+        std::thread::sleep(Duration::from_millis(20));
+        let mut paths = HashSet::new();
+        for index in 0..CHANGED {
+            let rel = format!("pages/Bulk {index}.md");
+            tg.write(&rel, &format!("- bulk page {index} switched\n"));
+            paths.insert(tg.path(&rel));
+        }
+
+        let incremental_started = Instant::now();
+        let (inc_changes, _, inc_errors) = incremental_reconcile(&inc_graph, &mut inc_snap, &paths);
+        let incremental_elapsed = incremental_started.elapsed();
+
+        let full_started = Instant::now();
+        let snapshot = collect_graph_text_files(&full_graph);
+        let (full_changes, _, full_errors) =
+            full_diff_reconcile(&full_graph, &mut full_snap, snapshot.files);
+        let full_elapsed = full_started.elapsed();
+
+        assert!(inc_errors.is_empty());
+        assert!(full_errors.is_empty());
+        assert_eq!(inc_changes.len(), CHANGED);
+        assert_eq!(full_changes.len(), CHANGED);
+        println!(
+            "bulk-reconcile bench: {CHANGED} changed of {TOTAL} files — \
+             incremental branch {}ms, full stat-diff branch {}ms",
+            incremental_elapsed.as_millis(),
+            full_elapsed.as_millis(),
+        );
+
+        // Generous gate: the escalated (full) branch reconciling a 400-file
+        // change over an 800-file graph measured 95 ms on the 2026-08 dev box
+        // (incremental branch: 94 ms — the branches cost the same for genuinely
+        // changed files; escalation buys one consistent snapshot and one
+        // aggregate emit, not reconcile speed). 10 s ≈ 100× measured: it catches
+        // an order-of-magnitude regression (e.g. an accidental whole-graph
+        // reparse per changed file) without ever flaking under load.
+        let ceiling = Duration::from_secs(10);
+        assert!(
+            full_elapsed < ceiling,
+            "escalated bulk reconcile took {}ms (ceiling {}ms)",
+            full_elapsed.as_millis(),
+            ceiling.as_millis(),
         );
     }
 
