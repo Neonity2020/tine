@@ -4213,6 +4213,30 @@
         "failBefore": "field-reproduced"
       },
       "notes": "On Android, a user requested Return to Direct Files while cold managed recovery still owned an app-global transition and then found every graph, including unrelated Direct Files graphs, trapped behind the same startup recovery UI. The root cause was duplicate authority: native managed open, a frontend attempt token, prefix-routed progress, and a frontend inactivity watchdog could each decide the transition. One native per-window/per-root supervisor now owns typed operation IDs, priority, and terminal outcomes; the frontend only renders them, and elapsed time cannot invent native.unavailable. Emergency return atomically selects Direct from the native-selected root without opening, draining, repairing, or archiving managed state, while stale managed workers are barred from later publication. The exact Linux real-app proof at commit 85b31dfe copied the 1,046-file anonymized graph, activated managed storage, edited and verified Markdown, waited 10 seconds, SIGKILLed Tine, requested Direct Files during the recovering managed open, verified Direct mode, made and projected a Direct edit, cleanly restarted, and verified the edit and Direct mode again. A second exact journey proved recovery followed by graceful drain/return and Direct restart; the two-device journey proved join, bidirectional edits, and byte-preserved provider evidence after emergency Direct return."
+    },
+    {
+      "id": "REG-WATCH-MIDEDIT-DEFERRED-RELOAD-337",
+      "title": "An external change to a page whose block is being edited (or mid block-move, or under an editor lease) is deferred and replayed when the blocking state clears, not silently dropped",
+      "family": "external-change-freshness",
+      "sources": {
+        "issues": [
+          337
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/App.test.tsx::deferred replay of externally changed pages skipped mid-edit"
+        ],
+        "scenario": "watch.mid-edit-deferred-replay",
+        "failBefore": "proven"
+      },
+      "notes": "reloadDisposition's \"skip\" (block edit / block move) and mayReplaceInstance's lease refusal correctly declined the reload but the watcher event was then dropped: backend cache fresh, visible page stale indefinitely. The declined GraphChange is now recorded and re-dispatched through handleGraphChange when onPageBecameReplaceable fires, so the disposition is re-evaluated at replay time (a page that became dirty meanwhile takes the applyDivergenceVerdict path). Fail-before: all three App.test.tsx cases fail on pre-fix code with the page stuck at its stale content. Concord P1 freshness lane."
     }
   ]
 }

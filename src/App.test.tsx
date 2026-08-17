@@ -7,7 +7,18 @@ import {
   installMobileExternalLinkHandler,
 } from "./App";
 import { resetPaneLayoutToSingle, restorePaneLayout } from "./panes";
-import { pageByName, reloadPage, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "./store";
+import {
+  doc,
+  pageByName,
+  reloadPage,
+  resetStore,
+  setBlockMoving,
+  setDoc,
+  takeEditorLease,
+  type FeedPage,
+  type Node as StoreNode,
+} from "./store";
+import { endEdit, startEditing } from "./editorController";
 import { clearConflict, isConflicted, pageInventoryRev } from "./ui";
 import { flushPage, forceSave, isDirty, markDirty, resetSaveState } from "./persistence";
 import { managedStorageRuntime } from "./managedStorageRuntime";
@@ -548,5 +559,87 @@ describe("conflict requires per-page divergence, not just a notification", () =>
       expect(calls.filter((call) => !call.force).length).toBeGreaterThanOrEqual(3)
     );
     expect(await forceSave(name)).toBe(true);
+  });
+});
+
+// Concord P1 (freshness lane): `reloadDisposition` returns "skip" while a block
+// on the changed page is being edited or a block move is in flight, and the
+// watcher event was then simply dropped — the backend cache is fresh but the
+// visible page stays stale indefinitely, because nothing replays the reload when
+// the blocking condition clears. These prove the deferred replay: the skip is
+// recorded and re-dispatched through `handleGraphChange` (so the disposition is
+// re-evaluated at replay time) once the page becomes replaceable.
+describe("deferred replay of externally changed pages skipped mid-edit", () => {
+  const name = "Externally Edited";
+
+  function loadedStalePage() {
+    resetPaneLayoutToSingle({
+      tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
+      activeIndex: 0,
+    });
+    setDoc({
+      byId: { b1: node("b1", name) },
+      pages: [page(name, "page", ["b1"])],
+      feed: [],
+      loaded: true,
+    });
+  }
+
+  function diskPage() {
+    return {
+      name,
+      kind: "page" as const,
+      title: name,
+      pre_block: null,
+      rev: "rev-2",
+      blocks: [{ id: "b1", raw: "fresh from disk", collapsed: false, children: [] }],
+    };
+  }
+
+  const visibleRaws = () => pageByName(name)?.roots.map((id) => doc.byId[id].raw);
+
+  it("replays the reload when editing on the page ends", async () => {
+    loadedStalePage();
+    startEditing("b1");
+    const getPage = vi.spyOn(backend(), "getPage").mockResolvedValue(diskPage());
+
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+
+    // Mid-edit: the reload is deferred, not applied — the caret must not be yanked.
+    expect(getPage).not.toHaveBeenCalled();
+    expect(visibleRaws()).toEqual(["loaded elsewhere"]);
+
+    endEdit("blur");
+
+    await vi.waitFor(() => expect(visibleRaws()).toEqual(["fresh from disk"]));
+  });
+
+  it("replays the reload when a block move settles", async () => {
+    loadedStalePage();
+    setBlockMoving(true);
+    vi.spyOn(backend(), "getPage").mockResolvedValue(diskPage());
+
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+    expect(visibleRaws()).toEqual(["loaded elsewhere"]);
+
+    setBlockMoving(false);
+
+    await vi.waitFor(() => expect(visibleRaws()).toEqual(["fresh from disk"]));
+  });
+
+  it("replays a reload declined by an editor lease once the lease is released", async () => {
+    loadedStalePage();
+    const release = takeEditorLease(name);
+    vi.spyOn(backend(), "getPage").mockResolvedValue(diskPage());
+
+    // The disposition is "reload" (a lease is not "skip"), so the handler fetches
+    // the DTO — but `reloadPageIfStillSafe` refuses to replace the instance while
+    // the lease holds uncommitted input. Same hole, different guard.
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+    expect(visibleRaws()).toEqual(["loaded elsewhere"]);
+
+    release();
+
+    await vi.waitFor(() => expect(visibleRaws()).toEqual(["fresh from disk"]));
   });
 });
