@@ -673,6 +673,10 @@ export interface BlockView {
   child_count: number;
 }
 
+/** How a row relates to the 3-way BASE (the Concord ledger's last-agreed text).
+ *  Only present on 3-way diffs. */
+export type Diff3Verdict = "mine-only" | "theirs-only" | "both-changed";
+
 /** One aligned position in the two block trees. `id` is a stable path ("2.1")
  *  that the resolve step reproduces, so a decision maps back to the same block. */
 export interface DiffRow {
@@ -681,6 +685,11 @@ export interface DiffRow {
   mine: BlockView | null;
   theirs: BlockView | null;
   children: DiffRow[];
+  /** 3-way classification against the base (absent on 2-way diffs). */
+  verdict?: Diff3Verdict | null;
+  /** Pre-selected decision the base justifies ("mine"/"theirs"); the modal only
+   *  pre-selects it — nothing applies without the user's confirm. */
+  suggestion?: "mine" | "theirs" | null;
 }
 
 /** The full block-level diff of a conflict copy against its winner. */
@@ -692,6 +701,8 @@ export interface SyncConflictDiff {
   theirs_pre: string | null;
   pre_differs: boolean;
   blocks_identical: boolean;
+  /** True when rows carry 3-way verdicts computed against a real base. */
+  three_way?: boolean;
 }
 
 /** A user's per-row merge decision. */

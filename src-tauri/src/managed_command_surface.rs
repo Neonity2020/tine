@@ -230,6 +230,8 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("stream_asset_path", Filesystem),
     ("sync_conflict_diff", Filesystem),
     ("take_data_home_fallback_notice", NoGraphSlot),
+    ("text_block_diff", NoGraphSlot),
+    ("text_block_diff3", NoGraphSlot),
     ("take_identifier_migration_notice", NoGraphSlot),
     ("tine_open_devtools", NoGraphSlot),
     ("tine_quit", NoGraphSlot),

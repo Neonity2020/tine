@@ -451,6 +451,17 @@ export interface Backend {
   /** Block-level diff of a conflict copy against its winner (graph-root-relative
    *  paths). Read-only; null if a path is invalid or the file is gone. */
   syncConflictDiff(winner: string, conflict: string): Promise<SyncConflictDiff | null>;
+  /** Path-free block-level 2-way diff of two raw page texts (Concord P3 seam —
+   *  no graph or path coupling; future in-page conflict UI builds on it). */
+  textBlockDiff(mine: string, theirs: string, format?: "md" | "org"): Promise<SyncConflictDiff>;
+  /** Path-free 3-way variant: rows are classified against `base` and carry
+   *  pre-selectable suggestions (ADR 0056). */
+  textBlockDiff3(
+    base: string,
+    mine: string,
+    theirs: string,
+    format?: "md" | "org"
+  ): Promise<SyncConflictDiff>;
   /** Merge a conflict copy into its winner per the user's per-row decisions
    *  (row id → mine/theirs/both), via the normal save path, then trash the copy.
    *  `baseRev` guards against the winner changing under the merge (throws
@@ -1191,6 +1202,12 @@ class TauriBackend implements Backend {
   }
   syncConflictDiff(winner: string, conflict: string) {
     return this.call<SyncConflictDiff | null>("sync_conflict_diff", { winner, conflict });
+  }
+  textBlockDiff(mine: string, theirs: string, format?: "md" | "org") {
+    return this.call<SyncConflictDiff>("text_block_diff", { mine, theirs, format });
+  }
+  textBlockDiff3(base: string, mine: string, theirs: string, format?: "md" | "org") {
+    return this.call<SyncConflictDiff>("text_block_diff3", { base, mine, theirs, format });
   }
   resolveSyncConflict(
     winner: string,
