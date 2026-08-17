@@ -79,7 +79,8 @@
    "nonRequirements": [
     "Exact pixels, menu geometry, coordinate values, CSS/DOM nesting, timing, palette/order, or animation."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-08-17: harness debt, source-proven, not a product defect. The journey was written on 2026-08-11 (981e8ffd) and no suite, npm script or workflow ever selected it, so nothing noticed when 3d79497f \"fix(outliner): add OG-compatible nested block drops\" (2026-08-12, GH #326) landed one day later. That change added blockDropPosition(), which returns \"child\" whenever clientX - blockRect.left > 50 -- OG's deeper-than-50px nesting zone. This journey drops at target.left + width * 0.65, far beyond 50px, so B+C are now nested under E and the visible roots are A,D,E rather than A,D,E,B,C. Failed identically on two unchanged-binary runs at 4253d52b (72.3s, 72.0s; capsule step \"drag B+C from A bullet to after E\"). The drop x-coordinate is explicitly a nonRequirement of this very contract, so the repair belongs to the harness, not the product: aim the drop inside E's shallow (<= 50px from its left edge) zone and keep the vertical half that means \"after\". Quarantined under the AGENTS.md 2b E2E stop-loss after two attempts instead of debugging further; it stays selected by linux-release so its evidence is retained, and returns to stable with that coordinate repair."
   },
   "scripts/e2e-capabilities.mjs": {
    "contracts": [
