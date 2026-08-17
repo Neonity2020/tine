@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **The file watcher now keeps always-on latency receipts for external-change batches.** Each batch that surfaces a change (or an error scheduling a retry) records how long it spent between the OS callback, the post-debounce reconcile, and the `graph-changed` events reaching the UI, logs one structured line, and lands in a small in-memory ring the new `watcher_latency_recent` debug command returns — so slow-external-change reports (GH #337's 5–20 s) can be diagnosed from the reporter's machine instead of guessed at. Works in both inotify and poll watch modes.
+
 - **Managed-storage activation no longer rejects a complete graph because Direct Files or the startup path catalog retained a different one-page inventory.** Readiness is now proved inside the candidate managed generation by opening its transactionally complete, exact-frontier-stamped SQLite inventory and a real page; the candidate remains unpublished until that proof succeeds.
 
 ### Changed
@@ -28,6 +32,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Managed-storage path names now come from `tine-storage`'s certified format manifest.** Tine core retains only a definition-free compatibility import, so releases pin one complete, machine-readable layout vocabulary without changing any persisted path.
 
 ### Fixed
+
+- **An external change to a page you are editing is no longer silently dropped.** The watcher correctly declines to yank the caret mid-edit, but the declined reload used to be forgotten: the page stayed stale until some unrelated event touched it again. Tine now records the skipped reload and replays it the moment the blocking state clears — editing ends, a block move settles, or a title rename/IME composition finishes — re-checking at that moment whether the page has meanwhile gained unsaved edits, in which case the normal conflict protocol takes over instead of a reload. (Part of GH #337.)
 
 - **The first cross-page subtree move after managed-storage activation no longer stalls forever in projection recovery.** Clean managed storage now reconstructs each accepted CRDT tail on its immutable activation baseline, rather than trying to import a baseline-dependent update into an empty document. The durable move therefore reaches SQLite and Markdown exactly once and remains recoverable after an immediate stop.
 
