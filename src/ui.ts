@@ -381,6 +381,24 @@ export function resetConflictCursor(): void {
   conflictCursor = 0;
 }
 
+/** Re-derive the queue when an external change touched a page that is IN it.
+ *
+ *  The watcher's `conflicts-changed` event fires for conflict-copy files only,
+ *  so a merge finished outside Tine (git resolving the markers) would otherwise
+ *  leave a resolved page sitting in the queue until the next graph load. Gated
+ *  on the queue being non-empty and actually touched, so the ordinary case —
+ *  no conflicts — costs one length check per external change. */
+export async function refreshConflictQueueIfTouched(
+  changes: { name: string; kind: PageKind }[]
+): Promise<void> {
+  const queue = conflictQueue();
+  if (!queue.length) return;
+  const touched = changes.some((c) =>
+    queue.some((q) => q.page_name === c.name && q.kind === c.kind)
+  );
+  if (touched) await refreshSyncConflicts();
+}
+
 /** Re-fetch the sync-conflict + VCS-marker lists; with `notify`, toast if any exist. */
 export async function refreshSyncConflicts(notify = false): Promise<void> {
   try {

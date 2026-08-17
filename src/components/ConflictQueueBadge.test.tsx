@@ -5,6 +5,7 @@ import { __setBackendForTest, type Backend } from "../backend";
 import {
   advanceConflictCursor,
   conflictQueue,
+  refreshConflictQueueIfTouched,
   refreshSyncConflicts,
   resetConflictCursor,
   setConflictQueue,
@@ -93,6 +94,32 @@ describe("the conflict queue badge", () => {
       }),
     } as unknown as Backend);
     await refreshSyncConflicts();
+    expect(conflictQueue()).toEqual([]);
+  });
+});
+
+describe("the queue after an external change", () => {
+  it("re-derives only when the change touched something queued", async () => {
+    const conflictQueueFn = vi.fn(async () => [] as ConflictObject[]);
+    __setBackendForTest({
+      listSyncConflicts: async () => [],
+      listVcsMarkerConflicts: async () => [],
+      conflictQueue: conflictQueueFn,
+    } as unknown as Backend);
+
+    // Empty queue: an external change must cost nothing at all.
+    await refreshConflictQueueIfTouched([{ name: "Anything", kind: "page" }]);
+    expect(conflictQueueFn).not.toHaveBeenCalled();
+
+    // Queued but untouched: still nothing.
+    setConflictQueue([object("markers:a", "Alpha")]);
+    await refreshConflictQueueIfTouched([{ name: "Beta", kind: "page" }]);
+    expect(conflictQueueFn).not.toHaveBeenCalled();
+
+    // Touched — e.g. git finished the merge outside Tine — so the queue is
+    // re-derived and the resolved page drops out of it.
+    await refreshConflictQueueIfTouched([{ name: "Alpha", kind: "page" }]);
+    expect(conflictQueueFn).toHaveBeenCalledTimes(1);
     expect(conflictQueue()).toEqual([]);
   });
 });
