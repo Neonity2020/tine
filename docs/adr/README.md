@@ -83,3 +83,4 @@ see the project `CLAUDE.md`.
 | [0054](0054-lazy-genesis-managed-activation.md) | Managed activation imports one lazy genesis and derives disposable projections once | Accepted — implementation gated |
 | [0055](0055-native-storage-mode-supervisor.md) | One native supervisor owns storage-mode transitions and an always-available emergency Direct Files escape | Accepted — implementation in progress |
 | [0056](0056-concord-base-ledger-and-three-way.md) | Concord base ledger enables block-level 3-way conflict suggestions | Accepted |
+| [0057](0057-concord-conflict-objects-and-in-page-resolution.md) | A conflict is a derived, multi-sided object resolved in the page; markers are parsed, never invented | Accepted |

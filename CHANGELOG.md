@@ -10,6 +10,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Conflicts are now one calm queue you resolve inside the page.** Everything
+  that needs your judgement — a Syncthing/Dropbox/Seafile conflict copy, or a
+  page carrying unresolved git/Fossil merge markers — appears in a single
+  `N conflicts` badge at the bottom of the sidebar, and clicking it walks you to
+  the next conflicted page. Nothing about a conflict is written into your graph:
+  the queue is recomputed from what is on disk, so it costs no storage, cannot go
+  stale, and survives restarts by construction. Opening a conflicted page shows
+  the two (or three) versions block by block, above the outline, named by
+  whatever produced them (a git ref, a device tag), with per-block keep-this /
+  keep-that / **keep both**, `N conflicts ↑↓` to walk between them, and a
+  suggested resolution pre-selected wherever a common ancestor answers the
+  question. Keep-both writes the two versions as adjacent sibling blocks —
+  ordinary outline Markdown. Nothing applies until you click *Apply resolution*,
+  and leaving a page with work outstanding gets a one-line note, never a blocking
+  dialog. (ADR 0057; Concord P4, part of GH #337; see docs/concord.md →
+  "Resolving conflicts".)
+
+- **git and Fossil merge conflicts can now be finished in Tine.** A page whose
+  file carries `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` markers is still
+  quarantined from ordinary saves — Tine never mangles a conflicted file — but
+  its marker sections are now parsed into complete page versions and reviewed
+  with the same block-level machinery as a sync conflict copy. `diff3`-style and
+  Fossil markers carry their own common ancestor, so most blocks arrive already
+  decided; applying writes the merged page with no markers at all, which lifts
+  the save quarantine by itself. It is the one circumstance in which Tine writes
+  a marker-bearing file, and only as the direct result of the resolution you
+  just confirmed. (Concord L5 completion.)
+
 - **Bulk external revisions — a `git checkout`, `fossil update`, branch switch, or big sync — are now handled as one calm epoch.** When one burst of external file changes touches more than 32 pages, the watcher reconciles it in a single pass against a consistent snapshot and tells the interface once (`graph-changed-bulk`) instead of once per page: one derived-view invalidation, visible pages refreshed through the existing safety checks (a page being edited defers its reload exactly like a single change), everything else reloaded lazily on navigation, and a single summary toast — "N pages updated externally", with a conflict count if any changed pages had genuinely diverged unsaved edits. Previously every page cost its own event, dataRev bump, and page fetch, and nothing summarized the revision. Small changes are untouched: at or below 32 pages, per-file behavior is byte-identical to before. (Concord P2, part of GH #337; see docs/concord.md → "External revisions".)
 
 - **Sync-conflict merges now come with per-block suggestions.** Tine keeps a
