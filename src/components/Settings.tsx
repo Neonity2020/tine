@@ -2135,7 +2135,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     | "confirming"
     | "listening"
     | "activating"
-    | "rebinding"
+    | "retiring_renderer"
+    | "managed_inventory"
+    | "managed_page"
   >("idle");
   const [enableStartedAt, setEnableStartedAt] = createSignal<number | null>(null);
   const [activationUpdatedAt, setActivationUpdatedAt] = createSignal<number | null>(null);
@@ -2173,7 +2175,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         confirming: "Waiting for confirmation…",
         listening: "Preparing progress reporting…",
         activating: "Opening or building managed storage…",
-        rebinding: "Verifying the managed page view…",
+        retiring_renderer: "Retiring the previous page view…",
+        managed_inventory: "Reading the managed page inventory…",
+        managed_page: "Opening a representative managed page…",
       }[stage];
     } else if (progress.kind === "bootstrap_detached_authoring") {
       label = `Building operation history (${progress.completed} of ${progress.total} parts)…`;
@@ -2248,16 +2252,21 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   onMount(() => void refresh());
 
   const refreshAuthorityState = async () => {
+    noteEnableStage("retiring_renderer");
     rebindCurrentStorageAuthority();
 
     // Native activation already proves completeness against the authenticated
     // accepted frontier. The frontend must prove only that its newly leased
     // managed generation can use that surface; comparing a Direct Files list
     // from the retired generation would recreate the race this boundary avoids.
+    noteEnableStage("managed_inventory");
     const pages = await backend().listPages();
     const representative = pages[0];
-    if (representative && !(await backend().getPageByPath(representative.path))) {
-      throw new Error("managed storage rebound but could not open a page from its inventory");
+    if (representative) {
+      noteEnableStage("managed_page");
+      if (!(await backend().getPageByPath(representative.path))) {
+        throw new Error("managed storage rebound but could not open a page from its inventory");
+      }
     }
   };
 
@@ -2368,7 +2377,6 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       const result = await backend().activateSparseV2();
       dbg(`managed storage setup: native activation returned (${result.state})`);
       if (result.state === "active") {
-        noteEnableStage("rebinding");
         await refreshAuthorityState();
         if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         pushToast("Tine-managed storage is active.", "success");
