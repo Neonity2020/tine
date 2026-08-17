@@ -446,9 +446,13 @@ async function clickButtonAndConfirm(text, label) {
   if (text === "to Direct Files") {
     const recoveryAction = await browser.$(".startup-recovery-actions button.danger");
     await recoveryAction.waitForClickable({ timeout: 15_000 });
-    const before = new Set(windowIds(".*"));
+    // The startup-recovery escape invokes the native cold return immediately and
+    // deliberately shows no confirmation: a native modal can be starved behind
+    // the very managed open this path abandons, which would trap the user
+    // (src/startupRecovery.ts, `returnToDirectFiles`). The leg's own assertions
+    // below — the source page, retained provider evidence, a writable Markdown
+    // save — are what prove the escape happened.
     await recoveryAction.click();
-    await acceptNativeConfirmation(label, before);
     return;
   }
   await waitFor(() => buttonContaining(text), 15_000, `${text} action was not visible`);
