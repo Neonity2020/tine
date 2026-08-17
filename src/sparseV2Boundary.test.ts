@@ -8,7 +8,7 @@ describe("Tine-managed storage app boundary", () => {
   const app = readFileSync("src/App.tsx", "utf8");
   const native = readFileSync("src-tauri/src/lib.rs", "utf8");
 
-  it("is explicit-only and refreshes the graph binding after setup", () => {
+  it("is explicit-only and reacts once to the native terminal receipt", () => {
     expect(settings).toContain("Enable Tine-managed storage for this graph?");
     expect(backend).toMatch(
       /activateSparseV2\(\)[\s\S]*activate_sparse_v2[\s\S]*this\.bindingGeneration = result\.binding_generation/
@@ -18,7 +18,12 @@ describe("Tine-managed storage app boundary", () => {
     );
     expect(settings).not.toContain("captureAuthorityReadiness");
     expect(settings).not.toContain("expectedPages");
-    expect(settings).toContain("no new phase for");
+    expect(settings).not.toContain("refreshAuthorityState");
+    expect(settings).not.toContain("getPageByPath(representative.path)");
+    expect(settings).not.toContain("enableStage");
+    expect(settings).not.toContain("no new phase for");
+    expect(settings).toContain("storageTransitionRuntime.active()");
+    expect(settings).toContain("managedStorageRuntime.acceptNativeTransition(result)");
     expect(settings).toContain("retained_runtime_projection_repair");
   });
 

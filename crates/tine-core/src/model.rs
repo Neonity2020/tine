@@ -1357,6 +1357,16 @@ struct GraphTextIdentityMutationGuard<'a> {
     gate: &'a ManagedTextWriteGate,
 }
 
+/// Holds the graph-text mutation authority across a storage-mode publication.
+///
+/// Callers cannot manufacture this guard.  `Graph` returns it only after the
+/// complete Direct Files identity generation still matches the candidate's
+/// captured source generation.  Keeping it alive closes the final race between
+/// that comparison and publishing a successor storage authority.
+pub struct GraphTextIdentityPublicationGuard<'a> {
+    _identity: GraphTextIdentityMutationGuard<'a>,
+}
+
 #[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
 impl ManagedTextWriteGate {
     fn new() -> Self {
@@ -6708,6 +6718,22 @@ impl Graph {
             generation: state.generation,
             last_build: state.last_build,
         }
+    }
+
+    /// Acquire graph-text mutation authority iff `expected_generation` is
+    /// still current.  The returned guard must remain alive until the storage
+    /// selector and in-process graph slot have both been published.
+    pub fn lock_graph_text_identity_publication(
+        &self,
+        expected_generation: u64,
+    ) -> io::Result<Option<GraphTextIdentityPublicationGuard<'_>>> {
+        let identity = self.lock_graph_text_identity_mutation()?;
+        if self.guarded_graph_text_identity_report().generation != expected_generation {
+            return Ok(None);
+        }
+        Ok(Some(GraphTextIdentityPublicationGuard {
+            _identity: identity,
+        }))
     }
 
     #[cfg(test)]

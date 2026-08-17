@@ -472,7 +472,28 @@ pub(crate) struct StorageTransitionGuard<'a> {
     terminal: bool,
 }
 
-impl StorageTransitionGuard<'_> {
+/// The post-publication half of a serving transition.  It deliberately has no
+/// publication method: once a prepared successor has been linearized, a
+/// second registry/selector publication is unrepresentable through this API.
+pub(crate) struct PublishedStorageTransitionGuard<'a> {
+    supervisor: &'a StorageModeSupervisor,
+    app: &'a tauri::AppHandle,
+    operation_id: StorageOperationId,
+    terminal: bool,
+}
+
+/// Recovery-to-Direct has a different protocol: it may temporarily withdraw
+/// a stopped managed actor while archiving it, then publish Direct Files.  Keep
+/// that explicitly separate so its multi-step escape machinery cannot be used
+/// by ActivateManaged or JoinManaged.
+pub(crate) struct StorageRecoveryTransitionGuard<'a> {
+    supervisor: &'a StorageModeSupervisor,
+    app: &'a tauri::AppHandle,
+    operation_id: StorageOperationId,
+    terminal: bool,
+}
+
+impl<'a> StorageTransitionGuard<'a> {
     pub(crate) fn advance(&self, phase: StorageTransitionPhase) -> Result<(), String> {
         self.supervisor
             .advance_transition(self.app, self.operation_id, phase)
@@ -482,7 +503,99 @@ impl StorageTransitionGuard<'_> {
         self.supervisor.operation_is_current(self.operation_id)
     }
 
-    pub(crate) fn commit<T>(
+    pub(crate) fn publish<T>(
+        mut self,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<(PublishedStorageTransitionGuard<'a>, T), String> {
+        let value = self
+            .supervisor
+            .commit_if_current(self.operation_id, publish)?;
+        self.terminal = true;
+        Ok((
+            PublishedStorageTransitionGuard {
+                supervisor: self.supervisor,
+                app: self.app,
+                operation_id: self.operation_id,
+                terminal: false,
+            },
+            value,
+        ))
+    }
+
+    pub(crate) fn succeed(mut self, mode: StableStorageMode) -> Result<(), String> {
+        self.supervisor.finish_transition(
+            self.app,
+            self.operation_id,
+            StorageTransitionOutcome::Succeeded,
+            Some(mode),
+            None,
+        )?;
+        self.terminal = true;
+        Ok(())
+    }
+
+    pub(crate) fn fail(mut self, code: impl Into<String>) {
+        let _ = self.supervisor.finish_transition(
+            self.app,
+            self.operation_id,
+            StorageTransitionOutcome::Failed,
+            None,
+            Some(code.into()),
+        );
+        self.terminal = true;
+    }
+}
+
+impl PublishedStorageTransitionGuard<'_> {
+    pub(crate) fn succeed(mut self, mode: StableStorageMode) -> Result<(), String> {
+        self.supervisor.finish_transition(
+            self.app,
+            self.operation_id,
+            StorageTransitionOutcome::Succeeded,
+            Some(mode),
+            None,
+        )?;
+        self.terminal = true;
+        Ok(())
+    }
+
+    pub(crate) fn fail(mut self, code: impl Into<String>) {
+        let _ = self.supervisor.finish_transition(
+            self.app,
+            self.operation_id,
+            StorageTransitionOutcome::Failed,
+            None,
+            Some(code.into()),
+        );
+        self.terminal = true;
+    }
+}
+
+impl Drop for PublishedStorageTransitionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.terminal {
+            let _ = self.supervisor.finish_transition(
+                self.app,
+                self.operation_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("published_operation_abandoned".into()),
+            );
+        }
+    }
+}
+
+impl StorageRecoveryTransitionGuard<'_> {
+    pub(crate) fn advance(&self, phase: StorageTransitionPhase) -> Result<(), String> {
+        self.supervisor
+            .advance_transition(self.app, self.operation_id, phase)
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.supervisor.operation_is_current(self.operation_id)
+    }
+
+    pub(crate) fn commit_recovery_step<T>(
         &self,
         publish: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
@@ -511,6 +624,20 @@ impl StorageTransitionGuard<'_> {
             Some(code.into()),
         );
         self.terminal = true;
+    }
+}
+
+impl Drop for StorageRecoveryTransitionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.terminal {
+            let _ = self.supervisor.finish_transition(
+                self.app,
+                self.operation_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("recovery_operation_abandoned".into()),
+            );
+        }
     }
 }
 
@@ -548,8 +675,37 @@ impl StorageModeSupervisor {
         canonical_root: PathBuf,
         kind: StorageTransitionKind,
     ) -> Result<StorageTransitionGuard<'a>, String> {
+        if !matches!(
+            kind,
+            StorageTransitionKind::ActivateManaged | StorageTransitionKind::JoinManaged
+        ) {
+            return Err(
+                "serving transition guard is limited to managed activation and join".into(),
+            );
+        }
         let operation_id = self.begin_transition(app, window, Some(canonical_root), kind)?;
         Ok(StorageTransitionGuard {
+            supervisor: self,
+            app,
+            operation_id,
+            terminal: false,
+        })
+    }
+
+    pub(crate) fn begin_recovery_guard<'a>(
+        &'a self,
+        app: &'a tauri::AppHandle,
+        window: &str,
+        canonical_root: PathBuf,
+        kind: StorageTransitionKind,
+    ) -> Result<StorageRecoveryTransitionGuard<'a>, String> {
+        if !matches!(kind, StorageTransitionKind::ReturnGracefully) {
+            return Err(
+                "recovery transition guard is limited to graceful Direct Files return".into(),
+            );
+        }
+        let operation_id = self.begin_transition(app, window, Some(canonical_root), kind)?;
+        Ok(StorageRecoveryTransitionGuard {
             supervisor: self,
             app,
             operation_id,
@@ -730,6 +886,18 @@ impl StorageModeSupervisor {
                 return Err("storage transition was superseded before publication".into());
             }
         }
+        publish()
+    }
+
+    /// Short same-mode recovery publication. The caller must perform an exact
+    /// registry generation comparison inside `publish`; this API cannot change
+    /// a storage selector and is intentionally unavailable through the managed
+    /// activation/join guard.
+    pub(crate) fn publish_managed_maintenance<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _publication = self.publication.lock().unwrap();
         publish()
     }
 
@@ -1115,6 +1283,30 @@ mod tests {
     }
 
     #[test]
+    fn serving_transition_publication_is_move_only_and_has_no_second_publish_api() {
+        let source = include_str!("storage_mode_supervisor.rs");
+        let prepared_start = source
+            .find("impl<'a> StorageTransitionGuard<'a>")
+            .expect("prepared transition implementation");
+        let published_start = source[prepared_start..]
+            .find("impl PublishedStorageTransitionGuard")
+            .map(|offset| prepared_start + offset)
+            .expect("published transition implementation");
+        let prepared = &source[prepared_start..published_start];
+        assert!(prepared.contains("pub(crate) fn publish<T>(\n        mut self,"));
+        assert_eq!(prepared.matches("commit_if_current").count(), 1);
+        assert!(!prepared.contains("pub(crate) fn commit"));
+
+        let published_end = source[published_start..]
+            .find("impl Drop for PublishedStorageTransitionGuard")
+            .map(|offset| published_start + offset)
+            .expect("published transition drop implementation");
+        let published = &source[published_start..published_end];
+        assert!(!published.contains("fn publish"));
+        assert!(!published.contains("commit_if_current"));
+    }
+
+    #[test]
     fn native_selected_root_is_the_only_emergency_return_target() {
         let mut model = StorageSupervisorModel::default();
         let first = PathBuf::from("/first");
@@ -1186,10 +1378,12 @@ mod tests {
         let contract = include_str!("../../docs/storage-sync-contract.md");
         for required in [
             "`StorageModeSupervisor`",
+            "move-only publication guard",
             "graceful return drains a healthy",
             "emergency return is always available",
             "Settings action is always graceful",
             "inactivity timers are not storage authority",
+            "does not grant renderer work actor-lane priority",
         ] {
             assert!(
                 contract.contains(required),

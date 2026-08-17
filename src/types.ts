@@ -520,7 +520,8 @@ export type SparseV2ActivationProgress =
   | { kind: "phase"; phase: SparseV2ActivationPhase }
   | { kind: "bootstrap_preparation_subphase"; subphase: SparseV2BootstrapPreparationSubphase }
   | { kind: "bootstrap_detached_authoring"; completed: number; total: number }
-  | { kind: "bootstrap_preparation_summary"; summary: SparseV2BootstrapPreparationSummary };
+  | { kind: "bootstrap_preparation_summary"; summary: SparseV2BootstrapPreparationSummary }
+  | { kind: "readiness_sample"; largest_page_path: string | null };
 
 export interface SparseV2ActivationProgressEvent {
   binding_generation: number;

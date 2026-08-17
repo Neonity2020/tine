@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { Settings } from "./Settings";
-import { closeSettings, dismissToast, openSettings, setGraphMeta, setToasts, toasts } from "../ui";
+import { closeSettings, dismissToast, openSettings, setGraphMeta, setGraphTransitioning, setToasts, toasts } from "../ui";
 import { backend } from "../backend";
 import { managedStorageRuntime } from "../managedStorageRuntime";
+import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import * as store from "../store";
 import type { SparseV2ActivationProgress, SparseV2Status } from "../types";
 import { formatJournal, parseJournalWith } from "../journal";
@@ -30,6 +31,8 @@ afterEach(() => {
   localStorage.clear();
   setToasts([]);
   managedStorageRuntime.clear();
+  storageTransitionRuntime.clear();
+  setGraphTransitioning(false);
   setGraphMeta(null);
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -177,7 +180,7 @@ describe("Settings storage transitions", () => {
     dispose();
   });
 
-  it("flushes before setup, offers retry, and invalidates stale pages", async () => {
+  it("flushes before setup and leaves the serving Direct renderer intact on candidate failure", async () => {
     const calls: string[] = [];
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
@@ -203,7 +206,7 @@ describe("Settings storage transitions", () => {
     await tick();
 
     expect(calls).toEqual(["flush", "activate"]);
-    expect(reset).toHaveBeenCalled();
+    expect(reset).not.toHaveBeenCalled();
     expect(toasts().at(-1)).toMatchObject({
       message: "Tine-managed storage setup did not complete: projection proof paused on the exact test cut",
       kind: "error",
@@ -215,58 +218,30 @@ describe("Settings storage transitions", () => {
     dispose();
   });
 
-  it("does not report active until the rebound generation can list and open its pages", async () => {
-    const page = {
-      name: "Readable",
-      kind: "page" as const,
-      date_key: null,
-      path: "pages/readable.md",
-    };
-    let releaseInventory!: (pages: typeof page[]) => void;
-    const reboundInventory = new Promise<typeof page[]>((resolve) => {
-      releaseInventory = resolve;
-    });
+  it("accepts the native readiness receipt without a second frontend page probe", async () => {
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
     vi.spyOn(store, "flushAll").mockResolvedValue(true);
-    const order: string[] = [];
-    const listPages = vi.spyOn(backend(), "listPages").mockImplementation(() => {
-      order.push("managed-list");
-      return reboundInventory;
-    });
-    const loadPage = vi.spyOn(backend(), "getPageByPath").mockResolvedValue({
-      name: page.name,
-      kind: page.kind,
-      title: page.name,
-      path: page.path,
-      rev: "managed-r1",
-      pre_block: null,
-      blocks: [],
-    });
-    vi.spyOn(backend(), "activateSparseV2").mockImplementation(async () => {
-      order.push("activate");
-      return localActive();
-    });
+    vi.spyOn(backend(), "listPages");
+    const loadPage = vi.spyOn(backend(), "getPageByPath");
+    vi.spyOn(backend(), "activateSparseV2").mockResolvedValue(localActive());
 
     const root = document.createElement("div");
     document.body.append(root);
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
+    loadPage.mockClear();
     const enable = [...root.querySelectorAll("button")].find((button) =>
       button.textContent?.includes("Enable Tine-managed storage")
     ) as HTMLButtonElement;
     enable.click();
-    await vi.waitFor(() => expect(listPages.mock.calls.length).toBeGreaterThanOrEqual(1));
-    expect(order[0]).toBe("activate");
-    expect(order.slice(1).every((entry) => entry === "managed-list")).toBe(true);
-    expect(toasts().some((toast) => toast.message === "Tine-managed storage is active.")).toBe(false);
-
-    releaseInventory([page]);
-    await vi.waitFor(() => expect(loadPage).toHaveBeenCalledWith(page.path));
     await vi.waitFor(() => expect(toasts().at(-1)).toMatchObject({
       message: "Tine-managed storage is active.",
       kind: "success",
     }));
+    // Renderer rebinding may refresh ordinary page-derived resources, but it
+    // must not run the former representative-page readiness proof.
+    expect(loadPage).not.toHaveBeenCalled();
     dispose();
   });
 
@@ -508,9 +483,18 @@ describe("Settings storage transitions", () => {
         return () => calls.push(`unlisten-${generation}`);
       }
     );
+    let activationOperation = 100;
     vi.spyOn(backend(), "activateSparseV2").mockImplementation(
       () => new Promise<SparseV2Status>((resolve) => {
         calls.push("activate");
+        storageTransitionRuntime.receive({
+          operationId: activationOperation,
+          window: "main",
+          kind: "activate_managed",
+          phase: "activating_managed",
+          elapsedMs: 0,
+          terminal: false,
+        });
         resolvers.push(resolve);
       })
     );
@@ -544,6 +528,15 @@ describe("Settings storage transitions", () => {
     await tick();
     expect(root.textContent).toContain("Opening retained managed state");
 
+    storageTransitionRuntime.receive({
+      operationId: activationOperation,
+      window: "main",
+      kind: "activate_managed",
+      phase: "activating_managed",
+      elapsedMs: 12,
+      terminal: true,
+      outcome: "failed",
+    });
     resolvers[0](localRetryable());
     await tick();
     await tick();
@@ -554,6 +547,7 @@ describe("Settings storage transitions", () => {
       (button) => button.textContent === "Retry setup"
     ) as HTMLButtonElement;
     retry.click();
+    activationOperation += 1;
     await tick();
     await tick();
     expect(calls.slice(-2)).toEqual(["listen-11", "activate"]);
@@ -562,6 +556,15 @@ describe("Settings storage transitions", () => {
     progress = root.querySelector(".settings-activation-progress progress") as HTMLProgressElement;
     expect(root.textContent).toContain("Sealing prepared history");
     expect(progress.hasAttribute("value")).toBe(false);
+    storageTransitionRuntime.receive({
+      operationId: activationOperation,
+      window: "main",
+      kind: "activate_managed",
+      phase: "activating_managed",
+      elapsedMs: 9,
+      terminal: true,
+      outcome: "succeeded",
+    });
     resolvers[1](localActive());
     await tick();
     await tick();

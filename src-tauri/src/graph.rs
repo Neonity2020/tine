@@ -759,7 +759,7 @@ pub(crate) fn load_graph_for_label(
             root_key.clone(),
             meta.clone(),
         ));
-        crate::sync_runtime::prove_managed_application_ready(&slot).map_err(|error| {
+        crate::sync_runtime::prove_managed_application_ready(&slot, None).map_err(|error| {
             let _ = state.storage_supervisor.finish_transition(
                 app,
                 managed_id,
@@ -1521,7 +1521,7 @@ mod tests {
             .expect("graph load function");
         let managed = &source[start..];
         let readiness = managed
-            .find("prove_managed_application_ready(&slot)")
+            .find("prove_managed_application_ready(&slot, None)")
             .expect("managed page readiness proof");
         let publication = managed
             .find("commit_if_current(managed_id")

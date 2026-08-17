@@ -3842,6 +3842,10 @@ pub(crate) struct CleanActivationInstrumentation {
     pub(crate) parser_nodes: u64,
     pub(crate) activation_record_bytes: u64,
     pub(crate) activation_records_spilled: bool,
+    /// Largest source page observed while deriving the canonical activation
+    /// inventory.  This is retained so the application readiness proof can
+    /// exercise a worst-shaped page without walking the source tree again.
+    pub(crate) largest_source_path: Option<String>,
     pub(crate) identity_scan_micros: u64,
     pub(crate) activation_record_micros: u64,
     pub(crate) candidate_fanout_micros: u64,
@@ -4021,7 +4025,7 @@ fn build_clean_activation_candidates(
 fn derive_clean_activation_import_id(
     capture: &BootstrapSourceCapture,
     workspace_id: WorkspaceId,
-) -> Result<ImportId, BootstrapStreamingImportError> {
+) -> Result<(ImportId, Option<String>), BootstrapStreamingImportError> {
     let source_count = usize::try_from(capture.source_file_count()).map_err(|_| {
         BootstrapStreamingImportError::ResourceLimit {
             resource: "source files",
@@ -4044,6 +4048,7 @@ fn derive_clean_activation_import_id(
         .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
     let mut entries = capture.entries_cursor()?;
     let mut observed = 0_usize;
+    let mut largest_source: Option<(u64, String)> = None;
     while let Some(entry) = entries.next()? {
         observed = observed.checked_add(1).ok_or_else(|| {
             BootstrapStreamingImportError::InvalidSource("source count overflow".into())
@@ -4055,15 +4060,26 @@ fn derive_clean_activation_import_id(
                 ImportInventoryState::Present(entry.description()),
             ))
             .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+        let path = entry.path().as_str().to_owned();
+        let bytes = entry.description().byte_length();
+        if largest_source
+            .as_ref()
+            .is_none_or(|(largest, largest_path)| {
+                bytes > *largest || (bytes == *largest && path < *largest_path)
+            })
+        {
+            largest_source = Some((bytes, path));
+        }
     }
     if observed != source_count {
         return Err(BootstrapStreamingImportError::InvalidSource(
             "sealed source entry count differs from its capture".into(),
         ));
     }
-    derivation
+    let import_id = derivation
         .finish()
-        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    Ok((import_id, largest_source.map(|(_, path)| path)))
 }
 
 /// Prepare the new operation-free activation episode. Source metadata is
@@ -4095,7 +4111,8 @@ pub(crate) fn prepare_clean_activation(
     record_capture_instrumentation(&mut legacy_instrumentation, capture.instrumentation());
 
     let started = Instant::now();
-    let import_id = derive_clean_activation_import_id(&capture, workspace_id)?;
+    let (import_id, largest_source_path) =
+        derive_clean_activation_import_id(&capture, workspace_id)?;
     let identity_scan_micros = elapsed_micros(started);
 
     let started = Instant::now();
@@ -4125,6 +4142,7 @@ pub(crate) fn prepare_clean_activation(
         parser_nodes: legacy_instrumentation.parser_nodes,
         activation_record_bytes: pages.encoded_bytes() as u64,
         activation_records_spilled: pages.spilled(),
+        largest_source_path,
         identity_scan_micros,
         activation_record_micros,
         candidate_fanout_micros,

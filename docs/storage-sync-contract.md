@@ -20,13 +20,23 @@ Supersession is cooperative abandonment, not forcible thread cancellation: a
 blocking OS worker may finish disposable computation, but it cannot publish or
 change the selected mode after its operation ID becomes stale. Operation start
 and final graph-slot publication share one short linearization lane; neither a
-root lane nor the supervisor model mutex is held for graph-sized work.
+root lane nor the supervisor model mutex is held for graph-sized work. Managed
+activation and join use a move-only publication guard: preparation can produce
+exactly one published successor, and the post-publication guard has no API for
+publishing again. Graceful Direct Files recovery uses a separately typed
+multi-step guard which managed activation and join cannot acquire.
 
 Installing a native graph slot is not sufficient evidence of stable readiness.
-A managed activation is reported successful only after its actor-backed
+A managed candidate is reported successful only after its actor-backed
 generation opens the exact accepted-frontier-stamped SQLite materialization,
-answers its complete paged inventory, and opens a representative page, and the
-frontend has retired all renderer state leased to the predecessor generation.
+answers its complete paged inventory, and opens deterministic representative
+pages including the largest captured source page. The largest-page path is
+retained during the activation capture; readiness never walks the Markdown tree
+a second time. The resulting structured native receipt names inventory, sample,
+and total timings. Only then may one native publication replace the exact
+predecessor generation and persist the Managed selector. The frontend reacts to
+that terminal native receipt by retiring renderer state; it does not re-prove
+native readiness.
 The SQLite candidate receives that stamp only after its authenticated page
 catalog was covered exactly once and every page was materialized.
 Readiness never compares against a cached Direct Files inventory captured before
@@ -38,16 +48,19 @@ legitimately proves readiness with an empty inventory.
 
 Explicit activation is never an unexplained spinner. Before native activation,
 the frontend names pending-save flush, confirmation, and progress-listener
-setup; during activation it shows elapsed time and how long the last native
-phase has remained unchanged. Fresh bootstrap reports its construction phases.
+setup; during activation it renders the active native operation and detailed
+native construction progress. Fresh bootstrap reports its construction phases.
 Reactivation of retained clean state separately reports marker/baseline/index
 open, committed-tail replay, projection repair, and actor open. After native
-success the frontend names its new-generation page-list/page-open observation.
-These progress values are observational and cannot authorize publication.
+success the frontend rebinds its renderer to the generation named by the native
+result. These progress values are observational and cannot authorize
+publication.
 After managed slot publication, the watcher still performs one full handoff-gap
-reconciliation. It is scheduled after a short grace interval so the first
-renderer inventory/page observations can use the actor lane before graph-wide
-reconciliation; deferral changes priority, not coverage.
+reconciliation. Its short grace interval delays when that work is enqueued; it
+does not grant renderer work actor-lane priority and does not bound or cancel a
+full scan once one begins. The interval remains only as an arrival-order hint
+until a measured actor-starvation receipt justifies the separately scoped
+bounded-maintenance redesign.
 
 Return to Direct Files has two meanings. A graceful return drains a healthy
 managed actor and confirms its committed projection before selecting Direct

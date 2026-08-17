@@ -135,6 +135,7 @@ import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
 import { createStartupRecoveryController } from "./startupRecovery";
+import { storageTransitionRuntime } from "./storageTransitionRuntime";
 import { writeClipboardTextResilient } from "./clipboard";
 import type { SparseV2CancelResult } from "./types";
 
@@ -809,7 +810,10 @@ export function App(): JSX.Element {
     };
     // Subscribe before starting: native transition identity is the only
     // progress authority, and early synchronous receipts must not be missed.
-    void backend().onStorageTransition(startupRecovery.receiveTransition).then((stop) => {
+    void backend().onStorageTransition((event) => {
+      storageTransitionRuntime.receive(event);
+      startupRecovery.receiveTransition(event);
+    }).then((stop) => {
       if (disposed) {
         stop();
         return;

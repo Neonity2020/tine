@@ -11,7 +11,6 @@ import {
   clearSettingsTabRequest,
   setJournalTemplate,
   setGraphTransitioning,
-  bumpGraphEpoch,
   theme,
   appearancePreference,
   setAppearancePreference,
@@ -111,11 +110,12 @@ import { openPage, openFile } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../graph";
-import { flushAll, resetStore } from "../store";
+import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
+import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -2128,25 +2128,11 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const status = () => managedStorageRuntime.snapshot().status;
   const runtimeError = () => managedStorageRuntime.snapshot().error;
   const [loading, setLoading] = createSignal(true);
-  const [enabling, setEnabling] = createSignal(false);
   const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
-  const [enableStage, setEnableStage] = createSignal<
-    | "idle"
-    | "flushing"
-    | "confirming"
-    | "listening"
-    | "activating"
-    | "retiring_renderer"
-    | "managed_inventory"
-    | "managed_page"
-  >("idle");
-  const [enableStartedAt, setEnableStartedAt] = createSignal<number | null>(null);
-  const [activationUpdatedAt, setActivationUpdatedAt] = createSignal<number | null>(null);
-  const [enableClock, setEnableClock] = createSignal(Date.now());
-  let enableClockTimer: ReturnType<typeof setInterval> | undefined;
-  onCleanup(() => clearInterval(enableClockTimer));
   const [sharing, setSharing] = createSignal(false);
   const [cancelling, setCancelling] = createSignal(false);
+  const activeNativeTransition = () => storageTransitionRuntime.active();
+  const enabling = () => activeNativeTransition()?.kind === "activate_managed";
   const retryable = () => {
     const value = status();
     return value?.state === "retryable" ? value : null;
@@ -2167,33 +2153,31 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
   const activationProgressLabel = () => {
     const progress = activationProgress();
-    const stage = enableStage();
-    let label: string;
     if (!progress) {
-      label = {
-        idle: "Preparing Tine-managed storage…",
-        flushing: "Saving pending edits…",
-        confirming: "Waiting for confirmation…",
-        listening: "Preparing progress reporting…",
-        activating: "Opening or building managed storage…",
-        retiring_renderer: "Retiring the previous page view…",
-        managed_inventory: "Reading the managed page inventory…",
-        managed_page: "Opening a representative managed page…",
-      }[stage];
-    } else if (progress.kind === "bootstrap_detached_authoring") {
-      label = `Building operation history (${progress.completed} of ${progress.total} parts)…`;
-    } else if (progress.kind === "bootstrap_preparation_subphase") {
-      label = {
+      const transition = activeNativeTransition();
+      return transition
+        ? `${transition.phase.replaceAll("_", " ")}…`
+        : "Preparing Tine-managed storage…";
+    }
+    if (progress.kind === "bootstrap_detached_authoring") {
+      return `Building operation history (${progress.completed} of ${progress.total} parts)…`;
+    }
+    if (progress.kind === "bootstrap_preparation_subphase") {
+      return {
         source_protocol: "Preparing source inventory…",
         operation_spool: "Planning graph operations…",
         partition: "Dividing setup work into parts…",
         detached_authoring: "Building operation history…",
         sealing: "Sealing prepared history…",
       }[progress.subphase];
-    } else if (progress.kind === "bootstrap_preparation_summary") {
-      label = "Prepared graph operation history…";
-    } else {
-      label = {
+    }
+    if (progress.kind === "bootstrap_preparation_summary") {
+      return "Prepared graph operation history…";
+    }
+    if (progress.kind === "readiness_sample") {
+      return "Selecting representative pages for the readiness proof…";
+    }
+    return {
         private_setup: "Preparing private managed state…",
         source_capture: "Capturing source files…",
         bootstrap_import_preparation: "Preparing graph operation history…",
@@ -2208,67 +2192,34 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         retained_runtime_projection_repair: "Repairing the Markdown projection…",
         retained_runtime_actor_open: "Starting the retained managed runtime…",
       }[progress.phase];
-    }
-    const started = enableStartedAt();
-    if (started === null) return label;
-    const elapsed = Math.max(0, Math.floor((enableClock() - started) / 1000));
-    const updated = activationUpdatedAt();
-    const stale = updated === null ? elapsed : Math.max(0, Math.floor((enableClock() - updated) / 1000));
-    return stale >= 10
-      ? `${label} ${elapsed}s elapsed; no new phase for ${stale}s.`
-      : `${label} ${elapsed}s elapsed.`;
-  };
-
-  const noteEnableStage = (stage: Exclude<ReturnType<typeof enableStage>, "idle">) => {
-    setEnableStage(stage);
-    dbg(`managed storage setup: stage=${stage}`);
-  };
-
-  const beginEnableClock = () => {
-    const started = Date.now();
-    setEnableStartedAt(started);
-    setEnableClock(started);
-    clearInterval(enableClockTimer);
-    enableClockTimer = setInterval(() => setEnableClock(Date.now()), 1_000);
-  };
-
-  const endEnableClock = () => {
-    clearInterval(enableClockTimer);
-    enableClockTimer = undefined;
-    setEnableStartedAt(null);
-    setActivationUpdatedAt(null);
-    setEnableStage("idle");
   };
 
   const refresh = async () => {
     setLoading(true);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      await managedStorageRuntime.refresh();
+      await Promise.race([
+        managedStorageRuntime.refresh(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("managed storage status did not answer within 10 seconds")),
+            10_000,
+          );
+        }),
+      ]);
     } catch (error) {
       reportManagedFailure("Couldn't read Tine-managed storage status", safeManagedErrorDetail(error));
     } finally {
+      clearTimeout(timeout);
       setLoading(false);
     }
   };
   onMount(() => void refresh());
 
-  const refreshAuthorityState = async () => {
-    noteEnableStage("retiring_renderer");
+  const acceptNativeAuthority = (result: SparseV2Status) => {
+    if (!managedStorageRuntime.acceptNativeTransition(result)) return false;
     rebindCurrentStorageAuthority();
-
-    // Native activation already proves completeness against the authenticated
-    // accepted frontier. The frontend must prove only that its newly leased
-    // managed generation can use that surface; comparing a Direct Files list
-    // from the retired generation would recreate the race this boundary avoids.
-    noteEnableStage("managed_inventory");
-    const pages = await backend().listPages();
-    const representative = pages[0];
-    if (representative) {
-      noteEnableStage("managed_page");
-      if (!(await backend().getPageByPath(representative.path))) {
-        throw new Error("managed storage rebound but could not open a page from its inventory");
-      }
-    }
+    return true;
   };
 
   // Status fields are structured, but some Rust producers still embed native
@@ -2336,21 +2287,16 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const enable = async () => {
-    const expectedBinding = status()?.binding_generation ?? null;
-    setEnabling(true);
     setActivationProgress(null);
-    beginEnableClock();
     setGraphTransitioning(true);
     let unlisten: (() => void) | undefined;
     try {
-      noteEnableStage("flushing");
       const flushed = await flushAll();
       dbg(`managed storage setup: pending-write flush completed (${flushed ? "clean" : "refused"})`);
       if (!flushed) {
         pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
         return;
       }
-      noteEnableStage("confirming");
       const confirmed = await backend().confirm(
         `Enable Tine-managed storage for this graph?\n\n` +
           `Tine first verifies a private operation history, local index, backup, and exact Markdown reconstruction. ` +
@@ -2359,13 +2305,11 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       dbg(`managed storage setup: native confirmation completed (${confirmed ? "accepted" : "cancelled"})`);
       if (!confirmed) return;
       const generation = status()?.binding_generation;
-      noteEnableStage("listening");
       if (generation !== undefined) {
         try {
           unlisten = await backend().onSparseV2ActivationProgress(
             generation,
             (progress) => {
-              setActivationUpdatedAt(Date.now());
               setActivationProgress(progress);
             }
           );
@@ -2374,17 +2318,13 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           // is unavailable in an older or closing WebView.
         }
       }
-      noteEnableStage("activating");
       const result = await backend().activateSparseV2();
       dbg(`managed storage setup: native activation returned (${result.state})`);
       if (result.state === "active") {
-        await refreshAuthorityState();
-        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
+        if (!acceptNativeAuthority(result)) return;
         pushToast("Tine-managed storage is active.", "success");
       } else {
-        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
-        resetStore();
-        bumpGraphEpoch();
+        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
         reportManagedFailure(
           "Tine-managed storage setup did not complete",
           failureDetail(result) ?? "Tine-managed storage did not become active."
@@ -2395,14 +2335,11 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } finally {
       unlisten?.();
       setActivationProgress(null);
-      endEnableClock();
       setGraphTransitioning(false);
-      setEnabling(false);
     }
   };
 
   const prepareShare = async () => {
-    const expectedBinding = status()?.binding_generation ?? null;
     setSharing(true);
     setGraphTransitioning(true);
     try {
@@ -2416,11 +2353,10 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       ))) return;
       const result = await backend().prepareSparseV2Share();
       if (result.state === "active") {
-        await refreshAuthorityState();
-        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
+        if (!acceptNativeAuthority(result)) return;
         pushToast("Sync is ready to use on another device.", "success");
       } else {
-        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
+        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
         reportManagedFailure("Sync setup did not complete", failureDetail(result) ?? "Tine-managed storage did not become active.");
       }
     } catch (error) {
@@ -2432,7 +2368,6 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const joinShare = async () => {
-    const expectedBinding = status()?.binding_generation ?? null;
     setSharing(true);
     setGraphTransitioning(true);
     try {
@@ -2446,11 +2381,10 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       ))) return;
       const result = await backend().joinSparseV2Shared();
       if (result.state === "active") {
-        await refreshAuthorityState();
-        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
+        if (!acceptNativeAuthority(result)) return;
         pushToast("This device joined the synced graph.", "success");
       } else {
-        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
+        if (!managedStorageRuntime.acceptNativeTransition(result)) return;
         reportManagedFailure(
           "Joining the synced graph did not complete",
           failureDetail(result) ?? "Tine-managed storage did not become active."
@@ -2465,7 +2399,6 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const cancelSparse = async () => {
-    const expectedBinding = status()?.binding_generation ?? null;
     setCancelling(true);
     setGraphTransitioning(true);
     try {
@@ -2478,7 +2411,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       }
       if (!(await backend().confirm(directFilesConfirmation()))) return;
       const result = await backend().cancelSparseV2();
-      if (!managedStorageRuntime.transitionTo(result.status, expectedBinding)) return;
+      if (!managedStorageRuntime.acceptNativeTransition(result.status)) return;
       let flushed = false;
       try {
         flushed = await flushAll();
@@ -2492,8 +2425,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         );
         return;
       }
-      resetStore();
-      bumpGraphEpoch();
+      rebindCurrentStorageAuthority();
       // Older native builds may still use the former mode name in this recovery text.
       pushToast(
         result.recovery_statement

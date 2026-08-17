@@ -147,7 +147,7 @@ describe("managed-storage runtime event bridge", () => {
     expect(bridge.snapshot().error).toBe("current graph failure");
   });
 
-  it("installs the load-route authority atomically and cannot let an old managed transition replace Direct", () => {
+  it("reacts to the native terminal transition without a second frontend generation veto", () => {
     const bridge = createManagedStorageRuntimeBridge({
       sparseV2Status: vi.fn().mockResolvedValue(active(31)),
       onSparseV2Status: async () => () => {},
@@ -167,10 +167,10 @@ describe("managed-storage runtime event bridge", () => {
       authority: "direct",
     });
     expect(bridge.receiveStatus(active(31))).toBe(false);
-    expect(bridge.transitionTo(active(31), 31)).toBe(false);
-    expect(bridge.snapshot().applicationPageAdmission).toEqual({
-      binding_generation: 32,
-      authority: "direct",
+    expect(bridge.acceptNativeTransition(active(33))).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({
+      binding_generation: 33,
+      authority: "managed_writable",
     });
   });
 

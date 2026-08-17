@@ -1145,6 +1145,30 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_candidate_has_no_registry_or_watcher_ownership() {
+        let base = std::env::temp_dir().join(format!(
+            "tine-unpublished-candidate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let serving_root = base.join("serving");
+        let candidate_root = base.join("candidate");
+        let mut registry = GraphRegistry::default();
+        let serving = graph(&serving_root);
+        registry.bind("main".into(), Arc::clone(&serving)).unwrap();
+
+        let candidate = graph(&candidate_root);
+        assert_eq!(registry.entries().len(), 1);
+        assert!(Arc::ptr_eq(&registry.entries()[0].1, &serving));
+        assert!(registry.owner(&candidate.root_key).is_none());
+        assert_ne!(candidate.binding_generation, serving.binding_generation);
+
+        let watcher = include_str!("watcher.rs");
+        assert!(watcher.contains("app.state::<AppState>().graphs.read().unwrap().entries()"));
+        assert!(!watcher.contains("PreparedManagedCandidate"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn registry_rejects_two_windows_for_one_root() {
         let base = std::env::temp_dir().join(format!("tine-registry-dupe-{}", std::process::id()));
         let mut registry = GraphRegistry::default();

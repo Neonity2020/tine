@@ -1577,6 +1577,12 @@ pub enum SyncLocalActivationProgress {
     BootstrapPreparationSummary {
         summary: SyncBootstrapPreparationSummary,
     },
+    /// Source-capture metadata retained for the application readiness proof.
+    /// It is emitted from the already-built activation record and therefore
+    /// requires no second graph-tree walk.
+    ReadinessSample {
+        largest_page_path: Option<String>,
+    },
 }
 
 impl SyncLocalActivationProgress {
@@ -1611,6 +1617,10 @@ impl SyncLocalActivationProgress {
                 summary.partition_micros,
                 summary.detached_authoring_micros,
                 summary.sealing_micros,
+            ),
+            Self::ReadinessSample { largest_page_path } => format!(
+                "readiness sample selected: largest_page_path={}",
+                largest_page_path.as_deref().unwrap_or("none")
             ),
         }
     }
@@ -5708,6 +5718,9 @@ fn activate_clean_runtime_resources(
         &ReferenceCatalogPolicyV1::default(),
     )
     .map_err(display)?;
+    progress(SyncLocalActivationProgress::ReadinessSample {
+        largest_page_path: preparation.instrumentation().largest_source_path.clone(),
+    });
     #[cfg(test)]
     LAST_CLEAN_ACTIVATION_INSTRUMENTATION.with(|slot| {
         *slot.borrow_mut() = Some(preparation.instrumentation().clone());

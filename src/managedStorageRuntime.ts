@@ -92,8 +92,7 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     return true;
   };
 
-  const transitionTo = (status: SparseV2Status, expectedPreviousBinding = snapshot().bindingGeneration): boolean => {
-    if (snapshot().bindingGeneration !== expectedPreviousBinding) return false;
+  const acceptNativeTransition = (status: SparseV2Status): boolean => {
     if (status.application_page_admission.binding_generation !== status.binding_generation) return false;
     setSnapshot({
       bindingGeneration: status.binding_generation,
@@ -116,11 +115,12 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     ownsRecovery: () => boolean,
   ): boolean => {
     if (!ownsRecovery()) return false;
+    if (snapshot().bindingGeneration !== expectedPreviousBinding) return false;
     if (result.previous_binding_generation !== expectedPreviousBinding) return false;
     if (result.episode_id !== expectedEpisodeId || result.outcome.episode_id !== expectedEpisodeId) return false;
     if (result.binding_generation !== result.status.binding_generation) return false;
     if (!admissionsAgree(result.application_page_admission, result.status.application_page_admission)) return false;
-    return transitionTo(result.status, expectedPreviousBinding);
+    return acceptNativeTransition(result.status);
   };
 
   const receiveRuntimeStatus = (event: SparseV2RuntimeStatusEvent): boolean => {
@@ -217,7 +217,7 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     snapshot: snapshot as Accessor<ManagedStorageRuntimeSnapshot>,
     bind,
     clear,
-    transitionTo,
+    acceptNativeTransition,
     transitionMoveRecovery,
     receiveStatus,
     receiveRuntimeStatus,
