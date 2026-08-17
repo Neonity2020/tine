@@ -2002,22 +2002,47 @@ fn activate_sparse_v2_under_transition(
     ));
 
     let core_started = Instant::now();
-    let binding = activate_record_with_diagnostics(
+    let binding = match activate_record_with_diagnostics(
         &state.sync_runtime,
         app,
         label,
         binding_generation,
         &record,
-    )?;
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            publish_retryable_sparse_slot(
+                &state,
+                label,
+                root,
+                graph_meta,
+                error.clone(),
+                Some(transition),
+            )?;
+            return Err(error);
+        }
+    };
     crate::debug::diag(format!(
         "sparse-v2 core bootstrap completed after {} ms: availability={:?}",
         core_started.elapsed().as_millis(),
         binding.availability()
     ));
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
-        binding, root, graph_meta,
+        binding,
+        root.clone(),
+        graph_meta.clone(),
     ));
-    prove_managed_application_ready(&replacement)?;
+    if let Err(error) = prove_managed_application_ready(&replacement) {
+        publish_retryable_sparse_slot(
+            &state,
+            label,
+            root,
+            graph_meta,
+            error.clone(),
+            Some(transition),
+        )?;
+        return Err(error);
+    }
     transition.commit(|| {
         state
             .graphs
@@ -3340,6 +3365,33 @@ mod tests {
     }
 
     #[test]
+    fn fresh_activation_candidate_failures_publish_retryable_slots() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("let graph = slot.legacy_graph()?;")
+            .expect("fresh activation starts from the Direct Files graph");
+        let body = &source[start
+            ..source[start..]
+                .find("sparse-v2 fresh activation published")
+                .map(|offset| start + offset)
+                .expect("fresh activation completion")];
+
+        assert!(
+            body.contains("let binding = match activate_record_with_diagnostics("),
+            "candidate-build failure must be handled before leaving the window slotless"
+        );
+        assert!(
+            body.contains("if let Err(error) = prove_managed_application_ready(&replacement)"),
+            "candidate-readiness failure must be handled before leaving the window slotless"
+        );
+        assert_eq!(
+            body.matches("publish_retryable_sparse_slot(").count(),
+            2,
+            "both long post-retirement failure legs must publish retryable managed authority"
+        );
+    }
+
+    #[test]
     fn every_storage_mode_change_is_owned_by_the_native_supervisor() {
         let source = include_str!("sync_runtime.rs");
         for (function, kind) in [
@@ -3687,6 +3739,41 @@ mod tests {
             self.slot = active;
             self.binding_bytes =
                 std::fs::read(self.private_root.join(SPARSE_BINDING_FILE)).unwrap();
+        }
+    }
+
+    #[test]
+    fn retryable_activation_failure_rebinds_an_empty_registry() {
+        for detail in [
+            "injected candidate-build failure",
+            "injected readiness failure",
+        ] {
+            let fixture = RollbackFixture::new(Some("local_active"));
+            fixture.state.graphs.write().unwrap().remove("main");
+            let graph_meta = Graph::open(&fixture.graph_root).meta();
+
+            let replacement = publish_retryable_sparse_slot(
+                &fixture.state,
+                "main",
+                fixture.graph_root.clone(),
+                graph_meta,
+                detail.into(),
+                None,
+            )
+            .unwrap();
+
+            let bound = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+            assert!(Arc::ptr_eq(&bound, &replacement));
+            assert!(bound.is_sparse_v2());
+            assert!(bound.sparse_runtime().is_none());
+            let status = sparse_v2_status_for_slot(&bound).unwrap();
+            assert!(status.can_retry);
+            assert!(status.can_cancel);
+            assert!(matches!(
+                status.availability,
+                SparseV2Availability::Retryable { ref detail, .. }
+                    if detail.contains("injected")
+            ));
         }
     }
 

@@ -54,6 +54,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A failed managed-storage bootstrap/readiness check no longer leaves the app with no graph bound.** Until the serving-transition redesign is complete, either long post-retirement failure now publishes an explicit retryable managed slot, preserving the in-app recovery/Direct Files escape instead of stranding the window behind a Managed selector with no serving graph.
+
 - **An external change to a page you are editing is no longer silently dropped.** The watcher correctly declines to yank the caret mid-edit, but the declined reload used to be forgotten: the page stayed stale until some unrelated event touched it again. Tine now records the skipped reload and replays it the moment the blocking state clears — editing ends, a block move settles, or a title rename/IME composition finishes — re-checking at that moment whether the page has meanwhile gained unsaved edits, in which case the normal conflict protocol takes over instead of a reload. (Part of GH #337.)
 
 - **Conflict-copy detection now matches the real formats sync tools generate.** A page whose name merely contains `.sync-conflict-` (say `Foo.sync-conflict-notes`) is no longer silently hidden from the page list as a false-positive Syncthing conflict copy; Syncthing detection now requires the generated `.sync-conflict-YYYYMMDD-HHMMSS-DEVICEID` shape. Seafile conflict copies (`name (SFConflict … ).md`) are now recognized and surfaced in Settings → Backups & recovery instead of appearing as duplicate pages that could hijack page identity via `title::`.

@@ -4237,6 +4237,29 @@
         "failBefore": "proven"
       },
       "notes": "reloadDisposition's \"skip\" (block edit / block move) and mayReplaceInstance's lease refusal correctly declined the reload but the watcher event was then dropped: backend cache fresh, visible page stale indefinitely. The declined GraphChange is now recorded and re-dispatched through handleGraphChange when onPageBecameReplaceable fires, so the disposition is re-evaluated at replay time (a page that became dirty meanwhile takes the applyDivergenceVerdict path). Fail-before: all three App.test.tsx cases fail on pre-fix code with the page stuck at its stale content. Concord P1 freshness lane."
+    },
+    {
+      "id": "REG-MANAGED-ACTIVATION-FAILURE-RETRYABLE-SLOT-001",
+      "title": "A managed-storage candidate-build or readiness failure keeps an explicit retryable graph bound instead of stranding the window without a serving slot",
+      "family": "managed-storage-transition",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-ui-lifecycle",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/sync_runtime.rs::tests::fresh_activation_candidate_failures_publish_retryable_slots",
+          "src-tauri/src/sync_runtime.rs::tests::retryable_activation_failure_rebinds_an_empty_registry"
+        ],
+        "scenario": "managed.activation-post-retirement-failure-keeps-recovery-route",
+        "failBefore": "proven"
+      },
+      "notes": "Fresh activation removed the Direct Files slot and durably selected Managed before the long core candidate build and application-readiness proof. Both error legs propagated directly, leaving no graph bound and no usable in-app recovery route. Packet 0 of the serving-transition rescue publishes a fresh no-actor retryable managed slot on either leg. The source-boundary regression failed before the fix because neither error was handled; the runtime regression proves the replacement is bound, retryable, and cancellable after an empty-registry state. This is an interim availability repair, not the final prepare/prove/one-publish architecture."
     }
   ]
 }
