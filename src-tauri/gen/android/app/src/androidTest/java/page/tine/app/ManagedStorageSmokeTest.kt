@@ -7,6 +7,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.io.File
 import java.util.UUID
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -32,6 +33,21 @@ class ManagedStorageSmokeTest {
     File(graphRoot, "journals").mkdirs()
     File(graphRoot, "logseq").mkdirs()
     File(graphRoot, "pages/Smoke.md").writeText("- Android managed storage smoke\n")
+    // Match Martin's physical graph shape closely enough that per-page work,
+    // shared-storage enumeration and final actor/readiness startup cannot hide
+    // behind the historical one-page smoke fixture.
+    repeat(1097) { pageIndex ->
+      val blocks = buildString {
+        repeat(12) { blockIndex ->
+          append("- Android corpus page ")
+          append(pageIndex)
+          append(" block ")
+          append(blockIndex)
+          append(" with [[Smoke]] and #android-corpus\n")
+        }
+      }
+      File(graphRoot, "pages/Corpus-$pageIndex.md").writeText(blocks)
+    }
     File(graphRoot, "logseq/config.edn").writeText("{}\n")
 
     System.loadLibrary("tine_lib")
@@ -40,7 +56,8 @@ class ManagedStorageSmokeTest {
         graphRoot.absolutePath,
         privateRoot.absolutePath,
       )
-      assertEquals("ok", result)
+      println("TINE_ANDROID_MANAGED_LARGE_GRAPH_RECEIPT $result")
+      assertTrue(result, result.startsWith("ok "))
       assertEquals(
         "- Android managed storage edited\n",
         File(graphRoot, "pages/Smoke.md").readText(),
@@ -81,7 +98,8 @@ class ManagedStorageSmokeTest {
         graphRoot.absolutePath,
         privateRoot.absolutePath,
       )
-      assertEquals("ok", result)
+      println("TINE_ANDROID_MANAGED_RESUME_RECEIPT $result")
+      assertTrue(result, result.startsWith("ok "))
       assertEquals(
         "- Android interrupted activation resume\n",
         File(graphRoot, "pages/Resume.md").readText(),

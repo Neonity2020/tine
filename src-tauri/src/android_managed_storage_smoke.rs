@@ -9,6 +9,7 @@ use jni::objects::{JClass, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
 use std::path::PathBuf;
+use std::time::Instant;
 use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
@@ -22,6 +23,7 @@ use tine_core::sync_runtime::{
 use uuid::Uuid;
 
 fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
+    let journey_started = Instant::now();
     let workspace_id = WorkspaceId::new();
     let lineage_seed = Uuid::new_v4();
     let identities = SyncLocalActivationIdentities {
@@ -62,10 +64,19 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
     };
 
     let mut last_progress = "activation-not-started".to_string();
+    let mut progress_receipt = Vec::new();
     let activation = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
         activation_request,
-        |progress| last_progress = format!("{progress:?}"),
+        |progress| {
+            last_progress = format!("{progress:?}");
+            progress_receipt.push(format!(
+                "{}@{}ms",
+                progress.diagnostic_name(),
+                journey_started.elapsed().as_millis()
+            ));
+        },
     );
+    let activation_ms = journey_started.elapsed().as_millis();
     if activation.status != SyncLocalActivationStatus::Active {
         return format!(
             "activation failed after {last_progress}: {:?}",
@@ -75,6 +86,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
     let Some(handle) = activation.handle else {
         return "activation returned Active without a handle".into();
     };
+    let first_page_started = Instant::now();
     let (mut page, revision) = match handle.load_application_page(SyncApplicationPageLoadRequest {
         page: SyncApplicationPageSelector::ExactPath {
             path: "pages/Smoke.md".into(),
@@ -83,6 +95,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         Ok(SyncApplicationPageLoadOutcome::Loaded { page, revision }) => (page, revision),
         outcome => return format!("post-activation page load failed: {outcome:?}"),
     };
+    let first_page_ms = first_page_started.elapsed().as_millis();
     let Some(first) = page.blocks.first_mut() else {
         return "post-activation page has no editable block".into();
     };
@@ -102,7 +115,9 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
     // be recovered by a fresh runtime open before testing sharing.
     drop(handle);
 
+    let reopen_started = Instant::now();
     let crashed_reopen = SyncRuntimeHandle::open(open_request.clone());
+    let crash_reopen_ms = reopen_started.elapsed().as_millis();
     if crashed_reopen.status != SyncRuntimeOpenStatus::Active {
         return format!("crash-style reopen failed: {:?}", crashed_reopen.status);
     }
@@ -136,7 +151,11 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         return "reopen returned Active without a handle".into();
     };
     match handle.clean_shutdown() {
-        Ok(SyncShutdownOutcome::Safe(_)) => "ok".into(),
+        Ok(SyncShutdownOutcome::Safe(_)) => format!(
+            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} total_ms={} progress={}",
+            journey_started.elapsed().as_millis(),
+            progress_receipt.join("|")
+        ),
         outcome => format!("reopened clean shutdown failed: {outcome:?}"),
     }
 }
