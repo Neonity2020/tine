@@ -731,8 +731,8 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         {(conflict) => (
           <div class="vcs-marker-banner" role="alert">
             This file contains unresolved version-control merge markers ({conflict().markers.join(" ")}).
-            It stays readable, and Tine won't save changes to it until the merge is resolved — below,
-            with your version-control tool, or in another editor.
+            It stays readable, and Tine won’t save changes to it until the merge is resolved — either
+            below, block by block, or in your version-control tool.
           </div>
         )}
       </Show>

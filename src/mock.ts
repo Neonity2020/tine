@@ -1831,17 +1831,23 @@ export function mockBackend(): Backend {
         mine_label: "HEAD",
         theirs_label: "feature/concord",
         regions: 1,
+        // A diff3-style marker block: it carried its own common ancestor, so
+        // rows only one side touched arrive already decided, and only the row
+        // both sides rewrote still needs a real choice (→ keep-both).
         diff: {
           base_rev: "mock-marker-rev",
           conflict_rev: "mock-marker-rev",
           rows: [
             { id: "0", kind: "unchanged" as const, mine: v("A local-first outliner"), theirs: v("A local-first outliner"), children: [] },
-            { id: "1", kind: "modified" as const, mine: v("Fast on big graphs"), theirs: v("Fast on very big graphs"), children: [] },
+            { id: "1", kind: "modified" as const, mine: v("Fast on very big graphs"), theirs: v("Fast on big graphs"), children: [], verdict: "mine-only" as const, suggestion: "mine" as const },
+            { id: "2", kind: "modified" as const, mine: v("Reads a real Logseq graph"), theirs: v("Reads a real Logseq graph, Markdown and Org"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
+            { id: "3", kind: "modified" as const, mine: v("Written in Rust and SolidJS"), theirs: v("Built on Tauri"), children: [], verdict: "both-changed" as const },
           ],
           mine_pre: null,
           theirs_pre: null,
           pre_differs: false,
           blocks_identical: false,
+          three_way: true,
         },
       };
     },

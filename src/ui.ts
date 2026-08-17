@@ -401,7 +401,7 @@ export async function refreshSyncConflicts(notify = false): Promise<void> {
     setVcsMarkerConflicts(m);
     if (notify && m.length) {
       pushToast(
-        `${m.length} file${m.length === 1 ? " contains" : "s contain"} unresolved VCS merge markers — Tine won't overwrite them; resolve the merge in your version-control tool`,
+        `${m.length} file${m.length === 1 ? " contains" : "s contain"} unresolved VCS merge markers — Tine won't overwrite them; open the page to resolve the merge block by block`,
         "info",
         { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
       );
