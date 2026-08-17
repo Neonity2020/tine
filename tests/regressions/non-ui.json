@@ -170,7 +170,15 @@
       "family": "sync-data-safety",
       "sources": {
         "issues": [],
-        "commits": []
+        "commits": [
+          "039bb7cc",
+          "d3568b48",
+          "028d6964",
+          "17f76c80",
+          "fc3f2358",
+          "69853735",
+          "85b31dfe"
+        ]
       },
       "platforms": [
         "all"
@@ -4194,15 +4202,18 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "src/startupRecovery.test.ts",
-          "src-tauri/src/state.rs::tests::queued_cold_return_keeps_its_native_authority_until_it_completes",
-          "src-tauri/src/sync_runtime.rs::tests::cold_return_requires_native_lock_attempt_target_and_full_direct_lifecycle",
+          "src/startupRecovery.test.ts::120s native work remains working without an invented failure",
+          "src/startupRecovery.test.ts::stale managed events remain inert after emergency return",
+          "src-tauri/src/storage_mode_supervisor.rs::tests::emergency_return_wins_at_every_managed_safe_checkpoint",
+          "src-tauri/src/storage_mode_supervisor.rs::tests::a_stuck_root_lane_does_not_delay_an_unrelated_graph",
+          "src-tauri/src/sync_runtime.rs::tests::cold_emergency_return_has_no_managed_runtime_or_archive_dependency",
+          "src-tauri/src/sync_runtime.rs::tests::every_storage_mode_change_is_owned_by_the_native_supervisor",
           "scripts/e2e-managed-force-close-recovery.mjs"
         ],
         "scenario": "managed.cold-return-during-inflight-open",
         "failBefore": "field-reproduced"
       },
-      "notes": "On Android, a user requested Return to Direct Files while cold managed recovery still owned the serialized graph transition. The frontend attributed the old worker's managed_open progress to cold_return, the queued return emitted no heartbeat, and managed-open completion revoked the startup authority token before the return acquired the lock. The exact Linux real-app regression at commit 380bd9b8 copied the 1,046-file anonymized graph, activated managed storage, edited and verified Markdown, waited 10 seconds, SIGKILLed Tine, requested Direct Files during the recovering managed open, verified Direct mode, made and projected a Direct edit, cleanly restarted, and verified the edit and Direct mode again. The first exact run also caught a harness evidence-lifetime bug: the final Direct restart correctly replaced the earlier managed-recovery log, so the harness now records managed-open evidence at the recovery boundary rather than asserting against the final process log."
+      "notes": "On Android, a user requested Return to Direct Files while cold managed recovery still owned an app-global transition and then found every graph, including unrelated Direct Files graphs, trapped behind the same startup recovery UI. The root cause was duplicate authority: native managed open, a frontend attempt token, prefix-routed progress, and a frontend inactivity watchdog could each decide the transition. One native per-window/per-root supervisor now owns typed operation IDs, priority, and terminal outcomes; the frontend only renders them, and elapsed time cannot invent native.unavailable. Emergency return atomically selects Direct from the native-selected root without opening, draining, repairing, or archiving managed state, while stale managed workers are barred from later publication. The exact Linux real-app proof at commit 85b31dfe copied the 1,046-file anonymized graph, activated managed storage, edited and verified Markdown, waited 10 seconds, SIGKILLed Tine, requested Direct Files during the recovering managed open, verified Direct mode, made and projected a Direct edit, cleanly restarted, and verified the edit and Direct mode again. A second exact journey proved recovery followed by graceful drain/return and Direct restart; the two-device journey proved join, bidirectional edits, and byte-preserved provider evidence after emergency Direct return."
     }
   ]
 }

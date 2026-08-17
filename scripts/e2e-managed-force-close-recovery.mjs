@@ -32,6 +32,10 @@ const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4725);
 const SETTLE_MS = Number(process.env.TINE_MANAGED_RECOVERY_SETTLE_MS || 10_000);
 const KILL_CYCLES = Number(process.env.TINE_MANAGED_RECOVERY_KILL_CYCLES || 1);
 const RETURN_DURING_OPEN = process.env.TINE_MANAGED_RECOVERY_RETURN_DURING_OPEN === "1";
+const GRACEFUL_RETURN_AFTER_RECOVERY = process.env.TINE_MANAGED_RECOVERY_GRACEFUL_RETURN === "1";
+if (RETURN_DURING_OPEN && GRACEFUL_RETURN_AFTER_RECOVERY) {
+  throw new Error("choose either emergency return during open or graceful return after recovery");
+}
 if (!Number.isSafeInteger(KILL_CYCLES) || KILL_CYCLES < 1 || KILL_CYCLES > 3) {
   throw new Error("TINE_MANAGED_RECOVERY_KILL_CYCLES must be an integer from 1 through 3");
 }
@@ -106,6 +110,7 @@ const receipt = {
   settleMs: SETTLE_MS,
   killCycles: KILL_CYCLES,
   returnDuringOpen: RETURN_DURING_OPEN,
+  gracefulReturnAfterRecovery: GRACEFUL_RETURN_AFTER_RECOVERY,
   activationMs: null,
   reopenMs: null,
   reopenDurationsMs: [],
@@ -401,6 +406,17 @@ async function returnToDirectFilesDuringOpen() {
   await assertDirectFilesActive();
 }
 
+async function returnToDirectFilesGracefully() {
+  await openStorageSettings();
+  const button = await waitFor(() => buttonContaining("Return to Direct files"), 60_000,
+    "healthy managed storage did not offer graceful return");
+  const before = new Set(windowIds("^Tine$"));
+  await button.click();
+  await acceptNativeConfirmation("graceful Return to Direct Files", before);
+  await waitForBody("Enable Tine-managed storage...", 300_000, "Direct Files after graceful return");
+  await closeSettings();
+}
+
 async function stopDriver() {
   try { await browser?.deleteSession(); } catch {}
   browser = undefined;
@@ -516,18 +532,28 @@ try {
       break;
     }
     await assertManagedStorageActive();
+    if (GRACEFUL_RETURN_AFTER_RECOVERY) {
+      phase = "graceful-return-after-managed-recovery";
+      await returnToDirectFilesGracefully();
+      await openPageThroughSwitcher(selected.entry.name);
+      await editSelectedPage(DIRECT_MARKER, "direct-edit-after-graceful-return");
+      break;
+    }
   }
 
   phase = "clean-shutdown-after-recovery";
   await cleanQuit();
-  if (RETURN_DURING_OPEN) {
-    phase = "direct-reopen-after-cold-return";
-    await connect("direct-reopen-after-cold-return");
+  if (RETURN_DURING_OPEN || GRACEFUL_RETURN_AFTER_RECOVERY) {
+    const returnKind = RETURN_DURING_OPEN ? "cold" : "graceful";
+    phase = `direct-reopen-after-${returnKind}-return`;
+    await connect(`direct-reopen-after-${returnKind}-return`);
     await openPageThroughSwitcher(selected.entry.name);
-    await waitForBody(DIRECT_MARKER, 60_000, "Direct Files edit after cold-return restart");
+    await waitForBody(DIRECT_MARKER, 60_000, `Direct Files edit after ${returnKind}-return restart`);
     await assertDirectFilesActive();
     await cleanQuit();
-    receipt.milestones.coldReturnDuringManagedOpen = {
+    receipt.milestones[RETURN_DURING_OPEN
+      ? "coldReturnDuringManagedOpen"
+      : "gracefulReturnAfterManagedRecovery"] = {
       directMode: true,
       postReturnSave: true,
       restart: true,

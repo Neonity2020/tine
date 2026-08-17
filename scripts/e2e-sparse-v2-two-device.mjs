@@ -4,6 +4,7 @@
 // lifecycle. Two launches use separate XDG app-data roots, just as desktop and
 // Android do; only the graph-local provider tree crosses the device boundary.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
@@ -107,6 +108,23 @@ const receipt = {
   mode: SOURCE ? "real-corpus-release" : "synthetic",
   milestones: {},
 };
+
+function exactTreeDigest(root) {
+  const hash = crypto.createHash("sha256");
+  const visit = (dir, prefix = "") => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name))) {
+      const relative = path.posix.join(prefix, entry.name);
+      hash.update(`${entry.isDirectory() ? "d" : "f"}:${relative}\0`);
+      const absolute = path.join(dir, entry.name);
+      if (entry.isDirectory()) visit(absolute, relative);
+      else if (entry.isFile()) hash.update(fs.readFileSync(absolute));
+      else throw new Error(`provider evidence contained unsupported entry ${relative}`);
+    }
+  };
+  visit(root);
+  return hash.digest("hex");
+}
 
 function processAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
@@ -719,17 +737,16 @@ try {
     })}\n`);
     const descriptor = path.join(GRAPH_B, ".tine-sync", "v2", "shared", "outbox", "enrollment", "shared-enrollment-v1.json");
     fs.writeFileSync(descriptor, "{\n");
+    const providerRoot = path.join(GRAPH_B, ".tine-sync", "v2");
+    const providerBeforeReturn = exactTreeDigest(providerRoot);
     await connect("device-b-cold-return", GRAPH_B, XDG_B, true);
     await assertBody("Tine-managed storage sync data appears to still be arriving or is incomplete", "fresh device B recovery screen");
     await clickButtonAndConfirm("to Direct Files", "device-b-cold-return");
     await leaseCurrentGraph(GRAPH_B);
     await assertPageContains(MARKER, "fresh device B source page after Direct Files return", 30_000);
-    if (fs.existsSync(path.join(GRAPH_B, ".tine-sync", "v2"))) {
-      throw new Error("fresh-device Direct Files return left the live v2 namespace in place");
-    }
-    const recoveryRoot = path.join(GRAPH_B, ".tine-sync", "recovery");
-    if (!fs.existsSync(recoveryRoot) || fs.readdirSync(recoveryRoot).length === 0) {
-      throw new Error("fresh-device Direct Files return did not preserve provider state");
+    if (!fs.existsSync(providerRoot)
+      || exactTreeDigest(providerRoot) !== providerBeforeReturn) {
+      throw new Error("fresh-device emergency return changed retained provider evidence");
     }
     const page = await getPage();
     page.blocks[0].raw = `${MARKER} direct after return`;
@@ -746,7 +763,7 @@ try {
     if (revision?.error) throw new Error(`Direct Files save failed after return: ${revision.error}`);
     const directBytes = fs.readFileSync(path.join(GRAPH_B, "pages", `${PAGE}.md`), "utf8");
     if (!directBytes.includes("direct after return")) throw new Error("Direct Files save did not reach Markdown after return");
-    receipt.milestones.directReturn = { archivedProvider: true, writableMarkdown: true };
+    receipt.milestones.directReturn = { providerEvidencePreserved: true, writableMarkdown: true };
   }
 
   receipt.result = "pass";

@@ -684,13 +684,25 @@
      "class": "core-operation",
      "userOutcome": "Native recovery remains visibly observable and reaches a usable graph without native.unavailable, a refusal loop, a silent hang, or recurring error notifications.",
      "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "Emergency return remains actionable while managed recovery is still running, publishes Direct Files without waiting for managed recovery or changing managed evidence, and preserves a subsequent Direct edit across restart.",
+     "blocking": true,
+     "authority": "Native StorageModeSupervisor priority, Direct-selection receipt, and stale-publication contract"
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A healthy Settings return drains managed storage, confirms the Markdown projection, switches to Direct Files, and preserves the next Direct edit across restart.",
+     "blocking": true,
+     "authority": "Graceful managed-to-Direct transition contract"
     }
    ],
    "acceptableVariations": [
     "Activation, driver startup, and recovery durations may vary with corpus size and machine speed while progress remains observable and recovery completes within the scenario timeout."
    ],
    "nonRequirements": [
-    "Exact progress wording, phase count, toast styling, DOM structure, process ID, or millisecond timing."
+    "Exact progress wording, phase count, toast styling, DOM structure, process ID, or millisecond timing. Managed provider bytes may remain in place after emergency return because the private Direct-selection receipt is authoritative."
    ],
    "stability": "burn-in"
   },
