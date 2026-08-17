@@ -56,11 +56,12 @@ success the frontend rebinds its renderer to the generation named by the native
 result. These progress values are observational and cannot authorize
 publication.
 After managed slot publication, the watcher still performs one full handoff-gap
-reconciliation. Its short grace interval delays when that work is enqueued; it
-does not grant renderer work actor-lane priority and does not bound or cancel a
-full scan once one begins. The interval remains only as an arrival-order hint
-until a measured actor-starvation receipt justifies the separately scoped
-bounded-maintenance redesign.
+reconciliation. It begins immediately, but the expensive path-comparison phase
+is a retained cursor with both a path-count and wall-time budget per actor turn.
+The cursor remains visibly pending and prevents `Safe` until its exact epoch is
+settled; application, enrollment, and status requests can run between turns.
+There is no timer-based priority claim and no O(graph) comparison turn on the
+shared actor lane.
 
 Return to Direct Files has two meanings. A graceful return drains a healthy
 managed actor and confirms its committed projection before selecting Direct

@@ -563,6 +563,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   priority over remote ingestion. Safe reopen also republishes a completely
   missing provider namespace, and exact deletion of an accepted manifest repairs
   from authenticated local archive bytes.
+- **Managed-storage handoff reconciliation no longer monopolizes page reads or
+  sync setup on a large graph.** The mandatory post-publication full scan now
+  retains one exact cursor and compares a bounded path/time slice per actor
+  turn. It remains pending for shutdown safety, but ordinary application and
+  enrollment work runs between slices; the former 750 ms arrival-order delay is
+  gone.
 - **Eligible Markdown and Org files outside configured page roots stay
   discoverable and exact-path load/save never exposes a blank writable substitute**
   (GH #246). Lowercase `.markdown` files and external add/delete updates follow

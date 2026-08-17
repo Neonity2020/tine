@@ -5236,6 +5236,8 @@ struct CleanRuntimeActorCore {
     runtime: CleanLocalRuntime,
     pending: Option<CleanPublishedContinuation>,
     watcher: CleanWatcherState,
+    full_scan: Option<CleanFullScanContinuation>,
+    completed_full_scan: Option<(u64, BTreeSet<ManagedPath>)>,
     /// An externally authored manifest has committed, but its derived graph
     /// projection has not yet completed.  Keep the watcher admission open
     /// until the continuation succeeds, then report one observable change
@@ -5255,6 +5257,30 @@ struct CleanWatcherState {
     latest_enqueue: u64,
     acknowledged: u64,
 }
+
+/// One bounded continuation for the expensive comparison half of a clean
+/// watcher full scan. Capturing the graph and the finite SQLite/manifest path
+/// inventory happens once; later actor turns compare only a small slice. This
+/// keeps application and enrollment requests from waiting behind an O(graph)
+/// actor turn while preserving the exact same final changed-path set.
+struct CleanFullScanContinuation {
+    epoch: u64,
+    disk: BTreeMap<ManagedPath, Vec<u8>>,
+    candidates: Vec<ManagedPath>,
+    next: usize,
+    changed: BTreeSet<ManagedPath>,
+}
+
+enum CleanFullScanStep {
+    Pending,
+    Complete {
+        epoch: u64,
+        changed: BTreeSet<ManagedPath>,
+    },
+}
+
+const CLEAN_FULL_SCAN_PATH_BUDGET: usize = 16;
+const CLEAN_FULL_SCAN_TIME_BUDGET: Duration = Duration::from_millis(25);
 
 impl CleanWatcherState {
     fn enqueue(&mut self, observation: SyncWatcherObservation) {
@@ -5296,6 +5322,20 @@ impl CleanWatcherState {
         self.full_scan = false;
         self.exact.clear();
         self.acknowledged
+    }
+
+    fn begin_full_scan(&mut self) -> Option<u64> {
+        if !self.full_scan {
+            return None;
+        }
+        let epoch = self.latest_enqueue;
+        self.full_scan = false;
+        self.exact.clear();
+        Some(epoch)
+    }
+
+    fn settle_through(&mut self, epoch: u64) {
+        self.acknowledged = self.acknowledged.max(epoch);
     }
 }
 
@@ -5342,6 +5382,8 @@ impl CleanRuntimeActorCore {
             runtime,
             pending: None,
             watcher,
+            full_scan: None,
+            completed_full_scan: None,
             external_change_pending_notification: false,
             provider_change_pending_notification: None,
         }
@@ -5465,13 +5507,23 @@ impl CleanRuntimeActorCore {
     }
 
     fn watcher_status(&self) -> SyncWatcherStatus {
-        self.watcher.status()
+        let mut status = self.watcher.status();
+        if self.full_scan.is_some() || self.completed_full_scan.is_some() {
+            status.pending = true;
+            status.pending_requires_full_scan = true;
+            status.drain_in_flight = true;
+        }
+        status
     }
 
-    fn full_scan_changed_paths(
-        &self,
-        graph: &Graph,
-    ) -> Result<BTreeSet<ManagedPath>, CleanActorMutationFailure> {
+    fn begin_full_scan(&mut self, graph: &Graph) -> Result<(), CleanActorMutationFailure> {
+        if self.full_scan.is_some() {
+            return Ok(());
+        }
+        if !self.watcher.full_scan {
+            return Ok(());
+        }
+        let epoch = self.watcher.latest_enqueue;
         let disk = graph
             .fresh_initial_shadow_raw_managed_text_inventory()
             .map_err(|error| CleanActorMutationFailure {
@@ -5522,8 +5574,39 @@ impl CleanRuntimeActorCore {
                     detail: format!("clean watcher manifest path inventory failed: {error}"),
                 })?,
         );
-        let mut changed = BTreeSet::new();
-        for path in candidates {
+        let retained_epoch = self
+            .watcher
+            .begin_full_scan()
+            .expect("full scan remains pending until its continuation is installed");
+        debug_assert_eq!(retained_epoch, epoch);
+        self.full_scan = Some(CleanFullScanContinuation {
+            epoch,
+            disk,
+            candidates: candidates.into_iter().collect(),
+            next: 0,
+            changed: BTreeSet::new(),
+        });
+        Ok(())
+    }
+
+    fn advance_full_scan(&mut self) -> Result<CleanFullScanStep, CleanActorMutationFailure> {
+        let continuation = self
+            .full_scan
+            .as_mut()
+            .expect("full scan advance requires an initialized continuation");
+        let read = self
+            .runtime
+            .database()
+            .materialized_read()
+            .map_err(|error| CleanActorMutationFailure {
+                phase: OperationalPhase::Planning,
+                detail: format!("clean watcher SQLite inventory failed: {error}"),
+            })?;
+        let started = Instant::now();
+        let mut processed = 0_usize;
+        while continuation.next < continuation.candidates.len() {
+            let path = continuation.candidates[continuation.next].clone();
+            processed += 1;
             let owners =
                 read.pages_by_path(&path, 2)
                     .map_err(|error| CleanActorMutationFailure {
@@ -5550,7 +5633,7 @@ impl CleanRuntimeActorCore {
                     phase: OperationalPhase::Planning,
                     detail: format!("clean watcher predecessor for {path} failed: {error}"),
                 })?;
-            let differs = match (disk.get(&path), &predecessor) {
+            let differs = match (continuation.disk.get(&path), &predecessor) {
                 (None, None)
                 | (
                     None,
@@ -5571,7 +5654,7 @@ impl CleanRuntimeActorCore {
                 if std::env::var_os("TINE_CLEAN_WATCHER_TRACE").is_some() {
                     eprintln!(
                         "clean watcher changed path {path}: disk={} predecessor={}",
-                        disk.get(&path).map_or_else(
+                        continuation.disk.get(&path).map_or_else(
                             || "absent".to_owned(),
                             |bytes| format!(
                                 "{}:{:?}",
@@ -5586,10 +5669,23 @@ impl CleanRuntimeActorCore {
                         }
                     );
                 }
-                changed.insert(path);
+                continuation.changed.insert(path);
+            }
+            continuation.next += 1;
+            if processed >= CLEAN_FULL_SCAN_PATH_BUDGET
+                || started.elapsed() >= CLEAN_FULL_SCAN_TIME_BUDGET
+            {
+                return Ok(CleanFullScanStep::Pending);
             }
         }
-        Ok(changed)
+        let completed = self
+            .full_scan
+            .take()
+            .expect("completed full scan continuation remains installed");
+        Ok(CleanFullScanStep::Complete {
+            epoch: completed.epoch,
+            changed: completed.changed,
+        })
     }
 
     fn execute_external_paths(
@@ -21121,19 +21217,41 @@ impl RuntimeActor {
             return SyncRuntimeTick::ProviderMutation { batch_id };
         }
 
-        let paths = {
-            let clean = self.clean.as_ref().expect("clean actor remains installed");
-            if !clean.watcher.pending() {
+        let (paths, full_scan_epoch) = {
+            let clean = self.clean.as_mut().expect("clean actor remains installed");
+            if clean.full_scan.is_none()
+                && clean.completed_full_scan.is_none()
+                && !clean.watcher.pending()
+            {
                 return if self.provider_has_work() {
                     self.tick_clean_provider()
                 } else {
                     SyncRuntimeTick::Idle
                 };
             }
-            if clean.watcher.full_scan {
-                clean.full_scan_changed_paths(&self.graph)
+            if let Some((epoch, changed)) = clean.completed_full_scan.as_ref() {
+                (Ok(changed.clone()), Some(*epoch))
+            } else if clean.full_scan.is_some() || clean.watcher.full_scan {
+                if let Err(error) = clean.begin_full_scan(&self.graph) {
+                    self.refresh_watcher();
+                    return SyncRuntimeTick::Failed(format!(
+                        "clean external reconciliation failed during {:?}: {}",
+                        error.phase, error.detail
+                    ));
+                }
+                match clean.advance_full_scan() {
+                    Ok(CleanFullScanStep::Pending) => {
+                        self.refresh_watcher();
+                        return SyncRuntimeTick::Recovering;
+                    }
+                    Ok(CleanFullScanStep::Complete { epoch, changed }) => {
+                        clean.completed_full_scan = Some((epoch, changed.clone()));
+                        (Ok(changed), Some(epoch))
+                    }
+                    Err(error) => (Err(error), None),
+                }
             } else {
-                Ok(clean.watcher.exact.clone())
+                (Ok(clean.watcher.exact.clone()), None)
             }
         };
         let paths = match paths {
@@ -21155,7 +21273,14 @@ impl RuntimeActor {
             Ok(CleanActorExternalOutcome::Noop) => {
                 let clean = self.clean.as_mut().expect("clean actor remains installed");
                 let observable = std::mem::take(&mut clean.external_change_pending_notification);
-                let epoch = clean.watcher.settle();
+                let epoch = match full_scan_epoch {
+                    Some(epoch) => {
+                        clean.completed_full_scan = None;
+                        clean.watcher.settle_through(epoch);
+                        epoch
+                    }
+                    None => clean.watcher.settle(),
+                };
                 self.refresh_watcher();
                 if observable {
                     SyncRuntimeTick::AdmittedComplete { epoch }
@@ -21167,7 +21292,14 @@ impl RuntimeActor {
                 self.queue_clean_provider_publication(batch_id);
                 let clean = self.clean.as_mut().expect("clean actor remains installed");
                 clean.external_change_pending_notification = false;
-                let epoch = clean.watcher.settle();
+                let epoch = match full_scan_epoch {
+                    Some(epoch) => {
+                        clean.completed_full_scan = None;
+                        clean.watcher.settle_through(epoch);
+                        epoch
+                    }
+                    None => clean.watcher.settle(),
+                };
                 self.refresh_watcher();
                 SyncRuntimeTick::AdmittedComplete { epoch }
             }
@@ -24811,11 +24943,12 @@ impl RuntimeActor {
         }
         if self.clean.is_some() {
             for _ in 0..MAX_CLEAN_DRAIN_TURNS {
-                let settled = self
-                    .clean
-                    .as_ref()
-                    .is_some_and(|clean| clean.pending.is_none() && !clean.watcher.pending())
-                    && !self.provider_has_work();
+                let settled = self.clean.as_ref().is_some_and(|clean| {
+                    clean.pending.is_none()
+                        && clean.full_scan.is_none()
+                        && clean.completed_full_scan.is_none()
+                        && !clean.watcher.pending()
+                }) && !self.provider_has_work();
                 if settled {
                     self.stopped_safe = true;
                     return Ok(SyncShutdownOutcome::Safe(self.snapshot()));
@@ -44350,6 +44483,52 @@ mod tests {
         ));
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn clean_full_scan_yields_between_bounded_path_slices() {
+        let fixture = ActivationFixture::nested_unicode("clean-bounded-full-scan", 0xa17f);
+        fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+        for index in 0..(CLEAN_FULL_SCAN_PATH_BUDGET + 8) {
+            fs::write(
+                fixture
+                    .graph_root
+                    .join("pages")
+                    .join(format!("bounded scan {index}.md")),
+                format!("- bounded scan page {index}\n"),
+            )
+            .unwrap();
+        }
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+            .unwrap();
+
+        assert_eq!(
+            handle.tick().unwrap(),
+            SyncRuntimeTick::Recovering,
+            "one full-scan turn must stop at its path budget"
+        );
+        assert!(handle.status().unwrap().watcher.drain_in_flight);
+
+        let loaded = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "Root.md".into(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            loaded,
+            SyncApplicationPageLoadOutcome::Loaded { page, .. } if page.path == "Root.md"
+        ));
+        drain_until_settled(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }

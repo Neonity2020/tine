@@ -1383,7 +1383,8 @@ mod tests {
             "emergency return is always available",
             "Settings action is always graceful",
             "inactivity timers are not storage authority",
-            "does not grant renderer work actor-lane priority",
+            "path-count and wall-time budget per actor turn",
+            "progress values are observational",
         ] {
             assert!(
                 contract.contains(required),
