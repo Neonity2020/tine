@@ -1243,10 +1243,67 @@ pub(crate) fn markdown_structurally_round_trips_parsed(
 ///   `>>>>>>> `) is present — a lone `=======` (e.g. a setext-style divider)
 ///   never quarantines a page.
 pub fn vcs_conflict_markers(content: &str) -> Vec<&'static str> {
-    let mut fence: Option<char> = None;
+    let scan = scan_vcs_conflict_markers(content);
+    if !scan
+        .iter()
+        .any(|(_, kind)| matches!(kind, ConflictMarkerKind::Ours | ConflictMarkerKind::Theirs))
+    {
+        // No anchor line → not a conflicted file (a lone `=======` is a divider).
+        return Vec::new();
+    }
     let mut seen: Vec<&'static str> = Vec::new();
-    let mut anchored = false;
-    for line in content.lines() {
+    for (_, kind) in scan {
+        let token = kind.token();
+        if !seen.contains(&token) {
+            seen.push(token);
+        }
+    }
+    seen
+}
+
+/// One recognized column-0 VCS merge-conflict marker line.
+///
+/// Ordering inside a git/Fossil conflict region is
+/// `Ours` → [`Suggested` (Fossil only)] → [`Base`] → `Divider` → `Theirs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictMarkerKind {
+    /// `<<<<<<< ours` — opens the region; our/local side follows.
+    Ours,
+    /// `||||||| base` (git diff3) / `||||||| COMMON ANCESTOR …` (Fossil).
+    Base,
+    /// `=======` / `======= MERGED IN …` — their side follows.
+    Divider,
+    /// `####### SUGGESTED CONFLICT RESOLUTION follows …` (Fossil only).
+    Suggested,
+    /// `>>>>>>> theirs` — closes the region.
+    Theirs,
+}
+
+impl ConflictMarkerKind {
+    /// The bare marker token, as reported to the user.
+    pub fn token(self) -> &'static str {
+        match self {
+            ConflictMarkerKind::Ours => "<<<<<<<",
+            ConflictMarkerKind::Base => "|||||||",
+            ConflictMarkerKind::Divider => "=======",
+            ConflictMarkerKind::Suggested => "#######",
+            ConflictMarkerKind::Theirs => ">>>>>>>",
+        }
+    }
+}
+
+/// THE scanner for VCS merge-conflict marker lines: `(line index, kind)` for
+/// every column-0 marker outside a column-0 fenced code block, in file order.
+///
+/// Single source of truth — [`vcs_conflict_markers`] (detection/quarantine) and
+/// the Concord marker parser (`crate::concord_queue`) both derive from it, so
+/// "what counts as a marker" can never diverge between the code that REFUSES to
+/// rewrite a file and the code that RESOLVES it. See [`vcs_conflict_markers`]
+/// for the recognized dialects and the two false-positive guards.
+pub fn scan_vcs_conflict_markers(content: &str) -> Vec<(usize, ConflictMarkerKind)> {
+    let mut fence: Option<char> = None;
+    let mut out = Vec::new();
+    for (index, line) in content.lines().enumerate() {
         if let Some(delimiter) = fence {
             if line.chars().take_while(|&c| c == delimiter).count() >= 3 {
                 fence = None;
@@ -1262,31 +1319,23 @@ pub fn vcs_conflict_markers(content: &str) -> Vec<&'static str> {
             continue;
         }
         let kind = if line.starts_with("<<<<<<< ") {
-            anchored = true;
-            Some("<<<<<<<")
+            Some(ConflictMarkerKind::Ours)
         } else if line.starts_with(">>>>>>> ") {
-            anchored = true;
-            Some(">>>>>>>")
+            Some(ConflictMarkerKind::Theirs)
         } else if line.starts_with("||||||| ") {
-            Some("|||||||")
+            Some(ConflictMarkerKind::Base)
         } else if line == "=======" || line.starts_with("======= ") {
-            Some("=======")
+            Some(ConflictMarkerKind::Divider)
         } else if line.starts_with("####### ") {
-            Some("#######")
+            Some(ConflictMarkerKind::Suggested)
         } else {
             None
         };
         if let Some(kind) = kind {
-            if !seen.contains(&kind) {
-                seen.push(kind);
-            }
+            out.push((index, kind));
         }
     }
-    if anchored {
-        seen
-    } else {
-        Vec::new()
-    }
+    out
 }
 
 #[cfg(test)]

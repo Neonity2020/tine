@@ -948,6 +948,23 @@ pub struct JournalConflict {
     pub files: Vec<JournalFile>,
 }
 
+/// Lifetime of the ONE authorized write to a marker-bearing file (Concord
+/// invariant 3's single exemption). Dropping it — including on an early return
+/// or a panic — re-arms the refusal for that path, so an exemption can never
+/// outlive the resolution that earned it.
+struct MarkerResolutionGuard<'a> {
+    graph: &'a Graph,
+    path: PathBuf,
+}
+
+impl Drop for MarkerResolutionGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.graph.marker_resolutions.lock() {
+            set.remove(&self.path);
+        }
+    }
+}
+
 /// A sync-tool conflict copy left in the graph (Syncthing/Dropbox) — a
 /// `*.sync-conflict-*.md` (or Dropbox `(conflicted copy)`) file that shadows a
 /// real page. Surfaced so the user can review + reconcile it instead of it
@@ -2516,6 +2533,15 @@ pub struct Graph {
     /// unset (managed regime, most tests) makes every hook a no-op. Never
     /// consulted on the save critical path — only by conflict diffs.
     concord_ledger: std::sync::OnceLock<Arc<crate::concord_ledger::ConcordLedger>>,
+    /// The exact page files currently being rewritten as the DIRECT result of a
+    /// user's VCS-marker resolution (Concord L5, `resolve_vcs_marker_conflict`).
+    /// Concord invariant 3 says Tine never rewrites a marker-bearing file — the
+    /// one exception is the resolution the user just confirmed, which REMOVES
+    /// the markers. Scoping the exception to an exact path (held only across the
+    /// one guarded write, under that page's lock) means a concurrent editor save
+    /// to any OTHER marker-bearing page is still refused. See
+    /// `serialize_page_document`.
+    marker_resolutions: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// `path → content_rev` of the on-disk bytes the cached page's
     /// `Document` was parsed from. Invariant: an entry exists IFF the page is in
     /// the cache, and `disk_revs[path] == content_rev(current disk bytes)` ⟹ the
@@ -5504,6 +5530,7 @@ impl Graph {
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             concord_ledger: std::sync::OnceLock::new(),
+            marker_resolutions: std::sync::Mutex::new(std::collections::HashSet::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
             loaded_file_identities: RwLock::new(std::collections::HashMap::new()),
             conflict_authority: std::sync::Mutex::new(ConflictAuthorityState::default()),
@@ -12914,6 +12941,252 @@ impl Graph {
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
         out
+    }
+
+    /// Whether `path` is inside its one authorized marker-resolution write.
+    fn is_resolving_markers(&self, path: &Path) -> bool {
+        self.marker_resolutions
+            .lock()
+            .map(|set| set.contains(path))
+            .unwrap_or(false)
+    }
+
+    /// Authorize exactly one marker-resolution write to `path`, for the lifetime
+    /// of the returned guard. Held only across the guarded write, under the
+    /// page lock.
+    fn authorize_marker_resolution(&self, path: &Path) -> MarkerResolutionGuard<'_> {
+        if let Ok(mut set) = self.marker_resolutions.lock() {
+            set.insert(path.to_path_buf());
+        }
+        MarkerResolutionGuard {
+            graph: self,
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// The Concord conflict queue (L3): ONE derived inventory of everything on
+    /// disk that needs the user's judgement, from both artifact sources.
+    ///
+    /// Derived, never stored — no new metadata goes into the graph (invariant 1)
+    /// and no cache is consulted, so the queue survives a restart trivially: the
+    /// same on-disk state recomputes the same objects with the same ids. Block
+    /// counts are computed here because conflicts are few (a handful at most) and
+    /// each costs one parse of two small texts; the two directory walks the
+    /// sources already do dominate.
+    pub fn conflict_queue(&self) -> Vec<crate::concord_queue::ConflictObject> {
+        use crate::concord_queue::{
+            decidable_row_count, ConflictObject, ConflictSide, ConflictSource, SideRole,
+        };
+        let mut out = Vec::new();
+        for copy in self.list_sync_conflicts() {
+            let Some(winner) = copy.base_path.clone() else {
+                // The page it shadowed is gone — it is a stray, not a two-sided
+                // conflict; the Settings panel offers to discard it. Nothing to
+                // resolve in place, so it stays out of the queue.
+                continue;
+            };
+            let diff = self.sync_conflict_diff(&winner, &copy.path).ok().flatten();
+            let mut sides = vec![
+                ConflictSide {
+                    role: SideRole::Mine,
+                    label: "This device".to_string(),
+                    path: Some(winner.clone()),
+                },
+                ConflictSide {
+                    role: SideRole::Theirs,
+                    label: if copy.tag.is_empty() {
+                        "Conflict copy".to_string()
+                    } else {
+                        copy.tag.clone()
+                    },
+                    path: Some(copy.path.clone()),
+                },
+            ];
+            if diff.as_ref().is_some_and(|d| d.three_way) {
+                sides.push(ConflictSide {
+                    role: SideRole::Base,
+                    label: "Last agreed version".to_string(),
+                    path: None,
+                });
+            }
+            out.push(ConflictObject {
+                id: format!("copy:{}", copy.path),
+                source: ConflictSource::SyncCopy,
+                page_name: copy.base_name.clone(),
+                page_path: winner,
+                kind: copy.kind,
+                sides,
+                block_conflicts: diff.as_ref().map(|d| decidable_row_count(&d.rows)),
+                markers: Vec::new(),
+            });
+        }
+        for marked in self.list_vcs_marker_conflicts() {
+            let parsed = self.vcs_marker_conflict_diff(&marked.path).ok().flatten();
+            let label = |pick: fn(&crate::concord_queue::MarkerConflictDiff) -> &str,
+                         fallback: &str| {
+                parsed
+                    .as_ref()
+                    .map(pick)
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or(fallback)
+                    .to_string()
+            };
+            let mut sides = vec![
+                ConflictSide {
+                    role: SideRole::Mine,
+                    label: label(|p| p.mine_label.as_str(), "Local side"),
+                    path: None,
+                },
+                ConflictSide {
+                    role: SideRole::Theirs,
+                    label: label(|p| p.theirs_label.as_str(), "Merged-in side"),
+                    path: None,
+                },
+            ];
+            if parsed.as_ref().is_some_and(|p| p.diff.three_way) {
+                sides.push(ConflictSide {
+                    role: SideRole::Base,
+                    label: "Common ancestor".to_string(),
+                    path: None,
+                });
+            }
+            out.push(ConflictObject {
+                id: format!("markers:{}", marked.path),
+                source: ConflictSource::VcsMarkers,
+                page_name: marked.name.clone(),
+                page_path: marked.path.clone(),
+                kind: marked.kind,
+                sides,
+                block_conflicts: parsed.as_ref().map(|p| decidable_row_count(&p.diff.rows)),
+                markers: marked.markers.clone(),
+            });
+        }
+        out.sort_by(|a, b| a.page_name.cmp(&b.page_name).then_with(|| a.id.cmp(&b.id)));
+        out
+    }
+
+    /// Block-level diff of a marker-bearing page's own two (or three) sides —
+    /// Concord L5 completion. The marker sections are parsed into COMPLETE page
+    /// texts (`concord_queue::parse_vcs_marker_sides`) and run through the very
+    /// same `sync_diff` machinery the conflict-copy path uses, so the in-page
+    /// resolution UI is one renderer, not two.
+    ///
+    /// Read-only. Both staleness tokens are the rev of the whole marker file, so
+    /// [`Graph::resolve_vcs_marker_conflict`]'s guard rejects decisions made
+    /// against a version the VCS has since changed. `Ok(None)` if the path is
+    /// invalid, gone, or not conflicted.
+    pub fn vcs_marker_conflict_diff(
+        &self,
+        rel: &str,
+    ) -> io::Result<Option<crate::concord_queue::MarkerConflictDiff>> {
+        let path = ManagedPath::parse(rel.to_owned()).map_err(|_| bad_path())?;
+        let Some(bytes) = self.read_projection_input(&path)? else {
+            return Ok(None);
+        };
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        let Some(sides) = crate::concord_queue::parse_vcs_marker_sides(&content) else {
+            return Ok(None);
+        };
+        let org = matches!(Format::from_path(&self.root.join(rel)), Format::Org);
+        let mut diff = match sides.base.as_deref() {
+            Some(base) => crate::sync_diff::diff3_texts(base, &sides.mine, &sides.theirs, org),
+            None => crate::sync_diff::diff_texts(&sides.mine, &sides.theirs, org),
+        };
+        // Both revs address the ONE file the decisions will be applied to.
+        let rev = content_rev(&content);
+        diff.base_rev = rev.clone();
+        diff.conflict_rev = rev;
+        Ok(Some(crate::concord_queue::MarkerConflictDiff {
+            mine_label: sides.mine_label,
+            theirs_label: sides.theirs_label,
+            regions: sides.regions,
+            diff,
+        }))
+    }
+
+    /// Apply the user's per-row decisions to a marker-bearing page and write the
+    /// CLEAN merged result — the one write Concord invariant 3 permits to such a
+    /// file, and only as the direct consequence of the resolution the user just
+    /// confirmed in the in-page resolver.
+    ///
+    /// Same guards as [`Graph::resolve_sync_conflict`]: managed-write admission,
+    /// page lock, `base_rev` staleness guard (here against the whole marker
+    /// file), org round-trip firewall. The merge itself is
+    /// `sync_diff::merge_blocks` over the SAME alignment the diff published, so a
+    /// row id means the same block to both. Once this succeeds the file no longer
+    /// carries markers, so the save refusal lifts naturally — nothing else has to
+    /// be told about it.
+    pub fn resolve_vcs_marker_conflict(
+        &self,
+        rel: &str,
+        decisions: &std::collections::HashMap<String, String>,
+        base_rev: &str,
+        pre_choice: &str,
+    ) -> io::Result<()> {
+        let write = self.admit_managed_text_writer()?;
+        let path = self
+            .resolve_managed_rel(&write, rel)?
+            .ok_or_else(bad_path)?;
+        let entry = self.entry_for_path(&path).ok_or_else(bad_path)?;
+        let lock = self.page_lock(&path);
+        let _guard = lock.lock().unwrap();
+        let content = self.managed_read_to_string(&write, &path)?;
+        if content_rev(&content) != base_rev {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file changed on disk",
+            ));
+        }
+        let Some(sides) = crate::concord_queue::parse_vcs_marker_sides(&content) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no VCS merge conflict markers to resolve",
+            ));
+        };
+        // Org round-trip firewall: refuse rather than risk corrupting an .org
+        // page whose sides don't survive a parse/serialize round trip.
+        if Format::from_path(&path) == Format::Org
+            && (!crate::org::org_editable(&sides.mine) || !crate::org::org_editable(&sides.theirs))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "an org side of this merge does not round-trip; not resolving",
+            ));
+        }
+        let mine_doc = parse_doc(&path, &sides.mine);
+        let theirs_doc = parse_doc(&path, &sides.theirs);
+        let merged_roots =
+            crate::sync_diff::merge_blocks(&mine_doc.roots, &theirs_doc.roots, decisions);
+        let pre_block = match pre_choice {
+            "theirs" => theirs_doc.pre_block.clone(),
+            "mine" => mine_doc.pre_block.clone(),
+            _ if Format::from_path(&path) == Format::Md => union_pre(
+                mine_doc.pre_block.as_deref(),
+                theirs_doc.pre_block.as_deref(),
+            ),
+            _ => mine_doc.pre_block.clone(),
+        };
+        let mut merged = Document {
+            pre_block,
+            roots: merged_roots,
+        };
+        assign_doc_runtime_ids(&mut merged.roots, &entry.rel_path);
+        let dto = page_dto_checked(&entry, &merged)?;
+        let cacheable = self.managed_path_is_cacheable(&write, &path)?;
+        let authorized = self.authorize_marker_resolution(&path);
+        let result = self.write_page(
+            &write,
+            &dto,
+            &path,
+            Some(&content),
+            true,
+            None,
+            None,
+            None,
+            cacheable,
+        );
+        drop(authorized);
+        result.map(|_| ())
     }
 
     /// Structural block-level diff of a conflict copy against its winner (both
@@ -21433,11 +21706,12 @@ impl Graph {
         // lines (or drop them), which destroys the VCS's own conflict
         // detection and can silently lose one side of the merge. The page
         // stays readable; every write to it — normal and force — is refused
-        // until the user resolves the merge outside Tine. Mirrors the GH #163
-        // refusal-instead-of-rewrite pattern below.
+        // until the user resolves the merge, in Tine's own in-page conflict
+        // resolver (`resolve_vcs_marker_conflict`, the ONE exemption below) or
+        // outside Tine. Mirrors the GH #163 refusal-instead-of-rewrite pattern.
         if let Some(existing) = existing {
             let markers = doc::vcs_conflict_markers(existing);
-            if !markers.is_empty() {
+            if !markers.is_empty() && !self.is_resolving_markers(path) {
                 return Err(projection_semantic_refusal(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -34964,6 +35238,238 @@ mod tests {
         assert_eq!(conflicts[0].kind, PageKind::Page);
         assert_eq!(conflicts[0].markers, vec!["<<<<<<<", "=======", ">>>>>>>"]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Concord P4: the derived conflict queue + in-page marker resolution ---
+
+    /// Markers exactly as `git merge` writes them in `diff3` style.
+    const P4_DIFF3_MARKERS: &str = concat!(
+        "- shared top\n",
+        "<<<<<<< HEAD\n- mine wins\n",
+        "||||||| merged common ancestors\n- original\n",
+        "=======\n- theirs wins\n",
+        ">>>>>>> feature\n",
+    );
+
+    #[test]
+    fn conflict_queue_derives_both_artifact_sources_and_survives_a_restart() {
+        let dir = scratch("concord-queue-sources");
+        fs::write(dir.join("pages").join("Notes.md"), "- winner text\n").unwrap();
+        fs::write(
+            dir.join("pages")
+                .join("Notes.sync-conflict-20260817-101010-ABCDEFG.md"),
+            "- copy text\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Merged.md"), P4_DIFF3_MARKERS).unwrap();
+        fs::write(dir.join("pages").join("Calm.md"), "- nothing wrong here\n").unwrap();
+
+        let queue = Graph::open(&dir).conflict_queue();
+        assert_eq!(
+            queue.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                "markers:pages/Merged.md",
+                "copy:pages/Notes.sync-conflict-20260817-101010-ABCDEFG.md",
+            ],
+            "one object per artifact, ordered by page name: {queue:?}"
+        );
+
+        let markers = &queue[0];
+        assert_eq!(
+            markers.source,
+            crate::concord_queue::ConflictSource::VcsMarkers
+        );
+        assert_eq!(markers.page_path, "pages/Merged.md");
+        // Three sides: the diff3 marker block carries its own common ancestor.
+        assert_eq!(
+            markers.sides.iter().map(|s| s.role).collect::<Vec<_>>(),
+            vec![
+                crate::concord_queue::SideRole::Mine,
+                crate::concord_queue::SideRole::Theirs,
+                crate::concord_queue::SideRole::Base,
+            ]
+        );
+        assert_eq!(markers.sides[0].label, "HEAD");
+        assert_eq!(markers.sides[1].label, "feature");
+        assert!(markers.block_conflicts.is_some_and(|n| n > 0));
+
+        let copy = &queue[1];
+        assert_eq!(copy.source, crate::concord_queue::ConflictSource::SyncCopy);
+        assert_eq!(copy.page_name, "Notes");
+        assert_eq!(copy.page_path, "pages/Notes.md");
+        assert_eq!(
+            copy.sides
+                .iter()
+                .filter_map(|s| s.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "pages/Notes.md".to_string(),
+                "pages/Notes.sync-conflict-20260817-101010-ABCDEFG.md".to_string(),
+            ]
+        );
+        assert!(copy.block_conflicts.is_some_and(|n| n > 0));
+
+        // The queue is DERIVED: a second, independent Graph over the same disk
+        // state — what a restart is — reproduces it identically, with no stored
+        // state of any kind (invariant 1).
+        let after_restart = Graph::open(&dir).conflict_queue();
+        assert_eq!(
+            after_restart
+                .iter()
+                .map(|c| (c.id.clone(), c.block_conflicts))
+                .collect::<Vec<_>>(),
+            queue
+                .iter()
+                .map(|c| (c.id.clone(), c.block_conflicts))
+                .collect::<Vec<_>>()
+        );
+        // And nothing was written into the graph to make that work.
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join("Merged.md")).unwrap(),
+            P4_DIFF3_MARKERS
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_conflict_diff_reads_the_pages_own_sides_without_writing() {
+        let dir = scratch("concord-marker-diff");
+        fs::write(dir.join("pages").join("Merged.md"), P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+        let parsed = graph
+            .vcs_marker_conflict_diff("pages/Merged.md")
+            .unwrap()
+            .expect("a conflicted page");
+        assert_eq!(parsed.mine_label, "HEAD");
+        assert_eq!(parsed.theirs_label, "feature");
+        assert_eq!(parsed.regions, 1);
+        let diff = parsed.diff;
+        assert!(diff.three_way, "the ||||||| section is a real ancestor");
+        // Both staleness tokens address the ONE file the resolution will write.
+        let rev = content_rev(&fs::read_to_string(dir.join("pages").join("Merged.md")).unwrap());
+        assert_eq!(diff.base_rev, rev);
+        assert_eq!(diff.conflict_rev, rev);
+        // A page with no markers has no marker diff.
+        fs::write(dir.join("pages").join("Calm.md"), "- fine\n").unwrap();
+        assert!(Graph::open(&dir)
+            .vcs_marker_conflict_diff("pages/Calm.md")
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_markers_keep_both_writes_sibling_blocks_and_clears_the_quarantine() {
+        let dir = scratch("concord-marker-resolve");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+
+        // Before: the page is quarantined — an ordinary save is refused.
+        let entry = graph.find_entry("Merged", PageKind::Page).unwrap();
+        let page = graph.load_page(&entry).unwrap();
+        assert!(
+            graph.save_page(&page, page.rev.as_deref()).is_err(),
+            "a marker-bearing page must refuse ordinary saves"
+        );
+
+        let diff = graph
+            .vcs_marker_conflict_diff(rel)
+            .unwrap()
+            .expect("conflicted")
+            .diff;
+        // Keep-both on every decidable row — the no-loss default.
+        let decisions: std::collections::HashMap<String, String> =
+            collect_decidable_ids(&diff.rows)
+                .into_iter()
+                .map(|id| (id, "both".to_string()))
+                .collect();
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("resolution writes the merged result");
+
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(
+            doc::vcs_conflict_markers(&after).is_empty(),
+            "no markers survive a resolution: {after:?}"
+        );
+        // Both sides are present, as adjacent sibling blocks of valid markdown.
+        assert!(after.contains("- mine wins"), "{after:?}");
+        assert!(after.contains("- theirs wins"), "{after:?}");
+        assert!(after.contains("- shared top"), "{after:?}");
+        let reparsed = doc::parse(&after);
+        assert_eq!(
+            reparsed
+                .roots
+                .iter()
+                .map(|b| b.raw.trim().to_string())
+                .collect::<Vec<_>>(),
+            vec!["shared top", "mine wins", "theirs wins"]
+        );
+        // The quarantine lifts by itself: the file simply has no markers now.
+        assert!(Graph::open(&dir).list_vcs_marker_conflicts().is_empty());
+        assert!(Graph::open(&dir).conflict_queue().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_resolution_is_guarded_and_never_leaves_the_file_writable() {
+        let dir = scratch("concord-marker-guards");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        let decisions = std::collections::HashMap::new();
+
+        // Stale base_rev → refuse without writing (the VCS moved under the UI).
+        let err = graph
+            .resolve_vcs_marker_conflict(rel, &decisions, "not-the-current-rev", "union")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&file).unwrap(), P4_DIFF3_MARKERS);
+
+        // A page with no markers is not a resolution target.
+        fs::write(dir.join("pages").join("Calm.md"), "- fine\n").unwrap();
+        let calm = Graph::open(&dir);
+        let calm_rev = content_rev("- fine\n");
+        assert_eq!(
+            calm.resolve_vcs_marker_conflict("pages/Calm.md", &decisions, &calm_rev, "union")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // The exemption is scoped to the one resolution: after it, ordinary
+        // saves to a still-marker-bearing page are refused again.
+        fs::write(dir.join("pages").join("Other.md"), P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("the real resolution succeeds");
+        let other_entry = graph.find_entry("Other", PageKind::Page).unwrap();
+        let other = graph.load_page(&other_entry).unwrap();
+        assert!(
+            graph.save_page(&other, other.rev.as_deref()).is_err(),
+            "the other marker page stays quarantined"
+        );
+        // And the resolved page is now an ordinary, savable page.
+        let resolved_entry = graph.find_entry("Merged", PageKind::Page).unwrap();
+        let resolved = graph.load_page(&resolved_entry).unwrap();
+        assert!(graph.save_page(&resolved, resolved.rev.as_deref()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn collect_decidable_ids(rows: &[crate::sync_diff::DiffRow]) -> Vec<String> {
+        let mut out = Vec::new();
+        for row in rows {
+            if row.kind != crate::sync_diff::RowKind::Unchanged {
+                out.push(row.id.clone());
+            }
+            out.extend(collect_decidable_ids(&row.children));
+        }
+        out
     }
 
     #[test]

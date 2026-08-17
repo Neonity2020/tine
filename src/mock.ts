@@ -1787,6 +1787,73 @@ export function mockBackend(): Backend {
         three_way: true,
       };
     },
+    async conflictQueue() {
+      // Same `?conflicts` demo flag as the two listings above; the queue is
+      // derived from exactly them, so the demo stays consistent.
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
+      return [
+        {
+          id: "copy:pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+          source: "sync-copy" as const,
+          page_name: "Project Plan",
+          page_path: "pages/Project Plan.md",
+          kind: "page" as const,
+          sides: [
+            { role: "mine" as const, label: "This device", path: "pages/Project Plan.md" },
+            {
+              role: "theirs" as const,
+              label: "sync-conflict-20260705-141233-A2B2C3D",
+              path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+            },
+            { role: "base" as const, label: "Last agreed version" },
+          ],
+          block_conflicts: 3,
+        },
+        {
+          id: "markers:pages/Tine.md",
+          source: "vcs-markers" as const,
+          page_name: "Tine",
+          page_path: "pages/Tine.md",
+          kind: "page" as const,
+          sides: [
+            { role: "mine" as const, label: "HEAD" },
+            { role: "theirs" as const, label: "feature/concord" },
+          ],
+          block_conflicts: 1,
+          markers: ["<<<<<<<", "=======", ">>>>>>>"],
+        },
+      ];
+    },
+    async vcsMarkerConflictDiff(path: string) {
+      if (path !== "pages/Tine.md") return null;
+      const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      return {
+        mine_label: "HEAD",
+        theirs_label: "feature/concord",
+        regions: 1,
+        // A diff3-style marker block: it carried its own common ancestor, so
+        // rows only one side touched arrive already decided, and only the row
+        // both sides rewrote still needs a real choice (→ keep-both).
+        diff: {
+          base_rev: "mock-marker-rev",
+          conflict_rev: "mock-marker-rev",
+          rows: [
+            { id: "0", kind: "unchanged" as const, mine: v("A local-first outliner"), theirs: v("A local-first outliner"), children: [] },
+            { id: "1", kind: "modified" as const, mine: v("Fast on very big graphs"), theirs: v("Fast on big graphs"), children: [], verdict: "mine-only" as const, suggestion: "mine" as const },
+            { id: "2", kind: "modified" as const, mine: v("Reads a real Logseq graph"), theirs: v("Reads a real Logseq graph, Markdown and Org"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
+            { id: "3", kind: "modified" as const, mine: v("Written in Rust and SolidJS"), theirs: v("Built on Tauri"), children: [], verdict: "both-changed" as const },
+          ],
+          mine_pre: null,
+          theirs_pre: null,
+          pre_differs: false,
+          blocks_identical: false,
+          three_way: true,
+        },
+      };
+    },
+    async resolveVcsMarkerConflict(): Promise<void> {
+      // no-op in the browser mock
+    },
     async resolveSyncConflict(): Promise<void> {
       // no-op in the browser mock
     },

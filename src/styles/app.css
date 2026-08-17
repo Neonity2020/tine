@@ -2693,6 +2693,133 @@ textarea {
   font-size: 11px;
   color: var(--link-color);
 }
+/* --- Concord L3/L4: the calm queue badge and the in-page resolver. --- */
+
+/* The badge waits in the sidebar footer. Deliberately quiet: no red, no count
+   bubble, no animation — a conflict is a thing to get to, not an alarm. */
+.conflict-queue-badge {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  text-align: left;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.conflict-queue-badge:hover {
+  border-color: color-mix(in srgb, var(--link-color) 45%, var(--border-color));
+  color: var(--text-primary);
+}
+.conflict-queue-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #b45309;
+  flex-shrink: 0;
+}
+
+.page-conflict {
+  margin: 0 0 14px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid #b45309;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+.page-conflict-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+}
+.page-conflict-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.page-conflict-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.page-conflict-count {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+/* The two (or three) sides get distinct, stable colours: the same hue names the
+   column label, the cell, and the segment button for that side. */
+.page-conflict-legend {
+  display: flex;
+  gap: 14px;
+  padding: 6px 14px 0;
+  font-size: 11px;
+}
+.page-conflict-side {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+}
+.page-conflict-side::before {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+.page-conflict-side.mine::before {
+  background: #2e7d32;
+}
+.page-conflict-side.theirs::before {
+  background: #1565c0;
+}
+.page-conflict-side.base::before {
+  background: var(--text-muted);
+}
+.page-conflict .sync-merge-cell.mine {
+  border-left: 3px solid color-mix(in srgb, #2e7d32 55%, transparent);
+}
+.page-conflict .sync-merge-cell.theirs {
+  border-left: 3px solid color-mix(in srgb, #1565c0 55%, transparent);
+}
+.page-conflict-rows {
+  padding: 2px 14px 8px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+/* Brief highlight as "n conflicts ↑↓" walks between regions. */
+.page-conflict-row-focus {
+  background: color-mix(in srgb, var(--link-color) 14%, transparent);
+  border-radius: 5px;
+}
+.page-conflict-empty {
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.page-conflict-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+}
+.page-conflict-foot button {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.page-conflict .sync-merge-toolbar,
+.page-conflict .sync-merge-collabels {
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
 .sync-merge-preblock {
   padding: 6px 16px 0;
 }

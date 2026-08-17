@@ -60,3 +60,14 @@ We will:
   id (becomes a fresh block), which is correct for an intentionally-duplicated block.
 - Scope stays bounded to detection + manual 2-way merge. It is explicitly **not** a
   sync engine; the op-log CRDT remains Deferred, with this item as its prerequisite.
+
+## Addendum (2026-08-17) — ADRs 0056, 0057
+
+- **0056** upgrades the diff to block-level 3-way when a base is known; the
+  alignment, row ids and `merge_blocks` semantics decided here are unchanged,
+  and the base only pre-selects a side.
+- **0057** moves the review to the page (this modal remains as the fallback
+  surface, rendered by the same shared row component) and routes a SECOND
+  artifact source — VCS marker sections, parsed into complete page texts —
+  through this same engine and, for its write, through an equivalent guarded
+  path. Nothing here was replaced; it was reused twice.

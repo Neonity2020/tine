@@ -3790,6 +3790,67 @@ pub(crate) fn list_vcs_marker_conflicts(
     with_filesystem_graph(&state, |g| Ok(g.list_vcs_marker_conflicts()))
 }
 
+/// The Concord conflict queue (L3): ONE derived inventory of everything on disk
+/// that needs the user's judgement — conflict copies AND marker-bearing pages —
+/// behind the calm badge and the in-page resolver. Derived on every call from
+/// what is on disk, so it survives restarts without storing anything.
+#[tauri::command]
+pub(crate) fn conflict_queue(
+    state: GraphContext<'_>,
+) -> Result<Vec<tine_core::concord_queue::ConflictObject>, String> {
+    with_filesystem_graph(&state, |g| Ok(g.conflict_queue()))
+}
+
+/// Block-level diff of a marker-bearing page's own sides (Concord L5): the
+/// marker sections are parsed into complete page texts and run through the SAME
+/// block diff the conflict-copy path uses. Read-only.
+#[tauri::command]
+pub(crate) fn vcs_marker_conflict_diff(
+    path: String,
+    state: GraphContext<'_>,
+) -> Result<Option<tine_core::concord_queue::MarkerConflictDiff>, String> {
+    with_filesystem_graph(&state, |g| {
+        g.vcs_marker_conflict_diff(&path).map_err(|e| e.to_string())
+    })
+}
+
+/// Apply the user's per-row decisions to a marker-bearing page, writing the
+/// clean merged result — the one write Concord invariant 3 permits to such a
+/// file. `base_rev` guards against the VCS changing it under the review.
+///
+/// Graph-text write on a Direct Files phenomenon: managed storage has no
+/// marker-bearing files, so this is deliberately legacy-authority only.
+#[tauri::command]
+pub(crate) async fn resolve_vcs_marker_conflict(
+    path: String,
+    decisions: std::collections::HashMap<String, String>,
+    base_rev: String,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.legacy_graph()?
+            .resolve_vcs_marker_conflict(
+                &path,
+                &decisions,
+                &base_rev,
+                pre_choice.as_deref().unwrap_or("union"),
+            )
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    "conflict".to_string()
+                } else {
+                    error.to_string()
+                }
+            })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Block-level diff of a sync-conflict copy against its winner (both graph-root-
 /// relative paths) — the data behind the two-column merge UI. Read-only.
 #[tauri::command]

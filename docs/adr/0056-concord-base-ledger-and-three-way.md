@@ -98,3 +98,12 @@ instead of replacing it.
 - `sync_file_checked` and `commit_write` each carry one small hook; the ledger
   machinery lives in `concord_ledger.rs` and can be deleted wholesale without
   touching the save or reload paths.
+
+## Addendum (2026-08-17) — ADR 0057
+
+P4 landed the consumer this ADR was built for. Its suggestions now have a
+second *producer* that needs no ledger at all — the common ancestor a
+`diff3`/Fossil marker block carries inside the file — and a second *consumer*,
+the in-page resolver. Where no base answers the question, ADR 0057 leads with
+keep-both rather than defaulting to "mine". See
+`0057-concord-conflict-objects-and-in-page-resolution.md`.

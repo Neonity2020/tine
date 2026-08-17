@@ -161,17 +161,80 @@ Tine therefore **quarantines** marker-bearing files:
   markers.
 - Affected files are listed in **Settings → Backups & recovery → VCS merge
   conflicts**.
-- You resolve the merge where it belongs — in your VCS or an external editor.
-  As soon as the markers are gone from disk, the page becomes editable again
-  automatically; nothing needs to be reset in Tine.
+- You can resolve it **inside Tine**, block by block, on the page itself (see
+  *Resolving conflicts* below) — or where it belongs in your VCS or an external
+  editor. Either way, as soon as the markers are gone from disk the page becomes
+  editable again automatically; nothing needs to be reset in Tine.
 
 A page that merely *documents* merge conflicts is not quarantined: markers
 quoted inside code fences (or indented inside a bullet) don't count, and a
 lone `=======` divider line never triggers the quarantine on its own.
 
-In-Tine resolution of these conflicts (choosing sides block-by-block inside
-the page) is planned for a later Concord phase; the quarantine guarantees that
-nothing is lost in the meantime.
+## Resolving conflicts
+
+### The conflict queue
+
+Everything that needs your judgement — a sync tool's conflict copy, a page
+carrying VCS merge markers — appears in **one queue**, shown as a quiet
+`N conflicts` badge at the bottom of the sidebar. Clicking it walks you to the
+next conflicted page.
+
+The queue is **derived**, not stored: Tine recomputes it from what is on disk.
+Nothing about a conflict is written into your graph, so the queue costs nothing,
+never goes stale, and survives restarts by simply being recalculated. Deleting
+Tine's app data does not lose it either.
+
+It is deliberately calm. A conflict is a thing waiting for you, not an
+interruption: no modal opens, nothing is blocked, and leaving a page with
+conflicts outstanding gets a one-line note, never a dialog you must answer.
+
+### Resolving on the page
+
+Open a conflicted page and the two (or three) versions are shown **at the
+page**, above the outline, block by block:
+
+- The two sides are named by whatever produced them — a git ref like `HEAD` and
+  the incoming branch, or the Syncthing device/timestamp tag — and coloured
+  consistently in the legend, the columns, and the buttons.
+- Each differing block gets its own choice: keep one side, keep the other, or
+  **keep both**.
+- `N conflicts` with ↑ / ↓ walks between the blocks that need a decision.
+
+**A suggested resolution is pre-selected.** Where a common ancestor is known
+(the base ledger, or the ancestor a `diff3`/Fossil marker block carries with it),
+a block only one side changed arrives with that side already chosen and labeled
+*suggested* — so the normal gesture is glance-and-confirm rather than
+hunt-and-compare. **Apply all suggested** re-applies that opening position after
+you have experimented.
+
+Where no ancestor answers the question — both sides changed the block, or no
+common version is known — the pre-selection is **keep both**, which loses
+nothing. Keeping both writes the two versions as **adjacent sibling blocks**:
+ordinary outline Markdown that every other tool can read. Tine never invents a
+marker or a property to record that a block was contested.
+
+Nothing is applied until you click **Apply resolution**.
+
+### What resolving does
+
+- For a **conflict copy**: the merged result is written to the page and the copy
+  moves to the recoverable trash (Settings → Backups & recovery), exactly as the
+  Settings merge dialog has always done.
+- For a **marker-bearing page**: the merged result is written *without any
+  markers* — the file becomes ordinary Markdown again and the save quarantine
+  lifts by itself, because there is no longer anything to quarantine. This is
+  the only circumstance in which Tine ever rewrites a file carrying merge
+  markers, and only as the direct result of the resolution you just confirmed.
+
+Both paths run through the same guarded write Tine uses everywhere: the page is
+locked, the file must still be byte-for-byte what you reviewed (if your VCS or
+sync tool moved it in the meantime, the write is refused and the review reloads),
+`.org` pages that would not survive a round trip are refused rather than risked,
+and the losing side stays recoverable.
+
+The older **Settings → Backups & recovery → Sync conflict copies → Review &
+merge** dialog is still there as a fallback surface; it shows the same rows,
+rendered by the same code.
 
 ## The base ledger
 
@@ -181,8 +244,8 @@ version is the common ancestor of any later divergence, which is what turns a
 conflict from a guessing game into a mostly-answered question: comparing each
 side against the ancestor tells Tine *who changed what*.
 
-When you review a sync conflict copy (Settings → Backups & recovery → Sync
-conflict copies → *Review & merge*), Tine uses that ancestor when it has one:
+When you review a conflict — on the page, or in the Settings dialog — Tine
+uses that ancestor when it has one:
 
 - A block only **you** changed arrives with *your* version pre-selected.
 - A block only the **other device** changed arrives with *its* version

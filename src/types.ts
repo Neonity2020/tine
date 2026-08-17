@@ -709,6 +709,48 @@ export interface SyncConflictDiff {
 /** A user's per-row merge decision. */
 export type MergeDecision = "mine" | "theirs" | "both";
 
+/** Where a conflict object came from (Concord L3). */
+export type ConflictSource = "sync-copy" | "vcs-markers";
+
+/** Which version of the page a side is. Three roles, not two — a diff3/Fossil
+ *  marker block and a ledger-backed conflict copy both supply a base. */
+export type SideRole = "mine" | "theirs" | "base";
+
+/** One version of a page participating in a conflict. */
+export interface ConflictSide {
+  role: SideRole;
+  label: string;
+  /** Graph-root-relative path, when the side is a file of its own. */
+  path?: string | null;
+}
+
+/** One item in the Concord conflict queue: a page that needs the user's
+ *  judgement. Entirely DERIVED from what is on disk (no metadata is stored in
+ *  the graph), so the queue survives restarts by being recomputed. */
+export interface ConflictObject {
+  /** Stable derived id — `copy:<path>` / `markers:<path>`. */
+  id: string;
+  source: ConflictSource;
+  page_name: string;
+  /** Path of the page to navigate to (the winner, or the marker file). */
+  page_path: string;
+  kind: PageKind;
+  sides: ConflictSide[];
+  /** Rows needing a decision, when it was cheap to compute (absent ≠ zero). */
+  block_conflicts?: number | null;
+  /** Marker tokens present, for a `vcs-markers` object. */
+  markers?: string[];
+}
+
+/** A marker-bearing page's own conflict, parsed out of its `<<<<<<<` sections
+ *  and diffed with the same block machinery as a conflict copy (Concord L5). */
+export interface MarkerConflictDiff {
+  mine_label: string;
+  theirs_label: string;
+  regions: number;
+  diff: SyncConflictDiff;
+}
+
 export interface RefGroup {
   page: string;
   kind: PageKind;

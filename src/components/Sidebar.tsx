@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
 import { openJournals, openPage, openPageInNewTab, openFile, openInNewTab, openPageTarget, openPageTargetInNewTab, route, type PageTarget } from "../router";
-import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, moveFavorite } from "../ui";
+import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, moveFavorite, conflictQueue, advanceConflictCursor } from "../ui";
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, reportGraphOpenFailure, type LoadGraphPathOutcome } from "../graph";
 import { backend } from "../backend";
@@ -311,9 +311,36 @@ export function Sidebar(props: {
       </div>
 
       <div class="sidebar-footer">
+        <ConflictQueueBadge />
         <button class="new-page-btn" onClick={() => openSwitcher()}>+ New page</button>
       </div>
     </div>
+  );
+}
+
+
+// Concord L3: the calm badge. A conflict is a persistent object, not an
+// interruption — it waits here, never opens a modal, never blocks anything, and
+// survives restarts because the queue is derived from disk. Clicking walks to
+// the next conflicted page, where the resolution actually happens.
+export function ConflictQueueBadge(): JSX.Element {
+  const count = () => conflictQueue().length;
+  return (
+    <Show when={count()}>
+      <button
+        class="conflict-queue-badge"
+        title="Review the pages that need a decision"
+        onClick={() => {
+          const next = advanceConflictCursor();
+          // Address the exact FILE: a conflict object is about one path, and a
+          // duplicate-day journal would otherwise resolve to the canonical file.
+          if (next) openPageTarget({ name: next.page_name, pageKind: next.kind, path: next.page_path });
+        }}
+      >
+        <span class="conflict-queue-dot" aria-hidden="true" />
+        {count()} conflict{count() === 1 ? "" : "s"}
+      </button>
+    </Show>
   );
 }
 

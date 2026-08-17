@@ -6,7 +6,7 @@ import {
   isFavorite, toggleFavorite,
   graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
   agendaQuery, contextMenu, dataRev, isConflicted, renamePageInNavigation,
-  vcsMarkerConflictFor,
+  vcsMarkerConflictFor, conflictObjectFor,
 } from "../ui";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
@@ -17,6 +17,7 @@ import { UnlinkedReferences } from "./UnlinkedReferences";
 import { QueryMacro } from "./Macro";
 import { SheetTable } from "./SheetTable";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
+import { PageConflictResolution } from "./ConflictResolution";
 import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText, PageRef } from "../render/inline";
 import { EmojiText } from "../render/emoji";
@@ -730,10 +731,14 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         {(conflict) => (
           <div class="vcs-marker-banner" role="alert">
             This file contains unresolved version-control merge markers ({conflict().markers.join(" ")}).
-            It stays readable, but Tine won't save changes to it — resolve the merge with your
-            version-control tool or an external editor first.
+            It stays readable, and Tine won’t save changes to it until the merge is resolved — either
+            below, block by block, or in your version-control tool.
           </div>
         )}
+      </Show>
+      {/* Concord L4: the conflict is resolved AT the page, block by block. */}
+      <Show when={conflictObjectFor(props.page.path)}>
+        {(conflict) => <PageConflictResolution conflict={conflict()} />}
       </Show>
       <Show when={props.page.kind === "page"}>
         <NamespaceCrumb name={props.page.name} />

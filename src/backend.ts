@@ -31,6 +31,8 @@ import type {
   SyncConflict,
   SyncConflictDiff,
   VcsMarkerConflict,
+  ConflictObject,
+  MarkerConflictDiff,
   MergeDecision,
   ManagedPageMutationPreflightResult,
   PrintOpts,
@@ -462,6 +464,25 @@ export interface Backend {
     theirs: string,
     format?: "md" | "org"
   ): Promise<SyncConflictDiff>;
+  /** The Concord conflict queue (L3): one derived inventory of every page that
+   *  needs the user's judgement, from BOTH artifact sources (conflict copies and
+   *  VCS-marker pages). Derived from disk on every call — nothing is stored, so
+   *  it survives a restart by being recomputed. */
+  conflictQueue(): Promise<ConflictObject[]>;
+  /** A marker-bearing page's own conflict: its `<<<<<<<` sections parsed into
+   *  complete page texts and run through the same block diff (Concord L5).
+   *  Read-only; null when the page has no (parseable) markers. */
+  vcsMarkerConflictDiff(path: string): Promise<MarkerConflictDiff | null>;
+  /** Apply per-row decisions to a marker-bearing page and write the CLEAN merged
+   *  result — the one write Tine ever makes to such a file, and only as the
+   *  direct result of this confirmation. `baseRev` guards against the VCS moving
+   *  the file under the review (throws "conflict" if it did). */
+  resolveVcsMarkerConflict(
+    path: string,
+    decisions: Record<string, MergeDecision>,
+    baseRev: string,
+    preChoice?: "mine" | "theirs" | "union"
+  ): Promise<void>;
   /** Merge a conflict copy into its winner per the user's per-row decisions
    *  (row id → mine/theirs/both), via the normal save path, then trash the copy.
    *  `baseRev` guards against the winner changing under the merge (throws
@@ -1213,6 +1234,25 @@ class TauriBackend implements Backend {
   }
   syncConflictDiff(winner: string, conflict: string) {
     return this.call<SyncConflictDiff | null>("sync_conflict_diff", { winner, conflict });
+  }
+  conflictQueue() {
+    return this.call<ConflictObject[]>("conflict_queue");
+  }
+  vcsMarkerConflictDiff(path: string) {
+    return this.call<MarkerConflictDiff | null>("vcs_marker_conflict_diff", { path });
+  }
+  resolveVcsMarkerConflict(
+    path: string,
+    decisions: Record<string, MergeDecision>,
+    baseRev: string,
+    preChoice?: "mine" | "theirs" | "union"
+  ) {
+    return this.call<void>("resolve_vcs_marker_conflict", {
+      path,
+      decisions,
+      baseRev,
+      preChoice: preChoice ?? "union",
+    });
   }
   textBlockDiff(mine: string, theirs: string, format?: "md" | "org") {
     return this.call<SyncConflictDiff>("text_block_diff", { mine, theirs, format });

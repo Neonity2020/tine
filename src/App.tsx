@@ -75,6 +75,7 @@ import {
   isConflicted,
   pushToast,
   refreshSyncConflicts,
+  refreshConflictQueueIfTouched,
   graphEpoch,
   graphTransitioning,
   setGraphTransitioning,
@@ -247,6 +248,9 @@ export async function handleGraphChange(c: GraphChange) {
   bumpDataRev();
   if (c.created || c.removed) bumpPageInventoryRev();
   await applyExternalChange(c, binding);
+  // A merge finished outside Tine (git resolving the markers, a sync tool
+  // removing a copy) must not leave a stale item in the conflict queue.
+  await refreshConflictQueueIfTouched([c]);
 }
 
 /** The per-page half of `handleGraphChange`: everything except the dataRev /
@@ -386,6 +390,10 @@ export async function handleGraphChangedBulk(bulk: GraphChangedBulk) {
       layoutPaneIds().map((paneId) => ({ paneId, route: paneRouter(paneId).route() }))
     );
   }
+  // A bulk revision is exactly the shape that resolves marker conflicts (a
+  // `git merge --continue`, a branch switch): re-derive the queue if it touched
+  // anything queued.
+  await refreshConflictQueueIfTouched(changes);
   const summary = `${changes.length} page${changes.length === 1 ? "" : "s"} updated externally`;
   const conflictSuffix = conflicts
     ? ` · ${conflicts} conflict${conflicts === 1 ? "" : "s"} to review`
