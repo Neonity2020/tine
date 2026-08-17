@@ -41,4 +41,41 @@ describe("missing remembered graph recovery (GH #250)", () => {
     expect(host.textContent).toContain("Return logseq to Direct Files");
     expect(host.textContent).not.toContain(missingRoot);
   });
+
+  it("routes the recovery-screen escape to cold Direct Files without promising archival", async () => {
+    const root = "/Volumes/logseq";
+    vi.spyOn(backend(), "startupGraphPath").mockResolvedValue(root);
+    vi.spyOn(backend(), "loadGraph").mockRejectedValue(new Error("managed open failed"));
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    const coldReturn = vi.spyOn(backend(), "cancelSparseV2Cold").mockResolvedValue({
+      status: {
+        state: "legacy_default",
+        runtime: null,
+        can_activate: true,
+        can_retry: false,
+        can_cancel: false,
+        cancel_reason: null,
+        binding_generation: 9,
+        application_page_admission: { binding_generation: 9, authority: "direct" },
+      },
+      binding_generation: 9,
+      recovery_statement: "Direct Files is active.",
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(() => <App />, host);
+    const button = await vi.waitFor(() => {
+      const candidate = [...host.querySelectorAll<HTMLButtonElement>("button")]
+        .find((item) => item.textContent?.includes("Return logseq to Direct Files"));
+      expect(candidate).toBeDefined();
+      return candidate!;
+    });
+    button.click();
+
+    await vi.waitFor(() => expect(coldReturn).toHaveBeenCalledWith(root));
+    const message = String(confirm.mock.calls[0]?.[0] ?? "");
+    expect(message).toContain("will not open, recover, drain, save, or archive managed state");
+    expect(message).not.toContain("will archive its durable managed-storage");
+  });
 });

@@ -613,7 +613,7 @@ export function App(): JSX.Element {
     coldReturn: (path) => backend().cancelSparseV2Cold(path),
     acceptColdReturn: acceptColdReturnManagedStorage,
     confirmColdReturn: (name) => backend().confirm(
-      `Return ${name} to Direct Files?\n\nTine will archive its durable managed-storage and provider state before reopening the Markdown files directly. This is a recovery exit, not confirmation that every pending or remote change synchronized.`,
+      `Forget managed mode for ${name} and open its current Markdown/Org files directly?\n\nThis emergency escape will not open, recover, drain, save, or archive managed state. Managed evidence is left untouched and may contain changes newer than Markdown.`,
       "Return to Direct Files?",
     ),
     copyText: writeClipboardTextResilient,
