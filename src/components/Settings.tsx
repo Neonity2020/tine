@@ -2985,10 +2985,10 @@ function VcsMarkerConflictsPanel(): JSX.Element {
         VCS merge conflicts
       </div>
       <div class="settings-hint settings-block">
-        {vcsMarkerConflicts().length === 1 ? "This file contains" : "These files contain"}{" "}
-        unresolved version-control merge markers (git/Fossil). The pages stay readable, but Tine
-        refuses to save them so the markers are never mangled — resolve the merge with your
-        version-control tool or an external editor, and this list clears on its own.
+        Files listed here contain unresolved version-control merge markers (git/Fossil). They stay
+        readable, but Tine refuses to save them so the markers are never mangled — resolve the
+        merge with your version-control tool or an external editor, and this list clears on its
+        own.
       </div>
       <For each={vcsMarkerConflicts()}>
         {(c) => (
