@@ -3963,6 +3963,21 @@ fn affine_before_projection_frontier_documents_are_exact(
             == BTreeSet::from([page_home_document_id, catalog_document_id])
 }
 
+fn projection_frontiers_match_except_catalog(
+    current: &FrontierV2,
+    retained: &FrontierV2,
+    catalog_document_id: DocumentId,
+) -> bool {
+    current
+        .documents()
+        .iter()
+        .filter(|document| document.document_id() != catalog_document_id)
+        .eq(retained
+            .documents()
+            .iter()
+            .filter(|document| document.document_id() != catalog_document_id))
+}
+
 fn capture_sealed_pending_local_predecessor_enabled() -> bool {
     #[cfg(test)]
     {
@@ -8778,8 +8793,13 @@ impl ShardedHotEngine {
                     )));
                 }
                 let (prior, from_baseline) = if let Some(prior) = self
-                    .clean_manifest_projection_predecessor(path, page_id, current.state(), None)?
-                {
+                    .clean_manifest_projection_predecessor(
+                        path,
+                        page_id,
+                        current.state(),
+                        None,
+                        false,
+                    )? {
                     (prior, false)
                 } else {
                     let prior = self
@@ -14394,7 +14414,67 @@ impl ShardedHotEngine {
         let overlay = std::mem::take(&mut self.local_overlay);
         let outcome = self.stage_archive_batch_bounded(batch_id, max_work);
         self.local_overlay = overlay;
-        outcome
+        let outcome = outcome?;
+
+        // Clean runtimes have no Patricia projection-work index. A managed
+        // local journal frame is first made durable and only later expanded
+        // beneath the hot overlay through this path, so it bypasses
+        // `commit_clean_prepared`, which normally advances the run-local map
+        // from paths to their latest accepted projection work. Advance that
+        // disposable locator here as soon as the accepted base catches up.
+        // Otherwise collapse removes the overlay's predecessor and the next
+        // external edit incorrectly falls back to immutable genesis bytes.
+        if matches!(
+            outcome.outcome().disposition(),
+            BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. }
+        ) {
+            self.refresh_clean_projection_head_for_batch(batch_id)?;
+        }
+        Ok(outcome)
+    }
+
+    fn refresh_clean_projection_head_for_batch(
+        &mut self,
+        batch_id: BatchId,
+    ) -> Result<(), EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.projection_work_index.is_some()
+        {
+            return Ok(());
+        }
+        let (_, endpoint) = self.clean_projection_runtime_binding()?;
+        let accepted = self.archive.get(&batch_id).ok_or_else(|| {
+            EngineError::Archive(format!(
+                "accepted managed-local batch {batch_id} disappeared before projection indexing"
+            ))
+        })?;
+        for work in self.clean_projection_locators_for_batch(accepted, endpoint)? {
+            self.clean_projection_heads
+                .insert(work.path().clone(), work);
+        }
+        Ok(())
+    }
+
+    /// Move the latest projection locator for every journal-committed local
+    /// derivative into the clean runtime's disposable path map before the hot
+    /// overlay is collapsed. The accepted archive remains the authority; this
+    /// only prevents a later external reconciliation from mistaking genesis
+    /// for the current predecessor in the same process.
+    pub(crate) fn refresh_clean_projection_heads_for_managed_local_overlay(
+        &mut self,
+    ) -> Result<(), EngineError> {
+        let batches = self
+            .local_overlay
+            .entries
+            .iter()
+            .map(|entry| entry.batch_id)
+            .collect::<Vec<_>>();
+        for batch_id in batches {
+            self.refresh_clean_projection_head_for_batch(batch_id)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn stage_archive_batch_for_recovery(
@@ -18005,6 +18085,7 @@ impl ShardedHotEngine {
         page_id: PageId,
         before: &ProjectionPageState,
         exact_local_bytes: Option<&[u8]>,
+        external_reconciliation: bool,
     ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
         let Some(work) = self.clean_projection_heads.get(path).cloned() else {
             return Ok(None);
@@ -18051,6 +18132,27 @@ impl ShardedHotEngine {
                     local,
                 ) {
                     Ok(local) => local,
+                    Err(super::projection::ExactSourceProjectionError::Semantic(_))
+                        if external_reconciliation =>
+                    {
+                        // The observed external file is the desired successor,
+                        // not the semantic predecessor. A real content change
+                        // therefore keeps the latest accepted managed
+                        // projection as the base for reconciliation. Local
+                        // authoring still returns None below and enters its
+                        // conflict/reconciliation path rather than overwriting
+                        // unseen external content.
+                        return Ok(Some(CapabilityCapturedPriorProjection {
+                            bytes: bytes.to_vec(),
+                            intent: replay.intent().clone(),
+                            completion: None,
+                            bootstrap_owner_binding: None,
+                            managed_local_authority: None,
+                            clean_manifest_authority: Some(work),
+                            receipt_backed_live_authority: false,
+                            correlated_authority: None,
+                        }));
+                    }
                     Err(super::projection::ExactSourceProjectionError::Semantic(_)) => {
                         return Ok(None);
                     }
@@ -18131,7 +18233,18 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
         let current = self.authorize_projection_write(prior.intent.page_id())?;
         if current.state().page.path != *path
-            || current.state().frontier != *work.post_frontier()
+            // The catalog is shared by every page, so an unrelated page
+            // creation or rename can advance only its dependency after this
+            // page's projection was accepted. That must not invalidate the
+            // page-local predecessor. Every other document dependency remains
+            // exact, claim evidence remains exact below, and the semantic
+            // replay that follows proves that the retained bytes are still the
+            // deterministic rendering of the current page.
+            || !projection_frontiers_match_except_catalog(
+                &current.state().frontier,
+                work.post_frontier(),
+                self.catalog_document_id,
+            )
             || current.state().claim_evidence != prior.intent.claim_evidence()
         {
             return Err(EngineError::ProjectionManifest(
@@ -18455,6 +18568,7 @@ impl ShardedHotEngine {
                             page_id,
                             before,
                             current.as_deref(),
+                            external,
                         )
                     })
                     .transpose()?
@@ -28790,7 +28904,17 @@ impl ShardedHotEngine {
                 );
             }
         }
-        let document = LoroDoc::new();
+        // Clean runtimes keep sequence-zero state in lazy genesis rather than
+        // in a fabricated bootstrap batch. A document with accepted tail
+        // heads must therefore replay those updates on its retained checkpoint
+        // (the same rule used by `reconstruct_frontier`), not on an empty
+        // document. Starting empty makes every first post-activation update
+        // whose Loro blob declares baseline dependencies permanently pending.
+        // Documents created after activation have no checkpoint and correctly
+        // start empty.
+        let document = self
+            .lazy_genesis_document(document_id, 1)?
+            .unwrap_or_else(LoroDoc::new);
         import_complete(document_id, &document, &updates)?;
         Ok(document)
     }

@@ -5357,11 +5357,32 @@ mod tests {
         // `resolve_application_move_subtrees` is recovery-only: asking it to
         // resolve a missing episode must remain a NoCommit rather than
         // silently initiating a user mutation (GH #333).
-        let committed = handle.move_application_subtrees(request.clone()).unwrap();
-        assert!(matches!(
-            committed,
-            SyncApplicationMoveSubtreesOutcome::Committed { .. }
-        ));
+        let mut committed = handle.move_application_subtrees(request.clone()).unwrap();
+        for _ in 0..512 {
+            if matches!(
+                committed,
+                SyncApplicationMoveSubtreesOutcome::Committed { .. }
+            ) {
+                break;
+            }
+            assert!(
+                matches!(
+                    committed,
+                    SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+                ),
+                "initial move was refused: {committed:?}"
+            );
+            let _ = handle.tick().unwrap();
+            committed = handle.move_application_subtrees(request.clone()).unwrap();
+        }
+        assert!(
+            matches!(
+                committed,
+                SyncApplicationMoveSubtreesOutcome::Committed { .. }
+            ),
+            "initial move did not settle: {committed:?}; status={:?}",
+            handle.status().unwrap(),
+        );
         assert!(matches!(
             clean_shutdown_slot(&predecessor).unwrap(),
             CleanShutdownSlot::Safe

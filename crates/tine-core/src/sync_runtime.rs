@@ -20727,6 +20727,11 @@ impl RuntimeActor {
         let engine = session
             .engine()
             .map_err(|error| format!("managed-local collapse lost engine authority: {error}"))?;
+        engine
+            .refresh_clean_projection_heads_for_managed_local_overlay()
+            .map_err(|error| {
+                format!("managed-local collapse could not retain projection locators: {error}")
+            })?;
         let accepted = engine.accepted_frontier_root().map_err(display)?;
         engine
             .collapse_managed_local_prefix(&accepted)
