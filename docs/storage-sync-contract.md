@@ -574,7 +574,15 @@ not allowed to redefine the production contract or make a release depend on
 retired enrollment, Patricia, projection-work, scratch, or shadow mechanics.
 The exact clean-runtime selection is pinned by
 `scripts/tine-core-nextest-contract.mjs`; every other `tine-core` module remains
-fully selected. Adding a new production runtime journey therefore requires an
+fully selected. The architectural guards that bind this document to the code —
+including the §3.1 refusal-table diff
+(`public_durable_refusal_scenarios_exactly_match_the_storage_contract`), the
+blocked-reason vocabulary scan, and
+`managed_storage_validation_is_not_unix_uid_coupled` — are release tests even
+though they live in `sync_runtime::tests`. What the release gate does not run is
+enumerated by name in `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES`, and the
+contract fails both on an unlisted exclusion and on a listed name with no test
+behind it. Adding a new production runtime journey therefore requires an
 explicit contract update rather than being silently included or omitted.
 
 Current disposable schema identities are scratch 13 / scratch page 1 / SQLite

@@ -9,7 +9,7 @@ The frozen release candidate receives the exhaustive pass.
 
 | Event | Automatic work | Purpose |
 | --- | --- | --- |
-| Non-doc pull request | `ci` → `PR validation / Linux unit and contract checks` | TypeScript, frontend and Rust-core tests plus cheap generated-artifact/release contract guards. No Windows, Android, performance, Flatpak build, or release packaging. |
+| Non-doc pull request | `ci` → `PR validation / Linux unit and contract checks` | TypeScript, frontend, the same curated `tine-core` nextest release selection the release shards run (unsharded, `ci` profile), plugin SDK, plus cheap generated-artifact/release contract guards. No Windows, Android, performance, Flatpak build, or release packaging. |
 | Docs/image-only pull request | No app CI | Avoid runner work for prose and image-only changes. A Flatpak/website metadata PR still gets its path-specific lightweight validator. |
 | Push to `master` | No app test/build workflow | Merging does not repeat CI after the reviewed commit. Website pushes may still deploy Pages; issue automation is separate from app CI. |
 | Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards, Windows compile-all `tine-core` targets + contract-selected cross-layer integration smoke, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence against the certified `tine-storage` pin. |
@@ -59,8 +59,16 @@ deterministic fixtures.
 ## Windows release scope
 
 Linux is Tine's complete behavior matrix: its nextest inventory contract proves
-every non-ignored `tine-core` test runs exactly once across four isolated
-shards. Those tests exercise Tine's semantic and lifecycle integration with the
+every non-ignored `tine-core` test in the release selection runs exactly once
+across four isolated shards. The selection is not the whole package — the
+pre-0.7 adversarial actor oracle inside `sync_runtime::tests` is excluded — but
+the exclusion is proven BY NAME, not by module prefix:
+`PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` in
+`scripts/tine-core-nextest-contract.mjs` lists every excluded test, and the
+contract fails both when a test is excluded without being listed and when a
+listed name no longer exists. The same selection and profile run on every pull
+request, so the PR gate and the release shards cannot drift apart. Those tests
+exercise Tine's semantic and lifecycle integration with the
 exact certified `tine-storage` pin. The package's own complete Linux, Windows,
 Android, format, crash-cut, and API matrix runs when a storage version is cut;
 ordinary Tine releases do not pay for it again.
