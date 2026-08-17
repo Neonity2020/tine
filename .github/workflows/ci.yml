@@ -72,6 +72,11 @@ jobs:
           node scripts/test-tine-core-nextest-contract.mjs
           node scripts/test-env-toolchain-fallback.mjs
 
+      # The E2E harness's own unit tests. `e2e-file-poll.test.mjs` sat in the E2E
+      # contract catalog from the day it was written with no runner behind it.
+      - name: E2E harness contract tests
+        run: npm run test:e2e-harness
+
       - name: lsdoc generated artifacts are current
         run: |
           node scripts/check-wasm-pin.mjs
@@ -141,6 +146,9 @@ jobs:
           node scripts/test-release-pipeline.mjs
           node scripts/test-tine-core-nextest-contract.mjs
           node scripts/test-env-toolchain-fallback.mjs
+
+      - name: E2E harness contract tests
+        run: npm run test:e2e-harness
 
       - name: Performance baseline policy is current
         env:
@@ -611,6 +619,13 @@ jobs:
         run: |
           npm run build
           ./scripts/build-community-plugins.sh
+      # The signed-catalogue journey has a full E2E contract entry and was
+      # reachable only through `npm run e2e:plugins`, which no workflow called.
+      # This job is its home: it already builds every community plugin and
+      # installs the browser the journey drives.
+      - name: Exercise the signed community catalogue
+        run: npm run e2e:plugins
+
       - name: Exercise every launch plugin and capture evidence
         env:
           TINE_PLUGIN_SCREENSHOT_ROOT: ${{ github.workspace }}/test-results/plugin-docs
