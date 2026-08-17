@@ -118,6 +118,10 @@ manifest tail. The pre-0.7 share and join implementations compile only in
 tests. A production decoder may still recognize an old descriptor so it can
 give a bounded migration refusal, but it cannot use that descriptor to reopen
 the retired runtime; the user must Return to Direct Files and share again.
+Both successful enrollment cuts intentionally retire the actor that entered
+them. Tauri must reopen the durable result, prove ordinary page inventory/load,
+and atomically replace the exact predecessor graph slot before reporting share
+or join success; querying or continuing to serve the retired actor is invalid.
 
 ## 1. On-disk layout
 

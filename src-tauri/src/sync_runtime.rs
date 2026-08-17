@@ -2903,9 +2903,10 @@ fn cancel_sparse_v2_blocking(
     }
 }
 
-/// Publish the already-safe local archive into the shared namespace. The
-/// retained actor owns this same-mode enrollment change; it does not replace
-/// the serving graph slot or storage selector.
+/// Publish the already-safe local archive into the shared namespace. Core
+/// deliberately retires the local-only actor after committing the enrollment
+/// transition, so the Tauri composition must reopen that durable state and
+/// atomically replace the serving slot before reporting success.
 #[tauri::command]
 pub(crate) async fn prepare_sparse_v2_share(
     state: crate::state::GraphContext<'_>,
@@ -2933,10 +2934,61 @@ fn prepare_sparse_v2_share_blocking(
     if slot.root_key != root {
         return Err("graph changed while share setup waited for its transition lane".into());
     }
+    let record = state
+        .sync_runtime
+        .binding_record(app, &root)?
+        .ok_or("Tine-managed storage setup is missing.")?;
     active_handle(&slot)?
         .prepare_shared()
         .map_err(|error| error.to_string())?;
-    sparse_v2_status_for_slot(&slot)
+    let candidate = prepare_reopened_managed_candidate(
+        app,
+        &state,
+        slot,
+        record,
+        "share enrollment runtime reopen",
+    )?;
+    publish_managed_candidate(app, &state, label, candidate)
+}
+
+/// Reconstitute the sole application actor after a durable enrollment cut.
+/// `prepare_shared` and a completed `join_shared` intentionally stop their
+/// predecessor actor: continuing to serve that handle would mix two enrollment
+/// epochs. This helper therefore proves the replacement through ordinary page
+/// APIs before its caller publishes it with `replace_if_current`.
+fn prepare_reopened_managed_candidate(
+    app: &tauri::AppHandle,
+    state: &crate::state::AppState,
+    predecessor: Arc<crate::state::GraphSlot>,
+    record: SparseV2ActivationRecord,
+    stage: &str,
+) -> Result<PreparedManagedCandidate, String> {
+    let graph_meta = SyncRuntimeFacade::graph_meta(&record);
+    let binding = state
+        .sync_runtime
+        .open_record(app, &record)
+        .map_err(|error| {
+            let detail = format!("{stage} failed: {error}");
+            crate::debug::diag(&detail);
+            detail
+        })?;
+    let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+        binding,
+        predecessor.root_key.clone(),
+        graph_meta,
+    ));
+    let readiness = prove_managed_application_ready(&replacement, None).map_err(|error| {
+        let detail = format!("{stage} readiness failed: {error}");
+        crate::debug::diag(&detail);
+        detail
+    })?;
+    Ok(PreparedManagedCandidate {
+        predecessor,
+        replacement,
+        record,
+        readiness,
+        direct_source_generation: None,
+    })
 }
 
 /// Explicitly retire the second device's legacy reader/watcher, derive its
@@ -3021,10 +3073,21 @@ fn prepare_sparse_v2_join(
             .map_err(|error| join_failure("provider discovery", error))?
             .ok_or("This graph does not yet contain sync data from another device.")?;
     if slot.sparse_binding().is_some() {
+        let record = state
+            .sync_runtime
+            .binding_record(app, &root)?
+            .ok_or("Tine-managed storage setup is missing.")?;
         active_handle(&slot)?
             .join_shared(descriptor)
             .map_err(|error| join_failure("provider scan", error))?;
-        return sparse_v2_status_for_slot(&slot).map(PreparedActivationOutcome::AlreadyCurrent);
+        let candidate = prepare_reopened_managed_candidate(
+            app,
+            &state,
+            slot,
+            record,
+            "joined enrollment runtime reopen",
+        )?;
+        return Ok(PreparedActivationOutcome::Candidate(candidate));
     }
     let graph = slot.legacy_graph()?;
     let graph_meta = graph.meta();
@@ -3930,6 +3993,53 @@ mod tests {
                 "binding_generation": direct.binding_generation,
                 "authority": "direct",
             })
+        );
+    }
+
+    #[test]
+    fn enrollment_commands_reopen_the_retired_actor_before_reporting_success() {
+        let source = include_str!("sync_runtime.rs");
+        let share_start = source
+            .find("fn prepare_sparse_v2_share_blocking(")
+            .expect("share command implementation");
+        let share_end = source[share_start..]
+            .find("/// Reconstitute the sole application actor")
+            .map(|offset| share_start + offset)
+            .expect("share command boundary");
+        let share = &source[share_start..share_end];
+        let share_cut = share.find(".prepare_shared()").expect("share cut");
+        let share_reopen = share
+            .find("prepare_reopened_managed_candidate(")
+            .expect("share runtime reopen");
+        let share_publish = share
+            .find("publish_managed_candidate(")
+            .expect("share replacement publication");
+        assert!(share_cut < share_reopen && share_reopen < share_publish);
+        assert!(
+            !share.contains("sparse_v2_status_for_slot(&slot)"),
+            "the actor that commits a share cut is intentionally stopped"
+        );
+
+        let join_start = source
+            .find("fn prepare_sparse_v2_join(")
+            .expect("join command implementation");
+        let join_end = source[join_start..]
+            .find("#[tauri::command]\npub(crate) async fn sparse_v2_query")
+            .map(|offset| join_start + offset)
+            .expect("join command boundary");
+        let join = &source[join_start..join_end];
+        let retained_branch = join
+            .find("if slot.sparse_binding().is_some()")
+            .expect("already-managed join branch");
+        let retained = &join[retained_branch..];
+        let join_cut = retained.find(".join_shared(").expect("join cut");
+        let join_reopen = retained
+            .find("prepare_reopened_managed_candidate(")
+            .expect("join runtime reopen");
+        assert!(join_cut < join_reopen);
+        assert!(
+            !retained[..join_reopen].contains("PreparedActivationOutcome::AlreadyCurrent"),
+            "a completed join must not publish the retired actor as current"
         );
     }
 

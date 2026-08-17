@@ -6691,6 +6691,27 @@
         "failBefore": "proven"
       },
       "notes": "The v0.6.92 journey clicked as soon as embed macro roots existed, while cross-page descendants populated asynchronously; adding an unrelated await moved the failure between disclosure and arrow/delete. The semantic readiness repair then exposed a deterministic product defect: multiple visible refs/embeds to the same initially unloaded page raced activation; one loaded the exact page, while siblings treated their expected stale-install refusal as permanent failure and stayed shallow. LiveRefGroup now rechecks the exact loaded kind/path after every installation attempt, so a sibling winner hydrates all groups while a different page/path remains refused. A render regression forces two concurrent activation promises and proves both descendants render with one retained activation. The release journey waits for exactly the identities/content/disclosure controls it will operate on, asserts no timing or pixels, and is restored to stable blocking coverage."
+    },
+    {
+      "id": "UI-MANAGED-SHARE-ACTOR-REBIND-001",
+      "title": "Setting up or joining managed sync reopens the actor retired by the enrollment cut before reporting success",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/sync_runtime.rs",
+          "scripts/e2e-sparse-v2-two-device.mjs"
+        ],
+        "scenario": "managed-storage.share-join-reopen-retired-actor",
+        "failBefore": "proven"
+      },
+      "notes": "The real two-device journey reached healthy local activation, then the first explicit share cut stopped its actor by design and the Tauri command immediately queried that retired handle, returning sync actor is unavailable. Share and already-managed join now reopen the durable post-enrollment runtime, prove its ordinary page inventory/load boundary, and publish a new exact-generation graph slot before returning success. The source regression pins the required cut -> reopen -> exact publish ordering; the real two-device journey is the release-blocking semantic proof."
     }
   ]
 }
