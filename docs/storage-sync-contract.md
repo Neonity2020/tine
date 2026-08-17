@@ -36,6 +36,15 @@ frontier's raw document count is not a page count because it also includes
 non-page managed documents. An empty graph
 legitimately proves readiness with an empty inventory.
 
+Explicit activation is never an unexplained spinner. Before native activation,
+the frontend names pending-save flush, confirmation, and progress-listener
+setup; during activation it shows elapsed time and how long the last native
+phase has remained unchanged. Fresh bootstrap reports its construction phases.
+Reactivation of retained clean state separately reports marker/baseline/index
+open, committed-tail replay, projection repair, and actor open. After native
+success the frontend names its new-generation page-list/page-open observation.
+These progress values are observational and cannot authorize publication.
+
 Return to Direct Files has two meanings. A graceful return drains a healthy
 managed actor and confirms its committed projection before selecting Direct
 Files. An emergency return is always available from managed startup/refusal.

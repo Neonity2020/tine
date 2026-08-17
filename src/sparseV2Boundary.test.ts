@@ -16,6 +16,10 @@ describe("Tine-managed storage app boundary", () => {
     expect(backend).toMatch(
       /cancelSparseV2\(\)[\s\S]*cancel_sparse_v2[\s\S]*this\.bindingGeneration = result\.binding_generation/
     );
+    expect(settings).not.toContain("captureAuthorityReadiness");
+    expect(settings).not.toContain("expectedPages");
+    expect(settings).toContain("no new phase for");
+    expect(settings).toContain("retained_runtime_projection_repair");
   });
 
   it("registers only bounded actor commands for the vertical slice", () => {

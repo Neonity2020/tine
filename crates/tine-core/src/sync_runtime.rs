@@ -1528,6 +1528,10 @@ pub enum SyncLocalActivationPhase {
     ShadowReconstructionByteVerification,
     PromotionReceiptConfirmation,
     ReconciliationBaselineActorOpen,
+    RetainedRuntimeOpen,
+    RetainedRuntimeTailReplay,
+    RetainedRuntimeProjectionRepair,
+    RetainedRuntimeActorOpen,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1674,6 +1678,10 @@ impl SyncLocalActivationPhase {
             Self::ShadowReconstructionByteVerification => "shadow reconstruction/byte verification",
             Self::PromotionReceiptConfirmation => "promotion/aggregate authority confirmation",
             Self::ReconciliationBaselineActorOpen => "reconciliation baseline and actor open",
+            Self::RetainedRuntimeOpen => "retained runtime marker/baseline/index open",
+            Self::RetainedRuntimeTailReplay => "retained runtime committed-tail replay",
+            Self::RetainedRuntimeProjectionRepair => "retained runtime projection repair",
+            Self::RetainedRuntimeActorOpen => "retained runtime actor open",
         }
     }
 }
@@ -3923,8 +3931,14 @@ impl SyncRuntimeHandle {
         if let Err(detail) = validate_activation_paths(&request, &request.graph_root) {
             return activation_retryable(SyncLocalActivationStage::Absent, detail);
         }
-        match open_clean_runtime_resources(&runtime_open_request_from_activation(&request)) {
+        match open_clean_runtime_resources_with_progress(
+            &runtime_open_request_from_activation(&request),
+            &mut progress,
+        ) {
             Ok(Some(resources)) => {
+                progress(SyncLocalActivationProgress::Phase {
+                    phase: SyncLocalActivationPhase::RetainedRuntimeActorOpen,
+                });
                 return activation_open_clean_resources(
                     request,
                     resources,
@@ -4049,6 +4063,9 @@ impl SyncRuntimeHandle {
                         return activation_retryable(SyncLocalActivationStage::Absent, detail)
                     }
                 };
+            progress(SyncLocalActivationProgress::Phase {
+                phase: SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
+            });
             return activation_open_clean_resources(
                 request,
                 resources,
@@ -5769,9 +5786,27 @@ fn activate_clean_runtime_resources(
 fn open_clean_runtime_resources(
     request: &SyncRuntimeOpenRequest,
 ) -> Result<Option<CleanRuntimeResources>, String> {
+    open_clean_runtime_resources_with_progress(request, &mut |_| {})
+}
+
+fn open_clean_runtime_resources_with_progress(
+    request: &SyncRuntimeOpenRequest,
+    progress: &mut dyn FnMut(SyncLocalActivationProgress),
+) -> Result<Option<CleanRuntimeResources>, String> {
     let identities = request.clean_identities.as_ref().ok_or_else(|| {
         "clean managed runtime open has no persisted local identity record".to_owned()
     })?;
+    if request
+        .enrollment_root
+        .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+        .is_file()
+    {
+        // This is progress only, never admission authority. The authenticated
+        // marker is still decoded and verified by `open_clean_activation`.
+        progress(SyncLocalActivationProgress::Phase {
+            phase: SyncLocalActivationPhase::RetainedRuntimeOpen,
+        });
+    }
     let Some(opened) = open_clean_activation(
         &request.enrollment_root,
         &clean_baseline_directory(&request.archive_root),
@@ -5812,6 +5847,9 @@ fn open_clean_runtime_resources(
     let baseline_claim_source =
         crate::oplog::sqlite::clean_genesis_materialized_read(&baseline_projection, &baseline_root)
             .map_err(display)?;
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::RetainedRuntimeTailReplay,
+    });
     let replayed = engine
         .replay_clean_committed_tail(&baseline_claim_source)
         .map_err(display)?;
@@ -5857,6 +5895,9 @@ fn open_clean_runtime_resources(
         .projection_endpoint_binding()
         .ok_or_else(|| "clean runtime has no projection endpoint".to_owned())?;
     let terminal_work = engine.clean_terminal_projection_work().map_err(display)?;
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::RetainedRuntimeProjectionRepair,
+    });
     for work in terminal_work
         .iter()
         .filter(|work| work.endpoint_id() == endpoint.endpoint_id())
@@ -52600,6 +52641,7 @@ mod tests {
             SyncLocalActivationPhase::BootstrapImportPreparation,
             SyncLocalActivationPhase::ImmutablePublicationInstall,
             SyncLocalActivationPhase::SqliteOpenBuild,
+            SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
         ];
         assert_eq!(
             transitions
@@ -52712,6 +52754,7 @@ mod tests {
                 SyncLocalActivationPhase::BootstrapImportPreparation,
                 SyncLocalActivationPhase::ImmutablePublicationInstall,
                 SyncLocalActivationPhase::SqliteOpenBuild,
+                SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
             ]
         );
         assert!(
@@ -52727,6 +52770,49 @@ mod tests {
     }
 
     #[test]
+    fn retained_clean_reactivation_reports_each_recovery_boundary() {
+        let fixture = ActivationFixture::nested_unicode("retained-reactivation-progress", 0xa091);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("fresh activation opens its actor");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let mut updates = Vec::new();
+        let reopened = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
+            fixture.request.clone(),
+            |update| updates.push(update),
+        );
+        assert_eq!(reopened.status, SyncLocalActivationStatus::Active);
+        let phases = updates
+            .iter()
+            .filter_map(|update| match update {
+                SyncLocalActivationProgress::Phase { phase } => Some(*phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                SyncLocalActivationPhase::RetainedRuntimeOpen,
+                SyncLocalActivationPhase::RetainedRuntimeTailReplay,
+                SyncLocalActivationPhase::RetainedRuntimeProjectionRepair,
+                SyncLocalActivationPhase::RetainedRuntimeActorOpen,
+            ]
+        );
+        let handle = reopened
+            .handle
+            .expect("retained activation opens its actor");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     fn activation_progress_is_ordered_exact_byte_and_structurally_near_linear() {
         let small = ActivationFixture::scaled("scale-small", 0xa090, 4);
         let large = ActivationFixture::scaled("scale-large", 0xa0a0, 8);
@@ -52737,8 +52823,8 @@ mod tests {
         assert_eq!(large_receipt.source_files, small_receipt.source_files + 4);
         assert!(large_receipt.source_bytes > small_receipt.source_bytes);
         assert!(large_receipt.blocks > small_receipt.blocks);
-        assert_eq!(small_receipt.phase_ms.len(), 5);
-        assert_eq!(large_receipt.phase_ms.len(), 5);
+        assert_eq!(small_receipt.phase_ms.len(), 6);
+        assert_eq!(large_receipt.phase_ms.len(), 6);
         for receipt in [&small_receipt, &large_receipt] {
             assert_eq!(
                 receipt.clean.source_files, receipt.source_files as u64,

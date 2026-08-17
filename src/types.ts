@@ -465,6 +465,7 @@ export interface StorageTransitionEvent {
 }
 
 export type SparseV2ActivationPhase =
+  | "private_setup"
   | "source_capture"
   | "bootstrap_import_preparation"
   | "immutable_publication_install"
@@ -472,7 +473,11 @@ export type SparseV2ActivationPhase =
   | "sqlite_open_build"
   | "shadow_reconstruction_byte_verification"
   | "promotion_receipt_confirmation"
-  | "reconciliation_baseline_actor_open";
+  | "reconciliation_baseline_actor_open"
+  | "retained_runtime_open"
+  | "retained_runtime_tail_replay"
+  | "retained_runtime_projection_repair"
+  | "retained_runtime_actor_open";
 
 export type SparseV2BootstrapPreparationSubphase =
   | "source_protocol"

@@ -2129,6 +2129,19 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const [loading, setLoading] = createSignal(true);
   const [enabling, setEnabling] = createSignal(false);
   const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
+  const [enableStage, setEnableStage] = createSignal<
+    | "idle"
+    | "flushing"
+    | "confirming"
+    | "listening"
+    | "activating"
+    | "rebinding"
+  >("idle");
+  const [enableStartedAt, setEnableStartedAt] = createSignal<number | null>(null);
+  const [activationUpdatedAt, setActivationUpdatedAt] = createSignal<number | null>(null);
+  const [enableClock, setEnableClock] = createSignal(Date.now());
+  let enableClockTimer: ReturnType<typeof setInterval> | undefined;
+  onCleanup(() => clearInterval(enableClockTimer));
   const [sharing, setSharing] = createSignal(false);
   const [cancelling, setCancelling] = createSignal(false);
   const retryable = () => {
@@ -2151,32 +2164,75 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
   const activationProgressLabel = () => {
     const progress = activationProgress();
-    if (!progress) return "Preparing Tine-managed storage…";
-    if (progress.kind === "bootstrap_detached_authoring") {
-      return `Building operation history (${progress.completed} of ${progress.total} parts)…`;
-    }
-    if (progress.kind === "bootstrap_preparation_subphase") {
-      return {
+    const stage = enableStage();
+    let label: string;
+    if (!progress) {
+      label = {
+        idle: "Preparing Tine-managed storage…",
+        flushing: "Saving pending edits…",
+        confirming: "Waiting for confirmation…",
+        listening: "Preparing progress reporting…",
+        activating: "Opening or building managed storage…",
+        rebinding: "Verifying the managed page view…",
+      }[stage];
+    } else if (progress.kind === "bootstrap_detached_authoring") {
+      label = `Building operation history (${progress.completed} of ${progress.total} parts)…`;
+    } else if (progress.kind === "bootstrap_preparation_subphase") {
+      label = {
         source_protocol: "Preparing source inventory…",
         operation_spool: "Planning graph operations…",
         partition: "Dividing setup work into parts…",
         detached_authoring: "Building operation history…",
         sealing: "Sealing prepared history…",
       }[progress.subphase];
+    } else if (progress.kind === "bootstrap_preparation_summary") {
+      label = "Prepared graph operation history…";
+    } else {
+      label = {
+        private_setup: "Preparing private managed state…",
+        source_capture: "Capturing source files…",
+        bootstrap_import_preparation: "Preparing graph operation history…",
+        immutable_publication_install: "Installing prepared history…",
+        backup_proof: "Verifying the safety backup…",
+        sqlite_open_build: "Building the local index…",
+        shadow_reconstruction_byte_verification: "Verifying exact file reconstruction…",
+        promotion_receipt_confirmation: "Confirming managed storage…",
+        reconciliation_baseline_actor_open: "Starting managed storage…",
+        retained_runtime_open: "Opening retained managed state…",
+        retained_runtime_tail_replay: "Replaying retained managed changes…",
+        retained_runtime_projection_repair: "Repairing the Markdown projection…",
+        retained_runtime_actor_open: "Starting the retained managed runtime…",
+      }[progress.phase];
     }
-    if (progress.kind === "bootstrap_preparation_summary") {
-      return "Prepared graph operation history…";
-    }
-    return {
-      source_capture: "Capturing source files…",
-      bootstrap_import_preparation: "Preparing graph operation history…",
-      immutable_publication_install: "Installing prepared history…",
-      backup_proof: "Verifying the safety backup…",
-      sqlite_open_build: "Building the local index…",
-      shadow_reconstruction_byte_verification: "Verifying exact file reconstruction…",
-      promotion_receipt_confirmation: "Confirming managed storage…",
-      reconciliation_baseline_actor_open: "Starting managed storage…",
-    }[progress.phase];
+    const started = enableStartedAt();
+    if (started === null) return label;
+    const elapsed = Math.max(0, Math.floor((enableClock() - started) / 1000));
+    const updated = activationUpdatedAt();
+    const stale = updated === null ? elapsed : Math.max(0, Math.floor((enableClock() - updated) / 1000));
+    return stale >= 10
+      ? `${label} ${elapsed}s elapsed; no new phase for ${stale}s.`
+      : `${label} ${elapsed}s elapsed.`;
+  };
+
+  const noteEnableStage = (stage: Exclude<ReturnType<typeof enableStage>, "idle">) => {
+    setEnableStage(stage);
+    dbg(`managed storage setup: stage=${stage}`);
+  };
+
+  const beginEnableClock = () => {
+    const started = Date.now();
+    setEnableStartedAt(started);
+    setEnableClock(started);
+    clearInterval(enableClockTimer);
+    enableClockTimer = setInterval(() => setEnableClock(Date.now()), 1_000);
+  };
+
+  const endEnableClock = () => {
+    clearInterval(enableClockTimer);
+    enableClockTimer = undefined;
+    setEnableStartedAt(null);
+    setActivationUpdatedAt(null);
+    setEnableStage("idle");
   };
 
   const refresh = async () => {
@@ -2191,39 +2247,15 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
   onMount(() => void refresh());
 
-  type AuthorityReadiness = Awaited<ReturnType<ReturnType<typeof backend>["listPages"]>>;
-
-  const captureAuthorityReadiness = async (): Promise<AuthorityReadiness | null> => {
-    try {
-      return await backend().listPages();
-    } catch {
-      // A retryable managed binding may not currently answer page reads. The
-      // post-transition probe is still mandatory before an Active result is
-      // shown as success; this snapshot only strengthens it with exact parity.
-      return null;
-    }
-  };
-
-  const refreshAuthorityState = async (expected: AuthorityReadiness | null) => {
+  const refreshAuthorityState = async () => {
     rebindCurrentStorageAuthority();
 
-    // This is the user observation boundary that the native slot publication
-    // alone cannot prove. An Active transition is not successful until the
-    // frontend's newly leased generation can list the same physical pages and
-    // load a real representative through the ordinary command surface.
+    // Native activation already proves completeness against the authenticated
+    // accepted frontier. The frontend must prove only that its newly leased
+    // managed generation can use that surface; comparing a Direct Files list
+    // from the retired generation would recreate the race this boundary avoids.
     const pages = await backend().listPages();
-    if (expected) {
-      const identities = new Set(pages.map((page) => `${page.kind}\0${page.path}\0${page.name}`));
-      const missing = expected.find(
-        (page) => !identities.has(`${page.kind}\0${page.path}\0${page.name}`),
-      );
-      if (pages.length !== expected.length || missing) {
-        throw new Error(
-          `managed storage rebound with an incomplete page inventory (${pages.length} of ${expected.length})`,
-        );
-      }
-    }
-    const representative = expected?.[0] ?? pages[0];
+    const representative = pages[0];
     if (representative && !(await backend().getPageByPath(representative.path))) {
       throw new Error("managed storage rebound but could not open a page from its inventory");
     }
@@ -2297,17 +2329,18 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     const expectedBinding = status()?.binding_generation ?? null;
     setEnabling(true);
     setActivationProgress(null);
+    beginEnableClock();
     setGraphTransitioning(true);
     let unlisten: (() => void) | undefined;
     try {
-      dbg("managed storage setup: flushing pending writes");
+      noteEnableStage("flushing");
       const flushed = await flushAll();
       dbg(`managed storage setup: pending-write flush completed (${flushed ? "clean" : "refused"})`);
       if (!flushed) {
         pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
         return;
       }
-      dbg("managed storage setup: awaiting native confirmation");
+      noteEnableStage("confirming");
       const confirmed = await backend().confirm(
         `Enable Tine-managed storage for this graph?\n\n` +
           `Tine first verifies a private operation history, local index, backup, and exact Markdown reconstruction. ` +
@@ -2315,24 +2348,28 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       );
       dbg(`managed storage setup: native confirmation completed (${confirmed ? "accepted" : "cancelled"})`);
       if (!confirmed) return;
-      const expectedPages = await captureAuthorityReadiness();
       const generation = status()?.binding_generation;
+      noteEnableStage("listening");
       if (generation !== undefined) {
         try {
           unlisten = await backend().onSparseV2ActivationProgress(
             generation,
-            setActivationProgress
+            (progress) => {
+              setActivationUpdatedAt(Date.now());
+              setActivationProgress(progress);
+            }
           );
         } catch {
           // Progress is observational; setup must continue if event listening
           // is unavailable in an older or closing WebView.
         }
       }
-      dbg("managed storage setup: invoking native activation");
+      noteEnableStage("activating");
       const result = await backend().activateSparseV2();
       dbg(`managed storage setup: native activation returned (${result.state})`);
       if (result.state === "active") {
-        await refreshAuthorityState(expectedPages);
+        noteEnableStage("rebinding");
+        await refreshAuthorityState();
         if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         pushToast("Tine-managed storage is active.", "success");
       } else {
@@ -2349,6 +2386,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } finally {
       unlisten?.();
       setActivationProgress(null);
+      endEnableClock();
       setGraphTransitioning(false);
       setEnabling(false);
     }
@@ -2367,10 +2405,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         "Set up sync with another device?\n\n" +
           "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
-      const expectedPages = await captureAuthorityReadiness();
       const result = await backend().prepareSparseV2Share();
       if (result.state === "active") {
-        await refreshAuthorityState(expectedPages);
+        await refreshAuthorityState();
         if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         pushToast("Sync is ready to use on another device.", "success");
       } else {
@@ -2398,10 +2435,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         "Join this synced graph?\n\n" +
           "Tine verifies that this device is joining the same graph history before it continues. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
-      const expectedPages = await captureAuthorityReadiness();
       const result = await backend().joinSparseV2Shared();
       if (result.state === "active") {
-        await refreshAuthorityState(expectedPages);
+        await refreshAuthorityState();
         if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         pushToast("This device joined the synced graph.", "success");
       } else {

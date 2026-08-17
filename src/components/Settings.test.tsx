@@ -229,10 +229,10 @@ describe("Settings storage transitions", () => {
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
     vi.spyOn(store, "flushAll").mockResolvedValue(true);
-    let inventoryCalls = 0;
+    const order: string[] = [];
     const listPages = vi.spyOn(backend(), "listPages").mockImplementation(() => {
-      inventoryCalls += 1;
-      return inventoryCalls === 2 ? reboundInventory : Promise.resolve([page]);
+      order.push("managed-list");
+      return reboundInventory;
     });
     const loadPage = vi.spyOn(backend(), "getPageByPath").mockResolvedValue({
       name: page.name,
@@ -243,7 +243,10 @@ describe("Settings storage transitions", () => {
       pre_block: null,
       blocks: [],
     });
-    vi.spyOn(backend(), "activateSparseV2").mockResolvedValue(localActive());
+    vi.spyOn(backend(), "activateSparseV2").mockImplementation(async () => {
+      order.push("activate");
+      return localActive();
+    });
 
     const root = document.createElement("div");
     document.body.append(root);
@@ -253,7 +256,9 @@ describe("Settings storage transitions", () => {
       button.textContent?.includes("Enable Tine-managed storage")
     ) as HTMLButtonElement;
     enable.click();
-    await vi.waitFor(() => expect(listPages.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await vi.waitFor(() => expect(listPages.mock.calls.length).toBeGreaterThanOrEqual(1));
+    expect(order[0]).toBe("activate");
+    expect(order.slice(1).every((entry) => entry === "managed-list")).toBe(true);
     expect(toasts().some((toast) => toast.message === "Tine-managed storage is active.")).toBe(false);
 
     releaseInventory([page]);
@@ -534,6 +539,10 @@ describe("Settings storage transitions", () => {
     expect(root.textContent).toContain("Building operation history (2 of 4 parts)");
     expect(progress.value).toBe(2);
     expect(progress.max).toBe(4);
+
+    listeners[0]({ kind: "phase", phase: "retained_runtime_open" });
+    await tick();
+    expect(root.textContent).toContain("Opening retained managed state");
 
     resolvers[0](localRetryable());
     await tick();
