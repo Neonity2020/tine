@@ -24,10 +24,17 @@ root lane nor the supervisor model mutex is held for graph-sized work.
 
 Installing a native graph slot is not sufficient evidence of stable readiness.
 A managed activation is reported successful only after its actor-backed
-generation answers the complete page inventory and opens a representative
-page, and the frontend has retired all renderer state leased to the predecessor
-generation. An empty graph legitimately proves readiness with an empty
-inventory.
+generation opens the exact accepted-frontier-stamped SQLite materialization,
+answers its complete paged inventory, and opens a representative page, and the
+frontend has retired all renderer state leased to the predecessor generation.
+The SQLite candidate receives that stamp only after its authenticated page
+catalog was covered exactly once and every page was materialized.
+Readiness never compares against a cached Direct Files inventory captured before
+the transition or the actor's live current-path catalog: filesystem delivery may
+legitimately change either while startup catch-up is settling. The accepted
+frontier's raw document count is not a page count because it also includes
+non-page managed documents. An empty graph
+legitimately proves readiness with an empty inventory.
 
 Return to Direct Files has two meanings. A graceful return drains a healthy
 managed actor and confirms its committed projection before selecting Direct

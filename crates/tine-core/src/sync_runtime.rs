@@ -15850,6 +15850,13 @@ impl RuntimeActor {
     fn application_inventory_ready(
         &self,
     ) -> Result<Vec<PageEntry>, SyncApplicationPageRequestError> {
+        // `application_materialized_read_ready` admits only a database carrying
+        // the exact accepted-frontier stamp. The candidate builder publishes
+        // that stamp only after its authenticated page-catalog cursor was
+        // covered exactly once and every page row was materialized. Do not
+        // compare this inventory with the live path catalog (which may already
+        // contain prospective watcher observations) or with the frontier's raw
+        // document count (which also includes non-page documents).
         let read = self.application_materialized_read_ready()?;
         const INVENTORY_BATCH: usize = 256;
         let mut pages = Vec::new();

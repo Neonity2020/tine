@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+- **Managed-storage activation no longer rejects a complete graph because Direct Files or the startup path catalog retained a different one-page inventory.** Readiness is now proved inside the candidate managed generation by opening its transactionally complete, exact-frontier-stamped SQLite inventory and a real page; the candidate remains unpublished until that proof succeeds.
+
 ### Changed
 
 - **Experimental managed-storage activation now reuses the parser facts it already produced during source capture.** Search text, tasks, properties, tags, headings, and collapse state travel through one bounded activation-only handoff and are accepted only when every terminal page and block still matches the authenticated engine state exactly; oversized or mismatched inputs fall back to the independent parser path. The 13,000-page fixture reused all 13,000 pages with no misses and cut SQLite lowering from about 8.1 s to 6.7 s, although total activation remained within run-to-run noise at 69.1 s. The same pass now reuses one authenticated catalog window while resolving block identities, avoiding a graph-sized catalog proof per UUID on pages that contain several `id::` values.

@@ -42,10 +42,12 @@ Beginning an operation and final graph-registry publication share one short
 linearization mutex. The supervisor model mutex is released before registry
 publication, so a registry lock cannot make the operation model itself
 unavailable. Native managed activation reaches stable success only after the
-new actor-backed generation can answer the complete page inventory and open a
-representative page. The frontend does not display that successful result until
-it has retired renderer state owned by the former generation and repeated the
-ordinary page-list/page-open observation through its newly leased generation.
+new actor-backed generation can answer an inventory complete against its own
+authenticated accepted-page catalog and open a representative page. A cached
+predecessor inventory is not transition authority. The frontend does not display
+that successful result until it has retired renderer state owned by the former
+generation and repeated the ordinary page-list/page-open observation through its
+newly leased generation.
 Native slot installation alone is not readiness, and frontend readiness is an
 observation gate rather than a second storage authority.
 

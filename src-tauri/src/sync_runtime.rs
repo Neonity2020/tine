@@ -8,13 +8,12 @@ use crate::storage_mode_supervisor::{
     StableStorageMode, StorageTransitionKind, StorageTransitionOutcome, StorageTransitionPhase,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
-use tine_core::model::{GraphMeta, PageEntry};
+use tine_core::model::GraphMeta;
 use tine_core::oplog::sync_layout::{
     PRIVATE_BINDING_DIR as SPARSE_BINDING_DIR, PRIVATE_BINDING_FILE as SPARSE_BINDING_FILE,
     PRIVATE_RECOVERY_DIR as SPARSE_RECOVERY_DIR, PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR,
@@ -1601,10 +1600,10 @@ fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2S
 /// Prove the application observation boundary before a fresh managed
 /// transition is called successful. Installing an actor-backed GraphSlot is
 /// only native publication; users need its ordinary inventory and page-load
-/// commands to retain every page the Direct authority handed over.
+/// commands to observe the complete SQLite materialization at the candidate's
+/// own authenticated accepted frontier.
 pub(crate) fn prove_managed_application_ready(
     slot: &crate::state::GraphSlot,
-    expected: Option<&[PageEntry]>,
 ) -> Result<(), String> {
     let handle = active_handle(slot)?;
     let pages = match handle
@@ -1616,26 +1615,7 @@ pub(crate) fn prove_managed_application_ready(
             return Err("managed readiness page inventory remained deferred".into())
         }
     };
-    let identities = pages
-        .iter()
-        .map(|page| (page.kind, page.rel_path.clone(), page.name.clone()))
-        .collect::<HashSet<_>>();
-    if let Some(expected) = expected {
-        let missing = expected.iter().find(|page| {
-            !identities.contains(&(page.kind, page.rel_path.clone(), page.name.clone()))
-        });
-        if pages.len() != expected.len() || missing.is_some() {
-            return Err(format!(
-                "managed readiness page inventory is incomplete ({} of {})",
-                pages.len(),
-                expected.len()
-            ));
-        }
-    }
-    if let Some(page) = expected
-        .and_then(|expected| expected.first())
-        .or_else(|| pages.first())
-    {
+    if let Some(page) = pages.first() {
         match handle
             .load_application_page(SyncApplicationPageLoadRequest {
                 page: SyncApplicationPageSelector::ExactPath {
@@ -1932,7 +1912,7 @@ fn activate_sparse_v2_under_transition(
         let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
             binding, root, graph_meta,
         ));
-        prove_managed_application_ready(&replacement, None)?;
+        prove_managed_application_ready(&replacement)?;
         transition.commit(|| {
             state
                 .graphs
@@ -1952,7 +1932,6 @@ fn activate_sparse_v2_under_transition(
 
     let graph = slot.legacy_graph()?;
     let graph_meta = graph.meta();
-    let expected_pages = graph.list_pages();
     drop(graph);
     let record = state
         .sync_runtime
@@ -2038,6 +2017,7 @@ fn activate_sparse_v2_under_transition(
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         binding, root, graph_meta,
     ));
+    prove_managed_application_ready(&replacement)?;
     transition.commit(|| {
         state
             .graphs
@@ -2047,7 +2027,6 @@ fn activate_sparse_v2_under_transition(
         crate::state::poke_watcher(&state);
         Ok(())
     })?;
-    prove_managed_application_ready(&replacement, Some(&expected_pages))?;
     let result = sparse_v2_status_for_slot(&replacement);
     crate::debug::diag(format!(
         "sparse-v2 fresh activation published after {} ms: {result:?}",
@@ -3334,26 +3313,30 @@ mod tests {
     }
 
     #[test]
-    fn fresh_activation_proves_application_readiness_before_reporting_status() {
+    fn fresh_activation_proves_candidate_owned_readiness_before_slot_publication() {
         let source = include_str!("sync_runtime.rs");
         let start = source
-            .find("let expected_pages = graph.list_pages();")
-            .expect("fresh activation captures the Direct Files inventory");
+            .find("let graph = slot.legacy_graph()?;")
+            .expect("fresh activation starts from the Direct Files graph");
         let body = &source[start
             ..source[start..]
                 .find("sparse-v2 fresh activation published")
                 .map(|offset| start + offset)
                 .expect("fresh activation completion")];
+        assert!(
+            !body.contains("graph.list_pages()") && !body.contains("expected_pages"),
+            "managed readiness must not compare against a cache leased to the retired Direct Files generation"
+        );
         let publication = body
-            .find("transition.commit(")
-            .expect("managed slot publication");
+            .rfind("transition.commit(")
+            .expect("final managed slot publication");
         let readiness = body
             .find("prove_managed_application_ready")
             .expect("managed application readiness proof");
         let public_status = body
             .find("sparse_v2_status_for_slot")
             .expect("managed public status");
-        assert!(publication < readiness && readiness < public_status);
+        assert!(readiness < publication && publication < public_status);
     }
 
     #[test]
