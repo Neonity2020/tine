@@ -66,6 +66,30 @@ you run with `TINE_DEBUG=1` (see README → Troubleshooting) it is captured in
 `tine-debug.log`, which you can send instead. Receipts contain file counts and
 timings only — never note content.
 
+## External revisions (bulk changes)
+
+A `git checkout`, `fossil update`, branch switch, or a first big sync can
+replace dozens or hundreds of files at once under a running Tine. Small
+changes keep the per-file behavior described above, unchanged. When one burst
+touches **more than 32 pages**, Tine treats it as a single *external
+revision* instead of hundreds of independent edits:
+
+- The watcher reconciles the whole burst in one pass against a consistent
+  snapshot of the graph, rather than file by file.
+- The interface is told once, not once per page: visible pages refresh
+  immediately through the same safety checks as any external change (a page
+  you are editing at that moment is deferred, exactly as above — never
+  yanked); everything else reloads lazily the next time you open it, which
+  always reads the fresh state.
+- You see one calm summary line — a toast like **"128 pages updated
+  externally"**, with a conflict count appended (e.g. **"· 2 conflicts to
+  review"**) if any of the changed pages had unsaved edits that genuinely
+  diverged. No dialogs, nothing to click through.
+
+Pages with unsaved edits keep every guarantee from the Freshness section:
+divergence is proven per page, the conflict banner appears only on the
+backend's own refusal, and both sides stay recoverable.
+
 ## Transport artifacts and VCS markers
 
 Tine does not sync your Direct Files graph itself — you bring the transport
