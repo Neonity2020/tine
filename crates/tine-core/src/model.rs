@@ -34672,10 +34672,7 @@ mod tests {
             // (syncthing lib/model/folder_sendrecv.go `conflictName`; the device
             // id is up to 7 base32 chars [A-Z2-7], empty when the modifying
             // device is unknown; pre-1.1.0 versions omitted `-<device>`).
-            (
-                "Foo.sync-conflict-20260705-141233-A2B3C4D",
-                Some("Foo"),
-            ),
+            ("Foo.sync-conflict-20260705-141233-A2B3C4D", Some("Foo")),
             ("Foo.sync-conflict-20260705-141233-", Some("Foo")),
             ("Foo.sync-conflict-20190201-124559", Some("Foo")),
             (
@@ -34704,7 +34701,10 @@ mod tests {
             ("Note (SFConflict 2026-08-01-10-00-00)", Some("Note")),
             ("Note (SFConflict discussion)", None),
             ("Note (SFConflict 2026-08-01)", None),
-            ("Note (SFConflict me@example.com 2026-08-01-10-00-00) extra", None),
+            (
+                "Note (SFConflict me@example.com 2026-08-01-10-00-00) extra",
+                None,
+            ),
             // Dropbox (behavior unchanged):
             ("Report (conflicted copy 2026-08-01)", Some("Report")),
             (
@@ -34723,7 +34723,8 @@ mod tests {
         // lines, which breaks git's own conflict detection. Saves are refused
         // with a typed refusal naming the markers; the bytes stay untouched.
         let dir = scratch("vcs-marker-quarantine");
-        let original = "<<<<<<< HEAD\n- mine\n||||||| base\n- old\n=======\n- theirs\n>>>>>>> feature\n";
+        let original =
+            "<<<<<<< HEAD\n- mine\n||||||| base\n- old\n=======\n- theirs\n>>>>>>> feature\n";
         fs::write(dir.join("pages").join("Merge.md"), original).unwrap();
         let graph = Graph::open(&dir);
         let mut page = graph
@@ -34779,10 +34780,9 @@ mod tests {
             "```\n<<<<<<< HEAD\n=======\n>>>>>>> feature\n```\n- notes about git\n"
         )
         .is_empty());
-        assert!(doc::vcs_conflict_markers(
-            "~~~text\n<<<<<<< HEAD\n>>>>>>> feature\n~~~\n"
-        )
-        .is_empty());
+        assert!(
+            doc::vcs_conflict_markers("~~~text\n<<<<<<< HEAD\n>>>>>>> feature\n~~~\n").is_empty()
+        );
         // Markers quoted in an indented fence inside a bullet are not at
         // column 0 at all.
         assert!(doc::vcs_conflict_markers(
