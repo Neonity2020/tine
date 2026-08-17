@@ -2,6 +2,11 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, crea
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
 import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
+import {
+  DiffRowView,
+  collectRows,
+  seedDecisionsFromSuggestions,
+} from "./DiffRows";
 import { writeClipboardTextResilient } from "../clipboard";
 import { safeManagedErrorDetail } from "../managedDiagnostics";
 import {
@@ -113,7 +118,7 @@ import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../gr
 import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2CancelResult, SparseV2Status } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2CancelResult, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import { formatJournal } from "../journal";
@@ -3127,110 +3132,6 @@ function SyncConflictsPanel(): JSX.Element {
       <Show when={merging()}>
         {(c) => <SyncConflictMergeModal conflict={c()} onClose={() => setMerging(null)} />}
       </Show>
-    </Show>
-  );
-}
-
-// The effective decision for a row (default keep-the-current-page everywhere).
-function decisionOf(decisions: Record<string, MergeDecision>, id: string): MergeDecision {
-  return decisions[id] ?? "mine";
-}
-
-// Pre-select each row's 3-way suggestion (Concord base ledger, ADR 0056) as its
-// initial decision. Only "theirs" needs seeding — "mine" is already the default.
-// The user still confirms; nothing is applied without the merge click.
-function seedDecisionsFromSuggestions(rows: DiffRow[], out: Record<string, MergeDecision> = {}): Record<string, MergeDecision> {
-  for (const r of rows) {
-    if (r.suggestion === "theirs") out[r.id] = "theirs";
-    if (r.children.length) seedDecisionsFromSuggestions(r.children, out);
-  }
-  return out;
-}
-
-// Collect every decidable row (id + kind), flattened, for the escape-hatch buttons.
-function collectRows(rows: DiffRow[], out: { id: string; kind: string }[] = []): { id: string; kind: string }[] {
-  for (const r of rows) {
-    if (r.kind !== "unchanged") out.push({ id: r.id, kind: r.kind });
-    if (r.children.length) collectRows(r.children, out);
-  }
-  return out;
-}
-
-function firstLine(text: string): string {
-  const l = text.split("\n").find((s) => s.trim().length) ?? "";
-  return l.trim();
-}
-
-// One diff row (recursive: a modified row shows its aligned children indented).
-function DiffRowView(props: {
-  row: DiffRow;
-  depth: number;
-  decisions: Record<string, MergeDecision>;
-  setDecision: (id: string, d: MergeDecision) => void;
-  showUnchanged: boolean;
-}): JSX.Element {
-  const row = () => props.row;
-  const dec = () => decisionOf(props.decisions, row().id);
-  const seg = (value: MergeDecision, label: string, side: "mine" | "theirs") => (
-    <button
-      class="sync-merge-seg"
-      classList={{ active: dec() === value }}
-      data-side={side}
-      onClick={() => props.setDecision(row().id, value)}
-    >
-      {label}
-    </button>
-  );
-  return (
-    <Show when={props.showUnchanged || row().kind !== "unchanged"}>
-      <div class="sync-merge-row" data-kind={row().kind} style={{ "padding-left": `${props.depth * 16}px` }}>
-        <div class="sync-merge-cols">
-          <div class="sync-merge-cell mine" classList={{ chosen: row().kind !== "removed" && dec() !== "theirs" }}>
-            {row().mine ? firstLine(row().mine!.text) : <span class="sync-merge-absent">—</span>}
-            <Show when={(row().mine?.child_count ?? 0) > 0}>
-              <span class="sync-merge-kids"> +{row().mine!.child_count}</span>
-            </Show>
-          </div>
-          <div class="sync-merge-cell theirs" classList={{ chosen: dec() === "theirs" || dec() === "both" }}>
-            {row().theirs ? firstLine(row().theirs!.text) : <span class="sync-merge-absent">—</span>}
-            <Show when={(row().theirs?.child_count ?? 0) > 0}>
-              <span class="sync-merge-kids"> +{row().theirs!.child_count}</span>
-            </Show>
-          </div>
-        </div>
-        <div class="sync-merge-controls">
-          <Show when={row().kind === "modified"}>
-            {seg("mine", "Current", "mine")}
-            {seg("theirs", "Copy", "theirs")}
-            {seg("both", "Both", "theirs")}
-          </Show>
-          <Show when={row().kind === "added"}>
-            {seg("mine", "Keep", "mine")}
-            {seg("theirs", "Drop", "theirs")}
-          </Show>
-          <Show when={row().kind === "removed"}>
-            {seg("mine", "Skip", "mine")}
-            {seg("theirs", "Pull in", "theirs")}
-          </Show>
-          <Show when={row().kind === "unchanged"}>
-            <span class="sync-merge-unchanged-tag">unchanged</span>
-          </Show>
-          <Show when={row().suggestion && dec() === row().suggestion}>
-            <span class="sync-merge-suggested-tag" title="Pre-selected from the last version Tine and this file agreed on">suggested</span>
-          </Show>
-        </div>
-      </div>
-      <For each={row().children}>
-        {(child) => (
-          <DiffRowView
-            row={child}
-            depth={props.depth + 1}
-            decisions={props.decisions}
-            setDecision={props.setDecision}
-            showUnchanged={props.showUnchanged}
-          />
-        )}
-      </For>
     </Show>
   );
 }

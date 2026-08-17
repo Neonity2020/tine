@@ -1,7 +1,14 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
 import { createSignal, useContext } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
-import type { GraphMeta, JournalConflict, SyncConflict, VcsMarkerConflict, PageKind } from "./types";
+import type {
+  ConflictObject,
+  GraphMeta,
+  JournalConflict,
+  SyncConflict,
+  VcsMarkerConflict,
+  PageKind,
+} from "./types";
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
@@ -348,6 +355,32 @@ export const [vcsMarkerConflicts, setVcsMarkerConflicts] = createSignal<VcsMarke
 export function vcsMarkerConflictFor(path: string | undefined): VcsMarkerConflict | undefined {
   return path ? vcsMarkerConflicts().find((c) => c.path === path) : undefined;
 }
+// --- Concord L3: the conflict queue. ONE derived inventory over both artifact
+// sources (conflict copies + VCS-marker pages), recomputed from disk — nothing
+// is stored, so it survives restarts for free. It drives a calm badge (never a
+// modal, never blocking) and the in-page resolver. ---
+export const [conflictQueue, setConflictQueue] = createSignal<ConflictObject[]>([]);
+/** The queue entry for the page loaded from `path`, if it has one. */
+export function conflictObjectFor(path: string | undefined): ConflictObject | undefined {
+  return path ? conflictQueue().find((c) => c.page_path === path) : undefined;
+}
+// Where the badge left off, so repeated clicks WALK the queue instead of parking
+// on its first item. Transient session state: the queue itself is derived.
+let conflictCursor = 0;
+/** The next conflict to visit, cycling. `undefined` when the queue is empty. */
+export function advanceConflictCursor(): ConflictObject | undefined {
+  const queue = conflictQueue();
+  if (!queue.length) return undefined;
+  conflictCursor = conflictCursor % queue.length;
+  const next = queue[conflictCursor];
+  conflictCursor = (conflictCursor + 1) % queue.length;
+  return next;
+}
+/** Reset the walk (a fresh queue makes the old position meaningless). */
+export function resetConflictCursor(): void {
+  conflictCursor = 0;
+}
+
 /** Re-fetch the sync-conflict + VCS-marker lists; with `notify`, toast if any exist. */
 export async function refreshSyncConflicts(notify = false): Promise<void> {
   try {
@@ -375,6 +408,16 @@ export async function refreshSyncConflicts(notify = false): Promise<void> {
     }
   } catch {
     /* best-effort */
+  }
+  try {
+    const before = conflictQueue().map((c) => c.id).join("\u0000");
+    const queue = await backend().conflictQueue();
+    setConflictQueue(queue);
+    if (queue.map((c) => c.id).join("\u0000") !== before) resetConflictCursor();
+  } catch {
+    // Best-effort like the two listings above: a missing queue means no badge,
+    // never a broken app. The Settings fallback surface still works.
+    setConflictQueue([]);
   }
 }
 
