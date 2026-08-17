@@ -2092,10 +2092,37 @@ pub struct SyncRuntimeStatusSnapshot {
     pub shared_role: Option<SyncSharedRole>,
     pub shared_phase: Option<SyncSharedPhase>,
     pub provider_pending: usize,
+    /// Whether another `tick` would route into the shared-provider lane.
+    ///
+    /// This is deliberately NOT `provider_pending != 0`. `provider_pending` is a
+    /// broad protocol inventory that also counts durable publication intents
+    /// which legitimately remain after their manifest, head and objects were
+    /// published; a scheduler driven by that number would never sleep. This flag
+    /// is the exact predicate `tick` itself consults, so it is true only while a
+    /// further tick can still act on provider work.
+    pub provider_runnable: bool,
     pub managed_local_pending: usize,
     pub managed_local_checkpointed_sequence: u64,
     pub managed_local_next_sequence: u64,
     pub managed_local_stage: Option<String>,
+}
+
+impl SyncRuntimeStatusSnapshot {
+    /// Work this runtime can still act on WITHOUT any further external event.
+    ///
+    /// A scheduler that sleeps while this is true has stranded known work: a
+    /// quiet graph produces no new filesystem edge to wake it. Delivered
+    /// provider evidence is such work — it arrives as bytes on disk, not as an
+    /// operation the receiving device performed — so it must be its own runnable
+    /// work source rather than waiting for an unrelated inotify event.
+    ///
+    /// The converse is the anti-hot-loop half of the same contract: when this is
+    /// false the actor has named itself idle and the scheduler must genuinely
+    /// sleep.
+    #[must_use]
+    pub const fn has_runnable_work(&self) -> bool {
+        self.watcher.pending || self.provider_runnable
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3557,6 +3584,7 @@ impl SyncRuntimeHandle {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            provider_runnable: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -3601,6 +3629,7 @@ impl SyncRuntimeHandle {
                         shared_role: None,
                         shared_phase: None,
                         provider_pending: 0,
+                        provider_runnable: false,
                         managed_local_pending: 0,
                         managed_local_checkpointed_sequence: 0,
                         managed_local_next_sequence: 0,
@@ -3697,6 +3726,7 @@ impl SyncRuntimeHandle {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            provider_runnable: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -3732,6 +3762,7 @@ impl SyncRuntimeHandle {
                         shared_role: None,
                         shared_phase: None,
                         provider_pending: 0,
+                        provider_runnable: false,
                         managed_local_pending: 0,
                         managed_local_checkpointed_sequence: 0,
                         managed_local_next_sequence: 0,
@@ -3807,6 +3838,7 @@ impl SyncRuntimeHandle {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            provider_runnable: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -3844,6 +3876,7 @@ impl SyncRuntimeHandle {
                         shared_role: None,
                         shared_phase: None,
                         provider_pending: 0,
+                        provider_runnable: false,
                         managed_local_pending: 0,
                         managed_local_checkpointed_sequence: 0,
                         managed_local_next_sequence: 0,
@@ -26332,6 +26365,14 @@ impl RuntimeActor {
                 + self.provider_intent_retirement.len()
                 + usize::from(self.provider_intent_retirement_scan_active)
                 + self.provider_intents.len(),
+            // The scheduling half of the inventory above: exactly the predicate
+            // `tick`/`tick_clean_runtime` consult before routing into the
+            // provider lane. Keeping these two in one place is what lets the
+            // Tauri scheduler treat delivered provider work as runnable without
+            // reading the inventory, which never reaches zero while durable
+            // publication intents remain.
+            provider_runnable: self.shared_phase == Some(SyncSharedPhase::Active)
+                && self.provider_has_work(),
             managed_local_pending: self
                 .managed_local
                 .as_ref()
@@ -46806,6 +46847,248 @@ mod tests {
                 .is_file(),
             "Safe was published before rejected provider work converged"
         );
+    }
+
+    /// Whether the real Tauri scheduler would schedule one further turn.
+    ///
+    /// A transcription of `sparse_tick_needs_continuation` in
+    /// `src-tauri/src/watcher.rs`: the tick result names the lane this turn
+    /// took, and `has_runnable_work` names work the actor still holds. Keep the
+    /// two in step; this is the whole scheduling contract the app has.
+    fn production_scheduler_continues(tick: &SyncRuntimeTick, runnable: bool) -> bool {
+        runnable
+            || matches!(
+                tick,
+                SyncRuntimeTick::LocalMutation(_)
+                    | SyncRuntimeTick::ProviderMutation { .. }
+                    | SyncRuntimeTick::Recovering
+                    | SyncRuntimeTick::RetryFull
+                    // Production paces this one by backoff rather than by the
+                    // progress cadence, but it does keep retrying it.
+                    | SyncRuntimeTick::RecoveryBlocked(_)
+            )
+    }
+
+    /// Drive an actor exactly as the production scheduler drives it.
+    ///
+    /// The app is NOT `settle_shared_provider`: it cannot loop on an internal
+    /// inventory, and on a quiet graph nothing produces a later filesystem event
+    /// to wake it. It gets exactly one bounded turn per scheduled continuation
+    /// and must decide from that turn's result plus the actor's own status
+    /// whether to schedule another. A drive that stops with work undone is the
+    /// app hanging, not a slow test.
+    fn drive_like_the_production_scheduler(handle: &SyncRuntimeHandle) -> usize {
+        for turn in 1..=1_024 {
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "scheduled provider turn failed: {tick:?}"
+            );
+            let runnable = handle.status().unwrap().has_runnable_work();
+            if !production_scheduler_continues(&tick, runnable) {
+                return turn;
+            }
+        }
+        panic!(
+            "scheduled provider turns exceeded the bounded budget: {:?}",
+            handle.status().unwrap()
+        );
+    }
+
+    /// Provider evidence delivered while the receiving device was stopped.
+    ///
+    /// This is the exact device-A state of the two-device journey: another
+    /// device's edit arrives as bytes inside the graph-local provider tree while
+    /// this device is not running, the device reopens, its own startup scan
+    /// settles its watcher epochs, and no further filesystem event is ever
+    /// produced. Nothing but the actor's own knowledge of the delivered work can
+    /// carry it to the page.
+    #[test]
+    fn provider_arrival_across_a_delivery_cut_becomes_scheduled_work() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-arrival-delivery-cut", 0xbe00);
+        let (batch_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xbe20,
+            "Provider Arrival Delivery Cut",
+            "notes/provider-arrival-delivery-cut.md",
+            "peer edit delivered while the receiver was stopped",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, batch_id);
+        settle_shared_provider(&initiator_handle);
+
+        // The receiver is stopped BEFORE delivery, exactly like the journey's
+        // forced kill around the external boundary. No inotify edge exists for
+        // bytes written while no watcher is installed.
+        drop(receiver_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        // The one scan the production watcher performs on its first turn after
+        // installing watches. Everything after this point must come from the
+        // actor's own knowledge of retained work.
+        reopened.observe_provider().unwrap();
+        drive_like_the_production_scheduler(&reopened);
+
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/provider-arrival-delivery-cut.md")
+                .is_file(),
+            "the peer's delivered edit never became scheduled actor work: {:?}",
+            reopened.status().unwrap()
+        );
+        let settled = reopened.status().unwrap();
+        assert!(
+            !settled.has_runnable_work(),
+            "a drained receiver must name no runnable work: {settled:?}"
+        );
+    }
+
+    /// Provider arrival while the receiving actor is already running.
+    ///
+    /// The bytes appear inside the graph-local provider namespace, are announced
+    /// once as an imprecise delivery observation, and then nothing else happens
+    /// on this device. Each scheduled turn is one bounded unit, so the arrival
+    /// only converges if the actor keeps naming the retained work between turns.
+    #[test]
+    fn provider_arrival_while_active_becomes_scheduled_work() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-arrival-while-active", 0xbe40);
+        let (batch_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xbe60,
+            "Provider Arrival While Active",
+            "notes/provider-arrival-while-active.md",
+            "peer edit delivered to a running receiver",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, batch_id);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+
+        drive_like_the_production_scheduler(&receiver_handle);
+
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/provider-arrival-while-active.md")
+                .is_file(),
+            "delivery to a running receiver was never scheduled to completion: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(
+            !receiver_handle.status().unwrap().has_runnable_work(),
+            "a drained running receiver must return the scheduler to sleep",
+        );
+    }
+
+    /// Several delivered items must drain to zero under the same one-turn-per-
+    /// continuation budget, and ordinary page reads must interleave with that
+    /// drain rather than queue behind the whole backlog.
+    #[test]
+    fn multiple_delivered_provider_items_drain_to_zero_without_starving_reads() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-arrival-multi-drain", 0xbe80);
+        let paths = [
+            "notes/provider-arrival-multi-one.md",
+            "notes/provider-arrival-multi-two.md",
+            "notes/provider-arrival-multi-three.md",
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            let seed = 0xbea0 + (index as u128) * 0x10;
+            let (batch_id, ..) = submit_shared_page(
+                &initiator_handle,
+                seed,
+                &format!("Provider Arrival Multi {index}"),
+                path,
+                "one of several delivered items",
+            );
+            publish_shared_batch(&initiator_handle, &initiator, batch_id);
+        }
+        settle_shared_provider(&initiator_handle);
+
+        drop(receiver_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        reopened.observe_provider().unwrap();
+
+        // Interleave an ordinary application read with every scheduled turn.
+        // Each turn is one bounded unit, so a read can never wait for the whole
+        // backlog.
+        for turn in 1..=1_024 {
+            let tick = reopened.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "scheduled provider turn failed: {tick:?}"
+            );
+            match reopened
+                .query(SyncRuntimeQueryRequest::ListPages {
+                    page_kind: None,
+                    limit: MAX_MATERIALIZATION_QUERY_ROWS,
+                })
+                .unwrap_or_else(|error| {
+                    panic!("an ordinary page read was starved during the provider drain: {error}")
+                }) {
+                SyncRuntimeQueryReply::Pages(_) => {}
+                other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+            }
+            let runnable = reopened.status().unwrap().has_runnable_work();
+            if !production_scheduler_continues(&tick, runnable) {
+                break;
+            }
+            assert!(turn < 1_024, "the delivered backlog never drained");
+        }
+
+        for path in paths {
+            assert!(
+                receiver.graph_root.join(path).is_file(),
+                "delivered item {path} never became scheduled actor work: {:?}",
+                reopened.status().unwrap()
+            );
+        }
+        let settled = reopened.status().unwrap();
+        assert!(
+            !settled.has_runnable_work(),
+            "a fully drained receiver must return the scheduler to sleep: {settled:?}"
+        );
+    }
+
+    /// The anti-hot-loop direction. A shared actor with nothing delivered and
+    /// nothing observed must name no runnable work, so the production scheduler
+    /// arms no timer and genuinely sleeps.
+    #[test]
+    fn a_quiet_shared_actor_names_no_runnable_work() {
+        let (_initiator, _receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-arrival-quiescent", 0xbec0);
+        for handle in [&initiator_handle, &receiver_handle] {
+            let status = handle.status().unwrap();
+            assert!(
+                !status.has_runnable_work(),
+                "a settled shared actor must not keep the scheduler awake: {status:?}"
+            );
+            assert!(matches!(handle.tick().unwrap(), SyncRuntimeTick::Idle));
+            assert!(!handle.status().unwrap().has_runnable_work());
+        }
     }
 
     #[test]

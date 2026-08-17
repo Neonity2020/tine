@@ -1125,12 +1125,22 @@ fn sparse_provider_rescan_required(
 /// `Admitted*` result from that turn does not mean the provider obligation was
 /// consumed. Schedule exactly one continuation; once provider work begins its
 /// ordinary `Recovering` result owns subsequent continuation turns.
+///
+/// `actor_has_runnable_work` is the durable half of that rule
+/// (`SyncRuntimeStatusSnapshot::has_runnable_work`): work the actor already
+/// KNOWS about — a newer watcher epoch queued behind a completed scan, or
+/// provider evidence another device delivered as bytes on disk — is itself a
+/// runnable work source. One tick's result describes only the lane that tick
+/// took, so a receiving device whose tick settled a watcher epoch can still be
+/// holding delivered provider manifests. Nothing on a quiet graph will produce a
+/// later filesystem edge to wake them, so a scheduler that consulted only the
+/// tick result slept forever with the peer's edit undelivered.
 fn sparse_tick_needs_continuation(
     tick: &SyncRuntimeTick,
     provider_rescan_queued: bool,
-    actor_watcher_pending: bool,
+    actor_has_runnable_work: bool,
 ) -> bool {
-    actor_watcher_pending
+    actor_has_runnable_work
         || matches!(
             tick,
             SyncRuntimeTick::LocalMutation(_)
@@ -1145,6 +1155,22 @@ fn sparse_tick_needs_continuation(
                     | SyncRuntimeTick::AdmittedNoop { .. }
                     | SyncRuntimeTick::AdmittedComplete { .. }
             ))
+}
+
+/// The anti-hot-loop half of the same contract.
+///
+/// The provider lane reports `Idle` when its ready queue is empty but pending
+/// batches remain blocked on causal dependencies whose bytes have not been
+/// delivered yet (`tick_provider`'s `ready_front()` miss). That is known work no
+/// tick can advance right now, so the 10ms progress cadence would become a poll
+/// loop against the disk. Retry it on the ordinary backoff schedule instead —
+/// bounded polling, never permanent sleep, and identical to how a
+/// `RecoveryBlocked` provider turn is already paced.
+fn sparse_tick_is_blocked_without_progress(
+    tick: &SyncRuntimeTick,
+    actor_has_runnable_work: bool,
+) -> bool {
+    actor_has_runnable_work && matches!(tick, SyncRuntimeTick::Idle)
 }
 
 fn take_sparse_initial_tick(pending: &mut bool) -> bool {
@@ -1509,25 +1535,33 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         // a content change. `AdmittedNoop` is, by its own name,
                         // the step that took no completed batch.
                         let changed = tick.committed_observable_change();
-                        // A bounded full scan can settle one retained epoch
-                        // while observations received during that scan leave a
-                        // newer epoch pending. The tick result describes only
-                        // the epoch it just completed, so continuation must
-                        // also consult the actor's post-tick watcher state.
-                        // Otherwise a quiet graph has no new inotify edge to
-                        // wake the remaining work and the first shared edit can
-                        // stay pending forever.
+                        // A bounded tick settles one lane. The tick result
+                        // describes only that lane, so continuation must also
+                        // consult the actor's post-tick status: a newer watcher
+                        // epoch can be queued behind a completed full scan, and
+                        // provider evidence another device delivered as bytes on
+                        // disk is work this device never performed and no
+                        // inotify edge will announce again. Otherwise a quiet
+                        // graph sleeps holding a peer's edit forever.
                         let status = graph.handle.status().ok();
-                        let actor_watcher_pending =
-                            status.as_ref().is_some_and(|status| status.watcher.pending);
+                        let actor_has_runnable_work = status
+                            .as_ref()
+                            .is_some_and(SyncRuntimeStatusSnapshot::has_runnable_work);
                         match &tick {
                             SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Failed(_) => {
+                                graph.retry.failed(Instant::now())
+                            }
+                            tick if sparse_tick_is_blocked_without_progress(
+                                tick,
+                                actor_has_runnable_work,
+                            ) =>
+                            {
                                 graph.retry.failed(Instant::now())
                             }
                             tick if sparse_tick_needs_continuation(
                                 tick,
                                 provider_rescan,
-                                actor_watcher_pending,
+                                actor_has_runnable_work,
                             ) =>
                             {
                                 graph.retry.progressed(Instant::now())
@@ -1718,6 +1752,7 @@ mod tests {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            provider_runnable: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -2139,7 +2174,7 @@ mod tests {
                 false,
                 true,
             ),
-            "a newer watcher epoch queued behind a completed scan must drain without another filesystem edge",
+            "work the actor still names must drain without another filesystem edge",
         );
         assert!(
             !sparse_tick_needs_continuation(
@@ -2148,6 +2183,167 @@ mod tests {
                 false,
             ),
             "blocked provider work keeps the existing backoff policy",
+        );
+    }
+
+    fn shared_active_snapshot(
+        watcher_pending: bool,
+        provider_runnable: bool,
+    ) -> SyncRuntimeStatusSnapshot {
+        let mut snapshot = runtime_snapshot(SyncRuntimeLifecycle::Active);
+        snapshot.shared_role = Some(tine_core::sync_runtime::SyncSharedRole::Initiator);
+        snapshot.shared_phase = Some(tine_core::sync_runtime::SyncSharedPhase::Active);
+        snapshot.watcher.pending = watcher_pending;
+        // The broad protocol inventory a receiving device really reported at the
+        // observed failure: three delivered provider items behind an idle
+        // watcher. It is deliberately NOT what the scheduler reads.
+        snapshot.provider_pending = if provider_runnable { 3 } else { 0 };
+        snapshot.provider_runnable = provider_runnable;
+        snapshot
+    }
+
+    /// The exact device-A failure state from the two-device journey: the peer's
+    /// edit was delivered as provider bytes on disk, the receiving actor knows
+    /// about it, the watcher epochs are settled, and no further filesystem event
+    /// is coming. The scheduler must schedule the work anyway.
+    #[test]
+    fn delivered_provider_work_is_its_own_runnable_work_source() {
+        let delivered = shared_active_snapshot(false, true);
+        assert!(
+            delivered.has_runnable_work(),
+            "an idle watcher over delivered provider evidence is not an idle actor",
+        );
+        assert!(
+            sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedNoop { epoch: 2 },
+                false,
+                delivered.has_runnable_work(),
+            ),
+            "a tick that settled a watcher epoch while provider evidence remains \
+             delivered must schedule its own continuation: nothing on a quiet \
+             graph will produce a later filesystem event for bytes another \
+             device wrote",
+        );
+        assert!(
+            sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedComplete { epoch: 2 },
+                false,
+                delivered.has_runnable_work(),
+            ),
+            "an admitted local change must not consume the provider obligation",
+        );
+    }
+
+    /// Provider arrival while the receiving actor is already busy with its own
+    /// lanes: the drain must continue across every non-terminal tick shape until
+    /// the actor itself reports no runnable work.
+    #[test]
+    fn provider_drain_continues_until_the_actor_reports_no_runnable_work() {
+        for remaining in [
+            SyncRuntimeTick::AdmittedNoop { epoch: 4 },
+            SyncRuntimeTick::AdmittedComplete { epoch: 4 },
+            SyncRuntimeTick::Recovering,
+            SyncRuntimeTick::ProviderMutation {
+                batch_id: tine_core::oplog::BatchId::from_uuid(uuid::Uuid::from_u128(9)),
+            },
+        ] {
+            assert!(
+                sparse_tick_needs_continuation(&remaining, false, true),
+                "{remaining:?} left runnable provider work behind",
+            );
+        }
+        let drained = shared_active_snapshot(false, false);
+        assert!(
+            !drained.has_runnable_work(),
+            "a drained shared actor names no runnable work",
+        );
+        assert!(
+            !sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedNoop { epoch: 5 },
+                false,
+                drained.has_runnable_work(),
+            ),
+            "the last provider item draining to zero must return the scheduler to sleep",
+        );
+    }
+
+    /// The anti-hot-loop direction, at the schedule rather than the predicate:
+    /// with both lanes empty the scheduler must arm no timer at all, so the
+    /// inotify branch blocks on the kernel instead of polling.
+    #[test]
+    fn an_empty_watcher_and_empty_provider_lane_arm_no_timer() {
+        let quiet = shared_active_snapshot(false, false);
+        assert!(!quiet.has_runnable_work());
+        let mut retry = RetrySchedule::default();
+        let now = Instant::now();
+        match &(SyncRuntimeTick::AdmittedNoop { epoch: 6 }) {
+            tick if sparse_tick_is_blocked_without_progress(tick, quiet.has_runnable_work()) => {
+                retry.failed(now)
+            }
+            tick if sparse_tick_needs_continuation(tick, false, quiet.has_runnable_work()) => {
+                retry.progressed(now)
+            }
+            _ => retry.succeeded(),
+        }
+        assert_eq!(
+            retry.remaining(now),
+            None,
+            "a genuinely quiet shared graph must sleep, not poll",
+        );
+    }
+
+    /// Known-but-unadvanceable provider work — pending batches blocked on causal
+    /// dependencies whose bytes have not arrived — must be paced by backoff, not
+    /// by the 10ms progress cadence, while still never sleeping forever.
+    #[test]
+    fn provider_work_that_cannot_advance_backs_off_instead_of_polling() {
+        assert!(
+            sparse_tick_is_blocked_without_progress(&SyncRuntimeTick::Idle, true),
+            "an Idle tick that left runnable provider work made no progress",
+        );
+        assert!(
+            !sparse_tick_is_blocked_without_progress(&SyncRuntimeTick::Idle, false),
+            "an Idle tick over an empty actor is ordinary quiescence",
+        );
+        assert!(
+            !sparse_tick_is_blocked_without_progress(&SyncRuntimeTick::Recovering, true),
+            "a Recovering provider turn is progress and keeps the fast cadence",
+        );
+
+        let mut retry = RetrySchedule::default();
+        let now = Instant::now();
+        retry.failed(now);
+        let backoff = retry.remaining(now).expect("blocked work stays scheduled");
+        assert!(
+            backoff >= Duration::from_millis(250),
+            "blocked provider work must not be retried at the progress cadence: {backoff:?}",
+        );
+    }
+
+    /// Ordinary page reads and saves share the actor's serialized request lane
+    /// with provider work. The scheduler must therefore keep handing the actor
+    /// bounded turns rather than one unbounded drain, so an application request
+    /// is never queued behind a whole provider backlog.
+    #[test]
+    fn provider_continuations_stay_bounded_single_turns() {
+        let mut retry = RetrySchedule::default();
+        let now = Instant::now();
+        retry.progressed(now);
+        let gap = retry
+            .remaining(now)
+            .expect("a provider continuation stays scheduled");
+        assert!(
+            gap <= Duration::from_millis(10),
+            "provider continuation must resume promptly: {gap:?}",
+        );
+        assert!(
+            retry.take_due(now + Duration::from_millis(10)),
+            "each continuation is one further bounded turn, not a drain loop",
+        );
+        assert_eq!(
+            retry.remaining(now + Duration::from_millis(10)),
+            None,
+            "a consumed continuation must not re-arm itself without another tick result",
         );
     }
 

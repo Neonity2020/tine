@@ -39,6 +39,15 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::shared_provider_clean_late_join_installs_provider_history_without_rewriting_graph",
   "sync_runtime::tests::shared_provider_clean_late_join_refuses_unmatched_local_graph_without_changing_authority",
   "sync_runtime::tests::shared_provider_clean_two_device_unicode_join_and_restart",
+  // Provider-arrival scheduling. Delivered provider evidence is work this
+  // device never performed and no filesystem event will announce again, so
+  // these drive the actor with the production scheduler's own contract
+  // (`SyncRuntimeStatusSnapshot::has_runnable_work`) rather than with the test
+  // harness's inventory loop. The last one is the anti-hot-loop direction.
+  "sync_runtime::tests::provider_arrival_across_a_delivery_cut_becomes_scheduled_work",
+  "sync_runtime::tests::provider_arrival_while_active_becomes_scheduled_work",
+  "sync_runtime::tests::multiple_delivered_provider_items_drain_to_zero_without_starving_reads",
+  "sync_runtime::tests::a_quiet_shared_actor_names_no_runnable_work",
 ]);
 
 // Architectural/contract guards that happen to live in `sync_runtime::tests`

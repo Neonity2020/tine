@@ -3277,6 +3277,7 @@ mod clean_shutdown_slot_tests {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            provider_runnable: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,

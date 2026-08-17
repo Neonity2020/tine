@@ -383,6 +383,25 @@ as an observable graph change and schedules a continuation for any remaining
 provider work. A terminal quiet watcher admission remains `AdmittedNoop` and
 must not manufacture a frontend refresh or conflict.
 
+**Known provider work is itself a runnable work source.** Delivered provider
+evidence is work this device never performed; it arrives as bytes another device
+wrote, and once the delivery is over no further filesystem event announces it.
+One actor turn settles one lane, so a turn that consumed a watcher epoch reports
+`Admitted*` while delivered provider evidence is still retained — that report is
+not evidence of a quiet graph. The actor therefore publishes
+`SyncRuntimeStatusSnapshot::provider_runnable`, the exact predicate `tick`
+consults before routing into the provider lane, and the production watcher
+schedules its next turn while `has_runnable_work()` (a pending watcher epoch OR
+runnable provider work) is true. `provider_pending` is NOT that predicate: it is
+a broad protocol inventory which also counts durable publication intents that
+legitimately remain after publication, so a scheduler driven by it would never
+sleep. Conversely, when `has_runnable_work()` is false the scheduler arms no
+timer at all and blocks on the kernel; and a turn that reports `Idle` while
+still naming runnable provider work — the ready queue blocked on causal
+dependencies whose bytes have not been delivered — is paced by the ordinary
+retry backoff rather than the progress cadence, so a blocked dependency cannot
+become a poll loop.
+
 ### 2.4 Lazy activation and clean runtime boundary
 
 The accepted next activation generation has one authority-changing record:

@@ -6712,6 +6712,30 @@
         "failBefore": "proven"
       },
       "notes": "The real two-device journey reached healthy local activation, then the first explicit share cut stopped its actor by design and the Tauri command immediately queried that retired handle, returning sync actor is unavailable. Share and already-managed join now reopen the durable post-enrollment runtime, prove its ordinary page inventory/load boundary, and publish a new exact-generation graph slot before returning success. That repair exposed a second product defect: a bounded watcher scan could acknowledge one epoch while newer observations remained pending, but an AdmittedNoop/Complete tick scheduled no continuation and a quiet graph supplied no new inotify edge. The watcher now consults the actor's post-tick pending bit, drains all retained epochs without a timer guess, and still leaves a truly quiet actor asleep. The source regressions pin cut -> reopen -> exact publish ordering and pending-epoch continuation; the real two-device journey remains the release-blocking semantic proof."
+    },
+    {
+      "id": "UI-MANAGED-PROVIDER-ARRIVAL-SCHEDULING-001",
+      "title": "A peer edit delivered into managed storage becomes visible without waiting for an unrelated filesystem event",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/watcher.rs",
+          "scripts/e2e-sparse-v2-two-device.mjs"
+        ],
+        "scenario": "managed-storage.provider-arrival-becomes-scheduled-work",
+        "failBefore": "proven"
+      },
+      "notes": "The two-device journey delivered device B's edit into device A's graph-local provider tree while device A was stopped. On reopen, device A discovered the delivery (provider_pending=3) while its watcher was idle (pending=false, latest_enqueue=2, acknowledged=2), and the peer edit never appeared. The Tauri sparse scheduler decided continuation from the tick result plus the actor's watcher pending bit only, so a tick that settled a watcher epoch read as a quiet graph and cleared the retry schedule; a quiet graph produces no further inotify edge for bytes another device wrote, so the delivered work was stranded forever. The actor now publishes provider_runnable alongside provider_pending - the exact predicate tick consults, not the broad inventory that legitimately never reaches zero while durable publication intents remain - and the scheduler continues while SyncRuntimeStatusSnapshot::has_runnable_work() is true. A tick that reports Idle while still naming runnable provider work is paced by the ordinary backoff schedule instead of the progress cadence, so a blocked causal dependency cannot become a poll loop, and a genuinely quiet actor still arms no timer at all. Source regressions pin arrival across the delivery/reopen cut, arrival to a running receiver, a multi-item drain to zero with interleaved page reads, and the idle direction; the real two-device journey remains the release-blocking semantic proof."
     }
   ]
 }
