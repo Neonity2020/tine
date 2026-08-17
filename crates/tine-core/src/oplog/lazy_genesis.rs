@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -863,6 +864,7 @@ impl LazyGenesisPackBuilder {
             .map(|(index, descriptor)| (descriptor.home_document_id, index))
             .collect();
         let scratch = std::mem::take(&mut self.scratch);
+        let segment_seals = SegmentSealMemo::new(manifest.segments.len());
         Ok(LazyGenesisCandidate {
             scratch,
             manifest,
@@ -871,6 +873,7 @@ impl LazyGenesisPackBuilder {
             index,
             home_index,
             cleanup_on_drop: true,
+            segment_seals,
         })
     }
 }
@@ -891,6 +894,40 @@ pub(crate) struct LazyGenesisCandidate {
     index: BTreeMap<PageId, usize>,
     home_index: BTreeMap<DocumentId, usize>,
     cleanup_on_drop: bool,
+    /// Which sealed segment packs this candidate has already proved against
+    /// the manifest's segment digests, and how many such whole-pack proofs it
+    /// has run. A sealed segment is written once and never rewritten, so
+    /// re-hashing the entire pack for every page read costs
+    /// `O(pages × segment bytes)` and proves nothing the first proof did not.
+    /// Every page still verifies its own capsule bytes against the descriptor
+    /// digest on every read, so localized corruption of the bytes actually
+    /// returned is caught regardless of this memo.
+    segment_seals: SegmentSealMemo,
+}
+
+/// One-shot per-segment seal proofs for a sealed lazy-genesis pack.
+#[derive(Debug, Default)]
+struct SegmentSealMemo {
+    proved: Vec<AtomicBool>,
+    proofs: AtomicUsize,
+}
+
+impl SegmentSealMemo {
+    fn new(segments: usize) -> Self {
+        Self {
+            proved: (0..segments).map(|_| AtomicBool::new(false)).collect(),
+            proofs: AtomicUsize::new(0),
+        }
+    }
+
+    /// Forget every proof. Used when the pack's location changes underneath a
+    /// retained candidate, so the next read re-proves the seal at its new home.
+    fn reset(&self) {
+        for proved in &self.proved {
+            proved.store(false, Ordering::Release);
+        }
+        self.proofs.store(0, Ordering::Release);
+    }
 }
 
 impl LazyGenesisCandidate {
@@ -1017,20 +1054,53 @@ impl LazyGenesisCandidate {
         self.manifest.block_count
     }
 
+    /// Prove one sealed segment pack against its manifest digest at most once
+    /// per candidate lifetime and return its path.
+    ///
+    /// The in-scope failure this defends against is a damaged sealed pack —
+    /// a truncated write, a crash between write and fsync, or a disk error —
+    /// not an adversary rewriting private storage. That failure is a property
+    /// of the file as it was opened, so one proof per pack answers it; running
+    /// the same proof once per page turns a linear baseline read into
+    /// `O(pages × segment bytes)`. `page` still checks every capsule against
+    /// its own descriptor digest, so damage to the bytes a caller actually
+    /// receives is rejected on every read.
+    fn prove_segment_seal(&self, segment: usize) -> io::Result<PathBuf> {
+        let expected = *self
+            .manifest
+            .segments
+            .get(segment)
+            .ok_or_else(|| invalid("lazy genesis descriptor names a missing segment"))?;
+        let path = segment_path(&self.scratch, segment);
+        let proved = self
+            .segment_seals
+            .proved
+            .get(segment)
+            .ok_or_else(|| invalid("lazy genesis descriptor names a missing segment"))?;
+        if proved.load(Ordering::Acquire) {
+            return Ok(path);
+        }
+        if describe_file(&path)? != expected {
+            return Err(invalid("lazy genesis segment bytes changed"));
+        }
+        self.segment_seals.proofs.fetch_add(1, Ordering::Relaxed);
+        proved.store(true, Ordering::Release);
+        Ok(path)
+    }
+
+    /// How many whole-pack seal proofs this candidate has run. A sealed pack
+    /// is immutable, so this must not grow with the number of pages read.
+    #[cfg(test)]
+    pub(crate) fn segment_seal_proofs(&self) -> usize {
+        self.segment_seals.proofs.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn page(&self, page_id: PageId) -> io::Result<Option<LazyGenesisPageInput>> {
         let Some(&index) = self.index.get(&page_id) else {
             return Ok(None);
         };
         let descriptor = &self.manifest.pages[index];
-        let expected_segment = *self
-            .manifest
-            .segments
-            .get(descriptor.segment as usize)
-            .ok_or_else(|| invalid("lazy genesis descriptor names a missing segment"))?;
-        let path = segment_path(&self.scratch, descriptor.segment as usize);
-        if describe_file(&path)? != expected_segment {
-            return Err(invalid("lazy genesis segment bytes changed"));
-        }
+        let path = self.prove_segment_seal(descriptor.segment as usize)?;
         let mut file = fs::File::open(path)?;
         file.seek(SeekFrom::Start(descriptor.offset))?;
         let mut bytes = vec![0_u8; descriptor.length as usize];
@@ -1145,6 +1215,10 @@ impl LazyGenesisCandidate {
         }
         self.scratch = destination.to_path_buf();
         self.cleanup_on_drop = false;
+        // The sealed packs now live somewhere else. Whatever this candidate
+        // proved about the old location says nothing about the new one, so
+        // discard every seal proof and let the next read re-prove it.
+        self.segment_seals.reset();
         Ok(self)
     }
 
@@ -1187,6 +1261,7 @@ impl LazyGenesisCandidate {
             .enumerate()
             .map(|(index, descriptor)| (descriptor.home_document_id, index))
             .collect();
+        let segment_seals = SegmentSealMemo::new(manifest.segments.len());
         Ok(Self {
             scratch: directory.to_path_buf(),
             manifest,
@@ -1195,6 +1270,7 @@ impl LazyGenesisCandidate {
             index,
             home_index,
             cleanup_on_drop: false,
+            segment_seals,
         })
     }
 
@@ -1587,6 +1663,136 @@ mod tests {
         assert_eq!(read.path.as_str(), "pages/b.org");
         assert_eq!(read.blocks.len(), 1);
         assert_eq!(read.exact_source_bytes, vec![b'x'; 8]);
+    }
+
+    /// Build a sealed single-segment pack of `pages` tiny pages.
+    fn sealed_pack(seed: u128, pages: usize) -> LazyGenesisCandidate {
+        let mut builder = LazyGenesisPackBuilder::new(
+            WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+            LineageDigest::of(b"lazy-genesis-segment-seal-test"),
+            catalog_document_id(),
+            BlobDescription::of(b"capture"),
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        for index in 0..pages {
+            builder
+                .push(page(index as u128 + 1, &format!("pages/p{index:06}.md"), 1))
+                .unwrap();
+        }
+        builder
+            .finish(vec![0x43, 0x41, 0x54], Some(catalog_dependencies()))
+            .unwrap()
+    }
+
+    fn page_id_at(ordinal: usize) -> PageId {
+        PageId::from_uuid(Uuid::from_u128(ordinal as u128 + 1))
+    }
+
+    /// A sealed segment pack is written once and never rewritten, so proving
+    /// it against its manifest digest is a property of the pack, not of the
+    /// read. Re-proving per page would make every baseline read — including
+    /// the clean watcher's full scan — cost `O(pages x segment bytes)`.
+    #[test]
+    fn lazy_genesis_proves_each_sealed_segment_at_most_once() {
+        const PAGES: usize = 64;
+        let candidate = sealed_pack(0xa181, PAGES);
+        assert_eq!(candidate.manifest.segments.len(), 1);
+        assert_eq!(candidate.segment_seal_proofs(), 0);
+        for ordinal in 0..PAGES {
+            assert!(candidate.page(page_id_at(ordinal)).unwrap().is_some());
+        }
+        assert_eq!(
+            candidate.segment_seal_proofs(),
+            1,
+            "reading {PAGES} pages must not re-hash the sealed segment once per page"
+        );
+
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("Reading one baseline page costs that page, not the pack."));
+        assert!(contract
+            .contains("proved against\nthe sealed manifest at most once per opened baseline"));
+    }
+
+    /// The retained proof must not blind the per-capsule integrity check: the
+    /// bytes a caller actually receives are verified against their descriptor
+    /// digest on every read.
+    #[test]
+    fn lazy_genesis_rejects_a_damaged_capsule_after_its_segment_was_proved() {
+        let candidate = sealed_pack(0xa182, 8);
+        assert!(candidate.page(page_id_at(0)).unwrap().is_some());
+        assert_eq!(candidate.segment_seal_proofs(), 1);
+
+        let descriptor = candidate
+            .manifest
+            .pages
+            .iter()
+            .find(|descriptor| descriptor.page_id == page_id_at(5))
+            .expect("sealed pack describes every pushed page")
+            .clone();
+        let segment = segment_path(&candidate.scratch, descriptor.segment as usize);
+        let mut bytes = fs::read(&segment).unwrap();
+        let target = descriptor.offset as usize;
+        bytes[target] ^= 0xff;
+        fs::write(&segment, &bytes).unwrap();
+
+        let error = candidate.page(page_id_at(5)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("capsule bytes changed"),
+            "damaged capsule bytes must be rejected on every read: {error}"
+        );
+    }
+
+    /// The whole-pack seal proof is retained, not deleted: damage that no
+    /// individual capsule read would notice is still rejected the first time
+    /// the segment is touched.
+    #[test]
+    fn lazy_genesis_rejects_a_damaged_segment_on_its_first_read() {
+        let candidate = sealed_pack(0xa183, 8);
+        let segment = segment_path(&candidate.scratch, 0);
+        let mut bytes = fs::read(&segment).unwrap();
+        bytes.push(0x00);
+        fs::write(&segment, &bytes).unwrap();
+
+        let error = candidate.page(page_id_at(0)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("segment bytes changed"),
+            "a resized sealed segment must be rejected: {error}"
+        );
+        assert_eq!(candidate.segment_seal_proofs(), 0);
+    }
+
+    /// A relocation moves the packs to a different directory, so proofs about
+    /// the old location say nothing about the new one and must be discarded.
+    #[test]
+    fn lazy_genesis_reproves_sealed_segments_after_a_parent_move() {
+        let candidate = sealed_pack(0xa184, 8);
+        assert!(candidate.page(page_id_at(0)).unwrap().is_some());
+        assert_eq!(candidate.segment_seal_proofs(), 1);
+
+        let destination = std::env::temp_dir().join(format!(
+            "tine-lazy-genesis-moved-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::rename(&candidate.scratch, &destination).unwrap();
+        let candidate = candidate.relocate_after_parent_move(&destination).unwrap();
+        assert_eq!(candidate.segment_seal_proofs(), 0);
+
+        // Damage the relocated pack in a way no single capsule read notices.
+        let segment = segment_path(&destination, 0);
+        let mut bytes = fs::read(&segment).unwrap();
+        bytes.push(0x00);
+        fs::write(&segment, &bytes).unwrap();
+
+        let error = candidate.page(page_id_at(0)).unwrap_err();
+        assert!(
+            error.to_string().contains("segment bytes changed"),
+            "a relocated candidate must re-prove its sealed segments: {error}"
+        );
+        drop(candidate);
+        let _ = fs::remove_dir_all(&destination);
     }
 
     #[test]

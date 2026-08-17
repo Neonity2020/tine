@@ -4294,6 +4294,33 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before on the pre-redesign source showed fresh activation removed the Direct Files slot and selected Managed before candidate construction or readiness; long failures then left no graph bound. The final serving transition retains the exact Direct predecessor in the registry and watcher while a private, write-refusing managed candidate is built and proves its complete SQLite inventory plus deterministic representative pages. A source-generation fence rejects edits made during preparation. A consuming supervisor guard makes a second publication unavailable by type, and its one closure persists the successor selector and swaps the exact predecessor. Crash cuts restart in either Direct or already-proven Managed mode, never an unlabeled intermediate. The frontend reacts to the native terminal receipt and does not repeat the readiness proof. The mandatory handoff-gap scan begins immediately but retains a generation-bound cursor, compares at most one bounded path/time slice per actor turn, remains visibly pending, and cannot declare Safe before settlement; page and enrollment requests run between slices. Its unchanged-path check reads exact accepted bytes without rebuilding semantic mutation authority; differing paths still enter the complete parser-owned reconciliation proof. Clean shutdown drains a finite graph-sized cursor under a wall-time bound instead of applying the unrelated 64-retry ceiling. Packet 0's activation retryable-slot workaround is no longer on the activation path; a separately typed multi-step guard remains only for graceful recovery after a managed actor has been stopped."
+    },
+    {
+      "id": "REG-MANAGED-BASELINE-PAGE-READ-LINEAR-20260817",
+      "title": "Reading one managed baseline page re-hashed the entire sealed segment pack, so a full external rescan cost O(pages x pack bytes)",
+      "family": "performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "tine-core-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_proves_each_sealed_segment_at_most_once",
+          "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_rejects_a_damaged_capsule_after_its_segment_was_proved",
+          "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_rejects_a_damaged_segment_on_its_first_read",
+          "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_reproves_sealed_segments_after_a_parent_move",
+          "crates/tine-core/src/sync_runtime.rs::tests::clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit"
+        ]
+      },
+      "notes": "Internal report, 2026-08-17: Full CI run 32071490984 shard 3/4 went red because clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit took 34.5 s on the runner and exceeded the production CLEAN_FULL_SCAN_SHUTDOWN_BUDGET (30 s), so clean_shutdown returned ActorRefused instead of Safe; a red full CI run blocks release.yml preflight. Root cause was not the watcher scan, which is already a bounded continuation: LazyGenesisCandidate::page called describe_file on the whole sealed segment pack to re-prove its manifest digest on EVERY page read. Measured with a temporary probe on the 1032-page fixture: 1035 whole-pack proofs of 721,648 bytes at ~15.4 ms each = 15.9 s of the 16.4 s spent inside the scan (clean_observed_projection 16.30 s, SQLite owner lookups 0.075 s, materialized_read 0.023 s). The cost is O(pages x segment bytes), and segments target 32 MiB, so Martin's real 1,045-file graph re-hashes its whole pack per page - the shape behind the reported ~15-second quit/recovery. Fix: prove each sealed segment at most once per opened candidate (SegmentSealMemo), reset on relocate_after_parent_move. The seal check is retained, not deleted, and the per-capsule descriptor-digest check still runs on every read, so damage to the bytes a caller receives is still rejected. Necessity: the guard COUNTS whole-pack proofs rather than timing anything - it reads 64 pages from a one-segment pack and requires exactly 1 proof - and fails (64 proofs) against the pre-fix shape. Drain wall clock 18.375/18.308/18.306 s before, 2.066/1.924/1.914 s after, on the same box, with no budget widened and no fixture shrunk."
     }
   ]
 }

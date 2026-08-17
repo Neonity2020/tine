@@ -446,6 +446,17 @@ mutation receipt, partition, or detached bootstrap part. Untouched page
 checkpoints remain unopened in the lazy pack until a page read or first ordinary
 operation needs one.
 
+Reading one baseline page costs that page, not the pack. A sealed segment pack
+is written once and never rewritten, so its whole-pack digest is proved against
+the sealed manifest at most once per opened baseline — re-proving it per page
+would make every consumer that walks the graph, including the clean watcher's
+full scan, cost `O(pages x segment bytes)`. The proof is discarded and repeated
+if the pack is relocated. Each page still verifies its own capsule bytes against
+the sealed descriptor digest on every read, so damage to the bytes a caller
+actually receives is rejected regardless of that retained whole-pack proof
+(`lazy_genesis::tests::lazy_genesis_proves_each_sealed_segment_at_most_once`
+and its damage siblings).
+
 The corresponding crash states are exhaustive:
 
 | Durable state at restart | Authority | Required behavior |
