@@ -118,16 +118,44 @@ fn slash_path(path: &Path) -> String {
 }
 
 /// If `stem` is a sync tool's conflict copy of another file, return the base file
-/// stem it shadows. Recognises Syncthing
-/// (`name.sync-conflict-YYYYMMDD-HHMMSS-XXXXXXX`) and Dropbox
-/// (`name (conflicted copy …)` / `name (<user>'s conflicted copy …)`).
+/// stem it shadows. Recognises the GENERATED shapes only (a page whose name
+/// merely resembles one stays a real page):
+///
+/// - Syncthing: `name.sync-conflict-YYYYMMDD-HHMMSS-DEVICEID`
+///   (`conflictName` in syncthing `lib/model/folder_sendrecv.go`; the device id
+///   is the modifying device's short id — up to 7 base32 chars `[A-Z2-7]`,
+///   empty when unknown — and pre-1.1.0 versions omitted `-DEVICEID`).
+/// - Seafile: `name (SFConflict [modifier ]YYYY-MM-DD-HH-MM-SS)`
+///   (`gen_conflict_path` in seafile `common/vc-common.c`; the modifier is the
+///   editing user's id when known).
+/// - Dropbox: `name (conflicted copy …)` / `name (<user>'s conflicted copy …)`.
+///
+/// Deliberately NOT recognized (too ambiguous to distinguish from a real page
+/// name, so treating them as conflict copies would deindex real pages):
+/// OneDrive's `name-COMPUTERNAME.ext` and Google Drive's `name (1).ext`.
 ///
 /// A conflict copy is NOT a real page — the versioned graph-text policy keeps it
 /// out of normal discovery and exact page resolution. The explicit conflict
 /// workflow has its own retained-capability path.
 pub fn sync_conflict_base(stem: &str) -> Option<&str> {
-    if let Some(i) = stem.find(".sync-conflict-") {
-        return Some(&stem[..i]);
+    const SYNCTHING_TAG: &str = ".sync-conflict-";
+    let mut search = 0;
+    while let Some(found) = stem[search..].find(SYNCTHING_TAG) {
+        let i = search + found;
+        if syncthing_conflict_tail(&stem[i + SYNCTHING_TAG.len()..]) {
+            return Some(&stem[..i]);
+        }
+        search = i + SYNCTHING_TAG.len();
+    }
+    const SEAFILE_TAG: &str = " (SFConflict ";
+    if let Some(inner) = stem.strip_suffix(')') {
+        if let Some(i) = inner.rfind(SEAFILE_TAG) {
+            let args = &inner[i + SEAFILE_TAG.len()..];
+            let timestamp = args.rsplit(' ').next().unwrap_or(args);
+            if seafile_conflict_timestamp(timestamp) && !args.contains(')') {
+                return Some(&stem[..i]);
+            }
+        }
     }
     // Dropbox: "<base> (conflicted copy …)" or "<base> (<user>'s conflicted copy …)".
     if let Some(i) = stem.find(" (") {
@@ -136,6 +164,46 @@ pub fn sync_conflict_base(stem: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Whether the text after `.sync-conflict-` matches Syncthing's generated
+/// `YYYYMMDD-HHMMSS[-DEVICEID]` tail exactly to the end of the stem.
+fn syncthing_conflict_tail(tail: &str) -> bool {
+    let bytes = tail.as_bytes();
+    if bytes.len() < 15
+        || !bytes[..8].iter().all(u8::is_ascii_digit)
+        || bytes[8] != b'-'
+        || !bytes[9..15].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    match &bytes[15..] {
+        // Pre-1.1.0 Syncthing: no `-DEVICEID` suffix at all.
+        [] => true,
+        // The short device id: up to 7 chars of RFC 4648 base32 (`[A-Z2-7]`),
+        // empty when the modifying device is unknown (zero ShortID).
+        [b'-', device @ ..] => {
+            device.len() <= 7
+                && device
+                    .iter()
+                    .all(|&b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `text` is Seafile's `%Y-%m-%d-%H-%M-%S` conflict timestamp
+/// (`gen_conflict_path` in seafile `common/vc-common.c`).
+fn seafile_conflict_timestamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 19
+        && bytes.iter().enumerate().all(|(i, &b)| {
+            if matches!(i, 4 | 7 | 10 | 13 | 16) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
 }
 
 /// Whether `stem` names a sync-tool conflict copy (see [`sync_conflict_base`]).
@@ -898,6 +966,23 @@ pub struct SyncConflict {
     pub tag: String,
     /// One-line content preview of the conflict copy.
     pub preview: String,
+}
+
+/// A page whose ON-DISK bytes carry unresolved VCS merge-conflict markers
+/// (git/Fossil; see [`crate::doc::vcs_conflict_markers`]). The page stays
+/// readable, but saves to it are refused so Tine never mangles the markers —
+/// surfaced alongside [`SyncConflict`]s so the conflicts panel can say
+/// "N files contain unresolved VCS merge markers".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VcsMarkerConflict {
+    /// Graph-root-relative path of the marker-bearing file.
+    pub path: String,
+    /// Display name of the page (decoded page name / journal title).
+    pub name: String,
+    pub kind: PageKind,
+    /// Distinct marker kinds found, in order of first appearance
+    /// (e.g. `["<<<<<<<", "=======", ">>>>>>>"]`).
+    pub markers: Vec<String>,
 }
 
 /// A full page as sent to / received from the frontend.
@@ -12713,6 +12798,52 @@ impl Graph {
         out
     }
 
+    /// Pages whose on-disk content carries unresolved VCS merge-conflict markers
+    /// (git/Fossil; see [`crate::doc::vcs_conflict_markers`]). These are REAL
+    /// pages — indexed, readable — but quarantined from saves (the serializer
+    /// refuses to rewrite them; see `serialize_page_document`). Surfaced beside
+    /// [`Graph::list_sync_conflicts`] for the conflicts panel. Sync-tool
+    /// conflict copies are excluded here — they have their own listing.
+    pub fn list_vcs_marker_conflicts(&self) -> Vec<VcsMarkerConflict> {
+        let mut out = Vec::new();
+        for (dir, kind) in [
+            (self.journals_path(), PageKind::Journal),
+            (self.pages_path(), PageKind::Page),
+        ] {
+            walk_page_files(&dir, |p| {
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                    return;
+                };
+                if is_sync_conflict(stem) {
+                    return;
+                }
+                let Ok(content) = fs::read_to_string(&p) else {
+                    return;
+                };
+                let markers = doc::vcs_conflict_markers(&content);
+                if markers.is_empty() {
+                    return;
+                }
+                let name = match kind {
+                    PageKind::Journal => self
+                        .journal_format
+                        .parse(stem)
+                        .map(|d| self.journal_format.title(d))
+                        .unwrap_or_else(|| stem.to_string()),
+                    PageKind::Page => decode_page_name(stem, self.config.file_name_format),
+                };
+                out.push(VcsMarkerConflict {
+                    path: self.rel_path(&p),
+                    name,
+                    kind,
+                    markers: markers.iter().map(|marker| marker.to_string()).collect(),
+                });
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
     /// Structural block-level diff of a conflict copy against its winner (both
     /// graph-root-relative paths). Loads each file directly by path — the conflict
     /// copy is deliberately not in the page cache — and aligns the two block trees
@@ -21169,6 +21300,26 @@ impl Graph {
         // `:journal/file-name-format` — so custom-format graphs create the correct
         // file for the day instead of a misplaced default-named duplicate.)
         let dto_is_org = matches!(Format::from_path(path), Format::Org);
+        // VCS merge-conflict quarantine (Concord invariant 3). In-scope threat:
+        // an external VCS merge (git/Fossil) left column-0 conflict markers in
+        // this file. Re-serializing would re-indent the markers as continuation
+        // lines (or drop them), which destroys the VCS's own conflict
+        // detection and can silently lose one side of the merge. The page
+        // stays readable; every write to it — normal and force — is refused
+        // until the user resolves the merge outside Tine. Mirrors the GH #163
+        // refusal-instead-of-rewrite pattern below.
+        if let Some(existing) = existing {
+            let markers = doc::vcs_conflict_markers(existing);
+            if !markers.is_empty() {
+                return Err(projection_semantic_refusal(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "file contains unresolved VCS merge conflict markers ({}) — resolve the merge with your version-control tool or an external editor first; Tine never rewrites a conflicted file",
+                        markers.join(", ")
+                    ),
+                ));
+            }
+        }
         // Data-preservation firewall for page-header properties (GH #163).
         // A frontend/store bug once reclassified a suffix of the page pre-block
         // as the first outline block (`A::` stayed in the header while `B::` and
@@ -34431,7 +34582,7 @@ mod tests {
         fs::write(
             dir.join("pages")
                 .join("client-a")
-                .join("Foo.sync-conflict-20260705-141233-A1B2C3D.md"),
+                .join("Foo.sync-conflict-20260705-141233-A2B2C3D.md"),
             "- conflict copy\n",
         )
         .unwrap();
@@ -34445,12 +34596,246 @@ mod tests {
         let c = &conflicts[0];
         assert_eq!(
             c.path,
-            "pages/client-a/Foo.sync-conflict-20260705-141233-A1B2C3D.md"
+            "pages/client-a/Foo.sync-conflict-20260705-141233-A2B2C3D.md"
         );
         assert_eq!(c.base_path.as_deref(), Some("pages/client-a/Foo.md"));
         assert_eq!(c.base_name, "Foo");
         assert_eq!(c.kind, PageKind::Page);
         assert_eq!(c.preview, "conflict copy");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_page_with_sync_conflict_like_name_stays_indexed() {
+        // The recognizer must match Syncthing's GENERATED shape
+        // (`.sync-conflict-YYYYMMDD-HHMMSS-DEVICEID`), not a bare
+        // `.sync-conflict-` substring — a real page whose name merely contains
+        // the substring was silently deindexed as a false positive.
+        let dir = scratch("conflict-lookalike-page");
+        fs::write(
+            dir.join("pages").join("Foo.sync-conflict-notes.md"),
+            "- real content\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let pages = graph.list_pages();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.rel_path == "pages/Foo.sync-conflict-notes.md"),
+            "a page whose name merely CONTAINS `.sync-conflict-` is a real page: {pages:?}"
+        );
+        assert!(
+            graph.list_sync_conflicts().is_empty(),
+            "a name without the generated timestamp shape is not a conflict copy"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seafile_conflict_copy_is_surfaced_not_indexed() {
+        // Seafile names conflict copies `<stem> (SFConflict <modifier>
+        // <YYYY-MM-DD-HH-MM-SS>).<ext>` (seafile/common/vc-common.c,
+        // `gen_conflict_path`). Left unrecognized, the copy is indexed as a
+        // duplicate page — with `title::` it duplicates page identity.
+        let dir = scratch("seafile-conflict");
+        fs::write(dir.join("pages").join("Note.md"), "- winner\n").unwrap();
+        fs::write(
+            dir.join("pages")
+                .join("Note (SFConflict me@example.com 2026-08-01-10-00-00).md"),
+            "- conflict copy\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        assert!(
+            graph
+                .list_pages()
+                .iter()
+                .all(|p| !p.rel_path.contains("SFConflict")),
+            "a Seafile conflict copy must not be indexed as a page"
+        );
+        let conflicts = graph.list_sync_conflicts();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "the Seafile copy is surfaced in the conflicts workflow: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].base_name, "Note");
+        assert_eq!(conflicts[0].base_path.as_deref(), Some("pages/Note.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_conflict_base_matches_real_provider_formats_only() {
+        for (stem, base) in [
+            // Syncthing: `<stem>.sync-conflict-YYYYMMDD-HHMMSS-<short device id>`
+            // (syncthing lib/model/folder_sendrecv.go `conflictName`; the device
+            // id is up to 7 base32 chars [A-Z2-7], empty when the modifying
+            // device is unknown; pre-1.1.0 versions omitted `-<device>`).
+            ("Foo.sync-conflict-20260705-141233-A2B3C4D", Some("Foo")),
+            ("Foo.sync-conflict-20260705-141233-", Some("Foo")),
+            ("Foo.sync-conflict-20190201-124559", Some("Foo")),
+            (
+                "Foo.bar.sync-conflict-20260705-141233-ABCDEFG",
+                Some("Foo.bar"),
+            ),
+            // Nested copy: the deepest tag wins, the base keeps the outer tag.
+            (
+                "Foo.sync-conflict-20260101-010101-AAAAAAA.sync-conflict-20260202-020202-BBBBBBB",
+                Some("Foo.sync-conflict-20260101-010101-AAAAAAA"),
+            ),
+            // False positives the loose substring match used to deindex:
+            ("Foo.sync-conflict-notes", None),
+            ("Foo.sync-conflict-", None),
+            ("Foo.sync-conflict-2026-08-01", None),
+            ("Foo.sync-conflict-20260705", None),
+            ("Foo.sync-conflict-20260705-141233x", None),
+            ("Foo.sync-conflict-20260705-141233-abcdefg", None),
+            ("Foo.sync-conflict-20260705-141233-ABCDEFGH", None),
+            // Seafile: `<stem> (SFConflict [modifier ]YYYY-MM-DD-HH-MM-SS)`
+            // (seafile/common/vc-common.c `gen_conflict_path`).
+            (
+                "Note (SFConflict me@example.com 2026-08-01-10-00-00)",
+                Some("Note"),
+            ),
+            ("Note (SFConflict 2026-08-01-10-00-00)", Some("Note")),
+            ("Note (SFConflict discussion)", None),
+            ("Note (SFConflict 2026-08-01)", None),
+            (
+                "Note (SFConflict me@example.com 2026-08-01-10-00-00) extra",
+                None,
+            ),
+            // Dropbox (behavior unchanged):
+            ("Report (conflicted copy 2026-08-01)", Some("Report")),
+            (
+                "Report (Alice's conflicted copy 2026-08-01)",
+                Some("Report"),
+            ),
+        ] {
+            assert_eq!(sync_conflict_base(stem), base, "stem: {stem:?}");
+        }
+    }
+
+    #[test]
+    fn marker_bearing_page_is_never_rewritten_by_save() {
+        // A file holding git/Fossil merge conflict markers must be quarantined:
+        // re-serializing it re-indents the column-0 markers as continuation
+        // lines, which breaks git's own conflict detection. Saves are refused
+        // with a typed refusal naming the markers; the bytes stay untouched.
+        let dir = scratch("vcs-marker-quarantine");
+        let original =
+            "<<<<<<< HEAD\n- mine\n||||||| base\n- old\n=======\n- theirs\n>>>>>>> feature\n";
+        fs::write(dir.join("pages").join("Merge.md"), original).unwrap();
+        let graph = Graph::open(&dir);
+        let mut page = graph
+            .load_named("Merge", PageKind::Page)
+            .unwrap()
+            .expect("a marker-bearing page stays readable");
+        assert!(!page.blocks.is_empty());
+        page.blocks[0].raw = "mine edited".into();
+        let base = page.rev.clone().unwrap();
+        let result = graph.save_page(&page, Some(&base));
+        let after = fs::read_to_string(dir.join("pages").join("Merge.md")).unwrap();
+        assert_eq!(
+            after, original,
+            "a marker-bearing file must never be rewritten by Tine"
+        );
+        let error = result.expect_err("saves to a marker-bearing page are refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(
+            message.contains("<<<<<<<") && message.contains(">>>>>>>"),
+            "the refusal names the markers it found: {message}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vcs_marker_detection_matches_real_markers_only() {
+        // git (merge and diff3 styles).
+        assert_eq!(
+            doc::vcs_conflict_markers(
+                "<<<<<<< HEAD\n- mine\n||||||| merged common ancestors\n- old\n=======\n- theirs\n>>>>>>> feature\n"
+            ),
+            vec!["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
+        );
+        // Fossil's verbose variants (mergeMarker table in fossil src/merge3.c).
+        assert_eq!(
+            doc::vcs_conflict_markers(concat!(
+                "<<<<<<< BEGIN MERGE CONFLICT: local copy shown first <<<<<<<<<<<<\n",
+                "- mine\n",
+                "####### SUGGESTED CONFLICT RESOLUTION follows ###################\n",
+                "- suggestion\n",
+                "||||||| COMMON ANCESTOR content follows |||||||||||||||||||||||||\n",
+                "- old\n",
+                "======= MERGED IN content follows ===============================\n",
+                "- theirs\n",
+                ">>>>>>> END MERGE CONFLICT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> (line 3)\n"
+            )),
+            vec!["<<<<<<<", "#######", "|||||||", "=======", ">>>>>>>"]
+        );
+        // Markers quoted inside a column-0 fenced code block (someone
+        // DOCUMENTING git) must not flag the page.
+        assert!(doc::vcs_conflict_markers(
+            "```\n<<<<<<< HEAD\n=======\n>>>>>>> feature\n```\n- notes about git\n"
+        )
+        .is_empty());
+        assert!(
+            doc::vcs_conflict_markers("~~~text\n<<<<<<< HEAD\n>>>>>>> feature\n~~~\n").is_empty()
+        );
+        // Markers quoted in an indented fence inside a bullet are not at
+        // column 0 at all.
+        assert!(doc::vcs_conflict_markers(
+            "- how git conflicts look:\n  ```\n  <<<<<<< HEAD\n  =======\n  >>>>>>> theirs\n  ```\n"
+        )
+        .is_empty());
+        // A lone `=======` (setext-style divider) never quarantines a page —
+        // an anchor marker must be present.
+        assert!(doc::vcs_conflict_markers("Heading\n=======\n- content\n").is_empty());
+        // Markers must start at column 0 with their trailing space/shape.
+        assert!(doc::vcs_conflict_markers("- <<<<<<< HEAD\n- >>>>>>> x\n").is_empty());
+        // A real conflict below a closed fence is still detected.
+        assert_eq!(
+            doc::vcs_conflict_markers(
+                "```\nexample\n```\n<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n"
+            ),
+            vec!["<<<<<<<", "=======", ">>>>>>>"]
+        );
+    }
+
+    #[test]
+    fn list_vcs_marker_conflicts_reports_only_marker_pages() {
+        let dir = scratch("vcs-marker-listing");
+        fs::write(
+            dir.join("pages").join("Merge.md"),
+            "<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Clean.md"), "- ordinary page\n").unwrap();
+        fs::write(
+            dir.join("pages").join("Docs about git.md"),
+            "```\n<<<<<<< HEAD\n=======\n>>>>>>> feature\n```\n",
+        )
+        .unwrap();
+        // A sync-tool conflict copy containing markers belongs to the
+        // conflict-copy listing, not this one.
+        fs::write(
+            dir.join("pages")
+                .join("Merge.sync-conflict-20260817-101010-ABCDEFG.md"),
+            "<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let conflicts = graph.list_vcs_marker_conflicts();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "only the real marker-bearing page is listed: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].path, "pages/Merge.md");
+        assert_eq!(conflicts[0].name, "Merge");
+        assert_eq!(conflicts[0].kind, PageKind::Page);
+        assert_eq!(conflicts[0].markers, vec!["<<<<<<<", "=======", ">>>>>>>"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -46751,7 +47136,7 @@ mod tests {
         .unwrap();
         let title_named = "Thursday, 25-06-2026.org";
         fs::write(dir.join("journals").join(title_named), "* migrate me\n").unwrap();
-        let conflict = "Foo.sync-conflict-20260705-141233-A1B2C3D.md";
+        let conflict = "Foo.sync-conflict-20260705-141233-A2B2C3D.md";
         fs::write(dir.join("pages").join(conflict), "- trash me\n").unwrap();
 
         let graph = Arc::new(Graph::open(&dir));

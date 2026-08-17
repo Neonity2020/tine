@@ -218,6 +218,9 @@ const NAMED: PageDto[] = [
     name: "Tine",
     kind: "page",
     title: "Tine",
+    // Explicit path so the `?conflicts` VCS-marker demo entry below can
+    // reference this page (the banner matches by loaded file path).
+    path: "pages/Tine.md",
     pre_block: "title:: Tine\ntags:: project, tooling",
     blocks: [
       b("A fast clone of [[Logseq]] built with **Tauri** + *SolidJS*.", [
@@ -1712,12 +1715,24 @@ export function mockBackend(): Backend {
       if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
       return [
         {
-          path: "pages/Project Plan.sync-conflict-20260705-141233-A1B2C3D.md",
+          path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
           base_name: "Project Plan",
           base_path: "pages/Project Plan.md",
           kind: "page" as const,
-          tag: "sync-conflict-20260705-141233-A1B2C3D",
+          tag: "sync-conflict-20260705-141233-A2B2C3D",
           preview: "Milestones for the launch",
+        },
+      ];
+    },
+    async listVcsMarkerConflicts() {
+      // Same `?conflicts` demo flag as listSyncConflicts above.
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
+      return [
+        {
+          path: "pages/Tine.md",
+          name: "Tine",
+          kind: "page" as const,
+          markers: ["<<<<<<<", "=======", ">>>>>>>"],
         },
       ];
     },

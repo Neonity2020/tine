@@ -1224,6 +1224,71 @@ pub(crate) fn markdown_structurally_round_trips_parsed(
         .is_ok_and(|canonical| canonical.document == parsed.document)
 }
 
+/// Distinct VCS merge-conflict marker kinds present in `content`, in order of
+/// first appearance — empty when the file is not merge-conflicted.
+///
+/// Recognizes the column-0 markers git writes (`<<<<<<< ours`, diff3
+/// `||||||| base`, `=======`, `>>>>>>> theirs`) and Fossil's verbose variants
+/// (`<<<<<<< BEGIN MERGE CONFLICT: …`, `####### SUGGESTED CONFLICT RESOLUTION
+/// follows …`, `||||||| COMMON ANCESTOR content follows …`, `======= MERGED IN
+/// content follows …`, `>>>>>>> END MERGE CONFLICT …` — the `mergeMarker` table
+/// in fossil's `src/merge3.c`). Both tools write markers at column 0 only, so
+/// indented lines never count.
+///
+/// Two guards keep a page that merely DOCUMENTS merge conflicts from being
+/// flagged:
+/// - lines inside column-0 fenced code blocks (``` / ~~~) are ignored; markers
+///   quoted in an indented fence inside a bullet are not at column 0 anyway;
+/// - the file counts as conflicted only if an anchor line (`<<<<<<< ` or
+///   `>>>>>>> `) is present — a lone `=======` (e.g. a setext-style divider)
+///   never quarantines a page.
+pub fn vcs_conflict_markers(content: &str) -> Vec<&'static str> {
+    let mut fence: Option<char> = None;
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut anchored = false;
+    for line in content.lines() {
+        if let Some(delimiter) = fence {
+            if line.chars().take_while(|&c| c == delimiter).count() >= 3 {
+                fence = None;
+            }
+            continue;
+        }
+        if line.starts_with("```") {
+            fence = Some('`');
+            continue;
+        }
+        if line.starts_with("~~~") {
+            fence = Some('~');
+            continue;
+        }
+        let kind = if line.starts_with("<<<<<<< ") {
+            anchored = true;
+            Some("<<<<<<<")
+        } else if line.starts_with(">>>>>>> ") {
+            anchored = true;
+            Some(">>>>>>>")
+        } else if line.starts_with("||||||| ") {
+            Some("|||||||")
+        } else if line == "=======" || line.starts_with("======= ") {
+            Some("=======")
+        } else if line.starts_with("####### ") {
+            Some("#######")
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            if !seen.contains(&kind) {
+                seen.push(kind);
+            }
+        }
+    }
+    if anchored {
+        seen
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod property_fence_tests {
     use super::*;

@@ -14,6 +14,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Managed-storage activation no longer rejects a complete graph because Direct Files or the startup path catalog retained a different one-page inventory.** Readiness is now proved inside the candidate managed generation by opening its transactionally complete, exact-frontier-stamped SQLite inventory and a real page; the candidate remains unpublished until that proof succeeds.
 
+### Added
+
+- **Files with unresolved git/Fossil merge-conflict markers are now quarantined instead of mangled.** A page whose file contains column-0 conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`, and Fossil's verbose variants) stays fully readable, but every save to it is refused with a message naming the markers — previously an edit re-indented or dropped the markers on re-save, which broke git's own conflict detection and could silently lose one side of the merge. Markers quoted inside code fences don't trigger the quarantine. Affected files are listed in Settings → Backups & recovery, and the page shows a banner explaining how to resolve.
+
 ### Changed
 
 - **Experimental managed-storage activation now reuses the parser facts it already produced during source capture.** Search text, tasks, properties, tags, headings, and collapse state travel through one bounded activation-only handoff and are accepted only when every terminal page and block still matches the authenticated engine state exactly; oversized or mismatched inputs fall back to the independent parser path. The 13,000-page fixture reused all 13,000 pages with no misses and cut SQLite lowering from about 8.1 s to 6.7 s, although total activation remained within run-to-run noise at 69.1 s. The same pass now reuses one authenticated catalog window while resolving block identities, avoiding a graph-sized catalog proof per UUID on pages that contain several `id::` values.
@@ -34,6 +38,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Fixed
 
 - **An external change to a page you are editing is no longer silently dropped.** The watcher correctly declines to yank the caret mid-edit, but the declined reload used to be forgotten: the page stayed stale until some unrelated event touched it again. Tine now records the skipped reload and replays it the moment the blocking state clears — editing ends, a block move settles, or a title rename/IME composition finishes — re-checking at that moment whether the page has meanwhile gained unsaved edits, in which case the normal conflict protocol takes over instead of a reload. (Part of GH #337.)
+
+- **Conflict-copy detection now matches the real formats sync tools generate.** A page whose name merely contains `.sync-conflict-` (say `Foo.sync-conflict-notes`) is no longer silently hidden from the page list as a false-positive Syncthing conflict copy; Syncthing detection now requires the generated `.sync-conflict-YYYYMMDD-HHMMSS-DEVICEID` shape. Seafile conflict copies (`name (SFConflict … ).md`) are now recognized and surfaced in Settings → Backups & recovery instead of appearing as duplicate pages that could hijack page identity via `title::`.
 
 - **The first cross-page subtree move after managed-storage activation no longer stalls forever in projection recovery.** Clean managed storage now reconstructs each accepted CRDT tail on its immutable activation baseline, rather than trying to import a baseline-dependent update into an empty document. The durable move therefore reaches SQLite and Markdown exactly once and remains recoverable after an immediate stop.
 
