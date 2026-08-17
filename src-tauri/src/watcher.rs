@@ -1,8 +1,9 @@
 use crate::settings::{settings_path, update_settings};
 use crate::state::{AppState, GraphSlot, LegacyGraphLease};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
 use tine_core::sync_runtime::{
@@ -66,6 +67,12 @@ struct Pending {
     full_paths: HashSet<PathBuf>,
     need_full: bool,
     notify_error: bool,
+    /// When the FIRST notify callback of the batch currently accumulating
+    /// arrived (monotonic). Taken together with the paths at drain time, so a
+    /// latency receipt can attribute callback→reconcile time (the coalescing
+    /// window plus any scheduling delay). One `Instant` per batch — per-path
+    /// stamps would allocate on the hot path for no diagnostic gain.
+    first_event_at: Option<Instant>,
 }
 
 /// Resolve the filesystem watcher inputs for an existing Direct Files binding.
@@ -78,7 +85,14 @@ fn direct_watch_paths(slot: &GraphSlot) -> Result<(LegacyGraphLease, PathBuf), S
 }
 
 impl Pending {
+    fn note_event_arrival(&mut self) {
+        if self.first_event_at.is_none() {
+            self.first_event_at = Some(Instant::now());
+        }
+    }
+
     fn add_event(&mut self, event: notify::Event) {
+        self.note_event_arrival();
         if event.need_rescan() {
             if event.paths.is_empty() {
                 self.need_full = true;
@@ -99,9 +113,143 @@ impl Pending {
     }
 
     fn add_notify_error(&mut self) {
+        self.note_event_arrival();
         self.need_full = true;
         self.notify_error = true;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Watcher latency receipts (GH #337 diagnosis)
+// ---------------------------------------------------------------------------
+// The reported 5–20 s external-change latency on Windows is unexplained by a
+// pipeline whose design floor is ~200 ms (inotify coalescing) / 3 s (poll), and
+// nothing measured the pipeline. These receipts are cheap and always on: one
+// monotonic stamp when the first notify callback of a batch arrives, one when
+// its post-debounce reconcile starts, one when its `graph-changed` events have
+// been emitted. Each external-change batch logs one structured line (via
+// `debug::diag`, so `--debug` captures it in the log file a reporter can send)
+// and lands in a small in-memory ring the `watcher_latency_recent` command
+// returns. No extra reads, no per-path allocation.
+
+/// One external-change batch, as the reconcile loop experienced it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct WatcherLatencyReceipt {
+    /// Monotonically increasing receipt number (process-wide).
+    seq: u64,
+    /// Wall-clock time the receipt was recorded (Unix ms) — to correlate with
+    /// the reporter's "I saved the file at ...".
+    at_unix_ms: u64,
+    /// Graph label the batch was reconciled for.
+    graph: String,
+    /// "inotify" or "poll".
+    mode: &'static str,
+    /// `graph-changed` events emitted for this batch.
+    pages: usize,
+    /// Exact event paths this graph owned in the batch (0 for a pure full diff).
+    event_paths: usize,
+    /// Whether a full stat-diff was forced (poll cycle, unclassifiable event,
+    /// kernel queue overflow, retry).
+    full_diff: bool,
+    /// Reconcile errors in this batch (each schedules a backoff retry — a
+    /// latency source worth seeing in a receipt trail).
+    errors: usize,
+    /// First notify callback → reconcile start (debounce + scheduling). `None`
+    /// when no callback stamp exists for the batch: poll mode, or a cycle
+    /// triggered by retry/control rather than an OS event.
+    event_to_reconcile_ms: Option<u64>,
+    /// Reconcile start → last `graph-changed` emitted (read + parse + emit).
+    reconcile_ms: u64,
+    /// First notify callback → last emit; the number GH #337 reports as 5–20 s.
+    event_to_emit_ms: Option<u64>,
+}
+
+const LATENCY_RECEIPT_CAP: usize = 64;
+
+static LATENCY_RECEIPTS: OnceLock<Mutex<VecDeque<WatcherLatencyReceipt>>> = OnceLock::new();
+static LATENCY_RECEIPT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn latency_receipts() -> &'static Mutex<VecDeque<WatcherLatencyReceipt>> {
+    LATENCY_RECEIPTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(LATENCY_RECEIPT_CAP)))
+}
+
+/// Pure builder so the duration arithmetic is unit-testable. `seq` and
+/// `at_unix_ms` are stamped by `record_latency_receipt`.
+#[allow(clippy::too_many_arguments)]
+fn latency_receipt(
+    graph: &str,
+    inotify: bool,
+    pages: usize,
+    event_paths: usize,
+    full_diff: bool,
+    errors: usize,
+    first_event_at: Option<Instant>,
+    reconcile_started: Instant,
+    emitted_at: Instant,
+) -> WatcherLatencyReceipt {
+    let since = |earlier: Instant, later: Instant| {
+        later.saturating_duration_since(earlier).as_millis() as u64
+    };
+    WatcherLatencyReceipt {
+        seq: 0,
+        at_unix_ms: 0,
+        graph: graph.to_string(),
+        mode: if inotify { "inotify" } else { "poll" },
+        pages,
+        event_paths,
+        full_diff,
+        errors,
+        event_to_reconcile_ms: first_event_at.map(|at| since(at, reconcile_started)),
+        reconcile_ms: since(reconcile_started, emitted_at),
+        event_to_emit_ms: first_event_at.map(|at| since(at, emitted_at)),
+    }
+}
+
+fn push_latency_receipt(
+    ring: &mut VecDeque<WatcherLatencyReceipt>,
+    receipt: WatcherLatencyReceipt,
+) {
+    while ring.len() >= LATENCY_RECEIPT_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(receipt);
+}
+
+fn record_latency_receipt(mut receipt: WatcherLatencyReceipt) {
+    receipt.seq = LATENCY_RECEIPT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    receipt.at_unix_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let stage =
+        |value: Option<u64>| value.map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"));
+    crate::debug::diag(format!(
+        "watcher-latency seq={} graph={} mode={} pages={} event_paths={} full_diff={} errors={} event->reconcile={} reconcile={}ms event->emit={}",
+        receipt.seq,
+        receipt.graph,
+        receipt.mode,
+        receipt.pages,
+        receipt.event_paths,
+        receipt.full_diff,
+        receipt.errors,
+        stage(receipt.event_to_reconcile_ms),
+        receipt.reconcile_ms,
+        stage(receipt.event_to_emit_ms),
+    ));
+    if let Ok(mut ring) = latency_receipts().lock() {
+        push_latency_receipt(&mut ring, receipt);
+    }
+}
+
+/// Debug command for bug reports: the last 64 external-change latency receipts,
+/// oldest first. A reporter runs it from the devtools console and pastes the
+/// result; no UI surface beyond that.
+#[tauri::command]
+pub(crate) fn watcher_latency_recent() -> Vec<WatcherLatencyReceipt> {
+    latency_receipts()
+        .lock()
+        .map(|ring| ring.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 const RETRY_BACKOFF: [Duration; 6] = [
@@ -1135,20 +1283,21 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             watch_failures.retain(|dir, _| desired.contains(dir));
 
             // --- reconcile (identical in both modes) ---
-            let (paths, full_paths, event_need_full, notify_error) = if inotify {
+            let (paths, full_paths, event_need_full, notify_error, first_event_at) = if inotify {
                 if let Ok(mut p) = pending.lock() {
                     let paths = std::mem::take(&mut p.paths);
                     let full_paths = std::mem::take(&mut p.full_paths);
                     let need_full = p.need_full;
                     let notify_error = p.notify_error;
+                    let first_event_at = p.first_event_at.take();
                     p.need_full = false;
                     p.notify_error = false;
-                    (paths, full_paths, need_full, notify_error)
+                    (paths, full_paths, need_full, notify_error, first_event_at)
                 } else {
-                    (HashSet::new(), HashSet::new(), true, true)
+                    (HashSet::new(), HashSet::new(), true, true, None)
                 }
             } else {
-                (HashSet::new(), HashSet::new(), false, false)
+                (HashSet::new(), HashSet::new(), false, false, None)
             };
             for (label, graph) in graphs.iter_mut() {
                 let initial_cycle = !graph.baseline;
@@ -1169,6 +1318,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let mut attempted = false;
                 if need_full || !owned.is_empty() {
                     attempted = true;
+                    let reconcile_started = Instant::now();
                     let (changes, conflicts_dirty, _, errors) = reconcile_pending(
                         &graph.legacy_graph,
                         &mut graph.snap,
@@ -1176,8 +1326,27 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         need_full,
                         !inotify,
                     );
+                    let pages = changes.len();
                     for change in changes {
                         let _ = app.emit_to(label, "graph-changed", change);
+                    }
+                    // Receipts only for batches that surfaced something: a
+                    // change reaching the frontend, or an error scheduling a
+                    // backoff retry (itself a latency source). Quiet cycles —
+                    // echo-suppressed self-writes, poll scans that found
+                    // nothing — would drown the 64-slot ring in no-ops.
+                    if pages > 0 || !errors.is_empty() {
+                        record_latency_receipt(latency_receipt(
+                            label,
+                            inotify,
+                            pages,
+                            owned.len(),
+                            need_full,
+                            errors.len(),
+                            if initial_cycle { None } else { first_event_at },
+                            reconcile_started,
+                            Instant::now(),
+                        ));
                     }
                     if !errors.is_empty() {
                         cycle_failed = true;
@@ -1518,6 +1687,128 @@ mod tests {
         assert!(!pending.need_full);
         assert_eq!(pending.full_paths, HashSet::from([unknown]));
         assert!(pending.paths.is_empty());
+    }
+
+    #[test]
+    fn pending_stamps_the_first_event_of_a_batch_once() {
+        use notify::event::{CreateKind, EventKind};
+
+        let mut pending = Pending::default();
+        assert!(pending.first_event_at.is_none());
+        pending.add_event(notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/graphs/a/pages/one.md")],
+            attrs: Default::default(),
+        });
+        let first = pending
+            .first_event_at
+            .expect("first event stamps the batch");
+        pending.add_event(notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/graphs/a/pages/two.md")],
+            attrs: Default::default(),
+        });
+        assert_eq!(
+            pending.first_event_at,
+            Some(first),
+            "later events in the same batch must not move the batch stamp"
+        );
+        pending.add_notify_error();
+        assert_eq!(pending.first_event_at, Some(first));
+    }
+
+    #[test]
+    fn latency_receipt_measures_the_three_stages() {
+        let first = Instant::now();
+        let reconcile_started = first + Duration::from_millis(200);
+        let emitted_at = reconcile_started + Duration::from_millis(35);
+
+        let receipt = latency_receipt(
+            "graph-a",
+            true,
+            3,
+            4,
+            false,
+            1,
+            Some(first),
+            reconcile_started,
+            emitted_at,
+        );
+
+        assert_eq!(receipt.graph, "graph-a");
+        assert_eq!(receipt.mode, "inotify");
+        assert_eq!(receipt.pages, 3);
+        assert_eq!(receipt.event_paths, 4);
+        assert!(!receipt.full_diff);
+        assert_eq!(receipt.errors, 1);
+        assert_eq!(receipt.event_to_reconcile_ms, Some(200));
+        assert_eq!(receipt.reconcile_ms, 35);
+        assert_eq!(receipt.event_to_emit_ms, Some(235));
+    }
+
+    #[test]
+    fn latency_receipt_without_a_callback_stamp_reports_only_reconcile_time() {
+        let reconcile_started = Instant::now();
+        let emitted_at = reconcile_started + Duration::from_millis(12);
+
+        let receipt = latency_receipt(
+            "graph-a",
+            false,
+            2,
+            0,
+            true,
+            0,
+            None,
+            reconcile_started,
+            emitted_at,
+        );
+
+        assert_eq!(receipt.mode, "poll");
+        assert!(receipt.full_diff);
+        assert_eq!(receipt.event_to_reconcile_ms, None);
+        assert_eq!(receipt.event_to_emit_ms, None);
+        assert_eq!(receipt.reconcile_ms, 12);
+    }
+
+    #[test]
+    fn latency_receipt_ring_keeps_the_newest_sixty_four() {
+        let now = Instant::now();
+        let mut ring = VecDeque::new();
+        for seq in 1..=(LATENCY_RECEIPT_CAP as u64 + 6) {
+            let mut receipt = latency_receipt("graph-a", true, 1, 1, false, 0, None, now, now);
+            receipt.seq = seq;
+            push_latency_receipt(&mut ring, receipt);
+        }
+        assert_eq!(ring.len(), LATENCY_RECEIPT_CAP);
+        assert_eq!(ring.front().map(|receipt| receipt.seq), Some(7));
+        assert_eq!(
+            ring.back().map(|receipt| receipt.seq),
+            Some(LATENCY_RECEIPT_CAP as u64 + 6)
+        );
+    }
+
+    /// The receipt is a diagnostic wire format a reporter pastes into an issue;
+    /// its field names are part of that contract.
+    #[test]
+    fn latency_receipt_wire_shape_is_stable() {
+        let now = Instant::now();
+        let receipt = latency_receipt("graph-a", true, 1, 1, false, 0, Some(now), now, now);
+        let wire = serde_json::to_value(&receipt).unwrap();
+        for key in [
+            "seq",
+            "at_unix_ms",
+            "graph",
+            "mode",
+            "pages",
+            "event_paths",
+            "full_diff",
+            "errors",
+            "event_to_reconcile_ms",
+            "reconcile_ms",
+            "event_to_emit_ms",
+        ] {
+            assert!(wire.get(key).is_some(), "missing receipt field {key}");
+        }
     }
 
     #[test]

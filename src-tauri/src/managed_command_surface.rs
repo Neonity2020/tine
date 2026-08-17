@@ -238,6 +238,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("uninstall_plugin", NoGraphSlot),
     ("verify_plugin_registry", NoGraphSlot),
     ("warm_done", NoGraphSlot),
+    ("watcher_latency_recent", NoGraphSlot),
     ("write_highlights", ManagedRouted),
     ("write_pdf_view_state", ManagedRouted),
 ];
