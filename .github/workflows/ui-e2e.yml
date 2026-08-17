@@ -64,6 +64,11 @@ jobs:
         run: cargo build --release --features custom-protocol --manifest-path src-tauri/Cargo.toml
       - name: Write Linux E2E candidate receipt
         run: node scripts/build-e2e-receipt.mjs after --snapshot target/release/tine.build.before.json --app target/release/tine
+      # The whole suite's honesty rests on the build receipt: it is what proves
+      # the binary under test is this checkout. Its own fixture test existed but
+      # was called by no workflow and no npm script until 2026-08-17.
+      - name: E2E build-provenance machinery is sound
+        run: npm run test:e2e-provenance
       - name: Install Tauri WebDriver bridge
         run: cargo install tauri-driver --locked
       - name: Run complete Linux UI regression catalog
