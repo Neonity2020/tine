@@ -41,6 +41,10 @@ const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"
 const packageJson = fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
+const androidManagedRuntimeScript = fs.readFileSync(
+  path.join(process.cwd(), ".github/scripts/android-managed-storage-runtime.sh"),
+  "utf8"
+);
 const windowsWebviewDriverInstaller = fs.readFileSync(
   path.join(process.cwd(), "scripts/install-windows-webview2-driver.ps1"),
   "utf8"
@@ -442,6 +446,15 @@ assert.equal(
 assert.equal(
   yamlScalar(androidManagedRuntime, "if", 4),
   "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')"
+);
+assert.match(
+  androidManagedRuntimeScript,
+  /grep -Fq 'FAILURES!!!'/,
+  "Android instrumentation must fail closed on a JUnit failure summary"
+);
+assert.ok(
+  androidManagedRuntimeScript.includes("grep -Eq 'OK \\([0-9]+ tests?\\)'"),
+  "Android instrumentation must require the runner's explicit passing summary"
 );
 assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
 assert.equal(

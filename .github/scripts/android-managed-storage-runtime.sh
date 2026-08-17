@@ -21,4 +21,16 @@ fi
 adb install -r "${app_apks[0]}"
 adb install -r "${test_apks[0]}"
 adb shell appops set --uid page.tine.app MANAGE_EXTERNAL_STORAGE allow
-adb shell am instrument -w page.tine.app.test/androidx.test.runner.AndroidJUnitRunner
+instrumentation_output="$(
+  adb shell am instrument -w page.tine.app.test/androidx.test.runner.AndroidJUnitRunner
+)"
+printf '%s\n' "$instrumentation_output"
+
+# `am instrument` reports a successful shell command even when AndroidJUnitRunner
+# prints a failed test suite.  Treat only the runner's explicit OK summary as
+# evidence; otherwise a real app-UID storage failure becomes a green CI job.
+if grep -Fq 'FAILURES!!!' <<<"$instrumentation_output" ||
+  ! grep -Eq 'OK \([0-9]+ tests?\)' <<<"$instrumentation_output"; then
+  printf 'Android managed-storage instrumentation did not pass\n' >&2
+  exit 1
+fi
