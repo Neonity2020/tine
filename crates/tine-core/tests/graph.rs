@@ -3834,3 +3834,77 @@ mod concord_ledger_integration {
         std::fs::remove_dir_all(&ledger_dir).ok();
     }
 }
+
+/// Manual measurement (Concord P3 deliverable): save-path overhead of the
+/// ledger hooks, before (no ledger attached — the hooks no-op, which is the
+/// exact pre-change code path modulo one None check) vs after (ledger
+/// attached). Run on a SCRATCH COPY of the anonymized-scale corpus:
+///   TINE_CONCORD_BENCH_GRAPH=/path/to/copy cargo test --release \
+///     -p tine-core --test graph concord_ledger_save_overhead -- --ignored --nocapture
+#[test]
+#[ignore = "manual measurement; needs TINE_CONCORD_BENCH_GRAPH (scratch copy — saves write into it)"]
+fn concord_ledger_save_overhead_measurement() {
+    let Ok(root) = std::env::var("TINE_CONCORD_BENCH_GRAPH") else {
+        eprintln!("TINE_CONCORD_BENCH_GRAPH not set; skipping");
+        return;
+    };
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    // The largest page in the corpus = the worst-case ledger record payload.
+    let pages = graph.list_pages();
+    let target = pages
+        .iter()
+        .filter(|p| p.rel_path.ends_with(".md"))
+        .max_by_key(|p| {
+            std::fs::metadata(std::path::Path::new(&root).join(&p.rel_path))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
+        .expect("a page");
+    let size = std::fs::metadata(std::path::Path::new(&root).join(&target.rel_path))
+        .unwrap()
+        .len();
+    eprintln!("target page: {} ({size} bytes)", target.rel_path);
+
+    let mut measure = |label: &str, rounds: usize| {
+        let mut page = graph.load_by_path(&target.rel_path).unwrap().unwrap();
+        let mut times_us: Vec<u128> = Vec::with_capacity(rounds);
+        for i in 0..rounds {
+            let marker = format!("concord bench marker {i}");
+            let last = page.blocks.len() - 1;
+            page.blocks[last].raw = marker;
+            let started = std::time::Instant::now();
+            let rev = graph.save_page(&page, page.rev.as_deref()).unwrap();
+            times_us.push(started.elapsed().as_micros());
+            page.rev = Some(rev);
+        }
+        times_us.sort_unstable();
+        let median = times_us[times_us.len() / 2];
+        let p90 = times_us[times_us.len() * 9 / 10];
+        let min = times_us[0];
+        eprintln!("{label}: {rounds} saves — min {min} µs, median {median} µs, p90 {p90} µs");
+        (min, median, p90)
+    };
+
+    // Phase A: no ledger attached (pre-change-equivalent foreground path).
+    let before = measure("before (no ledger)", 200);
+    // Phase B: ledger attached; hooks enqueue to the background worker.
+    let ledger_dir =
+        std::env::temp_dir().join(format!("tine-concord-bench-ledger-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ledger_dir);
+    graph.attach_concord_ledger(ledger_dir.clone());
+    let after = measure("after (ledger attached)", 200);
+    // Prove the ledger actually recorded (we measured real work, not a no-op).
+    let ledger = graph.concord_ledger().unwrap();
+    ledger.flush();
+    assert!(
+        ledger.base(&target.rel_path).is_some(),
+        "the ledger must hold the last save"
+    );
+    eprintln!(
+        "median delta: {} µs ({}%)",
+        after.1 as i128 - before.1 as i128,
+        (after.1 as i128 - before.1 as i128) * 100 / before.1.max(1) as i128
+    );
+    let _ = std::fs::remove_dir_all(&ledger_dir);
+}
