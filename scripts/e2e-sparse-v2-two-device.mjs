@@ -158,10 +158,15 @@ function windowManagerReady() {
 }
 
 async function assertBody(text, label, timeout = 30_000) {
-  await browser.waitUntil(async () => (await browser.$("body").getText()).includes(text), {
-    timeout,
-    timeoutMsg: `${label} was not visible: ${JSON.stringify(text)}`,
-  });
+  try {
+    await browser.waitUntil(async () => (await browser.$("body").getText()).includes(text), {
+      timeout,
+      timeoutMsg: `${label} was not visible: ${JSON.stringify(text)}`,
+    });
+  } catch (error) {
+    const body = await browser.$("body").getText().catch(() => "<body unavailable>");
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; final body=${JSON.stringify(body)}`);
+  }
 }
 
 async function getPage(name = PAGE) {

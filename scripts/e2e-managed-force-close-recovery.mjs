@@ -385,8 +385,13 @@ async function connect(label, timeoutMs = 300_000, lease = true) {
   });
   await browser.waitUntil(async () => {
     const text = await bodyText();
-    const startupVisible = !lease && await browser.$(".startup-recovery-overlay").isExisting();
-    return startupVisible || text.includes("Journals") || text.includes("Startup:") || text.includes("Native recovery");
+    const startupVisible = await browser.$(".startup-recovery-overlay").isExisting();
+    if (text.includes("Startup:") || text.includes("Native recovery")) return true;
+    if (!lease) return startupVisible || text.includes("Journals");
+    // The sidebar paints behind the managed-open overlay.  Seeing its
+    // "Journals" label therefore does not mean the native transition has
+    // published a graph that can be leased yet.
+    return !startupVisible && text.includes("Journals");
   }, { timeout: timeoutMs, interval: 250, timeoutMsg: `${label} painted no startup or graph UI` });
   const window = await waitFor(() => windowIds()[0], 30_000, `${label} native window was absent`);
   appPid = Number(xdo("getwindowpid", window));

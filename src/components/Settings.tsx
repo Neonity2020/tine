@@ -113,7 +113,7 @@ import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../gr
 import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2Status } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2CancelResult, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import { formatJournal } from "../journal";
@@ -2286,6 +2286,53 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     );
   };
 
+  const emergencyDirectFilesConfirmation = (detail: string) =>
+    "Managed storage did not stop cleanly. Open the existing Markdown/Org files in Direct Files mode anyway?\n\n" +
+    "This is an emergency exit. In-memory or managed-only changes may be missing from the Markdown/Org tree. " +
+    "Tine will leave the managed-storage evidence untouched and will not silently reopen or merge it.\n\n" +
+    `Managed shutdown detail: ${safeManagedErrorDetail(detail)}`;
+
+  const cancelSparseCooperatively = async () => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        backend().cancelSparseV2(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("managed storage did not stop within 10 seconds")),
+            10_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+
+  const emergencyDirectFiles = async (detail: string) => {
+    const root = graphMeta()?.root;
+    if (!root) throw new Error("The current graph path is unavailable.");
+    if (!(await backend().confirm(emergencyDirectFilesConfirmation(detail)))) return false;
+    const result = await backend().cancelSparseV2Cold(root);
+    if (!managedStorageRuntime.acceptNativeTransition(result.status)) return false;
+    rebindCurrentStorageAuthority();
+    pushToast(result.recovery_statement, "success");
+    return true;
+  };
+
+  const forceDirectFiles = async (detail: string) => {
+    setCancelling(true);
+    setGraphTransitioning(true);
+    try {
+      await emergencyDirectFiles(detail);
+    } catch (error) {
+      reportManagedFailure("Couldn't open the current files in Direct Files", safeManagedErrorDetail(error));
+    } finally {
+      setGraphTransitioning(false);
+      setCancelling(false);
+    }
+  };
+
   const enable = async () => {
     setActivationProgress(null);
     setGraphTransitioning(true);
@@ -2410,7 +2457,13 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         // has been restored.
       }
       if (!(await backend().confirm(directFilesConfirmation()))) return;
-      const result = await backend().cancelSparseV2();
+      let result: SparseV2CancelResult;
+      try {
+        result = await cancelSparseCooperatively();
+      } catch (error) {
+        if (!(await emergencyDirectFiles(safeManagedErrorDetail(error)))) return;
+        return;
+      }
       if (!managedStorageRuntime.acceptNativeTransition(result.status)) return;
       let flushed = false;
       try {
@@ -2450,12 +2503,36 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         </div>
         <Show
           when={!loading()}
-          fallback={<div class="settings-hint settings-block">Checking sync state…</div>}
+          fallback={
+            <div class="settings-hint settings-block">
+              <div>Checking sync state…</div>
+              <div style={{ "margin-top": "6px" }}>
+                <button
+                  class="settings-btn settings-btn-danger"
+                  disabled={cancelling()}
+                  onClick={() => void forceDirectFiles("managed storage status is still loading")}
+                >
+                  {cancelling() ? "Opening Direct Files..." : "Open current files in Direct Files..."}
+                </button>
+              </div>
+            </div>
+          }
         >
           <Show
             when={status()}
             fallback={
-              <div class="settings-hint settings-block">Tine-managed storage status is unavailable.</div>
+              <div class="settings-hint settings-block">
+                <div>Tine-managed storage status is unavailable.</div>
+                <div style={{ "margin-top": "6px" }}>
+                  <button
+                    class="settings-btn settings-btn-danger"
+                    disabled={cancelling()}
+                    onClick={() => void forceDirectFiles("managed storage status is unavailable")}
+                  >
+                    {cancelling() ? "Opening Direct Files..." : "Open current files in Direct Files..."}
+                  </button>
+                </div>
+              </div>
             }
           >
             {(current) => (

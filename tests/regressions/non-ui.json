@@ -4207,12 +4207,38 @@
           "src-tauri/src/storage_mode_supervisor.rs::tests::a_stuck_root_lane_does_not_delay_an_unrelated_graph",
           "src-tauri/src/sync_runtime.rs::tests::cold_emergency_return_has_no_managed_runtime_or_archive_dependency",
           "src-tauri/src/sync_runtime.rs::tests::every_storage_mode_change_is_owned_by_the_native_supervisor",
+          "src/components/Settings.test.tsx::uses the independent cold escape when the managed actor cannot shut down",
+          "src/components/Settings.test.tsx::bounds cooperative shutdown before offering the independent cold escape",
+          "src/components/Settings.test.tsx::keeps the independent Direct Files escape available while managed status is unavailable",
           "scripts/e2e-managed-force-close-recovery.mjs"
         ],
         "scenario": "managed.cold-return-during-inflight-open",
         "failBefore": "field-reproduced"
       },
-      "notes": "On Android, a user requested Return to Direct Files while cold managed recovery still owned an app-global transition and then found every graph, including unrelated Direct Files graphs, trapped behind the same startup recovery UI. The root cause was duplicate authority: native managed open, a frontend attempt token, prefix-routed progress, and a frontend inactivity watchdog could each decide the transition. One native per-window/per-root supervisor now owns typed operation IDs, priority, and terminal outcomes; the frontend only renders them, and elapsed time cannot invent native.unavailable. Emergency return atomically selects Direct from the native-selected root without opening, draining, repairing, or archiving managed state, while stale managed workers are barred from later publication. The exact Linux real-app proof at commit 85b31dfe copied the 1,046-file anonymized graph, activated managed storage, edited and verified Markdown, waited 10 seconds, SIGKILLed Tine, requested Direct Files during the recovering managed open, verified Direct mode, made and projected a Direct edit, cleanly restarted, and verified the edit and Direct mode again. A second exact journey proved recovery followed by graceful drain/return and Direct restart; the two-device journey proved join, bidirectional edits, and byte-preserved provider evidence after emergency Direct return."
+      "notes": "On Android, a user requested Return to Direct Files while cold managed recovery still owned an app-global transition and then found every graph, including unrelated Direct Files graphs, trapped behind the same startup recovery UI. The root cause was duplicate authority: native managed open, a frontend attempt token, prefix-routed progress, and a frontend inactivity watchdog could each decide the transition. One native per-window/per-root supervisor now owns typed operation IDs, priority, and terminal outcomes; the frontend only renders them, and elapsed time cannot invent native.unavailable. Emergency return atomically selects Direct from the native-selected root without opening, draining, repairing, or archiving managed state, while stale managed workers are barred from later publication. Settings now exposes that same independent escape even while status lookup is pending or unavailable, and bounds a graceful actor-mediated return at ten seconds before offering the explicit emergency confirmation. The exact Linux real-app proof at commit 85b31dfe copied the 1,046-file anonymized graph, activated managed storage, edited and verified Markdown, waited 10 seconds, SIGKILLed Tine, requested Direct Files during the recovering managed open, verified Direct mode, made and projected a Direct edit, cleanly restarted, and verified the edit and Direct mode again. A second exact journey proved recovery followed by graceful drain/return and Direct restart; the two-device journey proved join, bidirectional edits, and byte-preserved provider evidence after emergency Direct return."
+    },
+    {
+      "id": "REG-MANAGED-SAME-NAME-RECONCILIATION-001",
+      "title": "Editing an existing physical same-name page under managed storage does not poison reconciliation by reacquiring another page's canonical name",
+      "family": "managed-storage-reconciliation",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/import.rs::tests::clean_activation_prepares_both_candidates_and_final_scan_without_operations",
+          "crates/tine-core/src/oplog/sqlite_identity.rs::tests::content_only_delta_on_nonowner_duplicate_name_does_not_reacquire_identity"
+        ],
+        "scenario": "managed.same-name-content-edit-keeps-established-name-owner",
+        "failBefore": "field-reproduced"
+      },
+      "notes": "A physical Android graph repeatedly failed after activation with clean page-name identity transition refused: Occupied(canonical page-name key is occupied at frontier F). Direct Files legitimately admits multiple physical files with one logical name; file path remains storage identity under ADR 0040. Clean external-import preflight nevertheless consulted the deliberately empty run-local Patricia fallback instead of the frontier-matched SQLite name authority, so a collision could pass before authoring and fail only during final materialization. The finalizer also treated every content-only PageDelta as a fresh name acquisition. Clean reconciliation now asks SQLite for current path and canonical-name ownership, preflights only creation or exact-title changes, and leaves the deterministic existing owner unchanged when another already-admitted physical same-name page changes content or path. A genuinely new or renamed colliding page remains blocked before authoring."
     },
     {
       "id": "REG-WATCH-MIDEDIT-DEFERRED-RELOAD-337",

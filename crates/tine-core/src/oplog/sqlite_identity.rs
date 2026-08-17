@@ -658,10 +658,18 @@ pub(crate) fn prepare_page_name_identity_transition(
     let mut acquisitions = deltas
         .iter()
         .filter_map(|delta| {
-            prospective_pages[&delta.page_id]
+            let name = prospective_pages[&delta.page_id]
                 .as_ref()
-                .and_then(live_page_name)
-                .map(|name| (name.key_digest(), delta.page_id, name.clone(), delta))
+                .and_then(live_page_name)?;
+            // A block/content-only page delta does not acquire its name again.
+            // This matters for an ordinary Direct Files graph that already
+            // contains two physical pages with the same canonical name: the
+            // deterministic baseline owner remains the owner, while editing
+            // the other page must not turn a non-name edit into a collision.
+            if delta.before.as_ref().and_then(live_page_name) == Some(name) {
+                return None;
+            }
+            Some((name.key_digest(), delta.page_id, name.clone(), delta))
         })
         .collect::<Vec<_>>();
     acquisitions.sort_unstable_by(|left, right| {
@@ -1246,5 +1254,35 @@ mod tests {
             causal.changed[&key].occupied().unwrap().page_id(),
             next_page
         );
+    }
+
+    #[test]
+    fn content_only_delta_on_nonowner_duplicate_name_does_not_reacquire_identity() {
+        let owner = page(60);
+        let edited = page(61);
+        let owner_name = LogicalPageName::parse("F").unwrap();
+        let edited_state = live("F", "pages/duplicate-f.md", 62);
+        let delta = PageDelta {
+            page_id: edited,
+            before: Some(edited_state.clone()),
+            after: Some(edited_state.clone()),
+        };
+        let transition = prepare_page_name_identity_transition(
+            batch(63),
+            dot(63),
+            &BTreeMap::from([(edited, Some(edited_state.clone()))]),
+            std::slice::from_ref(&delta),
+            &BTreeMap::from([(edited, Some(edited_state.clone()))]),
+            &BTreeMap::from([(edited, Some(edited_state))]),
+            BTreeMap::from([(
+                owner_name.key_digest(),
+                PageNameIdentityRecordV1::baseline(owner, owner_name).unwrap(),
+            )]),
+            |_, _| true,
+        )
+        .unwrap();
+
+        assert!(transition.changed.is_empty());
+        assert!(transition.conflicts.is_empty());
     }
 }

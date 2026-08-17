@@ -458,11 +458,15 @@ For a valid clean marker, the immutable baseline plus committed ordinary
 manifests is the complete semantic authority. The runtime reconstructs any
 current projection-head map in process memory from those manifests; it neither
 opens nor updates a persistent projection-work index. SQLite owns current exact
-path identity. External reconciliation reads the affected path owners from the
+path identity and current canonical page-name identity. External reconciliation
+reads both affected path owners and name-acquisition candidates from the
 frontier-matched SQLite projection, reproves the corresponding baseline or
 latest-manifest bytes against the engine, and then uses the same structural
 page/block matcher as the established importer. It must not ask a native
-Patricia path index to duplicate SQLite ownership.
+Patricia path or page-name index to duplicate SQLite ownership. A content or
+path-only edit of an existing physical same-name page does not reacquire its
+logical name; only a creation or exact-title change enters name-acquisition
+preflight.
 
 An exact watcher callback queues only the named managed paths. An imprecise
 callback, and every cold open of a clean marker, queues one full comparison of

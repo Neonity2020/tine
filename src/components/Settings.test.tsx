@@ -654,6 +654,108 @@ describe("Settings storage transitions", () => {
     dispose();
   });
 
+  it("uses the independent cold escape when the managed actor cannot shut down", async () => {
+    const calls: string[] = [];
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    const flush = vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    const reset = vi.spyOn(store, "resetStore");
+    vi.spyOn(backend(), "cancelSparseV2").mockRejectedValue(
+      new Error("sync actor is unavailable")
+    );
+    vi.spyOn(backend(), "cancelSparseV2Cold").mockImplementation(async (path) => {
+      calls.push(`cold-${path}`);
+      return {
+        status: legacyAt(12),
+        binding_generation: 12,
+        recovery_statement:
+          "Direct Files is active from the current Markdown/Org tree. Managed-storage evidence was left untouched.",
+      };
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const rollback = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Return to Direct files")
+    ) as HTMLButtonElement;
+    rollback.click();
+    await tick();
+    await tick();
+
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(confirm.mock.calls[1][0]).toContain("emergency exit");
+    expect(confirm.mock.calls[1][0]).toContain("sync actor is unavailable");
+    expect(calls).toEqual(["cold-/graphs/settings-test"]);
+    expect(flush).toHaveBeenCalledOnce();
+    expect(reset).toHaveBeenCalledOnce();
+    expect(toasts().at(-1)?.message).toContain("Direct Files is active");
+    dispose();
+  });
+
+  it("bounds cooperative shutdown before offering the independent cold escape", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "cancelSparseV2").mockImplementation(
+      () => new Promise(() => {})
+    );
+    const cold = vi.spyOn(backend(), "cancelSparseV2Cold").mockResolvedValue({
+      status: legacyAt(12),
+      binding_generation: 12,
+      recovery_statement: "Direct Files is active.",
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    vi.useFakeTimers();
+    const rollback = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Return to Direct files")
+    ) as HTMLButtonElement;
+    rollback.click();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(cold).toHaveBeenCalledWith("/graphs/settings-test");
+    expect(toasts().at(-1)?.message).toBe("Direct Files is active.");
+    dispose();
+  });
+
+  it("keeps the independent Direct Files escape available while managed status is unavailable", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockRejectedValue(
+      new Error("managed actor did not answer")
+    );
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    const cold = vi.spyOn(backend(), "cancelSparseV2Cold").mockResolvedValue({
+      status: legacyAt(13),
+      binding_generation: 13,
+      recovery_statement: "Direct Files is active from the current Markdown/Org tree.",
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    await tick();
+    const escape = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Open current files in Direct Files")
+    ) as HTMLButtonElement;
+    expect(escape).toBeTruthy();
+    escape.click();
+    await tick();
+    await tick();
+
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0][0]).toContain("managed storage status is unavailable");
+    expect(cold).toHaveBeenCalledWith("/graphs/settings-test");
+    expect(toasts().at(-1)?.message).toContain("Direct Files is active");
+    dispose();
+  });
+
   it("keeps dirty in-memory pages when the post-rollback legacy flush still fails", async () => {
     const calls: string[] = [];
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());

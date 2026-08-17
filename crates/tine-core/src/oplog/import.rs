@@ -6686,7 +6686,14 @@ pub(crate) fn plan_clean_affected_import(
             instrumentation,
         );
     }
-    plan_import(graph, inventory, scope, engine, instrumentation)
+    plan_import(
+        graph,
+        inventory,
+        scope,
+        engine,
+        Some(database),
+        instrumentation,
+    )
 }
 
 pub(crate) fn plan_affected_import_with_bootstrap(
@@ -6797,7 +6804,7 @@ pub(crate) fn plan_affected_import_with_bootstrap(
     // Equal bounded collections detect stale diagnostic input only under the
     // explicit quiescent-writer boundary. They are neither a portable atomic
     // filesystem snapshot nor authority for later publication.
-    plan_import(graph, inventory, scope, engine, instrumentation)
+    plan_import(graph, inventory, scope, engine, None, instrumentation)
 }
 
 #[cfg(test)]
@@ -8229,6 +8236,7 @@ fn plan_import(
     inventory: RawInventory,
     mut scope: ImportScopeSnapshot,
     engine: &ShardedHotEngine,
+    clean_database: Option<&SqliteFrontier>,
     mut instrumentation: ImportInstrumentation,
 ) -> ImportPlan {
     if scope.paths.len() != inventory.entries().len()
@@ -8405,7 +8413,9 @@ fn plan_import(
             return blocked_authority_error(Some(inventory), block, instrumentation);
         }
     };
-    if let Err(block) = preflight_desired_page_names(&inventory, &page_transition, engine) {
+    if let Err(block) =
+        preflight_desired_page_names(&inventory, &page_transition, engine, clean_database)
+    {
         return blocked_authority_error(Some(inventory), block, instrumentation);
     }
 
@@ -8489,9 +8499,29 @@ fn preflight_desired_page_names(
     inventory: &RawInventory,
     transition: &DesiredPageTransition,
     engine: &ShardedHotEngine,
+    clean_database: Option<&SqliteFrontier>,
 ) -> Result<(), ImportBlock> {
+    // Clean managed storage deliberately has no second resident page-name
+    // index. Its disposable SQLite projection is the current name authority,
+    // just as it is for path ownership. Consulting the empty run-local
+    // fallback here used to let an ordinary collision pass preflight and fail
+    // only after authoring, poisoning the actor with an unpublished manifest.
+    let clean_read = clean_database
+        .map(SqliteFrontier::materialized_read)
+        .transpose()
+        .map_err(|error| {
+            authority_block(
+                ImportBlockReason::AuthorityUnavailable,
+                None,
+                format!("clean SQLite page-name authority is unavailable: {error}"),
+            )
+        })?;
     let mut desired = BTreeMap::new();
-    for (path, page) in &transition.pages {
+    for (path, page) in transition
+        .pages
+        .iter()
+        .filter(|(_, page)| page.acquires_name)
+    {
         if let Some((prior_path, prior_page_id, prior_name)) = desired.insert(
             page.name.key_digest(),
             (path.clone(), page.page_id, page.name.clone()),
@@ -8512,15 +8542,27 @@ fn preflight_desired_page_names(
         }
     }
     for (_, (path, page_id, name)) in desired {
-        let owner = engine
-            .current_page_for_logical_name(&name)
-            .map_err(|error| {
-                authority_block(
-                    ImportBlockReason::AuthorityUnavailable,
-                    Some(&path),
-                    format!("authenticated logical page-name lookup failed: {error}"),
-                )
-            })?;
+        let owner = match clean_read.as_ref() {
+            Some(read) => read
+                .causal_page_name_identity_record(name.key_digest())
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(&path),
+                        format!("clean SQLite logical page-name lookup failed: {error}"),
+                    )
+                })?
+                .and_then(|record| record.occupied().map(|owner| owner.page_id())),
+            None => engine
+                .current_page_for_logical_name(&name)
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(&path),
+                        format!("authenticated logical page-name lookup failed: {error}"),
+                    )
+                })?,
+        };
         if owner.is_some_and(|owner| {
             owner != page_id && !transition.released_name_owners.contains(&owner)
         }) {
@@ -8552,6 +8594,7 @@ struct DesiredImportPage {
     path: ManagedPath,
     kind: ManagedTextKind,
     existing: bool,
+    acquires_name: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -8712,6 +8755,7 @@ fn build_desired_page_transition(
                     path: path.clone(),
                     kind: path_identity.kind,
                     existing: true,
+                    acquires_name: current.name != path_identity.name,
                 }
             }
             None => {
@@ -8735,6 +8779,7 @@ fn build_desired_page_transition(
                     path: path.clone(),
                     kind: path_identity.kind,
                     existing: false,
+                    acquires_name: true,
                 }
             }
         };
@@ -13549,6 +13594,24 @@ mod tests {
         clean_engine
             .attach_clean_projection_endpoint(&graph, &receipts)
             .unwrap();
+
+        let colliding_path = root.path().join("graph/pages/beta-copy.md");
+        fs::write(&colliding_path, "title:: Beta\n\n- colliding page\n").unwrap();
+        let collision = plan_clean_affected_import(
+            &graph,
+            &clean_engine,
+            database_handle,
+            &["pages/beta-copy.md"],
+        );
+        assert_eq!(collision.status(), ImportPlanStatus::Blocked);
+        assert!(collision.blocks().iter().any(|blocked| {
+            blocked.reason == ImportBlockReason::ConflictingLocalTail
+                && blocked
+                    .detail
+                    .contains("decoded destination logical page name Beta is already owned")
+        }));
+        fs::remove_file(colliding_path).unwrap();
+
         let claim_source = database_handle.materialized_read().unwrap();
         clean_engine
             .clean_import_projection_predecessor(
@@ -16008,6 +16071,7 @@ mod tests {
         assert!(entry.contains("database: &SqliteFrontier"));
         assert!(entry.contains("capture_clean_import_scope("));
         assert!(entry.contains("database,"));
+        assert!(entry.contains("Some(database)"));
 
         let authority = source
             .split_once("fn clean_sqlite_path_owner(")
@@ -16019,9 +16083,20 @@ mod tests {
         assert!(!authority.contains("current_page_at_path"));
         assert!(!authority.contains("projection_work_index"));
 
+        let name_preflight = source
+            .split_once("fn preflight_desired_page_names(")
+            .and_then(|(_, tail)| tail.split_once("struct CurrentImportBlock"))
+            .map(|(body, _)| body)
+            .expect("page-name preflight must remain identifiable");
+        assert!(name_preflight.contains("clean_database: Option<&SqliteFrontier>"));
+        assert!(name_preflight.contains("causal_page_name_identity_record"));
+        assert!(name_preflight.contains("current_page_for_logical_name"));
+
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
         assert!(contract.contains("SQLite owns current exact\npath identity"));
-        assert!(contract.contains("must not ask a native\nPatricia path index"));
+        assert!(contract.contains("and current canonical page-name identity"));
+        assert!(contract.contains("does not reacquire its\nlogical name"));
+        assert!(contract.contains("must not ask a native\nPatricia path or page-name index"));
     }
 
     fn orchestration_binding(
