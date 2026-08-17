@@ -26,6 +26,7 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::clean_runtime_handle_serves_sqlite_queries_and_stops_without_legacy_handoff",
   "sync_runtime::tests::clean_runtime_cross_page_move_commits_once_and_cold_reopens",
   "sync_runtime::tests::clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys",
+  "sync_runtime::tests::retained_clean_reactivation_reports_each_recovery_boundary",
   "sync_runtime::tests::public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment",
   "sync_runtime::tests::public_fresh_activation_commits_clean_marker_and_skips_legacy_promotion",
   "sync_runtime::tests::public_clean_activation_loads_saves_and_cold_reopens_an_editor_page",
