@@ -11,7 +11,7 @@ use crate::storage_mode_supervisor::{
 };
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
@@ -41,79 +41,6 @@ pub(crate) fn resolve_root(path: &str) -> Option<String> {
         }
     }
     std::env::args().skip(1).find(|arg| !arg.starts_with('-'))
-}
-
-pub(crate) const STARTUP_PROGRESS_EVENT: &str = "startup-progress";
-const STARTUP_PROGRESS_MAX_ELAPSED_MS: u64 = 86_400_000;
-
-fn bounded_startup_elapsed_ms(elapsed: std::time::Duration) -> u64 {
-    u64::try_from(elapsed.as_millis())
-        .unwrap_or(u64::MAX)
-        .min(STARTUP_PROGRESS_MAX_ELAPSED_MS)
-}
-
-/// A bounded, content-free startup receipt.  It is intentionally suitable for
-/// both stderr diagnostics and the still-unbound startup webview: neither the
-/// graph path nor an underlying I/O error belongs in this event.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub(crate) struct StartupProgressEvent {
-    phase: &'static str,
-    elapsed_ms: u64,
-    terminal: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    outcome: Option<&'static str>,
-}
-
-#[derive(Clone)]
-pub(crate) struct StartupProgressReporter {
-    app: tauri::AppHandle,
-    label: String,
-    started: Instant,
-    terminal_emitted: Arc<AtomicBool>,
-}
-
-impl StartupProgressReporter {
-    pub(crate) fn for_window(app: &tauri::AppHandle, label: &str) -> Self {
-        Self {
-            app: app.clone(),
-            label: label.to_string(),
-            started: Instant::now(),
-            terminal_emitted: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub(crate) fn phase(&self, phase: &'static str) {
-        self.emit(phase, false, None);
-    }
-
-    /// Emit exactly one terminal receipt even when the owning blocking worker
-    /// is interrupted while Tauri is awaiting it.
-    pub(crate) fn terminal(&self, phase: &'static str, outcome: &'static str) {
-        if self
-            .terminal_emitted
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
-        }
-        self.emit(phase, true, Some(outcome));
-    }
-
-    fn emit(&self, phase: &'static str, terminal: bool, outcome: Option<&'static str>) {
-        let event = StartupProgressEvent {
-            phase,
-            elapsed_ms: bounded_startup_elapsed_ms(self.started.elapsed()),
-            terminal,
-            outcome,
-        };
-        crate::debug::diag(format!(
-            "startup progress: phase={}; elapsed_ms={}; terminal={}; outcome={}",
-            event.phase,
-            event.elapsed_ms,
-            event.terminal,
-            event.outcome.unwrap_or("none"),
-        ));
-        let _ = self.app.emit_to(&self.label, STARTUP_PROGRESS_EVENT, event);
-    }
 }
 
 /// The remembered-graph lookup retains its historical best-effort semantics:
@@ -154,36 +81,27 @@ fn remembered_startup_graph_path_at(
     result
 }
 
-fn startup_graph_path_blocking(
-    app: &tauri::AppHandle,
-    reporter: &StartupProgressReporter,
-) -> Option<String> {
+fn startup_graph_path_blocking(app: &tauri::AppHandle) -> Option<String> {
     let settings_path = crate::settings::settings_path(app);
     remembered_startup_graph_path_at(
         resolve_root(""),
         settings_path.as_deref(),
         |phase, terminal, outcome| {
-            if terminal {
-                reporter.terminal(
-                    phase,
-                    outcome.expect("terminal startup lookup has an outcome"),
-                );
-            } else {
-                reporter.phase(phase);
-            }
+            crate::debug::diag(format!(
+                "startup lookup: phase={phase}; terminal={terminal}; outcome={}",
+                outcome.unwrap_or("none")
+            ));
         },
     )
 }
 
 #[tauri::command]
 pub(crate) async fn startup_graph_path(
-    attempt: u64,
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Option<String> {
     let label = window.label().to_string();
     let state = app.state::<AppState>();
-    state.begin_startup_recovery_attempt(&label, attempt);
     let lookup_id = match state.storage_supervisor.begin_transition(
         &app,
         &label,
@@ -196,9 +114,7 @@ pub(crate) async fn startup_graph_path(
             return None;
         }
     };
-    let reporter = StartupProgressReporter::for_window(&app, &label);
     let worker_app = app.clone();
-    let worker_reporter = reporter.clone();
     let worker_label = label.clone();
     match tauri::async_runtime::spawn_blocking(move || {
         let worker_state = worker_app.state::<AppState>();
@@ -209,19 +125,21 @@ pub(crate) async fn startup_graph_path(
         ) {
             crate::debug::diag(error);
         }
-        let result = startup_graph_path_blocking(&worker_app, &worker_reporter);
+        let result = startup_graph_path_blocking(&worker_app);
         let canonical_target = result
             .as_deref()
             .and_then(|path| canonical_graph_root(path).ok());
         if let Some(root) = canonical_target.clone() {
             if let Err(error) = worker_state
                 .storage_supervisor
-                .bind_transition_root(lookup_id, root)
+                .bind_transition_root(lookup_id, root.clone())
             {
                 crate::debug::diag(error);
             }
+            worker_state
+                .storage_supervisor
+                .select_window_root(&worker_label, root);
         }
-        worker_state.authorize_startup_recovery_target(&worker_label, attempt, canonical_target);
         if let Err(error) = worker_state.storage_supervisor.finish_transition(
             &worker_app,
             lookup_id,
@@ -237,7 +155,6 @@ pub(crate) async fn startup_graph_path(
     {
         Ok(result) => result,
         Err(_) => {
-            reporter.terminal("lookup.complete", "error");
             if let Err(error) = state.storage_supervisor.finish_transition(
                 &app,
                 lookup_id,
@@ -663,7 +580,6 @@ pub(crate) fn open_and_publish_direct_files(
     let binding_generation = slot.binding_generation;
     let application_page_admission = slot.application_page_admission();
     warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation)?;
-    state.clear_startup_recovery_target(window_label);
     Ok(DirectFilesOpen {
         meta,
         binding_generation,
@@ -682,6 +598,9 @@ pub(crate) fn load_graph_for_label(
     let root = resolve_root(&path)
         .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
     let root_key = canonical_graph_root(&root)?;
+    state
+        .storage_supervisor
+        .select_window_root(window_label, root_key.clone());
     graph_load_phase(started, &mut previous, "canonical graph root");
     let transition_gate = state.storage_supervisor.legacy_transition_gate(&root_key);
     let _load = transition_gate.lock().unwrap();
@@ -700,7 +619,6 @@ pub(crate) fn load_graph_for_label(
     if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)?;
-            state.clear_startup_recovery_target(window_label);
             state.storage_supervisor.finish_transition(
                 app,
                 lookup_id,
@@ -729,7 +647,6 @@ pub(crate) fn load_graph_for_label(
                 }
             }
         }
-        state.clear_startup_recovery_target(window_label);
         state.storage_supervisor.finish_transition(
             app,
             lookup_id,
@@ -848,7 +765,6 @@ pub(crate) fn load_graph_for_label(
                 .unwrap_or("Graph");
             let _ = window.set_title(&format!("Tine — {name}"));
         }
-        state.clear_startup_recovery_target(window_label);
         return Ok(LoadGraphResult::Loaded {
             meta,
             binding_generation: slot.binding_generation,
@@ -1190,7 +1106,6 @@ mod tests {
             watch_ctl: std::sync::Mutex::new(None),
             last_focused: std::sync::Mutex::new(None),
             capture_graph: std::sync::Mutex::new(None),
-            startup_recovery: std::sync::Mutex::new(std::collections::HashMap::new()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: std::sync::atomic::AtomicU64::new(1),
@@ -1263,40 +1178,7 @@ mod tests {
             receipts.last(),
             Some(&("lookup.complete", true, Some("ok")))
         );
-        let encoded = serde_json::to_string(&StartupProgressEvent {
-            phase: "lookup.complete",
-            elapsed_ms: 1,
-            terminal: true,
-            outcome: Some("ok"),
-        })
-        .unwrap();
-        assert!(!encoded.contains(&remembered.display().to_string()));
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn startup_progress_elapsed_is_clamped_to_the_frontend_contract_before_serialization() {
-        assert_eq!(
-            bounded_startup_elapsed_ms(std::time::Duration::from_millis(
-                STARTUP_PROGRESS_MAX_ELAPSED_MS - 1
-            )),
-            STARTUP_PROGRESS_MAX_ELAPSED_MS - 1
-        );
-        let elapsed_ms = bounded_startup_elapsed_ms(std::time::Duration::from_millis(
-            STARTUP_PROGRESS_MAX_ELAPSED_MS + 1,
-        ));
-        assert_eq!(elapsed_ms, STARTUP_PROGRESS_MAX_ELAPSED_MS);
-        let encoded = serde_json::to_value(StartupProgressEvent {
-            phase: "lookup.complete",
-            elapsed_ms,
-            terminal: true,
-            outcome: Some("ok"),
-        })
-        .unwrap();
-        assert_eq!(
-            encoded["elapsed_ms"],
-            serde_json::Value::from(STARTUP_PROGRESS_MAX_ELAPSED_MS)
-        );
     }
 
     #[test]

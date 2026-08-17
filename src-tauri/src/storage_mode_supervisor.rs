@@ -128,6 +128,7 @@ pub(crate) struct StorageSupervisorModel {
     active_root_owner: HashMap<PathBuf, String>,
     terminal_operations: HashSet<StorageOperationId>,
     stable_modes: HashMap<PathBuf, StableStorageMode>,
+    selected_root_by_window: HashMap<String, PathBuf>,
 }
 
 impl Default for StorageSupervisorModel {
@@ -138,6 +139,7 @@ impl Default for StorageSupervisorModel {
             active_root_owner: HashMap::new(),
             terminal_operations: HashSet::new(),
             stable_modes: HashMap::new(),
+            selected_root_by_window: HashMap::new(),
         }
     }
 }
@@ -298,6 +300,21 @@ impl StorageSupervisorModel {
         self.active_by_window
             .get(window)
             .map(|active| &active.operation)
+    }
+
+    pub(crate) fn select_root(&mut self, window: impl Into<String>, root: PathBuf) {
+        self.selected_root_by_window.insert(window.into(), root);
+    }
+
+    pub(crate) fn selected_root(&self, window: &str) -> Option<&Path> {
+        self.active_by_window
+            .get(window)
+            .and_then(|active| active.operation.canonical_root.as_deref())
+            .or_else(|| {
+                self.selected_root_by_window
+                    .get(window)
+                    .map(PathBuf::as_path)
+            })
     }
 
     pub(crate) fn stable_mode(&self, canonical_root: &Path) -> StableStorageMode {
@@ -494,6 +511,57 @@ impl StorageModeSupervisor {
             outcome_code: None,
         };
         self.emit(app, event);
+        Ok(begun.operation.operation_id)
+    }
+
+    pub(crate) fn select_window_root(&self, window: &str, root: PathBuf) {
+        self.model.lock().unwrap().select_root(window, root);
+    }
+
+    /// Validate and supersede in one model lock. The submitted path is a UI
+    /// echo, never authority: emergency return is accepted only for the exact
+    /// native-selected root of this window.
+    pub(crate) fn begin_emergency_return(
+        &self,
+        app: &tauri::AppHandle,
+        window: &str,
+        canonical_root: PathBuf,
+    ) -> Result<StorageOperationId, String> {
+        let now_ms = self.now_ms();
+        let begun = {
+            let mut model = self.model.lock().unwrap();
+            if model.selected_root(window) != Some(canonical_root.as_path()) {
+                return Err(
+                    "This recovery action no longer matches the native-selected graph. Retry graph lookup before returning to Direct Files."
+                        .into(),
+                );
+            }
+            model
+                .begin(
+                    window,
+                    Some(canonical_root),
+                    StorageTransitionKind::ReturnEmergency,
+                    now_ms,
+                )
+                .map_err(|error| format!("storage transition refused: {error:?}"))?
+        };
+        if let Some(superseded) = begun.superseded {
+            self.emit(app, superseded);
+        }
+        self.emit(
+            app,
+            StorageTransitionEvent {
+                operation_id: begun.operation.operation_id,
+                window: begun.operation.window.clone(),
+                canonical_root: begun.operation.canonical_root.clone(),
+                kind: begun.operation.kind,
+                phase: begun.operation.phase,
+                elapsed_ms: 0,
+                terminal: false,
+                outcome: None,
+                outcome_code: None,
+            },
+        );
         Ok(begun.operation.operation_id)
     }
 
@@ -953,5 +1021,63 @@ mod tests {
             })
             .is_err());
         assert!(!published.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn native_selected_root_is_the_only_emergency_return_target() {
+        let mut model = StorageSupervisorModel::default();
+        let first = PathBuf::from("/first");
+        let second = PathBuf::from("/second");
+        model.select_root("main", first.clone());
+        assert_eq!(model.selected_root("main"), Some(first.as_path()));
+
+        let open = model
+            .begin(
+                "main",
+                Some(second.clone()),
+                StorageTransitionKind::OpenDirect,
+                0,
+            )
+            .unwrap();
+        assert_eq!(model.selected_root("main"), Some(second.as_path()));
+        model
+            .finish(
+                open.operation.operation_id,
+                StorageTransitionOutcome::Succeeded,
+                Some(StableStorageMode::Direct),
+                None,
+                1,
+            )
+            .unwrap();
+        model.select_root("main", second.clone());
+        assert_eq!(model.selected_root("main"), Some(second.as_path()));
+    }
+
+    #[test]
+    fn frontend_is_a_typed_transition_renderer_not_a_recovery_authority() {
+        let frontend = include_str!("../../src/startupRecovery.ts");
+        let app = include_str!("../../src/App.tsx");
+        let state = include_str!("state.rs");
+        let graph = include_str!("graph.rs");
+        for forbidden in [
+            "nativeAttempt",
+            "onStartupProgress",
+            "receiveProgress",
+            "STARTUP_LOOKUP_WATCHDOG_MS",
+        ] {
+            assert!(
+                !frontend.contains(forbidden),
+                "obsolete frontend authority: {forbidden}"
+            );
+            assert!(
+                !app.contains(forbidden),
+                "obsolete app authority: {forbidden}"
+            );
+        }
+        assert!(!frontend.contains("setTimeout("));
+        assert!(frontend.contains("operationId"));
+        assert!(frontend.contains("receiveTransition"));
+        assert!(!state.contains("startup_recovery:"));
+        assert!(!graph.contains("startup-progress"));
     }
 }

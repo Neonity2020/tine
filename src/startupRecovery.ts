@@ -1,57 +1,54 @@
 import { createSignal, type Accessor } from "solid-js";
 import type { LoadGraphPathOutcome } from "./graph";
 import { safeManagedErrorDetail } from "./managedDiagnostics";
-import type { SparseV2CancelResult, StartupProgressEvent } from "./types";
+import type {
+  SparseV2CancelResult,
+  StorageTransitionEvent,
+  StorageTransitionKind,
+} from "./types";
 
-export const STARTUP_LOOKUP_WATCHDOG_MS = 2_000;
 export const STARTUP_PROGRESS_VISIBLE_MS = 250;
-export const STARTUP_ACTION_WATCHDOG_MS = 15_000;
 
 export type StartupOperation = "lookup" | "graph_open" | "graph_picker" | "cold_return";
 
 export interface StartupRecoverySnapshot {
   mode: "idle" | "working" | "recovery";
   operation: StartupOperation | null;
-  /** Frontend continuation generation; user actions invalidate late promises. */
+  /** Frontend continuation generation only; never native storage authority. */
   attempt: number;
-  /** Native lookup authority token retained for a cold recovery command. */
-  nativeAttempt: number;
+  operationId: number | null;
+  transitionKind: StorageTransitionKind | null;
   phase: string;
-  nativePhase: string | null;
   startedAt: number;
   elapsedMs: number;
-  nativeElapsedMs: number | null;
   target: string;
   detail: string | null;
 }
 
 export interface StartupRecoveryDeps {
-  lookupGraphPath(attempt: number): Promise<string | null>;
+  lookupGraphPath(): Promise<string | null>;
   injectedGraphPath(): string;
   persistedGraphPath(): string;
   openGraph(path: string, supersedeCurrent?: boolean): Promise<LoadGraphPathOutcome>;
   pickGraph(): Promise<LoadGraphPathOutcome>;
-  coldReturn(path: string, attempt: number): Promise<SparseV2CancelResult>;
+  coldReturn(path: string): Promise<SparseV2CancelResult>;
   acceptColdReturn(result: SparseV2CancelResult): void;
   confirmColdReturn(graphName: string): Promise<boolean>;
   copyText(text: string): Promise<void>;
   notify(message: string, kind: "success" | "error"): void;
   completeFirstLoad(): void;
   now?: () => number;
-  watchdogMs?: number;
-  actionWatchdogMs?: number;
 }
 
 const idleSnapshot = (): StartupRecoverySnapshot => ({
   mode: "idle",
   operation: null,
   attempt: 0,
-  nativeAttempt: 0,
+  operationId: null,
+  transitionKind: null,
   phase: "idle",
-  nativePhase: null,
   startedAt: 0,
   elapsedMs: 0,
-  nativeElapsedMs: null,
   target: "",
   detail: null,
 });
@@ -63,58 +60,42 @@ export function startupGraphName(path: string): string {
 
 export function startupPhaseLabel(phase: string): string {
   const known: Record<string, string> = {
+    requested: "Starting storage operation",
+    waiting_for_transition: "Waiting for the current storage operation",
+    looking_up_selection: "Finding the last workspace",
+    validating_target: "Checking workspace access",
+    opening_direct: "Opening Direct Files",
+    opening_managed: "Opening managed storage",
+    activating_managed: "Enabling managed storage",
+    joining_managed: "Joining the synced workspace",
+    draining_managed: "Finishing managed-storage edits",
+    confirming_projection: "Confirming the Markdown projection",
+    quarantining_managed_selection: "Selecting the current Markdown tree as Direct Files",
+    publishing_direct: "Opening Direct Files",
     "lookup.starting": "Finding the last workspace",
-    "lookup.entry": "Starting workspace lookup",
-    "lookup.app_data": "Locating app settings",
-    "lookup.settings_stat": "Checking app settings",
-    "lookup.settings_read": "Reading app settings",
-    "lookup.settings_parse": "Reading the remembered workspace",
-    "lookup.complete": "Workspace lookup complete",
-    "lookup.timeout": "Workspace lookup is not responding",
-    "lookup.failed": "Workspace lookup failed",
-    "native.unavailable": "Native recovery is not responding",
     "graph.access": "Checking workspace access",
     "graph.failed": "Workspace open failed",
     "picker.open": "Waiting for a workspace selection",
     "direct.confirm": "Waiting for confirmation",
-    "direct.archive": "Archiving managed state before Direct Files",
-    "cold_return.waiting_for_graph_transition": "Finishing the current storage operation before Direct Files",
-    "cold_return.verifying_target": "Verifying the workspace before Direct Files",
-    "cold_return.quarantining_managed_selection": "Selecting the current Markdown tree as Direct Files",
-    "cold_return.archiving_managed_state": "Archiving managed state before Direct Files",
-    "cold_return.opening_direct_files": "Opening Direct Files",
-    "cold_return.complete": "Direct Files return complete",
   };
-  if (known[phase]) return known[phase];
-  if (phase.startsWith("managed_open.")) {
-    const tail = phase.slice("managed_open.".length);
-    if (tail === "complete") return "Managed storage open complete";
-    return `Opening managed storage: ${tail.replace(/[._]+/gu, " ")}`;
-  }
-  return phase.replace(/[._]+/gu, " ");
+  return known[phase] ?? phase.replace(/[._]+/gu, " ");
 }
 
-const LOOKUP_PROGRESS_PHASES = new Set([
-  "lookup.entry",
-  "lookup.app_data",
-  "lookup.settings_stat",
-  "lookup.settings_read",
-  "lookup.settings_parse",
-  "lookup.complete",
-]);
+export function validStorageTransition(event: StorageTransitionEvent): boolean {
+  return Number.isSafeInteger(event.operationId)
+    && event.operationId > 0
+    && Number.isSafeInteger(event.elapsedMs)
+    && event.elapsedMs >= 0
+    && typeof event.terminal === "boolean";
+}
 
-/** Runtime boundary for the native event bus: phase text is displayed/copied. */
-export function validStartupProgress(progress: StartupProgressEvent): boolean {
-  const phase = progress.phase as string;
-  const validPhase = LOOKUP_PROGRESS_PHASES.has(phase)
-    || /^managed_open\.[a-z0-9_]{1,64}$/u.test(phase)
-    || /^cold_return\.[a-z0-9_]{1,64}$/u.test(phase);
-  return validPhase
-    && Number.isSafeInteger(progress.elapsed_ms)
-    && progress.elapsed_ms >= 0
-    && progress.elapsed_ms <= 86_400_000
-    && typeof progress.terminal === "boolean"
-    && (progress.outcome === undefined || progress.outcome === "ok" || progress.outcome === "error");
+function startupOperation(kind: StorageTransitionKind): StartupOperation {
+  switch (kind) {
+    case "lookup": return "lookup";
+    case "return_emergency":
+    case "return_gracefully": return "cold_return";
+    default: return "graph_open";
+  }
 }
 
 export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
@@ -124,214 +105,114 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
   openAnother: () => Promise<void>;
   returnToDirectFiles: () => Promise<void>;
   copyDetails: () => Promise<void>;
-  receiveProgress: (progress: StartupProgressEvent) => void;
+  receiveTransition: (event: StorageTransitionEvent) => void;
   dispose: () => void;
 } {
   const now = deps.now ?? Date.now;
-  const watchdogMs = deps.watchdogMs ?? STARTUP_LOOKUP_WATCHDOG_MS;
-  const actionWatchdogMs = deps.actionWatchdogMs ?? STARTUP_ACTION_WATCHDOG_MS;
   const [snapshot, setSnapshot] = createSignal<StartupRecoverySnapshot>(idleSnapshot());
   let sequence = 0;
+  let latestNativeOperation = 0;
   let disposed = false;
-  let watchdog: ReturnType<typeof setTimeout> | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
 
-  const clearTimers = () => {
-    if (watchdog !== undefined) clearTimeout(watchdog);
+  const clearTicker = () => {
     if (ticker !== undefined) clearInterval(ticker);
-    watchdog = undefined;
     ticker = undefined;
   };
 
-  const tickElapsed = () => {
-    setSnapshot((current) => current.mode === "idle" ? current : {
-      ...current,
-      elapsedMs: Math.max(0, now() - current.startedAt),
-    });
-  };
-
-  const begin = (
-    attempt: number,
-    operation: StartupOperation,
-    phase: string,
-    target: string,
-    startedAt = now(),
-    nativeAttempt = attempt,
-  ) => {
-    clearTimers();
+  const begin = (attempt: number, operation: StartupOperation, phase: string, target: string) => {
+    clearTicker();
     setSnapshot({
       mode: "working",
       operation,
       attempt,
-      nativeAttempt,
+      operationId: null,
+      transitionKind: null,
       phase,
-      nativePhase: null,
-      startedAt,
+      startedAt: now(),
       elapsedMs: 0,
-      nativeElapsedMs: null,
       target,
       detail: null,
     });
-    ticker = setInterval(tickElapsed, 100);
-  };
-
-  const recover = (
-    attempt: number,
-    phase: string,
-    target: string,
-    detail: string,
-    startedAt: number,
-  ) => {
-    if (attempt !== sequence || disposed) return;
-    if (watchdog !== undefined) clearTimeout(watchdog);
-    watchdog = undefined;
-    setSnapshot((current) => ({
-      ...current,
-      mode: "recovery",
-      attempt,
-      phase,
-      target,
-      detail: safeManagedErrorDetail(detail),
-      startedAt,
-      elapsedMs: Math.max(0, now() - startedAt),
-    }));
-  };
-
-  const armActionWatchdog = (
-    attempt: number,
-    target: string,
-    startedAt: number,
-    detail: string,
-  ) => {
-    if (watchdog !== undefined) clearTimeout(watchdog);
-    watchdog = setTimeout(() => {
-      recover(attempt, "native.unavailable", target, detail, startedAt);
-    }, actionWatchdogMs);
+    ticker = setInterval(() => {
+      setSnapshot((current) => current.mode === "idle" ? current : {
+        ...current,
+        elapsedMs: Math.max(0, now() - current.startedAt),
+      });
+    }, 100);
   };
 
   const finish = (attempt: number) => {
     if (attempt !== sequence || disposed) return;
-    clearTimers();
+    clearTicker();
     setSnapshot({ ...idleSnapshot(), attempt });
     deps.completeFirstLoad();
   };
 
-  const completeOpen = async (
-    attempt: number,
-    target: string,
-    startedAt: number,
-    supersedeCurrent = false,
-  ) => {
+  const recover = (attempt: number, target: string, detail: unknown) => {
     if (attempt !== sequence || disposed) return;
     setSnapshot((current) => ({
       ...current,
-      mode: "working",
-      operation: "graph_open",
-      phase: "graph.access",
+      mode: "recovery",
+      phase: "graph.failed",
       target,
-      detail: null,
+      detail: safeManagedErrorDetail(detail),
+      elapsedMs: Math.max(0, now() - current.startedAt),
     }));
-    armActionWatchdog(
-      attempt,
-      target,
-      startedAt,
-      "Native recovery is unavailable or has stopped reporting progress. You can retry, choose another graph, or close and relaunch Tine; managed files have not been discarded.",
-    );
+  };
+
+  const completeOpen = async (attempt: number, target: string, supersedeCurrent = false) => {
+    if (attempt !== sequence || disposed) return;
+    setSnapshot((current) => ({ ...current, operation: "graph_open", phase: "graph.access", target }));
     try {
       const outcome = supersedeCurrent
         ? await deps.openGraph(target, true)
         : await deps.openGraph(target);
       if (attempt !== sequence || disposed) return;
-      if (outcome.kind === "loaded" || outcome.kind === "already_current") {
-        finish(attempt);
-      } else {
-        recover(
-          attempt,
-          "graph.failed",
-          target,
-          "The workspace open operation was aborted before a graph became available.",
-          startedAt,
-        );
-      }
+      if (outcome.kind === "loaded" || outcome.kind === "already_current") finish(attempt);
+      else recover(attempt, target, "The workspace open operation was superseded or cancelled.");
     } catch (error) {
-      recover(attempt, "graph.failed", target, error instanceof Error ? error.message : String(error), startedAt);
+      recover(attempt, target, error);
     }
   };
 
   const runLookup = () => {
     const attempt = ++sequence;
-    const startedAt = now();
     const fallback = deps.injectedGraphPath() || deps.persistedGraphPath();
-    begin(attempt, "lookup", "lookup.starting", fallback, startedAt);
-    watchdog = setTimeout(() => {
-      recover(
-        attempt,
-        "lookup.timeout",
-        fallback,
-        "The native workspace lookup is unresponsive. No storage operation has started.",
-        startedAt,
-      );
-    }, watchdogMs);
-
-    void deps.lookupGraphPath(attempt).then(
+    begin(attempt, "lookup", "lookup.starting", fallback);
+    void deps.lookupGraphPath().then(
       (remembered) => {
         if (attempt !== sequence || disposed) return;
-        if (watchdog !== undefined) clearTimeout(watchdog);
-        watchdog = undefined;
         const target = deps.injectedGraphPath() || remembered || deps.persistedGraphPath();
-        if (!target) {
-          finish(attempt);
-          return;
-        }
-        void completeOpen(attempt, target, startedAt);
+        if (target) void completeOpen(attempt, target);
+        else finish(attempt);
       },
       (error) => {
         if (attempt !== sequence || disposed) return;
-        if (watchdog !== undefined) clearTimeout(watchdog);
-        watchdog = undefined;
-        if (fallback) {
-          void completeOpen(attempt, fallback, startedAt);
-        } else {
-          recover(
-            attempt,
-            "lookup.failed",
-            "",
-            error instanceof Error ? error.message : String(error),
-            startedAt,
-          );
-        }
+        if (fallback) void completeOpen(attempt, fallback);
+        else recover(attempt, "", error);
       },
     );
   };
 
   const invalidate = () => {
     const attempt = ++sequence;
-    clearTimers();
+    clearTicker();
     return attempt;
   };
 
   const openAnother = async () => {
     const previous = snapshot();
-    if (previous.mode !== "recovery") return;
+    if (previous.mode === "idle") return;
     const attempt = invalidate();
-    const startedAt = now();
-    begin(attempt, "graph_picker", "picker.open", previous.target, startedAt, previous.nativeAttempt);
-    armActionWatchdog(
-      attempt,
-      previous.target,
-      startedAt,
-      "The native workspace picker is unavailable. Close and relaunch Tine if it did not appear.",
-    );
+    begin(attempt, "graph_picker", "picker.open", previous.target);
     try {
       const outcome = await deps.pickGraph();
       if (attempt !== sequence || disposed) return;
-      if (outcome.kind === "loaded" || outcome.kind === "already_current") {
-        finish(attempt);
-      } else {
-        recover(attempt, previous.phase, previous.target, previous.detail ?? "Workspace selection was cancelled.", startedAt);
-      }
+      if (outcome.kind === "loaded" || outcome.kind === "already_current") finish(attempt);
+      else recover(attempt, previous.target, previous.detail ?? "Workspace selection was cancelled.");
     } catch (error) {
-      recover(attempt, "graph.failed", previous.target, error instanceof Error ? error.message : String(error), startedAt);
+      recover(attempt, previous.target, error);
     }
   };
 
@@ -339,96 +220,53 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
     const previous = snapshot();
     const eligible = previous.mode === "recovery"
       || (previous.mode === "working" && previous.operation === "graph_open");
-    if (!eligible || !previous.target || previous.nativeAttempt <= 0) return;
+    if (!eligible || !previous.target) return;
     const attempt = invalidate();
-    const startedAt = now();
-    begin(attempt, "cold_return", "direct.confirm", previous.target, startedAt, previous.nativeAttempt);
-    armActionWatchdog(
-      attempt,
-      previous.target,
-      startedAt,
-      "The native recovery confirmation is unavailable. Managed files remain preserved; retry or close and relaunch Tine.",
-    );
+    begin(attempt, "cold_return", "direct.confirm", previous.target);
     const approved = await deps.confirmColdReturn(startupGraphName(previous.target));
     if (attempt !== sequence || disposed) return;
     if (!approved) {
-      if (previous.mode === "working" && previous.operation === "graph_open") {
-        await completeOpen(attempt, previous.target, previous.startedAt);
-        return;
-      }
-      if (watchdog !== undefined) clearTimeout(watchdog);
-      watchdog = undefined;
-      setSnapshot({ ...previous, attempt, startedAt, elapsedMs: Math.max(0, now() - startedAt) });
+      if (previous.mode === "working") await completeOpen(attempt, previous.target, true);
+      else setSnapshot({ ...previous, attempt, startedAt: now(), elapsedMs: 0 });
       return;
     }
-    begin(attempt, "cold_return", "direct.archive", previous.target, startedAt, previous.nativeAttempt);
-    armActionWatchdog(
-      attempt,
-      previous.target,
-      startedAt,
-      "Native recovery is unavailable or has stopped reporting progress. Managed files remain preserved; close and relaunch Tine before trying manual recovery.",
-    );
     try {
-      const result = await deps.coldReturn(previous.target, previous.nativeAttempt);
+      const result = await deps.coldReturn(previous.target);
       if (attempt !== sequence || disposed) return;
       deps.acceptColdReturn(result);
-      // Native emergency return has already selected and published Direct
-      // Files. Supersede the obsolete managed-open frontend continuation so it
-      // cannot keep the whole app in a transition or repaint recovery later.
-      await completeOpen(attempt, previous.target, startedAt, true);
+      await completeOpen(attempt, previous.target, true);
     } catch (error) {
-      recover(attempt, "graph.failed", previous.target, error instanceof Error ? error.message : String(error), startedAt);
+      recover(attempt, previous.target, error);
     }
+  };
+
+  const receiveTransition = (event: StorageTransitionEvent) => {
+    if (!validStorageTransition(event) || disposed) return;
+    if (event.operationId < latestNativeOperation) return;
+    latestNativeOperation = event.operationId;
+    setSnapshot((current) => {
+      if (current.mode === "idle") return current;
+      return {
+        ...current,
+        operation: startupOperation(event.kind),
+        operationId: event.operationId,
+        transitionKind: event.kind,
+        phase: event.phase,
+        elapsedMs: Math.max(current.elapsedMs, event.elapsedMs),
+      };
+    });
   };
 
   const diagnostics = () => {
     const current = snapshot();
-    const entries = [
+    const lines = [
       `Startup: ${current.phase}`,
       `Operation: ${current.operation ?? "none"}`,
       `Elapsed: ${Math.round(current.elapsedMs)} ms`,
     ];
-    if (current.nativePhase) entries.push(`Native phase: ${current.nativePhase} (${current.nativeElapsedMs ?? 0} ms)`);
-    if (current.detail) entries.push(`Detail: ${safeManagedErrorDetail(current.detail)}`);
-    return entries.join("\n");
-  };
-
-  const copyDetails = async () => {
-    try {
-      await deps.copyText(diagnostics());
-      deps.notify("Startup recovery details copied.", "success");
-    } catch (error) {
-      deps.notify(`Couldn't copy startup recovery details: ${safeManagedErrorDetail(error)}`, "error");
-    }
-  };
-
-  const receiveProgress = (progress: StartupProgressEvent) => {
-    if (!validStartupProgress(progress)) return;
-    setSnapshot((current) => {
-      if (current.mode === "idle") return current;
-      const lookup = progress.phase.startsWith("lookup.");
-      const managed = progress.phase.startsWith("managed_open.");
-      const coldReturn = progress.phase.startsWith("cold_return.");
-      if (lookup && current.operation !== "lookup") return current;
-      if (managed && current.operation !== "graph_open") return current;
-      if (coldReturn && current.operation !== "cold_return") return current;
-      if (managed || coldReturn) {
-        armActionWatchdog(
-          current.attempt,
-          current.target,
-          current.startedAt,
-          "Native recovery is unavailable or has stopped reporting progress. Managed files remain preserved; close and relaunch Tine before trying manual recovery.",
-        );
-      }
-      return {
-        ...current,
-        mode: (managed || coldReturn) && current.mode === "recovery" && current.phase === "native.unavailable"
-          ? "working"
-          : current.mode,
-        nativePhase: progress.phase,
-        nativeElapsedMs: Math.max(0, progress.elapsed_ms),
-      };
-    });
+    if (current.operationId) lines.push(`Native operation: ${current.operationId} (${current.transitionKind})`);
+    if (current.detail) lines.push(`Detail: ${safeManagedErrorDetail(current.detail)}`);
+    return lines.join("\n");
   };
 
   return {
@@ -437,12 +275,19 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
     retry: runLookup,
     openAnother,
     returnToDirectFiles,
-    copyDetails,
-    receiveProgress,
+    copyDetails: async () => {
+      try {
+        await deps.copyText(diagnostics());
+        deps.notify("Startup recovery details copied.", "success");
+      } catch (error) {
+        deps.notify(`Couldn't copy startup recovery details: ${safeManagedErrorDetail(error)}`, "error");
+      }
+    },
+    receiveTransition,
     dispose: () => {
       disposed = true;
       sequence++;
-      clearTimers();
+      clearTicker();
     },
   };
 }

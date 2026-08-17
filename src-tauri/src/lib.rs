@@ -651,7 +651,6 @@ pub fn run() {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(std::collections::HashMap::new()),
             sync_runtime: sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(1),

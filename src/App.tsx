@@ -131,7 +131,7 @@ import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
-import { createStartupRecoveryController, STARTUP_LOOKUP_WATCHDOG_MS } from "./startupRecovery";
+import { createStartupRecoveryController } from "./startupRecovery";
 import { writeClipboardTextResilient } from "./clipboard";
 import type { SparseV2CancelResult } from "./types";
 
@@ -605,12 +605,12 @@ export function App(): JSX.Element {
     forward: () => goForward(),
   };
   const startupRecovery = createStartupRecoveryController({
-    lookupGraphPath: (attempt) => backend().startupGraphPath(attempt),
+    lookupGraphPath: () => backend().startupGraphPath(),
     injectedGraphPath: () => (window as any).__GRAPH_PATH__ ?? "",
     persistedGraphPath,
     openGraph: (path, supersedeCurrent) => loadGraphPath(path, { supersedeCurrent }),
     pickGraph: switchGraph,
-    coldReturn: (path, attempt) => backend().cancelSparseV2Cold(path, attempt),
+    coldReturn: (path) => backend().cancelSparseV2Cold(path),
     acceptColdReturn: acceptColdReturnManagedStorage,
     confirmColdReturn: (name) => backend().confirm(
       `Return ${name} to Direct Files?\n\nTine will archive its durable managed-storage and provider state before reopening the Markdown files directly. This is a recovery exit, not confirmation that every pending or remote change synchronized.`,
@@ -718,12 +718,9 @@ export function App(): JSX.Element {
       started = true;
       startupRecovery.start();
     };
-    // A broken event bridge must not prevent startup altogether. The ordinary
-    // route starts as soon as subscription succeeds; this deadline preserves
-    // the controller's pre-existing bounded recovery behavior if it never does.
-    const subscriptionDeadline = setTimeout(start, STARTUP_LOOKUP_WATCHDOG_MS);
-    void backend().onStartupProgress(startupRecovery.receiveProgress).then((stop) => {
-      clearTimeout(subscriptionDeadline);
+    // Subscribe before starting: native transition identity is the only
+    // progress authority, and early synchronous receipts must not be missed.
+    void backend().onStorageTransition(startupRecovery.receiveTransition).then((stop) => {
       if (disposed) {
         stop();
         return;
@@ -735,15 +732,13 @@ export function App(): JSX.Element {
       // for a long clean-manifest recovery, only) phase receipt.
       start();
     }).catch(() => {
-      clearTimeout(subscriptionDeadline);
-      // The watchdog remains independent of this subscription. If the native
-      // event bridge itself is unavailable, still attempt startup so the
-      // recovery panel offers the user an actionable escape.
+      // If the event bridge itself is unavailable, startup still attempts the
+      // native command; command failure remains actionable without inventing a
+      // timeout-based storage outcome.
       start();
     });
     onCleanup(() => {
       disposed = true;
-      clearTimeout(subscriptionDeadline);
       unlisten();
       startupRecovery.dispose();
     });

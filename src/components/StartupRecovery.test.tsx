@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
-import { createStartupRecoveryController, STARTUP_LOOKUP_WATCHDOG_MS } from "../startupRecovery";
+import { createStartupRecoveryController } from "../startupRecovery";
 import { StartupRecoveryLayer } from "./StartupRecovery";
 
 afterEach(() => {
@@ -13,10 +13,10 @@ describe("startup recovery surface", () => {
     vi.useFakeTimers();
     const copyText = vi.fn(async (_text: string) => {});
     const controller = createStartupRecoveryController({
-      lookupGraphPath: () => new Promise(() => {}),
+      lookupGraphPath: async () => "/home/martin/private/Research graph",
       injectedGraphPath: () => "",
       persistedGraphPath: () => "/home/martin/private/Research graph",
-      openGraph: vi.fn(),
+      openGraph: vi.fn(async () => { throw new Error("managed open refused"); }),
       pickGraph: vi.fn(),
       coldReturn: vi.fn(),
       acceptColdReturn: vi.fn(),
@@ -30,7 +30,9 @@ describe("startup recovery surface", () => {
     const dispose = render(() => <StartupRecoveryLayer controller={controller} />, host);
 
     controller.start();
-    await vi.advanceTimersByTimeAsync(STARTUP_LOOKUP_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
     expect(host.querySelector("[role=alertdialog]")).not.toBeNull();
     expect(host.textContent).toContain("Retry lookup");
     expect(host.textContent).toContain("Open another graph");

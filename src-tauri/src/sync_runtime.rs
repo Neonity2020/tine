@@ -9,7 +9,7 @@ use crate::storage_mode_supervisor::{
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
@@ -1274,29 +1274,13 @@ impl SyncRuntimeFacade {
     pub(crate) fn open_record_for_window(
         &self,
         app: &tauri::AppHandle,
-        label: &str,
+        _label: &str,
         record: &SparseV2ActivationRecord,
     ) -> Result<SparseV2Binding, String> {
-        let reporter = crate::graph::StartupProgressReporter::for_window(app, label);
-        reporter.phase("managed_open.entry");
-        let result = self.open_record_with_progress(app, record, |progress| match progress {
-            SyncRuntimeOpenProgress::Phase { phase, .. } => {
-                reporter.phase(managed_open_phase_name(phase));
-            }
-            SyncRuntimeOpenProgress::Waiting { phase, .. } => {
-                reporter.phase(managed_open_waiting_phase_name(phase));
-            }
-            // The detailed receipt remains terminal-only.  The webview sees a
-            // bounded phase update, never counts, error strings, or paths.
-            SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {
-                reporter.phase("managed_open.recovery_diagnostics");
-            }
-        });
-        reporter.terminal(
-            "managed_open.complete",
-            if result.is_ok() { "ok" } else { "error" },
-        );
-        result
+        // The supervisor owns the public typed operation. Detailed engine
+        // phases remain native diagnostics and must not create a second
+        // frontend recovery state machine.
+        self.open_record_with_progress(app, record, |_| {})
     }
 
     pub(crate) fn activate_record(
@@ -2534,95 +2518,19 @@ fn cancel_sparse_v2_cold_at_paths(
 #[tauri::command]
 pub(crate) async fn cancel_sparse_v2_cold(
     path: String,
-    attempt: u64,
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<SparseV2ColdCancelResult, String> {
     let label = window.label().to_string();
-    let reporter = crate::graph::StartupProgressReporter::for_window(&app, &label);
-    reporter.phase("cold_return.verifying_target");
-    let worker_reporter = reporter.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        cancel_sparse_v2_cold_blocking(&app, &label, path, attempt, &worker_reporter)
-    })
-    .await
-    .map_err(|_| "Cold Direct Files recovery worker stopped before completion.".to_string())?;
-    reporter.terminal(
-        "cold_return.complete",
-        if result.is_ok() { "ok" } else { "error" },
-    );
-    result
-}
-
-/// A cold return can legitimately wait behind a graph open and can spend more
-/// than the frontend inactivity window archiving retained state. Keep that
-/// serialized transition observable without turning elapsed time into success.
-struct ColdReturnProgress {
-    control: Arc<(Mutex<(bool, &'static str)>, Condvar)>,
-    join: Option<JoinHandle<()>>,
-    reporter: crate::graph::StartupProgressReporter,
-}
-
-impl ColdReturnProgress {
-    fn start(reporter: crate::graph::StartupProgressReporter, phase: &'static str) -> Self {
-        let control = Arc::new((Mutex::new((false, phase)), Condvar::new()));
-        let worker_control = Arc::clone(&control);
-        let worker_reporter = reporter.clone();
-        let join = std::thread::Builder::new()
-            .name("tine-cold-return-progress".into())
-            .spawn(move || loop {
-                let (lock, changed) = &*worker_control;
-                let state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                let (state, timeout) = changed
-                    .wait_timeout(state, Duration::from_secs(5))
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if state.0 {
-                    break;
-                }
-                if !timeout.timed_out() {
-                    continue;
-                }
-                let phase = state.1;
-                drop(state);
-                worker_reporter.phase(phase);
-            })
-            .ok();
-        Self {
-            control,
-            join,
-            reporter,
-        }
-    }
-
-    fn phase(&self, phase: &'static str) {
-        let (lock, changed) = &*self.control;
-        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.1 = phase;
-        drop(state);
-        self.reporter.phase(phase);
-        changed.notify_all();
-    }
-}
-
-impl Drop for ColdReturnProgress {
-    fn drop(&mut self) {
-        let (lock, changed) = &*self.control;
-        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.0 = true;
-        drop(state);
-        changed.notify_all();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
+    tauri::async_runtime::spawn_blocking(move || cancel_sparse_v2_cold_blocking(&app, &label, path))
+        .await
+        .map_err(|_| "Cold Direct Files recovery worker stopped before completion.".to_string())?
 }
 
 fn cancel_sparse_v2_cold_blocking(
     app: &tauri::AppHandle,
     label: &str,
     path: String,
-    attempt: u64,
-    reporter: &crate::graph::StartupProgressReporter,
 ) -> Result<SparseV2ColdCancelResult, String> {
     // Canonicalization is read-only. Emergency return intentionally does not
     // wait for the managed root lane: its first durable mutation selects the
@@ -2633,14 +2541,10 @@ fn cancel_sparse_v2_cold_blocking(
             .to_string()
     })?;
     let state = app.state::<crate::state::AppState>();
-    state.request_startup_cold_return(label, attempt, &submitted_root)?;
-    let operation_id = state.storage_supervisor.begin_transition(
-        app,
-        label,
-        Some(submitted_root.clone()),
-        StorageTransitionKind::ReturnEmergency,
-    )?;
-    let progress = ColdReturnProgress::start(reporter.clone(), "cold_return.verifying_target");
+    let operation_id =
+        state
+            .storage_supervisor
+            .begin_emergency_return(app, label, submitted_root.clone())?;
     let mut failure_code = "target_validation_failed";
     let result = (|| {
         state.storage_supervisor.advance_transition(
@@ -2648,43 +2552,12 @@ fn cancel_sparse_v2_cold_blocking(
             operation_id,
             StorageTransitionPhase::ValidatingTarget,
         )?;
-        progress.phase("cold_return.verifying_target");
-
-        // Re-read the exact native target without waiting for managed work.
-        // A late lookup, picker, normal open, or another recovery action cannot
-        // turn a stale frontend token into selector authority.
-        let authorized_root = match state.authorized_startup_recovery_target(label, attempt) {
-            Ok(root) => root,
-            Err(_) if state.startup_recovery_attempt_is_current(label, attempt) => {
-                if !crate::settings::startup_recovery_target_is_remembered(app, &submitted_root) {
-                    return Err(
-                        "Tine could not verify this recovery target in its remembered graphs. Nothing was changed; retry graph lookup or choose another graph."
-                            .into(),
-                    );
-                }
-                state.authorize_startup_recovery_target(
-                    label,
-                    attempt,
-                    Some(submitted_root.clone()),
-                );
-                submitted_root.clone()
-            }
-            Err(error) => return Err(error),
-        };
-        if authorized_root != submitted_root {
-            return Err(
-                "The selected recovery target no longer matches Tine's remembered graph. Retry graph lookup before returning to Direct files."
-                    .into(),
-            );
-        }
-
         failure_code = "direct_selection_failed";
         state.storage_supervisor.advance_transition(
             app,
             operation_id,
             StorageTransitionPhase::QuarantiningManagedSelection,
         )?;
-        progress.phase("cold_return.quarantining_managed_selection");
         publish_direct_selection(app, &submitted_root, "emergency_return")?;
 
         failure_code = "direct_open_failed";
@@ -2693,7 +2566,6 @@ fn cancel_sparse_v2_cold_blocking(
             operation_id,
             StorageTransitionPhase::PublishingDirect,
         )?;
-        progress.phase("cold_return.opening_direct_files");
         if !state.storage_supervisor.operation_is_current(operation_id) {
             return Err(
                 "The Direct Files return was superseded by a newer graph selection.".into(),
@@ -2716,7 +2588,6 @@ fn cancel_sparse_v2_cold_blocking(
                 Some(StableStorageMode::Direct),
                 None,
             )?;
-            state.complete_startup_cold_return(label, attempt);
             Ok(SparseV2CancelResult {
                 binding_generation: direct.binding_generation,
                 status: SparseV2StatusDto::legacy(direct.binding_generation),
@@ -3517,7 +3388,6 @@ mod tests {
                 watch_ctl: Mutex::new(None),
                 last_focused: Mutex::new(None),
                 capture_graph: Mutex::new(None),
-                startup_recovery: Mutex::new(std::collections::HashMap::new()),
                 sync_runtime: SyncRuntimeFacade,
                 #[cfg(desktop)]
                 next_window: std::sync::atomic::AtomicU64::new(1),
@@ -3693,14 +3563,7 @@ mod tests {
                 .map(|end| start + end)
                 .expect("next managed command")];
         for required in [
-            "cold_return.verifying_target",
-            "cold_return.quarantining_managed_selection",
-            "cold_return.opening_direct_files",
-            "request_startup_cold_return",
-            "complete_startup_cold_return",
-            "authorized_startup_recovery_target",
-            "startup_recovery_target_is_remembered",
-            "StorageTransitionKind::ReturnEmergency",
+            "begin_emergency_return",
             "publish_direct_selection",
             "operation_is_current",
             "open_and_publish_direct_files",
@@ -3716,6 +3579,8 @@ mod tests {
             "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",
             "shutdown_for_direct_files_escape",
             "sparse_private_root",
+            "startup_recovery",
+            "startup_recovery_target_is_remembered",
         ] {
             assert!(
                 !command.contains(forbidden),
@@ -5181,7 +5046,6 @@ mod tests {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(std::collections::HashMap::new()),
             sync_runtime: SyncRuntimeFacade,
             #[cfg(desktop)]
             next_window: std::sync::atomic::AtomicU64::new(1),

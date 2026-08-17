@@ -20,12 +20,12 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
   const current = props.controller.snapshot;
   const visible = () => current().mode === "recovery"
     || (current().mode === "working" && current().elapsedMs >= STARTUP_PROGRESS_VISIBLE_MS);
-  const phase = () => current().nativePhase ?? current().phase;
+  const phase = () => current().phase;
   const targetName = () => current().target ? startupGraphName(current().target) : null;
   const canReturnToDirectFiles = () => Boolean(current().target)
-    && current().nativeAttempt > 0
     && (current().mode === "recovery"
       || (current().mode === "working" && current().operation === "graph_open"));
+  const canOpenAnother = () => current().mode !== "idle";
 
   return (
     <Show when={visible()}>
@@ -53,7 +53,7 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
           </Show>
           <p class="startup-recovery-phase">{startupPhaseLabel(phase())}</p>
           <p class="startup-recovery-elapsed">
-            {elapsedLabel(Math.max(current().elapsedMs, current().nativeElapsedMs ?? 0))}
+            {elapsedLabel(current().elapsedMs)}
           </p>
           <Show when={current().mode === "recovery"}>
             <p class="startup-recovery-detail">{current().detail}</p>
@@ -62,12 +62,14 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
               or close and relaunch Tine before attempting manual recovery.
             </p>
           </Show>
-          <Show when={current().mode === "recovery" || canReturnToDirectFiles()}>
+          <Show when={canOpenAnother() || canReturnToDirectFiles()}>
             <div class="startup-recovery-actions">
               <Show when={current().mode === "recovery"}>
                 <button type="button" class="settings-btn primary" onClick={() => props.controller.retry()}>
                   Retry lookup
                 </button>
+              </Show>
+              <Show when={canOpenAnother()}>
                 <button type="button" class="settings-btn" onClick={() => void props.controller.openAnother()}>
                   Open another graph…
                 </button>

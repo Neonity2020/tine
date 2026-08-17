@@ -738,10 +738,10 @@ export function mockBackend(): Backend {
     async openGraphWindow() {
       return { kind: "focused_existing" as const, window_label: "main" };
     },
-    async startupGraphPath(_attempt: number) {
+    async startupGraphPath() {
       return "/mock/graph";
     },
-    async onStartupProgress() {
+    async onStorageTransition() {
       return () => {};
     },
     async captureTarget() {

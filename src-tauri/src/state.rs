@@ -91,17 +91,6 @@ pub(crate) struct CaptureGraphBinding {
     pub(crate) binding_generation: u64,
 }
 
-/// Native authority for a startup recovery action.  The frontend may preserve
-/// an injected or locally cached path for display, but a destructive cold
-/// recovery is authorized only after the native remembered-graph lookup has
-/// associated this exact canonical root with the current window attempt.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StartupRecoveryTarget {
-    attempt: u64,
-    canonical_root: Option<PathBuf>,
-    cold_return_requested: bool,
-}
-
 /// The single **write** authority retained for one graph/window binding.
 ///
 /// Sparse v2 has its own bounded actor commands and is never routed through
@@ -552,7 +541,6 @@ pub(crate) struct AppState {
     pub(crate) watch_ctl: Mutex<Option<Sender<()>>>,
     pub(crate) last_focused: Mutex<Option<WindowKey>>,
     pub(crate) capture_graph: Mutex<Option<CaptureGraphBinding>>,
-    pub(crate) startup_recovery: Mutex<HashMap<WindowKey, StartupRecoveryTarget>>,
     /// Stateless sparse runtime composition. It retains no runtime handle;
     /// active authority lives only in the corresponding graph slot.
     pub(crate) sync_runtime: crate::sync_runtime::SyncRuntimeFacade,
@@ -561,119 +549,6 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn begin_startup_recovery_attempt(&self, window: &str, attempt: u64) {
-        self.startup_recovery.lock().unwrap().insert(
-            window.to_string(),
-            StartupRecoveryTarget {
-                attempt,
-                canonical_root: None,
-                cold_return_requested: false,
-            },
-        );
-    }
-
-    /// A late worker cannot overwrite a newer attempt's authority.  An
-    /// unavailable/missing remembered graph remains deliberately unauthorised.
-    pub(crate) fn authorize_startup_recovery_target(
-        &self,
-        window: &str,
-        attempt: u64,
-        canonical_root: Option<PathBuf>,
-    ) {
-        if let Some(target) = self.startup_recovery.lock().unwrap().get_mut(window) {
-            if target.attempt == attempt {
-                target.canonical_root = canonical_root;
-            }
-        }
-    }
-
-    pub(crate) fn authorized_startup_recovery_target(
-        &self,
-        window: &str,
-        attempt: u64,
-    ) -> Result<PathBuf, String> {
-        let target = self.startup_recovery.lock().unwrap();
-        let Some(target) = target.get(window) else {
-            return Err(
-                "This recovery action is no longer current. Retry graph lookup before returning to Direct files."
-                    .into(),
-            );
-        };
-        if target.attempt != attempt {
-            return Err(
-                "This recovery action is no longer current. Retry graph lookup before returning to Direct files."
-                    .into(),
-            );
-        }
-        target.canonical_root.clone().ok_or_else(|| {
-            "Tine has not verified a remembered graph for this recovery action. Retry graph lookup before returning to Direct files."
-                .into()
-        })
-    }
-
-    pub(crate) fn startup_recovery_attempt_is_current(&self, window: &str, attempt: u64) -> bool {
-        self.startup_recovery
-            .lock()
-            .unwrap()
-            .get(window)
-            .is_some_and(|target| target.attempt == attempt)
-    }
-
-    /// Claim the current startup authority for a queued Direct Files return.
-    /// The claim is made before waiting for the supervisor transition guard, so the managed open
-    /// ahead of it cannot erase the authority when it publishes its slot.
-    pub(crate) fn request_startup_cold_return(
-        &self,
-        window: &str,
-        attempt: u64,
-        submitted_root: &Path,
-    ) -> Result<(), String> {
-        let mut targets = self.startup_recovery.lock().unwrap();
-        let Some(target) = targets.get_mut(window) else {
-            return Err(
-                "This recovery action is no longer current. Retry graph lookup before returning to Direct files."
-                    .into(),
-            );
-        };
-        if target.attempt != attempt
-            || target
-                .canonical_root
-                .as_ref()
-                .is_some_and(|root| root != submitted_root)
-        {
-            return Err(
-                "This recovery action is no longer current. Retry graph lookup before returning to Direct files."
-                    .into(),
-            );
-        }
-        target.cold_return_requested = true;
-        Ok(())
-    }
-
-    pub(crate) fn complete_startup_cold_return(&self, window: &str, attempt: u64) {
-        let mut targets = self.startup_recovery.lock().unwrap();
-        if targets
-            .get(window)
-            .is_some_and(|target| target.attempt == attempt && target.cold_return_requested)
-        {
-            targets.remove(window);
-        }
-    }
-
-    /// A normal graph-open completion retires an unclaimed startup action. A
-    /// cold return that already claimed the same native attempt survives until
-    /// it acquires the supervisor transition guard; a newer `begin_startup_recovery_attempt`
-    /// remains the way another user action supersedes it.
-    pub(crate) fn clear_startup_recovery_target(&self, window: &str) {
-        let mut targets = self.startup_recovery.lock().unwrap();
-        if targets
-            .get(window)
-            .is_none_or(|target| !target.cold_return_requested)
-        {
-            targets.remove(window);
-        }
-    }
-
     /// Record the graph window that commands such as quick capture should use.
     ///
     /// Explicit graph activation must update this state synchronously: some
@@ -1118,7 +993,6 @@ mod tests {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("graph-1".into())),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(HashMap::new()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
@@ -1130,43 +1004,6 @@ mod tests {
     }
 
     #[test]
-    fn queued_cold_return_keeps_its_native_authority_until_it_completes() {
-        let state = AppState {
-            graphs: RwLock::new(GraphRegistry::default()),
-            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
-            watch_ctl: Mutex::new(None),
-            last_focused: Mutex::new(None),
-            capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(HashMap::new()),
-            sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
-            #[cfg(desktop)]
-            next_window: AtomicU64::new(2),
-        };
-        let root = PathBuf::from("/graphs/alpha");
-
-        state.begin_startup_recovery_attempt("main", 7);
-        state.authorize_startup_recovery_target("main", 7, Some(root.clone()));
-        state.request_startup_cold_return("main", 7, &root).unwrap();
-
-        // This is what the managed open ahead of the queued return does when
-        // it publishes. It must not revoke the already-claimed return.
-        state.clear_startup_recovery_target("main");
-        assert_eq!(
-            state.authorized_startup_recovery_target("main", 7),
-            Ok(root.clone())
-        );
-
-        state.complete_startup_cold_return("main", 7);
-        assert!(state.authorized_startup_recovery_target("main", 7).is_err());
-
-        // A newer startup attempt is still allowed to supersede an abandoned
-        // queued return.
-        state.begin_startup_recovery_attempt("main", 8);
-        assert!(!state.startup_recovery_attempt_is_current("main", 7));
-        assert!(state.startup_recovery_attempt_is_current("main", 8));
-    }
-
-    #[test]
     fn capture_binding_retains_the_selected_graph_lease() {
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
@@ -1174,7 +1011,6 @@ mod tests {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(HashMap::new()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
@@ -1234,7 +1070,6 @@ mod tests {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),
-            startup_recovery: Mutex::new(HashMap::new()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),

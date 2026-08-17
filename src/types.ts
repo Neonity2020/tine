@@ -427,22 +427,41 @@ export interface SparseV2CancelResult {
   recovery_statement: string;
 }
 
-/** Privacy-safe native progress shared by terminal diagnostics and cold-start UI. */
-export type StartupProgressPhase =
-  | "lookup.entry"
-  | "lookup.app_data"
-  | "lookup.settings_stat"
-  | "lookup.settings_read"
-  | "lookup.settings_parse"
-  | "lookup.complete"
-  | `managed_open.${string}`
-  | `cold_return.${string}`;
+export type StorageTransitionKind =
+  | "lookup"
+  | "open_direct"
+  | "open_managed"
+  | "activate_managed"
+  | "join_managed"
+  | "return_gracefully"
+  | "return_emergency";
 
-export interface StartupProgressEvent {
-  phase: StartupProgressPhase;
-  elapsed_ms: number;
+export type StorageTransitionPhase =
+  | "requested"
+  | "waiting_for_transition"
+  | "looking_up_selection"
+  | "validating_target"
+  | "opening_direct"
+  | "opening_managed"
+  | "activating_managed"
+  | "joining_managed"
+  | "draining_managed"
+  | "confirming_projection"
+  | "quarantining_managed_selection"
+  | "publishing_direct";
+
+/** Sole native storage-transition receipt. The frontend renders this identity;
+ * it never infers ownership or failure from text prefixes or elapsed time. */
+export interface StorageTransitionEvent {
+  operationId: number;
+  window: string;
+  canonicalRoot?: string;
+  kind: StorageTransitionKind;
+  phase: StorageTransitionPhase;
+  elapsedMs: number;
   terminal: boolean;
-  outcome?: "ok" | "error";
+  outcome?: "succeeded" | "failed" | "cancelled" | "superseded";
+  outcomeCode?: string;
 }
 
 export type SparseV2ActivationPhase =

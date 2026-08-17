@@ -246,45 +246,6 @@ pub(crate) fn last_graph_path(app: &tauri::AppHandle) -> Option<String> {
         })
 }
 
-/// Cold startup recovery may be invoked while the asynchronous remembered-path
-/// lookup is still waiting.  A display-only localStorage/injected value is not
-/// authority to archive storage; accept it only when this independent native
-/// settings read proves it is the current remembered graph or one of this
-/// device's exact known-graph entries.
-fn startup_recovery_target_is_remembered_at(
-    settings_path: &std::path::Path,
-    canonical_root: &std::path::Path,
-) -> bool {
-    let Ok(contents) = std::fs::read_to_string(settings_path) else {
-        return false;
-    };
-    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return false;
-    };
-    let last = settings
-        .get("last_graph_path")
-        .and_then(serde_json::Value::as_str)
-        .into_iter();
-    let known = parse_known_graphs(&settings)
-        .into_iter()
-        .map(|graph| graph.path)
-        .collect::<Vec<_>>();
-    last.chain(known.iter().map(String::as_str))
-        .any(|candidate| {
-            std::fs::canonicalize(candidate)
-                .ok()
-                .is_some_and(|found| found == canonical_root)
-        })
-}
-
-pub(crate) fn startup_recovery_target_is_remembered(
-    app: &tauri::AppHandle,
-    canonical_root: &std::path::Path,
-) -> bool {
-    settings_path(app)
-        .is_some_and(|path| startup_recovery_target_is_remembered_at(&path, canonical_root))
-}
-
 /// Quick-capture Enter behaviour (app-level, in tine-settings.json): true → a
 /// plain Enter files the capture; false (default) → Enter makes a new block and
 /// Cmd/Ctrl+Enter files.
@@ -620,43 +581,6 @@ pub(crate) fn save_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cold_recovery_target_must_be_an_exact_native_remembered_or_known_graph() {
-        let root = std::env::temp_dir().join(format!(
-            "tine-settings-cold-target-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let last = root.join("last");
-        let known = root.join("known");
-        let foreign = root.join("foreign");
-        std::fs::create_dir_all(&last).unwrap();
-        std::fs::create_dir_all(&known).unwrap();
-        std::fs::create_dir_all(&foreign).unwrap();
-        let settings = root.join("tine-settings.json");
-        std::fs::write(
-            &settings,
-            serde_json::json!({
-                "last_graph_path": last,
-                "known_graphs": [{ "path": known, "name": "known" }],
-            })
-            .to_string(),
-        )
-        .unwrap();
-        assert!(startup_recovery_target_is_remembered_at(
-            &settings,
-            &std::fs::canonicalize(root.join("last")).unwrap(),
-        ));
-        assert!(startup_recovery_target_is_remembered_at(
-            &settings,
-            &std::fs::canonicalize(root.join("known")).unwrap(),
-        ));
-        assert!(!startup_recovery_target_is_remembered_at(
-            &settings,
-            &std::fs::canonicalize(root.join("foreign")).unwrap(),
-        ));
-        let _ = std::fs::remove_dir_all(root);
-    }
 
     #[test]
     fn known_graphs_are_deduplicated_mru_and_removable() {
