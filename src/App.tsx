@@ -612,10 +612,6 @@ export function App(): JSX.Element {
     pickGraph: switchGraph,
     coldReturn: (path) => backend().cancelSparseV2Cold(path),
     acceptColdReturn: acceptColdReturnManagedStorage,
-    confirmColdReturn: (name) => backend().confirm(
-      `Forget managed mode for ${name} and open its current Markdown/Org files directly?\n\nThis emergency escape will not open, recover, drain, save, or archive managed state. Managed evidence is left untouched and may contain changes newer than Markdown.`,
-      "Return to Direct Files?",
-    ),
     copyText: writeClipboardTextResilient,
     notify: (message, kind) => pushToast(message, kind, kind === "error" ? { sticky: true } : undefined),
     completeFirstLoad: () => setFirstLoadDone(true),

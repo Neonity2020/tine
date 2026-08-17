@@ -23,21 +23,35 @@ experimental.
 ## Decision
 
 One native `StorageModeSupervisor` owns native operation IDs, priority, typed
-phases, cancellation/supersession, stable-mode publication, and exactly one
+phases, cooperative abandonment/supersession, stable-mode publication, and exactly one
 terminal outcome. Operations name their exact window, canonical graph root,
 and kind. There is no app-global long-lived transition lock: work on different
 canonical roots has independent lanes, while final registry publication is a
 short compare-and-publish against the current operation ID. A stuck recovery
 for graph A cannot delay opening graph B or later overwrite it, even when both
-requests came from the same window. Late work may mutate state only while its
-operation ID is current. The frontend subscribes before starting work,
-renders only the current operation ID, and sends actions back to the supervisor;
-it does not infer authority from phase strings or inactivity.
+requests came from the same window. Late work may publish state only while its
+operation ID is current. A blocking filesystem/SQLite worker is not forcibly
+killed; after supersession it may finish disposable computation, but every
+Tine-controlled phase and final publication boundary rejects its stale
+operation ID. The frontend subscribes before starting work, renders only the
+current operation ID, invalidates the old command continuation when a newer
+action begins, and sends actions back to the supervisor; it does not infer
+authority from phase strings or inactivity.
+
+Beginning an operation and final graph-registry publication share one short
+linearization mutex. The supervisor model mutex is released before registry
+publication, so a registry lock cannot make the operation model itself
+unavailable. Managed activation reaches stable success only after the new
+actor-backed generation can answer the complete page inventory and open a
+representative page, and after the frontend retires renderer state owned by the
+former generation. Native slot installation alone is not readiness.
 
 Return to Direct Files has two explicit operations. Graceful return drains a
 healthy managed actor and proves its committed projection before selecting
 Direct Files. Emergency return is always available from managed startup and
-refusal screens. It atomically quarantines the private managed selector, blocks
+refusal screens. The recovery button is itself the explicit destructive
+action; no native confirmation dialog may delay delivery to the supervisor. It
+atomically quarantines the private managed selector, blocks
 older managed publication, and opens the current Markdown/Org tree directly.
 It does not first open, repair, drain, archive, or recover managed storage.
 Managed evidence is preserved with a warning that it may be newer than the
@@ -57,8 +71,9 @@ ownership are deleted after their consumers move.
 Storage transitions are independently model-testable, emergency escape no
 longer depends on the failing subsystem, and stale workers cannot publish after
 a newer user decision. The frontend becomes a renderer rather than a second
-recovery authority. Native code must carry typed operation context through
-long-running boundaries and provide explicit cancellation checkpoints. Per-root
+recovery authority. Native code carries typed operation context through
+long-running boundaries and checks cooperative abandonment at every boundary it
+controls. Per-root
 transition lanes are owned by the supervisor and operation IDs decide whether
 the final publication is still current.
 

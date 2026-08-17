@@ -41,7 +41,6 @@ function dependencies(overrides: Partial<StartupRecoveryDeps> = {}): StartupReco
     pickGraph: vi.fn(async () => ({ kind: "loaded" as const, root: "/graphs/beta" })),
     coldReturn: vi.fn(async () => fakeCancelResult()),
     acceptColdReturn: vi.fn(),
-    confirmColdReturn: vi.fn(async () => true),
     copyText: vi.fn(async () => {}),
     notify: vi.fn(),
     completeFirstLoad: vi.fn(),

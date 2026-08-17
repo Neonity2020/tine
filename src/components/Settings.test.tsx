@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { Settings } from "./Settings";
-import { closeSettings, dismissToast, openSettings, setToasts, toasts } from "../ui";
+import { closeSettings, dismissToast, openSettings, setGraphMeta, setToasts, toasts } from "../ui";
 import { backend } from "../backend";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import * as store from "../store";
@@ -30,6 +30,7 @@ afterEach(() => {
   localStorage.clear();
   setToasts([]);
   managedStorageRuntime.clear();
+  setGraphMeta(null);
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -40,6 +41,7 @@ describe("Settings storage transitions", () => {
     // fixtures. These tests intentionally exercise backend status transitions
     // across several explicit binding generations, so they must begin unbound.
     managedStorageRuntime.clear();
+    setGraphMeta({ root: "/graphs/settings-test" } as never);
   });
 
   const legacy = (): SparseV2Status => ({
@@ -210,6 +212,56 @@ describe("Settings storage transitions", () => {
     expect(root.textContent).toContain("Retry setup");
     expect(root.textContent).toContain("Setup paused. You can retry setup when you are ready.");
     expect(root.textContent).toContain("Return to Direct files");
+    dispose();
+  });
+
+  it("does not report active until the rebound generation can list and open its pages", async () => {
+    const page = {
+      name: "Readable",
+      kind: "page" as const,
+      date_key: null,
+      path: "pages/readable.md",
+    };
+    let releaseInventory!: (pages: typeof page[]) => void;
+    const reboundInventory = new Promise<typeof page[]>((resolve) => {
+      releaseInventory = resolve;
+    });
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    let inventoryCalls = 0;
+    const listPages = vi.spyOn(backend(), "listPages").mockImplementation(() => {
+      inventoryCalls += 1;
+      return inventoryCalls === 2 ? reboundInventory : Promise.resolve([page]);
+    });
+    const loadPage = vi.spyOn(backend(), "getPageByPath").mockResolvedValue({
+      name: page.name,
+      kind: page.kind,
+      title: page.name,
+      path: page.path,
+      rev: "managed-r1",
+      pre_block: null,
+      blocks: [],
+    });
+    vi.spyOn(backend(), "activateSparseV2").mockResolvedValue(localActive());
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const enable = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Enable Tine-managed storage")
+    ) as HTMLButtonElement;
+    enable.click();
+    await vi.waitFor(() => expect(listPages.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(toasts().some((toast) => toast.message === "Tine-managed storage is active.")).toBe(false);
+
+    releaseInventory([page]);
+    await vi.waitFor(() => expect(loadPage).toHaveBeenCalledWith(page.path));
+    await vi.waitFor(() => expect(toasts().at(-1)).toMatchObject({
+      message: "Tine-managed storage is active.",
+      kind: "success",
+    }));
     dispose();
   });
 

@@ -313,6 +313,24 @@ export async function refreshPageIdentities(): Promise<void> {
     : {};
   commitNavigationIndex();
 }
+
+/** Retire every renderer object owned by the previous storage authority after
+ * native code has atomically rebound the SAME graph root to a new binding
+ * generation. Unlike `loadGraphPath`, this never asks native code to choose or
+ * open a graph a second time; the storage transition already owns that choice.
+ * The next epoch drives the ordinary Page/sidebar resources through the new
+ * binding, while the post-transition caller proves those reads before showing
+ * success. */
+export function rebindCurrentStorageAuthority(): void {
+  if (!graphMeta()) throw new Error("the current graph identity disappeared during the storage transition");
+  resetStore();
+  resetNavigationIndex();
+  clearAssetBlobCache();
+  bumpGraphEpoch();
+  void loadAliases();
+  void pruneSidebarBlocks();
+}
+
 async function loadAliases(): Promise<void> {
   const epoch = graphEpoch();
   if (!(await waitForWarmCache(epoch))) return;

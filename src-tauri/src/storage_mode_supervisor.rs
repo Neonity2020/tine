@@ -455,6 +455,12 @@ fn legal_phase_transition(
 #[derive(Debug)]
 pub(crate) struct StorageModeSupervisor {
     root_transitions: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    /// The short linearization lane shared only by operation start and final
+    /// graph-registry publication. Long recovery never holds it. This lets us
+    /// release the model mutex before touching the graph registry without
+    /// allowing an emergency operation to slip between the currentness check
+    /// and publication.
+    publication: Mutex<()>,
     model: Mutex<StorageSupervisorModel>,
     clock_origin: Instant,
 }
@@ -527,6 +533,7 @@ impl Default for StorageModeSupervisor {
     fn default() -> Self {
         Self {
             root_transitions: Mutex::new(HashMap::new()),
+            publication: Mutex::new(()),
             model: Mutex::new(StorageSupervisorModel::default()),
             clock_origin: Instant::now(),
         }
@@ -568,6 +575,7 @@ impl StorageModeSupervisor {
         canonical_root: Option<PathBuf>,
         kind: StorageTransitionKind,
     ) -> Result<StorageOperationId, String> {
+        let _publication = self.publication.lock().unwrap();
         let now_ms = self.now_ms();
         let begun = self
             .model
@@ -606,6 +614,7 @@ impl StorageModeSupervisor {
         window: &str,
         canonical_root: PathBuf,
     ) -> Result<StorageOperationId, String> {
+        let _publication = self.publication.lock().unwrap();
         let now_ms = self.now_ms();
         let begun = {
             let mut model = self.model.lock().unwrap();
@@ -710,13 +719,16 @@ impl StorageModeSupervisor {
         operation_id: StorageOperationId,
         publish: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let model = self.model.lock().unwrap();
-        if !model
-            .active_by_window
-            .values()
-            .any(|active| active.operation.operation_id == operation_id)
+        let _publication = self.publication.lock().unwrap();
         {
-            return Err("storage transition was superseded before publication".into());
+            let model = self.model.lock().unwrap();
+            if !model
+                .active_by_window
+                .values()
+                .any(|active| active.operation.operation_id == operation_id)
+            {
+                return Err("storage transition was superseded before publication".into());
+            }
         }
         publish()
     }
@@ -1154,8 +1166,17 @@ mod tests {
             );
         }
         assert!(!frontend.contains("setTimeout("));
+        assert!(!frontend.contains("confirmColdReturn"));
         assert!(frontend.contains("operationId"));
         assert!(frontend.contains("receiveTransition"));
+        let emergency = frontend
+            .find("const returnToDirectFiles")
+            .expect("startup emergency action exists");
+        let emergency = &frontend[emergency..];
+        assert!(
+            emergency.find("deps.coldReturn(").unwrap() < emergency.find("completeOpen(").unwrap(),
+            "emergency return must reach native abandonment before reopening the graph"
+        );
         assert!(!state.contains("startup_recovery:"));
         assert!(!graph.contains("startup-progress"));
     }

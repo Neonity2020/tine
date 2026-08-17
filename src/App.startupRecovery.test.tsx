@@ -38,15 +38,15 @@ describe("missing remembered graph recovery (GH #250)", () => {
       .find((button) => button.textContent?.includes("Open another graph"));
     expect(openExisting).toBeDefined();
     expect(openExisting?.disabled).toBe(false);
-    expect(host.textContent).toContain("Return logseq to Direct Files");
+    expect(host.textContent).toContain("Forget managed mode and open logseq in Direct Files now");
     expect(host.textContent).not.toContain(missingRoot);
   });
 
-  it("routes the recovery-screen escape to cold Direct Files without promising archival", async () => {
+  it("routes the recovery-screen escape immediately without a native confirmation dependency", async () => {
     const root = "/Volumes/logseq";
     vi.spyOn(backend(), "startupGraphPath").mockResolvedValue(root);
     vi.spyOn(backend(), "loadGraph").mockRejectedValue(new Error("managed open failed"));
-    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    const confirm = vi.spyOn(backend(), "confirm");
     const coldReturn = vi.spyOn(backend(), "cancelSparseV2Cold").mockResolvedValue({
       status: {
         state: "legacy_default",
@@ -67,15 +67,13 @@ describe("missing remembered graph recovery (GH #250)", () => {
     dispose = render(() => <App />, host);
     const button = await vi.waitFor(() => {
       const candidate = [...host.querySelectorAll<HTMLButtonElement>("button")]
-        .find((item) => item.textContent?.includes("Return logseq to Direct Files"));
+        .find((item) => item.textContent?.includes("open logseq in Direct Files now"));
       expect(candidate).toBeDefined();
       return candidate!;
     });
     button.click();
 
     await vi.waitFor(() => expect(coldReturn).toHaveBeenCalledWith(root));
-    const message = String(confirm.mock.calls[0]?.[0] ?? "");
-    expect(message).toContain("will not open, recover, drain, save, or archive managed state");
-    expect(message).not.toContain("will archive its durable managed-storage");
+    expect(confirm).not.toHaveBeenCalled();
   });
 });

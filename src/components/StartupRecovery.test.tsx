@@ -20,7 +20,6 @@ describe("startup recovery surface", () => {
       pickGraph: vi.fn(),
       coldReturn: vi.fn(),
       acceptColdReturn: vi.fn(),
-      confirmColdReturn: vi.fn(async () => false),
       copyText,
       notify: vi.fn(),
       completeFirstLoad: vi.fn(),
@@ -36,7 +35,7 @@ describe("startup recovery surface", () => {
     expect(host.querySelector("[role=alertdialog]")).not.toBeNull();
     expect(host.textContent).toContain("Retry lookup");
     expect(host.textContent).toContain("Open another graph");
-    expect(host.textContent).toContain("Return Research graph to Direct Files");
+    expect(host.textContent).toContain("Forget managed mode and open Research graph in Direct Files now");
     expect(host.textContent).toContain("Copy details");
     expect(host.textContent).not.toContain("/home/martin/private");
 
@@ -61,7 +60,6 @@ describe("startup recovery surface", () => {
       pickGraph: vi.fn(),
       coldReturn: vi.fn(),
       acceptColdReturn: vi.fn(),
-      confirmColdReturn: vi.fn(async () => false),
       copyText: vi.fn(),
       notify: vi.fn(),
       completeFirstLoad: vi.fn(),
@@ -77,7 +75,7 @@ describe("startup recovery surface", () => {
     await vi.advanceTimersByTimeAsync(300);
 
     const direct = [...host.querySelectorAll("button")]
-      .find((button) => button.textContent?.includes("Return alpha to Direct Files"));
+      .find((button) => button.textContent?.includes("open alpha in Direct Files now"));
     expect(direct).toBeDefined();
     expect(direct?.disabled).toBe(false);
     expect(host.textContent).not.toContain("Retry lookup");

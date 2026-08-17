@@ -8,12 +8,13 @@ use crate::storage_mode_supervisor::{
     StableStorageMode, StorageTransitionKind, StorageTransitionOutcome, StorageTransitionPhase,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
-use tine_core::model::GraphMeta;
+use tine_core::model::{GraphMeta, PageEntry};
 use tine_core::oplog::sync_layout::{
     PRIVATE_BINDING_DIR as SPARSE_BINDING_DIR, PRIVATE_BINDING_FILE as SPARSE_BINDING_FILE,
     PRIVATE_RECOVERY_DIR as SPARSE_RECOVERY_DIR, PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR,
@@ -28,13 +29,15 @@ use tine_core::oplog::{
 use tine_core::sync_runtime::{
     inspect_shared_enrollment_for_cold_discovery, ManagedStorageRefusalScenario,
     SyncAmbiguousEvidence, SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
-    SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationProgress,
-    SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
-    SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
-    SyncRuntimeLifecycle, SyncRuntimeOpenPhase, SyncRuntimeOpenProgress, SyncRuntimeOpenRequest,
-    SyncRuntimeOpenResult, SyncRuntimeOpenStatus, SyncRuntimeRecovery, SyncRuntimeStatusSnapshot,
-    SyncRuntimeTick, SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole,
-    SyncShutdownOutcome, SyncStorageProfile,
+    SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
+    SyncApplicationPageLoadRequest, SyncApplicationPageSelector, SyncLocalActivationIdentities,
+    SyncLocalActivationPhase, SyncLocalActivationProgress, SyncLocalActivationRequest,
+    SyncLocalActivationResult, SyncLocalActivationStage, SyncLocalActivationStatus,
+    SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle, SyncRuntimeLifecycle,
+    SyncRuntimeOpenPhase, SyncRuntimeOpenProgress, SyncRuntimeOpenRequest, SyncRuntimeOpenResult,
+    SyncRuntimeOpenStatus, SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
+    SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome,
+    SyncStorageProfile,
 };
 use uuid::Uuid;
 
@@ -1595,6 +1598,63 @@ fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2S
     Ok(status)
 }
 
+/// Prove the application observation boundary before a fresh managed
+/// transition is called successful. Installing an actor-backed GraphSlot is
+/// only native publication; users need its ordinary inventory and page-load
+/// commands to retain every page the Direct authority handed over.
+pub(crate) fn prove_managed_application_ready(
+    slot: &crate::state::GraphSlot,
+    expected: Option<&[PageEntry]>,
+) -> Result<(), String> {
+    let handle = active_handle(slot)?;
+    let pages = match handle
+        .application_page_inventory()
+        .map_err(|error| format!("managed readiness page inventory failed: {error}"))?
+    {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+        SyncApplicationPageInventoryOutcome::Deferred { .. } => {
+            return Err("managed readiness page inventory remained deferred".into())
+        }
+    };
+    let identities = pages
+        .iter()
+        .map(|page| (page.kind, page.rel_path.clone(), page.name.clone()))
+        .collect::<HashSet<_>>();
+    if let Some(expected) = expected {
+        let missing = expected.iter().find(|page| {
+            !identities.contains(&(page.kind, page.rel_path.clone(), page.name.clone()))
+        });
+        if pages.len() != expected.len() || missing.is_some() {
+            return Err(format!(
+                "managed readiness page inventory is incomplete ({} of {})",
+                pages.len(),
+                expected.len()
+            ));
+        }
+    }
+    if let Some(page) = expected
+        .and_then(|expected| expected.first())
+        .or_else(|| pages.first())
+    {
+        match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: page.rel_path.clone(),
+                },
+            })
+            .map_err(|error| format!("managed readiness representative page failed: {error}"))?
+        {
+            SyncApplicationPageLoadOutcome::Loaded { .. } => {}
+            SyncApplicationPageLoadOutcome::Missing { .. }
+            | SyncApplicationPageLoadOutcome::Ambiguous
+            | SyncApplicationPageLoadOutcome::Deferred { .. } => {
+                return Err("managed readiness could not open its representative page".into())
+            }
+        }
+    }
+    Ok(())
+}
+
 fn sparse_v2_status_for_observation(
     slot: &crate::state::GraphSlot,
     snapshot: SyncRuntimeStatusSnapshot,
@@ -1872,6 +1932,7 @@ fn activate_sparse_v2_under_transition(
         let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
             binding, root, graph_meta,
         ));
+        prove_managed_application_ready(&replacement, None)?;
         transition.commit(|| {
             state
                 .graphs
@@ -1891,6 +1952,7 @@ fn activate_sparse_v2_under_transition(
 
     let graph = slot.legacy_graph()?;
     let graph_meta = graph.meta();
+    let expected_pages = graph.list_pages();
     drop(graph);
     let record = state
         .sync_runtime
@@ -1985,6 +2047,7 @@ fn activate_sparse_v2_under_transition(
         crate::state::poke_watcher(&state);
         Ok(())
     })?;
+    prove_managed_application_ready(&replacement, Some(&expected_pages))?;
     let result = sparse_v2_status_for_slot(&replacement);
     crate::debug::diag(format!(
         "sparse-v2 fresh activation published after {} ms: {result:?}",
@@ -2654,17 +2717,20 @@ fn cancel_sparse_v2_cold_blocking(
             operation_id,
             StorageTransitionPhase::PublishingDirect,
         )?;
-        if !state.storage_supervisor.operation_is_current(operation_id) {
-            return Err(
-                "The Direct Files return was superseded by a newer graph selection.".into(),
-            );
-        }
-        crate::graph::open_and_publish_direct_files(app, label, &state, submitted_root.clone())
+        let prepared = crate::graph::prepare_direct_files_open(app, submitted_root.clone())
             .map_err(|error| {
                 format!(
                     "Direct Files was selected and managed evidence remains preserved, but the Markdown/Org graph could not open: {error}. Retry opening this graph or choose another graph."
                 )
-            })
+            })?;
+        state.storage_supervisor.commit_if_current(operation_id, || {
+            crate::graph::publish_prepared_direct_files(app, label, &state, prepared)
+                .map_err(|error| {
+                    format!(
+                        "Direct Files was selected and managed evidence remains preserved, but the Markdown/Org graph could not publish: {error}. Retry opening this graph or choose another graph."
+                    )
+                })
+        })
     })();
 
     match result {
@@ -3268,6 +3334,29 @@ mod tests {
     }
 
     #[test]
+    fn fresh_activation_proves_application_readiness_before_reporting_status() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("let expected_pages = graph.list_pages();")
+            .expect("fresh activation captures the Direct Files inventory");
+        let body = &source[start
+            ..source[start..]
+                .find("sparse-v2 fresh activation published")
+                .map(|offset| start + offset)
+                .expect("fresh activation completion")];
+        let publication = body
+            .find("transition.commit(")
+            .expect("managed slot publication");
+        let readiness = body
+            .find("prove_managed_application_ready")
+            .expect("managed application readiness proof");
+        let public_status = body
+            .find("sparse_v2_status_for_slot")
+            .expect("managed public status");
+        assert!(publication < readiness && readiness < public_status);
+    }
+
+    #[test]
     fn every_storage_mode_change_is_owned_by_the_native_supervisor() {
         let source = include_str!("sync_runtime.rs");
         for (function, kind) in [
@@ -3724,8 +3813,9 @@ mod tests {
         for required in [
             "begin_emergency_return",
             "publish_direct_selection",
-            "operation_is_current",
-            "open_and_publish_direct_files",
+            "prepare_direct_files_open",
+            "commit_if_current",
+            "publish_prepared_direct_files",
         ] {
             assert!(
                 command.contains(required),

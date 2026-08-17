@@ -533,12 +533,20 @@ fn direct_files_projection_path(app: &tauri::AppHandle, root: &Path) -> Result<P
         .join(format!("{key}.sqlite")))
 }
 
-pub(crate) fn open_and_publish_direct_files(
-    app: &tauri::AppHandle,
-    window_label: &str,
-    state: &AppState,
+pub(crate) struct PreparedDirectFilesOpen {
+    graph: Graph,
+    meta: GraphMeta,
+    launch_backup_done: bool,
     root_key: PathBuf,
-) -> Result<DirectFilesOpen, String> {
+}
+
+/// Perform the expensive, non-authoritative Direct Files work without touching
+/// the window registry.  A storage transition may be superseded while this
+/// runs; only `publish_prepared_direct_files` is the linearization point.
+pub(crate) fn prepare_direct_files_open(
+    app: &tauri::AppHandle,
+    root_key: PathBuf,
+) -> Result<PreparedDirectFilesOpen, String> {
     let root = root_key.display().to_string();
     let approved_assets = approved_external_assets(app, &root_key);
     let LoadedGraph {
@@ -565,6 +573,28 @@ pub(crate) fn open_and_publish_direct_files(
             "Direct Files SQLite projection path unavailable; parser fallback remains active: {error}"
         )),
     }
+    Ok(PreparedDirectFilesOpen {
+        graph,
+        meta,
+        launch_backup_done,
+        root_key,
+    })
+}
+
+/// The short authoritative half of a Direct Files open.  Callers must invoke
+/// this from the native storage supervisor's `commit_if_current` closure.
+pub(crate) fn publish_prepared_direct_files(
+    app: &tauri::AppHandle,
+    window_label: &str,
+    state: &AppState,
+    prepared: PreparedDirectFilesOpen,
+) -> Result<DirectFilesOpen, String> {
+    let PreparedDirectFilesOpen {
+        graph,
+        meta,
+        launch_backup_done,
+        root_key,
+    } = prepared;
     let (slot, warm_generation) = publish_direct_files_slot(state, window_label, graph, root_key)?;
     if !launch_backup_done {
         backup_async(app.clone(), slot.clone())?;
@@ -719,6 +749,16 @@ pub(crate) fn load_graph_for_label(
             root_key.clone(),
             meta.clone(),
         ));
+        crate::sync_runtime::prove_managed_application_ready(&slot, None).map_err(|error| {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                managed_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("managed_readiness_failed".into()),
+            );
+            format!("Managed storage opened but its pages are not usable: {error}")
+        })?;
         if let Err(error) = state.storage_supervisor.commit_if_current(managed_id, || {
             state
                 .graphs
@@ -810,7 +850,22 @@ pub(crate) fn load_graph_for_label(
         direct_id,
         StorageTransitionPhase::OpeningDirect,
     )?;
-    let direct = match open_and_publish_direct_files(app, window_label, state, root_key) {
+    let prepared = match prepare_direct_files_open(app, root_key) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                direct_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("direct_open_failed".into()),
+            );
+            return Err(error);
+        }
+    };
+    let direct = match state.storage_supervisor.commit_if_current(direct_id, || {
+        publish_prepared_direct_files(app, window_label, state, prepared)
+    }) {
         Ok(direct) => direct,
         Err(error) => {
             let _ = state.storage_supervisor.finish_transition(

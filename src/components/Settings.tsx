@@ -109,7 +109,7 @@ import {
 import { openPage, openFile } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
-import { switchGraph, loadGraphPath } from "../graph";
+import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../graph";
 import { flushAll, resetStore } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
@@ -2191,9 +2191,42 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
   onMount(() => void refresh());
 
-  const refreshAuthorityState = () => {
-    resetStore();
-    bumpGraphEpoch();
+  type AuthorityReadiness = Awaited<ReturnType<ReturnType<typeof backend>["listPages"]>>;
+
+  const captureAuthorityReadiness = async (): Promise<AuthorityReadiness | null> => {
+    try {
+      return await backend().listPages();
+    } catch {
+      // A retryable managed binding may not currently answer page reads. The
+      // post-transition probe is still mandatory before an Active result is
+      // shown as success; this snapshot only strengthens it with exact parity.
+      return null;
+    }
+  };
+
+  const refreshAuthorityState = async (expected: AuthorityReadiness | null) => {
+    rebindCurrentStorageAuthority();
+
+    // This is the user observation boundary that the native slot publication
+    // alone cannot prove. An Active transition is not successful until the
+    // frontend's newly leased generation can list the same physical pages and
+    // load a real representative through the ordinary command surface.
+    const pages = await backend().listPages();
+    if (expected) {
+      const identities = new Set(pages.map((page) => `${page.kind}\0${page.path}\0${page.name}`));
+      const missing = expected.find(
+        (page) => !identities.has(`${page.kind}\0${page.path}\0${page.name}`),
+      );
+      if (pages.length !== expected.length || missing) {
+        throw new Error(
+          `managed storage rebound with an incomplete page inventory (${pages.length} of ${expected.length})`,
+        );
+      }
+    }
+    const representative = expected?.[0] ?? pages[0];
+    if (representative && !(await backend().getPageByPath(representative.path))) {
+      throw new Error("managed storage rebound but could not open a page from its inventory");
+    }
   };
 
   // Status fields are structured, but some Rust producers still embed native
@@ -2282,6 +2315,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       );
       dbg(`managed storage setup: native confirmation completed (${confirmed ? "accepted" : "cancelled"})`);
       if (!confirmed) return;
+      const expectedPages = await captureAuthorityReadiness();
       const generation = status()?.binding_generation;
       if (generation !== undefined) {
         try {
@@ -2297,11 +2331,14 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       dbg("managed storage setup: invoking native activation");
       const result = await backend().activateSparseV2();
       dbg(`managed storage setup: native activation returned (${result.state})`);
-      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
-      refreshAuthorityState();
       if (result.state === "active") {
+        await refreshAuthorityState(expectedPages);
+        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         pushToast("Tine-managed storage is active.", "success");
       } else {
+        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
+        resetStore();
+        bumpGraphEpoch();
         reportManagedFailure(
           "Tine-managed storage setup did not complete",
           failureDetail(result) ?? "Tine-managed storage did not become active."
@@ -2330,12 +2367,14 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         "Set up sync with another device?\n\n" +
           "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
+      const expectedPages = await captureAuthorityReadiness();
       const result = await backend().prepareSparseV2Share();
-      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
-      refreshAuthorityState();
       if (result.state === "active") {
+        await refreshAuthorityState(expectedPages);
+        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         pushToast("Sync is ready to use on another device.", "success");
       } else {
+        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         reportManagedFailure("Sync setup did not complete", failureDetail(result) ?? "Tine-managed storage did not become active.");
       }
     } catch (error) {
@@ -2359,12 +2398,14 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         "Join this synced graph?\n\n" +
           "Tine verifies that this device is joining the same graph history before it continues. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
+      const expectedPages = await captureAuthorityReadiness();
       const result = await backend().joinSparseV2Shared();
-      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
-      refreshAuthorityState();
       if (result.state === "active") {
+        await refreshAuthorityState(expectedPages);
+        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         pushToast("This device joined the synced graph.", "success");
       } else {
+        if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
         reportManagedFailure(
           "Joining the synced graph did not complete",
           failureDetail(result) ?? "Tine-managed storage did not become active."
@@ -2406,7 +2447,8 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         );
         return;
       }
-      refreshAuthorityState();
+      resetStore();
+      bumpGraphEpoch();
       // Older native builds may still use the former mode name in this recovery text.
       pushToast(
         result.recovery_statement

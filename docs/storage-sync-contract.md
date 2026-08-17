@@ -16,11 +16,25 @@ a short current-operation compare-and-publish. A stuck graph cannot block an
 unrelated graph or later overwrite the newer selection in the same window. The
 frontend renders events for the current operation ID; phase-name prefixes,
 frontend attempt tokens, and inactivity timers are not storage authority.
+Supersession is cooperative abandonment, not forcible thread cancellation: a
+blocking OS worker may finish disposable computation, but it cannot publish or
+change the selected mode after its operation ID becomes stale. Operation start
+and final graph-slot publication share one short linearization lane; neither a
+root lane nor the supervisor model mutex is held for graph-sized work.
+
+Installing a native graph slot is not sufficient evidence of stable readiness.
+A managed activation is reported successful only after its actor-backed
+generation answers the complete page inventory and opens a representative
+page, and the frontend has retired all renderer state leased to the predecessor
+generation. An empty graph legitimately proves readiness with an empty
+inventory.
 
 Return to Direct Files has two meanings. A graceful return drains a healthy
 managed actor and confirms its committed projection before selecting Direct
-Files. An emergency return is always available from managed startup/refusal:
-it atomically retires the private managed selector and opens the current
+Files. An emergency return is always available from managed startup/refusal.
+The explicit recovery button invokes it immediately without a native
+confirmation dialog that could be delayed by the failing managed open. It
+atomically retires the private managed selector and opens the current
 Markdown/Org tree without first opening, repairing, draining, archiving, or
 recovering managed state. Managed evidence remains quarantined for inspection,
 and the UI warns that it may contain operations newer than Markdown. Re-enabling

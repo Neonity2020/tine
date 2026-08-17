@@ -33,7 +33,6 @@ export interface StartupRecoveryDeps {
   pickGraph(): Promise<LoadGraphPathOutcome>;
   coldReturn(path: string): Promise<SparseV2CancelResult>;
   acceptColdReturn(result: SparseV2CancelResult): void;
-  confirmColdReturn(graphName: string): Promise<boolean>;
   copyText(text: string): Promise<void>;
   notify(message: string, kind: "success" | "error"): void;
   completeFirstLoad(): void;
@@ -76,7 +75,6 @@ export function startupPhaseLabel(phase: string): string {
     "graph.access": "Checking workspace access",
     "graph.failed": "Workspace open failed",
     "picker.open": "Waiting for a workspace selection",
-    "direct.confirm": "Waiting for confirmation",
   };
   return known[phase] ?? phase.replace(/[._]+/gu, " ");
 }
@@ -222,14 +220,12 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
       || (previous.mode === "working" && previous.operation === "graph_open");
     if (!eligible || !previous.target) return;
     const attempt = invalidate();
-    begin(attempt, "cold_return", "direct.confirm", previous.target);
-    const approved = await deps.confirmColdReturn(startupGraphName(previous.target));
-    if (attempt !== sequence || disposed) return;
-    if (!approved) {
-      if (previous.mode === "working") await completeOpen(attempt, previous.target, true);
-      else setSnapshot({ ...previous, attempt, startedAt: now(), elapsedMs: 0 });
-      return;
-    }
+    // The button itself is the explicit emergency action. A native modal can
+    // be starved behind the very managed open this path must abandon, which
+    // leaves the user trapped before the native supervisor ever sees the
+    // request. Managed evidence is preserved, so immediate invocation is both
+    // the safer and the reversible failure-mode behavior.
+    begin(attempt, "cold_return", "quarantining_managed_selection", previous.target);
     try {
       const result = await deps.coldReturn(previous.target);
       if (attempt !== sequence || disposed) return;

@@ -76,7 +76,7 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
               </Show>
               <Show when={canReturnToDirectFiles()}>
                 <button type="button" class="settings-btn danger" onClick={() => void props.controller.returnToDirectFiles()}>
-                  Return {targetName()} to Direct Files…
+                  Forget managed mode and open {targetName()} in Direct Files now
                 </button>
               </Show>
               <Show when={current().mode === "recovery"}>
