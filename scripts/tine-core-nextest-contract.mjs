@@ -33,6 +33,10 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::public_fresh_activation_commits_clean_marker_and_skips_legacy_promotion",
   "sync_runtime::tests::public_clean_activation_loads_saves_and_cold_reopens_an_editor_page",
   "sync_runtime::tests::public_clean_activation_loads_and_saves_the_application_page_contract",
+  // The literal call sequence and request shape the Android instrumentation
+  // journey drives. It fails on Android shared storage and passes here, so the
+  // host boundary must stay green for that difference to stay attributable.
+  "sync_runtime::tests::android_instrumentation_save_journey_shape_succeeds_on_a_host_graph",
   "sync_runtime::tests::public_clean_runtime_reconciles_an_exact_external_edit_and_reopens_it",
   "sync_runtime::tests::public_clean_cold_open_discovers_an_external_edit_while_tine_was_closed",
   "sync_runtime::tests::public_clean_runtime_reconciles_external_create_delete_and_rename_as_one_batch",
@@ -74,6 +78,7 @@ export const SYNC_RUNTIME_CONTRACT_GUARD_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::managed_local_foreground_source_excludes_legacy_and_derivative_work",
   "sync_runtime::tests::managed_storage_validation_is_not_unix_uid_coupled",
   "sync_runtime::tests::android_receipt_bootstrap_does_not_reenter_capability_preflights",
+  "sync_runtime::tests::derived_editor_rejections_name_their_stage_at_the_application_boundary",
 ]);
 
 // The exact set of tine-core tests the Linux release gate deliberately does NOT
