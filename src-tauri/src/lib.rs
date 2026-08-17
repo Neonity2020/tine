@@ -86,7 +86,7 @@ use sync_runtime::{
 #[cfg(desktop)]
 use tauri::Emitter;
 use tauri::Manager;
-use watcher::{get_watch_mode, set_watch_mode, start_watcher};
+use watcher::{get_watch_mode, set_watch_mode, start_watcher, watcher_latency_recent};
 
 #[cfg(desktop)]
 const MAIN_WINDOW_REVEAL_FALLBACK_MS: u64 = 3_000;
@@ -829,6 +829,7 @@ pub fn run() {
             set_link_first_match,
             get_watch_mode,
             set_watch_mode,
+            watcher_latency_recent,
             list_backups,
             restore_backup,
             load_session,

@@ -89,6 +89,8 @@ import {
   flushAll,
   appendToTodayJournal,
   captureToPage,
+  deferExternalReload,
+  installExternalReloadReplayHandler,
   pageByName,
   reloadDisposition,
   reloadPageIfStillSafe,
@@ -215,6 +217,25 @@ function requestJournalFeedWatcherRestart(
   if (owner) void reloadJournalsFeedFromStart(owner);
 }
 
+// A skip/decline below records the change for deferred replay; the replay
+// re-enters this same handler so the disposition is re-evaluated with whatever
+// state holds at that moment (it may have become "conflict", which then takes
+// the divergence path exactly like a live event).
+installExternalReloadReplayHandler((change) => void handleGraphChange(change));
+
+// Console-only diagnostic for external-change latency reports (GH #337; see
+// docs/concord.md). Release builds ship the devtools but not `withGlobalTauri`,
+// so a reporter needs one named callable to reach the backend's receipt ring.
+// No UI beyond this.
+if (isTauri()) {
+  (window as unknown as {
+    __tineWatcherLatency?: () => Promise<unknown>;
+  }).__tineWatcherLatency = async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke("watcher_latency_recent");
+  };
+}
+
 export async function handleGraphChange(c: GraphChange) {
   const binding = graphBinding();
   // The backend watcher has already landed this transaction in its graph cache.
@@ -235,6 +256,7 @@ export async function handleGraphChange(c: GraphChange) {
       return;
     }
     if (disp === "skip") {
+      deferExternalReload(c, binding);
       if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
       return;
     }
@@ -253,6 +275,7 @@ export async function handleGraphChange(c: GraphChange) {
 
   const disp = reloadDisposition(c.name);
   if (disp === "skip") {
+    deferExternalReload(c, binding);
     if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
     return;
   }
@@ -273,7 +296,11 @@ export async function handleGraphChange(c: GraphChange) {
   }
   if (routes.some((p) => p.route.kind === "page" && p.route.name === c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) await reloadPageIfStillSafe(c.name, toLoadablePage(dto, c.name), binding);
+    // A decline here (an editor lease took hold, or the page turned dirty during
+    // the await) is the same dropped-reload hole as "skip": defer, don't drop.
+    if (dto && !(await reloadPageIfStillSafe(c.name, toLoadablePage(dto, c.name), binding))) {
+      deferExternalReload(c, binding);
+    }
     // A page surface may have the same journal loaded while another live pane
     // shows Journals.  Reloading that DTO is not feed reconciliation: always
     // give the live feed owner its authoritative null-cursor restart too.
@@ -283,7 +310,9 @@ export async function handleGraphChange(c: GraphChange) {
   if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
     if (pageByName(c.name)) {
       const dto = await backend().getPage(c.name, c.kind);
-      if (dto) await reloadPageIfStillSafe(c.name, dto, binding);
+      if (dto && !(await reloadPageIfStillSafe(c.name, dto, binding))) {
+        deferExternalReload(c, binding);
+      }
       requestJournalFeedWatcherRestart(routes);
       return;
     }
@@ -295,7 +324,9 @@ export async function handleGraphChange(c: GraphChange) {
   }
   if (pageByName(c.name) && !doc.feed.includes(c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) await reloadPageIfStillSafe(c.name, dto, binding);
+    if (dto && !(await reloadPageIfStillSafe(c.name, dto, binding))) {
+      deferExternalReload(c, binding);
+    }
   }
 }
 

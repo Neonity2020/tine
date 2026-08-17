@@ -8,6 +8,7 @@
 
 import { createStore, produce, unwrap } from "solid-js/store";
 import { createSignal, createMemo, createRoot } from "solid-js";
+import type { GraphChange } from "./backend";
 import type {
   ActivationIntent,
   BlockDto,
@@ -1070,6 +1071,92 @@ export async function reloadPageIfStillSafe(
   return (await ensurePageLoaded(dto, { expectedGraphBinding })) === null;
 }
 
+// --- deferred replay of skipped external reloads (Concord P1, freshness) ---
+//
+// `reloadDisposition` answers "skip" while a block on the changed page is being
+// edited or a block move is in flight, and `mayReplaceInstance` refuses while a
+// component-local editor lease holds uncommitted input. Those refusals are
+// correct — but the watcher event they decline used to be DROPPED: the backend
+// cache was fresh while the visible page stayed stale until some unrelated
+// event happened to touch it again. Record the declined change instead and
+// re-dispatch it through the original watcher handler once the page becomes
+// replaceable (editing ends, the move settles, the lease is released — all of
+// which already announce through `notifyPageBecameReplaceable`). Re-dispatching
+// the ORIGINAL handler means the disposition is re-evaluated at replay time: a
+// page that became dirty meanwhile takes the normal divergence path
+// (`applyDivergenceVerdict`), never a clobbering reload. No guard is weakened —
+// replay still funnels through `reloadPageIfStillSafe` and the same handler
+// branches as a live event.
+
+/** Why an external reload was deferred (diagnostics; the replay re-checks). */
+type DeferredExternalReloadReason =
+  | "block-edit"
+  | "block-move"
+  | "uncommitted-input"
+  | "declined";
+
+type DeferredExternalReload = {
+  change: GraphChange;
+  binding: number;
+  reason: DeferredExternalReloadReason;
+  stop: () => void;
+};
+
+const deferredExternalReloads = new Map<string, DeferredExternalReload>();
+
+let externalReloadReplay: ((change: GraphChange) => void) | null = null;
+
+/** Wired once by the watcher handler's module (`handleGraphChange`); injected
+ *  because the store must not import the App module. */
+export function installExternalReloadReplayHandler(
+  handler: (change: GraphChange) => void,
+): void {
+  externalReloadReplay = handler;
+}
+
+function deferredExternalReloadReason(name: string): DeferredExternalReloadReason {
+  if (isBlockMoving()) return "block-move";
+  const ed = editingId();
+  if (ed && doc.byId[ed]?.page === name) return "block-edit";
+  if (hasEditorLease(name)) return "uncommitted-input";
+  return "declined";
+}
+
+/** Record an external change the watcher handler could not apply right now, and
+ *  replay it when the page becomes replaceable. Latest observation wins — the
+ *  replay refetches the DTO, so only the newest change's shape (kind,
+ *  created/removed) matters. */
+export function deferExternalReload(change: GraphChange, binding = graphBinding()): void {
+  const existing = deferredExternalReloads.get(change.name);
+  if (existing) {
+    existing.change = change;
+    existing.binding = binding;
+    existing.reason = deferredExternalReloadReason(change.name);
+    return;
+  }
+  const stop = onPageBecameReplaceable(change.name, () => {
+    const pending = deferredExternalReloads.get(change.name);
+    if (!pending) return;
+    pending.stop();
+    deferredExternalReloads.delete(change.name);
+    if (pending.binding !== graphBinding()) return;
+    // Fire-and-forget like a live watcher event; if the handler declines again
+    // it re-defers, so the record cannot be lost between here and there.
+    externalReloadReplay?.(pending.change);
+  });
+  deferredExternalReloads.set(change.name, {
+    change,
+    binding,
+    reason: deferredExternalReloadReason(change.name),
+    stop,
+  });
+}
+
+function clearDeferredExternalReloads(): void {
+  for (const pending of deferredExternalReloads.values()) pending.stop();
+  deferredExternalReloads.clear();
+}
+
 const pendingHlsRefreshes = new Map<string, () => void>();
 
 function retryHlsRefreshWhenReplaceable(name: string, binding: number): void {
@@ -1165,6 +1252,7 @@ export function resetStore() {
   managedHistoryReplayEpoch++;
   managedHistoryReplayRunning = false;
   managedHistoryCommands.length = 0;
+  clearDeferredExternalReloads();
   clearPendingHlsRefreshes();
   clearPendingBlockRefStamps();
   // Cancel pending/in-flight saves and clear all save guard state (timers, graph
