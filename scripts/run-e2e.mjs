@@ -151,6 +151,17 @@ const suites = {
     ["empty-query-workspace", "scripts/e2e-empty-query-workspace.mjs", {}],
     ["scrollbars", "scripts/e2e-scrollbars.mjs", {}],
     ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
+    // Catalogued since 2026-08-09 and selected by nothing until 2026-08-17: seven
+    // journeys, six of them `stability: "stable"`, including the published-site
+    // security boundary. The catalog checker now enforces both directions, so a
+    // journey can no longer sit in the contract without a runner.
+    ["publish-security", "scripts/e2e-publish-security.mjs", {}],
+    ["page-identity-links", "scripts/e2e-page-identity-links.mjs", {}],
+    ["external-graph-wide-changes", "scripts/e2e-external-graph-wide-changes.mjs", {}],
+    ["rendered-delete-verify", "scripts/e2e-rendered-delete-verify.mjs", {}],
+    ["delete-selection-timing", "scripts/e2e-delete-selection-timing.mjs", {}],
+    ["selection-actions", "scripts/e2e-selection-actions.mjs", {}],
+    ["clipboard-roundtrip", "scripts/e2e-clipboard-roundtrip.mjs", {}],
   ],
   "windows-smoke": [
     // og-parity-references is a HARD gate on Linux (linux-release + og-parity-pilot
@@ -430,6 +441,10 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       E2E_NATIVE_PORT: String(nativePort),
       E2E_PREVIEW_PORT: String(previewPort),
       TINE_SOURCE_REVISION: buildProvenance.testedCommit || "",
+      // Journeys that refuse to run against an unidentified artifact read the
+      // exact receipted commit under this name; give them the same authority the
+      // runner already proved rather than a hand-exported shell variable.
+      TINE_CANDIDATE_COMMIT: buildProvenance.testedCommit || "",
       E2E_LEGACY_NOTES: "0",
       TAURI_DRIVER: process.env.TAURI_DRIVER || (process.platform === "win32" ? "msedgedriver.exe" : "tauri-driver"),
     };
