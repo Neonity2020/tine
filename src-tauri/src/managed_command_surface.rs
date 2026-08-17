@@ -149,6 +149,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("list_spellcheck_dictionaries", NoGraphSlot),
     ("list_sync_conflicts", Filesystem),
     ("list_templates", ManagedRouted),
+    ("list_vcs_marker_conflicts", Filesystem),
     ("load_graph", NoGraphSlot),
     ("load_plugin_registry_cache", NoGraphSlot),
     ("load_session", NoGraphSlot),

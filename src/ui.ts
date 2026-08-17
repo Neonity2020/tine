@@ -1,7 +1,7 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
 import { createSignal, useContext } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
-import type { GraphMeta, JournalConflict, SyncConflict, PageKind } from "./types";
+import type { GraphMeta, JournalConflict, SyncConflict, VcsMarkerConflict, PageKind } from "./types";
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
@@ -340,7 +340,15 @@ export async function refreshJournalConflicts(notify = false): Promise<void> {
 // Excluded from the page list; surfaced here so the user can review + merge them
 // (Settings → Backups & recovery) instead of them rotting as garbage pages. ---
 export const [syncConflicts, setSyncConflicts] = createSignal<SyncConflict[]>([]);
-/** Re-fetch the sync-conflict list; with `notify`, toast if any exist. */
+// Pages whose on-disk bytes carry unresolved VCS merge markers (git/Fossil).
+// Readable but quarantined from saves; surfaced in the same Settings area and
+// as a banner on the affected page.
+export const [vcsMarkerConflicts, setVcsMarkerConflicts] = createSignal<VcsMarkerConflict[]>([]);
+/** Whether the page loaded from `path` is quarantined by VCS merge markers. */
+export function vcsMarkerConflictFor(path: string | undefined): VcsMarkerConflict | undefined {
+  return path ? vcsMarkerConflicts().find((c) => c.path === path) : undefined;
+}
+/** Re-fetch the sync-conflict + VCS-marker lists; with `notify`, toast if any exist. */
 export async function refreshSyncConflicts(notify = false): Promise<void> {
   try {
     const c = await backend().listSyncConflicts();
@@ -348,6 +356,19 @@ export async function refreshSyncConflicts(notify = false): Promise<void> {
     if (notify && c.length) {
       pushToast(
         `${c.length} sync-conflict file${c.length === 1 ? "" : "s"} in your graph — review + merge them in Settings → Backups & recovery`,
+        "info",
+        { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
+      );
+    }
+  } catch {
+    /* best-effort */
+  }
+  try {
+    const m = await backend().listVcsMarkerConflicts();
+    setVcsMarkerConflicts(m);
+    if (notify && m.length) {
+      pushToast(
+        `${m.length} file${m.length === 1 ? " contains" : "s contain"} unresolved VCS merge markers — Tine won't overwrite them; resolve the merge in your version-control tool`,
         "info",
         { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
       );

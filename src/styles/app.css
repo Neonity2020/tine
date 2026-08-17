@@ -3508,6 +3508,19 @@ textarea {
   background: var(--bg-secondary);
   color: var(--text-secondary);
 }
+/* Unresolved VCS merge markers (git/Fossil) on disk: the page is readable but
+   quarantined from saves so Tine never mangles the markers. Amber = caution,
+   not an error — the fix happens outside Tine. */
+.vcs-marker-banner {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid #b45309;
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
 .page-guide-banner {
   display: flex;
   align-items: center;

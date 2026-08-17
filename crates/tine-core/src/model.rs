@@ -968,6 +968,23 @@ pub struct SyncConflict {
     pub preview: String,
 }
 
+/// A page whose ON-DISK bytes carry unresolved VCS merge-conflict markers
+/// (git/Fossil; see [`crate::doc::vcs_conflict_markers`]). The page stays
+/// readable, but saves to it are refused so Tine never mangles the markers —
+/// surfaced alongside [`SyncConflict`]s so the conflicts panel can say
+/// "N files contain unresolved VCS merge markers".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VcsMarkerConflict {
+    /// Graph-root-relative path of the marker-bearing file.
+    pub path: String,
+    /// Display name of the page (decoded page name / journal title).
+    pub name: String,
+    pub kind: PageKind,
+    /// Distinct marker kinds found, in order of first appearance
+    /// (e.g. `["<<<<<<<", "=======", ">>>>>>>"]`).
+    pub markers: Vec<String>,
+}
+
 /// A full page as sent to / received from the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageDto {
@@ -12781,6 +12798,52 @@ impl Graph {
         out
     }
 
+    /// Pages whose on-disk content carries unresolved VCS merge-conflict markers
+    /// (git/Fossil; see [`crate::doc::vcs_conflict_markers`]). These are REAL
+    /// pages — indexed, readable — but quarantined from saves (the serializer
+    /// refuses to rewrite them; see `serialize_page_document`). Surfaced beside
+    /// [`Graph::list_sync_conflicts`] for the conflicts panel. Sync-tool
+    /// conflict copies are excluded here — they have their own listing.
+    pub fn list_vcs_marker_conflicts(&self) -> Vec<VcsMarkerConflict> {
+        let mut out = Vec::new();
+        for (dir, kind) in [
+            (self.journals_path(), PageKind::Journal),
+            (self.pages_path(), PageKind::Page),
+        ] {
+            walk_page_files(&dir, |p| {
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                    return;
+                };
+                if is_sync_conflict(stem) {
+                    return;
+                }
+                let Ok(content) = fs::read_to_string(&p) else {
+                    return;
+                };
+                let markers = doc::vcs_conflict_markers(&content);
+                if markers.is_empty() {
+                    return;
+                }
+                let name = match kind {
+                    PageKind::Journal => self
+                        .journal_format
+                        .parse(stem)
+                        .map(|d| self.journal_format.title(d))
+                        .unwrap_or_else(|| stem.to_string()),
+                    PageKind::Page => decode_page_name(stem, self.config.file_name_format),
+                };
+                out.push(VcsMarkerConflict {
+                    path: self.rel_path(&p),
+                    name,
+                    kind,
+                    markers: markers.iter().map(|marker| marker.to_string()).collect(),
+                });
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
     /// Structural block-level diff of a conflict copy against its winner (both
     /// graph-root-relative paths). Loads each file directly by path — the conflict
     /// copy is deliberately not in the page cache — and aligns the two block trees
@@ -21237,6 +21300,26 @@ impl Graph {
         // `:journal/file-name-format` — so custom-format graphs create the correct
         // file for the day instead of a misplaced default-named duplicate.)
         let dto_is_org = matches!(Format::from_path(path), Format::Org);
+        // VCS merge-conflict quarantine (Concord invariant 3). In-scope threat:
+        // an external VCS merge (git/Fossil) left column-0 conflict markers in
+        // this file. Re-serializing would re-indent the markers as continuation
+        // lines (or drop them), which destroys the VCS's own conflict
+        // detection and can silently lose one side of the merge. The page
+        // stays readable; every write to it — normal and force — is refused
+        // until the user resolves the merge outside Tine. Mirrors the GH #163
+        // refusal-instead-of-rewrite pattern below.
+        if let Some(existing) = existing {
+            let markers = doc::vcs_conflict_markers(existing);
+            if !markers.is_empty() {
+                return Err(projection_semantic_refusal(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "file contains unresolved VCS merge conflict markers ({}) — resolve the merge with your version-control tool or an external editor first; Tine never rewrites a conflicted file",
+                        markers.join(", ")
+                    ),
+                ));
+            }
+        }
         // Data-preservation firewall for page-header properties (GH #163).
         // A frontend/store bug once reclassified a suffix of the page pre-block
         // as the first outline block (`A::` stayed in the header while `B::` and
@@ -34663,6 +34746,96 @@ mod tests {
             message.contains("<<<<<<<") && message.contains(">>>>>>>"),
             "the refusal names the markers it found: {message}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vcs_marker_detection_matches_real_markers_only() {
+        // git (merge and diff3 styles).
+        assert_eq!(
+            doc::vcs_conflict_markers(
+                "<<<<<<< HEAD\n- mine\n||||||| merged common ancestors\n- old\n=======\n- theirs\n>>>>>>> feature\n"
+            ),
+            vec!["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
+        );
+        // Fossil's verbose variants (mergeMarker table in fossil src/merge3.c).
+        assert_eq!(
+            doc::vcs_conflict_markers(concat!(
+                "<<<<<<< BEGIN MERGE CONFLICT: local copy shown first <<<<<<<<<<<<\n",
+                "- mine\n",
+                "####### SUGGESTED CONFLICT RESOLUTION follows ###################\n",
+                "- suggestion\n",
+                "||||||| COMMON ANCESTOR content follows |||||||||||||||||||||||||\n",
+                "- old\n",
+                "======= MERGED IN content follows ===============================\n",
+                "- theirs\n",
+                ">>>>>>> END MERGE CONFLICT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> (line 3)\n"
+            )),
+            vec!["<<<<<<<", "#######", "|||||||", "=======", ">>>>>>>"]
+        );
+        // Markers quoted inside a column-0 fenced code block (someone
+        // DOCUMENTING git) must not flag the page.
+        assert!(doc::vcs_conflict_markers(
+            "```\n<<<<<<< HEAD\n=======\n>>>>>>> feature\n```\n- notes about git\n"
+        )
+        .is_empty());
+        assert!(doc::vcs_conflict_markers(
+            "~~~text\n<<<<<<< HEAD\n>>>>>>> feature\n~~~\n"
+        )
+        .is_empty());
+        // Markers quoted in an indented fence inside a bullet are not at
+        // column 0 at all.
+        assert!(doc::vcs_conflict_markers(
+            "- how git conflicts look:\n  ```\n  <<<<<<< HEAD\n  =======\n  >>>>>>> theirs\n  ```\n"
+        )
+        .is_empty());
+        // A lone `=======` (setext-style divider) never quarantines a page —
+        // an anchor marker must be present.
+        assert!(doc::vcs_conflict_markers("Heading\n=======\n- content\n").is_empty());
+        // Markers must start at column 0 with their trailing space/shape.
+        assert!(doc::vcs_conflict_markers("- <<<<<<< HEAD\n- >>>>>>> x\n").is_empty());
+        // A real conflict below a closed fence is still detected.
+        assert_eq!(
+            doc::vcs_conflict_markers(
+                "```\nexample\n```\n<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n"
+            ),
+            vec!["<<<<<<<", "=======", ">>>>>>>"]
+        );
+    }
+
+    #[test]
+    fn list_vcs_marker_conflicts_reports_only_marker_pages() {
+        let dir = scratch("vcs-marker-listing");
+        fs::write(
+            dir.join("pages").join("Merge.md"),
+            "<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Clean.md"), "- ordinary page\n").unwrap();
+        fs::write(
+            dir.join("pages").join("Docs about git.md"),
+            "```\n<<<<<<< HEAD\n=======\n>>>>>>> feature\n```\n",
+        )
+        .unwrap();
+        // A sync-tool conflict copy containing markers belongs to the
+        // conflict-copy listing, not this one.
+        fs::write(
+            dir.join("pages")
+                .join("Merge.sync-conflict-20260817-101010-ABCDEFG.md"),
+            "<<<<<<< HEAD\n- mine\n=======\n- theirs\n>>>>>>> feature\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let conflicts = graph.list_vcs_marker_conflicts();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "only the real marker-bearing page is listed: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].path, "pages/Merge.md");
+        assert_eq!(conflicts[0].name, "Merge");
+        assert_eq!(conflicts[0].kind, PageKind::Page);
+        assert_eq!(conflicts[0].markers, vec!["<<<<<<<", "=======", ">>>>>>>"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

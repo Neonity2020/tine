@@ -1721,6 +1721,9 @@ export function mockBackend(): Backend {
         },
       ];
     },
+    async listVcsMarkerConflicts() {
+      return [];
+    },
     async syncConflictDiff() {
       const v = (text: string) => ({ uuid: "", text, child_count: 0 });
       return {

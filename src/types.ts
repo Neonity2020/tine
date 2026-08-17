@@ -210,6 +210,20 @@ export interface SyncConflict {
   preview: string;
 }
 
+/** A page whose on-disk bytes carry unresolved VCS merge-conflict markers
+ *  (git/Fossil). It stays readable, but saves to it are refused so Tine never
+ *  rewrites (and thereby mangles) the markers — the user resolves the merge in
+ *  their VCS or an external editor. */
+export interface VcsMarkerConflict {
+  /** Graph-root-relative path of the marker-bearing file. */
+  path: string;
+  /** Display name of the page (decoded page name / journal title). */
+  name: string;
+  kind: PageKind;
+  /** Distinct marker kinds found, e.g. ["<<<<<<<", "=======", ">>>>>>>"]. */
+  markers: string[];
+}
+
 export interface SparseV2WatcherStatus {
   latest_enqueue: number;
   acknowledged: number;

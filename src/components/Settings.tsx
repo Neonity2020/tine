@@ -61,6 +61,7 @@ import {
   refreshJournalConflicts,
   syncConflicts,
   refreshSyncConflicts,
+  vcsMarkerConflicts,
   type SettingsTabId,
 } from "../ui";
 import { interfaceZoom, zoomIn, zoomOut, zoomReset } from "../zoom";
@@ -2783,6 +2784,7 @@ function BackupsTab(props: { search: string }): JSX.Element {
 
       <JournalConflictsPanel />
       <SyncConflictsPanel />
+            <VcsMarkerConflictsPanel />
     </>
   );
 }
@@ -2965,6 +2967,39 @@ function JournalConflictsPanel(): JSX.Element {
             </div>
           );
         }}
+      </For>
+    </Show>
+  );
+}
+
+// Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
+// (git/Fossil `<<<<<<<` / `=======` / `>>>>>>>` lines). They stay readable, but
+// Tine refuses to save them: re-serializing would re-indent the column-0
+// markers and break the VCS's own conflict detection (Concord invariant 3).
+// Resolution happens in the user's VCS or an external editor; this panel only
+// says which files are affected and why. (In-Tine resolution is a later phase.)
+function VcsMarkerConflictsPanel(): JSX.Element {
+  return (
+    <Show when={vcsMarkerConflicts().length}>
+      <div class="settings-section" style={{ "margin-top": "18px" }}>
+        VCS merge conflicts
+      </div>
+      <div class="settings-hint settings-block">
+        {vcsMarkerConflicts().length === 1 ? "This file contains" : "These files contain"}{" "}
+        unresolved version-control merge markers (git/Fossil). The pages stay readable, but Tine
+        refuses to save them so the markers are never mangled — resolve the merge with your
+        version-control tool or an external editor, and this list clears on its own.
+      </div>
+      <For each={vcsMarkerConflicts()}>
+        {(c) => (
+          <div class="settings-block sync-conflict-row">
+            <div class="sync-conflict-head">
+              <span class="settings-asset-name">{c.name}</span>
+              <span class="sync-conflict-tag mono">{c.markers.join(" ")}</span>
+            </div>
+            <div class="journal-conflict-preview mono">{c.path}</div>
+          </div>
+        )}
       </For>
     </Show>
   );

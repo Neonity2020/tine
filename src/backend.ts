@@ -30,6 +30,7 @@ import type {
   JournalConflict,
   SyncConflict,
   SyncConflictDiff,
+  VcsMarkerConflict,
   MergeDecision,
   ManagedPageMutationPreflightResult,
   PrintOpts,
@@ -444,6 +445,9 @@ export interface Backend {
   /** Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
    *  user to review + merge instead of them showing as garbage pages. */
   listSyncConflicts(): Promise<SyncConflict[]>;
+  /** Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
+   *  (git/Fossil): readable, but quarantined from saves. */
+  listVcsMarkerConflicts(): Promise<VcsMarkerConflict[]>;
   /** Block-level diff of a conflict copy against its winner (graph-root-relative
    *  paths). Read-only; null if a path is invalid or the file is gone. */
   syncConflictDiff(winner: string, conflict: string): Promise<SyncConflictDiff | null>;
@@ -1181,6 +1185,9 @@ class TauriBackend implements Backend {
   }
   listSyncConflicts() {
     return this.call<SyncConflict[]>("list_sync_conflicts");
+  }
+  listVcsMarkerConflicts() {
+    return this.call<VcsMarkerConflict[]>("list_vcs_marker_conflicts");
   }
   syncConflictDiff(winner: string, conflict: string) {
     return this.call<SyncConflictDiff | null>("sync_conflict_diff", { winner, conflict });

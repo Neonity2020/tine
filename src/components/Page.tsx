@@ -6,6 +6,7 @@ import {
   isFavorite, toggleFavorite,
   graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
   agendaQuery, contextMenu, dataRev, isConflicted, renamePageInNavigation,
+  vcsMarkerConflictFor,
 } from "../ui";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
@@ -725,6 +726,15 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
       inert={pageMutationBusy(props.page.name) ? true : undefined}
       aria-busy={pageMutationBusy(props.page.name) ? "true" : undefined}
     >
+      <Show when={vcsMarkerConflictFor(props.page.path)}>
+        {(conflict) => (
+          <div class="vcs-marker-banner" role="alert">
+            This file contains unresolved version-control merge markers ({conflict().markers.join(" ")}).
+            It stays readable, but Tine won't save changes to it — resolve the merge with your
+            version-control tool or an external editor first.
+          </div>
+        )}
+      </Show>
       <Show when={props.page.kind === "page"}>
         <NamespaceCrumb name={props.page.name} />
       </Show>

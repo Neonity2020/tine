@@ -3780,6 +3780,16 @@ pub(crate) fn list_sync_conflicts(
     with_filesystem_graph(&state, |g| Ok(g.list_sync_conflicts()))
 }
 
+/// Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
+/// (git/Fossil). They stay readable but saves to them are refused, so the
+/// conflicts panel and the page banner can explain why.
+#[tauri::command]
+pub(crate) fn list_vcs_marker_conflicts(
+    state: GraphContext<'_>,
+) -> Result<Vec<tine_core::model::VcsMarkerConflict>, String> {
+    with_filesystem_graph(&state, |g| Ok(g.list_vcs_marker_conflicts()))
+}
+
 /// Block-level diff of a sync-conflict copy against its winner (both graph-root-
 /// relative paths) — the data behind the two-column merge UI. Read-only.
 #[tauri::command]
