@@ -6711,7 +6711,7 @@
         "scenario": "managed-storage.share-join-reopen-retired-actor",
         "failBefore": "proven"
       },
-      "notes": "The real two-device journey reached healthy local activation, then the first explicit share cut stopped its actor by design and the Tauri command immediately queried that retired handle, returning sync actor is unavailable. Share and already-managed join now reopen the durable post-enrollment runtime, prove its ordinary page inventory/load boundary, and publish a new exact-generation graph slot before returning success. The source regression pins the required cut -> reopen -> exact publish ordering; the real two-device journey is the release-blocking semantic proof."
+      "notes": "The real two-device journey reached healthy local activation, then the first explicit share cut stopped its actor by design and the Tauri command immediately queried that retired handle, returning sync actor is unavailable. Share and already-managed join now reopen the durable post-enrollment runtime, prove its ordinary page inventory/load boundary, and publish a new exact-generation graph slot before returning success. That repair exposed a second product defect: a bounded watcher scan could acknowledge one epoch while newer observations remained pending, but an AdmittedNoop/Complete tick scheduled no continuation and a quiet graph supplied no new inotify edge. The watcher now consults the actor's post-tick pending bit, drains all retained epochs without a timer guess, and still leaves a truly quiet actor asleep. The source regressions pin cut -> reopen -> exact publish ordering and pending-epoch continuation; the real two-device journey remains the release-blocking semantic proof."
     }
   ]
 }

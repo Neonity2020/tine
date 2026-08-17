@@ -1125,20 +1125,26 @@ fn sparse_provider_rescan_required(
 /// `Admitted*` result from that turn does not mean the provider obligation was
 /// consumed. Schedule exactly one continuation; once provider work begins its
 /// ordinary `Recovering` result owns subsequent continuation turns.
-fn sparse_tick_needs_continuation(tick: &SyncRuntimeTick, provider_rescan_queued: bool) -> bool {
-    matches!(
-        tick,
-        SyncRuntimeTick::LocalMutation(_)
-            | SyncRuntimeTick::ProviderMutation { .. }
-            | SyncRuntimeTick::Recovering
-            | SyncRuntimeTick::RetryFull
-    ) || (provider_rescan_queued
-        && matches!(
+fn sparse_tick_needs_continuation(
+    tick: &SyncRuntimeTick,
+    provider_rescan_queued: bool,
+    actor_watcher_pending: bool,
+) -> bool {
+    actor_watcher_pending
+        || matches!(
             tick,
-            SyncRuntimeTick::Idle
-                | SyncRuntimeTick::AdmittedNoop { .. }
-                | SyncRuntimeTick::AdmittedComplete { .. }
-        ))
+            SyncRuntimeTick::LocalMutation(_)
+                | SyncRuntimeTick::ProviderMutation { .. }
+                | SyncRuntimeTick::Recovering
+                | SyncRuntimeTick::RetryFull
+        )
+        || (provider_rescan_queued
+            && matches!(
+                tick,
+                SyncRuntimeTick::Idle
+                    | SyncRuntimeTick::AdmittedNoop { .. }
+                    | SyncRuntimeTick::AdmittedComplete { .. }
+            ))
 }
 
 fn take_sparse_initial_tick(pending: &mut bool) -> bool {
@@ -1503,11 +1509,27 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         // a content change. `AdmittedNoop` is, by its own name,
                         // the step that took no completed batch.
                         let changed = tick.committed_observable_change();
+                        // A bounded full scan can settle one retained epoch
+                        // while observations received during that scan leave a
+                        // newer epoch pending. The tick result describes only
+                        // the epoch it just completed, so continuation must
+                        // also consult the actor's post-tick watcher state.
+                        // Otherwise a quiet graph has no new inotify edge to
+                        // wake the remaining work and the first shared edit can
+                        // stay pending forever.
+                        let status = graph.handle.status().ok();
+                        let actor_watcher_pending =
+                            status.as_ref().is_some_and(|status| status.watcher.pending);
                         match &tick {
                             SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Failed(_) => {
                                 graph.retry.failed(Instant::now())
                             }
-                            tick if sparse_tick_needs_continuation(tick, provider_rescan) => {
+                            tick if sparse_tick_needs_continuation(
+                                tick,
+                                provider_rescan,
+                                actor_watcher_pending,
+                            ) =>
+                            {
                                 graph.retry.progressed(Instant::now())
                             }
                             _ => graph.retry.succeeded(),
@@ -1545,7 +1567,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         if changed {
                             let _ = app.emit_to(label, "sparse-v2-changed", ());
                         }
-                        if let Ok(status) = graph.handle.status() {
+                        if let Some(status) = status {
                             let _ = app.emit_to(
                                 label,
                                 "sparse-v2-status",
@@ -2089,25 +2111,41 @@ mod tests {
         assert!(sparse_tick_needs_continuation(
             &SyncRuntimeTick::AdmittedNoop { epoch: 7 },
             true,
+            false,
         ));
         assert!(sparse_tick_needs_continuation(
             &SyncRuntimeTick::AdmittedComplete { epoch: 8 },
             true,
+            false,
         ));
         assert!(sparse_tick_needs_continuation(
             &SyncRuntimeTick::ProviderMutation {
                 batch_id: tine_core::oplog::BatchId::from_uuid(uuid::Uuid::from_u128(8)),
             },
             false,
+            false,
         ));
         assert!(
-            !sparse_tick_needs_continuation(&SyncRuntimeTick::AdmittedNoop { epoch: 9 }, false,),
+            !sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedNoop { epoch: 9 },
+                false,
+                false,
+            ),
             "ordinary quiet graph admission must not become an idle hot loop",
+        );
+        assert!(
+            sparse_tick_needs_continuation(
+                &SyncRuntimeTick::AdmittedNoop { epoch: 9 },
+                false,
+                true,
+            ),
+            "a newer watcher epoch queued behind a completed scan must drain without another filesystem edge",
         );
         assert!(
             !sparse_tick_needs_continuation(
                 &SyncRuntimeTick::RecoveryBlocked("waiting for provider bytes".into()),
                 true,
+                false,
             ),
             "blocked provider work keeps the existing backoff policy",
         );
