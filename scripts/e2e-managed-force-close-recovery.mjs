@@ -33,8 +33,12 @@ const SETTLE_MS = Number(process.env.TINE_MANAGED_RECOVERY_SETTLE_MS || 10_000);
 const KILL_CYCLES = Number(process.env.TINE_MANAGED_RECOVERY_KILL_CYCLES || 1);
 const RETURN_DURING_OPEN = process.env.TINE_MANAGED_RECOVERY_RETURN_DURING_OPEN === "1";
 const GRACEFUL_RETURN_AFTER_RECOVERY = process.env.TINE_MANAGED_RECOVERY_GRACEFUL_RETURN === "1";
+const REENABLE_AFTER_RETURN = process.env.TINE_MANAGED_RECOVERY_REENABLE_AFTER_RETURN === "1";
 if (RETURN_DURING_OPEN && GRACEFUL_RETURN_AFTER_RECOVERY) {
   throw new Error("choose either emergency return during open or graceful return after recovery");
+}
+if (REENABLE_AFTER_RETURN && !GRACEFUL_RETURN_AFTER_RECOVERY) {
+  throw new Error("TINE_MANAGED_RECOVERY_REENABLE_AFTER_RETURN requires graceful return");
 }
 if (!Number.isSafeInteger(KILL_CYCLES) || KILL_CYCLES < 1 || KILL_CYCLES > 3) {
   throw new Error("TINE_MANAGED_RECOVERY_KILL_CYCLES must be an integer from 1 through 3");
@@ -111,6 +115,7 @@ const receipt = {
   killCycles: KILL_CYCLES,
   returnDuringOpen: RETURN_DURING_OPEN,
   gracefulReturnAfterRecovery: GRACEFUL_RETURN_AFTER_RECOVERY,
+  reenableAfterReturn: REENABLE_AFTER_RETURN,
   activationMs: null,
   reopenMs: null,
   reopenDurationsMs: [],
@@ -550,6 +555,19 @@ try {
     await openPageThroughSwitcher(selected.entry.name);
     await waitForBody(DIRECT_MARKER, 60_000, `Direct Files edit after ${returnKind}-return restart`);
     await assertDirectFilesActive();
+    if (REENABLE_AFTER_RETURN) {
+      phase = "managed-reenable-after-direct-return";
+      const started = Date.now();
+      await enableManagedStorage();
+      receipt.reenableMs = Date.now() - started;
+      await openPageThroughSwitcher(selected.entry.name);
+      await waitForBody(DIRECT_MARKER, 60_000, "managed re-enable retained the Direct Files edit");
+      await assertManagedStorageActive();
+      receipt.milestones.managedReenableAfterDirectReturn = {
+        active: true,
+        pageVisible: true,
+      };
+    }
     await cleanQuit();
     receipt.milestones[RETURN_DURING_OPEN
       ? "coldReturnDuringManagedOpen"
