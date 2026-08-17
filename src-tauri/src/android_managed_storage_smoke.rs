@@ -108,7 +108,24 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         page,
     }) {
         Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {}
-        outcome => return format!("post-activation page save failed: {outcome:?}"),
+        // The instrumentation boundary can only report the returned value, so
+        // carry everything that distinguishes one refusal from another: the
+        // Display form (which names the stage and reason code), the debug
+        // detail, and the runtime's own status.
+        outcome => {
+            let detail = match &outcome {
+                Err(error) => format!(
+                    "display={error}; debug_detail={:?}",
+                    error.debug_detail().unwrap_or("none")
+                ),
+                Ok(_) => "not a refusal".to_owned(),
+            };
+            return format!(
+                "post-activation page save failed: {outcome:?}; {detail}; status={:?}; progress={}",
+                handle.status(),
+                progress_receipt.join("|")
+            );
+        }
     }
     // Match a force-closed app: do not ask the actor for a clean drain.  Drop
     // the last sender, let the actor stop, and prove the exact durable edit can

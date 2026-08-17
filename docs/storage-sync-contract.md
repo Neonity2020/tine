@@ -597,6 +597,17 @@ from its bounded reason/stage code. Retryable open failures do not invent a
 scenario; if a lower storage boundary detects a durable refusal it emits the
 literal table ID and the public boundary preserves it.
 
+A managed application/editor refusal must also be *attributable*. An
+internal-invariant refusal — one that is not a caller error and has no user
+remedy — still names the stage it came from, and an error crossing between the
+editor and application surfaces preserves that stage instead of collapsing it.
+The reason is a boundary, not a preference: on a platform Tine cannot debug
+interactively (Android instrumentation, a user's device, a bug report) the
+returned value is the only evidence that exists, and an unattributed
+`ActorRefused` makes the failure permanently undiagnosable. An editor rejection
+of a request the *application layer itself* constructed is such a refusal: it
+is never reported as an invalid caller request, and it is never anonymous.
+
 Unix UID equality and “only the current user may write this path” are
 deliberately absent. The threat model does not defend against a malicious actor
 who can already rewrite the user's private filesystem, and those checks reject

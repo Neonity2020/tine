@@ -16583,7 +16583,11 @@ impl RuntimeActor {
             SyncEditorSaveOutcome::Durable { batch_id, page, .. } => {
                 let accepted = match self.prepared_application_reply.take() {
                     Some((prepared_batch, accepted)) if prepared_batch == batch_id => accepted,
-                    Some(_) => return Err(SyncApplicationPageRequestError::ActorRefused),
+                    Some(_) => {
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_prepared_batch_mismatch",
+                        ))
+                    }
                     None => self.reload_application_page(&page.path)?,
                 };
                 let (page, revision) = self.retain_hot_application_save_page(accepted)?;
@@ -16599,7 +16603,9 @@ impl RuntimeActor {
                         match self.load_application_save_exact_ready(&path)? {
                             ApplicationExactLoad::Loaded(current) => current,
                             ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                                return Err(SyncApplicationPageRequestError::ActorRefused)
+                                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_unchanged_reload",
+                                ))
                             }
                         }
                     }
@@ -16630,7 +16636,9 @@ impl RuntimeActor {
                         }
                         ApplicationSaveReloadTarget::CreatedPage => {
                             let [page_id] = affected_page_ids.as_slice() else {
-                                return Err(SyncApplicationPageRequestError::ActorRefused);
+                                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_created_page_id",
+                                ));
                             };
                             self.load_application_page_id_ready(
                                 parse_editor_page_id(page_id)
@@ -18862,7 +18870,11 @@ impl RuntimeActor {
                     let (current_application, requires_hot_recheck) = match prepared_existing.take()
                     {
                         Some(current) if current.editor.page.page_id == page_id => (current, false),
-                        Some(_) => return Err(SyncEditorRequestError::ActorRefused),
+                        Some(_) => {
+                            return Err(SyncEditorRequestError::ActorRefusedAt(
+                                "editor_prepared_page_mismatch",
+                            ))
+                        }
                         None => {
                             let Some(current) = self
                                 .load_active_hot_application_page(page_id)
@@ -18883,9 +18895,13 @@ impl RuntimeActor {
                             .active_engine()
                             .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
                             .materialize_page(page_id)
-                            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                            .map_err(|_| {
+                                SyncEditorRequestError::ActorRefusedAt("editor_materialize_current")
+                            })?;
                         if !editor_materialization_matches(&authoritative, &current.page) {
-                            return Err(SyncEditorRequestError::ActorRefused);
+                            return Err(SyncEditorRequestError::ActorRefusedAt(
+                                "editor_materialization_mismatch",
+                            ));
                         }
                     }
                     if current.dto.revision != *revision {
@@ -19128,8 +19144,9 @@ impl RuntimeActor {
                             .active_engine()
                             .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
                             .current_page_for_logical_name(&final_name)
-                            .map_err(|_| SyncEditorRequestError::ActorRefused)?
-                        {
+                            .map_err(|_| {
+                                SyncEditorRequestError::ActorRefusedAt("editor_rename_owner_lookup")
+                            })? {
                             Some(owner) if owner != page_id => {
                                 return Ok(SyncEditorSaveOutcome::Conflict {
                                     reason: SyncEditorConflict::PageAlreadyExists,
@@ -19145,21 +19162,27 @@ impl RuntimeActor {
                         let engine = self
                             .active_engine()
                             .map_err(|_| SyncEditorRequestError::ActorUnavailable)?;
-                        let store = engine
-                            .archive_store()
-                            .ok_or(SyncEditorRequestError::ActorRefused)?;
+                        let store = engine.archive_store().ok_or(
+                            SyncEditorRequestError::ActorRefusedAt("editor_rename_archive_store"),
+                        )?;
                         let mut query = self
                             .active_database()
                             .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
                             .frontier_reference_query(engine, store)
-                            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                            .map_err(|_| {
+                                SyncEditorRequestError::ActorRefusedAt(
+                                    "editor_rename_reference_query",
+                                )
+                            })?;
                         let plan = query
                             .plan_page_rename(
                                 &current.page.name,
                                 final_name,
                                 current.page.path.clone(),
                             )
-                            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                            .map_err(|_| {
+                                SyncEditorRequestError::ActorRefusedAt("editor_rename_plan")
+                            })?;
                         affected.extend(plan.touched_sources().iter().copied());
                         operations.extend(plan.transaction().operations.iter().cloned());
                     }
@@ -19321,12 +19344,16 @@ impl RuntimeActor {
                         &request,
                         &resolved,
                     )?;
-                    let target = render_requested_page_document(&requested_page, None)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    let target =
+                        render_requested_page_document(&requested_page, None).map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedAt("editor_render_target")
+                        })?;
                     let parsed = self
                         .graph
                         .parse_external_document(&path, &target, false)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedAt("editor_parse_target")
+                        })?;
                     let identity = parsed.resolve_identity(None);
                     let final_name = LogicalPageName::parse(identity.name).map_err(|_| {
                         SyncEditorRequestError::InvalidRequest(
@@ -19338,7 +19365,9 @@ impl RuntimeActor {
                         .active_engine()
                         .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
                         .current_page_for_logical_name(&final_name)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedAt("editor_new_name_owner_lookup")
+                        })?
                         .is_some()
                     {
                         return Ok(SyncEditorSaveOutcome::Conflict {
@@ -19376,9 +19405,9 @@ impl RuntimeActor {
         let Some(transaction) = transaction else {
             let current = match existing_application {
                 Some(current) => current.editor,
-                None => self
-                    .load_active_hot_editor_page(page_id)?
-                    .ok_or(SyncEditorRequestError::ActorRefused)?,
+                None => self.load_active_hot_editor_page(page_id)?.ok_or(
+                    SyncEditorRequestError::ActorRefusedAt("editor_load_current_page"),
+                )?,
             };
             return Ok(SyncEditorSaveOutcome::Unchanged {
                 page: current.dto,
@@ -20314,7 +20343,9 @@ impl RuntimeActor {
                         crate::model::content_rev(target) != committed.revision()
                     })
                 {
-                    return Err(SyncEditorRequestError::ActorRefused);
+                    return Err(SyncEditorRequestError::ActorRefusedAt(
+                        "editor_response_revision_shape",
+                    ));
                 }
                 page.clone()
             }
@@ -20325,13 +20356,15 @@ impl RuntimeActor {
                 #[cfg(test)]
                 note_trusted_local_response_parse_fallback();
                 let path = ManagedPath::parse(committed.relative_path().to_owned())
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    .map_err(|_| SyncEditorRequestError::ActorRefusedAt("editor_response_path"))?;
                 let parsed = self
                     .graph
                     .parse_exact_page_dto(&path, committed.exact_target())
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    .map_err(|_| SyncEditorRequestError::ActorRefusedAt("editor_response_parse"))?;
                 if parsed.rev.as_deref() != Some(committed.revision()) {
-                    return Err(SyncEditorRequestError::ActorRefused);
+                    return Err(SyncEditorRequestError::ActorRefusedAt(
+                        "editor_response_revision",
+                    ));
                 }
                 parsed
             }
@@ -20340,7 +20373,7 @@ impl RuntimeActor {
             committed.post_page().clone(),
             MAX_SYNC_APPLICATION_PAGE_BLOCKS,
         )?;
-        join_application_page(parsed, editor).map_err(|_| SyncEditorRequestError::ActorRefused)
+        join_application_page(parsed, editor).map_err(map_application_editor_error)
     }
 
     fn install_latest_task_query_overlay(
@@ -26483,9 +26516,69 @@ fn map_editor_application_error(error: SyncEditorRequestError) -> SyncApplicatio
         SyncEditorRequestError::ActorRefusedWithDebugDetail { code, debug_detail } => {
             SyncApplicationPageRequestError::ActorRefusedWithDebugDetail { code, debug_detail }
         }
-        SyncEditorRequestError::InvalidRequest(_) | SyncEditorRequestError::ActorRefused => {
-            SyncApplicationPageRequestError::ActorRefused
+        // An editor-shaped invalid request is not a caller error at the
+        // application boundary: the application layer built that request. Name
+        // the exact editor rejection instead of collapsing it into an
+        // unattributable refusal, or the only report a platform boundary can
+        // make is "something refused".
+        SyncEditorRequestError::InvalidRequest(reason) => {
+            SyncApplicationPageRequestError::ActorRefusedAt(derived_editor_invalid_request_stage(
+                reason,
+            ))
         }
+        SyncEditorRequestError::ActorRefused => SyncApplicationPageRequestError::ActorRefused,
+    }
+}
+
+/// Stage name for an editor rejection of a request the application layer built
+/// itself. These are internal-invariant failures, so the stage is the only
+/// evidence a non-host boundary (Android instrumentation, a user report) can
+/// carry back.
+fn derived_editor_invalid_request_stage(reason: SyncEditorInvalidRequest) -> &'static str {
+    match reason {
+        SyncEditorInvalidRequest::EmptyTemporaryKey => "derived_editor_empty_temporary_key",
+        SyncEditorInvalidRequest::InvalidTemporaryKey => "derived_editor_invalid_temporary_key",
+        SyncEditorInvalidRequest::InvalidExistingId => "derived_editor_invalid_existing_id",
+        SyncEditorInvalidRequest::DuplicateKey => "derived_editor_duplicate_key",
+        SyncEditorInvalidRequest::UnknownParent => "derived_editor_unknown_parent",
+        SyncEditorInvalidRequest::CyclicOutline => "derived_editor_cyclic_outline",
+        SyncEditorInvalidRequest::InvalidName => "derived_editor_invalid_name",
+    }
+}
+
+/// Carry an application-layer refusal back into the editor error surface
+/// without discarding where it came from.
+fn map_application_editor_error(error: SyncApplicationPageRequestError) -> SyncEditorRequestError {
+    match error {
+        SyncApplicationPageRequestError::ActorUnavailable => {
+            SyncEditorRequestError::ActorUnavailable
+        }
+        SyncApplicationPageRequestError::ActorRefusedAt(stage) => {
+            SyncEditorRequestError::ActorRefusedAt(stage)
+        }
+        SyncApplicationPageRequestError::ActorRefusedWithCode(code) => {
+            SyncEditorRequestError::ActorRefusedWithCode(code)
+        }
+        SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage, code } => {
+            SyncEditorRequestError::ActorRefusedAtWithCode { stage, code }
+        }
+        SyncApplicationPageRequestError::ActorRefusedWithDebugDetail { code, debug_detail } => {
+            SyncEditorRequestError::ActorRefusedWithDebugDetail { code, debug_detail }
+        }
+        SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+            stage,
+            code,
+            debug_detail,
+        } => SyncEditorRequestError::ActorRefusedAtWithDebugDetail {
+            stage,
+            code,
+            debug_detail,
+        },
+        SyncApplicationPageRequestError::RequestTooLarge(size) => {
+            SyncEditorRequestError::RequestTooLarge(size)
+        }
+        SyncApplicationPageRequestError::InvalidRequest(_)
+        | SyncApplicationPageRequestError::ActorRefused => SyncEditorRequestError::ActorRefused,
     }
 }
 
@@ -26657,7 +26750,9 @@ fn join_application_page(
                 parsed.guide,
             );
         }
-        return Err(SyncApplicationPageRequestError::ActorRefused);
+        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+            "managed_read_page_header",
+        ));
     }
     // Filename and journal formatting policy are parser inputs, not accepted
     // page identity. Once the exact path and source content authenticate this
@@ -26682,7 +26777,9 @@ fn join_application_page(
                 editor.blocks.len(),
             );
         }
-        return Err(SyncApplicationPageRequestError::ActorRefused);
+        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+            "managed_read_block_count",
+        ));
     }
     let materialized = editor
         .blocks
@@ -26698,7 +26795,11 @@ fn join_application_page(
             SyncEditorBlockKey::Existing(id) => parse_editor_block_id(id)
                 .map(|id| (id, index))
                 .map_err(map_editor_application_error),
-            SyncEditorBlockKey::Temporary(_) => Err(SyncApplicationPageRequestError::ActorRefused),
+            SyncEditorBlockKey::Temporary(_) => {
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "managed_read_temporary_block_index",
+                ))
+            }
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
     let mut frontend_ids = Vec::with_capacity(parsed_blocks.len());
@@ -26710,19 +26811,25 @@ fn join_application_page(
                 parse_editor_block_id(id).map_err(map_editor_application_error)?
             }
             SyncEditorBlockKey::Temporary(_) => {
-                return Err(SyncApplicationPageRequestError::ActorRefused)
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "managed_read_temporary_block_key",
+                ))
             }
         };
-        let actor_block = materialized
-            .get(&sparse_id)
-            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        let actor_block =
+            materialized
+                .get(&sparse_id)
+                .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "managed_read_missing_materialized_block",
+                ))?;
         let actor_parent_index = actor_block
             .parent
             .map(|parent| {
-                sparse_indexes
-                    .get(&parent)
-                    .copied()
-                    .ok_or(SyncApplicationPageRequestError::ActorRefused)
+                sparse_indexes.get(&parent).copied().ok_or(
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "managed_read_unknown_block_parent",
+                    ),
+                )
             })
             .transpose()?;
         if parsed_block.parent != actor_parent_index
@@ -26740,14 +26847,18 @@ fn join_application_page(
                     editor_block.content,
                 );
             }
-            return Err(SyncApplicationPageRequestError::ActorRefused);
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "managed_read_block_mismatch",
+            ));
         }
         let frontend_id = match actor_block.logseq_uuid {
             Some(logseq_uuid) => logseq_uuid.to_string(),
             None => format!("{SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX}{sparse_id}"),
         };
         if !seen_frontend_ids.insert(frontend_id.clone()) {
-            return Err(SyncApplicationPageRequestError::ActorRefused);
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "managed_read_duplicate_block_identity",
+            ));
         }
         frontend_ids.push(frontend_id);
     }
@@ -44410,6 +44521,166 @@ mod tests {
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    /// The Android instrumentation journey (`android_managed_storage_smoke.rs`)
+    /// drives this exact call sequence and request shape against a graph on
+    /// Android shared storage.  It has been failing there with an
+    /// information-free `Err(ActorRefused)` since the journey first performed a
+    /// post-activation save.  This host test pins the same sequence so the
+    /// Linux/host boundary stays green and any future host-visible regression
+    /// in it is caught here rather than only on an emulator.
+    #[test]
+    fn android_instrumentation_save_journey_shape_succeeds_on_a_host_graph() {
+        let root =
+            std::env::temp_dir().join(format!("tine-android-journey-shape-{}", Uuid::new_v4()));
+        let graph_root = root.join("graph");
+        let private_root = root.join("private");
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        fs::create_dir_all(graph_root.join("journals")).unwrap();
+        fs::create_dir_all(graph_root.join("logseq")).unwrap();
+        fs::write(
+            graph_root.join("pages/Smoke.md"),
+            b"- Android managed storage smoke\n",
+        )
+        .unwrap();
+        fs::write(graph_root.join("logseq/config.edn"), b"{}\n").unwrap();
+
+        let identities = SyncLocalActivationIdentities {
+            workspace_id: WorkspaceId::new(),
+            lineage_digest: LineageDigest::of(Uuid::new_v4().as_bytes()),
+            catalog_document_id: DocumentId::new(),
+            endpoint_id: ProjectionEndpointId::new(),
+            device_id: DeviceId::new(),
+            preparation_id: Uuid::new_v4(),
+            session_id: SessionId::new(),
+        };
+        let open_request = SyncRuntimeOpenRequest {
+            profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(identities.clone()),
+            graph_root: graph_root.clone(),
+            archive_root: private_root.join("archive"),
+            enrollment_root: private_root.join("enrollment"),
+            receipt_root: private_root.join("receipts"),
+            database_path: private_root.join("projection/materialization.sqlite"),
+            application_runtime_root: private_root.join("runtime"),
+            migration_backup_root: private_root.join("migration-backup"),
+            provider_root: graph_root.join(".tine-sync/v2/shared"),
+            provider_journal_root: private_root.join("provider/device/journal"),
+        };
+        let activation_request = SyncLocalActivationRequest {
+            graph_root: graph_root.clone(),
+            archive_root: open_request.archive_root.clone(),
+            enrollment_root: open_request.enrollment_root.clone(),
+            receipt_root: open_request.receipt_root.clone(),
+            database_path: open_request.database_path.clone(),
+            application_runtime_root: open_request.application_runtime_root.clone(),
+            migration_backup_root: open_request.migration_backup_root.clone(),
+            capture_root: private_root.join("capture"),
+            preparation_root: private_root.join("preparation"),
+            provider_root: open_request.provider_root.clone(),
+            provider_journal_root: open_request.provider_journal_root.clone(),
+            identities,
+        };
+
+        let mut progress_log = Vec::new();
+        let activation = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
+            activation_request,
+            |progress| progress_log.push(progress.diagnostic_name().to_string()),
+        );
+        assert_eq!(
+            activation.status,
+            SyncLocalActivationStatus::Active,
+            "progress={progress_log:?}"
+        );
+        let handle = activation.handle.expect("activation opens the actor");
+        let (mut page, revision) =
+            match handle.load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "pages/Smoke.md".into(),
+                },
+            }) {
+                Ok(SyncApplicationPageLoadOutcome::Loaded { page, revision }) => (page, revision),
+                other => panic!("post-activation page load failed: {other:?}"),
+            };
+        page.blocks
+            .first_mut()
+            .expect("post-activation page has an editable block")
+            .raw = "Android managed storage edited".into();
+        let saved = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        });
+        assert!(
+            matches!(saved, Ok(SyncApplicationPageSaveOutcome::Saved { .. })),
+            "post-activation page save failed: {saved:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/Smoke.md")).unwrap(),
+            "- Android managed storage edited\n"
+        );
+
+        // Match the force-closed app the instrumentation models: drop the last
+        // sender without a clean drain and prove the exact durable edit reopens.
+        drop(handle);
+        let reopened = SyncRuntimeHandle::open(open_request);
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened.handle.expect("crash-style reopen opens the actor");
+        match handle.load_application_page(SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath {
+                path: "pages/Smoke.md".into(),
+            },
+        }) {
+            Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. }) => assert_eq!(
+                page.blocks.first().map(|block| block.raw.as_str()),
+                Some("Android managed storage edited")
+            ),
+            other => panic!("crash-style reopened page mismatch: {other:?}"),
+        }
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// Every refusal a platform boundary can observe must name where it came
+    /// from.  The Android instrumentation journey can report only the returned
+    /// error value, so an editor-shaped rejection of a request the application
+    /// layer built itself must not collapse into a bare `ActorRefused`: that
+    /// leaves an off-host failure permanently undiagnosable.
+    #[test]
+    fn derived_editor_rejections_name_their_stage_at_the_application_boundary() {
+        for reason in [
+            SyncEditorInvalidRequest::EmptyTemporaryKey,
+            SyncEditorInvalidRequest::InvalidTemporaryKey,
+            SyncEditorInvalidRequest::InvalidExistingId,
+            SyncEditorInvalidRequest::DuplicateKey,
+            SyncEditorInvalidRequest::UnknownParent,
+            SyncEditorInvalidRequest::CyclicOutline,
+            SyncEditorInvalidRequest::InvalidName,
+        ] {
+            let mapped = map_editor_application_error(SyncEditorRequestError::InvalidRequest(
+                reason.clone(),
+            ));
+            let SyncApplicationPageRequestError::ActorRefusedAt(stage) = mapped else {
+                panic!("derived editor rejection {reason:?} lost its site: {mapped:?}");
+            };
+            assert!(
+                stage.starts_with("derived_editor_"),
+                "unexpected stage {stage}"
+            );
+        }
+        // The reverse direction must not discard a named application refusal
+        // either: the trusted-response join runs inside the editor turn.
+        assert_eq!(
+            map_application_editor_error(SyncApplicationPageRequestError::ActorRefusedAt(
+                "managed_read_block_count"
+            )),
+            SyncEditorRequestError::ActorRefusedAt("managed_read_block_count")
+        );
     }
 
     #[test]
