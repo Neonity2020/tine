@@ -72,6 +72,7 @@ import {
   pageInventoryRev,
   bumpPageInventoryRev,
   installPaneTracker,
+  isConflicted,
   pushToast,
   refreshSyncConflicts,
   graphEpoch,
@@ -98,7 +99,7 @@ import {
 } from "./store";
 import { applyDivergenceVerdict, graphBinding, isSaving, reconcileExternalChange } from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
-import { backend, isTauri, type GraphChange } from "./backend";
+import { backend, isTauri, type GraphChange, type GraphChangedBulk } from "./backend";
 import { parserFailed } from "./render/parse";
 import { warnIfSoftwareRendering } from "./gpu";
 import { initSmoothScroll } from "./smoothScroll";
@@ -244,7 +245,24 @@ export async function handleGraphChange(c: GraphChange) {
   // below, while unloaded block references re-resolve by UUID from dataRev.
   bumpDataRev();
   if (c.created || c.removed) bumpPageInventoryRev();
+  await applyExternalChange(c, binding);
+}
+
+/** The per-page half of `handleGraphChange`: everything except the dataRev /
+ *  inventory bumps, which a bulk revision performs once for its whole epoch.
+ *  `suppressFeedRestart` lets that bulk path restart a live Journals feed once
+ *  at the end instead of once per changed journal. */
+async function applyExternalChange(
+  c: GraphChange,
+  binding: number,
+  opts: { suppressFeedRestart?: boolean } = {},
+) {
   const routes = layoutPaneIds().map((paneId) => ({ paneId, router: paneRouter(paneId), route: paneRouter(paneId).route() }));
+  const requestJournalFeedRestart = (
+    owned: Array<{ paneId: string; route: ReturnType<PaneRouter["route"]> }>
+  ) => {
+    if (!opts.suppressFeedRestart) requestJournalFeedWatcherRestart(owned);
+  };
   if (c.removed) {
     const disp = reloadDisposition(c.name);
     if (disp === "conflict") {
@@ -252,12 +270,12 @@ export async function handleGraphChange(c: GraphChange) {
       // raise the banner: only its refusal carries the authority "Keep mine"
       // must present (see `reconcileExternalChange`).
       await reconcileExternalChange(c.name);
-      if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+      if (c.kind === "journal") requestJournalFeedRestart(routes);
       return;
     }
     if (disp === "skip") {
       deferExternalReload(c, binding);
-      if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+      if (c.kind === "journal") requestJournalFeedRestart(routes);
       return;
     }
     for (const p of routes) {
@@ -268,7 +286,7 @@ export async function handleGraphChange(c: GraphChange) {
     }
     if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
       await restoreTodayJournalInFeed();
-      requestJournalFeedWatcherRestart(routes);
+      requestJournalFeedRestart(routes);
     }
     return;
   }
@@ -276,7 +294,7 @@ export async function handleGraphChange(c: GraphChange) {
   const disp = reloadDisposition(c.name);
   if (disp === "skip") {
     deferExternalReload(c, binding);
-    if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+    if (c.kind === "journal") requestJournalFeedRestart(routes);
     return;
   }
   if (disp === "conflict") {
@@ -291,7 +309,7 @@ export async function handleGraphChange(c: GraphChange) {
       if (binding !== graphBinding()) return;
       await applyDivergenceVerdict(c.name, { exists: !!current, rev: current?.rev ?? null });
     }
-    if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+    if (c.kind === "journal") requestJournalFeedRestart(routes);
     return;
   }
   if (routes.some((p) => p.route.kind === "page" && p.route.name === c.name)) {
@@ -304,7 +322,7 @@ export async function handleGraphChange(c: GraphChange) {
     // A page surface may have the same journal loaded while another live pane
     // shows Journals.  Reloading that DTO is not feed reconciliation: always
     // give the live feed owner its authoritative null-cursor restart too.
-    if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
+    if (c.kind === "journal") requestJournalFeedRestart(routes);
     return;
   }
   if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
@@ -313,13 +331,13 @@ export async function handleGraphChange(c: GraphChange) {
       if (dto && !(await reloadPageIfStillSafe(c.name, dto, binding))) {
         deferExternalReload(c, binding);
       }
-      requestJournalFeedWatcherRestart(routes);
+      requestJournalFeedRestart(routes);
       return;
     }
     // The feed owner performs the page-scoped dirty/save/conflict/move gate.
     // Calling it even while unsafe records a pending restart instead of losing
     // this watcher update until another unrelated file changes.
-    requestJournalFeedWatcherRestart(routes);
+    requestJournalFeedRestart(routes);
     return;
   }
   if (pageByName(c.name) && !doc.feed.includes(c.name)) {
@@ -328,6 +346,50 @@ export async function handleGraphChange(c: GraphChange) {
       deferExternalReload(c, binding);
     }
   }
+}
+
+/** An external bulk revision — a VCS checkout, branch switch, or big sync that
+ *  the watcher coalesced into one `graph-changed-bulk` epoch (Concord P2).
+ *
+ *  One epoch, one invalidation: dataRev and the page inventory bump once for
+ *  the whole batch. Only pages that need active handling are touched — visible
+ *  (routed) pages reload through the existing safe path, and pages with unsaved
+ *  state run exactly the same divergence/defer machinery as a single watcher
+ *  event (a bulk change while a page is being edited defers that page's reload
+ *  like any other). Everything else is left for lazy reload: navigation always
+ *  refetches from the backend, whose cache the watcher has already updated.
+ *  The user sees one calm summary toast — never a dialog. */
+export async function handleGraphChangedBulk(bulk: GraphChangedBulk) {
+  const binding = graphBinding();
+  const changes = bulk.changes;
+  if (!changes.length) return;
+  bumpDataRev();
+  if (changes.some((c) => c.created || c.removed)) bumpPageInventoryRev();
+  const routedNames = new Set<string>();
+  for (const paneId of layoutPaneIds()) {
+    const route = paneRouter(paneId).route();
+    if (route.kind === "page") routedNames.add(route.name);
+  }
+  let conflicts = 0;
+  for (const c of changes) {
+    if (binding !== graphBinding()) return;
+    const active = routedNames.has(c.name) || reloadDisposition(c.name) !== "reload";
+    if (!active) continue;
+    // Journal-feed restarts are suppressed per page and issued once below.
+    await applyExternalChange(c, binding, { suppressFeedRestart: true });
+    if (isConflicted(c.name)) conflicts += 1;
+  }
+  if (binding !== graphBinding()) return;
+  if (changes.some((c) => c.kind === "journal")) {
+    requestJournalFeedWatcherRestart(
+      layoutPaneIds().map((paneId) => ({ paneId, route: paneRouter(paneId).route() }))
+    );
+  }
+  const summary = `${changes.length} page${changes.length === 1 ? "" : "s"} updated externally`;
+  const conflictSuffix = conflicts
+    ? ` · ${conflicts} conflict${conflicts === 1 ? "" : "s"} to review`
+    : "";
+  pushToast(summary + conflictSuffix, "info");
 }
 
 export async function handleSparseV2Changed() {
@@ -806,6 +868,15 @@ export function App(): JSX.Element {
     let unsub = () => {};
     void backend()
       .onGraphChanged((c) => void handleGraphChange(c))
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  // Coalesced external bulk revisions (VCS checkout / big sync): one aggregate
+  // event above the backend's bulk threshold instead of per-page events.
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onGraphChangedBulk((bulk) => void handleGraphChangedBulk(bulk))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });

@@ -557,6 +557,9 @@ export interface Backend {
   savePdfAreaImage(pdf: string, page: number, id: string, stamp: number, bytes: Uint8Array): Promise<string>;
   /** Subscribe to external file changes (file watcher). Returns an unsubscribe. */
   onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void>;
+  /** Subscribe to coalesced external bulk revisions (Concord P2): one event
+   *  per reconcile cycle that changed more than the bulk threshold of pages. */
+  onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void>;
   /** Subscribe to an admitted aggregate managed-storage change. */
   onSparseV2Changed(cb: () => void): Promise<() => void>;
   /** Subscribe to deduplicated managed-sync reconciliation failures. */
@@ -660,6 +663,14 @@ export interface GraphChange {
   kind: "journal" | "page";
   created: boolean;
   removed: boolean;
+}
+
+/** One aggregate watcher notification for an external bulk revision (a VCS
+ *  checkout, branch switch, or big sync): emitted instead of N `graph-changed`
+ *  events when one reconcile cycle changed more than the backend's bulk
+ *  threshold of pages. Carries the same per-page change shape. */
+export interface GraphChangedBulk {
+  changes: GraphChange[];
 }
 
 export function isTauri(): boolean {
@@ -1323,6 +1334,10 @@ class TauriBackend implements Backend {
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChange>("graph-changed", (e) => cb(e.payload));
+  }
+  async onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
   }
   async onSparseV2Changed(cb: () => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
