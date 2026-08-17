@@ -41,10 +41,13 @@ authority from phase strings or inactivity.
 Beginning an operation and final graph-registry publication share one short
 linearization mutex. The supervisor model mutex is released before registry
 publication, so a registry lock cannot make the operation model itself
-unavailable. Managed activation reaches stable success only after the new
-actor-backed generation can answer the complete page inventory and open a
-representative page, and after the frontend retires renderer state owned by the
-former generation. Native slot installation alone is not readiness.
+unavailable. Native managed activation reaches stable success only after the
+new actor-backed generation can answer the complete page inventory and open a
+representative page. The frontend does not display that successful result until
+it has retired renderer state owned by the former generation and repeated the
+ordinary page-list/page-open observation through its newly leased generation.
+Native slot installation alone is not readiness, and frontend readiness is an
+observation gate rather than a second storage authority.
 
 Return to Direct Files has two explicit operations. Graceful return drains a
 healthy managed actor and proves its committed projection before selecting

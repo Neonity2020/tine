@@ -1497,10 +1497,26 @@ mod tests {
             .expect("ordinary graph-load decision")..];
         assert!(
             load.find("refuse_unclaimed_sparse_archive")
-                < load.find("open_and_publish_direct_files"),
+                < load.find("let prepared = match prepare_direct_files_open"),
             "partial provider evidence must be refused before a Direct Files binding is installed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_reopen_proves_pages_before_registry_publication() {
+        let source = include_str!("graph.rs");
+        let start = source
+            .find("pub(crate) fn load_graph_for_label")
+            .expect("graph load function");
+        let managed = &source[start..];
+        let readiness = managed
+            .find("prove_managed_application_ready(&slot, None)")
+            .expect("managed page readiness proof");
+        let publication = managed
+            .find("commit_if_current(managed_id")
+            .expect("managed registry publication");
+        assert!(readiness < publication);
     }
 
     #[test]
