@@ -286,6 +286,12 @@ jobs:
         if: matrix.lane == 'linux-x64'
         run: cargo install tauri-driver --locked
 
+      # Prove the receipt machinery itself before trusting the receipt that
+      # binds the released binary to this exact source revision.
+      - name: E2E build-provenance machinery is sound
+        if: matrix.lane == 'linux-x64'
+        run: npm run test:e2e-provenance
+
       - name: Gate Linux x64 on the complete real-app regression catalog
         if: matrix.lane == 'linux-x64'
         env:

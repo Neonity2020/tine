@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { coverageReferenceProblem } from "./lib/coverage-reference.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const uiCheck = spawnSync(process.execPath, [path.join(root, "scripts/check-ui-regression-catalog.mjs")], {
@@ -61,11 +62,10 @@ if (index.schemaVersion !== 1 || !Array.isArray(index.inventories) || index.inve
         if (!Number.isInteger(issue) || issue < 1) problems.push(`${entry.id}: invalid issue ${issue}`);
       }
       for (const test of entry.coverage?.tests ?? []) {
-        // A coverage entry is `path`, `path#anchor`, or Rust-style `path::fn`
-        // (a real path never contains `::` or `#`). Strip the symbol suffix so
-        // we validate the actual file, not `path::fn` as a bogus filename.
-        const file = test.split(/::|#/, 1)[0];
-        if (!fs.existsSync(path.join(root, file))) problems.push(`${entry.id}: missing test file ${file}`);
+        // The file AND the named symbol must resolve: a catalog row that names a
+        // renamed or deleted test is a coverage claim with no evidence behind it.
+        const problem = coverageReferenceProblem(root, test);
+        if (problem) problems.push(`${entry.id}: ${problem}`);
       }
     }
   }
