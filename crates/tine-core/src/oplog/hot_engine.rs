@@ -3520,6 +3520,19 @@ pub(crate) enum CleanImportProjectionPredecessor {
     },
 }
 
+/// Exact bytes expected at one clean-runtime projection path while deciding
+/// whether an external observation needs semantic reconciliation.
+///
+/// This deliberately carries no mutation authority.  A changed path still
+/// goes through `clean_import_projection_predecessor`, which performs the
+/// complete semantic proof before authoring.  The watcher only needs a
+/// no-false-negative byte comparison, so making every unchanged page replay
+/// its parser and projection plan is both redundant and prohibitively slow.
+pub(crate) enum CleanObservedProjection {
+    Present(Vec<u8>),
+    Released,
+}
+
 impl CapabilityCapturedPriorProjection {
     fn validate_authority(&self) -> Result<(), EngineError> {
         match (
@@ -8860,6 +8873,91 @@ impl ShardedHotEngine {
                     intent,
                     completion,
                 }))
+            }
+        }
+    }
+
+    /// Read the exact currently accepted projection bytes for watcher
+    /// comparison without constructing semantic mutation authority.
+    ///
+    /// Accepted manifest work supersedes the immutable activation baseline.
+    /// Identity and path bindings are still checked here; if bytes differ,
+    /// external reconciliation repeats the stronger semantic proof before it
+    /// can mutate anything.
+    pub(crate) fn clean_observed_projection(
+        &self,
+        path: &ManagedPath,
+        sqlite_owner: Option<PageId>,
+    ) -> Result<Option<CleanObservedProjection>, EngineError> {
+        self.require_index_free_clean_projection_runtime()?;
+        match sqlite_owner {
+            Some(page_id) => {
+                if let Some(work) = self.clean_projection_heads.get(path).cloned() {
+                    if work.page_id() != page_id || work.path() != path {
+                        return Err(EngineError::ProjectionManifest(format!(
+                            "clean observed projection head for {path} is misbound"
+                        )));
+                    }
+                    let bytes = match work.target() {
+                        ProjectionWorkTarget::Present(_) => {
+                            let (archive, _) = self.clean_projection_runtime_binding()?;
+                            let decoded = super::projection::decode_manifested_projection_work(
+                                &archive, &work,
+                            )
+                            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                            decoded.target_bytes().map(<[u8]>::to_vec).ok_or_else(|| {
+                                EngineError::ProjectionManifest(format!(
+                                    "clean observed projection for {path} has no present bytes"
+                                ))
+                            })?
+                        }
+                        ProjectionWorkTarget::Absent => {
+                            return Err(EngineError::ProjectionManifest(format!(
+                                "clean observed projection for live path {path} is released"
+                            )))
+                        }
+                    };
+                    return Ok(Some(CleanObservedProjection::Present(bytes)));
+                }
+                let genesis = self.lazy_genesis.as_ref().ok_or_else(|| {
+                    EngineError::ProjectionWork(
+                        "clean runtime has no immutable activation baseline".into(),
+                    )
+                })?;
+                let page = genesis
+                    .page(page_id)
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+                    .ok_or_else(|| {
+                        EngineError::ProjectionManifest(format!(
+                            "clean observed projection for {path} has no baseline page {page_id}"
+                        ))
+                    })?;
+                if page.path != *path || page.page_id != page_id {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean observed baseline projection for {path} is misbound"
+                    )));
+                }
+                Ok(Some(CleanObservedProjection::Present(
+                    page.exact_source_bytes,
+                )))
+            }
+            None => {
+                let Some(work) = self.clean_projection_heads.get(path) else {
+                    return Ok(None);
+                };
+                if work.path() != path {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "clean observed released projection for {path} is misbound"
+                    )));
+                }
+                match work.target() {
+                    ProjectionWorkTarget::Absent => Ok(Some(CleanObservedProjection::Released)),
+                    ProjectionWorkTarget::Present(_) => {
+                        Err(EngineError::ProjectionManifest(format!(
+                            "clean observed projection for unowned path {path} remains present"
+                        )))
+                    }
+                }
             }
         }
     }

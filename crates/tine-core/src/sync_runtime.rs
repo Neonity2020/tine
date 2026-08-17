@@ -300,6 +300,7 @@ macro_rules! managed_local_compaction_cut {
 const MAX_WATCHER_OBSERVATIONS: usize = 256;
 const MAX_WATCHER_PATH_BYTES: usize = 64 * 1024;
 const MAX_CLEAN_DRAIN_TURNS: usize = 64;
+const CLEAN_FULL_SCAN_SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 const MAX_PROVIDER_EXACT_PATHS: usize = 256;
 const MAX_PROVIDER_EXACT_PATH_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_PUBLICATION_REPAIR_PROBES_PER_TICK: usize = 16;
@@ -5628,25 +5629,19 @@ impl CleanRuntimeActorCore {
             let predecessor = self
                 .runtime
                 .engine()
-                .clean_import_projection_predecessor(&path, sqlite_owner, &read)
+                .clean_observed_projection(&path, sqlite_owner)
                 .map_err(|error| CleanActorMutationFailure {
                     phase: OperationalPhase::Planning,
-                    detail: format!("clean watcher predecessor for {path} failed: {error}"),
+                    detail: format!("clean watcher observation for {path} failed: {error}"),
                 })?;
             let differs = match (continuation.disk.get(&path), &predecessor) {
                 (None, None)
-                | (
-                    None,
-                    Some(crate::oplog::hot_engine::CleanImportProjectionPredecessor::Released {
-                        ..
-                    }),
-                ) => false,
+                | (None, Some(crate::oplog::hot_engine::CleanObservedProjection::Released)) => {
+                    false
+                }
                 (
                     Some(bytes),
-                    Some(crate::oplog::hot_engine::CleanImportProjectionPredecessor::Present {
-                        bytes: prior,
-                        ..
-                    }),
+                    Some(crate::oplog::hot_engine::CleanObservedProjection::Present(prior)),
                 ) => bytes != prior,
                 _ => true,
             };
@@ -5664,8 +5659,15 @@ impl CleanRuntimeActorCore {
                         ),
                         match &predecessor {
                             None => "absent".to_owned(),
-                            Some(crate::oplog::hot_engine::CleanImportProjectionPredecessor::Present { bytes, .. }) => format!("present:{}:{:?}", bytes.len(), crate::oplog::BlobDescription::of(bytes)),
-                            Some(crate::oplog::hot_engine::CleanImportProjectionPredecessor::Released { .. }) => "released".to_owned(),
+                            Some(crate::oplog::hot_engine::CleanObservedProjection::Present(
+                                bytes,
+                            )) => format!(
+                                "present:{}:{:?}",
+                                bytes.len(),
+                                crate::oplog::BlobDescription::of(bytes)
+                            ),
+                            Some(crate::oplog::hot_engine::CleanObservedProjection::Released) =>
+                                "released".to_owned(),
                         }
                     );
                 }
@@ -24942,7 +24944,9 @@ impl RuntimeActor {
             )));
         }
         if self.clean.is_some() {
-            for _ in 0..MAX_CLEAN_DRAIN_TURNS {
+            let full_scan_started = Instant::now();
+            let mut non_scan_turns = 0_usize;
+            loop {
                 let settled = self.clean.as_ref().is_some_and(|clean| {
                     clean.pending.is_none()
                         && clean.full_scan.is_none()
@@ -24952,6 +24956,16 @@ impl RuntimeActor {
                 if settled {
                     self.stopped_safe = true;
                     return Ok(SyncShutdownOutcome::Safe(self.snapshot()));
+                }
+                let draining_full_scan = self.clean.as_ref().is_some_and(|clean| {
+                    clean.full_scan.is_some()
+                        || clean.completed_full_scan.is_some()
+                        || clean.watcher.full_scan
+                });
+                if draining_full_scan
+                    && full_scan_started.elapsed() >= CLEAN_FULL_SCAN_SHUTDOWN_BUDGET
+                {
+                    break;
                 }
                 match self.tick_clean_runtime() {
                     SyncRuntimeTick::Idle
@@ -24963,7 +24977,14 @@ impl RuntimeActor {
                     })
                     | SyncRuntimeTick::LocalMutation(
                         SyncLocalMutationOutcome::RetryableRetainedRecovery { .. },
-                    ) => {}
+                    ) => {
+                        if !draining_full_scan {
+                            non_scan_turns = non_scan_turns.saturating_add(1);
+                            if non_scan_turns >= MAX_CLEAN_DRAIN_TURNS {
+                                break;
+                            }
+                        }
+                    }
                     SyncRuntimeTick::Failed(detail)
                     | SyncRuntimeTick::Blocked(detail)
                     | SyncRuntimeTick::RecoveryBlocked(detail)
@@ -44527,6 +44548,33 @@ mod tests {
             SyncApplicationPageLoadOutcome::Loaded { page, .. } if page.path == "Root.md"
         ));
         drain_until_settled(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit() {
+        let fixture = ActivationFixture::nested_unicode("clean-large-shutdown-scan", 0xa180);
+        fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+        for index in 0..(MAX_CLEAN_DRAIN_TURNS * CLEAN_FULL_SCAN_PATH_BUDGET + 8) {
+            fs::write(
+                fixture
+                    .graph_root
+                    .join("pages")
+                    .join(format!("large shutdown scan {index}.md")),
+                format!("- large shutdown scan page {index}\n"),
+            )
+            .unwrap();
+        }
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+            .unwrap();
+
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

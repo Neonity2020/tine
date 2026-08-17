@@ -58,6 +58,10 @@ publication.
 After managed slot publication, the watcher still performs one full handoff-gap
 reconciliation. It begins immediately, but the expensive path-comparison phase
 is a retained cursor with both a path-count and wall-time budget per actor turn.
+That comparison reads exact accepted projection bytes; it does not replay the
+parser and semantic mutation planner for unchanged pages. A differing path is
+only a candidate: the ordinary external-reconciliation transaction must still
+reconstruct and validate its complete semantic predecessor before authoring.
 The cursor remains visibly pending and prevents `Safe` until its exact epoch is
 settled; application, enrollment, and status requests can run between turns.
 There is no timer-based priority claim and no O(graph) comparison turn on the

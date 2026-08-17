@@ -22,6 +22,8 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::clean_reopen_negative_lookup_settles_closed_interval_addition_and_rename",
   "sync_runtime::tests::clean_runtime_factories_adopt_marker_and_cold_reopen_without_legacy_enrollment",
   "sync_runtime::tests::clean_actor_core_retains_one_manifested_save_until_projection_finishes",
+  "sync_runtime::tests::clean_full_scan_yields_between_bounded_path_slices",
+  "sync_runtime::tests::clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit",
   "sync_runtime::tests::clean_runtime_actor_assembles_without_legacy_authority_and_saves_one_edit",
   "sync_runtime::tests::clean_runtime_handle_serves_sqlite_queries_and_stops_without_legacy_handoff",
   "sync_runtime::tests::clean_runtime_cross_page_move_commits_once_and_cold_reopens",
