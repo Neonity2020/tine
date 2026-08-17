@@ -61,6 +61,19 @@ pub enum RowKind {
     Removed,
 }
 
+/// How a row relates to the 3-way BASE (the last text Tine agreed on with the
+/// disk, from the Concord ledger). Only present on 3-way diffs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Diff3Verdict {
+    /// Only the winner diverged from the base → keeping mine preserves the change.
+    MineOnly,
+    /// Only the conflict copy diverged from the base → keeping theirs preserves it.
+    TheirsOnly,
+    /// Both sides diverged from the base — a true conflict, no safe suggestion.
+    BothChanged,
+}
+
 /// One aligned position in the block trees. `id` is a stable path ("2.1" = 2nd
 /// child of the 3rd row) that the resolve step reproduces exactly, so the UI's
 /// per-row decisions map back onto the same blocks.
@@ -74,6 +87,14 @@ pub struct DiffRow {
     /// present). `Added`/`Removed` subtrees are atomic (one decision for the
     /// whole subtree), so they carry no child rows.
     pub children: Vec<DiffRow>,
+    /// 3-way classification against the base (None on 2-way diffs and on rows
+    /// where the base gives no signal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Diff3Verdict>,
+    /// The pre-selected decision the base justifies: `"mine"` or `"theirs"`.
+    /// Never auto-applied — the UI only pre-selects it for the user to confirm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
 }
 
 /// The full diff of a conflict copy against its winner.
@@ -95,6 +116,10 @@ pub struct SyncConflictDiff {
     /// True when the two block trees are identical (only the pre-block, or
     /// nothing, differs) — lets the UI say "no block changes".
     pub blocks_identical: bool,
+    /// True when the rows carry 3-way verdicts computed against a real base
+    /// (so the UI can explain where its pre-selections come from).
+    #[serde(default)]
+    pub three_way: bool,
 }
 
 /// Diff `theirs` (the conflict copy's blocks) against `mine` (the winner's).
@@ -116,6 +141,178 @@ pub fn diff_docs(mine: &crate::doc::Document, theirs: &crate::doc::Document) -> 
         theirs_pre,
         rows,
         blocks_identical,
+        three_way: false,
+    }
+}
+
+/// Build the full 3-way page-level diff: the SAME mine/theirs alignment as
+/// [`diff_docs`] (so row ids stay compatible with [`merge_blocks`]), with each
+/// row additionally classified against `base` — the last text Tine agreed on
+/// with the disk (Concord ledger). Non-conflicting rows carry a `suggestion`
+/// (`"mine"`/`"theirs"`); rows both sides changed carry none. Suggestions are
+/// advice for the UI to pre-select, never something to auto-apply.
+pub fn diff3_docs(
+    base: &crate::doc::Document,
+    mine: &crate::doc::Document,
+    theirs: &crate::doc::Document,
+) -> SyncConflictDiff {
+    let nodes = align_nodes(&mine.roots, &theirs.roots, "");
+    let mut rows = nodes_to_rows(&nodes);
+    let mut base_of_mine = HashMap::new();
+    collect_base_pairs(&base.roots, &mine.roots, &mut base_of_mine);
+    let mut base_of_theirs = HashMap::new();
+    collect_base_pairs(&base.roots, &theirs.roots, &mut base_of_theirs);
+    annotate_rows(&mut rows, &nodes, &base_of_mine, &base_of_theirs);
+    let blocks_identical = rows.iter().all(|r| r.kind == RowKind::Unchanged);
+    let mine_pre = normalize_pre(mine.pre_block.as_deref());
+    let theirs_pre = normalize_pre(theirs.pre_block.as_deref());
+    SyncConflictDiff {
+        base_rev: String::new(),
+        conflict_rev: String::new(),
+        pre_differs: mine_pre != theirs_pre,
+        mine_pre,
+        theirs_pre,
+        rows,
+        blocks_identical,
+        three_way: true,
+    }
+}
+
+/// Path-free 2-way entry point: diff two raw page texts (`org` selects the
+/// parser), with staleness tokens filled the way `Graph::sync_conflict_diff`
+/// fills them (`content_rev` of the exact input bytes).
+pub fn diff_texts(mine: &str, theirs: &str, org: bool) -> SyncConflictDiff {
+    let mine_doc = parse_text(mine, org);
+    let theirs_doc = parse_text(theirs, org);
+    let mut diff = diff_docs(&mine_doc, &theirs_doc);
+    diff.base_rev = crate::model::content_rev(mine);
+    diff.conflict_rev = crate::model::content_rev(theirs);
+    diff
+}
+
+/// Path-free 3-way entry point (see [`diff3_docs`]); a pure function of the
+/// three texts, needing no `Graph`, path, or ledger.
+pub fn diff3_texts(base: &str, mine: &str, theirs: &str, org: bool) -> SyncConflictDiff {
+    let base_doc = parse_text(base, org);
+    let mine_doc = parse_text(mine, org);
+    let theirs_doc = parse_text(theirs, org);
+    let mut diff = diff3_docs(&base_doc, &mine_doc, &theirs_doc);
+    diff.base_rev = crate::model::content_rev(mine);
+    diff.conflict_rev = crate::model::content_rev(theirs);
+    diff
+}
+
+fn parse_text(content: &str, org: bool) -> crate::doc::Document {
+    if org {
+        crate::org::parse_org(content)
+    } else {
+        crate::doc::parse(content)
+    }
+}
+
+use std::collections::HashMap;
+
+type BasePairs<'a> = HashMap<*const DocBlock, &'a DocBlock>;
+
+/// Map each of `side`'s blocks (by identity) to its aligned base block, using
+/// the same alignment machinery as the diff. Content-equal subtrees pair their
+/// descendants positionally (identical shape); aligned modified pairs recurse.
+fn collect_base_pairs<'a>(base: &'a [DocBlock], side: &'a [DocBlock], out: &mut BasePairs<'a>) {
+    fn walk<'a>(nodes: &[Node<'a>], out: &mut BasePairs<'a>) {
+        for node in nodes {
+            if let Node::Both {
+                mine: base_block,
+                theirs: side_block,
+                modified,
+                children,
+                ..
+            } = node
+            {
+                out.insert(*side_block as *const DocBlock, base_block);
+                if *modified {
+                    walk(children, out);
+                } else {
+                    pair_equal_subtrees(base_block, side_block, out);
+                }
+            }
+        }
+    }
+    fn pair_equal_subtrees<'a>(base: &'a DocBlock, side: &'a DocBlock, out: &mut BasePairs<'a>) {
+        for (b, s) in base.children.iter().zip(side.children.iter()) {
+            out.insert(s as *const DocBlock, b);
+            pair_equal_subtrees(b, s, out);
+        }
+    }
+    walk(&align_nodes(base, side, ""), out);
+}
+
+/// Classify each aligned row against the base. `rows` and `nodes` have the same
+/// shape by construction (both come from the same `align_nodes` output).
+fn annotate_rows(
+    rows: &mut [DiffRow],
+    nodes: &[Node],
+    base_of_mine: &BasePairs,
+    base_of_theirs: &BasePairs,
+) {
+    for (row, node) in rows.iter_mut().zip(nodes.iter()) {
+        match node {
+            Node::Both {
+                mine,
+                theirs,
+                modified,
+                children,
+                ..
+            } => {
+                if !*modified {
+                    continue;
+                }
+                // The row decision picks this block's BODY (children have their
+                // own rows), so classify the body only.
+                if mine.raw != theirs.raw {
+                    let mine_changed = base_of_mine
+                        .get(&(*mine as *const DocBlock))
+                        .is_none_or(|b| b.raw != mine.raw);
+                    let theirs_changed = base_of_theirs
+                        .get(&(*theirs as *const DocBlock))
+                        .is_none_or(|b| b.raw != theirs.raw);
+                    let (verdict, suggestion) = match (mine_changed, theirs_changed) {
+                        (true, false) => (Diff3Verdict::MineOnly, Some("mine")),
+                        (false, true) => (Diff3Verdict::TheirsOnly, Some("theirs")),
+                        // (true, true): a true conflict. (false, false) can only
+                        // happen when the base maps disagree (duplicate content);
+                        // treat that inconsistency as a conflict too.
+                        _ => (Diff3Verdict::BothChanged, None),
+                    };
+                    row.verdict = Some(verdict);
+                    row.suggestion = suggestion.map(str::to_string);
+                }
+                annotate_rows(&mut row.children, children, base_of_mine, base_of_theirs);
+            }
+            // Added row (winner-only). Absent from base → mine added it (keep).
+            // Present and unchanged → theirs deleted it (suggest the deletion).
+            // Present but edited by mine while theirs deleted it → conflict.
+            Node::Mine { block, .. } => {
+                let (verdict, suggestion) = match base_of_mine.get(&(*block as *const DocBlock)) {
+                    None => (Diff3Verdict::MineOnly, Some("mine")),
+                    Some(b) if *b == *block => (Diff3Verdict::TheirsOnly, Some("theirs")),
+                    Some(_) => (Diff3Verdict::BothChanged, None),
+                };
+                row.verdict = Some(verdict);
+                row.suggestion = suggestion.map(str::to_string);
+            }
+            // Removed row (conflict-only). Absent from base → theirs added it
+            // (suggest pulling it in). Present and unchanged → mine deleted it
+            // (suggest skipping). Present but edited by theirs → conflict.
+            Node::Theirs { block, .. } => {
+                let (verdict, suggestion) = match base_of_theirs.get(&(*block as *const DocBlock)) {
+                    None => (Diff3Verdict::TheirsOnly, Some("theirs")),
+                    Some(b) if *b == *block => (Diff3Verdict::MineOnly, Some("mine")),
+                    Some(_) => (Diff3Verdict::BothChanged, None),
+                };
+                row.verdict = Some(verdict);
+                row.suggestion = suggestion.map(str::to_string);
+            }
+        }
     }
 }
 
@@ -376,6 +573,8 @@ fn nodes_to_rows(nodes: &[Node]) -> Vec<DiffRow> {
                 mine: Some(BlockView::of(mine)),
                 theirs: Some(BlockView::of(theirs)),
                 children: nodes_to_rows(children),
+                verdict: None,
+                suggestion: None,
             },
             Node::Mine { id, block } => DiffRow {
                 id: id.clone(),
@@ -383,6 +582,8 @@ fn nodes_to_rows(nodes: &[Node]) -> Vec<DiffRow> {
                 mine: Some(BlockView::of(block)),
                 theirs: None,
                 children: Vec::new(),
+                verdict: None,
+                suggestion: None,
             },
             Node::Theirs { id, block } => DiffRow {
                 id: id.clone(),
@@ -390,6 +591,8 @@ fn nodes_to_rows(nodes: &[Node]) -> Vec<DiffRow> {
                 mine: None,
                 theirs: Some(BlockView::of(block)),
                 children: Vec::new(),
+                verdict: None,
+                suggestion: None,
             },
         })
         .collect()
@@ -881,6 +1084,232 @@ mod tests {
             merged[1].raw
         );
         assert!(merged[1].raw.contains("their text"));
+    }
+
+    // --- 3-way (diff3 against a base) ---------------------------------------
+
+    /// Flatten (kind, verdict, suggestion) over the whole row tree.
+    fn table(rows: &[DiffRow]) -> Vec<(RowKind, Option<Diff3Verdict>, Option<String>)> {
+        let mut out = Vec::new();
+        fn rec(rows: &[DiffRow], out: &mut Vec<(RowKind, Option<Diff3Verdict>, Option<String>)>) {
+            for r in rows {
+                out.push((r.kind, r.verdict, r.suggestion.clone()));
+                rec(&r.children, out);
+            }
+        }
+        rec(rows, &mut out);
+        out
+    }
+
+    #[test]
+    fn diff3_identical_sides_have_no_verdicts() {
+        let base = parse("- one\n- two\n");
+        let d = diff3_docs(&base, &base, &base);
+        assert!(d.three_way);
+        assert!(d.blocks_identical);
+        assert!(table(&d.rows)
+            .iter()
+            .all(|(_, v, s)| v.is_none() && s.is_none()));
+    }
+
+    #[test]
+    fn diff3_mine_only_edit_suggests_mine() {
+        let base = parse("- alpha\n- the quick brown fox jumps\n");
+        let mine = parse("- alpha\n- the quick brown fox JUMPED\n");
+        let theirs = base.clone();
+        let d = diff3_docs(&base, &mine, &theirs);
+        let t = table(&d.rows);
+        assert!(
+            t.iter().any(|(k, v, s)| *k == RowKind::Modified
+                && *v == Some(Diff3Verdict::MineOnly)
+                && s.as_deref() == Some("mine")),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn diff3_theirs_only_edit_suggests_theirs() {
+        let base = parse("- alpha\n- the quick brown fox jumps\n");
+        let mine = base.clone();
+        let theirs = parse("- alpha\n- the quick brown fox LEAPT\n");
+        let d = diff3_docs(&base, &mine, &theirs);
+        let t = table(&d.rows);
+        assert!(
+            t.iter().any(|(k, v, s)| *k == RowKind::Modified
+                && *v == Some(Diff3Verdict::TheirsOnly)
+                && s.as_deref() == Some("theirs")),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn diff3_both_edited_is_a_true_conflict_without_suggestion() {
+        let base = parse("- the quick brown fox jumps\n");
+        let mine = parse("- the quick brown fox jumped\n");
+        let theirs = parse("- the quick brown fox leaped\n");
+        let d = diff3_docs(&base, &mine, &theirs);
+        let t = table(&d.rows);
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!(t[0].1, Some(Diff3Verdict::BothChanged));
+        assert_eq!(t[0].2, None);
+    }
+
+    #[test]
+    fn diff3_independent_edits_to_different_blocks_suggest_each_side() {
+        // The genuinely mergeable case: mine edited block one, theirs edited
+        // block two — both rows get a confident suggestion.
+        let base = parse("- first shared line here\n- second shared line here\n");
+        let mine = parse("- first shared line herz\n- second shared line here\n");
+        let theirs = parse("- first shared line here\n- second shared line herz\n");
+        let d = diff3_docs(&base, &mine, &theirs);
+        let suggestions: Vec<Option<String>> =
+            table(&d.rows).into_iter().map(|(_, _, s)| s).collect();
+        assert_eq!(
+            suggestions,
+            vec![Some("mine".to_string()), Some("theirs".to_string())],
+            "{:?}",
+            table(&d.rows)
+        );
+    }
+
+    #[test]
+    fn diff3_addition_by_each_side_is_kept() {
+        // mine added a block absent from base → Added row suggests keeping it.
+        let base = parse("- alpha\n");
+        let mine = parse("- alpha\n- winner addition\n");
+        let theirs = parse("- alpha\n- copy addition\n");
+        let d = diff3_docs(&base, &mine, &theirs);
+        let t = table(&d.rows);
+        assert!(
+            t.iter().any(|(k, v, s)| *k == RowKind::Added
+                && *v == Some(Diff3Verdict::MineOnly)
+                && s.as_deref() == Some("mine")),
+            "{t:?}"
+        );
+        // theirs added one too → Removed row suggests pulling it in.
+        assert!(
+            t.iter().any(|(k, v, s)| *k == RowKind::Removed
+                && *v == Some(Diff3Verdict::TheirsOnly)
+                && s.as_deref() == Some("theirs")),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn diff3_deletion_by_theirs_of_unchanged_block_suggests_the_deletion() {
+        // theirs deleted a block mine left untouched → the Added row (winner-
+        // only) is really a theirs-side deletion → suggest "theirs" (drop).
+        let base = parse("- alpha\n- doomed block\n");
+        let mine = base.clone();
+        let theirs = parse("- alpha\n");
+        let d = diff3_docs(&base, &mine, &theirs);
+        let t = table(&d.rows);
+        assert!(
+            t.iter().any(|(k, v, s)| *k == RowKind::Added
+                && *v == Some(Diff3Verdict::TheirsOnly)
+                && s.as_deref() == Some("theirs")),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn diff3_deletion_by_mine_of_unchanged_block_suggests_skipping() {
+        // mine deleted it, theirs still has it unchanged → Removed row suggests
+        // "mine" (keep it deleted).
+        let base = parse("- alpha\n- gone from winner\n");
+        let mine = parse("- alpha\n");
+        let theirs = base.clone();
+        let d = diff3_docs(&base, &mine, &theirs);
+        let t = table(&d.rows);
+        assert!(
+            t.iter().any(|(k, v, s)| *k == RowKind::Removed
+                && *v == Some(Diff3Verdict::MineOnly)
+                && s.as_deref() == Some("mine")),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn diff3_delete_vs_edit_is_a_conflict() {
+        // mine edited the block, theirs deleted it → both changed → no suggestion.
+        let base = parse("- alpha\n- contested block text\n");
+        let mine = parse("- alpha\n- contested block texz\n");
+        let theirs = parse("- alpha\n");
+        let d = diff3_docs(&base, &mine, &theirs);
+        let t = table(&d.rows);
+        assert!(
+            t.iter().any(|(k, v, s)| *k == RowKind::Added
+                && *v == Some(Diff3Verdict::BothChanged)
+                && s.is_none()),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn diff3_move_by_theirs_suggests_enacting_the_move() {
+        // theirs moved B after C; base == mine. The diff shows B as an Added
+        // (old position) + Removed (new position) pair; 3-way suggests "theirs"
+        // on BOTH rows — drop at the old spot, pull in at the new — which
+        // together enact the move.
+        let base = parse("- aaa\n- bbb\n- ccc\n");
+        let mine = base.clone();
+        let theirs = parse("- aaa\n- ccc\n- bbb\n");
+        let d = diff3_docs(&base, &mine, &theirs);
+        let t = table(&d.rows);
+        let added: Vec<_> = t.iter().filter(|(k, _, _)| *k == RowKind::Added).collect();
+        let removed: Vec<_> = t
+            .iter()
+            .filter(|(k, _, _)| *k == RowKind::Removed)
+            .collect();
+        assert_eq!(added.len(), 1, "{t:?}");
+        assert_eq!(removed.len(), 1, "{t:?}");
+        assert_eq!(added[0].2.as_deref(), Some("theirs"), "{t:?}");
+        assert_eq!(removed[0].2.as_deref(), Some("theirs"), "{t:?}");
+    }
+
+    #[test]
+    fn diff3_nested_child_edit_classifies_the_child_not_the_parent() {
+        let base = parse("- parent\n\t- the first child line\n\t- the second child line\n");
+        let mine = base.clone();
+        let theirs = parse("- parent\n\t- the first child line\n\t- the second child lyne\n");
+        let d = diff3_docs(&base, &mine, &theirs);
+        // Parent row: modified subtree but identical body → no row verdict.
+        assert_eq!(d.rows.len(), 1);
+        assert_eq!(d.rows[0].kind, RowKind::Modified);
+        assert_eq!(d.rows[0].verdict, None);
+        let ct = table(&d.rows[0].children);
+        assert!(
+            ct.iter().any(|(k, v, s)| *k == RowKind::Modified
+                && *v == Some(Diff3Verdict::TheirsOnly)
+                && s.as_deref() == Some("theirs")),
+            "{ct:?}"
+        );
+    }
+
+    #[test]
+    fn two_way_diff_carries_no_suggestions() {
+        // The 2-way path stays suggestion-free — the fallback when no base exists.
+        let mine = parse("- the quick brown fox jumps\n");
+        let theirs = parse("- the quick brown fox leaps\n");
+        let d = diff_docs(&mine, &theirs);
+        assert!(!d.three_way);
+        assert!(table(&d.rows)
+            .iter()
+            .all(|(_, v, s)| v.is_none() && s.is_none()));
+    }
+
+    #[test]
+    fn diff3_texts_fills_revs_like_the_graph_path() {
+        let base = "- shared\n";
+        let mine = "- shared\n- from tine\n";
+        let theirs = "- shared\n- from disk\n";
+        let d = diff3_texts(base, mine, theirs, false);
+        assert!(d.three_way);
+        assert_eq!(d.base_rev, crate::model::content_rev(mine));
+        assert_eq!(d.conflict_rev, crate::model::content_rev(theirs));
+        let d2 = diff_texts(mine, theirs, false);
+        assert!(!d2.three_way);
+        assert_eq!(d2.base_rev, crate::model::content_rev(mine));
     }
 
     #[test]

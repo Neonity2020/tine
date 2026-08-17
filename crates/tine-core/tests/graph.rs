@@ -3605,3 +3605,232 @@ mod shadow_journal_sees_every_text_extension {
         day_resolves_to_the_canonical_file("org");
     }
 }
+
+// --- Concord base ledger (ADR 0056) -----------------------------------------
+
+mod concord_ledger_integration {
+    use super::*;
+    use tine_core::sync_diff::{Diff3Verdict, DiffRow};
+
+    fn scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("tine-concord-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        let ledger_dir =
+            std::env::temp_dir().join(format!("tine-concord-ledger-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+        (root, ledger_dir)
+    }
+
+    fn flatten(rows: &[DiffRow]) -> Vec<&DiffRow> {
+        let mut out = Vec::new();
+        fn rec<'a>(rows: &'a [DiffRow], out: &mut Vec<&'a DiffRow>) {
+            for r in rows {
+                out.push(r);
+                rec(&r.children, out);
+            }
+        }
+        rec(rows, &mut out);
+        out
+    }
+
+    #[test]
+    fn ledger_records_saves_and_external_admissions() {
+        let (root, ledger_dir) = scratch("hooks");
+        std::fs::write(root.join("pages/Note.md"), "- version one\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.attach_concord_ledger(ledger_dir.clone());
+        let ledger = graph.concord_ledger().expect("attached").clone();
+
+        // A successful SAVE records the written bytes as the last-agreed text.
+        let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        page.blocks[0].raw = "version two".into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        ledger.flush();
+        assert_eq!(
+            ledger.base("pages/Note.md").as_deref(),
+            Some("- version two\n"),
+            "the committed save must become the ledger base"
+        );
+
+        // An admitted EXTERNAL change records the read bytes.
+        graph.warm_cache();
+        let path = root.join("pages/Note.md");
+        std::fs::write(&path, "- version three (external)\n").unwrap();
+        let admitted = graph.sync_file(&path);
+        assert!(admitted.is_some(), "the external change must be admitted");
+        ledger.flush();
+        assert_eq!(
+            ledger.base("pages/Note.md").as_deref(),
+            Some("- version three (external)\n"),
+            "the admitted external content must become the ledger base"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&ledger_dir).ok();
+    }
+
+    #[test]
+    fn conflict_diff_pre_selects_sides_with_a_known_base_and_stays_2way_without_one() {
+        // The divergence: from a common ancestor, "mine" (the winner on disk)
+        // edited block two, "theirs" (the conflict copy) added a block.
+        let ancestor = "- shared intro line\n- the quick brown fox jumps\n";
+        let mine = "- shared intro line\n- the quick brown fox jumped\n";
+        let theirs =
+            "- shared intro line\n- the quick brown fox jumps\n- added on the other device\n";
+        let conflict_name = "Note.sync-conflict-20260817-120000-AAAAAAA.md";
+
+        // FAIL-BEFORE (the old behavior, still the no-base fallback): without a
+        // ledger the diff is 2-way and offers NO suggestions anywhere.
+        {
+            let (root, _ledger_dir) = scratch("no-base");
+            std::fs::write(root.join("pages/Note.md"), mine).unwrap();
+            std::fs::write(root.join("pages").join(conflict_name), theirs).unwrap();
+            let graph = Graph::open(&root);
+            let diff = graph
+                .sync_conflict_diff("pages/Note.md", &format!("pages/{conflict_name}"))
+                .unwrap()
+                .expect("diff");
+            assert!(!diff.three_way);
+            assert!(
+                flatten(&diff.rows)
+                    .iter()
+                    .all(|r| r.suggestion.is_none() && r.verdict.is_none()),
+                "without a base no row may carry a suggestion"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // With the ancestor in the ledger the same divergence pre-selects the
+        // right side per row.
+        let (root, ledger_dir) = scratch("with-base");
+        std::fs::write(root.join("pages/Note.md"), mine).unwrap();
+        std::fs::write(root.join("pages").join(conflict_name), theirs).unwrap();
+        let graph = Graph::open(&root);
+        graph.attach_concord_ledger(ledger_dir.clone());
+        // Drain the attach-time prune before the synchronous record below
+        // (record_now bypasses the worker; production records are serialized).
+        graph.concord_ledger().unwrap().flush();
+        graph
+            .concord_ledger()
+            .unwrap()
+            .record_now("pages/Note.md", ancestor)
+            .unwrap();
+        let diff = graph
+            .sync_conflict_diff("pages/Note.md", &format!("pages/{conflict_name}"))
+            .unwrap()
+            .expect("diff");
+        assert!(diff.three_way);
+        let rows = flatten(&diff.rows);
+        // Mine's edit ("jumps" → "jumped") → suggest mine.
+        assert!(
+            rows.iter()
+                .any(|r| r.verdict == Some(Diff3Verdict::MineOnly)
+                    && r.suggestion.as_deref() == Some("mine")),
+            "{rows:?}"
+        );
+        // Theirs' addition → suggest theirs.
+        assert!(
+            rows.iter()
+                .any(|r| r.verdict == Some(Diff3Verdict::TheirsOnly)
+                    && r.suggestion.as_deref() == Some("theirs")),
+            "{rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&ledger_dir).ok();
+    }
+
+    #[test]
+    fn conflict_diff_skips_a_base_identical_to_the_winner() {
+        // The admission artifact: the winner's post-sync bytes were admitted and
+        // became the ledger entry before the diff ran. 3-way against base==mine
+        // would blanket-suggest "theirs"; it must fall back to 2-way instead.
+        let (root, ledger_dir) = scratch("degenerate");
+        let mine = "- shared\n- winner content\n";
+        let theirs = "- shared\n- copy content entirely different\n";
+        let conflict_name = "Note.sync-conflict-20260817-120000-BBBBBBB.md";
+        std::fs::write(root.join("pages/Note.md"), mine).unwrap();
+        std::fs::write(root.join("pages").join(conflict_name), theirs).unwrap();
+        let graph = Graph::open(&root);
+        graph.attach_concord_ledger(ledger_dir.clone());
+        // Drain the attach-time prune before the synchronous record below
+        // (record_now bypasses the worker; production records are serialized).
+        graph.concord_ledger().unwrap().flush();
+        graph
+            .concord_ledger()
+            .unwrap()
+            .record_now("pages/Note.md", mine)
+            .unwrap();
+        let diff = graph
+            .sync_conflict_diff("pages/Note.md", &format!("pages/{conflict_name}"))
+            .unwrap()
+            .expect("diff");
+        assert!(
+            !diff.three_way,
+            "base==winner must not produce a 3-way diff"
+        );
+        assert!(flatten(&diff.rows).iter().all(|r| r.suggestion.is_none()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&ledger_dir).ok();
+    }
+
+    #[test]
+    fn conflict_copy_appearance_pins_the_ancestor_before_the_winner_admission() {
+        // The real Syncthing timing on a device that had NOT edited the page:
+        // the watcher sees the conflict copy appear, THEN the winner's replaced
+        // bytes get admitted (which overwrites the winner's ledger entry). The
+        // pin taken at copy-appearance must preserve the true ancestor so the
+        // later diff still gets a useful base.
+        let (root, ledger_dir) = scratch("pin-timing");
+        let ancestor = "- shared intro line\n- the quick brown fox jumps\n";
+        let winner_after_sync =
+            "- shared intro line\n- the quick brown fox jumps\n- added by device B\n";
+        let conflict_copy = "- shared intro line\n- the quick brown fox jumpz\n";
+        let conflict_name = "Note.sync-conflict-20260817-130000-CCCCCCC.md";
+        std::fs::write(root.join("pages/Note.md"), ancestor).unwrap();
+        let graph = Graph::open(&root);
+        graph.attach_concord_ledger(ledger_dir.clone());
+        let ledger = graph.concord_ledger().unwrap().clone();
+        ledger.flush(); // drain the attach-time prune before the sync record
+        ledger.record_now("pages/Note.md", ancestor).unwrap();
+        graph.warm_cache();
+
+        // 1. The conflict copy appears; the watcher offers it for reconcile.
+        let conflict_path = root.join("pages").join(conflict_name);
+        std::fs::write(&conflict_path, conflict_copy).unwrap();
+        assert!(graph.sync_file(&conflict_path).is_none()); // never a page — but it pins
+                                                            // 2. The winner's replaced bytes are admitted.
+        std::fs::write(root.join("pages/Note.md"), winner_after_sync).unwrap();
+        assert!(graph.sync_file(&root.join("pages/Note.md")).is_some());
+        ledger.flush();
+        assert_eq!(
+            ledger.base("pages/Note.md").as_deref(),
+            Some(winner_after_sync),
+            "the admission must have overwritten the winner's current entry"
+        );
+
+        // 3. The diff still gets the ANCESTOR through the pin.
+        let diff = graph
+            .sync_conflict_diff("pages/Note.md", &format!("pages/{conflict_name}"))
+            .unwrap()
+            .expect("diff");
+        assert!(diff.three_way, "the pinned ancestor must enable 3-way");
+        let rows = flatten(&diff.rows);
+        // Device B's addition (mine-only vs the ancestor) → keep mine.
+        assert!(
+            rows.iter()
+                .any(|r| r.verdict == Some(Diff3Verdict::MineOnly)
+                    && r.suggestion.as_deref() == Some("mine")),
+            "{rows:?}"
+        );
+        // The copy's edit ("jumps" → "jumpz", theirs-only) → take theirs.
+        assert!(
+            rows.iter()
+                .any(|r| r.verdict == Some(Diff3Verdict::TheirsOnly)
+                    && r.suggestion.as_deref() == Some("theirs")),
+            "{rows:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&ledger_dir).ok();
+    }
+}

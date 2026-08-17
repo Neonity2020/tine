@@ -2,6 +2,7 @@
 //! Logseq-compatible outliner. Pure Rust, no GUI dependencies — fully unit
 //! testable without the Tauri shell.
 
+pub mod concord_ledger;
 pub mod config;
 pub mod date;
 mod direct_projection;
