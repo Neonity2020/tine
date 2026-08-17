@@ -82,8 +82,23 @@ jobs:
           npx tsc --noEmit
           npm test
 
-      - name: Rust core tests
-        run: cargo test -p tine-core
+      # PRs run the SAME curated tine-core selection and profile as the release
+      # shards, not `cargo test -p tine-core`. The bare package still contains
+      # the pre-0.7 adversarial actor oracle: it is deterministically red, and
+      # several of its scenarios never terminate. libtest has no per-test
+      # timeout, so this step used to hang until the GitHub job limit and the
+      # plugin SDK step below never ran on any PR. The `ci` nextest profile
+      # gives each test its own process, a 5m per-test timeout with
+      # `on-timeout = "fail"`, and no retries. What this selection deliberately
+      # leaves out is proven by name, not by module prefix, in
+      # scripts/tine-core-nextest-contract.mjs.
+      - name: Install cargo-nextest 0.9.143
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.143
+
+      - name: Rust core tests (curated release selection)
+        run: node scripts/tine-core-nextest-contract.mjs --mode linux --run-selection
 
       # The app crate itself is gated in full CI, not here: linking it needs the
       # GTK/WebKit toolchain, which is a slow install PRs should not pay for.

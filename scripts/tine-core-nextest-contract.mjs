@@ -285,24 +285,21 @@ function runWindowsSmoke(packageName, filterset, label) {
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
-function runLinuxShard(shard) {
-  const result = spawnSync(
-    "cargo",
-    [
-      "nextest",
-      "run",
-      "--profile",
-      "ci",
-      "--package",
-      "tine-core",
-      "--filterset",
-      LINUX_CORE_RELEASE_FILTERSET,
-      "--partition",
-      `hash:${shard}/${LINUX_TINE_CORE_SHARD_COUNT}`,
-    ],
-    { cwd: process.cwd(), stdio: "inherit" }
-  );
-  if (result.error) fail(`could not start Linux tine-core shard ${shard}: ${result.error.message}`);
+function runLinuxSelection({ shard } = {}) {
+  const args = [
+    "nextest",
+    "run",
+    "--profile",
+    "ci",
+    "--package",
+    "tine-core",
+    "--filterset",
+    LINUX_CORE_RELEASE_FILTERSET,
+  ];
+  if (shard !== undefined) args.push("--partition", `hash:${shard}/${LINUX_TINE_CORE_SHARD_COUNT}`);
+  const label = shard === undefined ? "Linux tine-core release selection" : `Linux tine-core shard ${shard}`;
+  const result = spawnSync("cargo", args, { cwd: process.cwd(), stdio: "inherit" });
+  if (result.error) fail(`could not start ${label}: ${result.error.message}`);
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
@@ -333,8 +330,11 @@ function main() {
       if (!Number.isInteger(shard) || shard < 1 || shard > LINUX_TINE_CORE_SHARD_COUNT) {
         fail(`--run-shard must be an integer from 1 to ${LINUX_TINE_CORE_SHARD_COUNT}`);
       }
-      runLinuxShard(shard);
+      runLinuxSelection({ shard });
     }
+    // The PR gate runs the whole verified selection in one job instead of four
+    // sharded ones; both paths execute the identical filterset and `ci` profile.
+    if (process.argv.includes("--run-selection")) runLinuxSelection();
     return;
   }
   if (mode === "windows") {
@@ -349,7 +349,9 @@ function main() {
     }
     return;
   }
-  fail("pass --mode linux or --mode windows (add --run-smoke to execute the verified Windows core/storage integration selection)");
+  fail(
+    "pass --mode linux (add --run-shard N for one release shard, or --run-selection for the whole verified release selection) or --mode windows (add --run-smoke to execute the verified Windows core/storage integration selection)"
+  );
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
