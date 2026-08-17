@@ -573,6 +573,16 @@ pub(crate) fn prepare_direct_files_open(
             "Direct Files SQLite projection path unavailable; parser fallback remains active: {error}"
         )),
     }
+    // Concord base ledger (ADR 0056): Direct Files only, app-private, outside
+    // the sync tree. Attach failure is impossible (the attach performs no I/O);
+    // an unavailable app-data dir simply leaves the ledger off — every hook
+    // no-ops and conflict diffs stay 2-way.
+    match crate::backup::concord_ledger_dir(app, &root_key) {
+        Some(dir) => graph.attach_concord_ledger(dir),
+        None => crate::debug::diag(
+            "Concord ledger directory unavailable; conflict diffs stay 2-way".to_string(),
+        ),
+    }
     Ok(PreparedDirectFilesOpen {
         graph,
         meta,

@@ -12,6 +12,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Bulk external revisions — a `git checkout`, `fossil update`, branch switch, or big sync — are now handled as one calm epoch.** When one burst of external file changes touches more than 32 pages, the watcher reconciles it in a single pass against a consistent snapshot and tells the interface once (`graph-changed-bulk`) instead of once per page: one derived-view invalidation, visible pages refreshed through the existing safety checks (a page being edited defers its reload exactly like a single change), everything else reloaded lazily on navigation, and a single summary toast — "N pages updated externally", with a conflict count if any changed pages had genuinely diverged unsaved edits. Previously every page cost its own event, dataRev bump, and page fetch, and nothing summarized the revision. Small changes are untouched: at or below 32 pages, per-file behavior is byte-identical to before. (Concord P2, part of GH #337; see docs/concord.md → "External revisions".)
 
+- **Sync-conflict merges now come with per-block suggestions.** Tine keeps a
+  private per-page record of the last version it agreed on with the disk (the
+  Concord base ledger — stored in app data, never inside your graph, always
+  safe to delete). When you review a Syncthing/Dropbox/Seafile conflict copy,
+  Tine compares both sides against that remembered version: blocks only one
+  side changed arrive with the right choice pre-selected and labeled
+  *suggested*, and only blocks both sides changed still need a real decision.
+  Nothing is merged without your confirm, exactly as before; with no
+  remembered version the diff simply looks the way it always did.
+  (ADR 0056; part of Concord P3, GH #337.)
+- **A path-free block-diff command pair (`text_block_diff` /
+  `text_block_diff3`)** diffs two or three raw page texts with the same
+  block-tree engine the conflict merge uses — the seam the upcoming in-page
+  conflict review builds on.
+
 - **The file watcher now keeps always-on latency receipts for external-change batches.** Each batch that surfaces a change (or an error scheduling a retry) records how long it spent between the OS callback, the post-debounce reconcile, and the `graph-changed` events reaching the UI, logs one structured line, and lands in a small in-memory ring the new `watcher_latency_recent` debug command returns — so slow-external-change reports (GH #337's 5–20 s) can be diagnosed from the reporter's machine instead of guessed at. Works in both inotify and poll watch modes.
 
 - **Managed-storage activation no longer rejects a complete graph because Direct Files or the startup path catalog retained a different one-page inventory.** Readiness is now proved inside the candidate managed generation by opening its transactionally complete, exact-frontier-stamped SQLite inventory and a real page; the candidate remains unpublished until that proof succeeds.

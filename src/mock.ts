@@ -1738,19 +1738,53 @@ export function mockBackend(): Backend {
     },
     async syncConflictDiff() {
       const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      // A 3-way diff (Concord base ledger): only the copy edited row 1, mine
+      // added row 2, the copy added row 3 — each row carries the suggestion
+      // the base justifies, which the modal pre-selects (never auto-applies).
       return {
         base_rev: "mock-sync-diff-rev",
         conflict_rev: "mock-sync-copy-rev",
         rows: [
           { id: "0", kind: "unchanged" as const, mine: v("Milestones for the launch"), theirs: v("Milestones for the launch"), children: [] },
-          { id: "1", kind: "modified" as const, mine: v("TODO ship the beta by Friday"), theirs: v("TODO ship the beta by Thursday"), children: [] },
-          { id: "2", kind: "added" as const, mine: v("write the release notes"), theirs: null, children: [] },
-          { id: "3", kind: "removed" as const, mine: null, theirs: v("ask marketing for the banner"), children: [] },
+          { id: "1", kind: "modified" as const, mine: v("TODO ship the beta by Friday"), theirs: v("TODO ship the beta by Thursday"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
+          { id: "2", kind: "added" as const, mine: v("write the release notes"), theirs: null, children: [], verdict: "mine-only" as const, suggestion: "mine" as const },
+          { id: "3", kind: "removed" as const, mine: null, theirs: v("ask marketing for the banner"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
         ],
         mine_pre: "title:: Project Plan",
         theirs_pre: "title:: Project Plan",
         pre_differs: false,
         blocks_identical: false,
+        three_way: true,
+      };
+    },
+    async textBlockDiff(mine: string, theirs: string) {
+      const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      const same = mine === theirs;
+      return {
+        base_rev: "mock-text-diff-mine",
+        conflict_rev: "mock-text-diff-theirs",
+        rows: [{ id: "0", kind: same ? ("unchanged" as const) : ("modified" as const), mine: v(mine), theirs: v(theirs), children: [] }],
+        mine_pre: null,
+        theirs_pre: null,
+        pre_differs: false,
+        blocks_identical: same,
+      };
+    },
+    async textBlockDiff3(base: string, mine: string, theirs: string) {
+      const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      const same = mine === theirs;
+      const mineChanged = mine !== base;
+      const theirsChanged = theirs !== base;
+      const suggestion = same || (mineChanged && theirsChanged) ? undefined : mineChanged ? ("mine" as const) : ("theirs" as const);
+      return {
+        base_rev: "mock-text-diff-mine",
+        conflict_rev: "mock-text-diff-theirs",
+        rows: [{ id: "0", kind: same ? ("unchanged" as const) : ("modified" as const), mine: v(mine), theirs: v(theirs), children: [], suggestion }],
+        mine_pre: null,
+        theirs_pre: null,
+        pre_differs: false,
+        blocks_identical: same,
+        three_way: true,
       };
     },
     async resolveSyncConflict(): Promise<void> {

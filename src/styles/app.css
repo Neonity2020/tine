@@ -2688,6 +2688,11 @@ textarea {
   font-size: 11px;
   color: var(--text-muted);
 }
+/* A 3-way pre-selection (Concord base ledger) the user hasn't overridden. */
+.sync-merge-suggested-tag {
+  font-size: 11px;
+  color: var(--link-color);
+}
 .sync-merge-preblock {
   padding: 6px 16px 0;
 }

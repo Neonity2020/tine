@@ -2500,6 +2500,12 @@ pub struct Graph {
     /// bytes we wrote and suppress that false positive (the parse-cache comparison
     /// alone races that window). See `write_page` / `sync_file_content`.
     recent_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
+    /// Concord base ledger (ADR 0056): the per-page last text Tine agreed on
+    /// with the disk, updated best-effort after successful saves and external-
+    /// change admissions. A disposable cache stored OUTSIDE the sync tree;
+    /// unset (managed regime, most tests) makes every hook a no-op. Never
+    /// consulted on the save critical path — only by conflict diffs.
+    concord_ledger: std::sync::OnceLock<Arc<crate::concord_ledger::ConcordLedger>>,
     /// `path → content_rev` of the on-disk bytes the cached page's
     /// `Document` was parsed from. Invariant: an entry exists IFF the page is in
     /// the cache, and `disk_revs[path] == content_rev(current disk bytes)` ⟹ the
@@ -5487,6 +5493,7 @@ impl Graph {
             page_list_cache: RwLock::new(None),
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            concord_ledger: std::sync::OnceLock::new(),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
             loaded_file_identities: RwLock::new(std::collections::HashMap::new()),
             conflict_authority: std::sync::Mutex::new(ConflictAuthorityState::default()),
@@ -5523,6 +5530,45 @@ impl Graph {
             );
         }
         Ok(())
+    }
+
+    /// Attach the Concord base ledger (ADR 0056) rooted at `dir` (an
+    /// app-private directory OUTSIDE the graph tree). Idempotent; the first
+    /// attach wins. Queues a background prune of unreferenced blobs.
+    pub fn attach_concord_ledger(&self, dir: PathBuf) {
+        let ledger = Arc::new(crate::concord_ledger::ConcordLedger::new(dir));
+        if self.concord_ledger.set(Arc::clone(&ledger)).is_ok() {
+            ledger.queue_prune();
+        }
+    }
+
+    /// The attached ledger, if any (None ⇒ every Concord hook no-ops).
+    pub fn concord_ledger(&self) -> Option<&Arc<crate::concord_ledger::ConcordLedger>> {
+        self.concord_ledger.get()
+    }
+
+    /// Best-effort ledger update: `content` is now the exact text Tine and the
+    /// disk agree on for `path`. Called after a successful save commit and
+    /// after an external-change admission. Foreground cost is one channel send;
+    /// non-page paths (config, assets) are filtered out here.
+    fn concord_record_agreed(&self, path: &Path, content: &str) {
+        let Some(ledger) = self.concord_ledger.get() else {
+            return;
+        };
+        if self.entry_for_path(path).is_none() || path_is_sync_conflict(path) {
+            return;
+        }
+        ledger.record(&self.rel_path(path), content);
+    }
+
+    /// The winner page a conflict copy shadows (same dir, same extension, base
+    /// stem), as a graph-relative path — the identity the ledger pins under.
+    fn conflict_winner_rel(&self, conflict_path: &Path) -> Option<String> {
+        let ext = text_extension_from_path(conflict_path)?;
+        let stem = conflict_path.file_stem()?.to_str()?;
+        let base_stem = sync_conflict_base(stem)?;
+        let winner = conflict_path.parent()?.join(format!("{base_stem}.{ext}"));
+        Some(self.rel_path(&winner))
     }
 
     fn direct_projection_enqueue_full(
@@ -12867,7 +12913,25 @@ impl Graph {
         let conf = self.root.join(conflict_rel);
         let mine = parse_doc(&win, &win_c);
         let theirs = parse_doc(&conf, &conf_c);
-        let mut diff = crate::sync_diff::diff_docs(&mine, &theirs);
+        // Concord ledger (ADR 0056): with a usable base — the last text Tine
+        // agreed on with the disk — upgrade to a 3-way diff whose rows carry
+        // per-row suggestions the UI pre-selects (never auto-applies). A base
+        // identical to the winner is almost always the admission artifact (the
+        // winner's post-sync bytes were admitted and became the ledger entry
+        // before this diff ran), and 3-way against it would blanket-suggest
+        // "theirs"; skip it and fall back to the plain 2-way diff.
+        let base_c = self
+            .concord_ledger
+            .get()
+            .and_then(|ledger| ledger.conflict_base(conflict_rel, winner_rel))
+            .filter(|base| base != &win_c);
+        let mut diff = match base_c {
+            Some(base_c) => {
+                let base = parse_doc(&win, &base_c);
+                crate::sync_diff::diff3_docs(&base, &mine, &theirs)
+            }
+            None => crate::sync_diff::diff_docs(&mine, &theirs),
+        };
         diff.base_rev = content_rev(&win_c);
         diff.conflict_rev = content_rev(&conf_c);
         Ok(Some(diff))
@@ -13080,6 +13144,11 @@ impl Graph {
             let _ = self.managed_move_noreplace(&write, &staged, &conf);
             return Err(e);
         }
+        // The conflict copy is resolved and trashed — its pinned base (if any)
+        // has served its purpose; let the ledger forget it (best-effort).
+        if let Some(ledger) = self.concord_ledger.get() {
+            ledger.drop_pin(conflict_rel);
+        }
         Ok(())
     }
 
@@ -13093,6 +13162,12 @@ impl Graph {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such conflict file"))?;
         self.stage_sync_conflict_trash(conflict_rel, content.as_bytes())
             .map(|_| ())
+            .inspect(|()| {
+                // Discarded without merging — drop the copy's pinned base too.
+                if let Some(ledger) = self.concord_ledger.get() {
+                    ledger.drop_pin(conflict_rel);
+                }
+            })
     }
 
     /// Raw contents of ONE journal file (by exact filename) — lets the UI show a
@@ -19157,7 +19232,14 @@ impl Graph {
             publish()
         })();
         match result {
-            Ok(published) => Ok((rev, published)),
+            Ok(published) => {
+                // Concord ledger (ADR 0056): these exact bytes are now on disk,
+                // so they are the last text Tine and the disk agree on. Off the
+                // save critical path — one channel send, work happens on the
+                // ledger's worker thread; failures are logged, never surfaced.
+                self.concord_record_agreed(path, content);
+                Ok((rev, published))
+            }
             Err(error) => {
                 self.drop_self_write_marker(path, &rev);
                 Err(error)
@@ -19283,6 +19365,22 @@ impl Graph {
         // Watch events are untrusted path inputs. Lexically reject non-managed
         // names first; the retained capability traversal below then performs the
         // component-wise no-follow containment and file-shape checks.
+        // Concord ledger: a conflict copy just appeared for its winner. Pin the
+        // winner's CURRENT base under the copy's identity BEFORE the winner's
+        // own external admission overwrites it — the pinned text is the closest
+        // thing to the true common ancestor the 3-way merge suggestions need
+        // (first-wins in the ledger). Checked here because a conflict copy is
+        // deliberately NOT eligible graph text (`entry_for_path` is None for
+        // it; the scope check below is the watcher's own lexical authority).
+        // Purely additive and best-effort; the event then flows through the
+        // unchanged reconcile path (which never caches a copy as a page).
+        if path_is_sync_conflict(path) && self.graph_text_watch_relevant(path) {
+            if let Some(ledger) = self.concord_ledger.get() {
+                if let Some(winner_rel) = self.conflict_winner_rel(path) {
+                    ledger.pin_conflict_base(&self.rel_path(path), &winner_rel);
+                }
+            }
+        }
         if self.entry_for_path(path).is_none() {
             return Ok(None);
         }
@@ -19477,6 +19575,9 @@ impl Graph {
             }
         }
         self.cache_upsert(entry.clone(), newdoc, disk_rev);
+        // Concord ledger: the external change was admitted, so this content is
+        // now what Tine last READ from disk — the new last-agreed text.
+        self.concord_record_agreed(path, content);
         Ok(Some(entry))
     }
 

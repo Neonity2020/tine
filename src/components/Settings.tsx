@@ -3127,6 +3127,17 @@ function decisionOf(decisions: Record<string, MergeDecision>, id: string): Merge
   return decisions[id] ?? "mine";
 }
 
+// Pre-select each row's 3-way suggestion (Concord base ledger, ADR 0056) as its
+// initial decision. Only "theirs" needs seeding — "mine" is already the default.
+// The user still confirms; nothing is applied without the merge click.
+function seedDecisionsFromSuggestions(rows: DiffRow[], out: Record<string, MergeDecision> = {}): Record<string, MergeDecision> {
+  for (const r of rows) {
+    if (r.suggestion === "theirs") out[r.id] = "theirs";
+    if (r.children.length) seedDecisionsFromSuggestions(r.children, out);
+  }
+  return out;
+}
+
 // Collect every decidable row (id + kind), flattened, for the escape-hatch buttons.
 function collectRows(rows: DiffRow[], out: { id: string; kind: string }[] = []): { id: string; kind: string }[] {
   for (const r of rows) {
@@ -3195,6 +3206,9 @@ function DiffRowView(props: {
           <Show when={row().kind === "unchanged"}>
             <span class="sync-merge-unchanged-tag">unchanged</span>
           </Show>
+          <Show when={row().suggestion && dec() === row().suggestion}>
+            <span class="sync-merge-suggested-tag" title="Pre-selected from the last version Tine and this file agreed on">suggested</span>
+          </Show>
         </div>
       </div>
       <For each={row().children}>
@@ -3216,7 +3230,7 @@ function DiffRowView(props: {
 // with a per-row keep-current / keep-copy / keep-both choice. Nothing is written
 // until "Merge & trash copy". Resolving goes through the safe backend path
 // (base_rev-guarded save + stage-before-commit trash).
-function SyncConflictMergeModal(props: { conflict: SyncConflict; onClose: () => void }): JSX.Element {
+export function SyncConflictMergeModal(props: { conflict: SyncConflict; onClose: () => void }): JSX.Element {
   let root: HTMLDivElement | undefined;
   createEffect(() => {
     const unregister = registerTransientLayer({ id: `sync-conflict-merge-${props.conflict.path}`, parentId: "settings", root: () => root ?? null, dismiss: () => { props.onClose(); return true; } });
@@ -3235,11 +3249,13 @@ function SyncConflictMergeModal(props: { conflict: SyncConflict; onClose: () => 
     const current = diff();
     if (!current) return;
     const nextVersion = `${current.base_rev}\0${current.conflict_rev}`;
-    if (diffVersion !== undefined && diffVersion !== nextVersion) {
+    if (diffVersion !== nextVersion) {
       // Choices are row-id decisions for one exact pair of files. A refetch can
       // publish a different alignment, so never carry old choices into it.
-      setDecisions({});
-      setPreChoice("union");
+      // Each fresh alignment starts from the 3-way suggestions (empty when the
+      // diff is 2-way) — pre-selected for the user to review, never auto-applied.
+      setDecisions(seedDecisionsFromSuggestions(current.rows));
+      if (diffVersion !== undefined) setPreChoice("union");
     }
     diffVersion = nextVersion;
   });
@@ -3312,6 +3328,9 @@ function SyncConflictMergeModal(props: { conflict: SyncConflict; onClose: () => 
               <div class="sync-merge-toolbar">
                 <span class="settings-hint">
                   {counts().modified} changed · {counts().added} only here · {counts().removed} only in copy
+                  <Show when={d().three_way}>
+                    {" "}· suggestions pre-selected from the last version Tine and this file agreed on
+                  </Show>
                 </span>
                 <span class="sync-merge-toolbar-actions">
                   <button class="settings-btn" onClick={() => setAll("mine")}>Keep all current</button>

@@ -438,6 +438,17 @@ fn backup_base_for_root(app: &tauri::AppHandle, root: &std::path::Path) -> Optio
     Some(data_dir.join("backups").join(root_backup_id(root)))
 }
 
+/// The Concord base-ledger directory for a graph root
+/// (`<app-data>/concord-ledger/<id>`, same root-id convention as backups —
+/// outside the sync tree, invisible to transports). See ADR 0056.
+pub(crate) fn concord_ledger_dir(
+    app: &tauri::AppHandle,
+    root: &std::path::Path,
+) -> Option<PathBuf> {
+    let data_dir = app.path().app_data_dir().ok()?;
+    Some(data_dir.join("concord-ledger").join(root_backup_id(root)))
+}
+
 #[tauri::command]
 pub(crate) async fn list_backups(
     app: tauri::AppHandle,

@@ -173,3 +173,35 @@ In-Tine resolution of these conflicts (choosing sides block-by-block inside
 the page) is planned for a later Concord phase; the quarantine guarantees that
 nothing is lost in the meantime.
 
+## The base ledger
+
+Tine remembers, for every page, **the last version it agreed on with the
+disk** — the text it last read from or wrote to the file. That remembered
+version is the common ancestor of any later divergence, which is what turns a
+conflict from a guessing game into a mostly-answered question: comparing each
+side against the ancestor tells Tine *who changed what*.
+
+When you review a sync conflict copy (Settings → Backups & recovery → Sync
+conflict copies → *Review & merge*), Tine uses that ancestor when it has one:
+
+- A block only **you** changed arrives with *your* version pre-selected.
+- A block only the **other device** changed arrives with *its* version
+  pre-selected.
+- A block **both** sides changed is a real conflict — no pre-selection; you
+  decide.
+
+Pre-selected rows are labeled *suggested*, and the toolbar says when
+suggestions are in play. Nothing is ever merged automatically — you review the
+rows and click merge, exactly as before; the suggestions just mean the common
+case is glance-and-confirm instead of hunt-and-compare.
+
+Practical notes:
+
+- The ledger lives in Tine's app data folder (`concord-ledger/`), **outside
+  your graph** — your sync tool never sees it, and it never touches your
+  files.
+- **Deleting it is always safe.** Tine falls back to the plain two-column diff
+  (no suggestions) until the ledger repopulates through normal editing.
+- It fills in as you work: pages saved or reloaded since the feature arrived
+  have a remembered version; untouched pages simply have none yet.
+

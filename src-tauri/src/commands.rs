@@ -3804,6 +3804,33 @@ pub(crate) fn sync_conflict_diff(
     })
 }
 
+/// Block-level diff of two raw page texts — a pure function of its inputs,
+/// needing no graph, path, or slot (Concord P3's path-free seam; future in-page
+/// conflict UI builds on it). `format`: `"org"` selects the org parser,
+/// anything else means markdown. Revs are `content_rev` of the exact inputs,
+/// the same staleness tokens `Graph::sync_conflict_diff` issues.
+#[tauri::command]
+pub(crate) fn text_block_diff(
+    mine: String,
+    theirs: String,
+    format: Option<String>,
+) -> tine_core::sync_diff::SyncConflictDiff {
+    tine_core::sync_diff::diff_texts(&mine, &theirs, format.as_deref() == Some("org"))
+}
+
+/// 3-way variant of [`text_block_diff`]: classifies each aligned row against
+/// `base` (the last-agreed text) and carries per-row suggestions the UI may
+/// pre-select — never auto-apply. See ADR 0056.
+#[tauri::command]
+pub(crate) fn text_block_diff3(
+    base: String,
+    mine: String,
+    theirs: String,
+    format: Option<String>,
+) -> tine_core::sync_diff::SyncConflictDiff {
+    tine_core::sync_diff::diff3_texts(&base, &mine, &theirs, format.as_deref() == Some("org"))
+}
+
 /// Resolve a sync-conflict copy: merge it into its winner per the user's per-row
 /// `decisions` (row id → "mine"/"theirs"/"both") via the normal save path, then
 /// trash the conflict copy. `base_rev` guards against the winner changing under
