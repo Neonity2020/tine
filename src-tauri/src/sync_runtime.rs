@@ -1784,14 +1784,48 @@ fn activate_sparse_v2_blocking(
     label: &str,
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
-    let started = Instant::now();
     let state = app.state::<crate::state::AppState>();
-    crate::debug::diag("sparse-v2 activation requested");
     let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
         .root_key
         .clone();
+    let transition = state.storage_supervisor.begin_guard(
+        app,
+        label,
+        root.clone(),
+        StorageTransitionKind::ActivateManaged,
+    )?;
+    transition.advance(StorageTransitionPhase::WaitingForTransition)?;
     let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
     let _transition = transition_gate.lock().unwrap();
+    if !transition.is_current() {
+        return Err("managed activation was superseded while waiting for its graph lane".into());
+    }
+    transition.advance(StorageTransitionPhase::ValidatingTarget)?;
+    transition.advance(StorageTransitionPhase::ActivatingManaged)?;
+    let result =
+        activate_sparse_v2_under_transition(app, label, binding_generation, root, &transition);
+    match result {
+        Ok(status) => {
+            transition.succeed(StableStorageMode::Managed)?;
+            Ok(status)
+        }
+        Err(error) => {
+            transition.fail("activation_failed");
+            Err(error)
+        }
+    }
+}
+
+fn activate_sparse_v2_under_transition(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    root: PathBuf,
+    transition: &crate::storage_mode_supervisor::StorageTransitionGuard<'_>,
+) -> Result<SparseV2StatusDto, String> {
+    let started = Instant::now();
+    let state = app.state::<crate::state::AppState>();
+    crate::debug::diag("sparse-v2 activation requested");
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     if slot.root_key != root {
         return Err("graph changed while activation waited for its transition lane".into());
@@ -1838,12 +1872,15 @@ fn activate_sparse_v2_blocking(
         let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
             binding, root, graph_meta,
         ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&replacement))?;
-        crate::state::poke_watcher(&state);
+        transition.commit(|| {
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), Arc::clone(&replacement))?;
+            crate::state::poke_watcher(&state);
+            Ok(())
+        })?;
         let result = sparse_v2_status_for_slot(&replacement);
         crate::debug::diag(format!(
             "sparse-v2 retained activation published after {} ms: {result:?}",
@@ -1865,7 +1902,7 @@ fn activate_sparse_v2_blocking(
 
     slot.begin_legacy_retirement()?;
     crate::debug::diag("sparse-v2 legacy authority retirement started");
-    let removed = state.graphs.write().unwrap().remove(label);
+    let removed = transition.commit(|| Ok(state.graphs.write().unwrap().remove(label)))?;
     if removed
         .as_ref()
         .is_none_or(|removed| removed.binding_generation != slot.binding_generation)
@@ -1883,12 +1920,15 @@ fn activate_sparse_v2_blocking(
             started.elapsed().as_millis()
         ));
         slot.cancel_legacy_retirement()?;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state);
+        transition.commit(|| {
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), Arc::clone(&slot))?;
+            crate::state::poke_watcher(&state);
+            Ok(())
+        })?;
         return Err(format!(
             "Tine-managed storage setup can be retried: {error}"
         ));
@@ -1904,12 +1944,15 @@ fn activate_sparse_v2_blocking(
             started.elapsed().as_millis()
         ));
         slot.cancel_legacy_retirement()?;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state);
+        transition.commit(|| {
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), Arc::clone(&slot))?;
+            crate::state::poke_watcher(&state);
+            Ok(())
+        })?;
         return Err(error);
     }
     crate::debug::diag(format!(
@@ -1933,12 +1976,15 @@ fn activate_sparse_v2_blocking(
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         binding, root, graph_meta,
     ));
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(label.to_string(), Arc::clone(&replacement))?;
-    crate::state::poke_watcher(&state);
+    transition.commit(|| {
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label.to_string(), Arc::clone(&replacement))?;
+        crate::state::poke_watcher(&state);
+        Ok(())
+    })?;
     let result = sparse_v2_status_for_slot(&replacement);
     crate::debug::diag(format!(
         "sparse-v2 fresh activation published after {} ms: {result:?}",
@@ -2134,25 +2180,90 @@ fn shutdown_for_direct_files_escape(
     }
 }
 
+fn shutdown_for_graceful_direct_files(
+    slot: &crate::state::GraphSlot,
+) -> Result<DirectFilesShutdown, String> {
+    let Some(handle) = slot.sparse_runtime() else {
+        return Ok(DirectFilesShutdown::Clean);
+    };
+    match handle.clean_shutdown() {
+        Ok(SyncShutdownOutcome::Safe(_)) => Ok(DirectFilesShutdown::Clean),
+        Ok(SyncShutdownOutcome::Terminal(snapshot)) => Err(format!(
+            "Tine-managed storage could not confirm a safe projection before returning to Direct Files: {}. Use the emergency return if you accept that managed operations may be newer than Markdown.",
+            snapshot
+                .detail
+                .unwrap_or_else(|| "the managed actor reached a terminal state".into())
+        )),
+        Err(error) => Err(format!(
+            "Tine-managed storage could not drain safely before returning to Direct Files: {error}. Use the emergency return if you accept that managed operations may be newer than Markdown."
+        )),
+    }
+}
+
 fn publish_retryable_sparse_slot(
     state: &crate::state::AppState,
     label: &str,
     root_key: PathBuf,
     graph_meta: GraphMeta,
     detail: String,
+    transition: Option<&crate::storage_mode_supervisor::StorageTransitionGuard<'_>>,
 ) -> Result<Arc<crate::state::GraphSlot>, String> {
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         retryable_binding("local_active", detail),
         root_key,
         graph_meta,
     ));
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(label.to_string(), Arc::clone(&replacement))?;
-    crate::state::poke_watcher(state);
+    commit_transition(transition, || {
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label.to_string(), Arc::clone(&replacement))?;
+        crate::state::poke_watcher(state);
+        Ok(())
+    })?;
     Ok(replacement)
+}
+
+fn commit_transition<T>(
+    transition: Option<&crate::storage_mode_supervisor::StorageTransitionGuard<'_>>,
+    publish: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    match transition {
+        Some(transition) => transition.commit(publish),
+        None => publish(),
+    }
+}
+
+fn publish_transition_slot(
+    state: &crate::state::AppState,
+    label: &str,
+    replacement: Arc<crate::state::GraphSlot>,
+    transition: &crate::storage_mode_supervisor::StorageTransitionGuard<'_>,
+) -> Result<(), String> {
+    transition.commit(|| {
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label.to_string(), replacement)?;
+        crate::state::poke_watcher(state);
+        Ok(())
+    })
+}
+
+fn remove_transition_slot(
+    state: &crate::state::AppState,
+    label: &str,
+    transition: &crate::storage_mode_supervisor::StorageTransitionGuard<'_>,
+) -> Result<Option<Arc<crate::state::GraphSlot>>, String> {
+    transition.commit(|| {
+        let removed = state.graphs.write().unwrap().remove(label);
+        if removed.is_some() {
+            crate::state::poke_watcher(state);
+        }
+        Ok(removed)
+    })
 }
 
 fn cancel_sparse_v2_at_paths_with_archive_and_publish(
@@ -2165,6 +2276,8 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
     archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
     publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
+    transition: Option<&crate::storage_mode_supervisor::StorageTransitionGuard<'_>>,
+    after_shutdown: impl FnOnce(&DirectFilesShutdown) -> Result<(), String>,
 ) -> Result<SparseV2CancelResult, String> {
     slot.sparse_binding()
         .ok_or("This graph is already using Direct files.")?;
@@ -2173,7 +2286,9 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     // learn a path we already own.
     let direct_root = slot.root_key.clone();
     let graph_meta = slot.graph_meta();
-    let removed = state.graphs.write().unwrap().remove(label);
+    let removed = commit_transition(transition, || {
+        Ok(state.graphs.write().unwrap().remove(label))
+    })?;
     if removed.is_some() {
         crate::state::poke_watcher(state);
     }
@@ -2181,12 +2296,15 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
         current.binding_generation != slot.binding_generation || current.root_key != slot.root_key
     }) {
         if let Some(current) = removed {
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), current)?;
-            crate::state::poke_watcher(state);
+            commit_transition(transition, || {
+                state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .bind(label.to_string(), current)?;
+                crate::state::poke_watcher(state);
+                Ok(())
+            })?;
         }
         return Err("The graph changed while returning to Direct files. Try again.".into());
     }
@@ -2196,20 +2314,24 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
         Err(error) => {
             // No archive has started; the live slot remains usable when a
             // force-stop itself could not be completed.
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), slot)
-                .map_err(|restore| {
-                    format!(
-                        "{error}; Tine-managed storage could not be restored in memory: {restore}"
-                    )
-                })?;
-            crate::state::poke_watcher(state);
+            commit_transition(transition, || {
+                state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .bind(label.to_string(), slot)
+                    .map_err(|restore| {
+                        format!(
+                            "{error}; Tine-managed storage could not be restored in memory: {restore}"
+                        )
+                    })?;
+                crate::state::poke_watcher(state);
+                Ok(())
+            })?;
             return Err(error);
         }
     };
+    after_shutdown(&shutdown)?;
 
     // `clean_shutdown` consumes the live actor even when it succeeds.  If a
     // later archive step fails, re-publishing that old slot would advertise a
@@ -2221,6 +2343,7 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
         direct_root.clone(),
         graph_meta,
         shutdown.retry_detail(),
+        transition,
     )?;
     let retry_generation = retryable.binding_generation;
     drop(removed);
@@ -2238,7 +2361,9 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
         return Err(reason);
     }
 
-    let binding_generation = publish_direct(&direct_root, approved_assets).map_err(|error| {
+    let binding_generation = commit_transition(transition, || {
+        publish_direct(&direct_root, approved_assets)
+    }).map_err(|error| {
         // Before Direct publication the retryable no-actor slot remains the
         // only authority.  Remove only that slot; if a later lifecycle step
         // already published Direct Files, leave its usable binding intact.
@@ -2306,6 +2431,8 @@ fn cancel_sparse_v2_at_paths_with_archive(
             crate::state::poke_watcher(state);
             Ok(binding_generation)
         },
+        None,
+        |_| Ok(()),
     )
 }
 
@@ -2330,6 +2457,7 @@ fn cancel_sparse_v2_at_paths(
     )
 }
 
+#[cfg(test)]
 fn cold_recovery_graph_meta(private_root: &Path, root_key: &Path) -> Result<GraphMeta, String> {
     match read_binding_at(&private_root.join(SPARSE_BINDING_FILE), root_key) {
         Ok(Some(record)) => Ok(SyncRuntimeFacade::graph_meta(&record)),
@@ -2349,11 +2477,9 @@ fn cold_recovery_graph_meta(private_root: &Path, root_key: &Path) -> Result<Grap
     }
 }
 
-/// The caller must hold `graph_load`.  That lock serializes every graph-open,
-/// sparse activation, and Direct Files return.  The registry check below is
-/// therefore a quiescence proof, not a best-effort snapshot: an actor/open
-/// worker cannot acquire a target slot between this check and the no-actor
-/// recovery slot reservation.
+/// Legacy cold-return fixture retained only to exercise archival rollback.
+/// Production emergency return never reserves a managed slot.
+#[cfg(test)]
 fn reserve_cold_recovery_slot(
     state: &crate::state::AppState,
     label: &str,
@@ -2394,11 +2520,9 @@ fn reserve_cold_recovery_slot(
     Ok(slot)
 }
 
-/// Resolve the exact slot that appeared while a cold-start recovery request was
-/// waiting for `graph_load`.  Callers hold that lock, so this is the mutation
-/// boundary rather than a stale preflight: an exact managed slot is safe to
-/// drain and archive through the established live-slot path; any other slot
-/// means the recovery request has been superseded.
+/// Legacy cold-return fixture retained only to exercise archival rollback.
+/// Native operation IDs own production supersession.
+#[cfg(test)]
 fn exact_live_cold_recovery_slot(
     state: &crate::state::AppState,
     label: &str,
@@ -2423,6 +2547,7 @@ fn exact_live_cold_recovery_slot(
     Ok(Some(slot))
 }
 
+#[cfg(test)]
 fn cancel_sparse_v2_cold_at_paths_with_archive(
     state: &crate::state::AppState,
     label: &str,
@@ -2458,44 +2583,7 @@ fn cancel_sparse_v2_cold_at_paths_with_archive(
     )
 }
 
-fn cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
-    state: &crate::state::AppState,
-    label: &str,
-    root_key: PathBuf,
-    private_root: &Path,
-    recovery_root: &Path,
-    approved_assets: Option<&Path>,
-    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
-    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
-) -> Result<SparseV2ColdCancelResult, String> {
-    if let Some(slot) = exact_live_cold_recovery_slot(state, label, &root_key)? {
-        return cancel_sparse_v2_at_paths_with_archive_and_publish(
-            state,
-            label,
-            slot,
-            private_root,
-            recovery_root,
-            approved_assets,
-            shutdown_for_direct_files_escape,
-            archive,
-            publish_direct,
-        );
-    }
-    let graph_meta = cold_recovery_graph_meta(private_root, &root_key)?;
-    let slot = reserve_cold_recovery_slot(state, label, root_key, graph_meta)?;
-    cancel_sparse_v2_at_paths_with_archive_and_publish(
-        state,
-        label,
-        slot,
-        private_root,
-        recovery_root,
-        approved_assets,
-        shutdown_for_direct_files_escape,
-        archive,
-        publish_direct,
-    )
-}
-
+#[cfg(test)]
 fn cancel_sparse_v2_cold_at_paths(
     state: &crate::state::AppState,
     label: &str,
@@ -2628,8 +2716,19 @@ fn cancel_sparse_v2_blocking(
     let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
         .root_key
         .clone();
+    let transition = state.storage_supervisor.begin_guard(
+        app,
+        label,
+        root.clone(),
+        StorageTransitionKind::ReturnGracefully,
+    )?;
+    transition.advance(StorageTransitionPhase::WaitingForTransition)?;
     let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
     let _transition = transition_gate.lock().unwrap();
+    if !transition.is_current() {
+        return Err("the graceful Direct Files return was superseded while waiting".into());
+    }
+    transition.advance(StorageTransitionPhase::ValidatingTarget)?;
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     if slot.root_key != root {
         return Err("graph changed while return waited for its transition lane".into());
@@ -2637,15 +2736,49 @@ fn cancel_sparse_v2_blocking(
     let private_root = sparse_private_root(&app, &slot.root_key)?;
     let recovery_root = sparse_recovery_root(&app)?;
     let approved_assets = crate::settings::approved_external_assets(&app, &slot.root_key);
-    cancel_sparse_v2_at_paths(
+    transition.advance(StorageTransitionPhase::DrainingManaged)?;
+    let result = cancel_sparse_v2_at_paths_with_archive_and_publish(
         &state,
         label,
         slot,
         &private_root,
         &recovery_root,
         approved_assets.as_deref(),
-        shutdown_for_direct_files_escape,
-    )
+        shutdown_for_graceful_direct_files,
+        archive_private_root,
+        |direct_root, approved_assets| {
+            let graph =
+                tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
+                    .map_err(|error| error.to_string())?;
+            let replacement = Arc::new(crate::state::GraphSlot::new(
+                graph,
+                direct_root.to_path_buf(),
+            ));
+            let binding_generation = replacement.binding_generation;
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), replacement)?;
+            crate::state::poke_watcher(&state);
+            Ok(binding_generation)
+        },
+        Some(&transition),
+        |_| {
+            transition.advance(StorageTransitionPhase::ConfirmingProjection)?;
+            transition.advance(StorageTransitionPhase::PublishingDirect)
+        },
+    );
+    match result {
+        Ok(result) => {
+            transition.succeed(StableStorageMode::Direct)?;
+            Ok(result)
+        }
+        Err(error) => {
+            transition.fail("graceful_return_failed");
+            Err(error)
+        }
+    }
 }
 
 /// Publish the already-safe local archive into the single shared v2
@@ -2734,6 +2867,45 @@ fn join_sparse_v2_shared_blocking(
     label: &str,
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
+    let state = app.state::<crate::state::AppState>();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition = state.storage_supervisor.begin_guard(
+        app,
+        label,
+        root.clone(),
+        StorageTransitionKind::JoinManaged,
+    )?;
+    transition.advance(StorageTransitionPhase::WaitingForTransition)?;
+    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let _transition = transition_gate.lock().unwrap();
+    if !transition.is_current() {
+        return Err("managed join was superseded while waiting for its graph lane".into());
+    }
+    transition.advance(StorageTransitionPhase::ValidatingTarget)?;
+    transition.advance(StorageTransitionPhase::JoiningManaged)?;
+    let result =
+        join_sparse_v2_shared_under_transition(app, label, binding_generation, root, &transition);
+    match result {
+        Ok(status) => {
+            transition.succeed(StableStorageMode::Managed)?;
+            Ok(status)
+        }
+        Err(error) => {
+            transition.fail("join_failed");
+            Err(error)
+        }
+    }
+}
+
+fn join_sparse_v2_shared_under_transition(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    root: PathBuf,
+    transition: &crate::storage_mode_supervisor::StorageTransitionGuard<'_>,
+) -> Result<SparseV2StatusDto, String> {
     fn join_failure(stage: &str, error: impl std::fmt::Display) -> String {
         let detail = error.to_string();
         crate::debug::diag(format!(
@@ -2743,11 +2915,6 @@ fn join_sparse_v2_shared_blocking(
     }
 
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
-        .root_key
-        .clone();
-    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
-    let _transition = transition_gate.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     if slot.root_key != root {
         return Err("graph changed while join waited for its transition lane".into());
@@ -2772,12 +2939,7 @@ fn join_sparse_v2_shared_blocking(
                     slot.root_key.clone(),
                     SyncRuntimeFacade::graph_meta(&record),
                 ));
-                state
-                    .graphs
-                    .write()
-                    .unwrap()
-                    .bind(label.to_string(), replacement)?;
-                crate::state::poke_watcher(&state);
+                publish_transition_slot(&state, label, replacement, transition)?;
                 return Err(join_failure("runtime reopen", error));
             }
         };
@@ -2786,12 +2948,7 @@ fn join_sparse_v2_shared_blocking(
             slot.root_key.clone(),
             SyncRuntimeFacade::graph_meta(&record),
         ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&replacement))?;
-        crate::state::poke_watcher(&state);
+        publish_transition_slot(&state, label, Arc::clone(&replacement), transition)?;
         return sparse_v2_status_for_slot(&replacement);
     }
     let graph = slot.legacy_graph()?;
@@ -2805,7 +2962,7 @@ fn join_sparse_v2_shared_blocking(
     );
 
     slot.begin_legacy_retirement()?;
-    let removed = state.graphs.write().unwrap().remove(label);
+    let removed = remove_transition_slot(&state, label, transition)?;
     if removed
         .as_ref()
         .is_none_or(|removed| removed.binding_generation != slot.binding_generation)
@@ -2813,25 +2970,14 @@ fn join_sparse_v2_shared_blocking(
         slot.cancel_legacy_retirement()?;
         return Err("The graph changed while joining sync. Try again.".into());
     }
-    crate::state::poke_watcher(&state);
     if let Err(error) = slot.wait_for_legacy_drain(LEGACY_DRAIN_TIMEOUT) {
         slot.cancel_legacy_retirement()?;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state);
+        publish_transition_slot(&state, label, Arc::clone(&slot), transition)?;
         return Err(format!("Joining sync can be retried: {error}"));
     }
     if let Err(error) = state.sync_runtime.persist_binding_record(app, &record) {
         slot.cancel_legacy_retirement()?;
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state);
+        publish_transition_slot(&state, label, Arc::clone(&slot), transition)?;
         return Err(join_failure("binding publication", error));
     }
     let activated = match state.sync_runtime.activate_record(app, &record) {
@@ -2848,12 +2994,7 @@ fn join_sparse_v2_shared_blocking(
                 slot.root_key.clone(),
                 graph_meta,
             ));
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), replacement)?;
-            crate::state::poke_watcher(&state);
+            publish_transition_slot(&state, label, replacement, transition)?;
             return Err(join_failure("local activation", error));
         }
     };
@@ -2867,12 +3008,7 @@ fn join_sparse_v2_shared_blocking(
             slot.root_key.clone(),
             graph_meta,
         ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), replacement)?;
-        crate::state::poke_watcher(&state);
+        publish_transition_slot(&state, label, replacement, transition)?;
         return Err(detail);
     };
     if let Err(error) = handle.join_shared(descriptor) {
@@ -2881,12 +3017,7 @@ fn join_sparse_v2_shared_blocking(
             slot.root_key.clone(),
             graph_meta,
         ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(label.to_string(), replacement)?;
-        crate::state::poke_watcher(&state);
+        publish_transition_slot(&state, label, replacement, transition)?;
         return Err(join_failure("provider scan", error));
     }
     let binding = match state.sync_runtime.open_record(app, &record) {
@@ -2897,12 +3028,7 @@ fn join_sparse_v2_shared_blocking(
                 slot.root_key.clone(),
                 SyncRuntimeFacade::graph_meta(&record),
             ));
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(label.to_string(), replacement)?;
-            crate::state::poke_watcher(&state);
+            publish_transition_slot(&state, label, replacement, transition)?;
             return Err(join_failure("runtime reopen", error));
         }
     };
@@ -2911,12 +3037,7 @@ fn join_sparse_v2_shared_blocking(
         slot.root_key.clone(),
         graph_meta,
     ));
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(label.to_string(), Arc::clone(&replacement))?;
-    crate::state::poke_watcher(&state);
+    publish_transition_slot(&state, label, Arc::clone(&replacement), transition)?;
     sparse_v2_status_for_slot(&replacement)
 }
 
@@ -3144,6 +3265,44 @@ mod tests {
                 .contains("activate_sparse_v2_blocking(&app, &label, binding_generation)"),
             "the blocking operation must re-resolve the exact graph generation from owned inputs"
         );
+    }
+
+    #[test]
+    fn every_storage_mode_change_is_owned_by_the_native_supervisor() {
+        let source = include_str!("sync_runtime.rs");
+        for (function, kind) in [
+            (
+                "fn activate_sparse_v2_blocking(",
+                "StorageTransitionKind::ActivateManaged",
+            ),
+            (
+                "fn join_sparse_v2_shared_blocking(",
+                "StorageTransitionKind::JoinManaged",
+            ),
+            (
+                "fn cancel_sparse_v2_blocking(",
+                "StorageTransitionKind::ReturnGracefully",
+            ),
+        ] {
+            let start = source.find(function).expect("transition function exists");
+            let body = &source[start
+                ..source[start..]
+                    .find("\n}\n")
+                    .map(|offset| start + offset + 3)
+                    .unwrap_or(source.len())];
+            assert!(
+                body.contains("begin_guard("),
+                "{function} bypasses supervisor"
+            );
+            assert!(
+                body.contains(kind),
+                "{function} uses the wrong transition kind"
+            );
+        }
+        let emergency = &source[source
+            .find("fn cancel_sparse_v2_cold_blocking(")
+            .expect("emergency return exists")..];
+        assert!(emergency.contains("begin_emergency_return("));
     }
 
     #[test]

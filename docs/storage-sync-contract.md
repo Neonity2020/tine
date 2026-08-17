@@ -13,9 +13,9 @@ phase, and exactly one native terminal outcome. Late work may publish only while
 its operation remains current. Long work is never serialized app-wide:
 different canonical roots have independent lanes, and graph-slot publication is
 a short current-operation compare-and-publish. A stuck graph cannot block an
-unrelated graph or later overwrite the newer selection in the same window. The frontend renders events for the current
-operation ID; phase-name prefixes, frontend attempt tokens, and inactivity
-timers are not storage authority.
+unrelated graph or later overwrite the newer selection in the same window. The
+frontend renders events for the current operation ID; phase-name prefixes,
+frontend attempt tokens, and inactivity timers are not storage authority.
 
 Return to Direct Files has two meanings. A graceful return drains a healthy
 managed actor and confirms its committed projection before selecting Direct
@@ -27,7 +27,10 @@ and the UI warns that it may contain operations newer than Markdown. Re-enabling
 managed storage after emergency return starts from the then-live Markdown tree;
 quarantined authority is never silently resurrected. Emergency return
 supersedes in-flight managed open/activation/join at native safe checkpoints,
-and an older operation cannot publish a managed slot afterwards.
+and an older operation cannot publish a managed slot afterwards. The ordinary
+Settings action is always graceful: if drain or projection confirmation fails,
+it leaves managed evidence selected and offers the separately named emergency
+return rather than force-stopping managed authority implicitly.
 
 The authoritative layout names live in the pinned
 `tine_storage::formats` manifest. Core code imports them through the

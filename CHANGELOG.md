@@ -27,6 +27,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A failed or killed managed-storage recovery can no longer trap Tine's whole window, including unrelated Direct Files graphs.** One native supervisor now owns each graph transition, stale managed workers cannot publish after a newer graph selection, and the recovery screen's emergency return selects and opens the current Markdown tree without waiting for managed recovery. The frontend no longer invents a terminal `native.unavailable` failure from elapsed time. A healthy Settings return remains stricter: it drains managed storage and confirms its projection, while a failed drain offers the explicit emergency escape instead of silently force-stopping authority.
+
 - **Experimental managed storage now preserves baseline `id::` block identity through editing, crash replay, and disposable-SQLite reconstruction.** Exact-frontier SQLite supplies bounded baseline UUID candidates while current CRDT documents remain semantic authority; committed-tail claims are combined with that baseline, and a missing or corrupt projection uses only a rebuild-scoped snapshot rather than restoring a resident Patricia or handwritten identity index. Ambiguous baseline UUID claims remain unresolved.
 
 - Android managed-storage activation now uses the ordinary app-private

@@ -460,6 +460,70 @@ pub(crate) struct StorageModeSupervisor {
     clock_origin: Instant,
 }
 
+pub(crate) struct StorageTransitionGuard<'a> {
+    supervisor: &'a StorageModeSupervisor,
+    app: &'a tauri::AppHandle,
+    operation_id: StorageOperationId,
+    terminal: bool,
+}
+
+impl StorageTransitionGuard<'_> {
+    pub(crate) fn advance(&self, phase: StorageTransitionPhase) -> Result<(), String> {
+        self.supervisor
+            .advance_transition(self.app, self.operation_id, phase)
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.supervisor.operation_is_current(self.operation_id)
+    }
+
+    pub(crate) fn commit<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.supervisor
+            .commit_if_current(self.operation_id, publish)
+    }
+
+    pub(crate) fn succeed(mut self, mode: StableStorageMode) -> Result<(), String> {
+        self.supervisor.finish_transition(
+            self.app,
+            self.operation_id,
+            StorageTransitionOutcome::Succeeded,
+            Some(mode),
+            None,
+        )?;
+        self.terminal = true;
+        Ok(())
+    }
+
+    pub(crate) fn fail(mut self, code: impl Into<String>) {
+        let _ = self.supervisor.finish_transition(
+            self.app,
+            self.operation_id,
+            StorageTransitionOutcome::Failed,
+            None,
+            Some(code.into()),
+        );
+        self.terminal = true;
+    }
+}
+
+impl Drop for StorageTransitionGuard<'_> {
+    fn drop(&mut self) {
+        if self.terminal {
+            return;
+        }
+        let _ = self.supervisor.finish_transition(
+            self.app,
+            self.operation_id,
+            StorageTransitionOutcome::Failed,
+            None,
+            Some("operation_abandoned".into()),
+        );
+    }
+}
+
 impl Default for StorageModeSupervisor {
     fn default() -> Self {
         Self {
@@ -471,6 +535,22 @@ impl Default for StorageModeSupervisor {
 }
 
 impl StorageModeSupervisor {
+    pub(crate) fn begin_guard<'a>(
+        &'a self,
+        app: &'a tauri::AppHandle,
+        window: &str,
+        canonical_root: PathBuf,
+        kind: StorageTransitionKind,
+    ) -> Result<StorageTransitionGuard<'a>, String> {
+        let operation_id = self.begin_transition(app, window, Some(canonical_root), kind)?;
+        Ok(StorageTransitionGuard {
+            supervisor: self,
+            app,
+            operation_id,
+            terminal: false,
+        })
+    }
+
     pub(crate) fn legacy_transition_gate(&self, canonical_root: &Path) -> Arc<Mutex<()>> {
         let mut gates = self.root_transitions.lock().unwrap();
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -1079,5 +1159,22 @@ mod tests {
         assert!(frontend.contains("receiveTransition"));
         assert!(!state.contains("startup_recovery:"));
         assert!(!graph.contains("startup-progress"));
+    }
+
+    #[test]
+    fn living_contract_names_the_two_distinct_direct_return_semantics() {
+        let contract = include_str!("../../docs/storage-sync-contract.md");
+        for required in [
+            "`StorageModeSupervisor`",
+            "graceful return drains a healthy",
+            "emergency return is always available",
+            "Settings action is always graceful",
+            "inactivity timers are not storage authority",
+        ] {
+            assert!(
+                contract.contains(required),
+                "missing storage contract: {required}"
+            );
+        }
     }
 }
