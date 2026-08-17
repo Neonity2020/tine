@@ -1,6 +1,6 @@
 # 0055. One native supervisor owns storage-mode transitions
 
-- **Status:** Accepted — implementation in progress
+- **Status:** Implemented
 - **Date:** 2026-08-16
 - **Amends:** [0049](0049-oplog-first-sparse-storage.md)
 
@@ -44,7 +44,7 @@ Managed evidence is preserved with a warning that it may be newer than the
 Markdown projection. Re-enabling managed storage starts afresh from the live
 Markdown tree and never silently resurrects quarantined authority.
 
-The migration is Direct-first. Ordinary Direct open, edit, save, and restart
+The migration was Direct-first. Ordinary Direct open, edit, save, and restart
 must remain green at every integration boundary. The pure transition model and
 typed contract land first; startup/Direct, emergency return, managed
 open/activation/join, and graceful return then move behind it in that order.
@@ -54,13 +54,13 @@ ownership are deleted after their consumers move.
 
 ## Consequences
 
-Storage transitions become independently model-testable, emergency escape no
+Storage transitions are independently model-testable, emergency escape no
 longer depends on the failing subsystem, and stale workers cannot publish after
 a newer user decision. The frontend becomes a renderer rather than a second
 recovery authority. Native code must carry typed operation context through
-long-running boundaries and provide explicit cancellation checkpoints. During
-the bounded migration, the supervisor's legacy lock bridge remains visible and
-must not become a permanent second API.
+long-running boundaries and provide explicit cancellation checkpoints. Per-root
+transition lanes are owned by the supervisor and operation IDs decide whether
+the final publication is still current.
 
 Completion requires deterministic transition/crash-cut tests and exact real-app
 journeys for Direct restart, managed restart, forced-kill recovery, emergency

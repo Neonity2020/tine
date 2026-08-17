@@ -449,10 +449,9 @@ fn legal_phase_transition(
 
 /// The only native owner of workspace storage-transition identity and lanes.
 ///
-/// S1 introduces the tested transition model and replaces the app-global lock
-/// with root-local migration gates. Subsequent packets route commands through
-/// operation IDs and short compare-and-publish sections; until then the gate is
-/// explicitly named as a legacy bridge so it cannot become the final API.
+/// The tested transition model replaces the app-global lock with root-local
+/// lanes. Long work shares a lane only with operations on the same canonical
+/// graph root; operation IDs still decide whether final publication is current.
 #[derive(Debug)]
 pub(crate) struct StorageModeSupervisor {
     root_transitions: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
@@ -551,7 +550,7 @@ impl StorageModeSupervisor {
         })
     }
 
-    pub(crate) fn legacy_transition_gate(&self, canonical_root: &Path) -> Arc<Mutex<()>> {
+    pub(crate) fn transition_lane(&self, canonical_root: &Path) -> Arc<Mutex<()>> {
         let mut gates = self.root_transitions.lock().unwrap();
         gates.retain(|_, gate| gate.strong_count() > 0);
         if let Some(gate) = gates.get(canonical_root).and_then(Weak::upgrade) {
@@ -1051,14 +1050,14 @@ mod tests {
         use std::time::Duration;
 
         let supervisor = Arc::new(StorageModeSupervisor::default());
-        let graph_a = supervisor.legacy_transition_gate(Path::new("/graph-a"));
+        let graph_a = supervisor.transition_lane(Path::new("/graph-a"));
         let held_a = graph_a.lock().unwrap();
         let (sent, received) = mpsc::channel();
 
         let other = Arc::clone(&supervisor);
         let sent_b = sent.clone();
         let graph_b_worker = std::thread::spawn(move || {
-            let graph_b = other.legacy_transition_gate(Path::new("/graph-b"));
+            let graph_b = other.transition_lane(Path::new("/graph-b"));
             let _held_b = graph_b.lock().unwrap();
             sent_b.send("b").unwrap();
         });
@@ -1066,7 +1065,7 @@ mod tests {
 
         let same = Arc::clone(&supervisor);
         let same_root_worker = std::thread::spawn(move || {
-            let graph_a = same.legacy_transition_gate(Path::new("/graph-a"));
+            let graph_a = same.transition_lane(Path::new("/graph-a"));
             let _held_a = graph_a.lock().unwrap();
             sent.send("a").unwrap();
         });

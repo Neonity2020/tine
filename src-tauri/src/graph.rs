@@ -602,7 +602,7 @@ pub(crate) fn load_graph_for_label(
         .storage_supervisor
         .select_window_root(window_label, root_key.clone());
     graph_load_phase(started, &mut previous, "canonical graph root");
-    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root_key);
+    let transition_gate = state.storage_supervisor.transition_lane(&root_key);
     let _load = transition_gate.lock().unwrap();
     graph_load_phase(started, &mut previous, "serialized graph-open lock");
     let lookup_id = state.storage_supervisor.begin_transition(

@@ -1659,7 +1659,7 @@ fn recover_managed_application_subtrees_with(
     let root = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?
         .root_key
         .clone();
-    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?;
     if predecessor.root_key != root {
@@ -1795,7 +1795,7 @@ fn activate_sparse_v2_blocking(
         StorageTransitionKind::ActivateManaged,
     )?;
     transition.advance(StorageTransitionPhase::WaitingForTransition)?;
-    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     if !transition.is_current() {
         return Err("managed activation was superseded while waiting for its graph lane".into());
@@ -2723,7 +2723,7 @@ fn cancel_sparse_v2_blocking(
         StorageTransitionKind::ReturnGracefully,
     )?;
     transition.advance(StorageTransitionPhase::WaitingForTransition)?;
-    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     if !transition.is_current() {
         return Err("the graceful Direct Files return was superseded while waiting".into());
@@ -2804,7 +2804,7 @@ fn prepare_sparse_v2_share_blocking(
     let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
         .root_key
         .clone();
-    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     if slot.root_key != root {
@@ -2878,7 +2878,7 @@ fn join_sparse_v2_shared_blocking(
         StorageTransitionKind::JoinManaged,
     )?;
     transition.advance(StorageTransitionPhase::WaitingForTransition)?;
-    let transition_gate = state.storage_supervisor.legacy_transition_gate(&root);
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
     if !transition.is_current() {
         return Err("managed join was superseded while waiting for its graph lane".into());
@@ -3733,7 +3733,7 @@ mod tests {
             );
         }
         for forbidden in [
-            "legacy_transition_gate",
+            "transition_lane",
             "archive_private_root",
             "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",
             "shutdown_for_direct_files_escape",
