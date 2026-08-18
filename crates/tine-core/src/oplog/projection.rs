@@ -2205,7 +2205,36 @@ pub(crate) fn decode_manifested_projection_work(
     })
 }
 
+/// Name the page whose projection failed, so a bare platform errno arriving
+/// from a device receipt identifies the artifact as well as the syscall.
+///
+/// Only [`ProjectionError::Io`] is decorated: every other variant already
+/// carries its own semantic name, and `GuardedConflict` in particular must keep
+/// its marker error intact for `is_projection_semantic_refusal`.
+fn locate_projection_failure(path: &str, error: ProjectionError) -> ProjectionError {
+    match error {
+        ProjectionError::Io(error) => ProjectionError::Io(io::Error::new(
+            error.kind(),
+            format!("projecting {path:?}: {error}"),
+        )),
+        other => other,
+    }
+}
+
 fn execute_manifested_projection_work_with_runtime(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    runtime: ManifestedProjectionRuntime<'_>,
+    work: &ProjectionWork,
+    handoff: Option<&crate::model::PublishedHandoffLatch>,
+) -> Result<(), ProjectionError> {
+    let path = work.path().as_str().to_owned();
+    execute_manifested_projection_work_located(graph, receipts, engine, runtime, work, handoff)
+        .map_err(|error| locate_projection_failure(&path, error))
+}
+
+fn execute_manifested_projection_work_located(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,

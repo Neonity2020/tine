@@ -54,6 +54,79 @@ const fn android_filesystem_sync_may_fallback(kind: io::ErrorKind) -> bool {
     )
 }
 
+/// Which durability class an artifact belongs to. Platform durability policy is
+/// stated per class and per platform; it is never global and never a blanket
+/// "ignore I/O errors".
+///
+/// The two classes are not symmetric, and the asymmetry is the whole contract:
+///
+/// * [`DurabilityArtifactClass::PrivateDurableAuthority`] — the oplog manifest,
+///   its object archive, the local journal and the receipt store, all below
+///   app-private storage. These *are* the durable truth. A barrier they cannot
+///   provide is a real durability failure and stays fatal on every platform,
+///   Android included.
+/// * [`DurabilityArtifactClass::SharedReconstructibleProjection`] — the
+///   Markdown/Org projection of an already-accepted manifest into the user's
+///   graph tree. On Android that tree is shared storage served by FUSE
+///   (MediaProvider) or sdcardfs, which does not uniformly provide the
+///   filesystem-wide and directory-level flush primitives and reports the
+///   refusal as `EPERM`/`ENOTSUP`/`EINVAL`. Those bytes are derived state: the
+///   accepted manifest in private storage still records them, and a crash that
+///   loses an unflushed directory entry is repaired by the projection drain on
+///   the next open, exactly as an interrupted projection already is. Retrying a
+///   capability refusal cannot ever succeed, so retrying it forever is not
+///   crash-safety — it is an availability bug that strands the user's edit.
+///   On Android only, and only for those three capability errors, the barrier
+///   degrades. Every other errno (a real I/O error, `ENOSPC`, `EIO`) stays
+///   fatal, and every other platform stays strict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurabilityArtifactClass {
+    PrivateDurableAuthority,
+    SharedReconstructibleProjection,
+}
+
+/// Apply the per-class, per-platform policy to one durability barrier result.
+///
+/// Only the Android leg can degrade, and only for the reconstructible
+/// projection class. Every other platform returns the result unchanged, so a
+/// desktop or Windows build has no branch that can swallow a barrier failure.
+pub(crate) fn finish_durability_barrier(
+    class: DurabilityArtifactClass,
+    result: io::Result<()>,
+) -> io::Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        return android_durability_barrier(class, result);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = class;
+        result
+    }
+}
+
+/// The exact Android arm of [`finish_durability_barrier`], reachable from host
+/// tests so the branch the device takes is the branch under test.
+#[cfg(any(test, target_os = "android"))]
+pub(crate) fn android_durability_barrier(
+    class: DurabilityArtifactClass,
+    result: io::Result<()>,
+) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                class,
+                DurabilityArtifactClass::SharedReconstructibleProjection
+            ) && android_filesystem_sync_may_fallback(error.kind()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(any(test, target_os = "android"))]
 fn finish_android_private_tree_sync(path: &Path, result: io::Result<()>) -> io::Result<()> {
     match result {
@@ -190,6 +263,61 @@ mod tests {
             b"durable private state"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// The artifact-class asymmetry, stated as a test rather than a comment:
+    /// Android degrades the reconstructible projection barrier and NEVER the
+    /// private durable authority, and no platform degrades anything that is not
+    /// one of the three documented capability refusals.
+    #[test]
+    fn only_the_reconstructible_projection_class_degrades_and_only_on_android() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::InvalidInput,
+        ] {
+            android_durability_barrier(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                Err(io::Error::new(kind, "capability refusal")),
+            )
+            .unwrap();
+
+            // The durable authority keeps the strict barrier on Android too.
+            let error = android_durability_barrier(
+                DurabilityArtifactClass::PrivateDurableAuthority,
+                Err(io::Error::new(kind, "capability refusal")),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+
+            // And off Android nothing degrades at all.
+            #[cfg(not(target_os = "android"))]
+            {
+                let error = finish_durability_barrier(
+                    DurabilityArtifactClass::SharedReconstructibleProjection,
+                    Err(io::Error::new(kind, "capability refusal")),
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), kind);
+            }
+        }
+    }
+
+    #[test]
+    fn a_real_io_failure_on_the_projection_stays_fatal_even_on_android() {
+        for kind in [
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::StorageFull,
+            io::ErrorKind::Other,
+            io::ErrorKind::NotFound,
+        ] {
+            let error = android_durability_barrier(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                Err(io::Error::new(kind, "real I/O failure")),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
     }
 
     #[test]

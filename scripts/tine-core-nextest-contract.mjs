@@ -37,6 +37,13 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // half of the contract — unsettled retained work DEFERS, never refuses.
   "sync_runtime::tests::clean_runtime_application_save_settles_its_own_retained_publication",
   "sync_runtime::tests::clean_runtime_application_save_defers_when_retained_publication_cannot_settle",
+  // Android shared storage can refuse the projection directory barrier
+  // outright (EINVAL). The projection is reconstructible from the already
+  // durable manifest, so the refusal degrades there and the edit lands; the
+  // sibling holds the other half — off Android the same errno still fails
+  // closed, and the deferred receipt names the operation and the page.
+  "sync_runtime::tests::clean_runtime_save_survives_an_android_projection_directory_barrier_refusal",
+  "sync_runtime::tests::a_projection_directory_barrier_refusal_still_fails_closed_off_android",
   "sync_runtime::tests::clean_runtime_cross_page_move_commits_once_and_cold_reopens",
   "sync_runtime::tests::clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys",
   "sync_runtime::tests::retained_clean_reactivation_reports_each_recovery_boundary",

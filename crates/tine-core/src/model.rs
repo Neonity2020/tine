@@ -398,6 +398,25 @@ pub(crate) fn is_projection_semantic_refusal(error: &io::Error) -> bool {
         .is_some_and(|source| source.is::<ProjectionSemanticRefusal>())
 }
 
+/// Name the filesystem primitive and the graph location behind a raw platform
+/// errno on the projection leg.
+///
+/// The device is the only oracle for Android's shared-storage semantics and one
+/// CI round trip costs ~20 minutes, so a receipt that says only
+/// `Invalid argument (os error 22)` cannot be acted on. `ErrorKind` is
+/// preserved, because callers above classify on it (`NotFound`/`AlreadyExists`
+/// are guarded-conflict signals) and the platform durability policy matches on
+/// it too. A semantic refusal is returned untouched so its marker type survives.
+fn projection_platform_error(operation: &str, location: &str, error: io::Error) -> io::Error {
+    if is_projection_semantic_refusal(&error) {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        format!("{operation} failed at {location}: {error}"),
+    )
+}
+
 /// Markdown's parser deliberately omits layout trivia such as empty separator
 /// lines, but a guarded journal target may retain that trivia through its
 /// authenticated projection annotations. This comparison is intentionally
@@ -12255,7 +12274,7 @@ impl Graph {
                 Ok(()) => {}
                 Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
                     current.create_dir(component)?;
-                    sync_projection_directory_required(current)?;
+                    sync_reconstructible_projection_directory(current)?;
                     projection_parent_after_sync_hook()?;
                 }
                 Err(error) => return Err(error),
@@ -17608,7 +17627,7 @@ impl Graph {
         let lock = self.page_lock(&target.absolute_path);
         let _guard = lock.lock().unwrap();
         let parent = self.projection_parent(&target, false)?;
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_target_shape(&parent, &target)?;
         self.validate_current_graph_text_collision(
             write,
@@ -17637,7 +17656,7 @@ impl Graph {
             ));
         }
         file.sync_all()?;
-        sync_projection_chain_required(&parent.chain)?;
+        sync_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         self.ensure_projection_target_shape(&parent, &target)?;
         self.validate_current_graph_text_collision(
@@ -17717,7 +17736,7 @@ impl Graph {
         let _guard = lock.lock().unwrap();
         let parent = self.projection_parent(&target_path, true)?;
         self.ensure_projection_target_shape(&parent, &target_path)?;
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
 
         let current = read_projection_optional(parent.final_dir(), &target_path.filename)?;
         let resumed_retirement = current.is_none()
@@ -17888,7 +17907,7 @@ impl Graph {
                                 projection_after_retire_hook(&target_path.absolute_path),
                                 projection_after_retire_collision_hook(),
                             );
-                            preflight_projection_chain(&parent.chain)?;
+                            preflight_reconstructible_projection_chain(&parent.chain)?;
                             let validation = (|| {
                                 self.ensure_projection_parent_binding(&parent, &target_path)?;
                                 self.ensure_projection_target_shape(&parent, &target_path)?;
@@ -17933,7 +17952,7 @@ impl Graph {
                         publish_name = None;
                         published = true;
                         mutated = true;
-                        sync_projection_chain_required(&parent.chain)?;
+                        sync_reconstructible_projection_chain(&parent.chain)?;
                         let hooks = combine_projection_hook_results(
                             projection_post_publish_hook(&target_path.absolute_path),
                             projection_post_publish_collision_hook(),
@@ -18038,14 +18057,14 @@ impl Graph {
                             &target_path.filename,
                             &published_target_recovery,
                         ) {
-                            Ok(()) => sync_projection_chain_required(&parent.chain),
+                            Ok(()) => sync_reconstructible_projection_chain(&parent.chain),
                             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                                 match parent
                                     .final_dir()
                                     .symlink_metadata(&target_path.filename)
                                 {
                                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                                        sync_projection_chain_required(&parent.chain)
+                                        sync_reconstructible_projection_chain(&parent.chain)
                                     }
                                     Ok(_) => Err(io::Error::new(
                                         io::ErrorKind::Interrupted,
@@ -18193,7 +18212,7 @@ impl Graph {
         )?;
         let parent = self.projection_parent(&target, false)?;
         self.ensure_projection_target_shape(&parent, &target)?;
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         let current = read_projection_optional(parent.final_dir(), &target.filename)?;
         if current.as_deref() != Some(expected_base) {
             return Err(io::Error::new(
@@ -18334,7 +18353,7 @@ impl Graph {
                     Ok(())
                 })();
                 combine_projection_hook_validation(hooks, validation)?;
-                sync_projection_chain_required(&parent.chain)?;
+                sync_reconstructible_projection_chain(&parent.chain)?;
                 let hooks = combine_projection_hook_results(
                     projection_post_publish_hook(&target.absolute_path),
                     projection_post_publish_collision_hook(),
@@ -18398,11 +18417,11 @@ impl Graph {
                 &target.filename,
                 &published_recovery,
             ) {
-                Ok(()) => sync_projection_chain_required(&parent.chain),
+                Ok(()) => sync_reconstructible_projection_chain(&parent.chain),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     match parent.final_dir().symlink_metadata(&target.filename) {
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            sync_projection_chain_required(&parent.chain)
+                            sync_reconstructible_projection_chain(&parent.chain)
                         }
                         Ok(_) => Err(io::Error::new(
                             io::ErrorKind::Interrupted,
@@ -18516,7 +18535,7 @@ impl Graph {
                 "projection confirmation target is present",
             ));
         }
-        sync_projection_chain_required(&parent.chain)?;
+        sync_reconstructible_projection_chain(&parent.chain)?;
         let hooks = combine_projection_hook_results(
             projection_post_publish_hook(&target.absolute_path),
             projection_post_publish_collision_hook(),
@@ -18731,7 +18750,7 @@ impl Graph {
         let _guard = lock.lock().unwrap();
         let parent = self.projection_parent(&target, false)?;
         let bytes = sync_and_read_projection_regular(parent.final_dir(), &evidence.filename)?;
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         Ok(bytes)
     }
@@ -18789,7 +18808,7 @@ impl Graph {
             }
             Err(error) => return Err(error),
         };
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
 
         let record = &records[0];
@@ -18862,7 +18881,7 @@ impl Graph {
                 )?;
                 return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
             }
-            preflight_projection_chain(&parent.chain)?;
+            preflight_reconstructible_projection_chain(&parent.chain)?;
             self.ensure_projection_parent_binding(&parent, &target)?;
             if !allow_retirement {
                 let final_name =
@@ -18942,7 +18961,7 @@ impl Graph {
         }
         drop(opened);
 
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         projection_recovery_retirement_after_validation_hook()?;
         rename_projection_noreplace(
@@ -18950,7 +18969,7 @@ impl Graph {
             record.recovery_filename(),
             &quarantine_name,
         )?;
-        sync_projection_chain_required(&parent.chain)?;
+        sync_reconstructible_projection_chain(&parent.chain)?;
 
         let (quarantined, quarantine_bytes) =
             open_and_read_projection_regular(parent.final_dir(), &quarantine_name)?;
@@ -19013,7 +19032,7 @@ impl Graph {
                 &bytes,
             )?);
         }
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(parent, target)?;
         evidence.sort_by(|left, right| {
             (&left.relative_path, &left.filename).cmp(&(&right.relative_path, &right.filename))
@@ -19064,7 +19083,7 @@ impl Graph {
                 evidence.push(retained);
             }
         }
-        preflight_projection_chain(&parent.chain)?;
+        preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(parent, target)?;
         evidence.sort_by(|left, right| {
             (&left.relative_path, &left.filename).cmp(&(&right.relative_path, &right.filename))
@@ -19140,7 +19159,7 @@ impl Graph {
                 "projection removal recovery has no exact retained base evidence",
             ));
         }
-        sync_projection_chain_required(&parent.chain)?;
+        sync_reconstructible_projection_chain(&parent.chain)?;
         let hooks = combine_projection_hook_results(
             projection_post_publish_hook(&target.absolute_path),
             projection_post_publish_collision_hook(),
@@ -19295,7 +19314,7 @@ impl Graph {
         self.note_self_write(&target_path.absolute_path, rev.clone());
         let result = (|| {
             file.sync_all()?;
-            sync_projection_chain_required(&parent.chain)?;
+            sync_reconstructible_projection_chain(&parent.chain)?;
             let hooks = combine_projection_hook_results(
                 projection_post_publish_hook(&target_path.absolute_path),
                 projection_post_publish_collision_hook(),
@@ -21147,7 +21166,7 @@ impl Graph {
         }
         file.sync_all()?;
         journal_projection_after_file_sync_hook()?;
-        sync_projection_chain_required(&target.chain)?;
+        sync_reconstructible_projection_chain(&target.chain)?;
         let rebound = self.managed_target(write, &plan.path, false)?;
         if canonical_projection_directory_resource_id(rebound.parent())?
             != plan.expected_parent_identity
@@ -23680,7 +23699,11 @@ fn open_projection_dir_nofollow(dir: &Dir, name: &str) -> io::Result<Dir> {
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(projection_platform_error(
+            "openat(O_DIRECTORY|O_NOFOLLOW) of a projection parent",
+            &format!("{name:?}"),
+            io::Error::last_os_error(),
+        ));
     }
     Ok(Dir::from_std_file(unsafe { fs::File::from_raw_fd(fd) }))
 }
@@ -23735,7 +23758,11 @@ fn open_projection_file_nofollow(dir: &Dir, name: &str) -> io::Result<fs::File> 
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(projection_platform_error(
+            "openat(O_NOFOLLOW) of a projection file",
+            &format!("{name:?}"),
+            io::Error::last_os_error(),
+        ));
     }
     let file = unsafe { fs::File::from_raw_fd(fd) };
     if !file.metadata()?.is_file() {
@@ -23910,7 +23937,7 @@ fn retain_projection_recovery_conflict(
         record.attempt_id().simple(),
         hex_digest(resource_id.as_bytes())
     );
-    preflight_projection_chain(&parent.chain)?;
+    preflight_reconstructible_projection_chain(&parent.chain)?;
     let live_source = open_projection_file_nofollow(parent.final_dir(), source_name)?;
     if canonical_projection_file_resource_id(&live_source)? != resource_id {
         return Err(io::Error::new(
@@ -23919,7 +23946,7 @@ fn retain_projection_recovery_conflict(
         ));
     }
     rename_projection_noreplace(parent.final_dir(), source_name, &conflict_name)?;
-    sync_projection_chain_required(&parent.chain)?;
+    sync_reconstructible_projection_chain(&parent.chain)?;
     projection_recovery_relative_path(&target.relative_path, &conflict_name)
 }
 
@@ -23978,7 +24005,7 @@ fn retire_stable_projection_quarantine(
     }
     projection_recovery_after_final_reread_hook()?;
     parent.remove_file(quarantine_name)?;
-    sync_projection_chain_required(projection_chain)?;
+    sync_reconstructible_projection_chain(projection_chain)?;
     Ok(StableProjectionQuarantineRetirement::Retired)
 }
 
@@ -24050,7 +24077,8 @@ fn sync_open_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<(f
             "projection evidence exceeds the reload bound",
         ));
     }
-    file.sync_all()?;
+    file.sync_all()
+        .map_err(|error| projection_platform_error("fsync of a projection file", name, error))?;
     let capacity = usize::try_from(len).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -30694,7 +30722,7 @@ fn preserve_and_restore_projection_recovery(
     expected_bytes: &[u8],
     expected_identity: ContentDigest,
 ) -> io::Result<()> {
-    preflight_projection_chain(&parent.chain)?;
+    preflight_reconstructible_projection_chain(&parent.chain)?;
 
     match read_projection_optional(parent.final_dir(), &target.filename) {
         Ok(Some(_)) => return Ok(()),
@@ -30768,7 +30796,7 @@ fn preserve_and_restore_projection_recovery(
     let restore = rename_projection_noreplace(parent.final_dir(), &temp, &target.filename);
     match restore {
         Ok(()) => {
-            preflight_projection_chain(&parent.chain)?;
+            preflight_reconstructible_projection_chain(&parent.chain)?;
             let validation = (|| {
                 graph.ensure_projection_parent_binding(parent, target)?;
                 graph.ensure_projection_target_shape(parent, target)?;
@@ -30800,7 +30828,7 @@ fn preserve_and_restore_projection_recovery(
                     &target.filename,
                 ) {
                     Ok(withdrawn) => {
-                        preflight_projection_chain(&parent.chain)?;
+                        preflight_reconstructible_projection_chain(&parent.chain)?;
                         Ok(Some(withdrawn))
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -30831,7 +30859,7 @@ fn preserve_and_restore_projection_recovery(
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let _ = parent.final_dir().remove_file(&temp);
-            preflight_projection_chain(&parent.chain)
+            preflight_reconstructible_projection_chain(&parent.chain)
         }
         Err(error) => {
             let _ = parent.final_dir().remove_file(&temp);
@@ -30845,11 +30873,24 @@ fn preserve_and_restore_projection_recovery(
 /// when directory flushing is unavailable. Windows first validates the retained
 /// exact directory capability, then records its documented lack of a
 /// directory-entry flush primitive as a platform limitation.
+///
+/// This is the strict, sole-authority variant. The Markdown/Org projection of
+/// an accepted manifest uses [`preflight_reconstructible_projection_chain`];
+/// see [`crate::filesystem_durability::DurabilityArtifactClass`] for why the
+/// two classes get different platform policies.
 fn preflight_projection_chain(chain: &[Dir]) -> io::Result<()> {
-    for dir in chain.iter().rev() {
-        sync_projection_directory_required(dir)?;
-    }
-    Ok(())
+    sync_projection_chain_with_class(
+        chain,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+    )
+}
+
+/// The same preflight for the reconstructible Markdown/Org projection leg.
+fn preflight_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
+    sync_projection_chain_with_class(
+        chain,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -30874,9 +30915,13 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
             libc::RENAME_NOREPLACE as libc::c_uint,
         )
     };
-    (result == 0)
-        .then_some(())
-        .ok_or_else(io::Error::last_os_error)
+    (result == 0).then_some(()).ok_or_else(|| {
+        projection_platform_error(
+            "renameat2(RENAME_NOREPLACE) publishing the projection",
+            &format!("{from:?} -> {to:?}"),
+            io::Error::last_os_error(),
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -31122,16 +31167,174 @@ fn rename_managed_noreplace(
     ))
 }
 
+/// The strict directory barrier for graph-tree artifacts the graph is the SOLE
+/// authority for — conflict copies, trash, withdrawn bytes, assets. A barrier
+/// the filesystem refuses for those is a real durability failure and stays fatal
+/// on every platform, Android included.
 fn sync_projection_chain_required(chain: &[Dir]) -> io::Result<()> {
     projection_directory_sync_hook(Path::new("."))?;
-    for dir in chain.iter().rev() {
-        sync_projection_directory_required(dir)?;
+    sync_projection_chain_with_class(
+        chain,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+    )
+}
+
+/// The directory barrier for the Markdown/Org projection of an accepted
+/// manifest. Android shared storage can refuse this barrier outright
+/// (`EPERM`/`ENOTSUP`/`EINVAL`); those bytes are reconstructible from the
+/// private manifest, so the refusal degrades there instead of retrying forever.
+fn sync_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
+    projection_directory_sync_hook(Path::new("."))?;
+    sync_projection_chain_with_class(
+        chain,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+    )
+}
+
+fn sync_projection_chain_with_class(
+    chain: &[Dir],
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+) -> io::Result<()> {
+    let depth = chain.len();
+    for (index, dir) in chain.iter().enumerate().rev() {
+        sync_projection_directory_with_class(dir, class, index, depth)?;
     }
     Ok(())
 }
 
 fn sync_projection_directory_required(dir: &Dir) -> io::Result<()> {
-    tine_storage::sync_dir_required(dir)
+    sync_projection_directory_with_class(
+        dir,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+        0,
+        1,
+    )
+}
+
+/// Flush one freshly created parent of the reconstructible projection tree.
+fn sync_reconstructible_projection_directory(dir: &Dir) -> io::Result<()> {
+    sync_projection_directory_with_class(
+        dir,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+        0,
+        1,
+    )
+}
+
+/// The single place the projection leg calls the platform directory-flush
+/// primitive. It names the operation and the chain position on failure — a bare
+/// platform errno on a device receipt is not actionable — and then applies the
+/// per-artifact-class platform policy.
+fn sync_projection_directory_with_class(
+    dir: &Dir,
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    index: usize,
+    depth: usize,
+) -> io::Result<()> {
+    let name = |error: io::Error| {
+        projection_platform_error(
+            "fsync of the projection parent directory",
+            &format!("chain depth {}/{depth} ({class:?})", index + 1),
+            error,
+        )
+    };
+    #[cfg(test)]
+    if let Some(injected) = armed_projection_directory_barrier(class, dir)? {
+        let result = Err(name(io::Error::from_raw_os_error(injected.errno)));
+        return if injected.android {
+            crate::filesystem_durability::android_durability_barrier(class, result)
+        } else {
+            crate::filesystem_durability::finish_durability_barrier(class, result)
+        };
+    }
+    let result = tine_storage::sync_dir_required(dir).map_err(name);
+    crate::filesystem_durability::finish_durability_barrier(class, result)
+}
+
+/// A substitute for the platform directory-flush primitive, armed for exactly
+/// one graph tree so a host test can reproduce a device that refuses the barrier
+/// on every attempt.
+///
+/// It is deliberately process-global rather than thread-local: the runtime
+/// executes a save on its actor thread, so a thread-local armed by a test would
+/// never be observed by the code under test. Scoping it to the fixture's own
+/// root directory identity keeps it from touching any other test's graph.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct ArmedProjectionDirectoryBarrier {
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    errno: i32,
+    android: bool,
+    root: (u64, u64),
+}
+
+#[cfg(test)]
+static ARMED_PROJECTION_DIRECTORY_BARRIER: std::sync::Mutex<
+    Option<ArmedProjectionDirectoryBarrier>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn armed_projection_directory_barrier(
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    dir: &Dir,
+) -> io::Result<Option<ArmedProjectionDirectoryBarrier>> {
+    let armed = *ARMED_PROJECTION_DIRECTORY_BARRIER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(armed) = armed.filter(|armed| armed.class == class) else {
+        return Ok(None);
+    };
+    Ok((projection_dir_identity(dir)? == armed.root).then_some(armed))
+}
+
+/// Make every projection directory barrier of `class` inside `root` fail with
+/// `errno` until the returned guard is dropped. `android` selects the Android
+/// platform policy for that barrier, so one test can drive the device's branch
+/// and its sibling can prove the desktop branch still fails closed.
+#[cfg(test)]
+pub(crate) struct InjectedProjectionDirectoryBarrierFailure(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+
+/// Only one injection may be armed at a time. Under nextest every test is its
+/// own process and this is free; under a threaded `cargo test` it stops two
+/// fixtures from observing each other's arming.
+#[cfg(test)]
+static PROJECTION_DIRECTORY_BARRIER_INJECTION_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
+#[cfg(test)]
+impl InjectedProjectionDirectoryBarrierFailure {
+    pub(crate) fn enter(
+        class: crate::filesystem_durability::DurabilityArtifactClass,
+        errno: i32,
+        android: bool,
+        root: &Path,
+    ) -> io::Result<Self> {
+        let exclusive = PROJECTION_DIRECTORY_BARRIER_INJECTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
+        let armed = ArmedProjectionDirectoryBarrier {
+            class,
+            errno,
+            android,
+            root: projection_dir_identity(&root_dir)?,
+        };
+        *ARMED_PROJECTION_DIRECTORY_BARRIER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(armed);
+        Ok(Self(exclusive))
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectedProjectionDirectoryBarrierFailure {
+    fn drop(&mut self) {
+        *ARMED_PROJECTION_DIRECTORY_BARRIER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 #[cfg(unix)]
@@ -33376,6 +33579,92 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
         dir
+    }
+
+    /// The artifact-class split, proved at the primitive itself: both barriers
+    /// call the same syscall on the same directory, and only the reconstructible
+    /// projection class degrades when Android refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_reconstructible_projection_barrier_degrades_on_android() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("projection-barrier-artifact-class");
+        let chain = vec![Dir::open_ambient_dir(&dir, ambient_authority()).unwrap()];
+
+        {
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EINVAL,
+                true,
+                &dir,
+            )
+            .unwrap();
+            sync_reconstructible_projection_chain(&chain)
+                .expect("Android cannot provide this barrier for reconstructible bytes");
+            preflight_reconstructible_projection_chain(&chain).unwrap();
+        }
+
+        {
+            // The graph tree also holds artifacts it is the SOLE authority for —
+            // conflict copies, trash, withdrawn bytes. Those keep the strict
+            // barrier on every platform, Android included.
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::PrivateDurableAuthority,
+                libc::EINVAL,
+                true,
+                &dir,
+            )
+            .unwrap();
+            let error = sync_projection_chain_required(&chain).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("fsync of the projection parent directory"),
+                "a bare errno is not diagnosable from a device receipt: {error}"
+            );
+            assert_eq!(
+                preflight_projection_chain(&chain).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+
+        {
+            // Off Android the reconstructible barrier is strict too.
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EINVAL,
+                false,
+                &dir,
+            )
+            .unwrap();
+            assert_eq!(
+                sync_reconstructible_projection_chain(&chain)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+
+        {
+            // A real I/O failure is not a capability refusal and stays fatal
+            // even on Android.
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EIO,
+                true,
+                &dir,
+            )
+            .unwrap();
+            let error = sync_reconstructible_projection_chain(&chain).unwrap_err();
+            assert!(
+                error.to_string().contains("Input/output error"),
+                "a real I/O failure must stay fatal even on Android: {error}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

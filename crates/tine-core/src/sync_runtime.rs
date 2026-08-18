@@ -19133,6 +19133,14 @@ impl RuntimeActor {
                 },
             ));
         }
+        // A retry that reproduces the SAME phase and the SAME failure detail has
+        // made no progress, and the failure it reports is deterministic: nothing
+        // about the next 62 turns will differ. Burning the whole budget on it
+        // costs the user's save that much latency for no chance of settling, so
+        // stop at the second identical observation and defer once. Any change in
+        // phase or detail is progress and keeps the loop running.
+        let mut previous_failure: Option<(SyncLocalMutationPhase, String)> = None;
+        let mut spent = MAX_EDITOR_SETTLE_TURNS;
         for turn in 0..MAX_EDITOR_SETTLE_TURNS {
             let outcome = self
                 .clean
@@ -19179,16 +19187,21 @@ impl RuntimeActor {
                         ));
                     }
                     phase = map_local_phase(next_phase);
+                    let observed = self
+                        .clean
+                        .as_ref()
+                        .expect("clean settlement retains its clean actor")
+                        .pending_failure()
+                        .map(|(_, _, detail)| (phase, detail));
+                    if observed.is_some() && observed == previous_failure {
+                        spent = turn + 1;
+                        break;
+                    }
+                    previous_failure = observed;
                 }
             }
         }
-        self.note_retained_publication(
-            expected_batch_id,
-            phase,
-            detail,
-            MAX_EDITOR_SETTLE_TURNS,
-            false,
-        );
+        self.note_retained_publication(expected_batch_id, phase, detail, spent, false);
         Ok(ApplicationPublicationSettlement::Deferred(
             SyncEditorDeferred::RetryableRetainedPublication {
                 batch_id: expected_batch_id.to_owned(),
@@ -19201,6 +19214,8 @@ impl RuntimeActor {
     /// so a blocked save still makes the runtime progress. Returns the turns
     /// spent and whether it settled.
     fn advance_clean_retained_publication(&mut self) -> (usize, bool) {
+        // Same permanent-failure stop as `settle_clean_retained_publication`.
+        let mut previous_failure: Option<(OperationalPhase, String)> = None;
         for turn in 0..MAX_EDITOR_SETTLE_TURNS {
             let outcome = self
                 .clean
@@ -19216,7 +19231,18 @@ impl RuntimeActor {
                 Some(
                     CleanActorMutationOutcome::DurablePending { .. }
                     | CleanActorMutationOutcome::RetainedPriorPending { .. },
-                ) => {}
+                ) => {
+                    let observed = self
+                        .clean
+                        .as_ref()
+                        .expect("clean settlement retains its clean actor")
+                        .pending_failure()
+                        .map(|(_, phase, detail)| (phase, detail));
+                    if observed.is_some() && observed == previous_failure {
+                        return (turn + 1, false);
+                    }
+                    previous_failure = observed;
+                }
             }
         }
         (MAX_EDITOR_SETTLE_TURNS, false)
@@ -45082,7 +45108,125 @@ mod tests {
             .unwrap()
             .expect("a deferred retained publication is reported");
         assert!(!retained.settled);
-        assert_eq!(retained.settle_turns, MAX_EDITOR_SETTLE_TURNS);
+        // The harness fault is deterministic, so every turn reproduces the same
+        // phase and detail. The settle loop recognises that as a permanent
+        // failure and stops at the second identical observation instead of
+        // spending the whole budget: a save the runtime cannot settle must cost
+        // the user one deferral, not 64 futile retries.
+        assert_eq!(retained.settle_turns, 2);
+        assert!(retained.settle_turns < MAX_EDITOR_SETTLE_TURNS);
+    }
+
+    /// Android's shared storage does not uniformly provide the directory flush
+    /// primitive and reports the refusal as `EINVAL`. The Markdown projection
+    /// is reconstructible from the already-durable manifest, so that refusal
+    /// must degrade and the user's edit must reach the graph. Anything else
+    /// retries forever and strands the save — which is exactly what Android CI
+    /// run 32088229039 observed (`phase:ProjectionDrain`,
+    /// `detail:Invalid argument (os error 22)`, `settled:false`, 64 turns).
+    #[test]
+    fn clean_runtime_save_survives_an_android_projection_directory_barrier_refusal() {
+        let fixture = ActivationFixture::nested_unicode("clean-android-einval", 0xa1783);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let mut edited = page.clone();
+        edited.blocks[0].raw = "android shared storage barrier refusal".into();
+
+        let _refusal = crate::model::InjectedProjectionDirectoryBarrierFailure::enter(
+            crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+            libc::EINVAL,
+            true,
+            &fixture.graph_root,
+        )
+        .unwrap();
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page: edited,
+        });
+        assert!(
+            matches!(outcome, Ok(SyncApplicationPageSaveOutcome::Saved { .. })),
+            "a projection directory barrier Android cannot provide must not strand the save: {outcome:?}"
+        );
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("android shared storage barrier refusal"));
+    }
+
+    /// The same errno on the same barrier, without the Android shared-storage
+    /// leg, still fails closed. The tolerance is a platform capability policy,
+    /// not a decision to ignore durability errors.
+    #[test]
+    fn a_projection_directory_barrier_refusal_still_fails_closed_off_android() {
+        let fixture = ActivationFixture::nested_unicode("clean-desktop-einval", 0xa1784);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let mut edited = page.clone();
+        edited.blocks[0].raw = "desktop barrier refusal is fatal".into();
+
+        let _refusal = crate::model::InjectedProjectionDirectoryBarrierFailure::enter(
+            crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+            libc::EINVAL,
+            false,
+            &fixture.graph_root,
+        )
+        .unwrap();
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page: edited,
+            })
+            .expect("an unsettled clean publication defers, it does not refuse");
+        assert!(
+            !matches!(outcome, SyncApplicationPageSaveOutcome::Saved { .. }),
+            "a durability barrier failure off Android must not be tolerated: {outcome:?}"
+        );
+        assert!(!fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("desktop barrier refusal is fatal"));
+
+        // And the receipt must now name the operation, not only the errno.
+        let retained = handle
+            .last_retained_publication()
+            .unwrap()
+            .expect("a deferred retained publication is reported");
+        assert!(!retained.settled);
+        assert!(
+            retained
+                .detail
+                .contains("fsync of the projection parent directory")
+                && retained.detail.contains("Root.md"),
+            "the retained failure must name the operation and the page: {retained:?}"
+        );
     }
 
     #[test]

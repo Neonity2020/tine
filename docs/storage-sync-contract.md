@@ -682,6 +682,53 @@ settlement — is enforced by tests
 which assert the actor's legacy-settlement counter stays at zero, not by this
 paragraph.
 
+The settlement budget is an upper bound, not a target. A retry that reproduces
+the **same phase and the same failure detail** as the previous turn has made no
+progress against a deterministic failure, so the loop stops at that second
+identical observation and defers once. Spending all `MAX_EDITOR_SETTLE_TURNS`
+turns on a permanent failure buys no chance of settling and charges the whole
+cost to the user's save. Any change of phase or detail counts as progress and
+keeps the loop running to the budget.
+
+### 2.10a Durability barriers by artifact class
+
+Platform durability policy is stated **per artifact class**, never globally.
+`crate::filesystem_durability::DurabilityArtifactClass` names the two classes,
+and every projection directory barrier passes through it:
+
+| Class | What it covers | Policy |
+| --- | --- | --- |
+| `PrivateDurableAuthority` | The oplog manifest, object archive, local journal and receipt store below app-private storage — and graph-tree artifacts the graph is the **sole** authority for: conflict copies, trash, withdrawn bytes, assets. | Strict on **every** platform, Android included. A barrier the filesystem refuses is a real durability failure. |
+| `SharedReconstructibleProjection` | The Markdown/Org projection of an already-accepted manifest into the user's graph tree. | Strict everywhere except Android. On Android only, and only for `PermissionDenied`/`Unsupported`/`InvalidInput` (`EPERM`/`ENOTSUP`/`EINVAL`), the barrier **degrades**. Every other errno stays fatal. |
+
+The crash story for the degraded case still holds: the projection is derived
+state. The accepted manifest in app-private storage — which keeps its strict
+barriers — already records those bytes, and a crash that loses an unflushed
+directory entry is repaired by the projection drain on the next open, by the
+same mechanism that finishes an interrupted projection. Retrying a capability
+refusal cannot ever succeed, so retrying it forever is not crash-safety; it is
+an availability bug that strands the user's edit, which is exactly what Android
+CI run 32088229039 recorded (`phase:ProjectionDrain`,
+`detail:Invalid argument (os error 22)`, `settled:false`, 64 turns).
+
+Because the device is the only oracle for these semantics, every platform
+primitive on the projection leg — the directory flush, `renameat2` with
+`RENAME_NOREPLACE`, projection file `fsync`, and the no-follow `openat` of a
+projection parent or file — names its operation and its location in the error it
+returns, and `execute_manifested_projection_work` prefixes the page path. A
+device receipt therefore reads `projecting "pages/X.md": fsync of the projection
+parent directory failed at chain depth 2/2 (…): Invalid argument (os error 22)`
+rather than a bare errno. `ErrorKind` is preserved, because guarded-conflict
+classification and the durability policy both match on it.
+
+The class split is enforced by tests, not by this table:
+`filesystem_durability::tests::only_the_reconstructible_projection_class_degrades_and_only_on_android`
+and `model::tests::only_the_reconstructible_projection_barrier_degrades_on_android`
+at the primitive, and
+`sync_runtime::tests::clean_runtime_save_survives_an_android_projection_directory_barrier_refusal`
+plus `…::a_projection_directory_barrier_refusal_still_fails_closed_off_android`
+at the save boundary.
+
 Unix UID equality and “only the current user may write this path” are
 deliberately absent. The threat model does not defend against a malicious actor
 who can already rewrite the user's private filesystem, and those checks reject
@@ -732,6 +779,8 @@ regular files, flushes published file contents, and validates bounded bytes and
 digests. On Android, inability to fsync a shared-storage directory is treated
 as a platform durability limit rather than a durable refusal. App-private
 enrollment, archive, journal, and SQLite directory barriers remain required.
+The same limit applies to the Markdown/Org projection under §2.10a; it does not
+apply to graph-tree artifacts the graph is the sole authority for.
 
 During uninterrupted activation, SQLite's terminal builder is the single
 bounded producer of parser-owned terminal page states. An activation-only
