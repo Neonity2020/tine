@@ -2989,7 +2989,12 @@ textarea {
 }
 @media (max-width: 480px) {
   .modal-overlay {
-    padding-top: calc(var(--overlay-inset-top) + 2vh);
+    /* Exactly the system inset, and nothing on top of it. The extra 2vh was a
+       desktop-shaped breathing gap; on a phone it put the modal noticeably
+       below the status bar and left a lit strip of the workspace behind it
+       showing through the scrim. A full-height sheet wants its top edge ON the
+       inset. */
+    padding-top: var(--overlay-inset-top);
   }
   .settings-modal {
     /* Fill the overlay's already-inset content box instead of measuring against

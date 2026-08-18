@@ -31,4 +31,43 @@ describe("managed-storage diagnostics", () => {
       "managed sync join failed at provider scan: provider evidence disappeared during join at [provider path]",
     );
   });
+
+  // Martin's phone, Aug 18: a join failure whose detail named a graph-relative
+  // provider path was discarded whole and shown as "The command failed without
+  // a safe diagnostic detail" — the redactor recognized absolute paths only,
+  // so the surviving "/" tripped the structural reject at the end.
+  it("redacts a graph-relative provider path instead of discarding the message", () => {
+    expect(safeManagedErrorDetail(
+      "managed sync join failed at provider discovery: .tine-sync/v2/shared/outbox: Invalid argument (os error 22)",
+    )).toBe(
+      "managed sync join failed at provider discovery: [path]: Invalid argument (os error 22)",
+    );
+  });
+
+  // Attributing every refusal site is what cracked the Android save defect.
+  // Blanket-redacting quoted text made every attributed refusal read alike; a
+  // bare snake_case identifier cannot carry graph text.
+  it("keeps an attributed refusal site, which is authored, not user data", () => {
+    expect(safeManagedErrorDetail(
+      'managed sync join failed at provider scan: ActorRefusedAt("require_pending_publication_absent")',
+    )).toBe(
+      'managed sync join failed at provider scan: ActorRefusedAt("require_pending_publication_absent")',
+    );
+  });
+
+  it("still redacts quoted text that is not an authored identifier", () => {
+    expect(safeManagedErrorDetail(
+      'clean external reconciliation refused: page "My Private Page Title" is already owned',
+    )).toBe(
+      'clean external reconciliation refused: page "[redacted]" is already owned',
+    );
+  });
+
+  // A page path is the one path whose last segment routinely contains spaces,
+  // and every whitespace-terminated rule leaked the remainder of the name.
+  it("redacts a page path whose last segment contains spaces", () => {
+    expect(safeManagedErrorDetail(
+      "join failed reading /home/someone/graph/pages/Some Private Page.md",
+    )).toBe("join failed reading [path]");
+  });
 });
