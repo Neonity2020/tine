@@ -34,6 +34,8 @@ describe("Tine-managed storage app boundary", () => {
       "cancel_sparse_v2",
       "prepare_sparse_v2_share",
       "join_sparse_v2_shared",
+      "adopt_sparse_v2_shared",
+      "sparse_v2_recovery_location",
       "sparse_v2_query",
       "sparse_v2_editor_load",
       "sparse_v2_editor_save",
@@ -50,6 +52,7 @@ describe("Tine-managed storage app boundary", () => {
       "Set up sync with another device...",
       "Join a synced graph from another device...",
       "Join this synced graph...",
+      "Adopt the graph your other device is sharing?",
       "Return to Direct files",
     ]) {
       expect(settings).toContain(copy);

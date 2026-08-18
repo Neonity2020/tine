@@ -1071,6 +1071,27 @@ export function mockBackend(): Backend {
       };
       return sparseV2;
     },
+    async adoptSparseV2Shared() {
+      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
+      sparseV2 = {
+        ...sparseV2,
+        runtime: {
+          ...sparseV2.runtime,
+          shared_role: "joiner",
+          shared_phase: "active",
+        },
+      };
+      return {
+        status: sparseV2,
+        binding_generation: sparseV2.binding_generation,
+        archive_location: "/mock/app-data/managed-recovery/graph-0",
+        adoption_statement:
+          "This device now serves the graph shared by your other device. Its own previous Tine-managed history was archived and was not merged.",
+      };
+    },
+    async sparseV2RecoveryLocation() {
+      return "/mock/app-data/managed-recovery";
+    },
     async sparseV2Query() {
       return { kind: "pages", value: [] };
     },

@@ -226,39 +226,130 @@ describe("Settings storage transitions", () => {
     expect(prompt).toContain("already identical on both sides");
     // And the other branch: a different history changes nothing at all.
     expect(prompt).toContain("Tine changes nothing at all");
-    expect(prompt).toContain("archives its managed history rather than deleting it");
+    // And that the dead end has an exit: a second prompt, which is where the
+    // archive location is named.
+    expect(prompt).toContain("offers to ADOPT the other device's graph instead");
+    expect(prompt).toContain("nothing happens until you accept that second prompt");
     // Declining leaves the graph exactly as it was.
     expect(join).not.toHaveBeenCalled();
     expect(toasts()).toEqual([]);
     dispose();
   });
 
-  it("answers a refused managed join with the action that resolves it", async () => {
-    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
-    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
-    vi.spyOn(store, "flushAll").mockResolvedValue(true);
-    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
-      new Error(
-        "managed sync join failed at provider scan: sync actor refused request: "
-          + "clean shared descriptor names another managed graph"
-      )
+  const independentHistoryRefusal = () =>
+    new Error(
+      "managed sync join failed at provider scan: sync actor refused request: "
+        + "clean shared descriptor names another managed graph"
     );
 
-    const root = document.createElement("div");
-    document.body.append(root);
-    const dispose = render(() => <Settings />, root);
-    await showSparsePanel(root);
+  const clickManagedJoin = async (root: HTMLElement) => {
     const button = [...root.querySelectorAll("button")].find((candidate) =>
       candidate.textContent?.includes("Join a synced graph from another device")
     ) as HTMLButtonElement;
     button.click();
     await tick();
     await tick();
+    await tick();
+  };
 
+  it("offers adoption when the shared graph names another managed history, and says where this device's own goes", async () => {
+    // Two devices that each enabled managed storage on their own can never
+    // join each other: the native branch compares workspace identity first.
+    // The refusal is correct, and adoption is the operation behind it.
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(independentHistoryRefusal());
+    vi.spyOn(backend(), "sparseV2RecoveryLocation").mockResolvedValue(
+      "/home/example/.local/share/tine/managed-history-archive"
+    );
+    const adopt = vi.spyOn(backend(), "adoptSparseV2Shared").mockResolvedValue({
+      status: {
+        ...localActive(),
+        binding_generation: 12,
+        runtime: { ...localActive().runtime!, shared_role: "joiner", shared_phase: "active" },
+        application_page_admission: {
+          ...localActive().application_page_admission,
+          binding_generation: 12,
+        },
+      },
+      binding_generation: 12,
+      archive_location: "/home/example/.local/share/tine/managed-history-archive/graph-7",
+      adoption_statement:
+        "This device now serves the graph shared by your other device. Its own previous Tine-managed "
+        + "history was archived at /home/example/.local/share/tine/managed-history-archive/graph-7 and was not merged.",
+    });
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    await clickManagedJoin(root);
+
+    expect(adopt).toHaveBeenCalledTimes(1);
+    const prompt = confirm.mock.calls[1][0];
+    // The archive location is stated BEFORE the operation, not only in the
+    // receipt: an archive nobody can find is not a backup.
+    expect(prompt).toContain("/home/example/.local/share/tine/managed-history-archive");
+    expect(prompt).toContain("archived whole, not deleted");
+    // The divergence, named. This is not a merge.
+    expect(prompt).toContain("Tine will not merge two histories");
+    expect(prompt).toContain("Nothing from this device's own managed history is carried across");
+    expect(prompt).toContain("they must already match the shared graph's files");
+    expect(prompt).toContain("Cancel now and this device is left exactly as it is");
+    expect(toasts().at(-1)?.message).toContain("was archived at");
+    dispose();
+  });
+
+  it("keeps the refusal and its remedy when the adoption prompt is declined", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(independentHistoryRefusal());
+    vi.spyOn(backend(), "sparseV2RecoveryLocation").mockResolvedValue("/archive/root");
+    const adopt = vi.spyOn(backend(), "adoptSparseV2Shared");
+    let call = 0;
+    vi.spyOn(backend(), "confirm").mockImplementation(async () => {
+      call += 1;
+      return call === 1;
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    await clickManagedJoin(root);
+
+    expect(adopt).not.toHaveBeenCalled();
     const message = toasts().at(-1)?.message ?? "";
     expect(message).toContain("Nothing was changed on either device");
-    expect(message).toContain("Return to Direct files");
-    expect(message).toContain("archives this device's");
+    expect(message).toContain("Tine will not merge two histories");
+    expect(message).toContain("archives this device's own history rather than deleting it");
+    dispose();
+  });
+
+  it("reports a failed adoption without claiming the shared graph was joined", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(independentHistoryRefusal());
+    vi.spyOn(backend(), "sparseV2RecoveryLocation").mockResolvedValue("/archive/root");
+    vi.spyOn(backend(), "adoptSparseV2Shared").mockRejectedValue(
+      new Error(
+        "This device's Tine-managed storage is already shared with, or joined to, another device. Nothing was changed."
+      )
+    );
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    await clickManagedJoin(root);
+
+    const message = toasts().at(-1)?.message ?? "";
+    expect(message).toContain("Couldn't adopt the shared graph");
+    expect(message).toContain("already shared with, or joined to, another device");
+    expect(message).toContain("Nothing was changed");
+    expect(message).not.toContain("joined the synced graph");
     dispose();
   });
 

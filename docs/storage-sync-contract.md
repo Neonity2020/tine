@@ -462,6 +462,72 @@ scan order, which is why this state reproduces only intermittently in journeys �
 `a_dependency_queued_behind_its_dependent_is_promoted_ahead_of_it` pins the rule
 deterministically.
 
+### 2.3a Adoption: a device that already has a managed graph of its own
+
+Both a phone and a desktop can enable Tine-managed storage on the same synced
+folder without either knowing about the other. Each activation mints its own
+`WorkspaceId`, `LineageDigest` and catalog `DocumentId`, so §2.3's join refuses
+immediately with `clean shared descriptor names another managed graph`. That
+refusal is correct: the join in §2.3 step 2 REPLACES this device's baseline and
+operation archive and deletes the replaced pair, and it may only do so when the
+two sides' user-visible semantics already agree. Widening the identity check
+would be silent data loss.
+
+**Adoption** is the named operation for that state, and it is a composition of
+the two transitions that already exist, not a new storage operation:
+
+1. **Set aside.** The graceful Direct Files return (§2.2) drains and stops this
+   device's managed runtime and renames its whole app-private managed root to
+   `<app-data>/sparse-v2-recovery/<graph-key>-<uuid>`, then publishes Direct
+   Files from the unchanged Markdown/Org tree. Adoption runs exactly that,
+   with one difference: it does **not** archive `<graph>/.tine-sync/v2`. That
+   subtree is the OTHER device's shared evidence. Archiving it would remove the
+   descriptor the second half is about to read and, under a folder-syncing
+   tool, propagate that removal back to the sharing device.
+2. **Join.** The Direct Files join branch bootstraps a binding out of the
+   descriptor's three identities — keeping this device's own `DeviceId` and
+   minting fresh endpoint/preparation/session identities — and performs §2.3
+   step 2 unchanged.
+
+Each half is a complete supervisor transition with its own stable end mode
+(`ReturnGracefully` → Direct, then `JoinManaged` → Managed). A crash between
+them therefore lands on Direct Files with the predecessor archived and the
+shared graph still joinable. That state reports as ordinary Direct Files
+(`sparse_v2_status_for_slot` deliberately does not inspect a shared descriptor
+for a Direct Files slot), whose panel already carries "Join a synced graph from
+another device", so the second half is retryable on its own. Within each
+half the pre-existing rollback applies: a failed drain restores the managed
+slot, a failed archive leaves both roots byte-identical, and a failed Direct
+publication leaves the archive and the shared evidence in place with the
+Markdown/Org tree serving. No seam can produce a hybrid.
+
+**What adoption carries across, precisely.** Nothing of this device's own
+managed history: not its operation lineage, not its baseline, not its block
+identities. That history is archived whole and stays readable — the same
+activation request rebased onto the archive still opens it. What survives on
+this device is its Markdown/Org tree, which adoption never writes; and because
+the second half is §2.3 step 2 unchanged, that tree must ALREADY be
+semantically equal to the shared graph's. When it is not, the join refuses by
+name (`… not in the shared provider frontier`), the archive remains readable,
+and nothing is merged. Adoption is therefore "keep the shared graph's history,
+set mine aside", never a merge of two divergent histories.
+
+**Refusals, each with its remedy.** Adoption decides all of these BEFORE the
+first durable step:
+
+| State | Refusal |
+| --- | --- |
+| Incomplete provider tree | The §3.1 partial-provider refusal: sync data is still arriving; let the file-sync tool finish and retry. |
+| No descriptor at all | "This graph does not yet contain sync data from another device", naming the path looked for. |
+| Every identity matches | Nothing to set aside; use the ordinary join. |
+| Some identities match and some do not | Tine cannot tell which history is which; nothing is changed. |
+| This device is itself sharing, joining, or holding an unfinished cut | Adopting would abandon devices joined to this one; finish or return to Direct Files first. |
+| This device is already in Direct Files | There is no managed history to set aside; use the ordinary join. |
+
+Every one of those strings is a single line and carries a diagnostic-class word,
+because the panel keeps only a native message's first line and drops lines with
+no recognised class.
+
 ### 2.4 Lazy activation and clean runtime boundary
 
 The accepted next activation generation has one authority-changing record:

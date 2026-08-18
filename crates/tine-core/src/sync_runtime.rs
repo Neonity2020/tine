@@ -48946,6 +48946,408 @@ mod tests {
         (initiator, receiver, initiator_handle, receiver_handle)
     }
 
+    /// Rebase every app-private path of an activation request onto an archived
+    /// copy of that private root. Adoption archives the private root whole
+    /// (`archive_private_root` in the Tauri composition), so the archive is
+    /// openable exactly when the same request, rebased, still opens.
+    fn rebase_private_root(
+        request: &SyncLocalActivationRequest,
+        from: &Path,
+        to: &Path,
+    ) -> SyncLocalActivationRequest {
+        let rebase = |path: &Path| -> PathBuf {
+            match path.strip_prefix(from) {
+                Ok(relative) => to.join(relative),
+                Err(_) => path.to_path_buf(),
+            }
+        };
+        SyncLocalActivationRequest {
+            graph_root: request.graph_root.clone(),
+            archive_root: rebase(&request.archive_root),
+            enrollment_root: rebase(&request.enrollment_root),
+            receipt_root: rebase(&request.receipt_root),
+            database_path: rebase(&request.database_path),
+            application_runtime_root: rebase(&request.application_runtime_root),
+            migration_backup_root: rebase(&request.migration_backup_root),
+            capture_root: rebase(&request.capture_root),
+            preparation_root: rebase(&request.preparation_root),
+            provider_root: request.provider_root.clone(),
+            provider_journal_root: rebase(&request.provider_journal_root),
+            identities: request.identities.clone(),
+        }
+    }
+
+    /// The identity swap the adopting device performs after setting its own
+    /// managed history aside: the shared graph's three identities, this
+    /// device's own device id, and everything run-local minted fresh. It is the
+    /// exact shape of `SparseV2ActivationRecord::from_shared` in the Tauri
+    /// composition.
+    fn adopting_activation_request(
+        request: &SyncLocalActivationRequest,
+        descriptor: &SyncSharedEnrollmentDescriptor,
+        seed: u128,
+    ) -> SyncLocalActivationRequest {
+        let mut adopted = request.clone();
+        adopted.identities.workspace_id = descriptor.workspace_id;
+        adopted.identities.lineage_digest = descriptor.lineage_digest;
+        adopted.identities.catalog_document_id = descriptor.catalog_document_id;
+        adopted.identities.endpoint_id = ProjectionEndpointId::from_uuid(Uuid::from_u128(seed));
+        adopted.identities.preparation_id = Uuid::from_u128(seed + 1);
+        adopted.identities.session_id = SessionId::from_uuid(Uuid::from_u128(seed + 2));
+        adopted
+    }
+
+    fn page_contents(handle: &SyncRuntimeHandle) -> BTreeMap<String, Vec<String>> {
+        let SyncRuntimeQueryReply::Pages(pages) = handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_MATERIALIZATION_QUERY_ROWS,
+            })
+            .unwrap()
+        else {
+            panic!("page list returned the wrong reply variant");
+        };
+        let mut contents = BTreeMap::new();
+        for page in pages {
+            let SyncRuntimeQueryReply::PageWithBlocks(Some(loaded)) = handle
+                .query(SyncRuntimeQueryRequest::LoadPage {
+                    page_id: page.page_id.clone(),
+                    block_limit: 64,
+                })
+                .unwrap()
+            else {
+                panic!("{} did not load its blocks", page.path);
+            };
+            contents.insert(
+                page.path.clone(),
+                loaded
+                    .blocks
+                    .iter()
+                    .map(|block| block.content.clone())
+                    .collect(),
+            );
+        }
+        contents
+    }
+
+    /// Both devices independently enabled Tine-managed storage on the same
+    /// synced folder, so each minted its own `WorkspaceId`. This is the state
+    /// the whole adoption packet exists for, and the first assertion is the
+    /// verbatim refusal that makes a plain join impossible.
+    fn independent_managed_devices(
+        label: &str,
+        seed: u128,
+    ) -> (
+        ActivationFixture,
+        ActivationFixture,
+        SyncSharedEnrollmentDescriptor,
+        BTreeMap<String, Vec<u8>>,
+    ) {
+        let initiator = ActivationFixture::nested_unicode(&format!("{label}-initiator"), seed);
+        // A different seed is the whole point: an independent activation mints
+        // its own workspace id, lineage digest and catalog document id.
+        let adopter =
+            ActivationFixture::nested_unicode(&format!("{label}-adopter"), seed + 0x1_0000);
+        assert_ne!(
+            initiator.request.identities.workspace_id,
+            adopter.request.identities.workspace_id
+        );
+
+        let initiator_handle =
+            SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone())
+                .handle
+                .expect("sharing device LocalActive");
+        drive_initial_feed(&initiator_handle);
+        let _ = submit_shared_page(
+            &initiator_handle,
+            seed + 0x2000,
+            "Shared From The Other Device",
+            "notes/shared from the other device.md",
+            "content the adopting device is joining",
+        );
+        let shared_graph = user_graph_bytes(&initiator.graph_root);
+        let descriptor = initiator_handle
+            .prepare_shared()
+            .expect("sharing device publishes its descriptor");
+        drop(initiator_handle);
+        (initiator, adopter, descriptor, shared_graph)
+    }
+
+    /// Fail-before evidence, kept verbatim: today a device that enabled
+    /// Tine-managed storage on its own cannot join another device's graph at
+    /// all, and the refusal is the identity check, not a content check.
+    #[test]
+    fn an_independently_activated_device_cannot_join_another_devices_managed_graph() {
+        let (initiator, adopter, descriptor, _shared_graph) =
+            independent_managed_devices("adoption-fail-before", 0xad00_0000);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &adopter.request.provider_root,
+        );
+        let adopter_handle = SyncRuntimeHandle::activate_or_resume_local(adopter.request.clone())
+            .handle
+            .expect("adopting device LocalActive");
+        drive_initial_feed(&adopter_handle);
+        let marker_before = read_activation_marker(&adopter.request.enrollment_root)
+            .unwrap()
+            .unwrap();
+        let graph_before = user_graph_bytes(&adopter.graph_root);
+
+        let refusal = adopter_handle.join_shared(descriptor).unwrap_err();
+
+        assert_eq!(
+            refusal.to_string(),
+            "sync actor refused request: clean shared descriptor names another managed graph"
+        );
+        assert_eq!(
+            read_activation_marker(&adopter.request.enrollment_root)
+                .unwrap()
+                .unwrap(),
+            marker_before,
+            "the identity refusal must not touch this device's managed authority"
+        );
+        assert_eq!(
+            user_graph_bytes(&adopter.graph_root),
+            graph_before,
+            "the identity refusal must not touch a single user byte"
+        );
+        assert!(matches!(
+            adopter_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    /// A descriptor that shares this device's workspace id but not its lineage
+    /// is refused by the same check. Adoption must not treat it as an
+    /// independent activation: the Tauri composition classifies it separately
+    /// and refuses before it archives anything.
+    #[test]
+    fn a_partially_matching_lineage_is_refused_by_the_same_identity_check() {
+        let (initiator, adopter, descriptor, _shared_graph) =
+            independent_managed_devices("adoption-partial-lineage", 0xad04_0000);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &adopter.request.provider_root,
+        );
+        // Only the workspace id agrees. The lineage digest and catalog document
+        // id remain this device's own.
+        let mut partial = adopter.request.clone();
+        partial.identities.workspace_id = descriptor.workspace_id;
+        let adopter_handle = SyncRuntimeHandle::activate_or_resume_local(partial.clone())
+            .handle
+            .expect("partially matching device LocalActive");
+        drive_initial_feed(&adopter_handle);
+        let graph_before = user_graph_bytes(&adopter.graph_root);
+
+        let refusal = adopter_handle.join_shared(descriptor).unwrap_err();
+
+        assert_eq!(
+            refusal.to_string(),
+            "sync actor refused request: clean shared descriptor names another managed graph"
+        );
+        assert_eq!(user_graph_bytes(&adopter.graph_root), graph_before);
+        assert!(matches!(
+            adopter_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    /// Adoption, end to end, as the Tauri composition performs it: stop the
+    /// adopting device's managed runtime, archive its whole private root, then
+    /// re-activate from the shared descriptor's identities and join. The
+    /// device's own pre-adoption history stays readable from the archive, and
+    /// the shared graph's content is what it serves afterwards.
+    #[test]
+    fn adoption_archives_this_devices_history_readably_and_then_serves_the_shared_graph() {
+        let (initiator, adopter, descriptor, shared_graph) =
+            independent_managed_devices("adoption-composition", 0xad01_0000);
+        let adopter_private = adopter.root.join("private");
+
+        let adopter_handle = SyncRuntimeHandle::activate_or_resume_local(adopter.request.clone())
+            .handle
+            .expect("adopting device LocalActive");
+        drive_initial_feed(&adopter_handle);
+        let _ = submit_shared_page(
+            &adopter_handle,
+            0xad01_3000,
+            "Only On The Adopting Device",
+            "notes/only on the adopting device.md",
+            "pre-adoption local edit",
+        );
+        assert!(matches!(
+            adopter_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(adopter_handle);
+
+        // Step 1 of the composition: the private managed root moves whole,
+        // exactly as `archive_private_root` renames it under the app-data
+        // recovery directory. Nothing is copied and nothing is deleted.
+        let archive_root = adopter.root.join("managed-history-archive/private-0");
+        fs::create_dir_all(archive_root.parent().unwrap()).unwrap();
+        fs::rename(&adopter_private, &archive_root).unwrap();
+        // The graph-local shared namespace is deliberately NOT archived: it is
+        // the other device's evidence, and the second half is about to read it.
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &adopter.request.provider_root,
+        );
+        // The user's file-sync tool, not Tine, converges the Markdown/Org tree.
+        // Adoption itself never rewrites user files.
+        for (relative, _) in user_graph_bytes(&adopter.graph_root) {
+            if !shared_graph.contains_key(&relative) {
+                fs::remove_file(adopter.graph_root.join(&relative)).unwrap();
+            }
+        }
+        for (relative, bytes) in &shared_graph {
+            let destination = adopter.graph_root.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
+        }
+
+        // Step 2: activate from the descriptor's identities and join.
+        let adopted_request =
+            adopting_activation_request(&adopter.request, &descriptor, 0xad01_4000);
+        let adopted_handle = SyncRuntimeHandle::activate_or_resume_local(adopted_request.clone())
+            .handle
+            .expect("adopting device re-activates from the shared identities");
+        drive_initial_feed(&adopted_handle);
+        adopted_handle
+            .join_shared(descriptor.clone())
+            .expect("adoption joins the shared graph once identities agree");
+        // A completed join retires its own actor by design, so what the device
+        // serves afterwards is the reopened runtime, not the joining one.
+        drop(adopted_handle);
+        let adopted_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&adopted_request)));
+
+        assert_eq!(
+            adopted_handle.status().unwrap().shared_role,
+            Some(SyncSharedRole::Joiner)
+        );
+        let served = page_contents(&adopted_handle);
+        assert!(
+            served.contains_key("notes/shared from the other device.md"),
+            "adoption must serve the shared graph's content: {served:?}"
+        );
+        assert!(
+            !served.contains_key("notes/only on the adopting device.md"),
+            "adoption is not a merge, so this device's own page must not appear: {served:?}"
+        );
+        assert_eq!(
+            user_graph_bytes(&adopter.graph_root),
+            shared_graph,
+            "adoption must not rewrite the already-converged user graph"
+        );
+        assert!(matches!(
+            adopted_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(adopted_handle);
+
+        // The safety property: the archived predecessor is not merely present,
+        // it opens and still holds this device's own pre-adoption edit.
+        let archived_request =
+            rebase_private_root(&adopter.request, &adopter_private, &archive_root);
+        let archived = active_handle(SyncRuntimeHandle::open(reopen_request(&archived_request)));
+        let preserved = page_contents(&archived);
+        assert_eq!(
+            preserved
+                .get("notes/only on the adopting device.md")
+                .map(Vec::as_slice),
+            Some(["pre-adoption local edit".to_owned()].as_slice()),
+            "the archived predecessor must still hold this device's own edit: {preserved:?}"
+        );
+        assert!(matches!(
+            archived.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    /// The second half of adoption still refuses when this device's files have
+    /// not converged on the shared graph's. That refusal lands after the
+    /// archive, so the test proves the state it leaves: Markdown untouched,
+    /// the predecessor archive still readable, nothing merged.
+    #[test]
+    fn adoption_stops_on_unconverged_files_and_leaves_the_archive_readable() {
+        let (initiator, adopter, descriptor, shared_graph) =
+            independent_managed_devices("adoption-unconverged", 0xad02_0000);
+        let adopter_private = adopter.root.join("private");
+
+        let adopter_handle = SyncRuntimeHandle::activate_or_resume_local(adopter.request.clone())
+            .handle
+            .expect("adopting device LocalActive");
+        drive_initial_feed(&adopter_handle);
+        let _ = submit_shared_page(
+            &adopter_handle,
+            0xad02_3000,
+            "Unconverged Local Page",
+            "notes/unconverged local page.md",
+            "still only on this device",
+        );
+        assert!(matches!(
+            adopter_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(adopter_handle);
+
+        let archive_root = adopter.root.join("managed-history-archive/private-0");
+        fs::create_dir_all(archive_root.parent().unwrap()).unwrap();
+        fs::rename(&adopter_private, &archive_root).unwrap();
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &adopter.request.provider_root,
+        );
+        // The shared files arrive, but this device's own page is still here.
+        for (relative, bytes) in &shared_graph {
+            let destination = adopter.graph_root.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
+        }
+        let graph_before = user_graph_bytes(&adopter.graph_root);
+
+        let adopted_request =
+            adopting_activation_request(&adopter.request, &descriptor, 0xad02_4000);
+        let adopted_handle = SyncRuntimeHandle::activate_or_resume_local(adopted_request)
+            .handle
+            .expect("adopting device re-activates from the shared identities");
+        drive_initial_feed(&adopted_handle);
+
+        let refusal = adopted_handle.join_shared(descriptor).unwrap_err();
+
+        assert!(
+            refusal
+                .to_string()
+                .contains("not in the shared provider frontier"),
+            "{refusal}"
+        );
+        assert_eq!(
+            user_graph_bytes(&adopter.graph_root),
+            graph_before,
+            "a refused adoption must not rewrite a single user byte"
+        );
+        assert!(matches!(
+            adopted_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        let archived_request =
+            rebase_private_root(&adopter.request, &adopter_private, &archive_root);
+        let archived = active_handle(SyncRuntimeHandle::open(reopen_request(&archived_request)));
+        let preserved = page_contents(&archived);
+        assert_eq!(
+            preserved
+                .get("notes/unconverged local page.md")
+                .map(Vec::as_slice),
+            Some(["still only on this device".to_owned()].as_slice()),
+            "a refused adoption must still leave the predecessor archive readable: {preserved:?}"
+        );
+        assert!(matches!(
+            archived.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
     fn submit_shared_page(
         handle: &SyncRuntimeHandle,
         seed: u128,

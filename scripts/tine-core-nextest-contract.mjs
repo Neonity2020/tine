@@ -187,6 +187,17 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::provider_create_projects_markdown_beside_a_concurrent_external_admission",
   "sync_runtime::tests::provider_edit_projects_markdown_beside_a_concurrent_external_admission",
   "sync_runtime::tests::provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_admission",
+  // Adoption: a device that enabled Tine-managed storage on its own, joining a
+  // graph another device is sharing. The first is the fail-before evidence
+  // (two independent activations can never join, and the refusal is the
+  // identity check), the second holds that a partially matching lineage is
+  // refused by the same check rather than treated as adoptable, and the last
+  // two are the composition itself — the predecessor archive stays readable
+  // whether the second half succeeds or refuses on unconverged files.
+  "sync_runtime::tests::an_independently_activated_device_cannot_join_another_devices_managed_graph",
+  "sync_runtime::tests::a_partially_matching_lineage_is_refused_by_the_same_identity_check",
+  "sync_runtime::tests::adoption_archives_this_devices_history_readably_and_then_serves_the_shared_graph",
+  "sync_runtime::tests::adoption_stops_on_unconverged_files_and_leaves_the_archive_readable",
 ]);
 
 // Architectural/contract guards that happen to live in `sync_runtime::tests`

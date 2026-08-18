@@ -114,7 +114,7 @@ import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../gr
 import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry, SparseV2ActivationProgress, SparseV2CancelResult, SparseV2Status } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry, SparseV2ActivationProgress, SparseV2AdoptionResult, SparseV2CancelResult, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import { formatJournal } from "../journal";
@@ -2270,8 +2270,8 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       return (
         "Nothing was changed on either device. This device's Tine-managed storage is its own separate history, "
         + "not the one the other device is sharing, and Tine will not merge two histories. "
-        + "To adopt the other device's graph, use \"Return to Direct files\" here first — that archives this device's "
-        + "managed history under Tine's app data instead of deleting it — and then Join."
+        + "Joining anyway means adopting the other device's graph, which archives this device's own history rather "
+        + "than deleting it. Use the join action again and accept the second prompt when you are ready."
       );
     }
     if (detail.includes("not in the shared provider frontier")) {
@@ -2312,11 +2312,34 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       + "Tine performs that swap only when every live page, its outline and its text are already identical on both "
       + "sides, so no note text is lost.\n\n"
       + "2. If the other device is sharing a DIFFERENT history — which is the normal case when this device set up "
-      + "Tine-managed storage on its own — Tine changes nothing at all and stops with an explanation. Joining then "
-      + "means returning this device to Direct files first, which archives its managed history rather than deleting it.\n\n"
+      + "Tine-managed storage on its own — Tine changes nothing at all and stops. It then offers to ADOPT the other "
+      + "device's graph instead, in a second prompt that names where this device's own history is archived. Nothing "
+      + "is merged, and nothing happens until you accept that second prompt.\n\n"
       + "Either way your Markdown/Org files stay in place and remain Logseq-compatible."
     );
   };
+
+  /**
+   * The second prompt, shown only when the native join has already refused
+   * because the two devices hold independent histories. It is where the
+   * divergence is named honestly: adoption keeps the shared graph and sets
+   * this device's own history aside; it is not a merge, and nothing of this
+   * device's own managed history crosses over. The archive location comes from
+   * the native side so it can be stated BEFORE the operation, not only in the
+   * receipt afterwards.
+   */
+  const adoptionConfirmation = (location: string | null) =>
+    "Adopt the graph your other device is sharing?\n\n"
+    + "This device set up Tine-managed storage on its own, so it holds a separate history. Tine will not merge two "
+    + "histories.\n\n"
+    + "Adopting keeps the other device's history and sets this device's own aside. This device's history is archived "
+    + "whole, not deleted"
+    + (location ? `, at:\n${location}\n\n` : ", inside Tine's application data folder.\n\n")
+    + "Nothing from this device's own managed history is carried across — not its recorded edits, not its block "
+    + "identities. Your Markdown/Org files are not touched by the archive step, and they must already match the "
+    + "shared graph's files; if they do not, Tine stops and changes nothing.\n\n"
+    + "Cancel now and this device is left exactly as it is. Continue and this device's own managed history is "
+    + "reachable only from that archive.";
 
   /**
    * The share cut is one-way. The storage contract never retires an active
@@ -2534,6 +2557,80 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     }
   };
 
+  /**
+   * Offer adoption in place of the refusal. Returns false when the user
+   * declines, so the caller still reports the refusal and its remedy.
+   * The refused join changed nothing on either device: the native branch
+   * compares identities before it stops the actor or opens the provider.
+   */
+  /**
+   * The one adoption failure whose remedy depends on how far it got. The
+   * native side marks it with a stable phrase because the panel keeps only the
+   * first line of a native error, and the archive location is worth more here
+   * than anywhere else.
+   */
+  const adoptionFailureRemedy = (detail: string, location: string | null): string | null => {
+    if (!detail.includes("after this device's own history was archived")) return null;
+    return (
+      "This device's own history is preserved"
+      + (location ? ` in ${location}` : " in Tine's application data folder")
+      + ", and your Markdown/Org files are unchanged. Nothing was merged. This device is back on Direct files, so "
+      + "the join action above retries the remaining half on its own."
+    );
+  };
+
+  const offerAdoption = async (): Promise<boolean> => {
+    let location: string | null = null;
+    try {
+      location = await backend().sparseV2RecoveryLocation();
+    } catch {
+      // Naming the folder is better than naming nothing, but a lookup failure
+      // must not be the reason a user cannot proceed.
+    }
+    if (!(await backend().confirm(adoptionConfirmation(location)))) return false;
+    let result: SparseV2AdoptionResult;
+    try {
+      result = await backend().adoptSparseV2Shared();
+    } catch (error) {
+      reportManagedFailure(
+        "Couldn't adopt the shared graph",
+        safeManagedErrorDetail(error),
+        adoptionFailureRemedy(String(error), location)
+      );
+      return true;
+    }
+    if (result.status.state === "active") {
+      if (acceptNativeAuthority(result.status)) {
+        pushToast(result.adoption_statement, "success");
+      }
+      return true;
+    }
+    if (managedStorageRuntime.acceptNativeTransition(result.status)) {
+      reportManagedFailure(
+        "Adopting the shared graph did not complete",
+        failureDetail(result.status) ?? "Tine-managed storage did not become active."
+      );
+    }
+    return true;
+  };
+
+  /**
+   * One refusal has an action behind it rather than only an explanation:
+   * a descriptor naming another managed graph is exactly the two-independent-
+   * activations case, and adoption is the operation for it.
+   */
+  const reportJoinRefusal = async (summary: string, detail: string, redacted: string) => {
+    if (detail.includes("names another managed graph")) {
+      try {
+        if (await offerAdoption()) return;
+      } catch (error) {
+        reportManagedFailure("Couldn't adopt the shared graph", safeManagedErrorDetail(error));
+        return;
+      }
+    }
+    reportManagedFailure(summary, redacted, joinFailureRemedy(detail));
+  };
+
   const joinShare = async (options: { fromManaged: boolean } = { fromManaged: false }) => {
     setSharing(true);
     beginStorageTransition();
@@ -2550,17 +2647,16 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       } else {
         if (!managedStorageRuntime.acceptNativeTransition(result)) return;
         const detail = failureDetail(result) ?? "Tine-managed storage did not become active.";
-        reportManagedFailure(
-          "Joining the synced graph did not complete",
-          detail,
-          joinFailureRemedy(detail)
-        );
+        await reportJoinRefusal("Joining the synced graph did not complete", detail, detail);
       }
     } catch (error) {
       // The refusal that matters most here is raw native text. Read the remedy
       // off the untruncated message, then report the redacted one.
-      const remedy = joinFailureRemedy(String(error));
-      reportManagedFailure("Couldn't join the synced graph", safeManagedErrorDetail(error), remedy);
+      await reportJoinRefusal(
+        "Couldn't join the synced graph",
+        String(error),
+        safeManagedErrorDetail(error)
+      );
     } finally {
       endStorageTransition();
       setSharing(false);
