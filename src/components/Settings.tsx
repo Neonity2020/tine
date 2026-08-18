@@ -2621,7 +2621,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       <div class="settings-section">Storage &amp; sync</div>
       <ExperimentalSection forceOpen={props.forceOpen}>
         <div class="settings-experimental-warning" role="note">
-          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. You can keep using Direct files in the meantime.
+          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything.
         </div>
         <Show
           when={!loading()}
@@ -2664,7 +2664,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                   <Show when={current().state === "legacy_default"}>
                     <span class="settings-value">Direct files</span>
                     <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                      Uses your graph’s Markdown or Org files directly.
+                      Tine reads and writes your graph’s Markdown or Org files directly. Many people will want to stay here.
                     </div>
                     <div style={{ "margin-top": "6px" }}>
                       <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
@@ -2828,7 +2828,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                     </div>
                   </Show>
                   <div class="settings-hint" style={{ "margin-top": "6px" }}>
-                    Tine keeps durable history and a local index while continuously maintaining your compatible Markdown/Org tree.
+                    Tine-managed storage keeps a durable operation history and a local index while continuously maintaining the same Logseq-compatible Markdown/Org tree. That history is what makes syncing a graph across devices possible; it is the reason to choose this mode, not a newer replacement for Direct files.
                   </div>
                 </div>
               </div>

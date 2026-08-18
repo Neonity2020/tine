@@ -145,8 +145,13 @@ describe("Settings storage transitions", () => {
 
     expect(experimental.getAttribute("aria-expanded")).toBe("true");
     expect(root.textContent).toContain("Tine-managed storage is for testing and is not yet mature.");
-    expect(root.textContent).toContain("You can keep using Direct files in the meantime.");
-    expect(root.textContent).toContain("Uses your graph’s Markdown or Org files directly.");
+    // Direct files and Tine-managed storage are peers. Neither description may
+    // present the other as the destination, and the panel says so where a user
+    // deciding between them will read it.
+    expect(root.textContent).toContain(
+      "Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything."
+    );
+    expect(root.textContent).toContain("Many people will want to stay here.");
     expect(root.textContent).toContain("Enable Tine-managed storage");
     expect(root.textContent).toContain("Join a synced graph from another device");
     dispose();
