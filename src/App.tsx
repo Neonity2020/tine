@@ -131,6 +131,7 @@ import { paneSel, samePaneTarget } from "./paneSelect";
 import { SurfaceContext } from "./components/Block";
 import { endEdit } from "./editorController";
 import { installBackgroundFlush } from "./backgroundFlush";
+import { installReloadOnFocus } from "./reloadOnFocus";
 import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
@@ -225,6 +226,12 @@ function requestJournalFeedWatcherRestart(
 // state holds at that moment (it may have become "conflict", which then takes
 // the divergence path exactly like a live event).
 installExternalReloadReplayHandler((change) => void handleGraphChange(change));
+
+// Concord L0's reload-on-focus fallback. Returning to the window replays
+// anything already deferred and asks the backend watcher for one full stat diff,
+// for the filesystems and sync clients that give us no event at all. Both halves
+// funnel into the machinery above; neither applies anything by itself.
+installReloadOnFocus();
 
 // Console-only diagnostic for external-change latency reports (GH #337; see
 // docs/concord.md). Release builds ship the devtools but not `withGlobalTauri`,

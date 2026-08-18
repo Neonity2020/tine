@@ -4265,6 +4265,30 @@
       "notes": "reloadDisposition's \"skip\" (block edit / block move) and mayReplaceInstance's lease refusal correctly declined the reload but the watcher event was then dropped: backend cache fresh, visible page stale indefinitely. The declined GraphChange is now recorded and re-dispatched through handleGraphChange when onPageBecameReplaceable fires, so the disposition is re-evaluated at replay time (a page that became dirty meanwhile takes the applyDivergenceVerdict path). Fail-before: all three App.test.tsx cases fail on pre-fix code with the page stuck at its stale content. Concord P1 freshness lane."
     },
     {
+      "id": "REG-WATCH-RELOAD-ON-FOCUS-337",
+      "title": "Returning to the window replays deferred reloads and asks the backend watcher for one full stat diff, for filesystems that deliver no event",
+      "family": "external-change-freshness",
+      "sources": {
+        "issues": [
+          337
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/reloadOnFocus.test.tsx::reload on focus"
+        ],
+        "scenario": "watch.reload-on-focus-fallback",
+        "failBefore": "proven"
+      },
+      "notes": "Network mounts, some sync clients and a suspended app deliver no inotify edge at all, so a page could sit stale indefinitely with the watcher healthy. Returning to the window now (a) calls sweepReplaceable() -- the P1 net, for a reload deferred mid-edit whose page never announced it became replaceable because the user alt-tabbed away -- and (b) invokes rescan_graph_now, which arms one full stat diff on the watcher thread. Findings arrive as ordinary graph-changed/graph-changed-bulk events, so the disposition, divergence proof and deferred replay all apply exactly as for a live event and no caret is stolen. The rescan is throttled (1.5 s); the sweep never is. Fail-before: with refreshOnReturnToWindow's body removed, 4 of the 6 cases fail with rescanGraphNow called 0 times. Concord P5."
+    },
+    {
       "id": "REG-MANAGED-ACTIVATION-FAILURE-RETRYABLE-SLOT-001",
       "title": "Managed-storage activation and join build and prove a private candidate while Direct Files keeps serving, then publish it exactly once",
       "family": "managed-storage-transition",

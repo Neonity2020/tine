@@ -3772,6 +3772,19 @@ pub(crate) fn list_journal_conflicts(
     with_filesystem_graph(&state, |g| Ok(g.journal_conflicts()))
 }
 
+/// Concord L0 reload-on-focus fallback: ask the watcher for ONE full stat-diff
+/// pass right now. Whatever changed on disk is then emitted through the normal
+/// `graph-changed` path, so the deferred-replay machinery decides what may be
+/// applied — this command never touches a page itself.
+///
+/// Deliberately graph-slot-free: it arms a process-wide flag on the single
+/// watcher thread, which already covers every bound graph in both regimes.
+#[tauri::command]
+pub(crate) fn rescan_graph_now(state: tauri::State<'_, AppState>) {
+    crate::watcher::request_full_rescan();
+    crate::state::poke_watcher(&state);
+}
+
 /// Journal files whose names don't round-trip to a date, and the names they
 /// would get. Concord invariant 4 (write-shyness): opening a graph used to
 /// perform these renames silently; it now only proposes them here.

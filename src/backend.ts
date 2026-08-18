@@ -407,6 +407,10 @@ export interface Backend {
   /** Journal days that resolve to >1 file (date-stem + title-named, or md/org
    *  twin) — for the user to reconcile. */
   listJournalConflicts(): Promise<JournalConflict[]>;
+  /** Ask the backend watcher for one full stat-diff pass now (Concord L0's
+   *  reload-on-focus fallback). Findings arrive as ordinary graph-changed
+   *  events; this never applies anything itself. */
+  rescanGraphNow(): Promise<void>;
   /** Journal files whose names don't round-trip to a date, with the names they
    *  would get. Proposed only — see `applyJournalFilenameMigrations`. */
   listJournalFilenameMigrations(): Promise<JournalFilenameMigration[]>;
@@ -1182,6 +1186,9 @@ class TauriBackend implements Backend {
   }
   listJournalConflicts() {
     return this.call<JournalConflict[]>("list_journal_conflicts");
+  }
+  rescanGraphNow() {
+    return this.call<void>("rescan_graph_now");
   }
   listJournalFilenameMigrations() {
     return this.call<JournalFilenameMigration[]>("list_journal_filename_migrations");

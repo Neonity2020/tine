@@ -189,6 +189,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("referenced_page_names", ManagedRouted),
     ("rename_file_to_page", ManagedRouted),
     ("rename_page", ManagedRouted),
+    ("rescan_graph_now", NoGraphSlot),
     ("resolve_block", ManagedRouted),
     ("resolve_blocks", ManagedRouted),
     ("resolve_sync_conflict", ManagedRouted),

@@ -1647,6 +1647,9 @@ export function mockBackend(): Backend {
         },
       ];
     },
+    async rescanGraphNow(): Promise<void> {
+      // no backend watcher in the browser mock
+    },
     async listJournalFilenameMigrations() {
       // Same demo gate as the duplicate-day list: only under `?conflicts`.
       if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];

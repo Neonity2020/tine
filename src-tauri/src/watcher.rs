@@ -2,7 +2,7 @@ use crate::settings::{settings_path, update_settings};
 use crate::state::{AppState, GraphSlot, LegacyGraphLease};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
@@ -209,6 +209,24 @@ pub(crate) struct WatcherLatencyReceipt {
     reconcile_ms: u64,
     /// First notify callback → last emit; the number GH #337 reports as 5–20 s.
     event_to_emit_ms: Option<u64>,
+}
+
+/// Concord L0's reload-on-focus fallback. Some filesystems and sync clients
+/// deliver no inotify edge at all (network mounts, a suspended app, a client
+/// that writes through a path the kernel doesn't report), so the ONE thing the
+/// user can always do — come back to the window — has to be able to ask.
+///
+/// This asks the watcher for one full stat-diff pass on its next cycle. It does
+/// NOT invent a second freshness path: whatever the diff finds is emitted as
+/// ordinary `graph-changed` / `graph-changed-bulk` events, so a page being
+/// edited is deferred by the P1 replay machinery exactly as for a live event,
+/// and a caret is never stolen.
+static FORCE_FULL_RESCAN: AtomicBool = AtomicBool::new(false);
+
+/// Request that one full rescan. Pair with `state::poke_watcher` — this only
+/// arms the flag; the poke is what wakes the loop to read it.
+pub(crate) fn request_full_rescan() {
+    FORCE_FULL_RESCAN.store(true, Ordering::SeqCst);
 }
 
 const LATENCY_RECEIPT_CAP: usize = 64;
@@ -1469,6 +1487,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             } else {
                 (HashSet::new(), HashSet::new(), false, false, None)
             };
+            // A focus-driven rescan demands the same full stat diff a kernel
+            // rescan does, for the Direct lane and the managed lane alike.
+            let event_need_full =
+                event_need_full || FORCE_FULL_RESCAN.swap(false, Ordering::SeqCst);
             for (label, graph) in graphs.iter_mut() {
                 let initial_cycle = !graph.baseline;
                 if initial_cycle {
