@@ -49264,6 +49264,278 @@ mod tests {
         );
     }
 
+    /// One ordinary local external admission on the RECEIVING device, on a page
+    /// that has nothing to do with the inbound provider work.
+    ///
+    /// This is the interleaving that used to swallow an inbound provider
+    /// batch's Markdown. The local admission commits its own batch, which
+    /// advances the shared page-catalog document, so the delivered intent's
+    /// post-frontier stops equalling the page's current frontier even though
+    /// the delivered page itself is untouched.
+    fn admit_unrelated_local_external_page(
+        fixture: &ActivationFixture,
+        handle: &SyncRuntimeHandle,
+        relative: &str,
+        content: &str,
+    ) {
+        fs::write(fixture.graph_root.join(relative), content.as_bytes()).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(relative).unwrap()])
+            .unwrap();
+    }
+
+    /// Drive the receiver the way the production scheduler does, then spend a
+    /// further bounded budget of turns so "the next turn would have written it"
+    /// is excluded rather than assumed.
+    fn drive_receiver_past_quiescence(handle: &SyncRuntimeHandle) {
+        drive_like_the_production_scheduler(handle);
+        for _ in 0..40 {
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "a settled receiver produced an unsafe turn: {tick:?}"
+            );
+        }
+    }
+
+    fn receiver_sqlite_has_path(handle: &SyncRuntimeHandle, path: &str) -> bool {
+        match handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_MATERIALIZATION_QUERY_ROWS,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => {
+                pages.iter().any(|page| page.path.as_str() == path)
+            }
+            other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+        }
+    }
+
+    /// Deliver the initiator's outbox to a RUNNING receiver and admit an
+    /// unrelated ordinary local external page in the same window, then settle.
+    fn deliver_beside_a_local_admission(
+        initiator: &ActivationFixture,
+        receiver: &ActivationFixture,
+        receiver_handle: &SyncRuntimeHandle,
+        local_relative: &str,
+        local_content: &str,
+    ) {
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        admit_unrelated_local_external_page(
+            receiver,
+            receiver_handle,
+            local_relative,
+            local_content,
+        );
+        drive_receiver_past_quiescence(receiver_handle);
+    }
+
+    /// A page created by the peer must reach the receiver's Markdown even when
+    /// an ordinary local external admission is in flight on the same device.
+    ///
+    /// The regression this pins is durable data-VISIBILITY loss, not a
+    /// projection lag: the batch was applied to SQLite, the Markdown file was
+    /// never written, `clean_shutdown` still reported Safe, and a full reopen
+    /// and re-drive never repaired it. Markdown is the interchange truth, so a
+    /// peer's edit that never reaches a file is lost to the user, to every
+    /// external tool, and to a Direct Files return.
+    #[test]
+    fn provider_create_projects_markdown_beside_a_concurrent_external_admission() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-beside-external-create", 0xbf00);
+        let path = "notes/provider-beside-external-create.md";
+        let (batch_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xbf20,
+            "Provider Beside External Create",
+            path,
+            "peer edit delivered beside a local external admission",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, batch_id);
+        settle_shared_provider(&initiator_handle);
+
+        deliver_beside_a_local_admission(
+            &initiator,
+            &receiver,
+            &receiver_handle,
+            "notes/local-beside-provider-create.md",
+            "- an unrelated local external edit in the same window\n",
+        );
+
+        assert!(
+            receiver_sqlite_has_path(&receiver_handle, path),
+            "the delivered batch was not applied at all, so this fixture no longer pins the defect",
+        );
+        assert!(
+            receiver.graph_root.join(path).is_file(),
+            "an applied provider batch never projected its Markdown: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- peer edit delivered beside a local external admission\n",
+            "the projected Markdown does not hold the peer's accepted bytes",
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        drive_receiver_past_quiescence(&reopened);
+        assert!(
+            receiver.graph_root.join(path).is_file(),
+            "the receiver lost the projected page across a clean reopen",
+        );
+    }
+
+    /// The same interleaving over a peer EDIT of a page the receiver already
+    /// projected.
+    #[test]
+    fn provider_edit_projects_markdown_beside_a_concurrent_external_admission() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-beside-external-edit", 0xbf40);
+        let path = "notes/provider-beside-external-edit.md";
+        let (create_batch, _page_id, block_id, document_id) = submit_shared_page(
+            &initiator_handle,
+            0xbf60,
+            "Provider Beside External Edit",
+            path,
+            "first",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- first\n"
+        );
+
+        let edit_batch = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: document_id,
+                },
+                content: "second".into(),
+            }],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, edit_batch);
+        settle_shared_provider(&initiator_handle);
+
+        deliver_beside_a_local_admission(
+            &initiator,
+            &receiver,
+            &receiver_handle,
+            "notes/local-beside-provider-edit.md",
+            "- an unrelated local external edit in the same window\n",
+        );
+
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- second\n",
+            "an applied provider EDIT never reached Markdown: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// Breadth: a peer CROSS-PAGE MOVE under the same interleaving must reach
+    /// BOTH pages' Markdown — the source loses the subtree, the target gains it.
+    #[test]
+    fn provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_admission() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-beside-external-move", 0xc000);
+        let source_path = "notes/provider-beside-external-move-source.md";
+        let target_path = "notes/provider-beside-external-move-target.md";
+        let (source_batch, source_page_id, moved_block, source_document) = submit_shared_page(
+            &initiator_handle,
+            0xc020,
+            "Provider Beside External Move Source",
+            source_path,
+            "carried across pages",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, source_batch);
+        let (target_batch, target_page_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xc040,
+            "Provider Beside External Move Target",
+            target_path,
+            "target anchor",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, target_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        assert!(receiver.graph_root.join(source_path).is_file());
+        assert!(receiver.graph_root.join(target_path).is_file());
+
+        let move_batch = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::MoveSubtree {
+                root: BlockLocation {
+                    block_id: moved_block,
+                    home_document_id: source_document,
+                },
+                from_page_id: source_page_id,
+                to_page_id: target_page_id,
+                parent: None,
+                order: "z".into(),
+            }],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, move_batch);
+        settle_shared_provider(&initiator_handle);
+
+        deliver_beside_a_local_admission(
+            &initiator,
+            &receiver,
+            &receiver_handle,
+            "notes/local-beside-provider-move.md",
+            "- an unrelated local external edit in the same window\n",
+        );
+
+        let target_bytes = fs::read(receiver.graph_root.join(target_path)).unwrap();
+        assert!(
+            String::from_utf8_lossy(&target_bytes).contains("carried across pages"),
+            "an applied provider CROSS-PAGE MOVE never reached the target Markdown: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        let source_bytes = fs::read(receiver.graph_root.join(source_path)).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&source_bytes).contains("carried across pages"),
+            "an applied provider CROSS-PAGE MOVE left the subtree in the source Markdown: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
     /// The direct provider lane only ever advances its front entry, so a batch
     /// whose causal dependency sits BEHIND it in the same queue can never make
     /// progress: it stalls on the dependency every turn while the dependency

@@ -86,6 +86,7 @@ describe("Settings storage transitions", () => {
       shared_role: null,
       shared_phase: null,
       provider_pending: 0,
+      provider_runnable: false,
     },
     can_activate: false,
     can_retry: false,

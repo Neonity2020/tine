@@ -514,6 +514,25 @@ remains valid predecessor evidence only after the projection planner replays
 the current semantic page and proves equality except for that frontier. Exact
 bytes, path, page identity, claims and layout annotations must still match.
 
+**An applied provider batch always owes a Markdown projection.** The same rule
+holds on the receiving side, and there it is a durability rule rather than a
+planning optimization. A receiver decides whether an inbound foreign projection
+intent is still the live authority for its page; equality of the whole merged
+frontier is NOT that test. An ordinary local external admission landing in the
+same window commits its own batch, which advances the shared page-catalog
+document, so a delivered intent's post-frontier stops matching a page it never
+touched. Treating that as supersession dropped the intent while the batch stayed
+applied in SQLite: the Markdown file was never written, `clean_shutdown` still
+reported Safe, and a reopen with a full re-drive never repaired it — durable
+data-visibility loss, because Markdown is the interchange truth for Direct Files
+parity and for every external tool. A receiver that cannot prove the delivered
+intent is still current therefore projects the page's CURRENT accepted state
+instead of skipping it. That is idempotent: a page genuinely superseded by newer
+accepted work renders to the bytes already on disk. A receiver that can
+authorize neither the delivered intent nor the current accepted state retains
+the obligation as a published continuation rather than reporting completion, so
+Safe is never published over a missing projection.
+
 A receiver-local projection can legitimately differ byte-for-byte from the
 source target while expressing the same accepted semantic page. On a later
 local edit, the current accepted manifest head remains the semantic authority,

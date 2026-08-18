@@ -57,6 +57,18 @@ function mount(ids: string[], extra: Record<string, StoreNode> = {}) {
   };
 }
 
+/** The first rendered TEXT node containing `needle` inside a block's wrapper. */
+function renderedTextNode(blockId: string, needle: string): Text | null {
+  const row = document.querySelector(`[data-block-id="${blockId}"]`);
+  const wrapper = row?.querySelector(":scope > .block-main .block-content-wrapper") ?? null;
+  if (!wrapper) return null;
+  const walker = document.createTreeWalker(wrapper, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if ((n.textContent ?? "").includes(needle)) return n as Text;
+  }
+  return null;
+}
+
 /** Select `start..end` of the FIRST text node that contains `needle` inside
  *  the given block's rendered wrapper. Returns false when not found. */
 function selectRenderedText(blockId: string, needle: string, start: number, end: number): boolean {
@@ -144,10 +156,12 @@ describe("rendered-text selection delete (OG parity)", () => {
       b: node("b", "second block", null),
     });
     try {
-      const rowA = document.querySelector('[data-block-id="a"]');
-      const rowB = document.querySelector('[data-block-id="b"]');
-      const textA = rowA?.querySelector(".block-content-wrapper")?.firstChild;
-      const textB = rowB?.querySelector(".block-content-wrapper")?.firstChild;
+      // Anchor the range in the rendered TEXT of each block — that is what a
+      // real cross-block drag selects. (Addressing `.block-content-wrapper` by
+      // child index instead pinned the number of Solid insert markers inside
+      // `.block-content`, which is not a contract of this behavior.)
+      const textA = renderedTextNode("a", "hello world");
+      const textB = renderedTextNode("b", "second block");
       expect(textA && textB).toBeTruthy();
       const range = document.createRange();
       range.setStart(textA!, 0);

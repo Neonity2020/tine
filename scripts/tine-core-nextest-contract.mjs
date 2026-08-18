@@ -143,6 +143,15 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // causal dependency is queued behind it deadlocks the pair and strands a
   // peer's edit. Deterministic ordering guard for that rule.
   "sync_runtime::tests::a_dependency_queued_behind_its_dependent_is_promoted_ahead_of_it",
+  // Receiver-local projection of an inbound provider batch must survive an
+  // ordinary local external admission landing in the same window. That
+  // admission advances the shared page-catalog document, which used to make the
+  // delivered intent look superseded and drop its Markdown projection while
+  // SQLite kept the batch — durable data-visibility loss that survived Safe
+  // shutdown and reopen.
+  "sync_runtime::tests::provider_create_projects_markdown_beside_a_concurrent_external_admission",
+  "sync_runtime::tests::provider_edit_projects_markdown_beside_a_concurrent_external_admission",
+  "sync_runtime::tests::provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_admission",
 ]);
 
 // Architectural/contract guards that happen to live in `sync_runtime::tests`
