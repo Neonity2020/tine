@@ -9,7 +9,7 @@
     "purpose": "Most recently published release. Advance immediately after publication; a tagged candidate automatically compares with the preceding tag."
   },
   "reliability": {
-    "rounds": 3,
+    "rounds": 5,
     "runsPerRound": 4,
     "maxCalibrationSpreadPct": 25
   },
