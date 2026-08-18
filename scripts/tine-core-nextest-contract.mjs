@@ -114,6 +114,15 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // product handles. This drives the whole journey through one such write and
   // holds the retried-past refusal in the receipt.
   "sync_runtime::tests::android_managed_storage_journey_converges_when_a_graph_file_changes_during_activation",
+  // What "enable sync with another device" leaves on disk, at the host
+  // boundary. A desktop repeated `RecoveryBlocked("unsafe provider entry:
+  // enrollment: No such file or directory (os error 2)")` after preparing a
+  // share, which reads as a preparation that published a half-built tree. This
+  // holds the two halves of the answer: preparation publishes the COMPLETE
+  // namespace inventory in both trees plus the one descriptor a joining device
+  // reads, and a tree that later loses `outbox/enrollment` discovers as
+  // "nothing to join yet" rather than as a hostile tree.
+  "sync_runtime::tests::preparing_a_share_publishes_a_complete_joinable_provider_tree",
   // Which of two physical files owns one decoded page name, pinned at the
   // application boundary: the FIRST exact path, in plain byte order, so an
   // ordinary backup copy under a directory sorting before `pages/` takes the
