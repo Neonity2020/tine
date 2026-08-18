@@ -480,6 +480,110 @@ struct ManagedApplicationQueryInstrumentation {
     block_branches: usize,
 }
 
+/// How many distinct simple-query answers one actor retains at a time.
+const APPLICATION_SIMPLE_QUERY_MEMO_ENTRIES: usize = 4;
+
+/// The largest answer the memo will retain, counted in emitted result blocks.
+/// A bigger answer is served but never stored, so the retained set stays a
+/// small multiple of this bound rather than of the caller's `max_rows`.
+const APPLICATION_SIMPLE_QUERY_MEMO_MAX_BLOCKS: usize = 4_096;
+
+/// Bounded, actor-local memo for the complete-page simple-query evaluator.
+///
+/// That evaluator costs one whole-page hydration per candidate page, and a page
+/// carrying a query re-runs it on every open, so the identical answer is
+/// recomputed from identical evidence each time. The memo holds at most
+/// [`APPLICATION_SIMPLE_QUERY_MEMO_ENTRIES`] answers of at most
+/// [`APPLICATION_SIMPLE_QUERY_MEMO_MAX_BLOCKS`] emitted blocks each, keyed by
+/// the exact request: query text and both caller bounds.
+///
+/// What invalidates it: the materialized acceptance sequence it was computed
+/// at. Every page change under managed storage -- a local save, a reconciled
+/// external edit, a delivered provider batch -- becomes an accepted batch and
+/// advances that sequence, and a different sequence drops every entry rather
+/// than any one of them. An actor holding a pending local suffix neither reads
+/// nor fills the memo, because that suffix is evidence the sequence does not
+/// cover. The one remaining input outside the stamp is a page file's mtime,
+/// which only orders equally-ranked results and only changes without an
+/// accepted batch when something rewrites a page's bytes identically.
+///
+/// It is a cache of a pure function over durable evidence, never authority: a
+/// dropped or absent entry costs one recomputation and nothing else.
+#[derive(Debug, Default)]
+struct ApplicationSimpleQueryMemo {
+    stamp: Option<u64>,
+    entries: VecDeque<ApplicationSimpleQueryMemoEntry>,
+}
+
+#[derive(Debug)]
+struct ApplicationSimpleQueryMemoEntry {
+    query: String,
+    max_rows: usize,
+    max_bytes: usize,
+    result: SyncApplicationBoundedRefGroups,
+}
+
+impl ApplicationSimpleQueryMemo {
+    fn get(
+        &mut self,
+        stamp: u64,
+        query: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Option<SyncApplicationBoundedRefGroups> {
+        if self.stamp != Some(stamp) {
+            self.stamp = Some(stamp);
+            self.entries.clear();
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.query == query && entry.max_rows == max_rows && entry.max_bytes == max_bytes
+            })
+            .map(|entry| entry.result.clone())
+    }
+
+    fn insert(
+        &mut self,
+        stamp: u64,
+        query: &str,
+        max_rows: usize,
+        max_bytes: usize,
+        result: &SyncApplicationBoundedRefGroups,
+    ) {
+        if self.stamp != Some(stamp) {
+            self.stamp = Some(stamp);
+            self.entries.clear();
+        }
+        let blocks = result
+            .groups
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum::<usize>();
+        if blocks > APPLICATION_SIMPLE_QUERY_MEMO_MAX_BLOCKS {
+            return;
+        }
+        self.entries.retain(|entry| {
+            entry.query != query || entry.max_rows != max_rows || entry.max_bytes != max_bytes
+        });
+        while self.entries.len() >= APPLICATION_SIMPLE_QUERY_MEMO_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(ApplicationSimpleQueryMemoEntry {
+            query: query.to_owned(),
+            max_rows,
+            max_bytes,
+            result: result.clone(),
+        });
+    }
+
+    fn clear(&mut self) {
+        self.stamp = None;
+        self.entries.clear();
+    }
+}
+
 /// A sparse result is authoritative only when every input and structural fact
 /// is complete.  These stable categories make test receipts distinguish a
 /// deliberate complete-page fallback from a successful sparse execution.
@@ -4821,6 +4925,50 @@ impl SyncRuntimeHandle {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::ResetManagedApplicationQueryInstrumentation {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    /// Evaluate a simple query through the complete-page evaluator, skipping
+    /// the sparse task-query path entirely.
+    ///
+    /// This is the receipt's "before": the exact work every managed task query
+    /// used to do, measurable in the same build, on the same fixture and the
+    /// same machine as the path that replaced it.
+    #[cfg(test)]
+    fn application_complete_page_simple_query(
+        &self,
+        query: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<SyncApplicationBoundedRefGroups, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ApplicationCompletePageSimpleQuery {
+            query: query.to_owned(),
+            max_rows,
+            max_bytes,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    /// Drop the actor's bounded complete-page query memo.
+    ///
+    /// Deliberately separate from the instrumentation reset: a receipt that
+    /// measures repeated cold evaluations calls both, while a test that has to
+    /// observe the memo's own hit calls only the reset.
+    #[cfg(test)]
+    fn clear_application_simple_query_memo(&self) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ClearApplicationSimpleQueryMemo {
             reply: reply_sender,
         })?;
         reply_receiver
@@ -9751,6 +9899,17 @@ enum ActorRequest {
     #[cfg(test)]
     ResetManagedApplicationQueryInstrumentation { reply: mpsc::Sender<()> },
     #[cfg(test)]
+    ClearApplicationSimpleQueryMemo { reply: mpsc::Sender<()> },
+    #[cfg(test)]
+    ApplicationCompletePageSimpleQuery {
+        query: String,
+        max_rows: usize,
+        max_bytes: usize,
+        #[allow(clippy::type_complexity)]
+        reply:
+            mpsc::Sender<Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError>>,
+    },
+    #[cfg(test)]
     ManagedApplicationQueryInstrumentation {
         reply: mpsc::Sender<ManagedApplicationQueryInstrumentation>,
     },
@@ -10146,6 +10305,23 @@ fn run_actor_loop(
             ActorRequest::ResetManagedApplicationQueryInstrumentation { reply } => {
                 actor.reset_managed_application_query_instrumentation();
                 let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ClearApplicationSimpleQueryMemo { reply } => {
+                actor.clear_application_simple_query_memo();
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ApplicationCompletePageSimpleQuery {
+                query,
+                max_rows,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply
+                    .send(actor.application_simple_query_pages_ready(&query, max_rows, max_bytes));
                 false
             }
             #[cfg(test)]
@@ -11852,6 +12028,10 @@ struct RuntimeActor {
     /// the accepted frontier that produced it. This is a single-page,
     /// process-local acceleration candidate, never storage authority.
     hot_application_save_page: Option<HotApplicationSavePage>,
+    /// Bounded repeat-answer memo for the complete-page simple-query
+    /// evaluator. See [`ApplicationSimpleQueryMemo`] for what it holds and
+    /// what drops it; it is a cache of durable evidence, never authority.
+    application_simple_query_memo: std::cell::RefCell<ApplicationSimpleQueryMemo>,
     #[cfg(test)]
     managed_application_query_instrumentation:
         std::cell::Cell<ManagedApplicationQueryInstrumentation>,
@@ -13464,6 +13644,9 @@ impl RuntimeActor {
             legacy_publication_settlements: std::cell::Cell::new(0),
             prepared_application_reply: None,
             hot_application_save_page: None,
+            application_simple_query_memo: std::cell::RefCell::new(
+                ApplicationSimpleQueryMemo::default(),
+            ),
             #[cfg(test)]
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
@@ -13655,6 +13838,9 @@ impl RuntimeActor {
             legacy_publication_settlements: std::cell::Cell::new(0),
             prepared_application_reply: None,
             hot_application_save_page: None,
+            application_simple_query_memo: std::cell::RefCell::new(
+                ApplicationSimpleQueryMemo::default(),
+            ),
             #[cfg(test)]
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
@@ -13736,6 +13922,11 @@ impl RuntimeActor {
     fn reset_managed_application_query_instrumentation(&self) {
         self.managed_application_query_instrumentation
             .set(ManagedApplicationQueryInstrumentation::default());
+    }
+
+    #[cfg(test)]
+    fn clear_application_simple_query_memo(&self) {
+        self.application_simple_query_memo.borrow_mut().clear();
     }
 
     #[cfg(test)]
@@ -15567,20 +15758,36 @@ impl RuntimeActor {
         // Borrow the exact pending suffix in place. It has to be a one-for-one
         // companion to the latest frames: any absent or incomplete entry is an
         // authority boundary, not an empty overlay.
-        let managed = self
-            .managed_local
-            .as_ref()
-            .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
-        if managed.latest_projection_frames.len() != managed.latest_task_query_overlay.len() {
+        //
+        // An absent managed-local runtime is the opposite of an absent entry.
+        // The clean baseline-plus-manifest actor -- the only actor a non-test
+        // build ever constructs -- deliberately holds no managed-local journal,
+        // so it has no pending suffix at all, and every other clean read path
+        // derives its (empty) navigation overlay from exactly this field. That
+        // empty overlay is the authority the complete-page fallback below then
+        // evaluates against SQLite, so refusing here never made an answer
+        // safer: it only made this path unreachable on the actor production
+        // runs, while the fallback answered the same query from the same
+        // evidence at whole-page cost.
+        let no_projection_frames = BTreeMap::new();
+        let no_task_query_overlay = BTreeMap::new();
+        let (latest_projection_frames, latest_task_query_overlay) =
+            match self.managed_local.as_ref() {
+                Some(managed) => (
+                    &managed.latest_projection_frames,
+                    &managed.latest_task_query_overlay,
+                ),
+                None => (&no_projection_frames, &no_task_query_overlay),
+            };
+        if latest_projection_frames.len() != latest_task_query_overlay.len() {
             return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
         }
         let mut overlay_pages = Vec::new();
         let mut overlay_pages_by_id = HashMap::new();
         let mut masked_paths = HashSet::new();
         let mut masked_page_ids = HashSet::new();
-        for (key, frame) in &managed.latest_projection_frames {
-            let entry = managed
-                .latest_task_query_overlay
+        for (key, frame) in latest_projection_frames {
+            let entry = latest_task_query_overlay
                 .get(key)
                 .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
             if entry.sequence != frame.sequence() || entry.path.as_str() != key {
@@ -15792,6 +15999,35 @@ impl RuntimeActor {
             Plan::Indexed(sources) => (sources, false),
             Plan::All => (Vec::new(), true),
         };
+
+        // Every open of a page carrying this query recomputes an identical
+        // answer from identical durable evidence, at one whole-page hydration
+        // per candidate page. Consult the bounded memo first -- but only where
+        // the accepted frontier is the whole story. An actor still holding a
+        // pending local suffix has evidence that sequence does not cover, so it
+        // neither reads nor fills the memo.
+        let memo_stamp = if self
+            .managed_local
+            .as_ref()
+            .is_none_or(|managed| managed.latest_projection_frames.is_empty())
+        {
+            let read = self.application_materialized_read_ready()?;
+            let stamp = read.acceptance_sequence();
+            drop(read);
+            Some(stamp)
+        } else {
+            None
+        };
+        if let Some(stamp) = memo_stamp {
+            if let Some(memoized) = self
+                .application_simple_query_memo
+                .borrow_mut()
+                .get(stamp, query, max_rows, max_bytes)
+            {
+                return Ok(memoized);
+            }
+        }
+
         let overlay = self.application_navigation_overlay_ready()?;
         let read = self.application_materialized_read_ready()?;
 
@@ -16016,11 +16252,17 @@ impl RuntimeActor {
             .collect::<Vec<_>>();
         let result =
             crate::query::run_application_query_pages_bounded(&pages, query, max_rows, max_bytes);
-        Ok(SyncApplicationBoundedRefGroups {
+        let bounded = SyncApplicationBoundedRefGroups {
             groups: result.groups,
             total: result.total,
             exceeded: result.exceeded,
-        })
+        };
+        if let Some(stamp) = memo_stamp {
+            self.application_simple_query_memo
+                .borrow_mut()
+                .insert(stamp, query, max_rows, max_bytes, &bounded);
+        }
+        Ok(bounded)
     }
 
     fn application_all_query_pages_ready(
@@ -60013,8 +60255,11 @@ mod tests {
     }
 
     fn managed_query_gate_scales() -> Vec<usize> {
-        let raw =
-            std::env::var("TINE_MANAGED_QUERY_GATE_PAGES").unwrap_or_else(|_| "1000,10000".into());
+        // The cut default fixture: enough pages for every counter in the
+        // receipt to be a real ratio rather than a coincidence, and small
+        // enough that the receipt runs in the ordinary selection. The release
+        // receipt supplies 1000,10000 through the environment.
+        let raw = std::env::var("TINE_MANAGED_QUERY_GATE_PAGES").unwrap_or_else(|_| "128".into());
         let scales = raw
             .split(',')
             .map(str::trim)
@@ -60037,7 +60282,7 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|samples| *samples >= 2)
-            .unwrap_or(5)
+            .unwrap_or(2)
     }
 
     fn assert_managed_simple_query_matches_direct(
@@ -60138,6 +60383,10 @@ mod tests {
             handle
                 .reset_managed_application_query_instrumentation()
                 .unwrap();
+            // Each sample is a cold measurement by construction: the receipt
+            // is about what one evaluation costs, not what the second one
+            // costs once the memo holds the answer.
+            handle.clear_application_simple_query_memo().unwrap();
             let started = Instant::now();
             let outcome = handle
                 .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
@@ -60163,6 +60412,7 @@ mod tests {
             handle
                 .reset_managed_application_query_instrumentation()
                 .unwrap();
+            handle.clear_application_simple_query_memo().unwrap();
             let started = Instant::now();
             let outcome = handle
                 .application_navigation(SyncApplicationNavigationRequest::GraphSearch {
@@ -60346,6 +60596,25 @@ mod tests {
             graph_search_counters.push(counters);
         }
 
+        // The same query through the evaluator the sparse path replaced. It is
+        // the receipt's before/after: one build, one fixture, one machine.
+        let mut complete_page_samples = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            handle.clear_application_simple_query_memo().unwrap();
+            let started = Instant::now();
+            let result = handle
+                .application_complete_page_simple_query(indexed, MAX_ROWS, MAX_BYTES)
+                .unwrap();
+            complete_page_samples.push(started.elapsed());
+            assert_managed_simple_query_matches_direct(
+                &format!("{label} complete-page indexed sample={sample}"),
+                result,
+                direct_indexed.clone(),
+            );
+        }
+        let complete_page_p50 = startup_median(&complete_page_samples);
+        let complete_page_p95 = startup_p95(&complete_page_samples);
+
         let indexed_p50 = startup_median(&indexed_samples);
         let indexed_p95 = startup_p95(&indexed_samples);
         let regex_all_p50 = startup_median(&regex_all_samples);
@@ -60353,9 +60622,11 @@ mod tests {
         let graph_search_p50 = startup_median(&graph_search_samples);
         let graph_search_p95 = startup_p95(&graph_search_samples);
         eprintln!(
-            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_sparse_attempts_max={} indexed_sparse_completions_max={} indexed_sparse_fallbacks_max={} indexed_sparse_candidates_max={} indexed_sparse_sqlite_rows_fetched_max={} indexed_sparse_ancestors_max={} indexed_sparse_parser_rows_max={} indexed_sparse_overlay_rows_max={} indexed_sparse_overlay_index_visits_max={} indexed_sparse_overlay_candidate_visits_max={} indexed_sparse_overlay_structure_lookups_max={} indexed_sparse_overlay_raw_bytes_cloned_max={} indexed_sparse_masked_page_fast_forwards_max={} indexed_sparse_dtos_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
+            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} indexed_complete_page_p50_ms={:.3} indexed_complete_page_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_sparse_attempts_max={} indexed_sparse_completions_max={} indexed_sparse_fallbacks_max={} indexed_sparse_candidates_max={} indexed_sparse_sqlite_rows_fetched_max={} indexed_sparse_ancestors_max={} indexed_sparse_parser_rows_max={} indexed_sparse_overlay_rows_max={} indexed_sparse_overlay_index_visits_max={} indexed_sparse_overlay_candidate_visits_max={} indexed_sparse_overlay_structure_lookups_max={} indexed_sparse_overlay_raw_bytes_cloned_max={} indexed_sparse_masked_page_fast_forwards_max={} indexed_sparse_dtos_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
             startup_ms(indexed_p50),
             startup_ms(indexed_p95),
+            startup_ms(complete_page_p50),
+            startup_ms(complete_page_p95),
             startup_ms(regex_all_p50),
             startup_ms(regex_all_p95),
             startup_ms(graph_search_p50),
@@ -60393,18 +60664,24 @@ mod tests {
         // release receipt: 10k/100% density measured p95 92.271ms. 150ms
         // preserves modest machine-variance headroom; the remaining limits
         // stay emergency tripwires retained from the predecessor receipt.
-        assert!(
-            indexed_p95 < Duration::from_millis(150),
-            "indexed query calibrated 150ms p95 architectural ceiling exceeded at {label}: {indexed_p95:?}"
-        );
-        assert!(
-            regex_all_p95 < Duration::from_secs(2),
-            "Regex-All emergency tripwire exceeded two seconds at {label}: {regex_all_p95:?}"
-        );
-        assert!(
-            graph_search_p95 < Duration::from_secs(2),
-            "graph-search emergency tripwire exceeded two seconds at {label}: {graph_search_p95:?}"
-        );
+        //
+        // All three are release-calibrated numbers. A debug build runs the
+        // same code an order of magnitude slower, so comparing it against them
+        // would only ever produce a widened ceiling.
+        if !cfg!(debug_assertions) {
+            assert!(
+                indexed_p95 < Duration::from_millis(150),
+                "indexed query calibrated 150ms p95 architectural ceiling exceeded at {label}: {indexed_p95:?}"
+            );
+            assert!(
+                regex_all_p95 < Duration::from_secs(2),
+                "Regex-All emergency tripwire exceeded two seconds at {label}: {regex_all_p95:?}"
+            );
+            assert!(
+                graph_search_p95 < Duration::from_secs(2),
+                "graph-search emergency tripwire exceeded two seconds at {label}: {graph_search_p95:?}"
+            );
+        }
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -60540,13 +60817,278 @@ mod tests {
         ));
     }
 
+    /// The sparse task-query fast path, driven through the only actor a
+    /// non-test build can construct.
+    ///
+    /// `pre_07_activation_oracle_has_no_production_entry_point` holds the other
+    /// half: every legacy activation entry -- including the actor constructor
+    /// that populates `managed_local` -- is `#[cfg(test)]`, so the clean
+    /// baseline-plus-manifest actor opened here is production's actor, with no
+    /// managed-local journal and therefore no pending suffix. Nothing is handed
+    /// in: the fixture activates and reopens through the public handle.
+    ///
+    /// It exists because that actor used to answer `{{query (task TODO)}}` by
+    /// hydrating every candidate page in full, having refused the block-bounded
+    /// path for the absence of a journal it can never have.
     #[test]
-    #[ignore = "manual release performance receipt: managed task query densities plus Regex-All and graph search at 1k/10k and optional copied corpus"]
-    fn managed_query_search_manual_gate() {
-        assert!(
-            !cfg!(debug_assertions),
-            "run with cargo test -p tine-core --release managed_query_search_manual_gate -- --ignored --nocapture"
+    fn clean_runtime_task_query_takes_the_sparse_fast_path_without_hydrating_pages() {
+        const TOTAL_PAGES: usize = 32;
+        const CANDIDATE_PAGES: usize = 8;
+        const MAX_ROWS: usize = 20_000;
+        const MAX_BYTES: usize = 32 * 1024 * 1024;
+
+        let fixture = ActivationFixture::scaled_query_candidate_density(
+            "clean-task-query-fast-path",
+            0xa3f0,
+            TOTAL_PAGES,
+            CANDIDATE_PAGES,
         );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("clean reopen retains its actor");
+        assert_eq!(
+            handle.status().unwrap().managed_local_pending,
+            0,
+            "the clean runtime must hold no pending managed-local suffix"
+        );
+
+        let query = "(task TODO)";
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: query.into(),
+                max_rows: MAX_ROWS,
+                max_bytes: MAX_BYTES,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::SimpleQuery(managed),
+        } = outcome
+        else {
+            panic!("clean task query returned the wrong outcome: {outcome:?}")
+        };
+        assert_eq!(managed.total, CANDIDATE_PAGES);
+        assert_managed_simple_query_matches_direct(
+            "clean runtime task query",
+            managed,
+            Graph::open(&fixture.graph_root).run_query_bounded(query, MAX_ROWS, MAX_BYTES),
+        );
+
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
+        assert_eq!(
+            counters.sparse_completions, 1,
+            "the production-shaped actor must COMPLETE the sparse path: {counters:?}"
+        );
+        assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
+        assert_eq!(counters.sparse_fallback_reason, None, "{counters:?}");
+        assert_eq!(
+            counters.result_page_hydrations, 0,
+            "the task query must not hydrate a single result page: {counters:?}"
+        );
+        assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
+        assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+        assert_eq!(counters.inventory_pages, 0, "{counters:?}");
+        assert_eq!(
+            counters.sparse_candidate_rows, CANDIDATE_PAGES,
+            "{counters:?}"
+        );
+        assert_eq!(counters.sparse_parser_rows, CANDIDATE_PAGES, "{counters:?}");
+        assert_eq!(
+            counters.sparse_sqlite_rows_fetched, CANDIDATE_PAGES,
+            "the SQLite read must stay candidate-row bounded: {counters:?}"
+        );
+        assert_eq!(counters.sparse_ancestor_rows, 0, "{counters:?}");
+        assert_eq!(
+            counters.sparse_dto_constructions, CANDIDATE_PAGES,
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.sparse_overlay_rows, 0,
+            "a clean runtime has no overlay candidates at all: {counters:?}"
+        );
+        assert_eq!(counters.sparse_overlay_index_visits, 0, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_candidate_visits, 0, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_structure_lookups, 0, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_raw_bytes_cloned, 0, "{counters:?}");
+        assert_eq!(counters.sparse_masked_page_fast_forwards, 0, "{counters:?}");
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The complete-page evaluator's memo: what it saves, what drops it, and
+    /// that dropping it is driven by the accepted frontier rather than by the
+    /// caller remembering to ask.
+    ///
+    /// The last leg is the one that matters. An answer memoized before a save
+    /// must not survive the accepted batch that save produces, or a query page
+    /// would keep showing the graph as it was.
+    #[test]
+    fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch() {
+        const TOTAL_PAGES: usize = 24;
+        const CANDIDATE_PAGES: usize = 6;
+        const MAX_ROWS: usize = 20_000;
+        const MAX_BYTES: usize = 32 * 1024 * 1024;
+        const WITNESS: &str = "memo-invalidation-witness";
+
+        let fixture = ActivationFixture::scaled_query_candidate_density(
+            "clean-simple-query-memo",
+            0xa3f4,
+            TOTAL_PAGES,
+            CANDIDATE_PAGES,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("clean reopen retains its actor");
+
+        // Regex-All is the whole-graph shape of the evaluator the sparse task
+        // path deliberately does NOT cover: one inventory pass and one full
+        // hydration per page, every time.
+        let query = format!("(content-regex \"{WITNESS}\")");
+        let run = |label: &str| {
+            handle
+                .reset_managed_application_query_instrumentation()
+                .unwrap();
+            let outcome = handle
+                .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.clone(),
+                    max_rows: MAX_ROWS,
+                    max_bytes: MAX_BYTES,
+                })
+                .unwrap();
+            let SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::SimpleQuery(managed),
+            } = outcome
+            else {
+                panic!("{label} returned the wrong outcome: {outcome:?}")
+            };
+            (
+                managed,
+                handle.managed_application_query_instrumentation().unwrap(),
+            )
+        };
+
+        let (cold, counters) = run("cold complete-page query");
+        assert_eq!(cold.total, 0);
+        assert_eq!(counters.full_inventory_passes, 1, "{counters:?}");
+        assert_eq!(
+            counters.result_page_hydrations, TOTAL_PAGES,
+            "the cold evaluation must hydrate every page: {counters:?}"
+        );
+        assert_managed_simple_query_matches_direct(
+            "cold complete-page query",
+            cold,
+            Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
+        );
+
+        let (repeat, counters) = run("memoized complete-page query");
+        assert_eq!(repeat.total, 0);
+        assert_eq!(
+            counters.result_page_hydrations, 0,
+            "the repeated evaluation must be served from the memo: {counters:?}"
+        );
+        assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+
+        handle.clear_application_simple_query_memo().unwrap();
+        let (recomputed, counters) = run("query after an explicitly dropped memo");
+        assert_eq!(recomputed.total, 0);
+        assert_eq!(
+            counters.result_page_hydrations, TOTAL_PAGES,
+            "a dropped memo must recompute rather than answer empty: {counters:?}"
+        );
+
+        // Refill the memo, then change the graph through the ordinary save
+        // path. The accepted batch, not the caller, is what has to invalidate.
+        let (_, counters) = run("refilled memo");
+        assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
+
+        let witness_path = Graph::open(&fixture.graph_root)
+            .list_pages()
+            .into_iter()
+            .next()
+            .expect("the memo fixture must contain pages")
+            .rel_path;
+        let (mut page, revision) = load_application_exact(&handle, &witness_path);
+        page.blocks[0].raw = format!("{} {WITNESS}", page.blocks[0].raw);
+        let save = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        assert!(
+            matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+            "the memo fixture edit was not accepted: {save:?}"
+        );
+
+        let (after_save, counters) = run("query after an accepted batch");
+        assert_eq!(
+            after_save.total, 1,
+            "a memo that survived its accepted batch would still answer zero"
+        );
+        assert!(
+            counters.result_page_hydrations > 0,
+            "the invalidated memo must recompute: {counters:?}"
+        );
+        assert_managed_simple_query_matches_direct(
+            "query after an accepted batch",
+            after_save,
+            Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
+        );
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The managed query/search performance receipt.
+    ///
+    /// It runs in the ordinary selection at the cut scale below, where its job
+    /// is the SHAPE contract: how many inventory passes, page hydrations,
+    /// candidate rows and DTO constructions each query kind is allowed. Those
+    /// counters are the architectural claim and hold in any build profile.
+    ///
+    /// The calibrated timing ceilings are asserted only in a release build,
+    /// because they were measured in one and a debug number cannot be compared
+    /// against them -- and widening them to fit debug would retire the ceiling
+    /// rather than move it. The release receipt at full scale is
+    /// `TINE_MANAGED_QUERY_GATE_PAGES=1000,10000 TINE_MANAGED_QUERY_GATE_SAMPLES=5
+    /// cargo test -p tine-core --release managed_query_search_manual_gate -- --nocapture`,
+    /// optionally with `TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY=<copy>`.
+    ///
+    /// It was `#[ignore]`d, and red: it asserted the sparse task-query path
+    /// completed on a runtime that refused it, and nothing ran it to say so.
+    #[test]
+    fn managed_query_search_manual_gate() {
         let samples = managed_query_gate_samples();
         for (scale, total_pages) in managed_query_gate_scales().into_iter().enumerate() {
             for (density, candidate_pages) in [

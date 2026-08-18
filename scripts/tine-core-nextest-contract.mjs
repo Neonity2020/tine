@@ -200,6 +200,19 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::provider_create_projects_markdown_beside_a_concurrent_external_admission",
   "sync_runtime::tests::provider_edit_projects_markdown_beside_a_concurrent_external_admission",
   "sync_runtime::tests::provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_admission",
+  // The managed task query on the clean runtime. `application_sparse_task_query_ready`
+  // required a managed-local journal the clean actor deliberately never holds,
+  // so every `{{query (task TODO)}}` fell through to one full page hydration
+  // per candidate page -- and the receipt that would have said so was
+  // `#[ignore]`d and red. The first proves the block-bounded path is taken on
+  // the only actor a non-test build constructs; the second holds the memo that
+  // bounds the remaining complete-page evaluator, including that an accepted
+  // batch drops it; the third is that receipt, no longer ignored, at a cut
+  // fixture scale with its release-calibrated timing ceilings asserted in a
+  // release build.
+  "sync_runtime::tests::clean_runtime_task_query_takes_the_sparse_fast_path_without_hydrating_pages",
+  "sync_runtime::tests::clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch",
+  "sync_runtime::tests::managed_query_search_manual_gate",
 ]);
 
 // Architectural/contract guards that happen to live in `sync_runtime::tests`
