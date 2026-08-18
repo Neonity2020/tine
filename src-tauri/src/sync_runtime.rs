@@ -2271,6 +2271,21 @@ fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespa
     })
 }
 
+/// Adoption's counterpart to `archive_graph_provider_namespace`: it preserves
+/// `<graph>/.tine-sync/v2` exactly where it is.
+///
+/// The graceful Direct Files return archives that subtree because an unclaimed
+/// v2 namespace would otherwise lock a later Direct Files restart out. Adoption
+/// is not staying in Direct Files: the subtree it would archive is the OTHER
+/// device's shared evidence, and archiving it would delete the descriptor the
+/// second half of adoption is about to read — and, under a folder-syncing
+/// tool, propagate that removal back to the device that is sharing.
+fn preserve_graph_provider_namespace(
+    _graph_root: &Path,
+) -> Result<ProviderNamespaceArchive, String> {
+    Ok(ProviderNamespaceArchive::Absent)
+}
+
 fn restore_graph_provider_namespace(archive: ProviderNamespaceArchive) -> Result<(), String> {
     let ProviderNamespaceArchive::Moved {
         source,
@@ -2397,6 +2412,7 @@ fn commit_transition<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     state: &crate::state::AppState,
     label: &str,
@@ -2406,6 +2422,7 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     approved_assets: Option<&Path>,
     shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
     archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
+    archive_provider: impl FnOnce(&Path) -> Result<ProviderNamespaceArchive, String>,
     publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
     transition: Option<&crate::storage_mode_supervisor::StorageRecoveryTransitionGuard<'_>>,
     after_shutdown: impl FnOnce(&DirectFilesShutdown) -> Result<(), String>,
@@ -2480,7 +2497,7 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     drop(removed);
     drop(slot);
 
-    let provider_archive = match archive_graph_provider_namespace(&direct_root) {
+    let provider_archive = match archive_provider(&direct_root) {
         Ok(archive) => archive,
         Err(error) => return Err(error),
     };
@@ -2545,6 +2562,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
         approved_assets,
         shutdown,
         archive,
+        archive_graph_provider_namespace,
         |direct_root, approved_assets| {
             let graph =
                 tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
@@ -2562,6 +2580,38 @@ fn cancel_sparse_v2_at_paths_with_archive(
             crate::state::poke_watcher(state);
             Ok(binding_generation)
         },
+        None,
+        |_| Ok(()),
+    )
+}
+
+/// The path-level shape of adoption's first half, wired to exactly the
+/// production provider-namespace decision. `set_aside_managed_history_for_adoption`
+/// composes the same call with the supervisor guard around it.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn set_aside_managed_history_at_paths(
+    state: &crate::state::AppState,
+    label: &str,
+    slot: Arc<crate::state::GraphSlot>,
+    private_root: &Path,
+    recovery_root: &Path,
+    approved_assets: Option<&Path>,
+    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
+    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
+) -> Result<SparseV2CancelResult, String> {
+    cancel_sparse_v2_at_paths_with_archive_and_publish(
+        state,
+        label,
+        slot,
+        private_root,
+        recovery_root,
+        approved_assets,
+        shutdown,
+        archive,
+        preserve_graph_provider_namespace,
+        publish_direct,
         None,
         |_| Ok(()),
     )
@@ -2880,6 +2930,7 @@ fn cancel_sparse_v2_blocking(
         approved_assets.as_deref(),
         shutdown_for_graceful_direct_files,
         archive_private_root,
+        archive_graph_provider_namespace,
         |direct_root, approved_assets| {
             let graph =
                 tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
@@ -3178,6 +3229,280 @@ fn prepare_sparse_v2_join(
             direct_source_generation: Some(direct_source_generation),
         },
     ))
+}
+
+/// How this device's own managed identity stands to the graph another device
+/// is sharing.
+///
+/// The three identities are minted together by one activation
+/// (`SparseV2ActivationRecord::new`) and copied together from a descriptor
+/// (`from_shared`), so in practice they either all agree or all differ. A
+/// mixture is evidence that one side's identity was rewritten or truncated,
+/// which is exactly the state adoption must not guess about.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SharedGraphRelation {
+    /// Every identity matches: this device already holds the shared lineage.
+    SameGraph,
+    /// No identity matches: two independent activations of the same folder.
+    Independent,
+    /// Some identities match and some do not.
+    PartialLineage,
+}
+
+fn shared_graph_relation(
+    local: (WorkspaceId, LineageDigest, DocumentId),
+    shared: (WorkspaceId, LineageDigest, DocumentId),
+) -> SharedGraphRelation {
+    let matches = [
+        local.0 == shared.0,
+        local.1 == shared.1,
+        local.2 == shared.2,
+    ];
+    if matches.iter().all(|matched| *matched) {
+        return SharedGraphRelation::SameGraph;
+    }
+    if matches.iter().all(|matched| !*matched) {
+        return SharedGraphRelation::Independent;
+    }
+    SharedGraphRelation::PartialLineage
+}
+
+/// Both non-adoptable relations, said in the words the panel repeats.
+fn shared_graph_relation_refusal(relation: SharedGraphRelation) -> Option<&'static str> {
+    match relation {
+        SharedGraphRelation::Independent => None,
+        SharedGraphRelation::SameGraph => Some(
+            "This device's Tine-managed storage already holds the same history the other device is sharing, so there is nothing to set aside. Nothing was changed. Use \"Join a synced graph from another device\" instead.",
+        ),
+        SharedGraphRelation::PartialLineage => Some(
+            "This device's Tine-managed storage matches part of the shared graph's identity and not the rest, so Tine cannot tell which history is which. Nothing was changed. Let your file-sync tool finish delivering the hidden .tine-sync folder and try again; if it persists, return this device to Direct files and join from there.",
+        ),
+    }
+}
+
+/// Adoption abandons this device's own managed history. When that history is
+/// itself shared, abandoning it also abandons whatever other devices are
+/// joined to it, so adoption refuses instead of deciding that for them.
+fn shared_cut_refusal(shared_phase: Option<&str>) -> Option<&'static str> {
+    match shared_phase? {
+        "share_prepared" => Some(
+            "This device's Tine-managed storage has an unfinished sync cut of its own. Nothing was changed. Finish it with \"Retry setup\", or return this device to Direct files, before adopting another device's graph.",
+        ),
+        "joining" => Some(
+            "This device's Tine-managed storage is part-way through a join already. Nothing was changed. Let that join finish or fail first.",
+        ),
+        _ => Some(
+            "This device's Tine-managed storage is already shared with, or joined to, another device. Nothing was changed. Adopting a different graph would abandon that; return this device to Direct files first if that is what you want.",
+        ),
+    }
+}
+
+/// What adoption did, and where the predecessor went.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct SparseV2AdoptionResult {
+    status: SparseV2StatusDto,
+    binding_generation: u64,
+    /// The archived pre-adoption managed history, named in full. `None` only
+    /// when a failed or partially-created activation had retained nothing.
+    archive_location: Option<String>,
+    adoption_statement: String,
+}
+
+/// Where a set-aside managed history is archived. Stable, and knowable before
+/// the point of no return, which is why the panel can name it in the
+/// confirmation rather than only in the receipt.
+#[tauri::command]
+pub(crate) async fn sparse_v2_recovery_location(app: tauri::AppHandle) -> Result<String, String> {
+    sparse_recovery_root(&app).map(|root| root.display().to_string())
+}
+
+/// Adopt a graph another device is sharing on a device that already holds a
+/// managed graph of its own.
+///
+/// This is a composition, not a new storage operation: the graceful Direct
+/// Files return already archives this device's complete managed history under
+/// `sparse-v2-recovery`, and the Direct Files join branch already bootstraps a
+/// binding out of provider evidence. Adoption sequences exactly those two,
+/// with one difference that a literal "Return to Direct files, then Join"
+/// cannot express — the return must NOT archive `<graph>/.tine-sync/v2`,
+/// because that subtree is the other device's shared evidence and archiving it
+/// removes the very descriptor the join is about to read.
+///
+/// Each half is a complete supervisor transition with its own stable end mode.
+/// A crash between them therefore lands on Direct Files with the predecessor
+/// archived and the shared graph still joinable, which is a state the panel
+/// already offers a button for.
+#[tauri::command]
+pub(crate) async fn adopt_sparse_v2_shared(
+    state: crate::state::GraphContext<'_>,
+) -> Result<SparseV2AdoptionResult, String> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        adopt_sparse_v2_shared_blocking(&app, &label, binding_generation)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn adopt_sparse_v2_shared_blocking(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+) -> Result<SparseV2AdoptionResult, String> {
+    let state = app.state::<crate::state::AppState>();
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let root = slot.root_key.clone();
+    if slot.sparse_binding().is_none() {
+        return Err(
+            "This device is already using Direct files, so it has no Tine-managed storage history to set aside. Nothing was changed. Use \"Join a synced graph from another device\" instead."
+                .into(),
+        );
+    }
+    // An incomplete provider tree is "not yet", not a reason to start
+    // dismantling this device's own storage.
+    crate::graph::refuse_unclaimed_sparse_archive(&root)?;
+    let descriptor =
+        inspect_shared_enrollment_for_cold_discovery(&root.join(".tine-sync/v2/shared"))
+            .map_err(|error| format!("Couldn't read the shared sync data: {error}"))?
+            .ok_or_else(|| shared_enrollment_not_here_yet(&root))?;
+    let record = state
+        .sync_runtime
+        .binding_record(app, &root)?
+        .ok_or("Tine-managed storage setup is missing.")?;
+    let relation = shared_graph_relation(
+        (
+            record.workspace_id,
+            record.lineage_digest,
+            record.catalog_document_id,
+        ),
+        (
+            descriptor.workspace_id,
+            descriptor.lineage_digest,
+            descriptor.catalog_document_id,
+        ),
+    );
+    if let Some(refusal) = shared_graph_relation_refusal(relation) {
+        return Err(refusal.into());
+    }
+    let status = sparse_v2_status_for_slot(&slot)?;
+    if let Some(refusal) = shared_cut_refusal(
+        status
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.shared_phase.as_deref()),
+    ) {
+        return Err(refusal.into());
+    }
+    drop(slot);
+
+    let (set_aside, archive_location) =
+        set_aside_managed_history_for_adoption(app, label, binding_generation)?;
+    let archive_location = archive_location.map(|path| path.display().to_string());
+    // One line, because the panel's redaction keeps only the first one. The
+    // token is stable so the panel can attach the archive location it already
+    // read, rather than repeating a native path through the redactor.
+    let status = join_sparse_v2_shared_blocking(app, label, set_aside.binding_generation)
+        .map_err(|error| {
+            format!(
+                "Tine-managed storage adoption stopped after this device's own history was archived; Direct files is serving your Markdown/Org files unchanged and nothing was merged, so the join action can retry the remaining half on its own: {error}"
+            )
+        })?;
+    let binding_generation = status.binding_generation;
+    Ok(SparseV2AdoptionResult {
+        adoption_statement: match &archive_location {
+            Some(location) => format!(
+                "This device now serves the graph shared by your other device. Its own previous Tine-managed history was archived at {location} and was not merged."
+            ),
+            None => "This device now serves the graph shared by your other device. It had no retained managed history to archive, and nothing was merged.".into(),
+        },
+        status,
+        binding_generation,
+        archive_location,
+    })
+}
+
+/// The first half of adoption: drain and stop this device's managed runtime,
+/// archive its complete private managed root, and publish Direct Files from
+/// the unchanged Markdown/Org tree — leaving `<graph>/.tine-sync/v2` exactly
+/// where it is so the second half can still read the shared descriptor.
+fn set_aside_managed_history_for_adoption(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+) -> Result<(SparseV2CancelResult, Option<PathBuf>), String> {
+    let state = app.state::<crate::state::AppState>();
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+        .root_key
+        .clone();
+    let transition = state.storage_supervisor.begin_recovery_guard(
+        app,
+        label,
+        root.clone(),
+        StorageTransitionKind::ReturnGracefully,
+    )?;
+    transition.advance(StorageTransitionPhase::WaitingForTransition)?;
+    let transition_gate = state.storage_supervisor.transition_lane(&root);
+    let _transition = transition_gate.lock().unwrap();
+    if !transition.is_current() {
+        return Err("adoption was superseded while waiting for its graph lane".into());
+    }
+    transition.advance(StorageTransitionPhase::ValidatingTarget)?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    if slot.root_key != root {
+        return Err("graph changed while adoption waited for its transition lane".into());
+    }
+    let private_root = sparse_private_root(app, &slot.root_key)?;
+    let recovery_root = sparse_recovery_root(app)?;
+    let approved_assets = crate::settings::approved_external_assets(app, &slot.root_key);
+    transition.advance(StorageTransitionPhase::DrainingManaged)?;
+    let archived = std::cell::RefCell::new(None);
+    let result = cancel_sparse_v2_at_paths_with_archive_and_publish(
+        &state,
+        label,
+        slot,
+        &private_root,
+        &recovery_root,
+        approved_assets.as_deref(),
+        shutdown_for_graceful_direct_files,
+        |private_root, recovery_root| {
+            let destination = archive_private_root(private_root, recovery_root)?;
+            *archived.borrow_mut() = destination.clone();
+            Ok(destination)
+        },
+        preserve_graph_provider_namespace,
+        |direct_root, approved_assets| {
+            let graph =
+                tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
+                    .map_err(|error| error.to_string())?;
+            let replacement = Arc::new(crate::state::GraphSlot::new(
+                graph,
+                direct_root.to_path_buf(),
+            ));
+            let binding_generation = replacement.binding_generation;
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), replacement)?;
+            crate::state::poke_watcher(&state);
+            Ok(binding_generation)
+        },
+        Some(&transition),
+        |_| {
+            transition.advance(StorageTransitionPhase::ConfirmingProjection)?;
+            transition.advance(StorageTransitionPhase::PublishingDirect)
+        },
+    );
+    match result {
+        Ok(result) => {
+            transition.succeed(StableStorageMode::Direct)?;
+            Ok((result, archived.into_inner()))
+        }
+        Err(error) => {
+            transition.fail("adoption_set_aside_failed");
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -4179,6 +4504,349 @@ mod tests {
                 "emergency return must not depend on `{forbidden}`"
             );
         }
+    }
+
+    fn adoption_identities(seed: u128) -> (WorkspaceId, LineageDigest, DocumentId) {
+        (
+            WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+            LineageDigest::of(format!("lineage-{seed}").as_bytes()),
+            DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+        )
+    }
+
+    #[test]
+    fn two_independent_activations_are_adoptable_and_every_other_relation_is_refused() {
+        let mine = adoption_identities(0xad10);
+        let theirs = adoption_identities(0xad20);
+
+        assert_eq!(
+            shared_graph_relation(mine, theirs),
+            SharedGraphRelation::Independent
+        );
+        assert!(shared_graph_relation_refusal(SharedGraphRelation::Independent).is_none());
+
+        assert_eq!(
+            shared_graph_relation(mine, mine),
+            SharedGraphRelation::SameGraph
+        );
+        let same = shared_graph_relation_refusal(SharedGraphRelation::SameGraph).unwrap();
+        assert!(same.contains("Nothing was changed"));
+        assert!(same.contains("Join a synced graph from another device"));
+
+        // Each single agreeing identity is a partial lineage, and none of them
+        // is allowed to look like an independent activation.
+        for partial in [
+            (theirs.0, mine.1, mine.2),
+            (mine.0, theirs.1, mine.2),
+            (mine.0, mine.1, theirs.2),
+            (theirs.0, theirs.1, mine.2),
+            (theirs.0, mine.1, theirs.2),
+            (mine.0, theirs.1, theirs.2),
+        ] {
+            assert_eq!(
+                shared_graph_relation(mine, partial),
+                SharedGraphRelation::PartialLineage,
+                "{partial:?} must not be treated as adoptable"
+            );
+        }
+        let partial = shared_graph_relation_refusal(SharedGraphRelation::PartialLineage).unwrap();
+        assert!(partial.contains("matches part of the shared graph's identity"));
+        assert!(partial.contains("Nothing was changed"));
+        assert!(partial.contains("return this device to Direct files"));
+    }
+
+    #[test]
+    fn every_adoption_refusal_names_a_reason_and_a_remedy_that_survives_panel_redaction() {
+        let mut refusals = vec![
+            shared_graph_relation_refusal(SharedGraphRelation::SameGraph).unwrap(),
+            shared_graph_relation_refusal(SharedGraphRelation::PartialLineage).unwrap(),
+        ];
+        for phase in ["share_prepared", "joining", "active"] {
+            refusals.push(shared_cut_refusal(Some(phase)).expect("a shared cut refuses adoption"));
+        }
+        // A purely local managed device has no shared phase at all, and that is
+        // precisely the device adoption exists for.
+        assert!(shared_cut_refusal(None).is_none());
+
+        for refusal in refusals {
+            assert!(
+                refusal.contains("Nothing was changed"),
+                "refusal must say what it did not do: {refusal}"
+            );
+            // The panel keeps only the first line of a native message and drops
+            // any line with no recognised diagnostic class, so a refusal that
+            // fails this is a refusal the user never reads.
+            assert!(
+                !refusal.contains('\n'),
+                "refusal must survive first-line truncation: {refusal}"
+            );
+            assert!(
+                refusal.contains("storage") || refusal.contains("sync"),
+                "refusal must carry a diagnostic class the panel keeps: {refusal}"
+            );
+        }
+    }
+
+    /// Seam 1 — the drain. Nothing has been archived, so the managed slot must
+    /// come back and every byte on both sides must be untouched.
+    #[test]
+    fn adoption_seam_shutdown_failure_keeps_the_managed_device_serving_its_own_history() {
+        let mut fixture = RollbackFixture::new(Some("local_active"));
+        fixture.make_active();
+        create_empty_local_provider_scaffold(&fixture.graph_root);
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+
+        let error = set_aside_managed_history_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            |_| Err("injected adoption drain failure".into()),
+            archive_private_root,
+            |_, _| panic!("adoption must not publish Direct files after a failed drain"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected adoption drain failure"));
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before
+        );
+        assert!(!fixture.recovery_root.exists());
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        let serving = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        assert!(serving.is_sparse_v2());
+        assert!(serving.sparse_runtime().is_some());
+    }
+
+    /// Seam 2 — the archive itself. The rename is the only durable step, so a
+    /// failure here must leave the device exactly where it was, retryable.
+    #[test]
+    fn adoption_seam_archive_failure_keeps_both_histories_where_they_were() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        create_empty_local_provider_scaffold(&fixture.graph_root);
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+
+        let error = set_aside_managed_history_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+            |_, _| Err("injected adoption archive failure".into()),
+            |_, _| panic!("adoption must not publish Direct files after a failed archive"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected adoption archive failure"));
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before
+        );
+        assert!(!fixture.recovery_root.exists());
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        let retryable = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        assert!(retryable.is_sparse_v2());
+        assert!(retryable.sparse_runtime().is_none());
+    }
+
+    /// Seam 3 — after the archive, before Direct Files opens. The device serves
+    /// its own unchanged Markdown/Org tree either way, which is still the
+    /// pre-adoption state; the archive and the shared evidence both survive, so
+    /// both halves remain retryable.
+    #[test]
+    fn adoption_seam_direct_publication_failure_keeps_the_archive_and_the_shared_evidence() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        create_empty_local_provider_scaffold(&fixture.graph_root);
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+
+        let error = set_aside_managed_history_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+            archive_private_root,
+            |_, _| Err("injected adoption Direct files failure".into()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("recovery state was preserved"));
+        assert!(!fixture.private_root.exists());
+        let archives = std::fs::read_dir(&fixture.recovery_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(snapshot_tree(&archives[0]), private_before);
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before,
+            "the shared evidence must survive so the join half can still run"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        assert!(fixture.state.graphs.read().unwrap().slot("main").is_none());
+        assert!(Graph::open_checked(&fixture.graph_root).is_ok());
+    }
+
+    /// The first half, completed. This is the one behaviour a literal "Return
+    /// to Direct files, then Join" cannot produce: the predecessor archived AND
+    /// the other device's shared namespace still in place.
+    #[test]
+    fn adoption_set_aside_archives_the_predecessor_and_leaves_the_shared_namespace_in_place() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        create_empty_local_provider_scaffold(&fixture.graph_root);
+        let descriptor = fixture
+            .graph_root
+            .join(".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json");
+        std::fs::create_dir_all(descriptor.parent().unwrap()).unwrap();
+        std::fs::write(&descriptor, b"the other device's descriptor").unwrap();
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+
+        let result = set_aside_managed_history_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+            archive_private_root,
+            |direct_root, approved_assets| {
+                let graph =
+                    tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
+                        .map_err(|error| error.to_string())?;
+                let replacement = Arc::new(crate::state::GraphSlot::new(
+                    graph,
+                    direct_root.to_path_buf(),
+                ));
+                let binding_generation = replacement.binding_generation;
+                fixture
+                    .state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .bind("main".into(), replacement)?;
+                Ok(binding_generation)
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!fixture.private_root.exists());
+        let archives = std::fs::read_dir(&fixture.recovery_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(snapshot_tree(&archives[0]), private_before);
+        assert_eq!(
+            std::fs::read(archives[0].join(SPARSE_BINDING_FILE)).unwrap(),
+            fixture.binding_bytes
+        );
+        // The graceful Direct Files return moves this subtree under
+        // `.tine-sync/recovery`. Adoption must not.
+        assert!(!fixture.graph_root.join(".tine-sync/recovery").exists());
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before
+        );
+        assert_eq!(
+            std::fs::read(&descriptor).unwrap(),
+            b"the other device's descriptor"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        assert!(fixture
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+    }
+
+    #[test]
+    fn adoption_is_composed_of_the_two_existing_transitions_and_never_archives_shared_evidence() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("fn adopt_sparse_v2_shared_blocking(")
+            .expect("adoption composition exists");
+        let body = &source[start
+            ..source[start..]
+                .find("\n}\n")
+                .map(|offset| start + offset + 3)
+                .unwrap_or(source.len())];
+        // Every refusal is decided before the first durable step.
+        let set_aside = body
+            .find("set_aside_managed_history_for_adoption(")
+            .expect("adoption archives before it joins");
+        for refusal in [
+            "refuse_unclaimed_sparse_archive(",
+            "shared_enrollment_not_here_yet(",
+            "shared_graph_relation_refusal(",
+            "shared_cut_refusal(",
+        ] {
+            let at = body.find(refusal).unwrap_or_else(|| {
+                panic!("adoption must decide `{refusal}` for itself");
+            });
+            assert!(at < set_aside, "`{refusal}` must precede the archive");
+        }
+        assert!(
+            body.find("join_sparse_v2_shared_blocking(").unwrap() > set_aside,
+            "adoption joins only after the predecessor is archived"
+        );
+
+        let start = source
+            .find("fn set_aside_managed_history_for_adoption(")
+            .expect("adoption's first half exists");
+        let first_half = &source[start
+            ..source[start..]
+                .find("\n}\n")
+                .map(|offset| start + offset + 3)
+                .unwrap_or(source.len())];
+        assert!(first_half.contains("preserve_graph_provider_namespace"));
+        assert!(
+            !first_half.contains("archive_graph_provider_namespace"),
+            "adoption must never archive the other device's shared evidence"
+        );
+        assert!(first_half.contains("StorageTransitionKind::ReturnGracefully"));
+        assert!(first_half.contains("begin_recovery_guard("));
+
+        let contract = include_str!("../../docs/storage-sync-contract.md");
+        assert!(contract
+            .contains("### 2.3a Adoption: a device that already has a managed graph of its own"));
+        assert!(contract.contains("it does **not** archive `<graph>/.tine-sync/v2`"));
+        assert!(contract.contains("never a merge of two divergent histories"));
+        assert!(contract.contains("sparse-v2-recovery"));
     }
 
     #[test]

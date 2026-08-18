@@ -39,6 +39,7 @@ import type {
   PrintOpts,
   SparseV2Status,
   SparseV2CancelResult,
+  SparseV2AdoptionResult,
   SparseV2ActivationProgressEvent,
   SparseV2Tick,
   SparseV2RuntimeStatusEvent,
@@ -311,6 +312,10 @@ export interface Backend {
   cancelSparseV2Cold(path: string): Promise<SparseV2CancelResult>;
   prepareSparseV2Share(): Promise<SparseV2Status>;
   joinSparseV2Shared(): Promise<SparseV2Status>;
+  /** Adopt another device's shared graph, archiving this device's own managed history. */
+  adoptSparseV2Shared(): Promise<SparseV2AdoptionResult>;
+  /** Where a set-aside managed history is archived, knowable before adoption runs. */
+  sparseV2RecoveryLocation(): Promise<string>;
   sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
   sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
   sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
@@ -985,6 +990,14 @@ class TauriBackend implements Backend {
     const result = await this.call<SparseV2Status>("join_sparse_v2_shared");
     this.bindingGeneration = result.binding_generation;
     return result;
+  }
+  async adoptSparseV2Shared() {
+    const result = await this.call<SparseV2AdoptionResult>("adopt_sparse_v2_shared");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  sparseV2RecoveryLocation() {
+    return this.call<string>("sparse_v2_recovery_location");
   }
   sparseV2Query(request: SparseV2QueryRequest) {
     return this.call<SparseV2QueryReply>("sparse_v2_query", { request });

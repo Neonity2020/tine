@@ -453,6 +453,18 @@ export interface SparseV2CancelResult {
   recovery_statement: string;
 }
 
+/**
+ * The receipt for adopting a graph shared by another device on a device that
+ * held a managed graph of its own. `archive_location` is where that own
+ * history went; it is absent only when there was no retained history to keep.
+ */
+export interface SparseV2AdoptionResult {
+  status: SparseV2Status;
+  binding_generation: number;
+  archive_location: string | null;
+  adoption_statement: string;
+}
+
 export type StorageTransitionKind =
   | "lookup"
   | "open_direct"

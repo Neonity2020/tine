@@ -245,7 +245,7 @@ enum ColdSparseArchive {
     Refused(ManagedStorageRefusalScenario),
 }
 
-fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
+pub(crate) fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
     refuse_unclaimed_sparse_archive_with(root, |shared| match inspect_shared_provider_cold_prefix(
         shared,
     )? {
