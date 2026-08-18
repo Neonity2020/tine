@@ -86,6 +86,28 @@ describe("GH #161 Android SafeBack owner", () => {
     expect(subscribe).not.toHaveBeenCalled();
   });
 
+  it("reports the rung it chose, without letting the report change the choice", () => {
+    const seen: string[] = [];
+    const state = { transient: false, drawer: false };
+    const deps = {
+      dismissTransient: () => state.transient,
+      dismissDrawer: () => state.drawer,
+      restoreDrawerFocus: () => {},
+      historyBack: () => seen.push("historyBack"),
+      closeRoot: () => seen.push("closeRoot"),
+      dispatched: (disposition: string) => seen.push(`dispatched:${disposition}`),
+    };
+    expect(dispatchAndroidBack({ canGoBack: true }, deps)).toBe("history");
+    expect(dispatchAndroidBack({ canGoBack: false }, deps)).toBe("root");
+    // The report always follows the action it describes.
+    expect(seen).toEqual([
+      "historyBack",
+      "dispatched:history",
+      "closeRoot",
+      "dispatched:root",
+    ]);
+  });
+
   it("leaves the native SafeBack owner blocking when platform or subscription setup rejects", async () => {
     for (const failure of ["platform", "subscribe"] as const) {
       const deps = dispatchDeps();

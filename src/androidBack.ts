@@ -14,6 +14,9 @@ export interface AndroidBackDispatchDeps {
   restoreDrawerFocus(): void;
   historyBack(): void;
   closeRoot(): void;
+  /** Told which rung answered the gesture, for surfaces that must report a
+   * Back that produced nothing. Never influences the choice. */
+  dispatched?(disposition: AndroidBackDisposition, payload: AndroidBackPayload): void;
 }
 
 export type AndroidBackDisposition = "transient" | "drawer" | "history" | "root";
@@ -21,6 +24,15 @@ export type AndroidBackDisposition = "transient" | "drawer" | "history" | "root"
 /** Synchronous ordering matters: a hardware Back gesture selects exactly one
  * rung and never synthesizes a KeyboardEvent or a second router back action. */
 export function dispatchAndroidBack(
+  payload: AndroidBackPayload,
+  deps: AndroidBackDispatchDeps,
+): AndroidBackDisposition {
+  const chosen = selectAndroidBackRung(payload, deps);
+  deps.dispatched?.(chosen, payload);
+  return chosen;
+}
+
+function selectAndroidBackRung(
   payload: AndroidBackPayload,
   deps: AndroidBackDispatchDeps,
 ): AndroidBackDisposition {

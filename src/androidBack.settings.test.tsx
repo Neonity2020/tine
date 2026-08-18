@@ -125,6 +125,30 @@ describe("Android Back and the Settings modal", () => {
     expect(host.querySelector(".settings-modal")).toBeNull();
   });
 
+  // Martin, Aug 18, on the APK that first made Tine the topmost Back owner:
+  // "back for nav is broken - but it wasn't, some time today". Before that
+  // change Tauri's AppPlugin answered Back with webView.goBack(), so ordinary
+  // navigation worked and only modals were unreachable. Now every gesture is
+  // ours, and a plain page with nothing open must therefore reach the history
+  // rung — anything above it silently eating the gesture is the new defect.
+  it("reaches the history rung on a plain page with nothing open", async () => {
+    await mountApp();
+    const { activeDrawer, setLeftSidebarOpen } = await import("./ui");
+    // A fresh mount opens the left drawer, and closing it is a legitimate rung.
+    // The question here is what happens once nothing is open at all.
+    setLeftSidebarOpen(false);
+    await tick();
+    expect(activeDrawer()).toBeNull();
+
+    const trace: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const press = pressBack();
+      await tick();
+      trace.push(press.disposition);
+    }
+    expect(trace).toEqual(["history", "history", "history"]);
+  });
+
   it("closes the modal even while a mobile drawer is open underneath it", async () => {
     const { setLeftSidebarOpen, activeDrawer } = await import("./ui");
     const host = await mountApp();

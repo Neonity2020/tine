@@ -784,6 +784,10 @@ export function App(): JSX.Element {
     { defer: true },
   ));
 
+  // A same-document history move is synchronous plus one task; this is slack
+  // for the WebView's main-thread hop, not a retry budget.
+  const BACK_SETTLE_MS = 350;
+
   // SafeBackPlugin is the single Android native Back owner. A drawer/transient
   // is never represented by synthetic history; route history remains the JS
   // dispatch fallback once the native listener is explicitly ready.
@@ -800,6 +804,25 @@ export function App(): JSX.Element {
       restoreDrawerFocus: () => restoreDrawerFocus("back"),
       historyBack: () => window.history.back(),
       closeRoot: () => { void closeAndroidRootSafely(); },
+      // A Back that lands on the history rung and moves nothing is
+      // indistinguishable, on the phone, from a Back that was never delivered.
+      // Martin hit exactly that: no toast, no navigation, no modal close, and
+      // nothing to tell the two apart. Say so instead of swallowing it.
+      dispatched: (disposition, payload) => {
+        if (disposition !== "history") return;
+        // Observed by comparing the address, never by listening for popstate:
+        // this file must not grow a second back-navigation path beside the
+        // router's (androidBack.test.ts pins that).
+        const before = window.location.href;
+        const entries = window.history.length;
+        window.setTimeout(() => {
+          if (window.location.href !== before || window.history.length !== entries) return;
+          pushToast(
+            `Back had nowhere to go (canGoBack=${payload.canGoBack}, entries=${window.history.length}).`,
+            "error",
+          );
+        }, BACK_SETTLE_MS);
+      },
       // Listener absence/rejection remains owned by the native SafeBackPlugin,
       // which consumes Back rather than delegating to AppPlugin's unsafe
       // WebView/activity fallback.
