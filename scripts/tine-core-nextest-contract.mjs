@@ -123,6 +123,19 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // reads, and a tree that later loses `outbox/enrollment` discovers as
   // "nothing to join yet" rather than as a hostile tree.
   "sync_runtime::tests::preparing_a_share_publishes_a_complete_joinable_provider_tree",
+  // Managed storage is write-shy about the graph folder until the user asks to
+  // share it: a first local activation writes NOTHING under `.tine-sync/`. Two
+  // comments in the Tauri shell asserted the opposite, and the "Return to
+  // Direct files" escape hatch reasons from that assertion, so the real
+  // behaviour is pinned rather than described.
+  "sync_runtime::tests::local_activation_writes_nothing_into_the_graphs_sync_folder",
+  // The device that prepared a share owns the descriptor in its own outbox.
+  // When a file-sync tool removed it, the exact callback refused ("clean
+  // provider evidence disappeared at …") and, because that entry is only
+  // popped on success, produced the identical blocked tick on every retry
+  // while the second device kept reading "does not yet contain sync data".
+  // This drives a real prepared share through the loss and back.
+  "sync_runtime::tests::the_initiator_republishes_a_descriptor_something_else_removed",
   // Which of two physical files owns one decoded page name, pinned at the
   // application boundary: the FIRST exact path, in plain byte order, so an
   // ordinary backup copy under a directory sorting before `pages/` takes the
