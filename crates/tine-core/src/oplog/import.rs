@@ -8690,12 +8690,25 @@ fn preflight_desired_page_names(
         if owner.is_some_and(|owner| {
             owner != page_id && !transition.released_name_owners.contains(&owner)
         }) {
+            // Said in the user's words, because this is the text a device
+            // showed Martin once per tick: a page name and a UUID, neither of
+            // which appears anywhere in the app. Page names fold case and
+            // Unicode normalization here exactly as they do in Logseq
+            // (`canonical_page_name_key`), so "differ by more than
+            // capitalisation" is the action that actually resolves it — and it
+            // is the same sentence on a filesystem that folds those names into
+            // one file (`docs/storage-sync-contract.md` §2.10d). The owning
+            // page id stays at the end for diagnosis.
             return Err(authority_block(
                 ImportBlockReason::ConflictingLocalTail,
                 Some(&path),
                 format!(
-                    "decoded destination logical page name {} is already owned by page {}",
+                    "another file in this graph is already the page \u{201c}{}\u{201d}, so \
+                     {} cannot take that name too — give one of them a name that differs by \
+                     more than capitalisation or accent spelling (decoded destination logical \
+                     page name is already owned by page {})",
                     name.as_str(),
+                    path.as_str(),
                     owner.expect("checked above")
                 ),
             ));
