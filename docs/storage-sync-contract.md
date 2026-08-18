@@ -123,6 +123,29 @@ them. Tauri must reopen the durable result, prove ordinary page inventory/load,
 and atomically replace the exact predecessor graph slot before reporting share
 or join success; querying or continuing to serve the retired actor is invalid.
 
+That retirement is recorded on the handle by the cut itself, not left for the
+caller to infer. `SyncRuntimeHandle::prepare_shared` on success, and
+`join_shared` on completion, close the private sender and join the actor thread
+before returning, so the handle's final published snapshot becomes its
+authority. The two observational calls that survive a retired actor therefore
+keep working: `status()` reports the actor's own last snapshot, and
+`clean_shutdown()` reports `Safe` for a runtime that already reached
+`StoppedSafe` — which the cut guarantees, because it commits the Safe
+transaction before publishing anything. Every other request on a retired handle
+is `ActorUnavailable`, which is the truth. A pre-Safe refusal from either cut
+retires nothing: the actor stays reachable for an explicit retry or a
+crash-style drop.
+
+This is an availability rule, not a durability concession. `clean_shutdown`
+still reports `Safe` only from a `StoppedSafe` lifecycle; it never converts an
+unreachable actor, a terminal latch, or outstanding work into `Safe`. Reporting
+a bare `ActorUnavailable` for a state the runtime durably reached serves no
+in-scope threat, and off-host it costs a full CI round trip to localise
+(Android CI run 32098261560: `clean shutdown failed: Err(ActorUnavailable)`
+immediately after a successful share preparation). The Android instrumentation
+receipt accordingly prints the runtime `status=` beside every save or shutdown
+refusal, so an unreachable snapshot is distinguishable from a reported one.
+
 ## 1. On-disk layout
 
 ### 1.1 Shared graph-local provider

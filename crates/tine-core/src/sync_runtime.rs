@@ -4272,9 +4272,13 @@ impl SyncRuntimeHandle {
         self.send(ActorRequest::PrepareShared {
             reply: reply_sender,
         })?;
-        reply_receiver
+        let prepared = reply_receiver
             .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
+        if prepared.is_ok() {
+            self.observe_retired_actor()?;
+        }
+        prepared
     }
 
     pub fn join_shared(
@@ -4309,9 +4313,35 @@ impl SyncRuntimeHandle {
                     );
                     std::thread::yield_now();
                 }
-                SharedJoinStep::Complete(descriptor) => return Ok(descriptor),
+                SharedJoinStep::Complete(descriptor) => {
+                    self.observe_retired_actor()?;
+                    return Ok(descriptor);
+                }
             }
         }
+    }
+
+    /// A successful enrollment cut retires its actor by design: the actor
+    /// commits the Safe transaction, publishes the cut, and then stops so that
+    /// one handle can never serve two enrollment epochs.  The handle must
+    /// record that, because it — not the actor — owns the sender.  Left
+    /// advertising a live sender, every later request reaches a dropped
+    /// receiver and collapses into a payload-free `ActorUnavailable`, including
+    /// the observational `status()` and the `clean_shutdown()` that should just
+    /// report the Safe state the runtime already reached (Android CI run
+    /// 32098261560: `clean shutdown failed: Err(ActorUnavailable)`).
+    ///
+    /// Joining is what makes the recorded status authoritative: the actor loop
+    /// publishes its final snapshot after replying and before stopping.
+    /// Only a SUCCESSFUL cut may call this; a pre-Safe refusal deliberately
+    /// leaves the actor available for an explicit retry or a crash-style drop.
+    fn observe_retired_actor(&self) -> Result<(), SyncRuntimeRequestError> {
+        self.inner.sender.lock().unwrap().take();
+        if let Some(join) = self.inner.join.lock().unwrap().take() {
+            join.join()
+                .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
+        }
+        Ok(())
     }
 
     fn enrollment_operation(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -45836,10 +45866,13 @@ mod tests {
     /// post-activation save.  This host test pins the same sequence so the
     /// Linux/host boundary stays green and any future host-visible regression
     /// in it is caught here rather than only on an emulator.
-    #[test]
-    fn android_instrumentation_save_journey_shape_succeeds_on_a_host_graph() {
-        let root =
-            std::env::temp_dir().join(format!("tine-android-journey-shape-{}", Uuid::new_v4()));
+    /// The exact request pair `src-tauri/src/android_managed_storage_smoke.rs`
+    /// builds, on a host graph.  Every journey-shape test drives it, so the
+    /// host and Android call sequences can only diverge deliberately.
+    fn android_instrumentation_journey_fixture(
+        name: &str,
+    ) -> (PathBuf, SyncRuntimeOpenRequest, SyncLocalActivationRequest) {
+        let root = std::env::temp_dir().join(format!("tine-android-{name}-{}", Uuid::new_v4()));
         let graph_root = root.join("graph");
         let private_root = root.join("private");
         fs::create_dir_all(graph_root.join("pages")).unwrap();
@@ -45888,6 +45921,13 @@ mod tests {
             provider_journal_root: open_request.provider_journal_root.clone(),
             identities,
         };
+        (graph_root, open_request, activation_request)
+    }
+
+    #[test]
+    fn android_instrumentation_save_journey_shape_succeeds_on_a_host_graph() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture("journey-shape");
 
         let mut progress_log = Vec::new();
         let activation = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
@@ -45949,6 +45989,145 @@ mod tests {
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// One journey step further than its sibling: the Android instrumentation
+    /// prepares a share and then asks the SAME handle for a clean shutdown
+    /// (CI run 32098261560 — `clean shutdown failed: Err(ActorUnavailable)`,
+    /// with no panic anywhere in the job log).
+    ///
+    /// A successful `prepare_shared` retires its actor by design — the actor
+    /// commits a Safe transaction, publishes the enrollment cut, and then stops
+    /// so one handle can never serve two enrollment epochs.  The handle,
+    /// however, kept advertising a live sender, so every later request —
+    /// including the observational `status()` and the `clean_shutdown()` that
+    /// should simply report the already-committed Safe state — collapsed into a
+    /// payload-free `ActorUnavailable`.  That is an availability bug: no
+    /// in-scope threat is served by refusing to name a state the runtime has
+    /// already reached durably.
+    #[test]
+    fn android_instrumentation_share_journey_shape_shuts_down_cleanly_on_a_host_graph() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture("share-journey-shape");
+
+        let mut progress_log = Vec::new();
+        let activation = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
+            activation_request,
+            |progress| progress_log.push(progress.diagnostic_name().to_string()),
+        );
+        assert_eq!(
+            activation.status,
+            SyncLocalActivationStatus::Active,
+            "progress={progress_log:?}"
+        );
+        let handle = activation.handle.expect("activation opens the actor");
+        let (mut page, revision) =
+            match handle.load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "pages/Smoke.md".into(),
+                },
+            }) {
+                Ok(SyncApplicationPageLoadOutcome::Loaded { page, revision }) => (page, revision),
+                other => panic!("post-activation page load failed: {other:?}"),
+            };
+        page.blocks
+            .first_mut()
+            .expect("post-activation page has an editable block")
+            .raw = "Android managed storage edited".into();
+        let saved = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        });
+        assert!(
+            matches!(saved, Ok(SyncApplicationPageSaveOutcome::Saved { .. })),
+            "post-activation page save failed: {saved:?}"
+        );
+
+        drop(handle);
+        let reopened = SyncRuntimeHandle::open(open_request.clone());
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened.handle.expect("crash-style reopen opens the actor");
+        match handle.load_application_page(SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath {
+                path: "pages/Smoke.md".into(),
+            },
+        }) {
+            Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. }) => assert_eq!(
+                page.blocks.first().map(|block| block.raw.as_str()),
+                Some("Android managed storage edited")
+            ),
+            other => panic!("crash-style reopened page mismatch: {other:?}"),
+        }
+        let prepared = handle.prepare_shared();
+        assert!(prepared.is_ok(), "share preparation failed: {prepared:?}");
+
+        // The enrollment cut retired the actor.  Observation must survive it:
+        // the handle answers from the actor's final published snapshot rather
+        // than reporting that the runtime cannot be reached at all.
+        let status = handle
+            .status()
+            .expect("a retired actor still answers its own final status");
+        assert_eq!(status.lifecycle, SyncRuntimeLifecycle::StoppedSafe);
+        assert_eq!(status.shared_role, Some(SyncSharedRole::Initiator));
+        let shutdown = handle.clean_shutdown();
+        assert!(
+            matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "clean shutdown after share preparation failed: {shutdown:?}"
+        );
+        drop(handle);
+
+        let reopened = SyncRuntimeHandle::open(open_request);
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened
+            .handle
+            .expect("the shared-enrolled runtime reopens after its cut");
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/Smoke.md")).unwrap(),
+            "- Android managed storage edited\n"
+        );
+        let shutdown = handle.clean_shutdown();
+        assert!(
+            matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "reopened clean shutdown failed: {shutdown:?}"
+        );
+    }
+
+    /// The other half of the retirement rule.  Only a SUCCESSFUL enrollment cut
+    /// retires the actor; a pre-Safe refusal must leave it reachable for an
+    /// explicit retry or a crash-style drop, exactly as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_share_preparation_leaves_the_actor_available() {
+        let fixture = ActivationFixture::nested_unicode("share-refusal-keeps-actor", 0xa179_0000);
+        let handle = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone())
+            .handle
+            .expect("share-refusal initiator LocalActive");
+        drive_initial_feed(&handle);
+        let refused = {
+            let _injected =
+                crate::oplog::wire::InjectedSharedProviderFlaggedRenameFailure::enter(libc::EIO);
+            handle.prepare_shared()
+        };
+        assert!(
+            matches!(refused, Err(SyncRuntimeRequestError::ActorRefused(_))),
+            "unexpected share-preparation outcome: {refused:?}"
+        );
+        // An actor round trip, not a cached snapshot: it proves the thread is
+        // still running and its request channel is still open.
+        assert!(
+            handle.last_retained_publication().is_ok(),
+            "a refused share preparation must leave the actor reachable"
+        );
+        handle
+            .prepare_shared()
+            .expect("the retained actor completes the cut on an explicit retry");
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
         ));
     }
 

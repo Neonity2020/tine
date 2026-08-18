@@ -75,6 +75,15 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // journey drives. It fails on Android shared storage and passes here, so the
   // host boundary must stay green for that difference to stay attributable.
   "sync_runtime::tests::android_instrumentation_save_journey_shape_succeeds_on_a_host_graph",
+  // One journey step further (CI run 32098261560: activation, load, save,
+  // crash reopen and share preparation all landed, then `clean shutdown
+  // failed: Err(ActorUnavailable)`). A successful enrollment cut retires its
+  // actor by design; the handle must record that retirement so `status()` and
+  // `clean_shutdown()` still report the Safe state the runtime reached instead
+  // of a payload-free unavailability. The sibling holds the other half: a
+  // pre-Safe refusal must leave the actor reachable for an explicit retry.
+  "sync_runtime::tests::android_instrumentation_share_journey_shape_shuts_down_cleanly_on_a_host_graph",
+  "sync_runtime::tests::a_refused_share_preparation_leaves_the_actor_available",
   "sync_runtime::tests::public_clean_runtime_reconciles_an_exact_external_edit_and_reopens_it",
   "sync_runtime::tests::public_clean_cold_open_discovers_an_external_edit_while_tine_was_closed",
   "sync_runtime::tests::public_clean_runtime_reconciles_external_create_delete_and_rename_as_one_batch",

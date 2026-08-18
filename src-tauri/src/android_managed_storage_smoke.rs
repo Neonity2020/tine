@@ -134,8 +134,8 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
                 Ok(_) => "not a refusal".to_owned(),
             };
             return format!(
-                "post-activation page save failed: {outcome:?}; {detail}; {retained}; status={:?}; progress={}",
-                handle.status(),
+                "post-activation page save failed: {outcome:?}; {detail}; {retained}; status={}; progress={}",
+                describe_status(&handle),
                 progress_receipt.join("|")
             );
         }
@@ -164,29 +164,67 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
                 == Some("Android managed storage edited") => {}
         outcome => return format!("crash-style reopened page mismatch: {outcome:?}"),
     }
-    if let Err(error) = handle.prepare_shared() {
-        return format!("prepare shared failed: {error}");
-    }
+    let shared = match handle.prepare_shared() {
+        Ok(descriptor) => format!("shared_descriptor={}", descriptor.descriptor_digest),
+        Err(error) => return format!("prepare shared failed: {error}"),
+    };
+    // A successful enrollment cut retires the actor, so this shutdown reads
+    // the runtime's own final state rather than reaching a live thread.
+    // `ActorUnavailable` carries no payload at all, so never report a shutdown
+    // refusal bare: `status=` distinguishes "the runtime stopped Safe and this
+    // is merely a report of it" from "the snapshot itself is unreachable, so
+    // the actor died some way the retirement contract does not describe".
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => {}
-        outcome => return format!("clean shutdown failed: {outcome:?}"),
+        outcome => {
+            return format!(
+                "clean shutdown failed: {outcome:?}; {shared}; status={}; {retained}; progress={}",
+                describe_status(&handle),
+                progress_receipt.join("|")
+            )
+        }
     }
     drop(handle);
 
     let reopened = SyncRuntimeHandle::open(open_request);
     if reopened.status != SyncRuntimeOpenStatus::Active {
-        return format!("reopen failed: {:?}", reopened.status);
+        return format!(
+            "reopen after sharing failed: {:?}; {shared}",
+            reopened.status
+        );
     }
     let Some(handle) = reopened.handle else {
         return "reopen returned Active without a handle".into();
     };
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => format!(
-            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} total_ms={} {retained} progress={}",
+            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} total_ms={} {retained} {shared} progress={}",
             journey_started.elapsed().as_millis(),
             progress_receipt.join("|")
         ),
-        outcome => format!("reopened clean shutdown failed: {outcome:?}"),
+        outcome => format!(
+            "reopened clean shutdown failed: {outcome:?}; {shared}; status={}",
+            describe_status(&handle)
+        ),
+    }
+}
+
+/// The instrumentation boundary can report only returned values, and a
+/// `SyncRuntimeRequestError` carries no state. Name the runtime's own view of
+/// itself next to every refusal so one CI round trip localises it.
+fn describe_status(handle: &SyncRuntimeHandle) -> String {
+    match handle.status() {
+        Ok(status) => format!(
+            "lifecycle:{:?} recovery:{:?} shared_role:{:?} shared_phase:{:?} provider_pending:{} managed_local_pending:{} detail:{}",
+            status.lifecycle,
+            status.recovery,
+            status.shared_role,
+            status.shared_phase,
+            status.provider_pending,
+            status.managed_local_pending,
+            status.detail.as_deref().unwrap_or("none")
+        ),
+        Err(error) => format!("unavailable:{error}"),
     }
 }
 
