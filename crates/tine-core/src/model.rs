@@ -17394,27 +17394,38 @@ impl Graph {
         // On mismatch → conflict; PdfViewer.persist toasts + reverts and a retry merges
         // cleanly (the .edn was already 3-way-merged, so no highlight is lost).
         let page_md = serialize_pdf_hls_page(&page_path, &page_doc, existing_raw.as_deref())?;
-        let page_rev = match self.commit_editor_write(
-            &write,
-            &page_path,
-            &page_md,
-            page_baseline.as_deref(),
-            true,
-            None,
-            None,
-            None,
-        ) {
-            Ok(rev) => rev,
-            Err(page_error) => {
-                if let Err(rollback_error) = self.rollback_highlight_sidecar_commit(&sidecar) {
-                    return Err(io::Error::new(
+        // No-op save (write_page's guard, which this path lacked): a re-save of
+        // an unchanged highlight set produces the page's exact current bytes.
+        // Committing them anyway rewrote the file, stamped a watcher
+        // suppression marker and woke every sync tool watching the tree for
+        // nothing — Concord invariant 4. Skip the write; hash the bytes already
+        // on disk for the rev the cache records.
+        let page_changed = page_baseline.as_deref() != Some(page_md.as_str());
+        let page_rev = if !page_changed {
+            content_rev(&page_md)
+        } else {
+            match self.commit_editor_write(
+                &write,
+                &page_path,
+                &page_md,
+                page_baseline.as_deref(),
+                true,
+                None,
+                None,
+                None,
+            ) {
+                Ok(rev) => rev,
+                Err(page_error) => {
+                    if let Err(rollback_error) = self.rollback_highlight_sidecar_commit(&sidecar) {
+                        return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!(
                             "highlight notes page was not saved ({page_error}); the sidecar rollback also failed ({rollback_error})"
                         ),
                     ));
+                    }
+                    return Err(page_error);
                 }
-                return Err(page_error);
             }
         };
         // The hls page is a real page; reflect it in the search cache.
@@ -17430,8 +17441,10 @@ impl Graph {
             });
         self.cache_upsert(entry, page_doc, page_rev.clone());
         // Drop the self-write marker now the write is published + cached (see
-        // write_page / drop_self_write_marker).
-        self.drop_self_write_marker(&page_path, &page_rev);
+        // write_page / drop_self_write_marker). A no-op save took no marker.
+        if page_changed {
+            self.drop_self_write_marker(&page_path, &page_rev);
+        }
         self.finish_highlight_sidecar_commit(&sidecar)?;
         // Migrate-on-write cleanup is compare-and-recover: only retire a legacy
         // artifact if it still equals the exact bytes we merged. A concurrent
@@ -22061,8 +22074,22 @@ fn serialize_pdf_hls_page(
     document: &Document,
     existing: Option<&str>,
 ) -> io::Result<String> {
+    // Concord invariant 4 (write-shyness): an `hls__` page is an ordinary Logseq
+    // page the user and OG also write. This used to serialize with DEFAULT opts
+    // — one trailing newline, tab indent, one blank line after the preamble —
+    // so a highlight save re-indented and re-terminated the whole file even
+    // where nothing changed. Reproduce the file's own formatting exactly as the
+    // editor save path (`serialize_page_document`) does, including the
+    // layout-identity retention that keeps untouched blocks byte-stable.
+    let identities = doc::layout_identities_of(document);
     match Format::from_path(path) {
-        Format::Md => Ok(preserve_crlf(doc::serialize(document), existing)),
+        Format::Md => {
+            let opts = doc::SerializeOpts::detect_with_layout_identities(existing, &identities);
+            Ok(preserve_crlf(
+                doc::serialize_with(document, &opts),
+                existing,
+            ))
+        }
         Format::Org => {
             if existing.is_some_and(|raw| !crate::org::org_editable(raw)) {
                 return Err(io::Error::new(
@@ -22070,7 +22097,11 @@ fn serialize_pdf_hls_page(
                     "org highlight page is read-only (does not round-trip)",
                 ));
             }
-            Ok(crate::org::serialize_org_detect(document, existing))
+            Ok(crate::org::serialize_org_detect_with_layout_identities(
+                document,
+                existing,
+                &identities,
+            ))
         }
     }
 }
@@ -39696,6 +39727,86 @@ mod tests {
             .unwrap();
         assert!(org_path.exists());
         assert!(!dir.join("pages").join("hls__paper.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Concord invariant 4 (write-shyness). An `hls__` page is an ordinary
+    /// Logseq page: the user (or OG) may have written it with two-space
+    /// indentation and no trailing newline, and it may carry hand-written note
+    /// children. Re-saving the SAME highlight set is not a semantic change, so
+    /// it must not touch a single byte — every spurious rewrite is a diff in a
+    /// graph kept in git, and a wake for every sync tool watching the tree.
+    #[test]
+    fn write_highlights_leaves_an_unchanged_hls_page_byte_identical() {
+        let dir = scratch("highlights-write-shy");
+        let g = Graph::open(&dir);
+        let key = crate::pdf::asset_key("paper.pdf");
+        let page_path = dir.join("pages").join(format!("hls__{key}.md"));
+        let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
+        g.write_highlights("paper.pdf", "Paper", &[h.clone()], &[])
+            .unwrap();
+        // Rewrite the generated page in the OTHER house style the ecosystem
+        // uses: two-space indent, no trailing newline, plus a user note child.
+        let generated = fs::read_to_string(&page_path).unwrap();
+        let restyled = format!("{}\n  - my own note\n", generated.trim_end()).replace('\t', "  ");
+        let restyled = restyled.trim_end().to_string();
+        fs::write(&page_path, &restyled).unwrap();
+
+        let reopened = Graph::open(&dir);
+        reopened
+            .write_highlights("paper.pdf", "Paper", &[h], &[])
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&page_path).unwrap(),
+            restyled,
+            "re-saving the same highlights must not rewrite the page"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same invariant when there IS a semantic change: adding a highlight
+    /// appends one block and leaves the rest of the file's formatting alone.
+    #[test]
+    fn write_highlights_keeps_the_hls_pages_formatting_when_it_does_change() {
+        let dir = scratch("highlights-write-shy-changed");
+        let g = Graph::open(&dir);
+        let key = crate::pdf::asset_key("paper.pdf");
+        let page_path = dir.join("pages").join(format!("hls__{key}.md"));
+        let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
+        g.write_highlights("paper.pdf", "Paper", &[h.clone()], &[])
+            .unwrap();
+        let restyled = fs::read_to_string(&page_path)
+            .unwrap()
+            .replace('\t', "  ")
+            .trim_end()
+            .to_string()
+            + "\n  - my own note";
+        fs::write(&page_path, &restyled).unwrap();
+
+        let reopened = Graph::open(&dir);
+        let h2 = mkhl("22222222-2222-2222-2222-222222222222", 4, Some("more"));
+        reopened
+            .write_highlights("paper.pdf", "Paper", &[h, h2], &[])
+            .unwrap();
+
+        let after = fs::read_to_string(&page_path).unwrap();
+        assert!(
+            after.contains("more"),
+            "the new highlight landed: {after:?}"
+        );
+        assert!(
+            after.contains("  - my own note"),
+            "the user's note keeps its two-space indent: {after:?}"
+        );
+        assert!(
+            !after.contains('\t'),
+            "no line was re-indented with tabs: {after:?}"
+        );
+        assert!(
+            !after.ends_with('\n'),
+            "the file's missing trailing newline is preserved: {after:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
