@@ -737,10 +737,15 @@ export function App(): JSX.Element {
       unlisten();
     });
   });
+  // One calm report per condition, not one per retry. The bridge advances the
+  // notice sequence only for a message the user has not already been shown, and
+  // clears it when the actor genuinely recovers, so a permanently blocked
+  // reconciliation says its piece once and leaves Storage & sync to carry the
+  // live status (GH: Android, 2026-08-18).
   createEffect(on(
-    () => managedStorageRuntime.snapshot().error,
-    (reason) => {
-      if (reason) pushToast(managedStorageRuntimeErrorMessage(reason), "error");
+    () => managedStorageRuntime.snapshot().notice,
+    (notice) => {
+      if (notice) pushToast(managedStorageRuntimeErrorMessage(notice.message), "error");
     },
     { defer: true },
   ));

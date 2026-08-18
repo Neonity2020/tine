@@ -75,6 +75,13 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // journey drives. It fails on Android shared storage and passes here, so the
   // host boundary must stay green for that difference to stay attributable.
   "sync_runtime::tests::android_instrumentation_save_journey_shape_succeeds_on_a_host_graph",
+  // The WHOLE instrumentation journey at the host boundary, driving the same
+  // shared fixture and call sequence the device does — including the clean
+  // external reconciliation leg the journey used to skip. It exists because the
+  // device journey was green on CI in the round a physical Android flooded the
+  // app with `clean external reconciliation failed during Planning: decoded
+  // destination logical page name … is already owned by page <uuid>`.
+  "sync_runtime::tests::android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph",
   // One journey step further (CI run 32098261560: activation, load, save,
   // crash reopen and share preparation all landed, then `clean shutdown
   // failed: Err(ActorUnavailable)`). A successful enrollment cut retires its

@@ -45875,15 +45875,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tine-android-{name}-{}", Uuid::new_v4()));
         let graph_root = root.join("graph");
         let private_root = root.join("private");
-        fs::create_dir_all(graph_root.join("pages")).unwrap();
-        fs::create_dir_all(graph_root.join("journals")).unwrap();
-        fs::create_dir_all(graph_root.join("logseq")).unwrap();
-        fs::write(
-            graph_root.join("pages/Smoke.md"),
-            b"- Android managed storage smoke\n",
-        )
-        .unwrap();
-        fs::write(graph_root.join("logseq/config.edn"), b"{}\n").unwrap();
+        // The instrumentation and this host test share ONE fixture, so the two
+        // boundaries cannot drift apart the way they had (the device hit a
+        // reconciliation refusal on real-graph name shapes while the journey
+        // was green on a single ASCII page).
+        crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
 
         let identities = SyncLocalActivationIdentities {
             workspace_id: WorkspaceId::new(),
@@ -45922,6 +45918,62 @@ mod tests {
             identities,
         };
         (graph_root, open_request, activation_request)
+    }
+
+    /// The complete Android instrumentation journey, run at the HOST boundary.
+    ///
+    /// This is the same code `ManagedStorageSmokeTest` invokes over JNI — same
+    /// fixture, same call sequence — so a defect that would fail on the device
+    /// fails here first, without an emulator. What it therefore does NOT prove:
+    /// the Android UID, Android shared storage, SAF, or anything above the
+    /// native runtime (no WebView, no Tauri commands, no watcher thread, no
+    /// UI). It is also one fixture of a few dozen pages: a name-shape gate, not
+    /// a corpus-scale gate.
+    ///
+    /// It exists because the device-side journey was GREEN on CI in the same
+    /// round Martin's physical Android flooded the app with
+    /// `clean external reconciliation failed during Planning: decoded
+    /// destination logical page name … is already owned by page <uuid>`. The
+    /// journey never drove an external change through reconciliation planning,
+    /// and its fixture was one ASCII page — so the failing leg and the failing
+    /// shapes were both outside it (GH: Android, 2026-08-18).
+    #[test]
+    fn android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture("full-journey");
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        assert!(
+            receipt.starts_with("ok "),
+            "the managed-storage journey must survive real-graph page-name shapes and an \
+             external reconciliation: {receipt}"
+        );
+        // Every physical file the journey deliberately does not import is still
+        // exactly where the user left it.
+        for (path, bytes) in [
+            (
+                "pages/Z\u{30c} pilot notes #pilot.md",
+                "- decomposed pilot notes\n",
+            ),
+            (
+                "pages/\u{17d} pilot notes %23pilot.md",
+                "- encoded pilot notes\n",
+            ),
+            (
+                "pages/k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md",
+                "- lowercase horse\n",
+            ),
+            ("archiv/2026/Denn\u{ed} pozn\u{e1}mky.md", "- backup copy\n"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(graph_root.join(path)).unwrap(),
+                bytes,
+                "{path} was rewritten or removed"
+            );
+        }
     }
 
     #[test]

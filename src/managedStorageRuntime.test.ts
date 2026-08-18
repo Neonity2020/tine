@@ -122,6 +122,58 @@ describe("managed-storage runtime event bridge", () => {
     for (const dispose of unlisten) expect(dispose).toHaveBeenCalledOnce();
   });
 
+  it("reports one repeating reconciliation failure once, and again only after real recovery", () => {
+    // The device receipt: managed storage enabled, then an unbounded stream of
+    // IDENTICAL red toasts for ONE condition. The native watcher suppresses a
+    // repeated error only until some other tick intervenes, and the retry cycle
+    // supplies one every time — so the surface, not the actor, is what has to
+    // stay calm (GH: Android, 2026-08-18).
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn(),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+    bridge.bind(3);
+    const message = 'Failed("clean external reconciliation failed during Planning: decoded '
+      + 'destination logical page name X is already owned by page 00000000-0000-0000-0000-000000000001")';
+    const notices: number[] = [];
+    const observe = () => {
+      const notice = bridge.snapshot().notice;
+      if (notice && notices.at(-1) !== notice.sequence) notices.push(notice.sequence);
+    };
+
+    // Six identical retry cycles: error, in-flight recovery step, failure tick.
+    for (let cycle = 0; cycle < 6; cycle += 1) {
+      bridge.receiveError({ binding_generation: 3, message });
+      observe();
+      bridge.receiveTick({ binding_generation: 3, tick: { state: "recovering", detail: null, epoch: null } });
+      // An in-flight retry step is not recovery. Treating it as one is what
+      // re-armed both the native repeat-suppression and this store, so the very
+      // next identical error read as news.
+      expect(bridge.snapshot().error).toBe(message);
+      observe();
+      bridge.receiveTick({ binding_generation: 3, tick: { state: "failed", detail: message, epoch: null } });
+      observe();
+    }
+    expect(notices).toEqual([1]);
+    expect(bridge.snapshot().error).toBe(message);
+
+    // A genuinely healthy tick is the recovery signal; the panel and the toast
+    // both clear, so a later recurrence is news again.
+    bridge.receiveTick({ binding_generation: 3, tick: { state: "admitted_noop", detail: null, epoch: 9 } });
+    expect(bridge.snapshot().error).toBeNull();
+    expect(bridge.snapshot().notice).toBeNull();
+    bridge.receiveError({ binding_generation: 3, message });
+    observe();
+    expect(notices).toEqual([1, 2]);
+
+    // A DIFFERENT condition is always its own report.
+    bridge.receiveError({ binding_generation: 3, message: 'Blocked("something else")' });
+    observe();
+    expect(notices).toEqual([1, 2, 3]);
+  });
+
   it("drops events and late status reads from a graph binding that has been replaced", async () => {
     let resolveStatus: ((status: SparseV2Status) => void) | undefined;
     const bridge = createManagedStorageRuntimeBridge({

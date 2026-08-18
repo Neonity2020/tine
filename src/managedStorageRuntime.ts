@@ -27,6 +27,16 @@ export interface ManagedStorageRuntimeSnapshot {
   runtime: SparseV2RuntimeStatus | null;
   tick: SparseV2Tick | null;
   error: string | null;
+  /**
+   * The one report the user still owes an acknowledgement for. A persistently
+   * failing actor emits the SAME error again after every retry, and each retry
+   * passes through an in-flight `recovering` tick, so keying user-facing
+   * feedback off `error` alone produced an unbounded stream of identical red
+   * toasts for one condition (GH: Android, 2026-08-18). The sequence only ever
+   * advances for a message the user has not been shown yet, so a repeat of a
+   * condition that is still live is silent while the panel keeps showing it.
+   */
+  notice: { message: string; sequence: number } | null;
 }
 
 const initialSnapshot = (): ManagedStorageRuntimeSnapshot => ({
@@ -36,10 +46,18 @@ const initialSnapshot = (): ManagedStorageRuntimeSnapshot => ({
   runtime: null,
   tick: null,
   error: null,
+  notice: null,
 });
 
-function isFailureTick(tick: SparseV2Tick): boolean {
-  return ["recovery_blocked", "blocked", "terminal", "failed"].includes(tick.state);
+/**
+ * Did the actor actually get somewhere? `recovering` and `retry_full` are the
+ * in-flight steps of the very retry that is about to fail again, so they are
+ * neither the failure nor its resolution: treating them as recovery is what let
+ * one permanently blocked condition re-arm the toast on every cycle.
+ */
+function isRecoveredTick(tick: SparseV2Tick): boolean {
+  return ["idle", "admitted_noop", "admitted_complete", "local_mutation", "provider_mutation"]
+    .includes(tick.state);
 }
 
 function admissionsAgree(left: ApplicationPageAdmission, right: ApplicationPageAdmission): boolean {
@@ -58,6 +76,14 @@ function admissionsAgree(left: ApplicationPageAdmission, right: ApplicationPageA
 export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = backend()) {
   const [snapshot, setSnapshot] = createSignal<ManagedStorageRuntimeSnapshot>(initialSnapshot());
   let registration: Promise<() => void> | null = null;
+  // Monotonic across the whole window: a report the user has already been shown
+  // must never be re-raised, and a genuine recurrence after recovery must never
+  // reuse a sequence the effect has already seen.
+  let noticeSequence = 0;
+  let noticedMessage: string | null = null;
+  const clearNotice = () => {
+    noticedMessage = null;
+  };
 
   const accepts = (bindingGeneration: number) => snapshot().bindingGeneration === bindingGeneration;
 
@@ -73,11 +99,15 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
       setSnapshot((current) => ({ ...current, applicationPageAdmission }));
       return true;
     }
+    clearNotice();
     setSnapshot({ ...initialSnapshot(), bindingGeneration, applicationPageAdmission });
     return true;
   };
 
-  const clear = () => setSnapshot(initialSnapshot());
+  const clear = () => {
+    clearNotice();
+    setSnapshot(initialSnapshot());
+  };
 
   const receiveStatus = (status: SparseV2Status): boolean => {
     if (!accepts(status.binding_generation)) return false;
@@ -94,6 +124,7 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
 
   const acceptNativeTransition = (status: SparseV2Status): boolean => {
     if (status.application_page_admission.binding_generation !== status.binding_generation) return false;
+    clearNotice();
     setSnapshot({
       bindingGeneration: status.binding_generation,
       applicationPageAdmission: status.application_page_admission,
@@ -101,6 +132,7 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
       runtime: status.runtime,
       tick: status.runtime?.last_tick ?? null,
       error: null,
+      notice: null,
     });
     return true;
   };
@@ -148,14 +180,18 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
       const runtime = current.runtime
         ? { ...current.runtime, last_tick: event.tick }
         : current.runtime;
+      // The native watcher emits an error before its failure tick; a later
+      // HEALTHY tick is the matching recovery signal. An in-flight retry step
+      // is not one, so it neither clears the condition nor re-arms its report.
+      const recovered = isRecoveredTick(event.tick);
+      if (recovered) clearNotice();
       return {
         ...current,
         runtime,
         status: current.status && runtime ? { ...current.status, runtime } : current.status,
         tick: event.tick,
-        // The native watcher emits an error before its failure tick; a later
-        // healthy tick is the matching recovery signal.
-        error: isFailureTick(event.tick) ? current.error : null,
+        error: recovered ? null : current.error,
+        notice: recovered ? null : current.notice,
       };
     });
     return true;
@@ -163,6 +199,11 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
 
   const receiveError = (event: SparseV2ErrorEvent): boolean => {
     if (!accepts(event.binding_generation)) return false;
+    if (noticedMessage !== event.message) {
+      noticedMessage = event.message;
+      noticeSequence += 1;
+    }
+    const notice = { message: event.message, sequence: noticeSequence };
     setSnapshot((current) => {
       // A `managed_writable` admission is evidence that a live actor will save
       // what we accept. A failing tick withdraws that evidence, so writability
@@ -175,10 +216,13 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
         admission?.authority === "managed_writable"
           ? { binding_generation: admission.binding_generation, authority: "managed_unavailable" }
           : admission;
-      if (current.error === event.message && revoked === admission) return current;
+      if (current.error === event.message && notice === current.notice && revoked === admission) {
+        return current;
+      }
       return {
         ...current,
         error: event.message,
+        notice,
         applicationPageAdmission: revoked,
         status: current.status && revoked
           ? { ...current.status, application_page_admission: revoked }

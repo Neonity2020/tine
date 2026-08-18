@@ -539,6 +539,23 @@ path-only edit of an existing physical same-name page does not reacquire its
 logical name; only a creation or exact-title change enters name-acquisition
 preflight.
 
+One canonical page name has one owner, and a graph may legitimately hold more
+than one physical file for it. Activation already resolves that: it selects one
+authoritative source per canonical page name and per portable path in exact-path
+order and retains every other file untouched, with no page of its own
+(`bootstrap_authoritative_source_paths`). External reconciliation makes the SAME
+selection. A source that carries no accepted page identity and whose decoded name
+is already owned — by an established page, or by an earlier exact path in the
+same transaction — acquires no identity: no page is created for it, no operation
+touches it, and its exact bytes are still observed by the transaction. A clean
+requested set likewise selects the first exact path per portable identity rather
+than refusing the set. Refusing instead turned an ordinary duplicate into a
+permanent graph-wide denial: planning failed for every affected path, on every
+tick, with no user action that could clear it. An accepted page is never
+withdrawn this way — it keeps the identity it already has, and a real title
+change into a name another page owns remains the visible ambiguity preflight
+refuses.
+
 An exact watcher callback queues only the named managed paths. An imprecise
 callback, and every cold open of a clean marker, queues one full comparison of
 current Markdown/Org paths, SQLite paths, and released paths named by accepted

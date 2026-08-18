@@ -283,6 +283,10 @@ impl AuthorityFixture {
         write(&self.graph_root, path, bytes);
     }
 
+    fn read(&self, path: &str) -> Vec<u8> {
+        std::fs::read(self.graph_root.join(path)).unwrap()
+    }
+
     fn append_local_tail(&mut self, page: usize, block: usize, content: &str, seed: u128) {
         let page = &self.pages[page];
         let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
@@ -1665,8 +1669,15 @@ fn exact_title_removal_and_format_only_edit_follow_authenticated_base_evidence()
     assert!(diagnostic.contains("SetPagePreamble"));
 }
 
+/// One canonical page name has one owner; a second physical file for it is a
+/// deduplicated source, not a reason to refuse the transaction.
+///
+/// Activation already makes exactly this selection over the same graph
+/// (`bootstrap_authoritative_source_paths`), so refusing here denied every
+/// affected path for as long as both files existed — permanently, since no user
+/// action inside Tine could clear it.
 #[test]
-fn explicit_title_collisions_block_before_authoring() {
+fn explicit_title_collisions_import_the_first_exact_path_and_withhold_the_rest() {
     let fixture = AuthorityFixture::one_page(
         "explicit-title-collision",
         "pages/Owned.md",
@@ -1675,11 +1686,35 @@ fn explicit_title_collisions_block_before_authoring() {
     fixture.overwrite("pages/first.md", b"title:: Shared Explicit\n\n- first\n");
     fixture.overwrite("pages/second.md", b"title:: Shared Explicit\n\n- second\n");
     let affected = fixture.plan(&["pages/first.md", "pages/second.md"]);
-    assert!(blocked_reasons(&affected).contains(&ImportBlockReason::ConflictingLocalTail));
+    assert!(affected.blocks().is_empty(), "{affected:?}");
+    assert_eq!(
+        affected.status(),
+        ImportPlanStatus::Reconcile,
+        "{affected:?}"
+    );
+    let diagnostic = format!("{affected:#?}");
+    assert_eq!(
+        diagnostic.matches("CreatePage").count(),
+        1,
+        "exactly one exact path may carry the shared name: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("path: ManagedPath(\n                        \"pages/first.md\",")
+            || diagnostic.contains("\"pages/first.md\""),
+        "the first exact path is the one that carries it: {diagnostic}"
+    );
+    assert_eq!(
+        fixture.read("pages/second.md").as_slice(),
+        b"title:: Shared Explicit\n\n- second\n".as_slice(),
+        "the withheld source keeps its exact bytes"
+    );
 
+    // The same rule against an ALREADY accepted owner: the established page
+    // keeps the name and nothing is left to author.
     fixture.overwrite("pages/new.md", b"title:: Imported Page 0\n\n- new\n");
     let accepted = fixture.plan(&["pages/new.md"]);
-    assert!(blocked_reasons(&accepted).contains(&ImportBlockReason::ConflictingLocalTail));
+    assert!(accepted.blocks().is_empty(), "{accepted:?}");
+    assert_eq!(accepted.status(), ImportPlanStatus::Noop, "{accepted:?}");
 }
 
 #[test]

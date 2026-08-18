@@ -15,6 +15,7 @@ mod filesystem_durability;
 pub mod graph_text_scope;
 pub mod html_sanitize;
 pub mod logbook;
+pub mod managed_storage_journey;
 pub mod model;
 pub mod onboarding;
 pub mod oplog;
