@@ -46062,6 +46062,64 @@ mod tests {
         );
     }
 
+    /// What "enable sync with another device" actually leaves on disk.
+    ///
+    /// Martin's desktop repeated `RecoveryBlocked("unsafe provider entry:
+    /// enrollment: No such file or directory (os error 2)")` after preparing a
+    /// share, which reads as a preparation that published a half-built tree.
+    /// It does not: the transport creates every namespace in both trees before
+    /// it writes a byte, and preparation then publishes the descriptor into the
+    /// tree it already made. So a tree missing `outbox/enrollment` was made
+    /// incomplete AFTER preparation — by whatever carries the folder between
+    /// devices — which is exactly the case discovery must read as "not yet".
+    #[test]
+    fn preparing_a_share_publishes_a_complete_joinable_provider_tree() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture("share-provider-tree");
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        assert!(receipt.starts_with("ok "), "{receipt}");
+
+        let provider_root = graph_root.join(".tine-sync/v2/shared");
+        let mut expected = crate::oplog::SHARED_PROVIDER_TREE_NAMESPACES.to_vec();
+        expected.sort_unstable();
+        for tree in ["inbox", "outbox"] {
+            let mut present = fs::read_dir(provider_root.join(tree))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            present.sort();
+            assert_eq!(
+                present, expected,
+                "share preparation left an incomplete {tree} tree"
+            );
+        }
+        // The one file a joining device looks for, present and readable.
+        let descriptor = inspect_shared_enrollment_for_cold_discovery(&provider_root)
+            .unwrap()
+            .expect("a prepared share is joinable");
+        assert!(!descriptor.encoded.is_empty());
+        assert_eq!(
+            inspect_shared_provider_cold_prefix(&provider_root).unwrap(),
+            SyncSharedProviderColdPrefix::ReadyForDescriptorInspection
+        );
+
+        // The state Martin's desktop is in. It must read as "nothing to join
+        // yet", not as a hostile tree, on both the discovery and prefix paths.
+        fs::remove_dir_all(provider_root.join("outbox/enrollment")).unwrap();
+        assert_eq!(
+            inspect_shared_enrollment_for_cold_discovery(&provider_root).unwrap(),
+            None
+        );
+        assert_eq!(
+            inspect_shared_provider_cold_prefix(&provider_root).unwrap(),
+            SyncSharedProviderColdPrefix::Partial
+        );
+    }
+
     /// The same journey on a filesystem that CANNOT hold two of its page names.
     ///
     /// Android shared storage folds case (CI 32123012366): the fixture's

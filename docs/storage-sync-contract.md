@@ -176,6 +176,29 @@ The device-private provider journal also has `pending-publication-v1/` and
 `provider-transaction.authority`; these never sync and cannot grant shared
 graph authority.
 
+An INCOMPLETE provider tree is not an unsafe one. A file-sync tool creates the
+directories above in whatever order it likes, may hold one back for minutes,
+and may remove one again while it propagates another device's deletion. An
+absent provider root, an absent tree, an absent namespace directory and an
+absent descriptor therefore all read the same way — "no sync data here yet":
+cold discovery answers `None`, the cold prefix classifier answers `Partial`,
+the runtime's exact reads answer `None`, and a provider scan treats the absent
+namespace as an empty one. `UnsafeProviderEntry` is reserved for an entry that
+IS present and is not what the protocol requires: a symlink, a regular file
+where a directory is required, a non-UTF-8 or traversing name, or an entry
+that cannot be opened for any reason other than absence. Refusals name the path
+on disk, not the bare component. Nothing about this relaxes what happens once
+bytes ARE present: descriptor, manifest and object validation is unchanged.
+
+`ProviderRuntime::open` creates the whole namespace inventory
+(`tine_core::oplog::SHARED_PROVIDER_TREE_NAMESPACES`) in both trees before any
+publication, and share preparation opens the transport before it writes a byte.
+A preparation that fails at any later step therefore leaves a complete tree
+with no descriptor in it, which discovers as "nothing to join yet" — never as a
+half-built tree another device could act on. Any reader that claims to
+recognize an untouched local skeleton takes that inventory from the same
+constant rather than re-listing it.
+
 Shared-provider paths and files may be owned by a different operating-system
 user than the Tine process. This is normal for Android shared storage, NFS,
 containers, and shared-group deployments. Unix UID equality is therefore not

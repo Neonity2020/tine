@@ -17,11 +17,9 @@ use tine_core::model::GraphMeta;
 use tine_core::oplog::sync_layout::{
     PRIVATE_BINDING_DIR as SPARSE_BINDING_DIR, PRIVATE_BINDING_FILE as SPARSE_BINDING_FILE,
     PRIVATE_RECOVERY_DIR as SPARSE_RECOVERY_DIR, PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR,
-    SHARED_ENROLLMENT_DIR, SHARED_FRONTIER_HEADS_DIR, SHARED_MANIFESTS_DIR,
-    SHARED_MANIFEST_RECOVERY_BLOBS_DIR, SHARED_MANIFEST_RECOVERY_LINKS_DIR, SHARED_OBJECTS_DIR,
-    SHARED_PUBLICATION_INTENTS_DIR, SHARED_REMOVED_DIR, SHARED_RENAME_EVIDENCE_DIR,
-    SHARED_TEMP_DIR,
+    SHARED_ENROLLMENT_DESCRIPTOR_PATH,
 };
+use tine_core::oplog::SHARED_PROVIDER_TREE_NAMESPACES;
 use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
@@ -921,18 +919,13 @@ enum ProviderNamespaceEvidence {
 }
 
 const PROVIDER_SCAFFOLD_TREES: [&str; 2] = [PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR];
-const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 10] = [
-    SHARED_OBJECTS_DIR,
-    SHARED_MANIFESTS_DIR,
-    SHARED_ENROLLMENT_DIR,
-    SHARED_FRONTIER_HEADS_DIR,
-    SHARED_PUBLICATION_INTENTS_DIR,
-    SHARED_MANIFEST_RECOVERY_LINKS_DIR,
-    SHARED_MANIFEST_RECOVERY_BLOBS_DIR,
-    SHARED_TEMP_DIR,
-    SHARED_REMOVED_DIR,
-    SHARED_RENAME_EVIDENCE_DIR,
-];
+/// Exactly what a first local activation writes — taken from the core that
+/// writes it, never re-listed here. A hand-copied list drifted the moment
+/// clean baselines were added: activation wrote eleven namespaces while this
+/// check still expected ten, so an ordinary local-only graph failed to match
+/// its own skeleton and the escape hatch warned every user that their graph
+/// might be shared with another device.
+const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 11] = SHARED_PROVIDER_TREE_NAMESPACES;
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
     let mut entries = std::fs::read_dir(path)
@@ -2958,6 +2951,34 @@ fn prepare_sparse_v2_share_blocking(
     publish_managed_candidate(app, &state, label, candidate)
 }
 
+/// The exact file a joining device is waiting for.
+pub(crate) fn shared_enrollment_descriptor_path(graph_root: &Path) -> PathBuf {
+    graph_root
+        .join(".tine-sync/v2/shared/outbox")
+        .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
+}
+
+/// What a device that cannot find sync data should be told.
+///
+/// "This graph does not yet contain sync data from another device" is true and
+/// a dead end: it names neither what was looked for nor either thing the user
+/// can actually check. Both causes are ordinary — the other device has not
+/// finished its half, or the file-sync tool never carried `.tine-sync/`, which
+/// several exclude by default because it starts with a dot.
+fn shared_enrollment_not_here_yet(graph_root: &Path) -> String {
+    format!(
+        concat!(
+            "This graph does not yet contain sync data from another device.\n\n",
+            "Tine looked for {}.\n\n",
+            "Two things usually explain that. The other device may not have finished ",
+            "\"Set up sync with another device\" yet. Or your file-sync tool is not copying the ",
+            "hidden .tine-sync folder — several tools skip dot-directories unless you ",
+            "tell them not to.",
+        ),
+        shared_enrollment_descriptor_path(graph_root).display()
+    )
+}
+
 /// Reconstitute the sole application actor after a durable enrollment cut.
 /// `prepare_shared` and a completed `join_shared` intentionally stop their
 /// predecessor actor: continuing to serve that handle would mix two enrollment
@@ -3078,7 +3099,7 @@ fn prepare_sparse_v2_join(
     let descriptor =
         inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))
             .map_err(|error| join_failure("provider discovery", error))?
-            .ok_or("This graph does not yet contain sync data from another device.")?;
+            .ok_or_else(|| shared_enrollment_not_here_yet(&slot.root_key))?;
     if slot.sparse_binding().is_some() {
         let record = state
             .sync_runtime
@@ -3589,6 +3610,63 @@ mod tests {
         );
         assert_eq!(serialized["progress"]["completed"], 2);
         assert_eq!(serialized["progress"]["total"], 5);
+    }
+
+    /// A join that finds nothing must not dead-end the user. "This graph does
+    /// not yet contain sync data from another device" is true and unactionable:
+    /// it names neither the file it looked for nor either ordinary reason it is
+    /// missing — the other device has not finished, or the sync tool is not
+    /// carrying the hidden `.tine-sync/` folder.
+    #[test]
+    fn a_join_with_no_sync_data_names_the_file_and_both_likely_causes() {
+        let message = shared_enrollment_not_here_yet(Path::new("/graphs/notes"));
+        assert!(
+            message.contains(
+                "/graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("may not have finished"), "{message}");
+        assert!(message.contains("hidden .tine-sync folder"), "{message}");
+        assert!(message.contains("skip dot-directories"), "{message}");
+        assert!(
+            !message.contains("  "),
+            "the message must not carry source-indentation runs: {message:?}"
+        );
+        assert_eq!(
+            shared_enrollment_descriptor_path(Path::new("/graphs/notes")),
+            PathBuf::from(
+                "/graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json"
+            )
+        );
+    }
+
+    /// One source of truth for what a provider tree contains: the check that
+    /// recognizes an untouched local skeleton must expect exactly what a first
+    /// local activation writes, or an ordinary local graph reads as shared.
+    #[test]
+    fn the_local_scaffold_check_expects_what_activation_actually_writes() {
+        assert_eq!(
+            PROVIDER_SCAFFOLD_NAMESPACES.len(),
+            SHARED_PROVIDER_TREE_NAMESPACES.len()
+        );
+        assert!(PROVIDER_SCAFFOLD_NAMESPACES.contains(&"clean-baselines-v1"));
+
+        let root = std::env::temp_dir().join(format!("tine-scaffold-{}", Uuid::new_v4()));
+        let shared = root.join("shared");
+        for tree in PROVIDER_SCAFFOLD_TREES {
+            for namespace in PROVIDER_SCAFFOLD_NAMESPACES {
+                std::fs::create_dir_all(shared.join(tree).join(namespace)).unwrap();
+            }
+        }
+        assert!(is_empty_local_provider_scaffold(&shared).unwrap());
+        std::fs::write(
+            shared.join("outbox/enrollment/shared-enrollment-v1.json"),
+            b"x",
+        )
+        .unwrap();
+        assert!(!is_empty_local_provider_scaffold(&shared).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1922,6 +1922,27 @@ struct ProviderFileIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderFileIdentity;
 
+/// Every namespace a Tine provider tree carries, in BOTH trees.
+///
+/// This is the inventory `ProviderRuntime::open` creates, and therefore the one
+/// any reader that claims to recognize an untouched local skeleton must expect.
+/// The two drifted the moment clean baselines were added: the reader still
+/// expected ten namespaces while a first local activation wrote eleven, so an
+/// ordinary local graph read as shared-or-unknown. One source of truth instead.
+pub const SHARED_PROVIDER_TREE_NAMESPACES: [&str; 11] = [
+    PROVIDER_OBJECTS_NAMESPACE,
+    PROVIDER_MANIFESTS_NAMESPACE,
+    PROVIDER_ENROLLMENT_NAMESPACE,
+    SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+    SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+    SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+    SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+    SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE,
+    PROVIDER_TEMP_NAMESPACE,
+    PROVIDER_REMOVED_NAMESPACE,
+    PROVIDER_RENAME_EVIDENCE_NAMESPACE,
+];
+
 struct ProviderRuntime {
     root: PathBuf,
     inbox: Dir,
@@ -1948,19 +1969,7 @@ impl ProviderRuntime {
         for tree in ["inbox", "outbox"] {
             ensure_shared_provider_directory(&provider, tree)?;
             let tree = open_provider_directory(&provider, tree)?;
-            for namespace in [
-                PROVIDER_OBJECTS_NAMESPACE,
-                PROVIDER_MANIFESTS_NAMESPACE,
-                PROVIDER_ENROLLMENT_NAMESPACE,
-                SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
-                SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
-                SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
-                SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
-                SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE,
-                PROVIDER_TEMP_NAMESPACE,
-                PROVIDER_REMOVED_NAMESPACE,
-                PROVIDER_RENAME_EVIDENCE_NAMESPACE,
-            ] {
+            for namespace in SHARED_PROVIDER_TREE_NAMESPACES {
                 ensure_shared_provider_directory(&tree, namespace)?;
                 let _ = open_provider_directory(&tree, namespace)?;
             }
@@ -2012,6 +2021,43 @@ impl ProviderRuntime {
                 ensure_shared_provider_directory(&parent, component)?;
             }
             parent = open_provider_directory(&parent, component)?;
+        }
+        Err(ScenarioError::InvalidProviderPath(path.into()))
+    }
+
+    /// Resolve a read-only provider location whose intermediate directories a
+    /// file-sync tool may not have delivered yet.
+    ///
+    /// `None` means one of those directories is absent. An entry that is
+    /// present but is not a real no-follow directory still refuses.
+    fn delivered_parent_and_name(
+        &self,
+        tree: ProviderTree,
+        path: &str,
+    ) -> Result<Option<(Dir, String)>, ScenarioError> {
+        if !valid_provider_path(path) {
+            return Err(ScenarioError::InvalidProviderPath(path.into()));
+        }
+        let mut components = path.split('/').peekable();
+        let mut parent = self
+            .tree(tree)
+            .try_clone()
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let mut parent_path = self.tree_path(tree);
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                return Ok(Some((parent, component.into())));
+            }
+            let Some(child) = open_delivered_provider_directory(
+                &parent,
+                component,
+                &parent_path.join(component),
+            )?
+            else {
+                return Ok(None);
+            };
+            parent_path.push(component);
+            parent = child;
         }
         Err(ScenarioError::InvalidProviderPath(path.into()))
     }
@@ -3113,9 +3159,18 @@ impl SharedProviderTransport {
             }
             None => MAX_PROVIDER_RESCAN_BYTES,
         };
-        let (parent, name) = self
+        // `read_exact` answers "is this provider item here?", and a namespace
+        // directory a file-sync tool has not delivered is one more way for the
+        // answer to be no. Reporting it as an unsafe entry instead made the
+        // runtime lanes that read through this surface — the frontier-head
+        // check on every managed-local publication among them — refuse an
+        // ordinary half-delivered tree, once per retry, forever.
+        let Some((parent, name)) = self
             .runtime
-            .parent_and_name(ProviderTree::Outbox, path, false)?;
+            .delivered_parent_and_name(ProviderTree::Outbox, path)?
+        else {
+            return Ok(None);
+        };
         open_provider_regular_optional(&parent, &name, limit, path)
             .map(|opened| opened.map(|opened| opened.bytes))
     }
@@ -3207,8 +3262,20 @@ impl SharedProviderTransport {
                 _ => return Ok(SharedProviderObservation::Complete),
             };
             if cursor.entries.is_none() {
+                // A namespace a file-sync tool has not delivered (or has
+                // removed while propagating another device's deletion) is an
+                // EMPTY namespace, not a hostile tree. Refusing it turned every
+                // provider scan into `UnsafeProviderEntry`, which the actor
+                // reports as a `RecoveryBlocked` tick — and the cursor never
+                // advances, so the same tick is produced on every retry for as
+                // long as the directory is missing (GH: desktop pairing,
+                // 2026-08-18).
+                let Some(directory) = self.open_delivered_outbox_namespace(namespace)? else {
+                    cursor.phase = cursor.phase.saturating_add(1);
+                    continue;
+                };
                 cursor.entries = Some(
-                    open_provider_directory(self.runtime.tree(ProviderTree::Outbox), namespace)?
+                    directory
                         .entries()
                         .map_err(|error| ScenarioError::Io(error.to_string()))?,
                 );
@@ -3240,14 +3307,41 @@ impl SharedProviderTransport {
                 cursor.observed_entries = cursor.observed_entries.saturating_add(1);
                 return Ok(SharedProviderObservation::Path(path));
             }
-            let file = open_provider_file_nofollow(
-                &open_provider_directory(self.runtime.tree(ProviderTree::Outbox), namespace)?,
-                &name,
-            )
-            .map_err(|error| ScenarioError::UnsafeProviderEntry(error.to_string()))?;
+            let Some(directory) = self.open_delivered_outbox_namespace(namespace)? else {
+                cursor.entries = None;
+                cursor.phase = cursor.phase.saturating_add(1);
+                continue;
+            };
+            let file = open_provider_file_nofollow(&directory, &name)
+                .map_err(|error| ScenarioError::UnsafeProviderEntry(error.to_string()))?;
             validate_provider_regular_file(&file, &path)?;
             cursor.observed_entries = cursor.observed_entries.saturating_add(1);
             return Ok(SharedProviderObservation::Path(path));
+        }
+    }
+
+    /// Open one outbox namespace that a file-sync tool may not have delivered.
+    ///
+    /// `None` means the namespace directory is absent. An entry that IS present
+    /// but is not a real no-follow directory still refuses, and the refusal
+    /// names the path on disk rather than the bare component.
+    fn open_delivered_outbox_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<Dir>, ScenarioError> {
+        let outbox = self.runtime.tree(ProviderTree::Outbox);
+        match open_dir_nofollow(outbox, namespace) {
+            Ok(directory) => Ok(Some(directory)),
+            Err(error) => match outbox.symlink_metadata(namespace) {
+                Err(absent) if absent.kind() == ErrorKind::NotFound => Ok(None),
+                _ => Err(ScenarioError::UnsafeProviderEntry(format!(
+                    "{}: {error}",
+                    self.runtime
+                        .tree_path(ProviderTree::Outbox)
+                        .join(namespace)
+                        .display(),
+                ))),
+            },
         }
     }
 
@@ -3471,8 +3565,12 @@ pub(crate) fn inspect_cold_shared_provider_prefix(
 ) -> Result<ColdSharedProviderPrefix, ScenarioError> {
     let metadata = match fs::symlink_metadata(provider_root) {
         Ok(metadata) => metadata,
+        // An absent root is the same "not yet" every other absent component
+        // below is: the folder a file-sync tool has not created here. It is not
+        // an unsafe kind, and the only thing a refusal buys is a scarier
+        // message for the ordinary case.
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(ColdSharedProviderPrefix::Refused)
+            return Ok(ColdSharedProviderPrefix::Partial)
         }
         Err(error) => return Err(ScenarioError::Io(error.to_string())),
     };
@@ -3532,8 +3630,41 @@ fn inspect_shared_provider_descriptor_with(
     }
     let root = Dir::open_ambient_dir(provider_root, ambient_authority())
         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-    let outbox = open_provider_directory(&root, "outbox")?;
-    let enrollment = open_provider_directory(&outbox, PROVIDER_ENROLLMENT_NAMESPACE)?;
+    // A provider tree that exists but is INCOMPLETE is the ordinary state of a
+    // folder a sync tool is still filling: Syncthing and Dropbox deliver
+    // entries in arbitrary order and may hold a directory back for minutes.
+    // The descriptor file itself has always been optional here; the two
+    // directories above it must be too, or an early device reads a hostile
+    // tree where there is only an early one.
+    let descriptor_path = provider_root
+        .join("outbox")
+        .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH);
+    // Name the file discovery actually wants. "unsafe provider entry:
+    // enrollment" told the one person who could act on it nothing at all.
+    let wanted = |error: ScenarioError| match error {
+        ScenarioError::UnsafeProviderEntry(detail) => ScenarioError::UnsafeProviderEntry(format!(
+            "{detail}; Tine reads sync data from another device at {}",
+            descriptor_path.display()
+        )),
+        error => error,
+    };
+    let Some(outbox) =
+        open_delivered_provider_directory(&root, "outbox", &provider_root.join("outbox"))
+            .map_err(wanted)?
+    else {
+        return Ok(None);
+    };
+    let Some(enrollment) = open_delivered_provider_directory(
+        &outbox,
+        PROVIDER_ENROLLMENT_NAMESPACE,
+        &provider_root
+            .join("outbox")
+            .join(PROVIDER_ENROLLMENT_NAMESPACE),
+    )
+    .map_err(wanted)?
+    else {
+        return Ok(None);
+    };
     open_provider_regular_optional(
         &enrollment,
         "shared-enrollment-v1.json",
@@ -3541,6 +3672,33 @@ fn inspect_shared_provider_descriptor_with(
         SHARED_ENROLLMENT_DESCRIPTOR_PATH,
     )
     .map(|opened| opened.map(|opened| opened.bytes))
+}
+
+/// Open one canonical provider directory that a file-sync tool may not have
+/// delivered yet.
+///
+/// `None` means exactly one thing: the entry is not there. Anything that IS
+/// there but cannot be opened as a real no-follow directory — a symlink, a
+/// regular file, an unreadable entry — is still
+/// [`ScenarioError::UnsafeProviderEntry`], which is what that error was written
+/// for. The refusal names the path on disk and the file discovery ultimately
+/// wants, because "unsafe provider entry: enrollment" told the one person who
+/// could act on it nothing at all.
+fn open_delivered_provider_directory(
+    parent: &Dir,
+    name: &str,
+    entry_path: &Path,
+) -> Result<Option<Dir>, ScenarioError> {
+    match open_dir_nofollow(parent, name) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) => match parent.symlink_metadata(name) {
+            Err(absent) if absent.kind() == ErrorKind::NotFound => Ok(None),
+            _ => Err(ScenarioError::UnsafeProviderEntry(format!(
+                "{}: {error}",
+                entry_path.display(),
+            ))),
+        },
+    }
 }
 
 impl ProviderRetryJournal {
@@ -16074,6 +16232,241 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5]
         );
+    }
+
+    /// A provider tree that exists but is still being filled is the ORDINARY
+    /// state of a folder a file-sync tool is delivering: Syncthing, Dropbox and
+    /// friends create entries in arbitrary order and may hold a directory back
+    /// for minutes. Every one of these shapes must read as "no sync data here
+    /// yet", never as a hostile tree, because refusing them blocks recovery on
+    /// the device that is merely early (GH: desktop pairing, 2026-08-18).
+    #[test]
+    fn a_partly_delivered_provider_tree_discovers_as_nothing_yet() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        provider.publish_descriptor(b"descriptor").unwrap();
+        drop(provider);
+
+        assert_eq!(
+            inspect_shared_provider_descriptor(&provider_root).unwrap(),
+            Some(b"descriptor".to_vec()),
+            "a complete tree still discovers its descriptor"
+        );
+
+        // The descriptor file has not arrived yet.
+        fs::remove_file(provider_root.join("outbox/enrollment/shared-enrollment-v1.json")).unwrap();
+        assert_eq!(
+            inspect_shared_provider_descriptor(&provider_root).unwrap(),
+            None,
+            "an undelivered descriptor file is nothing yet"
+        );
+
+        // The enrollment namespace has not arrived yet.
+        fs::remove_dir_all(provider_root.join("outbox/enrollment")).unwrap();
+        assert_eq!(
+            inspect_shared_provider_descriptor(&provider_root).unwrap(),
+            None,
+            "an undelivered enrollment namespace is nothing yet, not an unsafe entry"
+        );
+
+        // The whole outbox tree has not arrived yet.
+        fs::remove_dir_all(provider_root.join("outbox")).unwrap();
+        assert_eq!(
+            inspect_shared_provider_descriptor(&provider_root).unwrap(),
+            None,
+            "an undelivered outbox tree is nothing yet, not an unsafe entry"
+        );
+
+        // The provider root itself has not arrived yet.
+        assert_eq!(
+            inspect_shared_provider_descriptor(&root.0.join("never-delivered")).unwrap(),
+            None,
+        );
+        assert_eq!(
+            inspect_cold_shared_provider_prefix(&root.0.join("never-delivered")).unwrap(),
+            ColdSharedProviderPrefix::Partial,
+            "an absent provider root is nothing yet, not a refusal"
+        );
+    }
+
+    /// The narrow set `UnsafeProviderEntry` was written for. Relaxing "absent"
+    /// must not relax any of these.
+    #[test]
+    fn a_genuinely_unsafe_provider_entry_still_refuses_cold_discovery() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        provider.publish_descriptor(b"descriptor").unwrap();
+        drop(provider);
+
+        // A regular file where the enrollment namespace must be a directory.
+        fs::remove_dir_all(provider_root.join("outbox/enrollment")).unwrap();
+        fs::write(provider_root.join("outbox/enrollment"), b"not a directory").unwrap();
+        assert!(matches!(
+            inspect_shared_provider_descriptor(&provider_root),
+            Err(ScenarioError::UnsafeProviderEntry(_))
+        ));
+        assert_eq!(
+            inspect_cold_shared_provider_prefix(&provider_root).unwrap(),
+            ColdSharedProviderPrefix::Refused
+        );
+        fs::remove_file(provider_root.join("outbox/enrollment")).unwrap();
+
+        // A regular file where the outbox tree must be a directory.
+        fs::remove_dir_all(provider_root.join("outbox")).unwrap();
+        fs::write(provider_root.join("outbox"), b"not a directory").unwrap();
+        assert!(matches!(
+            inspect_shared_provider_descriptor(&provider_root),
+            Err(ScenarioError::UnsafeProviderEntry(_))
+        ));
+        assert_eq!(
+            inspect_cold_shared_provider_prefix(&provider_root).unwrap(),
+            ColdSharedProviderPrefix::Refused
+        );
+        fs::remove_file(provider_root.join("outbox")).unwrap();
+
+        // A regular file where the provider root must be a directory.
+        let file_root = root.0.join("file-root");
+        fs::write(&file_root, b"not a directory").unwrap();
+        assert!(matches!(
+            inspect_shared_provider_descriptor(&file_root),
+            Err(ScenarioError::UnsafeProviderEntry(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            // A symlink standing in for the enrollment namespace, pointing at a
+            // real directory: the kind check, not the open, must refuse it.
+            let elsewhere = root.0.join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            fs::create_dir_all(provider_root.join("outbox")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, provider_root.join("outbox/enrollment"))
+                .unwrap();
+            assert!(matches!(
+                inspect_shared_provider_descriptor(&provider_root),
+                Err(ScenarioError::UnsafeProviderEntry(_))
+            ));
+            assert_eq!(
+                inspect_cold_shared_provider_prefix(&provider_root).unwrap(),
+                ColdSharedProviderPrefix::Refused
+            );
+        }
+    }
+
+    /// The runtime ingress lane sees the same half-delivered tree the cold
+    /// discovery path does. An undelivered namespace made every provider scan
+    /// raise `UnsafeProviderEntry`, and the actor turned that into a
+    /// `RecoveryBlocked` tick on every retry — the repeating desktop toast.
+    #[test]
+    fn an_undelivered_namespace_does_not_block_the_provider_scan() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        provider.publish_descriptor(b"descriptor").unwrap();
+
+        let complete = drain_observed_paths(&provider);
+        assert_eq!(complete, vec![SHARED_ENROLLMENT_DESCRIPTOR_PATH.to_owned()]);
+
+        for namespace in [
+            SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+            SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+            SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+            SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+            PROVIDER_MANIFESTS_NAMESPACE,
+            PROVIDER_OBJECTS_NAMESPACE,
+        ] {
+            fs::remove_dir_all(provider_root.join("outbox").join(namespace)).unwrap();
+        }
+        assert_eq!(
+            drain_observed_paths(&provider),
+            vec![SHARED_ENROLLMENT_DESCRIPTOR_PATH.to_owned()],
+            "namespaces a file sync has not delivered are simply empty"
+        );
+
+        fs::remove_dir_all(provider_root.join("outbox/enrollment")).unwrap();
+        assert_eq!(
+            drain_observed_paths(&provider),
+            Vec::<String>::new(),
+            "an undelivered enrollment namespace must not block the scan"
+        );
+
+        // The same tree read through the runtime's exact-read surface. This is
+        // the one the frontier-head check uses on every managed-local
+        // publication, so a refusal here is a `RecoveryBlocked` tick per retry.
+        assert_eq!(
+            provider
+                .read_exact(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            provider
+                .read_exact(&format!(
+                    "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/never-delivered.head"
+                ))
+                .unwrap(),
+            None
+        );
+
+        // Still refused when the namespace is present as something other than
+        // a real directory.
+        fs::write(provider_root.join("outbox/enrollment"), b"not a directory").unwrap();
+        assert!(matches!(
+            provider.read_exact(SHARED_ENROLLMENT_DESCRIPTOR_PATH),
+            Err(ScenarioError::UnsafeProviderEntry(_))
+        ));
+    }
+
+    /// Opening a provider transport is the FIRST thing share preparation does,
+    /// before it publishes a single byte. So the tree it leaves is either
+    /// complete or absent: a preparation that dies at any later step leaves a
+    /// tree with no descriptor in it, which discovers as "nothing to join yet",
+    /// never as a half-built tree another device could act on.
+    #[test]
+    fn opening_a_provider_publishes_the_whole_tree_before_any_bytes() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        drop(provider);
+
+        for tree in ["inbox", "outbox"] {
+            let mut present = fs::read_dir(provider_root.join(tree))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            present.sort();
+            let mut expected = SHARED_PROVIDER_TREE_NAMESPACES.to_vec();
+            expected.sort_unstable();
+            assert_eq!(present, expected, "{tree} is not the canonical inventory");
+        }
+        assert_eq!(
+            inspect_shared_provider_descriptor(&provider_root).unwrap(),
+            None,
+            "a prepared-but-unpublished tree is nothing to join yet"
+        );
+        assert_eq!(
+            inspect_cold_shared_provider_prefix(&provider_root).unwrap(),
+            ColdSharedProviderPrefix::Partial
+        );
+    }
+
+    fn drain_observed_paths(provider: &SharedProviderTransport) -> Vec<String> {
+        let mut cursor = provider.full_observation_cursor().unwrap();
+        let mut paths = Vec::new();
+        loop {
+            match provider.next_observed_path(&mut cursor).unwrap() {
+                SharedProviderObservation::Path(path) => paths.push(path),
+                SharedProviderObservation::ChunkBoundary => cursor.begin_next_chunk(),
+                SharedProviderObservation::Complete => break,
+            }
+        }
+        paths.sort();
+        paths
     }
 }
 
