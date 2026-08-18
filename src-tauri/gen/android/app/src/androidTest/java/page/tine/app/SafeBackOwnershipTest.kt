@@ -55,11 +55,37 @@ class SafeBackOwnershipTest {
       // Tine is an SPA and never performs a second real navigation, so proving
       // ownership behind a loadUrl would prove it under conditions that never
       // occur on Martin's phone.
+      val loadState = awaitLoadComplete(scenario)
       val historyBefore = evaluateInt(scenario, "history.length")
-      evaluate(scenario, "history.pushState(null, '', location.href)")
-      val historyAfter = evaluateInt(scenario, "history.length")
+      var historyAfter = historyBefore
+      var pushes = 0
+      // A pushState issued while the document is still loading grows the JS
+      // history without adding a WebView back/forward entry: run 32180708057
+      // reported `history.length 1 -> 2` beside `canGoBack=false`, with the
+      // list still holding only [initial, first commit]. Waiting for the load
+      // to finish is the fix; repeating the push is the belt, because a
+      // software-GL emulator can report `complete` while the first frame is
+      // still settling.
+      while (pushes < MAX_HISTORY_PUSHES) {
+        evaluate(scenario, "history.pushState(null, '', location.href)")
+        historyAfter = evaluateInt(scenario, "history.length")
+        pushes += 1
+        if (awaitTrue(PUSH_SETTLE_MS) { onUiThread(scenario) { webView.canGoBack() } }) break
+      }
 
-      if (!awaitTrue(SETTLE_TIMEOUT_MS) { onUiThread(scenario) { webView.canGoBack() } }) {
+      // Last resort, and reported as such: a real same-document navigation.
+      // pushState is what production does, so it is tried first and three
+      // times; but a run that observes ownership under a fragment navigation
+      // still answers the question this fixture exists to answer, and a run
+      // that observes nothing answers nothing at all.
+      var historyMode = "pushState"
+      if (!onUiThread(scenario) { webView.canGoBack() }) {
+        historyMode = "fragment"
+        scenario.onActivity { webView.loadUrl(webView.url + "#tine-back-probe") }
+        awaitTrue(SETTLE_TIMEOUT_MS) { onUiThread(scenario) { webView.canGoBack() } }
+      }
+
+      if (!onUiThread(scenario) { webView.canGoBack() }) {
         // Name the failure instead of leaving the next receipt to guess. If the
         // JS history grew but the WebView's back/forward list did not, then
         // pushState does not feed canGoBack() on this device and the production
@@ -69,6 +95,7 @@ class SafeBackOwnershipTest {
         fail(
           "the fixture could not give the WebView a history entry, so this run " +
             "cannot observe Back ownership at all. document=$document " +
+            "loadState=$loadState pushes=$pushes mode=$historyMode " +
             "history.length $historyBefore -> $historyAfter, " +
             "backForwardList size=${list.size} currentIndex=${list.currentIndex}, " +
             "canGoBack=${onUiThread(scenario) { webView.canGoBack() }}",
@@ -79,9 +106,10 @@ class SafeBackOwnershipTest {
       scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
 
       assertTrue(
-        "Back did not reach Tine's SafeBack owner: another OnBackPressedCallback " +
-          "(Tauri's AppPlugin) was registered later and answered the gesture with " +
-          "WebView history navigation instead",
+        "Back did not reach Tine's SafeBack owner (history arranged by " +
+          "$historyMode): another OnBackPressedCallback (Tauri's AppPlugin) was " +
+          "registered later and answered the gesture with WebView history " +
+          "navigation instead",
         awaitTrue(SETTLE_TIMEOUT_MS) { SafeBackBridge.gesturesReceived > before },
       )
     } finally {
@@ -140,6 +168,25 @@ class SafeBackOwnershipTest {
     )
   }
 
+  /**
+   * Wait for `document.readyState === "complete"`, and REPORT what was reached
+   * rather than requiring it. A pushed history entry only becomes a WebView
+   * back/forward entry once the navigation that owns it has finished loading,
+   * so this wait is what makes the fixture able to observe anything at all —
+   * but a slow subresource on a software-GL emulator must not be the reason a
+   * Back-ownership run goes red, which is why it returns instead of failing.
+   */
+  private fun awaitLoadComplete(scenario: ActivityScenario<MainActivity>): String {
+    var last = "(never evaluated)"
+    val deadline = SystemClock.elapsedRealtime() + LOAD_COMPLETE_TIMEOUT_MS
+    while (SystemClock.elapsedRealtime() < deadline) {
+      last = evaluate(scenario, "document.readyState").trim('"')
+      if (last == "complete") return last
+      SystemClock.sleep(POLL_MS)
+    }
+    return last
+  }
+
   /** `evaluateJavascript` hands back a JSON-encoded value, so a JSON.stringify
    * result arrives double-encoded: a JSON string whose contents are the array. */
   private fun parseJsonStringArray(raw: String): JSONArray? = runCatching {
@@ -189,6 +236,11 @@ class SafeBackOwnershipTest {
     /** A pushed history entry and a dispatched Back are both immediate; this is
      * slack for the main-thread hop, not a retry budget. */
     const val SETTLE_TIMEOUT_MS = 10_000L
+    /** Per push attempt; the push itself is immediate, this is main-thread slack. */
+    const val PUSH_SETTLE_MS = 3_000L
+    const val MAX_HISTORY_PUSHES = 3
+    /** Reported, never required: see awaitLoadComplete. */
+    const val LOAD_COMPLETE_TIMEOUT_MS = 20_000L
     const val POLL_MS = 100L
   }
 }
