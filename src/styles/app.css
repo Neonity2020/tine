@@ -33,6 +33,21 @@ body {
    a monospace shorthand later in this file; safety must survive those rules. */
 :root {
   --tine-editable-emoji-font: "Noto Emoji Variable";
+  /* System-inset gutters for viewport-fixed chrome.
+     `.app-container` already pads the app SHELL by the four insets, but a
+     `position: fixed` overlay is laid out against the viewport and escapes that
+     padding completely — so every full-viewport overlay has to reapply them.
+     A larger vh/px constant cannot substitute: the status bar, cutout and
+     gesture bar differ per device, and on Android targetSdk 36 the viewport
+     always includes them. All four are 0 on desktop, so each `calc()` below
+     reduces to its own gap there.
+     Overriding these four variables is also how the browser harness
+     (scripts/check-mobile-safe-area.mjs) can measure inset behaviour in a
+     desktop Chromium, where env() is always 0. */
+  --overlay-inset-top: env(safe-area-inset-top, 0px);
+  --overlay-inset-right: env(safe-area-inset-right, 0px);
+  --overlay-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --overlay-inset-left: env(safe-area-inset-left, 0px);
 }
 html[data-editable-emoji="windows"] {
   --tine-editable-emoji-font: "Segoe UI Emoji", "Noto Emoji Variable";
@@ -91,7 +106,9 @@ textarea {
   left: 0;
   right: 0;
   z-index: 9999;
-  padding: 8px 14px;
+  padding: calc(var(--overlay-inset-top) + 8px)
+    calc(var(--overlay-inset-right) + 14px) 8px
+    calc(var(--overlay-inset-left) + 14px);
   font-size: 13px;
   background: #b91c1c;
   color: #fff;
@@ -1829,7 +1846,14 @@ textarea {
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 12vh;
+  box-sizing: border-box;
+  /* Shared by Settings, Copy/Export, Print to PDF and the advanced query
+     workspace, so the system-inset gutter belongs here rather than on any one
+     of them. */
+  padding: calc(var(--overlay-inset-top) + 12vh)
+    calc(var(--overlay-inset-right) + 8px)
+    calc(var(--overlay-inset-bottom) + 8px)
+    calc(var(--overlay-inset-left) + 8px);
   z-index: 120;
 }
 .settings-modal {
@@ -2585,6 +2609,11 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 8px)
+    calc(var(--overlay-inset-right) + 8px)
+    calc(var(--overlay-inset-bottom) + 8px)
+    calc(var(--overlay-inset-left) + 8px);
   z-index: 60;
 }
 .sync-merge-modal {
@@ -2960,12 +2989,16 @@ textarea {
 }
 @media (max-width: 480px) {
   .modal-overlay {
-    padding-top: 2vh;
+    padding-top: calc(var(--overlay-inset-top) + 2vh);
   }
   .settings-modal {
-    width: calc(100vw - 16px);
+    /* Fill the overlay's already-inset content box instead of measuring against
+       the raw viewport. `96vh` counted the status bar and the gesture bar as
+       usable space, so the modal rode up under the transparent status bar and
+       its lowest control could sit under the gesture bar. */
+    width: 100%;
     max-width: none;
-    height: 96vh;
+    height: 100%;
     max-height: none;
     flex-direction: column;
   }
@@ -5020,7 +5053,11 @@ mark {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 24px)
+    calc(var(--overlay-inset-right) + 24px)
+    calc(var(--overlay-inset-bottom) + 24px)
+    calc(var(--overlay-inset-left) + 24px);
 }
 .audio-panel {
   width: 90vw;
@@ -6464,8 +6501,8 @@ body.file-drop-active::after {
 /* ------------------------------------------------------------- toasts */
 .toast-stack {
   position: fixed;
-  bottom: 18px;
-  right: 18px;
+  bottom: calc(var(--overlay-inset-bottom) + 18px);
+  right: calc(var(--overlay-inset-right) + 18px);
   z-index: 200;
   display: flex;
   flex-direction: column;
@@ -6545,6 +6582,11 @@ body.file-drop-active::after {
   display: flex;
   align-items: center;
   justify-content: center;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 8px)
+    calc(var(--overlay-inset-right) + 8px)
+    calc(var(--overlay-inset-bottom) + 8px)
+    calc(var(--overlay-inset-left) + 8px);
   cursor: zoom-out;
 }
 .lightbox-overlay > img.lightbox-img {
@@ -7942,7 +7984,11 @@ img.emoji {
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 12vh;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 12vh)
+    calc(var(--overlay-inset-right) + 8px)
+    calc(var(--overlay-inset-bottom) + 8px)
+    calc(var(--overlay-inset-left) + 8px);
   z-index: 100;
 }
 
@@ -8990,7 +9036,11 @@ img.emoji {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  box-sizing: border-box;
+  padding: calc(var(--overlay-inset-top) + 24px)
+    calc(var(--overlay-inset-right) + 24px)
+    calc(var(--overlay-inset-bottom) + 24px)
+    calc(var(--overlay-inset-left) + 24px);
   background: var(--bg-primary);
   overflow: auto;
 }
@@ -9219,7 +9269,10 @@ img.emoji {
   display: grid;
   place-items: center;
   box-sizing: border-box;
-  padding: 46px 20px 24px;
+  padding: calc(var(--overlay-inset-top) + 46px)
+    calc(var(--overlay-inset-right) + 20px)
+    calc(var(--overlay-inset-bottom) + 24px)
+    calc(var(--overlay-inset-left) + 20px);
   overflow: auto;
   background: color-mix(in srgb, var(--bg-primary) 96%, transparent);
   color: var(--text-primary);

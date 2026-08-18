@@ -6757,6 +6757,29 @@
         "failBefore": "proven"
       },
       "notes": "On a running receiving device, an inbound provider batch could be applied to SQLite while its Markdown file was never written. The receiver-local projection decided whether a delivered foreign intent was still the live authority by comparing the intent's post-frontier with the page's WHOLE current merged frontier. An ordinary local external admission landing in the same window commits its own batch, which advances the shared page-catalog document, so the delivered intent stopped matching a page it never touched; the intent was then treated as superseded historical evidence and dropped. Nothing else owned that path, so the page existed in ListPages at the right path with no file on disk, clean_shutdown still returned Safe, and a reopen with a full re-drive never repaired it - durable data-visibility loss, since Markdown is the interchange truth for Direct Files parity and for every external tool. A receiver that cannot prove the delivered intent is still current now projects the page's CURRENT accepted state instead of skipping it (idempotent: a genuinely superseded page renders to the bytes already on disk), projects at the path the accepted state names rather than the intent's stale one, and retains the obligation as a published continuation when neither the intent nor the current state can be authorized. Source regressions pin creates, edits and cross-page moves under that interleaving, each with a Safe shutdown and a clean reopen. NOT covered here: provider-delivered DELETES and RENAMES never converge on the clean runtime at all - with or without the interleaving - because the receiver-local tombstone authorization still requires the retired pre-0.7 durable endpoint history store; that is a separate open defect."
+    },
+    {
+      "id": "UI-ANDROID-BACK-OWNERSHIP-001",
+      "title": "The Android Back gesture reaches Tine's rungs and closes the Settings modal instead of silently stepping WebView history",
+      "family": "android-shell",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/SafeBackOwnershipTest.kt",
+          "src/androidBack.settings.test.tsx"
+        ],
+        "scenario": "android.safe-back-owner-is-topmost",
+        "failBefore": "unavailable"
+      },
+      "notes": "Reported internally by Martin: with the Settings modal open, the hardware Back gesture did not close it. The frontend rungs were never at fault - dispatchAndroidBack, the transient registry and Settings' three-rung dismiss all behave correctly in the real app composition, which is why the defect survived. androidx's OnBackPressedDispatcher hands a gesture to the LAST-ADDED enabled callback, and Tauri's core AppPlugin adds its own from its Kotlin constructor, which runs on the Rust startup thread tao spawns inside Rust.create() - after MainActivity.onCreate has already returned. AppPlugin therefore sat ABOVE Tine's SafeBack owner, took its no-listener branch (Tine registers android-safe-back on its own plugin, never back-button on Tauri's) and answered Back with WebView.goBack() whenever the WebView had history. The mobile router pushes one history entry per navigation, so after the user's first navigation every Back popped a route BEHIND whatever was on screen and no rung ever ran; before that first navigation canGoBack() is false, AppPlugin re-dispatches and Back works, which is why this read as intermittent. SafeBackPlugin now claims ownership from its own constructor and again from load(), both strictly later than every plugin registered so far. failBefore is unavailable rather than proven because the fail-before run needs a booted Android emulator: the Kotlin instrumentation test arranges real WebView history first (without it the defect hides behind AppPlugin's re-dispatch) and only ci.yml scope=android-runtime can execute it."
     }
   ]
 }
