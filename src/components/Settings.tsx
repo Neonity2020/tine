@@ -168,6 +168,14 @@ const DATE_FORMATS = [
   "yyyyMMdd",
 ];
 
+// The one file a joining device waits for, relative to the graph folder.
+// The native side names the absolute path in a message the panel can only show
+// the first line of (`shared_enrollment_not_here_yet`, src-tauri/src/sync_runtime.rs),
+// so the panel names the relative one itself. Pinned from the native side by
+// `the_not_yet_refusal_reaches_the_panel_with_its_remedy_intact`.
+const SHARED_ENROLLMENT_RELATIVE_PATH =
+  ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json";
+
 type Tab = SettingsTabId;
 const TABS: { id: Tab; label: string }[] = [
   { id: "appearance", label: "Appearance" },
@@ -2266,6 +2274,20 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
    * (`join_shared_clean` in crates/tine-core/src/sync_runtime.rs.)
    */
   const joinFailureRemedy = (detail: string): string | null => {
+    // The native side writes a three-paragraph explanation for this one, and
+    // the panel keeps only its first line — which is the dead end the native
+    // text was written to replace. Re-author the rest here, where nothing has
+    // to survive redaction. The relative path is a constant, not user data.
+    if (detail.includes("does not yet contain sync data")) {
+      return (
+        "Nothing was changed on this device. Tine looked for "
+        + `${SHARED_ENROLLMENT_RELATIVE_PATH} inside this graph's folder. `
+        + "Two things usually explain an absent one. The other device may not have finished "
+        + "\"Set up sync with another device\" yet — check that it reports sharing as ready. Or your "
+        + "file-sync tool is not carrying the hidden .tine-sync folder; several skip dot-directories "
+        + "unless you tell them not to."
+      );
+    }
     if (detail.includes("names another managed graph")) {
       return (
         "Nothing was changed on either device. This device's Tine-managed storage is its own separate history, "
@@ -2595,7 +2617,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       reportManagedFailure(
         "Couldn't adopt the shared graph",
         safeManagedErrorDetail(error),
-        adoptionFailureRemedy(String(error), location)
+        // Adoption raises the same not-yet refusal as the join it follows,
+        // and the panel truncates it the same way.
+        adoptionFailureRemedy(String(error), location) ?? joinFailureRemedy(String(error))
       );
       return true;
     }

@@ -186,6 +186,44 @@ describe("Settings storage transitions", () => {
     dispose();
   });
 
+  it("keeps the not-yet refusal actionable after the panel truncates it to one line", async () => {
+    // The native message names the file and both ordinary causes; the panel
+    // shows only its first line, which is the dead end. The remedy carries the
+    // rest, or a real device is told nothing it can act on.
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
+      new Error(
+        "This graph does not yet contain sync data from another device.\n\n"
+        + "Tine looked for /graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json.\n\n"
+        + "Two things usually explain that."
+      )
+    );
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join a synced graph from another device")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+
+    const message = String(toasts().at(-1)?.message ?? "");
+    expect(message).toContain("does not yet contain sync data from another device");
+    expect(message).toContain(
+      ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json"
+    );
+    expect(message).toContain("Set up sync with another device");
+    expect(message).toContain("skip dot-directories");
+    expect(message).toContain("Nothing was changed on this device.");
+    dispose();
+  });
+
   const sharedActive = (): SparseV2Status => {
     const base = localActive();
     return {

@@ -57,7 +57,15 @@ describe("Tine-managed storage app boundary", () => {
     ]) {
       expect(settings).toContain(copy);
     }
-    expect(settings).not.toMatch(/sparse v2|sparse-v2|enrollment/i);
+    // Internal vocabulary must never reach the panel's copy. Three references
+    // are not copy and are allowed by name: the on-disk path a joining device
+    // waits for (a user has to look for that exact file), the constant holding
+    // it, and the native function whose message the panel re-authors.
+    const copy = settings
+      .replaceAll(".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json", "")
+      .replaceAll("SHARED_ENROLLMENT_RELATIVE_PATH", "")
+      .replaceAll("shared_enrollment_not_here_yet", "");
+    expect(copy).not.toMatch(/sparse v2|sparse-v2|enrollment/i);
   });
 
   it("models the adjacent-tagged query reply wire shape", () => {

@@ -3978,6 +3978,40 @@ mod tests {
         );
     }
 
+    /// The message above is helpful and the user never saw it. The panel keeps
+    /// only the FIRST LINE of a native error (`safeManagedErrorDetail`), so the
+    /// path and both causes were cut and the dead-end sentence was all that
+    /// reached the phone. The panel re-authors the rest as a remedy; this pins
+    /// the two halves together, because a remedy keyed on text the native side
+    /// no longer emits is the same silence again.
+    #[test]
+    fn the_not_yet_refusal_reaches_the_panel_with_its_remedy_intact() {
+        let message = shared_enrollment_not_here_yet(Path::new("/graphs/notes"));
+        let first_line = message.lines().next().expect("the message has a line");
+        let panel = include_str!("../../src/components/Settings.tsx");
+
+        // What the panel matches on must survive the truncation to line one.
+        let key = "does not yet contain sync data";
+        assert!(first_line.contains(key), "{first_line}");
+        assert!(
+            panel.contains(&format!("detail.includes(\"{key}\")")),
+            "the panel must recognize the refusal it re-authors"
+        );
+
+        // The relative path the panel names must be the one this message means.
+        let relative = ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json";
+        assert!(
+            shared_enrollment_descriptor_path(Path::new("/graphs/notes"))
+                .to_string_lossy()
+                .ends_with(relative),
+            "the relative path drifted from the descriptor path"
+        );
+        assert!(
+            panel.contains(&format!("\n  \"{relative}\";")),
+            "the panel must name the same relative path"
+        );
+    }
+
     /// One source of truth for what a provider tree contains: the check that
     /// recognizes an untouched skeleton must expect exactly what the shared
     /// provider transport writes when it opens a tree, or a graph that has only
