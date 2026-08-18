@@ -3239,6 +3239,15 @@ impl SharedProviderTransport {
                     continue;
                 };
                 if !SHARED_PROVIDER_TREE_NAMESPACES.contains(&name.as_str()) {
+                    // Skipping is cheap per entry, but a sync tool can leave
+                    // arbitrarily many of them here, and this sweep used to
+                    // stop at the first one. Charge them to the same per-turn
+                    // budget the namespaces use so one tick cannot walk an
+                    // unbounded directory.
+                    cursor.observed_entries = cursor.observed_entries.saturating_add(1);
+                    if !cursor.full && cursor.observed_entries >= cursor.entry_limit {
+                        return Ok(SharedProviderObservation::ChunkBoundary);
+                    }
                     continue;
                 }
                 let kind = entry
