@@ -2035,6 +2035,24 @@ pub struct SyncWatcherStatus {
     pub deferred: bool,
     pub quiescing: bool,
     pub sequence_exhausted: bool,
+    /// Managed documents physically read by the most expensive single actor turn
+    /// of the full scans this runtime has performed.
+    ///
+    /// The clean watcher's full scan is a bounded continuation: it enumerates
+    /// paths once and then reads and compares at most
+    /// `CLEAN_FULL_SCAN_PATH_BUDGET` documents per turn, so the actor lane is
+    /// released between slices. This number is that claim, measured. It used to
+    /// be `2 x N` for a graph of N documents, because the scan opened its first
+    /// turn with a two-pass byte-retaining capture of the whole graph.
+    pub full_scan_documents_read_in_slowest_turn: usize,
+    /// Managed documents physically read by every full-scan turn this runtime
+    /// has performed, in total.
+    ///
+    /// This is what says an overrunning scan cannot chain: a full-scan-forcing
+    /// observation arriving mid-pass is answered by redoing only the prefix that
+    /// pass read before it arrived, so a stream of them costs a converging
+    /// series rather than a fresh whole-graph pass each time.
+    pub full_scan_documents_read: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5366,6 +5384,16 @@ struct CleanRuntimeActorCore {
     watcher: CleanWatcherState,
     full_scan: Option<CleanFullScanContinuation>,
     completed_full_scan: Option<(u64, BTreeSet<ManagedPath>)>,
+    /// The worst single-turn document-read cost any full scan of this actor has
+    /// paid. Published through `SyncWatcherStatus`.
+    full_scan_worst_turn_reads: usize,
+    /// Every full-scan document read this actor has performed, cumulative.
+    full_scan_total_reads: usize,
+    /// Handed forward by a pass during which a full-scan-forcing observation
+    /// arrived; it bounds how much the next pass has to redo. Dropped as soon as
+    /// such an observation arrives with no pass in flight, because then nothing
+    /// is covered and the next pass owes a complete sweep.
+    full_scan_resume: Option<CleanFullScanResume>,
     /// An externally authored manifest has committed, but its derived graph
     /// projection has not yet completed.  Keep the watcher admission open
     /// until the continuation succeeds, then report one observable change
@@ -5386,17 +5414,56 @@ struct CleanWatcherState {
     acknowledged: u64,
 }
 
-/// One bounded continuation for the expensive comparison half of a clean
-/// watcher full scan. Capturing the graph and the finite SQLite/manifest path
-/// inventory happens once; later actor turns compare only a small slice. This
-/// keeps application and enrollment requests from waiting behind an O(graph)
-/// actor turn while preserving the exact same final changed-path set.
+/// One bounded continuation for a clean watcher full scan. Enumerating the
+/// on-disk paths and the finite SQLite/manifest path inventory happens once;
+/// later actor turns read and compare only a small slice. This keeps application
+/// and enrollment requests from waiting behind an O(graph) actor turn while
+/// preserving the exact same final changed-path set.
+///
+/// Document bytes are deliberately NOT captured up front. Reading them lazily,
+/// one budgeted slice at a time, is what makes the FIRST turn of a rescan bounded
+/// too: it used to be a two-pass byte-retaining capture of the whole graph
+/// (`2 × N` file opens) in a single unbudgeted turn.
 struct CleanFullScanContinuation {
     epoch: u64,
-    disk: BTreeMap<ManagedPath, Vec<u8>>,
     candidates: Vec<ManagedPath>,
     next: usize,
     changed: BTreeSet<ManagedPath>,
+    /// Set when a full-scan-forcing observation arrives while THIS scan runs.
+    /// See [`CleanFullScanRecheck`].
+    recheck: Option<CleanFullScanRecheck>,
+}
+
+/// How much of a completed pass a follow-up pass has to redo.
+///
+/// A scan reads its candidates in sorted order at increasing times. An
+/// observation arriving when the cursor sits at candidate `p` is already covered
+/// for every candidate from `p` onward — those are read *after* it arrived — and
+/// uncovered only for the prefix read before it. So the follow-up pass has to
+/// redo that prefix and nothing else.
+///
+/// This is the whole anti-chain property. Before it, an observation arriving
+/// mid-scan left `CleanWatcherState::full_scan` set (the flag having been cleared
+/// at *begin*), and the completed scan was immediately followed by a fresh
+/// whole-graph pass with no idle gap — so a cycle that overran its window made
+/// rescans back-to-back and the actor lane was never free. Now each follow-up
+/// pass covers a strictly shorter prefix, so an overrun converges instead of
+/// chaining.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CleanFullScanRecheck {
+    /// The pass had already read every candidate when the observation arrived.
+    All,
+    /// Candidates strictly before this path were read too early to have seen it.
+    Before(ManagedPath),
+}
+
+/// What a completed pass hands to the pass that answers the observations which
+/// arrived while it ran.
+struct CleanFullScanResume {
+    recheck: CleanFullScanRecheck,
+    /// The completed pass's candidate list, so the follow-up can tell a path it
+    /// already covered late in that pass from one that appeared afterwards.
+    previous: Vec<ManagedPath>,
 }
 
 enum CleanFullScanStep {
@@ -5524,6 +5591,9 @@ impl CleanRuntimeActorCore {
             watcher,
             full_scan: None,
             completed_full_scan: None,
+            full_scan_resume: None,
+            full_scan_worst_turn_reads: 0,
+            full_scan_total_reads: 0,
             external_change_pending_notification: false,
             provider_change_pending_notification: None,
         }
@@ -5660,12 +5730,35 @@ impl CleanRuntimeActorCore {
 
     fn observe(&mut self, observations: Vec<SyncWatcherObservation>) {
         for observation in observations {
+            // Only an observation that forces a whole-graph sweep can create a
+            // follow-up pass, so only that kind moves the recheck bound.
+            let forces_full_scan = !matches!(observation, SyncWatcherObservation::ManagedPath(_));
             self.watcher.enqueue(observation);
+            if !forces_full_scan {
+                continue;
+            }
+            match self.full_scan.as_mut() {
+                Some(continuation) => {
+                    // Everything from the cursor onward will be read after this
+                    // observation arrived, so it is already covered.
+                    continuation.recheck =
+                        Some(match continuation.candidates.get(continuation.next) {
+                            Some(path) => CleanFullScanRecheck::Before(path.clone()),
+                            None => CleanFullScanRecheck::All,
+                        });
+                }
+                // No pass is running, so nothing is covered: whatever a previous
+                // pass handed forward no longer bounds the work this observation
+                // demands.
+                None => self.full_scan_resume = None,
+            }
         }
     }
 
     fn watcher_status(&self) -> SyncWatcherStatus {
         let mut status = self.watcher.status();
+        status.full_scan_documents_read_in_slowest_turn = self.full_scan_worst_turn_reads;
+        status.full_scan_documents_read = self.full_scan_total_reads;
         if self.full_scan.is_some() || self.completed_full_scan.is_some() {
             status.pending = true;
             status.pending_requires_full_scan = true;
@@ -5682,14 +5775,15 @@ impl CleanRuntimeActorCore {
             return Ok(());
         }
         let epoch = self.watcher.latest_enqueue;
-        let disk = graph
-            .fresh_initial_shadow_raw_managed_text_inventory()
-            .map_err(|error| CleanActorMutationFailure {
+        // Paths only. The bytes are read lazily by `advance_full_scan`, inside
+        // its per-turn budget; capturing them here is what made this turn an
+        // unbudgeted `2 × N` file-open sweep of the whole graph.
+        let disk = graph.clean_watcher_managed_text_paths().map_err(|error| {
+            CleanActorMutationFailure {
                 phase: OperationalPhase::Planning,
                 detail: format!("clean watcher full graph capture failed: {error}"),
-            })?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
+            }
+        })?;
         let read = self
             .runtime
             .database()
@@ -5698,7 +5792,7 @@ impl CleanRuntimeActorCore {
                 phase: OperationalPhase::Planning,
                 detail: format!("clean watcher SQLite inventory failed: {error}"),
             })?;
-        let mut candidates = disk.keys().cloned().collect::<BTreeSet<_>>();
+        let mut candidates = disk.into_iter().collect::<BTreeSet<_>>();
         let mut cursor = None;
         loop {
             let pages = read
@@ -5732,6 +5826,24 @@ impl CleanRuntimeActorCore {
                     detail: format!("clean watcher manifest path inventory failed: {error}"),
                 })?,
         );
+        // A pass that ran while observations arrived told us exactly how much of
+        // itself those observations did NOT cover. Redo that and nothing else,
+        // so an overrunning cycle converges instead of chaining whole-graph
+        // passes back to back.
+        let candidates: Vec<ManagedPath> = match self.full_scan_resume.take() {
+            None => candidates.into_iter().collect(),
+            Some(CleanFullScanResume {
+                recheck: CleanFullScanRecheck::All,
+                ..
+            }) => candidates.into_iter().collect(),
+            Some(CleanFullScanResume {
+                recheck: CleanFullScanRecheck::Before(bound),
+                previous,
+            }) => candidates
+                .into_iter()
+                .filter(|path| *path < bound || previous.binary_search(path).is_err())
+                .collect(),
+        };
         let retained_epoch = self
             .watcher
             .begin_full_scan()
@@ -5739,15 +5851,18 @@ impl CleanRuntimeActorCore {
         debug_assert_eq!(retained_epoch, epoch);
         self.full_scan = Some(CleanFullScanContinuation {
             epoch,
-            disk,
-            candidates: candidates.into_iter().collect(),
+            candidates,
             next: 0,
             changed: BTreeSet::new(),
+            recheck: None,
         });
         Ok(())
     }
 
-    fn advance_full_scan(&mut self) -> Result<CleanFullScanStep, CleanActorMutationFailure> {
+    fn advance_full_scan(
+        &mut self,
+        graph: &Graph,
+    ) -> Result<CleanFullScanStep, CleanActorMutationFailure> {
         let continuation = self
             .full_scan
             .as_mut()
@@ -5765,6 +5880,17 @@ impl CleanRuntimeActorCore {
         while continuation.next < continuation.candidates.len() {
             let path = continuation.candidates[continuation.next].clone();
             processed += 1;
+            // One document read, charged to this turn's budget. Reconciliation
+            // recaptures every path it is handed under its own two-pass
+            // authority, so this read is a filter, never publication evidence --
+            // and reading it here rather than in `begin_full_scan` is what keeps
+            // the whole scan inside a bound.
+            let disk = graph
+                .clean_watcher_managed_text_read(&path)
+                .map_err(|error| CleanActorMutationFailure {
+                    phase: OperationalPhase::Planning,
+                    detail: format!("clean watcher read for {path} failed: {error}"),
+                })?;
             let owners =
                 read.pages_by_path(&path, 2)
                     .map_err(|error| CleanActorMutationFailure {
@@ -5791,7 +5917,7 @@ impl CleanRuntimeActorCore {
                     phase: OperationalPhase::Planning,
                     detail: format!("clean watcher observation for {path} failed: {error}"),
                 })?;
-            let differs = match (continuation.disk.get(&path), &predecessor) {
+            let differs = match (disk.as_ref(), &predecessor) {
                 (None, None)
                 | (None, Some(crate::oplog::hot_engine::CleanObservedProjection::Released)) => {
                     false
@@ -5806,7 +5932,7 @@ impl CleanRuntimeActorCore {
                 if std::env::var_os("TINE_CLEAN_WATCHER_TRACE").is_some() {
                     eprintln!(
                         "clean watcher changed path {path}: disk={} predecessor={}",
-                        continuation.disk.get(&path).map_or_else(
+                        disk.as_ref().map_or_else(
                             || "absent".to_owned(),
                             |bytes| format!(
                                 "{}:{:?}",
@@ -5841,6 +5967,13 @@ impl CleanRuntimeActorCore {
             .full_scan
             .take()
             .expect("completed full scan continuation remains installed");
+        // Flush what this pass found FIRST -- an observation arriving mid-pass
+        // must never be able to postpone reconciliation of what the pass already
+        // proved changed -- and hand the follow-up pass its bound.
+        self.full_scan_resume = completed.recheck.map(|recheck| CleanFullScanResume {
+            recheck,
+            previous: completed.candidates,
+        });
         Ok(CleanFullScanStep::Complete {
             epoch: completed.epoch,
             changed: completed.changed,
@@ -22005,38 +22138,41 @@ impl RuntimeActor {
                 };
             }
             if let Some((epoch, changed)) = clean.completed_full_scan.as_ref() {
-                (Ok(changed.clone()), Some(*epoch))
+                (changed.clone(), Some(*epoch))
             } else if clean.full_scan.is_some() || clean.watcher.full_scan {
-                if let Err(error) = clean.begin_full_scan(&self.graph) {
-                    self.refresh_watcher();
-                    return SyncRuntimeTick::Failed(format!(
-                        "clean external reconciliation failed during {:?}: {}",
-                        error.phase, error.detail
-                    ));
-                }
-                match clean.advance_full_scan() {
-                    Ok(CleanFullScanStep::Pending) => {
+                // Both halves of the scan read documents; charge them to ONE
+                // turn, because one turn is what holds the actor lane.
+                let reads_before = crate::model::managed_text_capture_reads();
+                let outcome = clean
+                    .begin_full_scan(&self.graph)
+                    .and_then(|()| clean.advance_full_scan(&self.graph).map(Some));
+                let turn_reads =
+                    crate::model::managed_text_capture_reads().saturating_sub(reads_before);
+                clean.full_scan_worst_turn_reads = clean.full_scan_worst_turn_reads.max(turn_reads);
+                clean.full_scan_total_reads =
+                    clean.full_scan_total_reads.saturating_add(turn_reads);
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.refresh_watcher();
+                        return SyncRuntimeTick::Failed(format!(
+                            "clean external reconciliation failed during {:?}: {}",
+                            error.phase, error.detail
+                        ));
+                    }
+                };
+                match outcome.expect("a successful full-scan turn produces a step") {
+                    CleanFullScanStep::Pending => {
                         self.refresh_watcher();
                         return SyncRuntimeTick::Recovering;
                     }
-                    Ok(CleanFullScanStep::Complete { epoch, changed }) => {
+                    CleanFullScanStep::Complete { epoch, changed } => {
                         clean.completed_full_scan = Some((epoch, changed.clone()));
-                        (Ok(changed), Some(epoch))
+                        (changed, Some(epoch))
                     }
-                    Err(error) => (Err(error), None),
                 }
             } else {
-                (Ok(clean.watcher.exact.clone()), None)
-            }
-        };
-        let paths = match paths {
-            Ok(paths) => paths,
-            Err(error) => {
-                self.refresh_watcher();
-                return SyncRuntimeTick::Failed(format!(
-                    "clean external reconciliation failed during {:?}: {}",
-                    error.phase, error.detail
-                ));
+                (clean.watcher.exact.clone(), None)
             }
         };
         let outcome = self
@@ -29498,6 +29634,9 @@ fn map_watcher(status: crate::oplog::watcher_queue::WatcherQueueStatus) -> SyncW
         deferred: status.deferred,
         quiescing: status.quiescing,
         sequence_exhausted: status.sequence_exhausted,
+        // The legacy managed-local queue has no bounded full scan to report.
+        full_scan_documents_read_in_slowest_turn: 0,
+        full_scan_documents_read: 0,
     }
 }
 
@@ -46940,6 +47079,166 @@ mod tests {
             SyncApplicationPageLoadOutcome::Loaded { page, .. } if page.path == "Root.md"
         ));
         drain_until_settled(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The clean watcher full scan reads documents inside its per-turn budget,
+    /// not in one unbudgeted opening turn.
+    ///
+    /// `begin_full_scan` used to seed itself from
+    /// `fresh_initial_shadow_raw_managed_text_inventory`: a two-pass
+    /// byte-retaining capture of the whole graph, `2 x N` file opens, in the
+    /// single actor turn that every application read then queued behind. This
+    /// pins the bound the rewrite exists to hold.
+    #[test]
+    fn clean_full_scan_reads_no_more_documents_per_turn_than_its_path_budget() {
+        const PAGES: usize = CLEAN_FULL_SCAN_PATH_BUDGET * 4;
+        let fixture = ActivationFixture::nested_unicode("clean-full-scan-read-budget", 0xa190);
+        fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+        for index in 0..PAGES {
+            fs::write(
+                fixture
+                    .graph_root
+                    .join("pages")
+                    .join(format!("read budget {index}.md")),
+                format!("- read budget page {index}\n"),
+            )
+            .unwrap();
+        }
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        drain_until_settled(&handle);
+
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+            .unwrap();
+        drain_until_settled(&handle);
+
+        let watcher = handle.status().unwrap().watcher;
+        assert!(
+            watcher.full_scan_documents_read_in_slowest_turn <= CLEAN_FULL_SCAN_PATH_BUDGET,
+            "no full-scan turn may read more documents than its path budget: \
+             slowest turn read {}, budget {CLEAN_FULL_SCAN_PATH_BUDGET}, graph has {PAGES} pages",
+            watcher.full_scan_documents_read_in_slowest_turn
+        );
+        assert!(
+            watcher.full_scan_documents_read_in_slowest_turn > 0,
+            "the scan must actually have read the graph"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// A rescan arriving DURING a full scan must not chain a second whole-graph
+    /// pass behind the first.
+    ///
+    /// `CleanWatcherState::begin_full_scan` clears the pending flag when the
+    /// continuation is installed, so an observation arriving mid-scan set it
+    /// again; on completion `has_runnable_work` was true, the watcher re-ticked
+    /// immediately, and a fresh whole-graph pass started with no idle gap. On a
+    /// device where one cycle overruns its 3 s poll window that made rescans
+    /// back-to-back and the single actor lane was never free.
+    ///
+    /// The scan now carries the bound instead: candidates from the cursor onward
+    /// are read AFTER the observation arrived and are already covered, so the
+    /// follow-up pass redoes only the prefix read before it.
+    #[test]
+    fn clean_full_scan_overrun_redoes_only_the_prefix_the_rescan_did_not_cover() {
+        const PAGES: usize = CLEAN_FULL_SCAN_PATH_BUDGET * 4;
+        let fixture = ActivationFixture::nested_unicode("clean-full-scan-overrun", 0xa191);
+        fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+        for index in 0..PAGES {
+            fs::write(
+                fixture
+                    .graph_root
+                    .join("pages")
+                    .join(format!("overrun {index}.md")),
+                format!("- overrun page {index}\n"),
+            )
+            .unwrap();
+        }
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        drain_until_settled(&handle);
+
+        // Calibrate: what ONE complete, uninterrupted pass over this graph costs.
+        // Measured rather than assumed, because the fixture carries pages this
+        // test did not write.
+        let before_calibration = handle.status().unwrap().watcher.full_scan_documents_read;
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+            .unwrap();
+        drain_until_settled(&handle);
+        let settled = handle.status().unwrap().watcher;
+        assert!(
+            !settled.pending && !settled.drain_in_flight,
+            "the calibration pass must settle: {settled:?}"
+        );
+        let one_pass = settled.full_scan_documents_read - before_calibration;
+        assert!(
+            one_pass > CLEAN_FULL_SCAN_PATH_BUDGET,
+            "the calibration pass must span several budgeted turns: read {one_pass}"
+        );
+
+        // The overrun.
+        let before_overrun = settled.full_scan_documents_read;
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+            .unwrap();
+        assert_eq!(
+            handle.tick().unwrap(),
+            SyncRuntimeTick::Recovering,
+            "one full-scan turn must stop at its path budget"
+        );
+        let after_one_turn = handle.status().unwrap().watcher;
+        assert!(
+            after_one_turn.drain_in_flight,
+            "the scan must still be in flight when the second rescan arrives"
+        );
+        let uncovered = after_one_turn.full_scan_documents_read - before_overrun;
+        // A second rescan lands while the first is still running.
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+            .unwrap();
+        for _ in 0..128 {
+            let watcher = handle.status().unwrap().watcher;
+            if !watcher.pending && !watcher.drain_in_flight {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+
+        let watcher = handle.status().unwrap().watcher;
+        assert!(
+            !watcher.pending && !watcher.drain_in_flight,
+            "the absorbed rescan must settle instead of chaining: {watcher:?}"
+        );
+        let total = watcher.full_scan_documents_read - before_overrun;
+        // One complete pass, plus a follow-up covering only the prefix the first
+        // pass had already read when the second rescan arrived. Two complete
+        // passes is the chain this test exists to forbid.
+        assert!(
+            total < 2 * one_pass,
+            "an overrunning rescan must not cost a second whole-graph pass: \
+             read {total} documents where one pass costs {one_pass}"
+        );
+        assert!(
+            total <= one_pass + uncovered,
+            "the follow-up pass must redo only the uncovered prefix: read {total}, \
+             expected at most {} ({one_pass} + {uncovered})",
+            one_pass + uncovered
+        );
+        assert!(
+            total > one_pass,
+            "the follow-up pass must actually redo the uncovered prefix: read {total}"
+        );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
