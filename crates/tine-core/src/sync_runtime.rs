@@ -60496,6 +60496,377 @@ mod tests {
         ));
     }
 
+    /// The Journals back-gesture, staged.
+    ///
+    /// Martin reports that under managed storage on Android, opening a page
+    /// forward is fast while the back gesture to Journals — a feed loaded
+    /// seconds earlier, with nothing changed in between — takes 2–3 seconds.
+    /// The commands behind the two gestures are not the same shape:
+    /// `get_page` is ONE actor page load, while `journal_feed_page` is a FULL
+    /// page inventory followed by `limit` page loads. This receipt separates
+    /// those stages so the cost is attributed rather than guessed at, and
+    /// prints the Direct Files analogue of each stage beside it.
+    #[test]
+    #[ignore = "manual benchmark: the Journals back gesture, staged, on a supplied graph copy"]
+    fn managed_journals_back_navigation_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run with TINE_MANAGED_NAV_GRAPH_COPY=<copy> cargo test -p tine-core --release managed_journals_back_navigation_manual_benchmark -- --ignored --nocapture"
+        );
+        let source_root = real_graph_copy_source_from_env("TINE_MANAGED_NAV_GRAPH_COPY");
+        let rounds = std::env::var("TINE_MANAGED_NAV_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|rounds| *rounds > 0)
+            .unwrap_or(12);
+        // `FEED_PAGE` in src/components/Page.tsx.
+        const FEED_LIMIT: usize = 3;
+
+        let fixture =
+            ActivationFixture::copied_graph("managed-journals-back-nav", 0xa1c0, &source_root);
+        let source = user_graph_bytes(&fixture.graph_root);
+
+        let direct_graph = Graph::open(&fixture.graph_root);
+        let direct_list_cold = Instant::now();
+        let direct_entries = direct_graph.list_pages();
+        let direct_list_cold = direct_list_cold.elapsed();
+        let direct_list_warm = Instant::now();
+        let _ = direct_graph.list_pages();
+        let direct_list_warm = direct_list_warm.elapsed();
+        assert!(!direct_entries.is_empty());
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("managed reopen retains its actor");
+
+        let today = crate::date::JournalDate::today().ordinal_key();
+        let feed_paths = |pages: &[PageEntry]| -> Vec<String> {
+            let mut journals = pages
+                .iter()
+                .filter(|entry| {
+                    entry.kind == PageKind::Journal
+                        && entry.date_key.is_some_and(|day| day <= today)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if journals.len() < FEED_LIMIT {
+                journals = pages
+                    .iter()
+                    .filter(|entry| entry.kind == PageKind::Journal && entry.date_key.is_some())
+                    .cloned()
+                    .collect();
+            }
+            journals.sort_by_key(|entry| std::cmp::Reverse(entry.date_key.unwrap_or(0)));
+            journals
+                .into_iter()
+                .take(FEED_LIMIT)
+                .map(|entry| entry.rel_path)
+                .collect()
+        };
+
+        let mut inventory_samples = Vec::with_capacity(rounds);
+        let mut feed_load_samples = Vec::with_capacity(rounds);
+        let mut feed_total_samples = Vec::with_capacity(rounds);
+        let mut forward_samples = Vec::with_capacity(rounds);
+        let mut direct_feed_samples = Vec::with_capacity(rounds);
+        let mut direct_forward_samples = Vec::with_capacity(rounds);
+
+        // The forward gesture's target: an ordinary (non-journal) page, the
+        // largest one, so the comparison is not flattered by a tiny file.
+        let forward_entry = direct_entries
+            .iter()
+            .filter(|entry| entry.kind == PageKind::Page)
+            .max_by_key(|entry| std::fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0))
+            .cloned()
+            .unwrap_or_else(|| direct_entries[0].clone());
+
+        let mut inventory_len = 0usize;
+        for _ in 0..rounds {
+            // Back gesture: journal_feed_page = inventory, then FEED_LIMIT loads.
+            let feed_started = Instant::now();
+            let inventory_started = Instant::now();
+            let pages = match handle.application_page_inventory().unwrap() {
+                SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+                other => panic!("managed page inventory did not load: {other:?}"),
+            };
+            let inventory_elapsed = inventory_started.elapsed();
+            inventory_len = pages.len();
+            let paths = feed_paths(&pages);
+            let loads_started = Instant::now();
+            for path in &paths {
+                let _ = load_application_exact(&handle, path);
+            }
+            let loads_elapsed = loads_started.elapsed();
+            let feed_elapsed = feed_started.elapsed();
+            inventory_samples.push(inventory_elapsed);
+            feed_load_samples.push(loads_elapsed);
+            feed_total_samples.push(feed_elapsed);
+
+            // Forward gesture: get_page = ONE actor page load.
+            let forward_started = Instant::now();
+            let _ = load_application_exact(&handle, &forward_entry.rel_path);
+            forward_samples.push(forward_started.elapsed());
+
+            // Direct Files analogues of the same two gestures.
+            let direct_feed_started = Instant::now();
+            let direct_pages = direct_graph.list_pages();
+            let direct_paths = feed_paths(&direct_pages);
+            for path in &direct_paths {
+                let entry = direct_pages
+                    .iter()
+                    .find(|entry| &entry.rel_path == path)
+                    .expect("the direct feed path is in the direct inventory");
+                let _ = direct_graph.load_page(entry).unwrap();
+            }
+            direct_feed_samples.push(direct_feed_started.elapsed());
+
+            let direct_forward_started = Instant::now();
+            let _ = direct_graph.load_page(&forward_entry).unwrap();
+            direct_forward_samples.push(direct_forward_started.elapsed());
+        }
+
+        let report = |label: &str, samples: &[Duration]| {
+            eprintln!(
+                "managed_journals_back_nav stage={label} p50_ms={:.3} p95_ms={:.3} max_ms={:.3}",
+                startup_ms(startup_median(samples)),
+                startup_ms(startup_p95(samples)),
+                startup_ms(samples.iter().copied().max().unwrap_or(Duration::ZERO)),
+            );
+        };
+        eprintln!(
+            "managed_journals_back_nav pages={inventory_len} direct_pages={} rounds={rounds} feed_limit={FEED_LIMIT} direct_list_cold_ms={:.3} direct_list_warm_ms={:.3}",
+            direct_entries.len(),
+            startup_ms(direct_list_cold),
+            startup_ms(direct_list_warm),
+        );
+        report("managed_back_total", &feed_total_samples);
+        report("managed_back_inventory", &inventory_samples);
+        report("managed_back_page_loads", &feed_load_samples);
+        report("managed_forward_one_page", &forward_samples);
+        report("direct_back_total", &direct_feed_samples);
+        report("direct_forward_one_page", &direct_forward_samples);
+
+        assert_eq!(user_graph_bytes(&fixture.graph_root), source);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    /// What one Android poll cycle costs the navigation lane.
+    ///
+    /// `watch_mode` defaults to `"poll"` on Android
+    /// (src-tauri/src/watcher.rs:1797-1817) with a 3 s cycle. Every such cycle
+    /// pushes `RescanRequired`, and the actor answers it with `begin_full_scan`
+    /// followed by budgeted continuation turns, all of them holding the same
+    /// `operation` lane that `journal_feed_page` and `get_page` need. This
+    /// receipt drives exactly that loop and reports (a) how long the scan owns
+    /// the lane and (b) what a Journals back gesture and a forward page open
+    /// cost while it does.
+    #[test]
+    #[ignore = "manual benchmark: what an Android poll-cycle rescan costs the navigation lane"]
+    fn managed_poll_cycle_rescan_navigation_cost_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run with TINE_MANAGED_NAV_GRAPH_COPY=<copy> cargo test -p tine-core --release managed_poll_cycle_rescan_navigation_cost_manual_benchmark -- --ignored --nocapture"
+        );
+        let source_root = real_graph_copy_source_from_env("TINE_MANAGED_NAV_GRAPH_COPY");
+        let cycles = std::env::var("TINE_MANAGED_NAV_BENCH_SCAN_CYCLES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|cycles| *cycles > 0)
+            .unwrap_or(3);
+        const FEED_LIMIT: usize = 3;
+        // `RetryState::progressed` in src-tauri/src/watcher.rs re-arms a
+        // continuing scan at 10 ms.
+        const CONTINUATION_CADENCE: Duration = Duration::from_millis(10);
+
+        let fixture =
+            ActivationFixture::copied_graph("managed-poll-cycle-rescan-nav", 0xa1d0, &source_root);
+        let source = user_graph_bytes(&fixture.graph_root);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = std::sync::Arc::new(opened.handle.expect("managed reopen retains its actor"));
+
+        let today = crate::date::JournalDate::today().ordinal_key();
+        let inventory_of = |handle: &SyncRuntimeHandle| -> Vec<PageEntry> {
+            match handle.application_page_inventory().unwrap() {
+                SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+                other => panic!("managed page inventory did not load: {other:?}"),
+            }
+        };
+        let baseline_inventory = inventory_of(&handle);
+        let mut journals = baseline_inventory
+            .iter()
+            .filter(|entry| {
+                entry.kind == PageKind::Journal && entry.date_key.is_some_and(|day| day <= today)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if journals.len() < FEED_LIMIT {
+            journals = baseline_inventory
+                .iter()
+                .filter(|entry| entry.kind == PageKind::Journal && entry.date_key.is_some())
+                .cloned()
+                .collect();
+        }
+        journals.sort_by_key(|entry| std::cmp::Reverse(entry.date_key.unwrap_or(0)));
+        let feed_paths = journals
+            .iter()
+            .take(FEED_LIMIT)
+            .map(|entry| entry.rel_path.clone())
+            .collect::<Vec<_>>();
+        assert!(!feed_paths.is_empty());
+        let forward_path = baseline_inventory
+            .iter()
+            .filter(|entry| entry.kind == PageKind::Page)
+            .max_by_key(|entry| std::fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0))
+            .map(|entry| entry.rel_path.clone())
+            .unwrap_or_else(|| baseline_inventory[0].rel_path.clone());
+
+        // Uncontended reference, on the same actor, before any rescan is armed.
+        let idle_back = Instant::now();
+        let _ = inventory_of(&handle);
+        for path in &feed_paths {
+            let _ = load_application_exact(&handle, path);
+        }
+        let idle_back = idle_back.elapsed();
+        let idle_forward = Instant::now();
+        let _ = load_application_exact(&handle, &forward_path);
+        let idle_forward = idle_forward.elapsed();
+
+        let scanning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scan_handle = std::sync::Arc::clone(&handle);
+        let scan_running = std::sync::Arc::clone(&scanning);
+        let scanner = std::thread::spawn(move || {
+            // One poll cycle, exactly as src-tauri/src/watcher.rs drives it:
+            // observe `RescanRequired`, then re-tick at the 10 ms continuation
+            // cadence for as long as the actor reports it is still recovering.
+            let mut receipts = Vec::new();
+            for _ in 0..cycles {
+                scan_handle
+                    .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+                    .expect("the watcher observation is accepted");
+                let cycle_started = Instant::now();
+                let mut turns = 0_usize;
+                let mut first_turn = Duration::ZERO;
+                let mut slowest_turn = Duration::ZERO;
+                let mut lane_held = Duration::ZERO;
+                loop {
+                    let turn_started = Instant::now();
+                    let tick = scan_handle.tick().expect("the actor answers a tick");
+                    let turn = turn_started.elapsed();
+                    lane_held = lane_held.saturating_add(turn);
+                    if turns == 0 {
+                        first_turn = turn;
+                    }
+                    if turn > slowest_turn {
+                        slowest_turn = turn;
+                    }
+                    turns += 1;
+                    match tick {
+                        SyncRuntimeTick::Recovering | SyncRuntimeTick::RetryFull => {}
+                        _ => {
+                            if !scan_handle.status().unwrap().watcher.pending {
+                                break;
+                            }
+                        }
+                    }
+                    if turns >= 4_000 {
+                        break;
+                    }
+                    std::thread::sleep(CONTINUATION_CADENCE);
+                }
+                receipts.push((
+                    cycle_started.elapsed(),
+                    lane_held,
+                    turns,
+                    first_turn,
+                    slowest_turn,
+                ));
+            }
+            scan_running.store(false, std::sync::atomic::Ordering::Release);
+            receipts
+        });
+
+        // Meanwhile: the two gestures, on the lane the scan is holding.
+        let mut back_samples = Vec::new();
+        let mut forward_samples = Vec::new();
+        while scanning.load(std::sync::atomic::Ordering::Acquire) {
+            let back_started = Instant::now();
+            let _ = inventory_of(&handle);
+            for path in &feed_paths {
+                let _ = load_application_exact(&handle, path);
+            }
+            back_samples.push(back_started.elapsed());
+            let forward_started = Instant::now();
+            let _ = load_application_exact(&handle, &forward_path);
+            forward_samples.push(forward_started.elapsed());
+        }
+        let receipts = scanner.join().expect("the scan thread finishes");
+
+        for (index, (wall, lane_held, turns, first_turn, slowest_turn)) in
+            receipts.iter().enumerate()
+        {
+            eprintln!(
+                "managed_poll_cycle_rescan cycle={index} wall_ms={:.3} lane_held_ms={:.3} turns={turns} first_turn_ms={:.3} slowest_turn_ms={:.3}",
+                startup_ms(*wall),
+                startup_ms(*lane_held),
+                startup_ms(*first_turn),
+                startup_ms(*slowest_turn),
+            );
+        }
+        let report = |label: &str, samples: &[Duration]| {
+            if samples.is_empty() {
+                eprintln!("managed_poll_cycle_rescan stage={label} samples=0");
+                return;
+            }
+            eprintln!(
+                "managed_poll_cycle_rescan stage={label} n={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3}",
+                samples.len(),
+                startup_ms(startup_median(samples)),
+                startup_ms(startup_p95(samples)),
+                startup_ms(samples.iter().copied().max().unwrap_or(Duration::ZERO)),
+            );
+        };
+        eprintln!(
+            "managed_poll_cycle_rescan pages={} feed_limit={FEED_LIMIT} idle_back_ms={:.3} idle_forward_ms={:.3}",
+            baseline_inventory.len(),
+            startup_ms(idle_back),
+            startup_ms(idle_forward),
+        );
+        report("contended_back_total", &back_samples);
+        report("contended_forward_one_page", &forward_samples);
+
+        assert_eq!(user_graph_bytes(&fixture.graph_root), source);
+        let handle =
+            std::sync::Arc::try_unwrap(handle).expect("the scan thread released the handle");
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
     #[test]
     #[ignore = "manual release benchmark: managed application saves at 100 and 10,000 pages"]
     fn managed_application_save_100_and_10000_page_manual_benchmark() {
