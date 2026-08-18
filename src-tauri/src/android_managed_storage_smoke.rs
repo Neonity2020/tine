@@ -4,26 +4,35 @@
 //! invokes the real Rust runtime as Tine's app UID, with graph files on Android
 //! shared storage and all private authority below `filesDir`. That is the
 //! boundary ordinary host tests and cross-compilation cannot exercise.
+//!
+//! The journey itself — its graph fixture AND its call sequence — lives in
+//! `tine_core::managed_storage_journey`, which the host test drives too. This
+//! module is only the JNI shim and the request shape. Two hand-maintained
+//! copies of a journey diverge silently, and one already did: the device hit a
+//! reconciliation refusal the green CI journey never reached.
 
 use jni::objects::{JClass, JString};
-use jni::sys::jstring;
+use jni::sys::{jboolean, jstring};
 use jni::JNIEnv;
 use std::path::PathBuf;
-use std::time::Instant;
+use tine_core::managed_storage_journey::{
+    run_managed_storage_journey, write_journey_graph_fixture,
+};
 use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
 use tine_core::sync_runtime::{
-    SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
-    SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
-    SyncLocalActivationIdentities, SyncLocalActivationRequest, SyncLocalActivationStatus,
-    SyncRuntimeHandle, SyncRuntimeOpenRequest, SyncRuntimeOpenStatus, SyncShutdownOutcome,
+    SyncLocalActivationIdentities, SyncLocalActivationRequest, SyncRuntimeOpenRequest,
     SyncStorageProfile,
 };
 use uuid::Uuid;
 
-fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
-    let journey_started = Instant::now();
+fn run(graph_root: PathBuf, private_root: PathBuf, write_fixture: bool) -> String {
+    if write_fixture {
+        if let Err(error) = write_journey_graph_fixture(&graph_root) {
+            return format!("journey graph fixture could not be written: {error}");
+        }
+    }
     let workspace_id = WorkspaceId::new();
     let lineage_seed = Uuid::new_v4();
     let identities = SyncLocalActivationIdentities {
@@ -49,7 +58,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         provider_journal_root: private_root.join("provider/device/journal"),
     };
     let activation_request = SyncLocalActivationRequest {
-        graph_root,
+        graph_root: graph_root.clone(),
         archive_root: open_request.archive_root.clone(),
         enrollment_root: open_request.enrollment_root.clone(),
         receipt_root: open_request.receipt_root.clone(),
@@ -62,170 +71,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         provider_journal_root: open_request.provider_journal_root.clone(),
         identities,
     };
-
-    let mut last_progress = "activation-not-started".to_string();
-    let mut progress_receipt = Vec::new();
-    let activation = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
-        activation_request,
-        |progress| {
-            last_progress = format!("{progress:?}");
-            progress_receipt.push(format!(
-                "{}@{}ms",
-                progress.diagnostic_name(),
-                journey_started.elapsed().as_millis()
-            ));
-        },
-    );
-    let activation_ms = journey_started.elapsed().as_millis();
-    if activation.status != SyncLocalActivationStatus::Active {
-        return format!(
-            "activation failed after {last_progress}: {:?}",
-            activation.status
-        );
-    }
-    let Some(handle) = activation.handle else {
-        return "activation returned Active without a handle".into();
-    };
-    let first_page_started = Instant::now();
-    let (mut page, revision) = match handle.load_application_page(SyncApplicationPageLoadRequest {
-        page: SyncApplicationPageSelector::ExactPath {
-            path: "pages/Smoke.md".into(),
-        },
-    }) {
-        Ok(SyncApplicationPageLoadOutcome::Loaded { page, revision }) => (page, revision),
-        outcome => return format!("post-activation page load failed: {outcome:?}"),
-    };
-    let first_page_ms = first_page_started.elapsed().as_millis();
-    let Some(first) = page.blocks.first_mut() else {
-        return "post-activation page has no editable block".into();
-    };
-    first.raw = "Android managed storage edited".into();
-    let save_outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
-        target: SyncApplicationPageSaveTarget::Existing {
-            path: page.path.clone(),
-            revision,
-        },
-        page,
-    });
-    // A clean-runtime save can succeed only after settling a RETAINED
-    // publication, and settling it consumes the failure that caused it. Read
-    // the report either way: a converged retry still costs a retry on every
-    // write, and a bare "ok" receipt would hide the underlying cause.
-    let retained = match handle.last_retained_publication() {
-        Ok(Some(report)) => format!(
-            "retained_publication=batch:{} phase:{:?} settled:{} turns:{} detail:{}",
-            report.batch_id, report.phase, report.settled, report.settle_turns, report.detail
-        ),
-        Ok(None) => "retained_publication=none".to_owned(),
-        Err(error) => format!("retained_publication=unavailable:{error}"),
-    };
-    match save_outcome {
-        Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {}
-        // The instrumentation boundary can only report the returned value, so
-        // carry everything that distinguishes one refusal from another: the
-        // Display form (which names the stage and reason code), the debug
-        // detail, and the runtime's own status.
-        outcome => {
-            let detail = match &outcome {
-                Err(error) => format!(
-                    "display={error}; debug_detail={:?}",
-                    error.debug_detail().unwrap_or("none")
-                ),
-                Ok(_) => "not a refusal".to_owned(),
-            };
-            return format!(
-                "post-activation page save failed: {outcome:?}; {detail}; {retained}; status={}; progress={}",
-                describe_status(&handle),
-                progress_receipt.join("|")
-            );
-        }
-    }
-    // Match a force-closed app: do not ask the actor for a clean drain.  Drop
-    // the last sender, let the actor stop, and prove the exact durable edit can
-    // be recovered by a fresh runtime open before testing sharing.
-    drop(handle);
-
-    let reopen_started = Instant::now();
-    let crashed_reopen = SyncRuntimeHandle::open(open_request.clone());
-    let crash_reopen_ms = reopen_started.elapsed().as_millis();
-    if crashed_reopen.status != SyncRuntimeOpenStatus::Active {
-        return format!("crash-style reopen failed: {:?}", crashed_reopen.status);
-    }
-    let Some(handle) = crashed_reopen.handle else {
-        return "crash-style reopen returned Active without a handle".into();
-    };
-    match handle.load_application_page(SyncApplicationPageLoadRequest {
-        page: SyncApplicationPageSelector::ExactPath {
-            path: "pages/Smoke.md".into(),
-        },
-    }) {
-        Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. })
-            if page.blocks.first().map(|block| block.raw.as_str())
-                == Some("Android managed storage edited") => {}
-        outcome => return format!("crash-style reopened page mismatch: {outcome:?}"),
-    }
-    let shared = match handle.prepare_shared() {
-        Ok(descriptor) => format!("shared_descriptor={}", descriptor.descriptor_digest),
-        Err(error) => return format!("prepare shared failed: {error}"),
-    };
-    // A successful enrollment cut retires the actor, so this shutdown reads
-    // the runtime's own final state rather than reaching a live thread.
-    // `ActorUnavailable` carries no payload at all, so never report a shutdown
-    // refusal bare: `status=` distinguishes "the runtime stopped Safe and this
-    // is merely a report of it" from "the snapshot itself is unreachable, so
-    // the actor died some way the retirement contract does not describe".
-    match handle.clean_shutdown() {
-        Ok(SyncShutdownOutcome::Safe(_)) => {}
-        outcome => {
-            return format!(
-                "clean shutdown failed: {outcome:?}; {shared}; status={}; {retained}; progress={}",
-                describe_status(&handle),
-                progress_receipt.join("|")
-            )
-        }
-    }
-    drop(handle);
-
-    let reopened = SyncRuntimeHandle::open(open_request);
-    if reopened.status != SyncRuntimeOpenStatus::Active {
-        return format!(
-            "reopen after sharing failed: {:?}; {shared}",
-            reopened.status
-        );
-    }
-    let Some(handle) = reopened.handle else {
-        return "reopen returned Active without a handle".into();
-    };
-    match handle.clean_shutdown() {
-        Ok(SyncShutdownOutcome::Safe(_)) => format!(
-            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} total_ms={} {retained} {shared} progress={}",
-            journey_started.elapsed().as_millis(),
-            progress_receipt.join("|")
-        ),
-        outcome => format!(
-            "reopened clean shutdown failed: {outcome:?}; {shared}; status={}",
-            describe_status(&handle)
-        ),
-    }
-}
-
-/// The instrumentation boundary can report only returned values, and a
-/// `SyncRuntimeRequestError` carries no state. Name the runtime's own view of
-/// itself next to every refusal so one CI round trip localises it.
-fn describe_status(handle: &SyncRuntimeHandle) -> String {
-    match handle.status() {
-        Ok(status) => format!(
-            "lifecycle:{:?} recovery:{:?} shared_role:{:?} shared_phase:{:?} provider_pending:{} managed_local_pending:{} detail:{}",
-            status.lifecycle,
-            status.recovery,
-            status.shared_role,
-            status.shared_phase,
-            status.provider_pending,
-            status.managed_local_pending,
-            status.detail.as_deref().unwrap_or("none")
-        ),
-        Err(error) => format!("unavailable:{error}"),
-    }
+    run_managed_storage_journey(graph_root, open_request, activation_request)
 }
 
 #[unsafe(no_mangle)]
@@ -234,6 +80,7 @@ pub extern "system" fn Java_page_tine_app_ManagedStorageSmoke_runManagedActivati
     _class: JClass<'_>,
     graph_root: JString<'_>,
     private_root: JString<'_>,
+    write_fixture: jboolean,
 ) -> jstring {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let graph_root = env
@@ -244,7 +91,7 @@ pub extern "system" fn Java_page_tine_app_ManagedStorageSmoke_runManagedActivati
             .get_string(&private_root)
             .map(|value| PathBuf::from(value.to_string_lossy().into_owned()))
             .map_err(|error| format!("invalid private-root JNI string: {error}"))?;
-        Ok::<_, String>(run(graph_root, private_root))
+        Ok::<_, String>(run(graph_root, private_root, write_fixture != 0))
     }))
     .map_err(|_| "managed-storage smoke probe panicked".to_string())
     .and_then(|result| result)

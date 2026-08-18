@@ -6609,7 +6609,10 @@ pub(crate) fn plan_clean_affected_import(
         requested_paths: requested_paths.len(),
         ..ImportInstrumentation::default()
     };
-    let paths = match parse_requested_paths(requested_paths) {
+    let paths = match parse_requested_paths_with_portable_policy(
+        requested_paths,
+        PortablePathPolicy::SelectFirstExactPath,
+    ) {
         Ok(paths) => paths,
         Err(error) => return blocked_inventory_error(error, instrumentation),
     };
@@ -6835,7 +6838,31 @@ fn post_snapshot_frontier(
     engine.accepted_frontier_root()
 }
 
+/// What a requested set does with two exact paths that fold to one portable
+/// identity (`Caf\u{e9}.md` and `Cafe\u{301}.md`, `Foo.md` and `foo.md`).
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PortablePathPolicy {
+    /// The authenticated engine keeps ONE Patricia entry per portable path, so
+    /// a requested set that folds is refused rather than half-applied.
+    Refuse,
+    /// Clean managed storage has no such index: activation already accepts a
+    /// graph holding both spellings and selects the first exact path as its one
+    /// authoritative source (`bootstrap_authoritative_source_paths`). The
+    /// reconciler makes the SAME selection, because refusing the requested set
+    /// denied every path in the graph for as long as both files existed — and
+    /// two spellings of one name is the ordinary result of syncing a graph
+    /// between a normalizing or case-folding filesystem and this one.
+    SelectFirstExactPath,
+}
+
 fn parse_requested_paths(requested_paths: &[&str]) -> Result<Vec<ManagedPath>, InventoryError> {
+    parse_requested_paths_with_portable_policy(requested_paths, PortablePathPolicy::Refuse)
+}
+
+fn parse_requested_paths_with_portable_policy(
+    requested_paths: &[&str],
+    portable: PortablePathPolicy,
+) -> Result<Vec<ManagedPath>, InventoryError> {
     if requested_paths.len() > MAX_IMPORT_FILES {
         return Err(InventoryError::ResourceBudgetExceeded {
             resource: "requested managed path count",
@@ -6862,8 +6889,14 @@ fn parse_requested_paths(requested_paths: &[&str]) -> Result<Vec<ManagedPath>, I
         }
         paths.push(path);
     }
-    require_portable_unique(&paths)?;
     paths.sort_unstable();
+    match portable {
+        PortablePathPolicy::Refuse => require_portable_unique(&paths)?,
+        PortablePathPolicy::SelectFirstExactPath => {
+            let mut selected = BTreeSet::new();
+            paths.retain(|path| selected.insert(path.portable_key()));
+        }
+    }
     Ok(paths)
 }
 
@@ -8401,7 +8434,7 @@ fn plan_import(
         }
     };
 
-    let page_transition = match build_desired_page_transition(
+    let mut page_transition = match build_desired_page_transition(
         &inventory,
         &matches,
         &scope,
@@ -8413,9 +8446,15 @@ fn plan_import(
             return blocked_authority_error(Some(inventory), block, instrumentation);
         }
     };
-    if let Err(block) =
-        preflight_desired_page_names(&inventory, &page_transition, engine, clean_database)
-    {
+    let authority = match PageNameAuthority::open(engine, clean_database) {
+        Ok(authority) => authority,
+        Err(block) => return blocked_authority_error(Some(inventory), block, instrumentation),
+    };
+    let deduplicated = match retain_authoritative_desired_pages(&mut page_transition, &authority) {
+        Ok(deduplicated) => deduplicated,
+        Err(block) => return blocked_authority_error(Some(inventory), block, instrumentation),
+    };
+    if let Err(block) = preflight_desired_page_names(&inventory, &page_transition, &authority) {
         return blocked_authority_error(Some(inventory), block, instrumentation);
     }
 
@@ -8431,7 +8470,12 @@ fn plan_import(
             Some(RawObservation::Present(bytes)) if bytes.description() == page.description()
         )
     }) || inventory.entries().iter().any(|(path, observation)| {
-        matches!(observation, RawObservation::Present(_)) && !completed_paths.contains(path)
+        matches!(observation, RawObservation::Present(_))
+            && !completed_paths.contains(path)
+            // A source this transaction deliberately does not import is not
+            // evidence of a change. Without this it would be "new" on every
+            // pass, and every quiet tick would author an empty batch.
+            && !deduplicated.contains(path)
     });
     drop(completed);
     scope.path_identities = resolved_path_identities;
@@ -8490,6 +8534,122 @@ fn plan_import(
     }
 }
 
+/// The one current owner of a canonical page name, read from whichever
+/// authority this runtime keeps it in.
+///
+/// Clean managed storage deliberately has no second resident page-name index.
+/// Its disposable SQLite projection is the current name authority, just as it
+/// is for path ownership. Consulting the empty run-local fallback there used to
+/// let an ordinary collision pass preflight and fail only after authoring,
+/// poisoning the actor with an unpublished manifest.
+struct PageNameAuthority<'a> {
+    clean: Option<super::SqliteMaterializedRead<'a>>,
+    engine: &'a ShardedHotEngine,
+}
+
+impl<'a> PageNameAuthority<'a> {
+    fn open(
+        engine: &'a ShardedHotEngine,
+        clean_database: Option<&'a SqliteFrontier>,
+    ) -> Result<Self, ImportBlock> {
+        let clean = clean_database
+            .map(SqliteFrontier::materialized_read)
+            .transpose()
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    None,
+                    format!("clean SQLite page-name authority is unavailable: {error}"),
+                )
+            })?;
+        Ok(Self { clean, engine })
+    }
+
+    fn owner(
+        &self,
+        name: &LogicalPageName,
+        path: &ManagedPath,
+    ) -> Result<Option<PageId>, ImportBlock> {
+        match self.clean.as_ref() {
+            Some(read) => Ok(read
+                .causal_page_name_identity_record(name.key_digest())
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(path),
+                        format!("clean SQLite logical page-name lookup failed: {error}"),
+                    )
+                })?
+                .and_then(|record| record.occupied().map(|owner| owner.page_id()))),
+            None => self
+                .engine
+                .current_page_for_logical_name(name)
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(path),
+                        format!("authenticated logical page-name lookup failed: {error}"),
+                    )
+                }),
+        }
+    }
+}
+
+/// Apply activation's deterministic source selection to the affected set, so a
+/// graph that already holds two physical files for one canonical page name
+/// keeps reconciling instead of refusing every path in the transaction.
+///
+/// `bootstrap_authoritative_source_paths` selects ONE authoritative source per
+/// canonical page name and per portable path at activation, matching OG's
+/// "retain the first, skip the later collision"
+/// (`frontend.handler.repo/parse-files-and-load-to-db!`). Every later member
+/// stays on disk as ordinary graph text with no page of its own. Reconciliation
+/// then met that same file as a brand-new page whose decoded name was already
+/// owned, and refused the whole transaction — for every path, on every tick,
+/// with no way for the user to make progress (GH: Android, 2026-08-18).
+///
+/// A source that carries no accepted page identity and cannot acquire the name
+/// it decodes to therefore acquires no identity at all here either. Its exact
+/// bytes stay on disk and are still observed; only the semantic page is
+/// withheld. An accepted page is never withdrawn this way: it keeps whatever
+/// identity it already has, and a real title change into a taken name remains
+/// the visible ambiguity the preflight below refuses.
+fn retain_authoritative_desired_pages(
+    transition: &mut DesiredPageTransition,
+    authority: &PageNameAuthority<'_>,
+) -> Result<BTreeSet<ManagedPath>, ImportBlock> {
+    let mut claimed = BTreeMap::<super::PageNameKeyDigest, PageId>::new();
+    let mut deduplicated = BTreeSet::new();
+    for (path, page) in transition
+        .pages
+        .iter()
+        .filter(|(_, page)| page.acquires_name)
+    {
+        let key = page.name.key_digest();
+        let claimant = claimed
+            .get(&key)
+            .copied()
+            .filter(|claimant| *claimant != page.page_id);
+        // An authority that cannot answer is never read as "the name is free".
+        let owner = authority.owner(&page.name, path)?.filter(|owner| {
+            *owner != page.page_id && !transition.released_name_owners.contains(owner)
+        });
+        match claimant.or(owner) {
+            Some(_) if !page.existing => {
+                deduplicated.insert(path.clone());
+            }
+            Some(_) => {}
+            None => {
+                claimed.insert(key, page.page_id);
+            }
+        }
+    }
+    for path in &deduplicated {
+        transition.pages.remove(path);
+    }
+    Ok(deduplicated)
+}
+
 /// Refuse a transaction before authoring when two affected files would acquire
 /// one logical page name, or when an affected destination name is already
 /// owned by another authenticated page.  Paths are deliberately not used as a
@@ -8498,24 +8658,8 @@ fn plan_import(
 fn preflight_desired_page_names(
     inventory: &RawInventory,
     transition: &DesiredPageTransition,
-    engine: &ShardedHotEngine,
-    clean_database: Option<&SqliteFrontier>,
+    authority: &PageNameAuthority<'_>,
 ) -> Result<(), ImportBlock> {
-    // Clean managed storage deliberately has no second resident page-name
-    // index. Its disposable SQLite projection is the current name authority,
-    // just as it is for path ownership. Consulting the empty run-local
-    // fallback here used to let an ordinary collision pass preflight and fail
-    // only after authoring, poisoning the actor with an unpublished manifest.
-    let clean_read = clean_database
-        .map(SqliteFrontier::materialized_read)
-        .transpose()
-        .map_err(|error| {
-            authority_block(
-                ImportBlockReason::AuthorityUnavailable,
-                None,
-                format!("clean SQLite page-name authority is unavailable: {error}"),
-            )
-        })?;
     let mut desired = BTreeMap::new();
     for (path, page) in transition
         .pages
@@ -8542,36 +8686,37 @@ fn preflight_desired_page_names(
         }
     }
     for (_, (path, page_id, name)) in desired {
-        let owner = match clean_read.as_ref() {
-            Some(read) => read
-                .causal_page_name_identity_record(name.key_digest())
-                .map_err(|error| {
-                    authority_block(
-                        ImportBlockReason::AuthorityUnavailable,
-                        Some(&path),
-                        format!("clean SQLite logical page-name lookup failed: {error}"),
-                    )
-                })?
-                .and_then(|record| record.occupied().map(|owner| owner.page_id())),
-            None => engine
-                .current_page_for_logical_name(&name)
-                .map_err(|error| {
-                    authority_block(
-                        ImportBlockReason::AuthorityUnavailable,
-                        Some(&path),
-                        format!("authenticated logical page-name lookup failed: {error}"),
-                    )
-                })?,
-        };
+        let owner = authority.owner(&name, &path)?;
         if owner.is_some_and(|owner| {
             owner != page_id && !transition.released_name_owners.contains(&owner)
         }) {
+            // Said in the user's words, because this is the text a device
+            // showed the user once per tick: a page name and a UUID, neither of
+            // which appears anywhere in the app. Page names fold case and
+            // Unicode normalization here exactly as they do in Logseq
+            // (`canonical_page_name_key`), so "differ by more than
+            // capitalisation, accent spelling, or # vs %23" is the action that
+            // actually resolves it. The escape case is not hypothetical: a
+            // reported graph held one title twice, once with a literal `#` and
+            // once with `%23`, both files written by Logseq years earlier — so
+            // a message naming only capitalisation would read as "not my
+            // problem" to the person actually hitting it. The sentence is the
+            // same on a filesystem that folds those names into
+            // one file (`docs/storage-sync-contract.md` §2.10d). The owning
+            // page id stays at the end for diagnosis.
             return Err(authority_block(
                 ImportBlockReason::ConflictingLocalTail,
                 Some(&path),
                 format!(
-                    "decoded destination logical page name {} is already owned by page {}",
+                    "another file in this graph is already the page \u{201c}{}\u{201d}, so \
+                     {} cannot take that name too — the two file names differ only in a way \
+                     Tine and Logseq both ignore when they read a page name: capitalisation, \
+                     accent spelling, or writing a character literally where the other escapes \
+                     it (a title containing # can be stored as # or as %23). Rename one file \
+                     if you meant two different pages (decoded destination logical page name \
+                     is already owned by page {})",
                     name.as_str(),
+                    path.as_str(),
                     owner.expect("checked above")
                 ),
             ));
@@ -8933,14 +9078,39 @@ fn build_execution_material(
         let state = match observation {
             RawObservation::Absent => ExternalImportObservationState::Absent,
             RawObservation::Present(bytes) => {
+                let Some(page) = desired_pages.get(path) else {
+                    // A source this transaction deliberately does not import:
+                    // another physical file already owns its canonical page
+                    // name, exactly as activation decided
+                    // (`retain_authoritative_desired_pages`). Its exact bytes
+                    // are still observed, so the transaction still proves what
+                    // was on disk; no block identity is assigned to them and no
+                    // operation touches the file.
+                    observation_entries.push(
+                        ExternalImportObservationEntry::new(
+                            path.clone(),
+                            kind,
+                            ExternalImportObservationState::present(
+                                bytes.bytes().to_vec(),
+                                Vec::new(),
+                            )
+                            .map_err(|error| {
+                                ImportExecutionError::Observation(
+                                    ExternalImportObservationMaterialError::Observation(error),
+                                )
+                            })?,
+                        )
+                        .map_err(|error| {
+                            ImportExecutionError::Observation(
+                                ExternalImportObservationMaterialError::Observation(error),
+                            )
+                        })?,
+                    );
+                    continue;
+                };
                 let tree = trees.get(path).ok_or_else(|| {
                     ImportExecutionError::InvalidMaterial(
                         "sealed present inventory path has no parsed tree".into(),
-                    )
-                })?;
-                let page = desired_pages.get(path).ok_or_else(|| {
-                    ImportExecutionError::InvalidMaterial(
-                        "sealed present inventory path has no desired page".into(),
                     )
                 })?;
                 let mut annotations = Vec::with_capacity(tree.nodes.len());
@@ -11656,11 +11826,40 @@ mod tests {
         );
 
         let duplicate_names = legacy.plan(&["pages/left/shared.md", "pages/right/shared.md"]);
-        assert_eq!(duplicate_names.status(), ImportPlanStatus::Blocked);
+        assert!(
+            duplicate_names.blocks().is_empty(),
+            "same basenames in distinct paths must not deny the transaction: {:?}",
+            duplicate_names.blocks()
+        );
+        let duplicate_creates = duplicate_names
+            .execution_material()
+            .unwrap()
+            .transaction()
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                SemanticOperation::CreatePage { name, path, .. } => {
+                    Some((path.as_str().to_owned(), name.as_str().to_owned()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            duplicate_names.blocks()[0].reason,
-            ImportBlockReason::ConflictingLocalTail,
-            "same basenames in distinct paths are a visible ambiguity, never a successful import"
+            duplicate_creates,
+            vec![("pages/left/shared.md".to_owned(), "shared".to_owned())],
+            "exactly one deterministic exact path carries the shared name, as at activation"
+        );
+        assert!(
+            duplicate_names
+                .execution_material()
+                .unwrap()
+                .observation()
+                .entries()
+                .iter()
+                .any(|entry| entry.path().as_str() == "pages/right/shared.md"
+                    && entry.state().bytes() == Some(b"- external\n".as_slice())
+                    && entry.state().annotations().is_empty()),
+            "the withheld source is still observed exactly, with no identity assigned"
         );
 
         let triple_lowbar = SnapshotFixture::new_with_graph_config(
@@ -12338,18 +12537,35 @@ mod tests {
             .unwrap();
     }
 
+    /// A second physical file for one canonical page name is a deduplicated
+    /// source, not a reason to deny the transaction.
+    ///
+    /// Activation already makes exactly this choice
+    /// (`bootstrap_authoritative_source_paths`), so a reconciler that instead
+    /// refused turned an ordinary duplicate — the same page saved twice, a
+    /// backup copy, one title encoded two ways — into a permanent graph-wide
+    /// refusal, with no user action that could clear it.
     #[test]
-    fn existing_authenticated_logical_name_collision_blocks_before_execution_material() {
+    fn existing_authenticated_logical_name_collision_withholds_only_the_duplicate_source() {
         let fixture = SnapshotFixture::new("existing-name-collision", &["pages/seed.md"]);
         let target = fixture.graph_root.join("pages/Snapshot%20Page%200.md");
         fs::write(&target, b"- external\n").unwrap();
         let plan = fixture.plan(&["pages/Snapshot%20Page%200.md"]);
-        assert_eq!(plan.status(), ImportPlanStatus::Blocked);
-        assert_eq!(
-            plan.blocks()[0].reason,
-            ImportBlockReason::ConflictingLocalTail
+        assert!(
+            plan.blocks().is_empty(),
+            "a duplicate source must not block reconciliation: {:?}",
+            plan.blocks()
         );
-        assert!(plan.blocks()[0].detail.contains("already owned"));
+        assert_eq!(
+            plan.status(),
+            ImportPlanStatus::Noop,
+            "the established owner keeps the name, so nothing is left to author"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"- external\n",
+            "the duplicate source keeps its exact bytes"
+        );
     }
 
     #[test]
@@ -13388,6 +13604,170 @@ mod tests {
         assert!(legacy.database.applied_batch_count().unwrap() > 0);
     }
 
+    /// One page name, two physical files, and the whole graph stops reconciling.
+    ///
+    /// Reported from a physical Android device (2026-08-18): managed storage
+    /// reports that it enabled, then every tick fails with
+    /// `clean external reconciliation failed during Planning: decoded
+    /// destination logical page name <name> is already owned by page <uuid>`.
+    ///
+    /// Activation deliberately selects ONE authoritative source per canonical
+    /// page name and per portable path (`bootstrap_authoritative_source_paths`,
+    /// matching OG's "retain the first, skip the later collision"). The skipped
+    /// twin stays on disk as ordinary graph text with no page in the clean
+    /// SQLite projection, so the very next external reconciliation sees it as a
+    /// brand-new page whose decoded name is already owned — and refuses the
+    /// whole transaction, for every path, forever.
+    ///
+    /// The fixture uses the reported shape: a non-ASCII character and an inline
+    /// hashtag in the page name. `encode_page_name` escapes `#` as `%23`, while
+    /// an outside editor writes it literally, so one title has two ordinary
+    /// physical spellings that `decode_page_name` maps back to one name.
+    #[test]
+    fn clean_reconciliation_admits_a_name_twin_activation_deduplicated() {
+        // "Želva sample page #alpha" written twice: once with the literal `#` an
+        // outside editor produces, once with the `%23` Tine's own filename
+        // encoder produces for the same title. Both decode to one page name.
+        const PRECOMPOSED: &str = "pages/\u{17d}elva sample page #alpha.md";
+        const ENCODED: &str = "pages/\u{17d}elva sample page %23alpha.md";
+        // The same title again, this time as a decomposed FILE NAME: one
+        // portable path identity, two exact spellings, which is what syncing a
+        // graph between a decomposing and a precomposing filesystem produces.
+        const DECOMPOSED: &str = "pages/Z\u{30c}elva sample page #alpha.md";
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "clean-duplicate-name-twin",
+            &[
+                ("pages/alpha.md", "- alpha\n"),
+                (PRECOMPOSED, "- precomposed twin\n"),
+                (ENCODED, "- encoded twin\n"),
+                (DECOMPOSED, "- decomposed twin\n"),
+            ],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let scratch = root.path().join("clean-preparation");
+        let database = root.path().join("clean-projection.sqlite");
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            LineageDigest::of(b"clean-duplicate-name-twin"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5b02)),
+            &scratch,
+            &database,
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            preparation.instrumentation().source_files,
+            4,
+            "every physical source file is retained by the capture"
+        );
+        assert_eq!(
+            preparation.candidates().baseline().page_count(),
+            2,
+            "activation selects one authoritative page per canonical name"
+        );
+        let clean_archive = root.path().join("clean-archive");
+        let clean_enrollment = root.path().join("clean-enrollment");
+        fs::create_dir(&clean_archive).unwrap();
+        let committed = commit_clean_activation(
+            &graph,
+            preparation,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &clean_enrollment,
+        )
+        .unwrap();
+        let (baseline, physical, baseline_frontier, _) = committed.into_parts();
+        drop(physical);
+        drop(baseline);
+
+        let reopened = open_clean_activation(
+            &clean_enrollment,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &database,
+            DocumentId::from_uuid(Uuid::from_u128(0x5b02)),
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap()
+        .expect("published marker opens clean activation");
+        let (mut clean_engine, clean_projection, _) = reopened.into_parts();
+        let operation_archive_path = clean_archive.join("operations");
+        clean_engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&operation_archive_path, workspace).unwrap(),
+            )
+            .unwrap();
+        let runtime_store = ObjectStore::open(&operation_archive_path, workspace).unwrap();
+        let lease = WorkspaceRuntimeLease::acquire(&runtime_store, workspace).unwrap();
+        let mut leased_projection = LeasedWorkspaceProjection::adopt_clean_genesis(
+            lease,
+            &database,
+            ProjectionClaim::current(workspace, LineageDigest::of(b"clean-duplicate-name-twin")),
+            &baseline_frontier,
+            &runtime_store,
+            &clean_engine,
+            clean_projection,
+        )
+        .map_err(|(_, error)| error)
+        .unwrap();
+        let (database_handle, lease_identity) = leased_projection.database_and_lease_identity();
+        lease_identity.revalidate().unwrap();
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5b21)),
+            DeviceId::from_uuid(Uuid::from_u128(0x5b22)),
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &root.path().join("clean-receipts"),
+            workspace,
+            endpoint,
+        )
+        .unwrap();
+        clean_engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+
+        // Exactly what a cold clean open queues: one full comparison of every
+        // eligible graph-text path.
+        let full_scan = plan_clean_affected_import(
+            &graph,
+            &clean_engine,
+            database_handle,
+            &["pages/alpha.md", PRECOMPOSED, ENCODED, DECOMPOSED],
+        );
+        assert_ne!(
+            full_scan.status(),
+            ImportPlanStatus::Blocked,
+            "an activation-deduplicated name twin must not deny reconciliation for the whole \
+             graph, but planning was blocked: {:?}",
+            full_scan.blocks(),
+        );
+
+        // The same refusal reaches the user through a single watcher path too.
+        let exact = plan_clean_affected_import(&graph, &clean_engine, database_handle, &[ENCODED]);
+        assert_ne!(
+            exact.status(),
+            ImportPlanStatus::Blocked,
+            "an exact watcher observation of the deduplicated twin must not be a refusal: {:?}",
+            exact.blocks(),
+        );
+
+        // Nothing was moved, rewritten, or removed to reach that.
+        assert_eq!(
+            fs::read_to_string(root.path().join("graph").join(DECOMPOSED)).unwrap(),
+            "- decomposed twin\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("graph").join(PRECOMPOSED)).unwrap(),
+            "- precomposed twin\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("graph").join(ENCODED)).unwrap(),
+            "- encoded twin\n"
+        );
+    }
+
     #[test]
     fn clean_activation_prepares_both_candidates_and_final_scan_without_operations() {
         let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
@@ -13595,6 +13975,9 @@ mod tests {
             .attach_clean_projection_endpoint(&graph, &receipts)
             .unwrap();
 
+        // A second physical file for one canonical page name is withheld from
+        // the semantic graph, exactly as activation withholds it, instead of
+        // refusing the transaction and with it every other affected path.
         let colliding_path = root.path().join("graph/pages/beta-copy.md");
         fs::write(&colliding_path, "title:: Beta\n\n- colliding page\n").unwrap();
         let collision = plan_clean_affected_import(
@@ -13603,13 +13986,17 @@ mod tests {
             database_handle,
             &["pages/beta-copy.md"],
         );
-        assert_eq!(collision.status(), ImportPlanStatus::Blocked);
-        assert!(collision.blocks().iter().any(|blocked| {
-            blocked.reason == ImportBlockReason::ConflictingLocalTail
-                && blocked
-                    .detail
-                    .contains("decoded destination logical page name Beta is already owned")
-        }));
+        assert!(
+            collision.blocks().is_empty(),
+            "a duplicate canonical page name must not deny clean reconciliation: {:?}",
+            collision.blocks()
+        );
+        assert_eq!(collision.status(), ImportPlanStatus::Noop);
+        assert_eq!(
+            fs::read_to_string(&colliding_path).unwrap(),
+            "title:: Beta\n\n- colliding page\n",
+            "the withheld source keeps its exact bytes"
+        );
         fs::remove_file(colliding_path).unwrap();
 
         let claim_source = database_handle.materialized_read().unwrap();
@@ -16083,20 +16470,28 @@ mod tests {
         assert!(!authority.contains("current_page_at_path"));
         assert!(!authority.contains("projection_work_index"));
 
+        let name_authority = source
+            .split_once("impl<'a> PageNameAuthority<'a> {")
+            .and_then(|(_, tail)| tail.split_once("fn retain_authoritative_desired_pages("))
+            .map(|(body, _)| body)
+            .expect("page-name authority must remain identifiable");
+        assert!(name_authority.contains("clean_database: Option<&'a SqliteFrontier>"));
+        assert!(name_authority.contains("causal_page_name_identity_record"));
+        assert!(name_authority.contains("current_page_for_logical_name"));
         let name_preflight = source
             .split_once("fn preflight_desired_page_names(")
             .and_then(|(_, tail)| tail.split_once("struct CurrentImportBlock"))
             .map(|(body, _)| body)
             .expect("page-name preflight must remain identifiable");
-        assert!(name_preflight.contains("clean_database: Option<&SqliteFrontier>"));
-        assert!(name_preflight.contains("causal_page_name_identity_record"));
-        assert!(name_preflight.contains("current_page_for_logical_name"));
+        assert!(name_preflight.contains("authority: &PageNameAuthority<'_>"));
 
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
         assert!(contract.contains("SQLite owns current exact\npath identity"));
         assert!(contract.contains("and current canonical page-name identity"));
         assert!(contract.contains("does not reacquire its\nlogical name"));
         assert!(contract.contains("must not ask a native\nPatricia path or page-name index"));
+        assert!(contract.contains("acquires no identity: no page is created for it"));
+        assert!(contract.contains("selects the first exact path per portable identity"));
     }
 
     fn orchestration_binding(
@@ -16756,12 +17151,41 @@ mod tests {
                     ("pages/second.md".into(), "Shared Explicit".into()),
                 ]
             );
+            // Planning now agrees with the bootstrap capture above: both
+            // physical files are retained and observed, and exactly the first
+            // exact path carries the shared canonical name.
             let plan = fixture.plan(&case.affected);
-            assert_eq!(plan.status(), ImportPlanStatus::Blocked, "{plan:?}");
-            assert!(plan
-                .blocks()
+            assert!(plan.blocks().is_empty(), "{plan:?}");
+            assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+            let material = plan
+                .execution_material()
+                .expect("collision case reconciles");
+            let created = material
+                .transaction()
+                .operations
                 .iter()
-                .any(|block| block.reason == ImportBlockReason::ConflictingLocalTail));
+                .filter_map(|operation| match operation {
+                    SemanticOperation::CreatePage { name, path, .. } => {
+                        Some((path.as_str().to_owned(), name.as_str().to_owned()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                created,
+                vec![("pages/first.md".to_owned(), "Shared Explicit".to_owned())],
+                "{plan:?}"
+            );
+            assert!(
+                material
+                    .observation()
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path().as_str() == "pages/second.md"
+                        && entry.state().bytes().is_some()
+                        && entry.state().annotations().is_empty()),
+                "the withheld duplicate is still observed exactly: {plan:?}"
+            );
             return;
         }
 

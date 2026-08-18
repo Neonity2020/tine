@@ -5925,11 +5925,55 @@ fn clean_operation_archive_directory(archive_root: &Path) -> PathBuf {
     archive_root.join(CLEAN_OPERATION_ARCHIVE_DIRECTORY)
 }
 
-/// Construct the production clean runtime directly from one operation-free
-/// baseline episode. Every fallible filesystem capability is opened before
-/// the authority marker where possible; after that marker, any failed
-/// same-process adoption is recoverable through `open_clean_runtime_resources`.
+/// Construct the production clean runtime, retracting the disposable archive if
+/// the attempt refuses before any authority exists.
+///
+/// Nothing this lane builds before the activation marker is authority: the
+/// Markdown/Org tree is still the sole one, and the whole archive is
+/// reconstructible from current Direct Files. Leaving it behind is therefore not
+/// neutral, it is fatal — the next activation finds an archive with no
+/// enrollment beside it and no private activation reservation to attribute it
+/// (this lane records none), so `discover_startup` classifies it
+/// `AmbiguousOrForeignResidue { ArchiveResidue, SyncConflict }` and every later
+/// attempt refuses the same way, for good.
+///
+/// That is reachable in one ordinary step: another writer touching the graph
+/// during activation makes the final source proof refuse `Retryable {
+/// durable_stage: Absent }` — the refusal a physical Android reported on
+/// CI 32108957903 — after this lane has already created the archive. Only what
+/// THIS attempt created is retracted; a pre-existing archive is left exactly
+/// where it is, so genuinely foreign residue is still refused.
 fn activate_clean_runtime_resources(
+    request: &SyncLocalActivationRequest,
+    graph: Graph,
+    progress: &mut dyn FnMut(SyncLocalActivationProgress),
+) -> Result<CleanRuntimeResources, String> {
+    let archive_predates_this_attempt = request.archive_root.exists();
+    let result = activate_clean_runtime_resources_retaining_archive(request, graph, progress);
+    if result.is_err() && !archive_predates_this_attempt {
+        if let Err(error) = remove_disposable_clean_archive(&request.archive_root) {
+            return Err(match result {
+                Err(detail) => format!(
+                    "{detail}; retracting the disposable clean archive also failed: {error}"
+                ),
+                Ok(_) => unreachable!("the result was just observed to be an error"),
+            });
+        }
+    }
+    result
+}
+
+/// Remove an archive tree that carries no authority. It is private state under
+/// the app's own directory; no graph path is ever reachable from here.
+fn remove_disposable_clean_archive(archive_root: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(archive_root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn activate_clean_runtime_resources_retaining_archive(
     request: &SyncLocalActivationRequest,
     graph: Graph,
     progress: &mut dyn FnMut(SyncLocalActivationProgress),
@@ -6202,7 +6246,13 @@ fn open_clean_runtime_resources_with_progress(
                     .clone()
             };
             crate::oplog::projection::execute_receiver_local_projection_under_handoff(
-                &graph, &receipts, &engine, &source, &published, true,
+                &graph,
+                &receipts,
+                &engine,
+                Some(projection.database()),
+                &source,
+                &published,
+                true,
             )
             .map_err(display)?;
         }
@@ -25771,10 +25821,14 @@ impl RuntimeActor {
             let detail = clean.pending.as_ref().map_or_else(
                 || "clean shutdown awaits retained external reconciliation".to_owned(),
                 |pending| {
+                    // Name WHY, not just which batch: a delivered deletion that
+                    // this device cannot apply must be explained in the refusal
+                    // rather than left as a phase name.
                     format!(
-                        "clean shutdown awaits committed batch {} at {:?}",
+                        "clean shutdown awaits committed batch {} at {:?}: {}",
                         pending.batch_id(),
-                        pending.failure().phase()
+                        pending.failure().phase(),
+                        pending.failure().detail()
                     )
                 },
             );
@@ -45885,18 +45939,23 @@ mod tests {
     fn android_instrumentation_journey_fixture(
         name: &str,
     ) -> (PathBuf, SyncRuntimeOpenRequest, SyncLocalActivationRequest) {
+        android_instrumentation_journey_fixture_with(name, true)
+    }
+
+    fn android_instrumentation_journey_fixture_with(
+        name: &str,
+        write_journey_graph: bool,
+    ) -> (PathBuf, SyncRuntimeOpenRequest, SyncLocalActivationRequest) {
         let root = std::env::temp_dir().join(format!("tine-android-{name}-{}", Uuid::new_v4()));
         let graph_root = root.join("graph");
         let private_root = root.join("private");
-        fs::create_dir_all(graph_root.join("pages")).unwrap();
-        fs::create_dir_all(graph_root.join("journals")).unwrap();
-        fs::create_dir_all(graph_root.join("logseq")).unwrap();
-        fs::write(
-            graph_root.join("pages/Smoke.md"),
-            b"- Android managed storage smoke\n",
-        )
-        .unwrap();
-        fs::write(graph_root.join("logseq/config.edn"), b"{}\n").unwrap();
+        // The instrumentation and this host test share ONE fixture, so the two
+        // boundaries cannot drift apart the way they had (the device hit a
+        // reconciliation refusal on real-graph name shapes while the journey
+        // was green on a single ASCII page).
+        if write_journey_graph {
+            crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+        }
 
         let identities = SyncLocalActivationIdentities {
             workspace_id: WorkspaceId::new(),
@@ -45935,6 +45994,436 @@ mod tests {
             identities,
         };
         (graph_root, open_request, activation_request)
+    }
+
+    /// The complete Android instrumentation journey, run at the HOST boundary.
+    ///
+    /// This is the same code `ManagedStorageSmokeTest` invokes over JNI — same
+    /// fixture, same call sequence — so a defect that would fail on the device
+    /// fails here first, without an emulator. What it therefore does NOT prove:
+    /// the Android UID, Android shared storage, SAF, or anything above the
+    /// native runtime (no WebView, no Tauri commands, no watcher thread, no
+    /// UI). It is also one fixture of a few dozen pages: a name-shape gate, not
+    /// a corpus-scale gate.
+    ///
+    /// It exists because the device-side journey was GREEN on CI in the same
+    /// round Martin's physical Android flooded the app with
+    /// `clean external reconciliation failed during Planning: decoded
+    /// destination logical page name … is already owned by page <uuid>`. The
+    /// journey never drove an external change through reconciliation planning,
+    /// and its fixture was one ASCII page — so the failing leg and the failing
+    /// shapes were both outside it (GH: Android, 2026-08-18).
+    #[test]
+    fn android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture("full-journey");
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        assert!(
+            receipt.starts_with("ok "),
+            "the managed-storage journey must survive real-graph page-name shapes and an \
+             external reconciliation: {receipt}"
+        );
+        // Every physical file the journey deliberately does not import is still
+        // exactly where the user left it.
+        for (path, bytes) in [
+            (
+                "pages/Z\u{30c} pilot notes #pilot.md",
+                "- decomposed pilot notes\n",
+            ),
+            (
+                "pages/\u{17d} pilot notes %23pilot.md",
+                "- encoded pilot notes\n",
+            ),
+            (
+                crate::managed_storage_journey::JOURNEY_CASE_TWIN_PAGE,
+                // The journey's external leg now rewrites this file after
+                // activation, so the byte assertion is about write-shyness on
+                // the OUTSIDE writer's bytes rather than on the fixture's.
+                crate::managed_storage_journey::JOURNEY_CASE_TWIN_AFTER,
+            ),
+            ("archiv/2026/Denn\u{ed} pozn\u{e1}mky.md", "- backup copy\n"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(graph_root.join(path)).unwrap(),
+                bytes,
+                "{path} was rewritten or removed"
+            );
+        }
+        // The host filesystem holds every spelling apart, and the receipt has
+        // to say so: a device receipt is read against this one, and "the
+        // journey passed" means different things on the two filesystem classes.
+        assert!(
+            receipt.contains("graph_name_folding=none"),
+            "the receipt must state what the graph filesystem folds: {receipt}"
+        );
+    }
+
+    /// The same journey on a filesystem that CANNOT hold two of its page names.
+    ///
+    /// Android shared storage folds case (CI 32123012366): the fixture's
+    /// `pages/K\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md` read back the 18
+    /// bytes written for `pages/k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md`
+    /// instead of its own 8. The fixture's precondition check caught that and
+    /// refused — correctly, but it took Android's ONLY coverage with it.
+    ///
+    /// So the journey now models what the filesystem does and asserts the
+    /// product behavior on the tree that filesystem can actually hold:
+    /// * exactly ONE page for the folded pair, never two and never none;
+    /// * that page holds the bytes the storage really has;
+    /// * the outside writer's write to the twin spelling is an ordinary EDIT
+    ///   there, reconciled rather than refused;
+    /// * and nothing about it refuses the rest of the graph.
+    ///
+    /// No host filesystem this suite runs on folds anything, so the fold is
+    /// forced. That is the same reason the Android instrumentation exists at
+    /// all: the behavior is unreachable here and reachable there.
+    #[test]
+    fn android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem() {
+        use crate::graph_name_folding::{
+            clear_graph_name_folding_for_tests, force_graph_name_folding_for_tests,
+            GraphNameFolding,
+        };
+
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("case-folding", false);
+        fs::create_dir_all(&graph_root).unwrap();
+        let folding = GraphNameFolding {
+            ascii_case: true,
+            unicode_case: true,
+            normalization: false,
+        };
+        force_graph_name_folding_for_tests(&graph_root, folding);
+        crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        clear_graph_name_folding_for_tests(&graph_root);
+        assert!(
+            receipt.starts_with("ok "),
+            "a filesystem that cannot hold two of the graph's page names must not deny the whole graph: {receipt}"
+        );
+        assert!(
+            receipt.contains("graph_name_folding=ascii_case+unicode_case"),
+            "the receipt must name the folding it ran on: {receipt}"
+        );
+        // The twin never became a file of its own, and the one file the pair
+        // shares holds exactly what the outside writer last wrote. Tine neither
+        // recreated the twin nor rewrote the survivor.
+        assert!(
+            !graph_root
+                .join(crate::managed_storage_journey::JOURNEY_CASE_TWIN_PAGE)
+                .exists(),
+            "Tine must not manufacture a file this storage cannot hold"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                graph_root.join(crate::managed_storage_journey::JOURNEY_CASE_OWNER_PAGE)
+            )
+            .unwrap(),
+            crate::managed_storage_journey::JOURNEY_CASE_TWIN_AFTER,
+        );
+        // The pair that this filesystem does NOT fold is still two files. A
+        // fixture that dropped every twin as soon as anything folded would stop
+        // covering the normalization shape that reproduced the field report.
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/Z\u{30c} pilot notes #pilot.md")).unwrap(),
+            "- decomposed pilot notes\n"
+        );
+    }
+
+    /// The other axis, probed independently because it is a different platform
+    /// fact: a filesystem that folds NFC against NFD but keeps case apart —
+    /// HFS+, and what AOSP's casefold implementation suggests Android should
+    /// also do, though CI 32123012366 says it does not (see
+    /// `docs/storage-sync-contract.md` §2.10d).
+    ///
+    /// The pair that folds is the other one, so this is not the same test with
+    /// a different constant: it proves the journey reads its expectations out
+    /// of the probe rather than out of a hard-coded idea of which pair folds.
+    #[test]
+    fn android_managed_storage_journey_holds_one_page_on_a_normalizing_graph_filesystem() {
+        use crate::graph_name_folding::{
+            clear_graph_name_folding_for_tests, force_graph_name_folding_for_tests,
+            GraphNameFolding,
+        };
+
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("normalization-folding", false);
+        fs::create_dir_all(&graph_root).unwrap();
+        force_graph_name_folding_for_tests(
+            &graph_root,
+            GraphNameFolding {
+                ascii_case: false,
+                unicode_case: false,
+                normalization: true,
+            },
+        );
+        crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        clear_graph_name_folding_for_tests(&graph_root);
+        assert!(
+            receipt.starts_with("ok "),
+            "a normalizing filesystem must not deny the whole graph either: {receipt}"
+        );
+        assert!(
+            receipt.contains("graph_name_folding=normalization"),
+            "the receipt must name the folding it ran on: {receipt}"
+        );
+        // The decomposed spelling has no file of its own; the precomposed one
+        // holds the last write for the pair.
+        assert!(!graph_root
+            .join("pages/Z\u{30c} pilot notes #pilot.md")
+            .exists());
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/\u{17d} pilot notes #pilot.md")).unwrap(),
+            "- decomposed pilot notes\n"
+        );
+        // Case is a different axis: this filesystem holds that pair apart, and
+        // the twin still carries the outside writer's bytes with no page of its
+        // own.
+        assert_eq!(
+            fs::read_to_string(
+                graph_root.join(crate::managed_storage_journey::JOURNEY_CASE_TWIN_PAGE)
+            )
+            .unwrap(),
+            crate::managed_storage_journey::JOURNEY_CASE_TWIN_AFTER,
+        );
+        assert_eq!(
+            fs::read_to_string(
+                graph_root.join(crate::managed_storage_journey::JOURNEY_CASE_OWNER_PAGE)
+            )
+            .unwrap(),
+            "- horse\n"
+        );
+    }
+
+    /// The device shape, at the host boundary: another writer changes a graph
+    /// file WHILE activation is running — after the source capture is sealed and
+    /// before the final inventory proof.
+    ///
+    /// CI 32115065229 reported it from an Android emulator as
+    /// `activation failed after Phase { phase: ImmutablePublicationInstall }:
+    /// Retryable { … "source capture changed before final inventory proof: 1
+    /// row(s) differ; first 1: changed: file pages/Ž pilot notes #pilot.md …
+    /// content:4371a8010f63@26 -> … content:888a74373a30@25" }` — and both
+    /// spellings of that path print identically, which is why the escaped
+    /// rendering is asserted here rather than the raw one.
+    ///
+    /// An external editor saving mid-activation is in scope, and the runtime
+    /// already answers it: the refusal is `Retryable` and the attempt retracts
+    /// the disposable archive it created. What was NOT proven anywhere is that
+    /// the journey converges — the instrumentation reported the first refusal
+    /// and stopped, so three device rounds said "activation failed" about a
+    /// scenario the product handles. This drives the whole journey through it.
+    #[test]
+    fn android_managed_storage_journey_converges_when_a_graph_file_changes_during_activation() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture("external-write-during-activation");
+        let moved = graph_root.join("pages/\u{17d} pilot notes #pilot.md");
+        let changed = "- precomposed pilot notes edited by another editor\n";
+        crate::model::set_bootstrap_source_capture_before_final_proof_hook_for_test({
+            let moved = moved.clone();
+            move || fs::write(&moved, changed)
+        });
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        assert!(
+            receipt.starts_with("ok "),
+            "an external write during activation must converge on retry, not fail forever: \
+             {receipt}"
+        );
+        assert!(
+            receipt.contains("activation_attempts=2"),
+            "the receipt must say the journey needed a second attempt: {receipt}"
+        );
+        assert!(
+            receipt.contains("source capture changed before final inventory proof"),
+            "a retried-past refusal must stay in the receipt verbatim, or a device that \
+             refuses on every attempt looks the same as one that never refused: {receipt}"
+        );
+        assert!(
+            receipt.contains("u{17d} pilot notes #pilot.md"),
+            "the refusal must name the moved row in a spelling its normalization twin \
+             cannot be confused with: {receipt}"
+        );
+        assert!(
+            !receipt.contains("pages/\u{17d} pilot notes #pilot.md"),
+            "the raw glyph spelling reads exactly like its decomposed twin, so it must not \
+             be what the refusal reports: {receipt}"
+        );
+        // Write-shyness: the retry rebuilt from the OTHER writer's bytes and
+        // rewrote nothing of its own, here or on the twin that differs from it
+        // only by Unicode normalization.
+        assert_eq!(fs::read_to_string(&moved).unwrap(), changed);
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/Z\u{30c} pilot notes #pilot.md")).unwrap(),
+            "- decomposed pilot notes\n"
+        );
+    }
+
+    /// The journey's external-reconciliation leg EDITS a page that the
+    /// journey's own fixture put on disk. Driven against a graph that lacks
+    /// that fixture the same write is a CREATE, the `archiv/` backup copy of
+    /// the same decoded name sorts earlier and wins it, and the run fails as
+    /// `external edit did not reconcile: Ok(Missing { draft: None })` — which
+    /// says nothing about the actual mistake. That is verbatim how the resume
+    /// instrumentation case failed on CI 32108957903 while the runtime behaved
+    /// exactly as `bootstrap_authoritative_source_paths` specifies.
+    ///
+    /// The precondition is now proven where it is required, so a caller that
+    /// drives the journey against the wrong graph is told so.
+    #[test]
+    fn android_journey_refuses_a_graph_that_lacks_its_own_fixture() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("no-journey-graph", false);
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        fs::create_dir_all(graph_root.join("journals")).unwrap();
+        fs::create_dir_all(graph_root.join("logseq")).unwrap();
+        fs::write(graph_root.join("logseq/config.edn"), "{}\n").unwrap();
+        fs::write(
+            graph_root.join("pages/Resume.md"),
+            "- Android interrupted activation resume\n",
+        )
+        .unwrap();
+        fs::write(
+            graph_root.join(crate::managed_storage_journey::JOURNEY_EDITED_PAGE),
+            "- Android managed storage smoke\n",
+        )
+        .unwrap();
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root,
+            open_request,
+            activation_request,
+        );
+        assert!(
+            receipt.starts_with("journey precondition failed:"),
+            "a journey driven against the wrong graph must say so: {receipt}"
+        );
+        assert!(
+            receipt.contains(crate::managed_storage_journey::JOURNEY_EXTERNAL_EDIT_PAGE),
+            "the refusal must name the page the leg edits: {receipt}"
+        );
+    }
+
+    /// The graph the device journey actually holds: the instrumentation writes
+    /// 1097 corpus pages before it calls in, and the journey's own name shapes
+    /// are layered under them.
+    ///
+    /// Reconciliation advances one bounded slice per turn, so the number of
+    /// turns the drain must offer scales with the graph. This graph settles on
+    /// tick 71 here; the journey's previous fixed 64 was below that, so a
+    /// correct runtime would have been reported as `external reconciliation
+    /// never admitted an epoch` on the first device run that got this far.
+    /// Nothing smaller reproduces it — 600 corpus pages settle on tick 40 — so
+    /// the fixture is the device's, deliberately.
+    #[test]
+    fn android_managed_storage_journey_settles_reconciliation_on_a_corpus_scale_graph() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("corpus-scale", false);
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        for page_index in 0..1097 {
+            let mut blocks = String::new();
+            for block_index in 0..12 {
+                blocks.push_str(&format!(
+                    "- Android corpus page {page_index} block {block_index} with [[Smoke]] \
+                     and #android-corpus\n"
+                ));
+            }
+            fs::write(
+                graph_root.join(format!("pages/Corpus-{page_index}.md")),
+                blocks,
+            )
+            .unwrap();
+        }
+        crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root,
+            open_request,
+            activation_request,
+        );
+        assert!(
+            receipt.starts_with("ok "),
+            "the journey must settle its external reconciliation at the size the device \
+             instrumentation runs: {receipt}"
+        );
+    }
+
+    /// Two physical files whose decoded page name is the same: the FIRST exact
+    /// path owns the name and the later one keeps its bytes with no page of its
+    /// own (`bootstrap_authoritative_source_paths`). Exact-path order is plain
+    /// byte order over the graph-relative path, so a copy under a directory
+    /// that sorts before `pages/` takes the name from the file in `pages/`.
+    ///
+    /// This pins the rule rather than endorsing it: it is the reason a journey
+    /// leg that meant to edit `pages/Denní poznámky.md` silently addressed
+    /// `archiv/2026/Denní poznámky.md` instead, and a user with an ordinary
+    /// backup copy gets the backup as their page with no surface saying so.
+    #[test]
+    fn one_page_name_with_two_physical_files_is_owned_by_the_first_exact_path() {
+        let (graph_root, _open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("duplicate-name-order", false);
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        fs::create_dir_all(graph_root.join("journals")).unwrap();
+        fs::create_dir_all(graph_root.join("logseq")).unwrap();
+        fs::write(graph_root.join("logseq/config.edn"), "{}\n").unwrap();
+        fs::create_dir_all(graph_root.join("archiv/2026")).unwrap();
+        fs::write(graph_root.join("pages/Notes.md"), "- the page\n").unwrap();
+        fs::write(
+            graph_root.join("archiv/2026/Notes.md"),
+            "- the backup copy\n",
+        )
+        .unwrap();
+
+        let activation = SyncRuntimeHandle::activate_or_resume_local(activation_request);
+        assert_eq!(activation.status, SyncLocalActivationStatus::Active);
+        let handle = activation.handle.expect("activation opens the actor");
+        let backup = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "archiv/2026/Notes.md".into(),
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(&backup, SyncApplicationPageLoadOutcome::Loaded { page, .. }
+                if page.blocks.first().map(|block| block.raw.as_str()) == Some("the backup copy")),
+            "the earlier exact path owns the decoded name: {backup:?}"
+        );
+        let canonical = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "pages/Notes.md".into(),
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(canonical, SyncApplicationPageLoadOutcome::Missing { .. }),
+            "the later exact path acquires no page of its own: {canonical:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/Notes.md")).unwrap(),
+            "- the page\n",
+            "its bytes are still exactly where the user left them"
+        );
+        drop(handle);
     }
 
     #[test]
@@ -49225,6 +49714,438 @@ mod tests {
             receiver_handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    /// Deliver every provider batch the initiator has published to the receiver
+    /// and drive the receiver exactly as the production scheduler would.
+    fn deliver_provider_to_receiver(
+        initiator: &ActivationFixture,
+        receiver: &ActivationFixture,
+        receiver_handle: &SyncRuntimeHandle,
+    ) {
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        drive_like_the_production_scheduler(receiver_handle);
+    }
+
+    /// A peer's DELETE, delivered to a running receiver with no concurrent local
+    /// work of any kind. The user-visible outcome is the only thing asserted:
+    /// the Markdown file the peer deleted is gone from this device's graph.
+    #[test]
+    fn provider_delete_removes_the_receiver_markdown() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-delete-converges", 0xbf00);
+        let path = "notes/provider-delete-converges.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            0xbf20,
+            "Provider Delete Converges",
+            path,
+            "peer page that will be deleted",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(
+            receiver.graph_root.join(path).is_file(),
+            "the peer's page never reached the receiver's graph: {:?}",
+            receiver_handle.status().unwrap()
+        );
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
+        assert!(
+            !initiator.graph_root.join(path).exists(),
+            "the initiator's own deletion did not reach its own graph"
+        );
+
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+
+        assert!(
+            !receiver.graph_root.join(path).exists(),
+            "a delivered peer DELETE never removed the receiver's Markdown: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(
+            matches!(
+                receiver_handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ),
+            "a converged receiver must publish a Safe shutdown"
+        );
+    }
+
+    /// A peer's RENAME (a path release plus a path acquisition) delivered to a
+    /// running receiver with no concurrent local work.
+    #[test]
+    fn provider_rename_moves_the_receiver_markdown() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-rename-converges", 0xbf40);
+        let old_path = "notes/provider-rename-converges.md";
+        let new_path = "notes/provider-rename-converges-renamed.md";
+        let (create_batch, page_id, _, _) = submit_shared_page(
+            &initiator_handle,
+            0xbf60,
+            "Provider Rename Converges",
+            old_path,
+            "peer page that will be renamed",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(
+            receiver.graph_root.join(old_path).is_file(),
+            "the peer's page never reached the receiver's graph: {:?}",
+            receiver_handle.status().unwrap()
+        );
+
+        let rename_batch = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id,
+                    new_name: LogicalPageName::parse("Provider Rename Converges Renamed").unwrap(),
+                    new_path: ManagedPath::parse(new_path).unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, rename_batch);
+        settle_shared_provider(&initiator_handle);
+        assert!(!initiator.graph_root.join(old_path).exists());
+        assert!(initiator.graph_root.join(new_path).is_file());
+
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+
+        assert!(
+            receiver.graph_root.join(new_path).is_file(),
+            "a delivered peer RENAME never created the receiver's new Markdown: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert_eq!(
+            fs::read(receiver.graph_root.join(new_path)).unwrap(),
+            b"- peer page that will be renamed\n"
+        );
+        assert!(
+            !receiver.graph_root.join(old_path).exists(),
+            "a delivered peer RENAME left the receiver's old Markdown behind: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(
+            matches!(
+                receiver_handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ),
+            "a converged receiver must publish a Safe shutdown"
+        );
+    }
+
+    /// A peer moves a block subtree to another page and then deletes the page it
+    /// emptied. The delivered batch carries a `Present` intent for the target and
+    /// an `Absent` intent for the source in one manifest, so both halves have to
+    /// converge on this device.
+    #[test]
+    fn provider_cross_page_move_then_delete_converges_on_the_receiver() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-move-then-delete", 0xbf80);
+        let source_path = "notes/provider-move-then-delete-source.md";
+        let target_path = "notes/provider-move-then-delete-target.md";
+        let (source_batch, source_page_id, block_id, home_document_id) = submit_shared_page(
+            &initiator_handle,
+            0xbfa0,
+            "Provider Move Then Delete Source",
+            source_path,
+            "carried subtree",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, source_batch);
+        let (target_batch, target_page_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xbfc0,
+            "Provider Move Then Delete Target",
+            target_path,
+            "target base",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, target_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(receiver.graph_root.join(source_path).is_file());
+        assert!(receiver.graph_root.join(target_path).is_file());
+
+        let move_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    from_page_id: source_page_id,
+                    to_page_id: target_page_id,
+                    parent: None,
+                    order: "z".into(),
+                },
+                SemanticOperation::DeletePage {
+                    page_id: source_page_id,
+                },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, move_batch);
+        settle_shared_provider(&initiator_handle);
+        assert!(!initiator.graph_root.join(source_path).exists());
+
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+
+        assert!(
+            !receiver.graph_root.join(source_path).exists(),
+            "the emptied source page's Markdown survived a delivered delete: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert_eq!(
+            fs::read(receiver.graph_root.join(target_path)).unwrap(),
+            b"- target base\n- carried subtree\n",
+            "the delivered cross-page move never reached the target Markdown"
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// A peer's DELETE for a path this device does not hold. Removing nothing is
+    /// the convergent answer, and it must be reported as done rather than retried
+    /// forever.
+    #[test]
+    fn provider_delete_of_a_path_absent_from_the_receiver_converges() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-delete-absent-locally", 0xc000);
+        let path = "notes/provider-delete-absent-locally.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            0xc020,
+            "Provider Delete Absent Locally",
+            path,
+            "peer page removed underneath the receiver",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(receiver.graph_root.join(path).is_file());
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        // The file is already gone here -- another tool removed it, or a prior
+        // attempt completed the removal and crashed before its receipt landed.
+        fs::remove_file(receiver.graph_root.join(path)).unwrap();
+        receiver_handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+            .unwrap();
+        receiver_handle.observe_provider().unwrap();
+        drive_like_the_production_scheduler(&receiver_handle);
+
+        assert!(
+            !receiver.graph_root.join(path).exists(),
+            "a delivered DELETE re-created a path that was already absent: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// A peer's DELETE arriving against a receiver-local external edit of the
+    /// same page. The edit must be in immutable local history, the deletion must
+    /// reach a settled outcome, and the device must never spin.
+    #[test]
+    fn provider_delete_racing_a_local_edit_of_the_same_page_settles() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-delete-races-local-edit", 0xc040);
+        let path = "notes/provider-delete-races-local-edit.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            0xc060,
+            "Provider Delete Races Local Edit",
+            path,
+            "shared base",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(receiver.graph_root.join(path).is_file());
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        let sentinel = "receiver edited this while the peer was deleting it";
+        fs::write(
+            receiver.graph_root.join(path),
+            format!("- {sentinel}\n").as_bytes(),
+        )
+        .unwrap();
+        receiver_handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+            .unwrap();
+        receiver_handle.observe_provider().unwrap();
+        drive_like_the_production_scheduler(&receiver_handle);
+
+        assert!(
+            archive_root_contains_bytes(&receiver, sentinel.as_bytes()),
+            "the racing local edit was destroyed instead of captured in immutable \
+             local history: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        // Either side may win the race; a spin is not an outcome. If the edit
+        // won, the file keeps exactly the receiver's bytes and nothing else.
+        if receiver.graph_root.join(path).exists() {
+            assert_eq!(
+                fs::read(receiver.graph_root.join(path)).unwrap(),
+                format!("- {sentinel}\n").as_bytes(),
+                "a retained remote deletion rewrote the receiver's external bytes"
+            );
+        }
+        assert!(
+            !receiver_handle.status().unwrap().has_runnable_work(),
+            "a settled receiver must name no runnable work: {:?}",
+            receiver_handle.status().unwrap()
+        );
+    }
+
+    /// A peer deletes a page and then gives its exact path to a different page.
+    /// The delivered release must never remove the file the new owner owns:
+    /// path ownership, not the deleted page's lifecycle, is what authorizes a
+    /// removal.
+    #[test]
+    fn provider_delete_then_reuse_of_the_same_path_keeps_the_new_owner() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-delete-then-reuse-path", 0xc080);
+        let path = "notes/provider-delete-then-reuse-path.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            0xc0a0,
+            "Provider Delete Then Reuse Path",
+            path,
+            "first owner",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- first owner\n"
+        );
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
+        let (reuse_batch, ..) = submit_shared_page(
+            &initiator_handle,
+            0xc0c0,
+            "Provider Delete Then Reuse Path Second",
+            path,
+            "second owner",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, reuse_batch);
+        settle_shared_provider(&initiator_handle);
+        assert_eq!(
+            fs::read(initiator.graph_root.join(path)).unwrap(),
+            b"- second owner\n"
+        );
+
+        // Both batches arrive together, so the release and the reacquisition of
+        // the same exact path are settled in one delivery.
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- second owner\n",
+            "the delivered release removed or stale-kept the path its new owner \
+             owns: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// Whether the receiver's immutable local history retains these exact bytes.
+    ///
+    /// Deliberately NOT `archive_contains_payload`, which only walks
+    /// `committed_manifests()` -> `required_objects()` and returns false for
+    /// bytes that are demonstrably retained on disk. This scans what the device
+    /// actually kept.
+    fn archive_root_contains_bytes(fixture: &ActivationFixture, expected: &[u8]) -> bool {
+        let mut stack = vec![fixture.request.archive_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if fs::read(&path).is_ok_and(|bytes| {
+                    bytes
+                        .windows(expected.len())
+                        .any(|window| window == expected)
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The direct provider lane only ever advances its front entry, so a batch
@@ -60446,23 +61367,51 @@ mod tests {
         );
     }
 
+    /// A graph that moves under a live activation must refuse retryably, and the
+    /// refusal must NAME what moved.
+    ///
+    /// This used to arm the shadow-projection publication's injection point,
+    /// which clean local activation no longer walks: the hook never ran, the
+    /// graph was never edited, and the test asserted a refusal that could not
+    /// happen — it has been red on master rather than guarding anything. It now
+    /// arms the proof itself, which every promoting lane calls.
+    ///
+    /// The detail assertions are the second half. CI 32108957903 reported this
+    /// refusal from a physical Android as `Retryable { durable_stage: Absent,
+    /// detail: "source capture changed before final inventory proof" }` and
+    /// nothing more, which cannot be acted on by anyone.
     #[test]
     fn activation_external_edit_before_promotion_refuses_then_retries_from_current_direct_files() {
         let fixture = ActivationFixture::nested_unicode("source-change-before-promotion", 0xa580);
         let source = fixture.graph_root.join("Root.md");
         let changed = b"title:: Changed externally\n\n- retained Direct Files edit\n".to_vec();
-        set_before_final_source_verify_hook_for_test({
+        crate::model::set_bootstrap_source_capture_before_final_proof_hook_for_test({
             let source = source.clone();
             let changed = changed.clone();
             move || fs::write(source, changed)
         });
 
         let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert!(matches!(
-            interrupted.status,
-            SyncLocalActivationStatus::Retryable { .. }
-        ));
+        let SyncLocalActivationStatus::Retryable { detail, .. } = &interrupted.status else {
+            panic!(
+                "a graph that moved before promotion must refuse retryably: {:?}",
+                interrupted.status
+            );
+        };
+        assert!(detail.contains("Root.md"), "{detail}");
+        assert!(detail.contains("changed:"), "{detail}");
+        assert!(detail.contains("content:"), "{detail}");
         assert!(interrupted.handle.is_none());
+        // The third half, and the one that makes `Retryable` true. This lane
+        // records no private activation reservation, so an archive left behind
+        // by a refused attempt is an archive the next `discover_startup` can
+        // attribute to nobody: `AmbiguousOrForeignResidue { ArchiveResidue,
+        // SyncConflict }`, permanently, for a graph whose only authority is
+        // still the Markdown tree beside it.
+        assert!(
+            !fixture.request.archive_root.exists(),
+            "a refusal before any authority must retract the archive it created"
+        );
         assert_eq!(fs::read(&source).unwrap(), changed);
 
         let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());

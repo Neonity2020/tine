@@ -558,6 +558,23 @@ path-only edit of an existing physical same-name page does not reacquire its
 logical name; only a creation or exact-title change enters name-acquisition
 preflight.
 
+One canonical page name has one owner, and a graph may legitimately hold more
+than one physical file for it. Activation already resolves that: it selects one
+authoritative source per canonical page name and per portable path in exact-path
+order and retains every other file untouched, with no page of its own
+(`bootstrap_authoritative_source_paths`). External reconciliation makes the SAME
+selection. A source that carries no accepted page identity and whose decoded name
+is already owned — by an established page, or by an earlier exact path in the
+same transaction — acquires no identity: no page is created for it, no operation
+touches it, and its exact bytes are still observed by the transaction. A clean
+requested set likewise selects the first exact path per portable identity rather
+than refusing the set. Refusing instead turned an ordinary duplicate into a
+permanent graph-wide denial: planning failed for every affected path, on every
+tick, with no user action that could clear it. An accepted page is never
+withdrawn this way — it keeps the identity it already has, and a real title
+change into a name another page owns remains the visible ambiguity preflight
+refuses.
+
 An exact watcher callback queues only the named managed paths. An imprecise
 callback, and every cold open of a clean marker, queues one full comparison of
 current Markdown/Org paths, SQLite paths, and released paths named by accepted
@@ -579,6 +596,29 @@ claimant. Every causal origin is explicitly either `Baseline` or an accepted
 index. The old Patricia values remain only as a differential oracle until the
 single production cutover, and are then deleted rather than retained as a
 second ready route.
+
+A receiver-local projection intent authored by another endpoint whose target is
+`Absent` releases one exact path on this device. On the clean runtime its
+authority is: the batch carrying the intent is archive-ready and is exactly the
+batch this runtime accepted (accepted-batch evidence, manifest fingerprint
+matched against the archived bytes), the batch carries that intent exactly once,
+any declared render base is the authenticated annotated base bound to this
+workspace/page/path, every declared frontier head is accepted and durable here,
+and — the release itself — no live page owns the exact path in the
+frontier-matched SQLite projection. Path ownership, not the page's catalog
+lifecycle, is what authorizes a removal; a rename releases its old path while
+its page stays live. This is deliberately the same question the own-endpoint
+clean deletion asks, and it replaces the pre-0.7 proof built from the durable
+endpoint-history record and the portable-path release record, neither of which
+the clean runtime persists.
+
+That authorization is total: it either authorizes the removal, proves the
+release superseded because a live page now owns the path (complete without
+touching that file — the owner projects it), or defers with a named reason and
+retains the published continuation. Only malformed delivered content is an
+error. A deferred receiver-local deletion keeps its batch `DurablePending`, and
+clean shutdown refuses `Safe` naming the batch, the phase, the operation and the
+path.
 
 The clean engine does not hydrate those baseline UUID introductions into a
 resident identity map. During ordinary operation the exact-frontier SQLite
@@ -1003,6 +1043,44 @@ store from the unchanged Markdown/Org source. Once enrollment has promoted the
 receipt-store identity, this recovery is forbidden: normal exact identity and
 receipt recovery rules apply.
 
+The same rule governs the archive a clean activation builds. Before the
+activation marker is committed, the archive carries no authority and is
+reconstructible from current Direct Files, and the clean lane records no private
+activation reservation that a later attempt could use to attribute it. An
+attempt that refuses before that marker therefore retracts the archive it
+created, and only that one: an archive that predates the attempt is left exactly
+where it is, so genuinely foreign residue is still refused as
+`AmbiguousOrForeignResidue { ArchiveResidue, SyncConflict }`. Without the
+retraction, one ordinary external write landing during activation — which makes
+the final source proof refuse `Retryable { durable_stage: Absent }` — leaves an
+archive that no later attempt can attribute, and every retry refuses
+`SyncConflict` permanently for a graph whose only authority is still the
+Markdown/Org tree beside it.
+
+A refusal from that final source proof names what moved: the row count and, for
+the first rows, the exact path together with the field that changed (filesystem
+resource identity, link count, or content description), and whether the row
+appeared, vanished, or changed. A file that merely appears changes neither the
+source-file nor the source-chunk count, so the inventory report is the only
+thing that localises it.
+
+Reported paths escape every non-ASCII scalar (`pages/\u{17d} pilot notes.md`);
+ASCII paths are reported exactly as they are on disk. A graph may hold two files
+whose names differ only by Unicode normalization, and those two names print as
+one glyph sequence in every log and issue tracker — a refusal that named such a
+row unescaped named a row nobody could tell from its neighbour. Escaping is a
+reporting rule only: nothing normalizes, folds, or rewrites a name or a byte on
+disk.
+
+`Retryable` from that proof means retryable, and callers are expected to retry
+rather than surface the first refusal as a failed activation. An external
+editor, a filesystem sync provider, or a second window saving while Tine is
+still importing is an ordinary in-scope event; the attempt retracts the
+disposable archive it created, and the next attempt rebuilds from the current
+Direct Files bytes. A caller that retries must still carry every refusal it
+retried past, so that a graph refusing on every attempt cannot read as a graph
+that never refused.
+
 The graph-local shared-provider tree is transport rather than local authority.
 Tine still creates and opens it no-follow, requires ordinary directories and
 regular files, flushes published file contents, and validates bounded bytes and
@@ -1048,6 +1126,101 @@ SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates
 only that derived representation and costs one rebuild; it must not migrate or
 reinterpret authoritative oplog bytes. Authoritative format changes require an
 explicit versioned migration and cannot be treated as a cache rebuild.
+
+### 2.10d When the graph filesystem folds two page names into one file
+
+Android CI run 32123012366 recorded the managed-storage journey's fixture
+refusing to write itself on real shared storage
+(`/storage/emulated/0/Download/…`):
+
+```
+journey graph fixture could not be written: graph filesystem folds two journey
+page names into one file: pages/K\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md reads
+back the bytes written for pages/k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md
+(18 bytes, not 8)
+```
+
+Two files whose names differ only by case cannot both exist there. This is not
+confined to Android: FAT/exFAT removable media, NTFS, APFS in its default
+configuration and any `ext4` directory carrying the casefold attribute fold
+case, and HFS+ additionally folds Unicode normalization.
+
+**Which folding, measured rather than assumed.** Three axes are probed
+independently — ASCII case, non-ASCII (Unicode) case, and NFC against NFD —
+because they are separable platform facts and a graph that is legal under one is
+illegal under another. On the API-35 emulator the answer was **case folds,
+normalization does not**: the fixture verifies its shapes in list order, and the
+run above reported the case pair while the normalization pair
+(`pages/\u{17d} pilot notes #pilot.md` against
+`pages/Z\u{30c} pilot notes #pilot.md`) had already read back byte-exact.
+
+AOSP disagrees with that. Android shared storage folds case through
+`ext4`'s casefold attribute, whose comparison (`fs/unicode`, `utf8_strncasecmp`)
+is defined over the NFDICF form, and NFC and NFD share that form — so on the
+source, normalization should fold too. §2.10b already settled how that
+disagreement is resolved: **upstream source is evidence about upstream intent,
+not proof about the running device; the receipt wins.** The probe therefore
+reports what the filesystem in front of it does, and the managed-storage journey
+receipt carries the verdict verbatim as `graph_name_folding=…`, so no future
+round trip is needed to learn it.
+
+**Why this is not, by itself, a merge of two pages.** Tine's logical page name
+is already case- and normalization-insensitive: `LogicalPageName::key_digest`
+hashes `canonical_page_name_key`, which lowercases and then applies NFC,
+matching Logseq. Every pair of file names a case-folding or normalization-folding
+filesystem cannot tell apart is therefore a pair Tine **already treats as one
+page**. Such a filesystem cannot merge two distinct Tine pages, because two
+names it folds were never two pages here. This is the load-bearing fact behind
+everything below, and it is bound to the code by
+`graph_name_folding::tests::filesystem_folding_never_separates_names_tine_already_treats_as_one`.
+
+What folding does change is that the non-authoritative DUPLICATE file — the one
+`retain_authoritative_desired_pages` deliberately leaves on disk as ordinary
+graph text with no page of its own — cannot exist there at all. Whoever wrote
+the second spelling (a sync client, a file manager, the user) overwrote the
+authoritative file instead of landing beside it.
+
+**The contract.**
+
+| | On a folding graph filesystem |
+| --- | --- |
+| Pages | Exactly ONE page per folded name — never two, never none. The twin spelling never becomes a second page, and never displaces the first. |
+| Bytes | The page carries whatever the storage actually holds. An outside write to the twin spelling IS a write to that one file, so it reconciles as an ordinary external edit, not as a create for an already-owned name. |
+| Availability | Folding never refuses activation, never refuses a reconciliation transaction, and never converts to an `ImportBlock`. One folded pair may not deny the rest of the graph — the same rule §3.1 imposes on the duplicate-name case, in its filesystem-shaped variant. |
+| Direct Files | Unchanged and required to work. Tine writes a graph path only when it either learned that exact path from the filesystem's own directory entry or created it with an exclusive create (`O_CREAT|O_EXCL`, §2.10b), so Tine can never be the writer that destroys a folded twin: an occupied fold resolves to `AlreadyExists` before anything has moved. |
+| Reporting | A fold performed by ANOTHER writer before Tine ever saw the graph is not detectable and is not reported — Tine has no evidence two files ever existed, and inventing a warning from a bare capability answer would put an unactionable message in front of every Android user. What is reported is the actionable case: a name the user asks for that this storage cannot hold beside a name it already holds, phrased by `GraphNameFolding::explain_one_file_two_names` — both spellings, which one is kept, and the one action that works. Reported once: the runtime bridge (`src/managedStorageRuntime.ts`) advances its notice sequence only for a message the user has not already been shown, so a live condition cannot re-arm the toast on every retry. |
+
+**The probe** (`graph_name_folding::graph_name_folding`). A write/read-back pair
+per axis inside one hidden, uniquely named directory under the graph root, which
+is removed before returning. Deliberately a write probe rather than an
+inspection of the mount table, for the reason §2.10b gives. The answer is a
+property of the mounted filesystem, so it is remembered per `st_dev` — the same
+key and the same reasoning as `model::FLAGGED_RENAME_UNSUPPORTED_DEVICES` — and
+it is **never load-bearing**: a probe that cannot run answers
+`GraphNameFolding::UNKNOWN`, which is byte-identical to "folds nothing", so no
+behavior depends on it having succeeded. It writes and removes files under the
+graph root, so it must not run inside a live source capture, which would report
+the graph as moving underneath it; the managed-storage journey calls it before
+activation starts, and the memo means the device pays for it once.
+
+**What is deliberately NOT promised.** Tine does not reconstruct a side of a
+folded pair that another writer already destroyed, and does not claim a merge it
+has no evidence of. On such a device the user's graph can hold only one of the
+two spellings; keeping both requires a name that differs by more than
+capitalisation or accent spelling.
+
+Enforced by `graph_name_folding::tests` (nine cases: the three axes are
+independent, every path component folds, the probe leaves no residue, an
+unprobeable root degrades to non-folding, a forced answer is scoped to one graph
+root, and the equivalence-class fact above),
+`managed_storage_journey::tests::the_fixture_writes_and_accepts_a_tree_a_folding_filesystem_can_hold`,
+`…::the_fixture_refuses_a_graph_tree_that_folds_two_of_its_shapes` (a fold the
+probe did NOT predict is still a refusal, and now says so),
+`…::the_graph_tree_model_separates_the_two_filesystem_classes`, and at the whole-
+journey boundary by
+`sync_runtime::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem`
+and
+`…::android_managed_storage_journey_holds_one_page_on_a_normalizing_graph_filesystem`.
 
 ## 4. Concord base ledger (Direct Files)
 

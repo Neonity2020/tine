@@ -28485,6 +28485,233 @@ fn validate_sealed_bootstrap_source_capture(capture: &BootstrapSourceCapture) ->
     )
 }
 
+/// How many differing rows one capture-change refusal names. The refusal has to
+/// fit in a log line and a toast; the row count is reported in full so a large
+/// difference is never mistaken for a small one.
+const BOOTSTRAP_SOURCE_CHANGE_REPORT_ROWS: usize = 4;
+/// How much of a path one reported row carries. Long enough to identify a page
+/// in an ordinary graph, short enough that four rows stay readable.
+const BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES: usize = 120;
+
+/// Render one reported path so that two spellings can never read as one.
+///
+/// The device evidence this reporting exists for printed
+/// `pages/\u{17d} pilot notes #pilot.md` on BOTH sides of a `changed:` row. The
+/// graph held two files whose names differ only by Unicode normalization
+/// (`U+017D` against `Z` + `U+030C`), and both render as the same glyph in
+/// every log, terminal and issue tracker — so the refusal named a row nobody
+/// could tell apart from its neighbour, and the first reading of it was wrong.
+/// Escaping every non-ASCII scalar makes the two spellings different strings.
+/// ASCII paths, which are the overwhelming majority, are untouched.
+fn bootstrap_source_change_report_path(path: &str) -> String {
+    let rendered = if path.is_ascii() {
+        path.to_owned()
+    } else {
+        let mut rendered = String::with_capacity(path.len());
+        for character in path.chars() {
+            if character.is_ascii() {
+                rendered.push(character);
+            } else {
+                rendered.push_str(&format!("\\u{{{:x}}}", character as u32));
+            }
+        }
+        rendered
+    };
+    if rendered.len() <= BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES {
+        return rendered;
+    }
+    let mut end = BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES;
+    while end > 0 && !rendered.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &rendered[..end])
+}
+
+fn bootstrap_source_change_report_digest(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Render one sorted-spool row in the shape the refusal reports.
+///
+/// Only fields the final proof actually compares appear here: the exact path,
+/// the filesystem resource identity, the link count, and the content
+/// description. Nothing derived from the parser is in the inventory at all.
+fn render_bootstrap_source_spool_row(
+    kind: BootstrapSourceSpoolKind,
+    frame: &[u8],
+) -> io::Result<String> {
+    match kind {
+        BootstrapSourceSpoolKind::Inventory => {
+            let tag = *frame
+                .first()
+                .ok_or_else(|| bootstrap_source_capture_error("empty source inventory record"))?;
+            let mut decoder = BootstrapSourceDecoder::new(frame, tag)?;
+            match tag {
+                1 => {
+                    let path = decoder.string()?;
+                    let resource = decoder.digest()?;
+                    decoder.finish()?;
+                    Ok(format!(
+                        "dir {} resource:{}",
+                        bootstrap_source_change_report_path(path),
+                        bootstrap_source_change_report_digest(resource.as_bytes())
+                    ))
+                }
+                2 => {
+                    let path = decoder.string()?;
+                    let resource = decoder.digest()?;
+                    let link_count = decoder.u64()?;
+                    let source = match decoder.u8()? {
+                        0 => None,
+                        1 => Some(decoder.description()?),
+                        _ => {
+                            return Err(bootstrap_source_capture_error(
+                                "invalid source inventory source flag",
+                            ))
+                        }
+                    };
+                    decoder.finish()?;
+                    let content = match source {
+                        None => "none".to_owned(),
+                        Some(description) => format!(
+                            "{}@{}",
+                            bootstrap_source_change_report_digest(description.sha256()),
+                            description.byte_length()
+                        ),
+                    };
+                    Ok(format!(
+                        "file {} resource:{} links:{link_count} content:{content}",
+                        bootstrap_source_change_report_path(path),
+                        bootstrap_source_change_report_digest(resource.as_bytes())
+                    ))
+                }
+                _ => Err(bootstrap_source_capture_error(
+                    "unexpected source inventory record tag",
+                )),
+            }
+        }
+        BootstrapSourceSpoolKind::Chunks => {
+            let chunk = decode_bootstrap_source_chunk(frame)?;
+            Ok(format!(
+                "chunk {}#{} content:{}@{}",
+                bootstrap_source_change_report_path(chunk.path.as_str()),
+                chunk.ordinal,
+                bootstrap_source_change_report_digest(chunk.description.sha256()),
+                chunk.description.byte_length()
+            ))
+        }
+        BootstrapSourceSpoolKind::Entries
+        | BootstrapSourceSpoolKind::Aliases
+        | BootstrapSourceSpoolKind::Portable => Err(bootstrap_source_capture_error(
+            "spool kind carries no capture-change report",
+        )),
+    }
+}
+
+fn bootstrap_source_change_report_key(
+    kind: BootstrapSourceSpoolKind,
+    frame: &[u8],
+) -> io::Result<(String, u32)> {
+    match kind {
+        BootstrapSourceSpoolKind::Inventory => {
+            let (path, tag) = bootstrap_source_inventory_key(frame)?;
+            Ok((path.to_owned(), u32::from(tag)))
+        }
+        BootstrapSourceSpoolKind::Chunks => {
+            let (path, ordinal) = bootstrap_source_chunk_key(frame)?;
+            Ok((path.to_owned(), ordinal))
+        }
+        BootstrapSourceSpoolKind::Entries
+        | BootstrapSourceSpoolKind::Aliases
+        | BootstrapSourceSpoolKind::Portable => Err(bootstrap_source_capture_error(
+            "spool kind carries no capture-change report",
+        )),
+    }
+}
+
+/// Name what changed under a live activation between the sealed capture and the
+/// final proof.
+///
+/// Both spools are sorted by the same key, so one merge walk localises every
+/// difference: a row only the sealed capture has (the file or directory is
+/// gone), a row only the recapture has (something appeared), and a row both
+/// have whose bytes differ (identity, link count or content moved). Reporting
+/// runs only on the refusal path.
+fn describe_bootstrap_source_spool_change(
+    kind: BootstrapSourceSpoolKind,
+    sealed: &Path,
+    recaptured: &Path,
+) -> io::Result<String> {
+    let mut sealed_reader = BootstrapSourceFrameReader::open(sealed)?;
+    let mut recaptured_reader = BootstrapSourceFrameReader::open(recaptured)?;
+    let mut sealed_frame = sealed_reader.next()?;
+    let mut recaptured_frame = recaptured_reader.next()?;
+    let mut differences = 0_u64;
+    let mut reported = Vec::new();
+    let mut report = |line: String| {
+        if reported.len() < BOOTSTRAP_SOURCE_CHANGE_REPORT_ROWS {
+            reported.push(line);
+        }
+    };
+    loop {
+        let order = match (&sealed_frame, &recaptured_frame) {
+            (None, None) => break,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(sealed), Some(recaptured)) => bootstrap_source_change_report_key(kind, sealed)?
+                .cmp(&bootstrap_source_change_report_key(kind, recaptured)?),
+        };
+        match order {
+            std::cmp::Ordering::Less => {
+                let frame = sealed_frame.take().expect("sealed row is present");
+                differences = differences.saturating_add(1);
+                report(format!(
+                    "gone: {}",
+                    render_bootstrap_source_spool_row(kind, &frame)?
+                ));
+                sealed_frame = sealed_reader.next()?;
+            }
+            std::cmp::Ordering::Greater => {
+                let frame = recaptured_frame.take().expect("recaptured row is present");
+                differences = differences.saturating_add(1);
+                report(format!(
+                    "appeared: {}",
+                    render_bootstrap_source_spool_row(kind, &frame)?
+                ));
+                recaptured_frame = recaptured_reader.next()?;
+            }
+            std::cmp::Ordering::Equal => {
+                let sealed_row = sealed_frame.take().expect("sealed row is present");
+                let recaptured_row = recaptured_frame.take().expect("recaptured row is present");
+                if sealed_row != recaptured_row {
+                    differences = differences.saturating_add(1);
+                    report(format!(
+                        "changed: {} -> {}",
+                        render_bootstrap_source_spool_row(kind, &sealed_row)?,
+                        render_bootstrap_source_spool_row(kind, &recaptured_row)?
+                    ));
+                }
+                sealed_frame = sealed_reader.next()?;
+                recaptured_frame = recaptured_reader.next()?;
+            }
+        }
+    }
+    if differences == 0 {
+        // The byte comparison and this walk disagree, which is itself the
+        // report: the spools differ somewhere the sorted key does not describe.
+        return Ok("rows compare equal but the sorted spools differ".to_owned());
+    }
+    Ok(format!(
+        "{differences} row(s) differ; first {}: {}",
+        reported.len(),
+        reported.join("; ")
+    ))
+}
+
 fn encode_bootstrap_source_manifest(capture: &BootstrapSourceCapture) -> io::Result<Vec<u8>> {
     let mut frame = BootstrapSourceEncoder { bytes: Vec::new() };
     frame.u32(BOOTSTRAP_SOURCE_CAPTURE_SCHEMA);
@@ -28560,9 +28787,14 @@ fn verify_bootstrap_source_capture(
     if current.source_files != capture.source_files
         || current.source_chunks != capture.source_chunks
     {
-        return Err(bootstrap_source_capture_interrupted(
-            "source capture changed before final hash-only proof",
-        ));
+        return Err(bootstrap_source_capture_interrupted(format!(
+            "source capture changed before final hash-only proof: source files {}->{}, \
+             source chunks {}->{}",
+            capture.source_files,
+            current.source_files,
+            capture.source_chunks,
+            current.source_chunks
+        )));
     }
     for (kind, sealed) in [
         (
@@ -28571,12 +28803,16 @@ fn verify_bootstrap_source_capture(
         ),
         (BootstrapSourceSpoolKind::Chunks, BOOTSTRAP_SOURCE_CHUNKS),
     ] {
-        if !bootstrap_source_files_equal(
-            &current.paths.sorted(kind),
-            &capture.sealed_directory.join(sealed),
-        )? {
+        let recaptured = current.paths.sorted(kind);
+        let sealed = capture.sealed_directory.join(sealed);
+        if !bootstrap_source_files_equal(&recaptured, &sealed)? {
+            // A bare "something changed" is unactionable: this refusal is
+            // Retryable, so the user sees only a failed activation that may
+            // fail again for the same invisible reason. Name the rows.
+            let difference = describe_bootstrap_source_spool_change(kind, &sealed, &recaptured)
+                .unwrap_or_else(|error| format!("difference could not be decoded: {error}"));
             return Err(bootstrap_source_capture_interrupted(format!(
-                "source capture changed before final {} proof",
+                "source capture changed before final {} proof: {difference}",
                 kind.label()
             )));
         }
@@ -28624,6 +28860,23 @@ fn bootstrap_source_capture_before_final_proof_hook() -> io::Result<()> {
         Some(hook) => hook(),
         None => Ok(()),
     })
+}
+
+/// Arm one mutation immediately before the final source proof, on the lane
+/// activation actually uses.
+///
+/// The older injection point lives in the shadow-projection publication, which
+/// clean local activation no longer walks, so the test that used it stopped
+/// exercising anything: it asserted a refusal on an activation that had never
+/// run the hook at all. This one sits inside `verify_bootstrap_source_capture`
+/// itself, which every lane reaching promotion must call.
+#[cfg(test)]
+pub(crate) fn set_bootstrap_source_capture_before_final_proof_hook_for_test(
+    hook: impl FnOnce() -> io::Result<()> + 'static,
+) {
+    BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|pending| {
+        *pending.borrow_mut() = Some(Box::new(hook));
+    });
 }
 
 #[cfg(not(test))]
@@ -50782,6 +51035,129 @@ mod tests {
             .is_err());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// A capture-change refusal has to say WHAT moved.
+    ///
+    /// It reaches the user as a `Retryable` activation failure and nothing
+    /// else: on CI 32108957903 the whole report was `Retryable { durable_stage:
+    /// Absent, detail: "source capture changed before final inventory proof" }`
+    /// — not the path, not the field, not whether one row moved or a thousand.
+    /// Both directions are pinned. A file that merely APPEARED matters most:
+    /// it changes no source-file and no source-chunk count, so every other
+    /// check in the final proof is blind to it.
+    #[test]
+    fn final_proof_refusal_names_the_rows_that_changed() {
+        for (mutation, expect) in [
+            ("modify", "changed:"),
+            ("add-source", "appeared:"),
+            ("add-other", "appeared:"),
+            ("delete", "gone:"),
+        ] {
+            let root = scratch(&format!("bootstrap-source-named-change-{mutation}"));
+            let source = root.join("pages/one.md");
+            let second = root.join("pages/two.md");
+            fs::write(&source, b"- before the final proof\n").unwrap();
+            fs::write(&second, b"- untouched\n").unwrap();
+            let capture_scratch = bootstrap_capture_scratch(&format!("named-change-{mutation}"));
+            let graph = Graph::open(&root);
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let source = source.clone();
+                    let root = root.clone();
+                    move || match mutation {
+                        "modify" => fs::write(source, b"- changed under the activation\n"),
+                        "add-source" => fs::write(root.join("pages/three.md"), b"- new page\n"),
+                        "add-other" => fs::write(root.join("pages/notes.txt"), b"not a page\n"),
+                        "delete" => fs::remove_file(source),
+                        _ => unreachable!(),
+                    }
+                }));
+            });
+            let error = capture
+                .verify_before_inactive_bootstrap_authoring(&graph)
+                .expect_err("the final proof must refuse a graph that moved");
+            let detail = error.to_string();
+            if mutation == "add-other" {
+                // The only mutation of the four that leaves both counts equal,
+                // so the inventory report is the ONLY thing that localises it.
+                assert!(
+                    detail.contains("source capture changed before final inventory proof"),
+                    "{mutation}: {detail}"
+                );
+                assert!(detail.contains("pages/notes.txt"), "{mutation}: {detail}");
+                assert!(detail.contains("1 row(s) differ"), "{mutation}: {detail}");
+            }
+            if mutation == "modify" {
+                assert!(detail.contains("pages/one.md"), "{mutation}: {detail}");
+                assert!(detail.contains("content:"), "{mutation}: {detail}");
+            }
+            if detail.contains("inventory proof") {
+                assert!(detail.contains(expect), "{mutation}: {detail}");
+            } else {
+                // A count mismatch is caught before the spools are compared, so
+                // it reports the counts rather than the rows.
+                assert!(
+                    detail.contains("source files") && detail.contains("source chunks"),
+                    "{mutation}: {detail}"
+                );
+            }
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&capture_scratch);
+        }
+    }
+
+    /// A named row is worth nothing if the name cannot be told from its twin.
+    ///
+    /// CI 32115065229 reported `changed: file pages/\u{17d} pilot notes
+    /// #pilot.md … -> file pages/\u{17d} pilot notes #pilot.md …` for a graph
+    /// holding TWO files whose names differ only by Unicode normalization
+    /// (`U+017D` against `Z` + `U+030C`). Both spellings print as the same
+    /// glyph sequence in every log, so the refusal could not say which file
+    /// moved, and the first reading of that evidence — content normalization —
+    /// was wrong. The report escapes non-ASCII; ASCII paths are untouched.
+    #[test]
+    fn a_capture_change_refusal_distinguishes_two_spellings_of_one_glyph() {
+        let root = scratch("bootstrap-source-normalization-twins");
+        let precomposed = root.join("pages/\u{17d} pilot notes.md");
+        let decomposed = root.join("pages/Z\u{30c} pilot notes.md");
+        fs::write(&precomposed, b"- precomposed\n").unwrap();
+        fs::write(&decomposed, b"- decomposed\n").unwrap();
+        let capture_scratch = bootstrap_capture_scratch("normalization-twins");
+        let graph = Graph::open(&root);
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_scratch)
+            .unwrap();
+        BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new({
+                let decomposed = decomposed.clone();
+                move || fs::write(decomposed, b"- decomposed, changed under the activation\n")
+            }));
+        });
+        let detail = capture
+            .verify_before_inactive_bootstrap_authoring(&graph)
+            .expect_err("the final proof must refuse a graph that moved")
+            .to_string();
+        assert!(detail.contains("1 row(s) differ"), "{detail}");
+        assert!(
+            detail.contains("pages/Z\\u{30c} pilot notes.md"),
+            "the refusal must name the DECOMPOSED twin as the row that moved: {detail}"
+        );
+        assert!(
+            !detail.contains("pages/\u{17d} pilot notes.md")
+                && !detail.contains("pages/Z\u{30c} pilot notes.md"),
+            "no raw glyph spelling may reach the refusal, or the twins read alike: {detail}"
+        );
+        // An ASCII path is still reported exactly as it is on disk.
+        assert_eq!(
+            bootstrap_source_change_report_path("pages/one.md"),
+            "pages/one.md"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&capture_scratch);
     }
 
     #[test]

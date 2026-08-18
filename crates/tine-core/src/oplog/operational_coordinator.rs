@@ -1012,6 +1012,7 @@ impl PublishedContinuationCore {
                 graph,
                 receipts,
                 engine,
+                Some(database),
                 source,
                 &self.guard,
                 budget.remaining > 0,
@@ -3037,6 +3038,7 @@ fn resume_clean_published(
             graph,
             receipts,
             engine,
+            Some(database),
             source,
             &continuation.guard,
             true,
@@ -3045,9 +3047,20 @@ fn resume_clean_published(
             OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
         })?;
         if completed.is_none() {
+            // Name the artifact and the operation. This detail is what
+            // `clean_shutdown` reports when it refuses `Safe`, so an
+            // unapplied delivered deletion is never silent.
+            let operation = if matches!(source.target(), super::ManifestProjectionTarget::Absent) {
+                "deletion"
+            } else {
+                "projection"
+            };
             return Err(OperationalCoordinatorError::continuation_required(
                 OperationalPhase::ProjectionDrain,
-                "clean receiver-local projection requires a continuation",
+                format!(
+                    "clean receiver-local {operation} of {:?} requires a continuation",
+                    source.path().as_str()
+                ),
             ));
         }
     }
