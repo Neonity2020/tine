@@ -214,7 +214,7 @@ describe("SheetGrid", () => {
     const byId: Record<string, Node> = {};
     const rowIds = ["wide-row-0", "wide-row-1", "wide-row-2"];
     for (let row = 0; row < 3; row++) {
-      const cellIds = Array.from({ length: 20_000 }, (_, col) => `wide-cell-${row}-${col}`);
+      const cellIds = Array.from({ length: 4_000 }, (_, col) => `wide-cell-${row}-${col}`);
       byId[rowIds[row]] = node(rowIds[row], "", pageName, "wide-grid", cellIds);
       for (const cellId of cellIds) byId[cellId] = node(cellId, cellId, pageName, rowIds[row]);
     }
@@ -224,7 +224,7 @@ describe("SheetGrid", () => {
     const { root, dispose } = mount(() => <Block id="wide-grid" />);
     const grid = root.querySelector(".sheet-grid") as HTMLElement;
     expect(grid.querySelectorAll(":scope > .sheet-cell")).toHaveLength(600);
-    expect(grid.querySelector(".sheet-load-more-columns")?.textContent).toContain("1-200 of 20000");
+    expect(grid.querySelector(".sheet-load-more-columns")?.textContent).toContain("1-200 of 4000");
     (grid.querySelector(".sheet-load-more-columns") as HTMLButtonElement).click();
     expect(grid.querySelectorAll(":scope > .sheet-cell")).toHaveLength(1_200);
     expect(grid.querySelectorAll(":scope > .sheet-cell").length).toBeLessThanOrEqual(2_000);

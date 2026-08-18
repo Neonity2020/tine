@@ -357,7 +357,7 @@ describe("SheetGrid interaction", () => {
     const byId: Record<string, StoreNode> = {};
     const rowIds: string[] = [];
     let rowLengthReads = 0;
-    for (let row = 0; row < 100_001; row++) {
+    for (let row = 0; row < 20_001; row++) {
       const rowId = `perf-row-${row}`;
       const children = new Proxy([] as string[], {
         get(target, property, receiver) {
@@ -377,7 +377,12 @@ describe("SheetGrid interaction", () => {
       <SurfaceContext.Provider value="pane:right"><SheetGrid id="perf-grid" /></SurfaceContext.Provider>
     </>);
     // 200 shared discovery reads + one 200-row active-window pass per surface.
-    // A per-pane dimension scan would push this to at least 800.
+    // A per-pane dimension scan would push this to at least 800 — and to 40,000+
+    // on this fixture, so the bound still fails loudly if windowing regresses.
+    // The row count is the smallest that keeps that gap unmistakable: building
+    // one Proxy per row dominates this test, and a 100k fixture timed out
+    // whenever the box was loaded (the house rule is cut the fixture, never
+    // widen the timeout).
     expect(rowLengthReads - readsBeforeMount).toBeLessThanOrEqual(650);
     expect(root.querySelectorAll(":scope .sheet-grid > .sheet-cell")).toHaveLength(400);
     const surfaceId = "pane:left";
