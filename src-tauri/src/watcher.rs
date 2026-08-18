@@ -1251,6 +1251,31 @@ fn sparse_tick_is_blocked_without_progress(
     actor_has_runnable_work && matches!(tick, SyncRuntimeTick::Idle)
 }
 
+/// Has the condition the last emitted error described actually ended?
+///
+/// One tick settles ONE lane. A blocked provider lane and a healthy local lane
+/// therefore interleave: `RecoveryBlocked`, `Idle`, `RecoveryBlocked`, … Reading
+/// any non-blocked tick as "the failure is over" reset the repeat suppression
+/// on every cycle, so ONE permanently blocked condition emitted a fresh
+/// `sparse-v2-error` — and a fresh red toast — for as long as it lasted. The
+/// frontend's own notice de-duplication (`managedStorageRuntime.ts`) cannot see
+/// past this: it is handed genuinely new error events and correctly reports
+/// each one.
+///
+/// `actor_has_runnable_work` is the durable signal that the actor still knows
+/// about work it has not been able to finish, which is exactly the state a
+/// blocked lane holds. A graph that truly recovered drains to no runnable work,
+/// and the next failure after that reports again.
+fn sparse_error_condition_ended(tick: &SyncRuntimeTick, actor_has_runnable_work: bool) -> bool {
+    !matches!(
+        tick,
+        SyncRuntimeTick::RecoveryBlocked(_)
+            | SyncRuntimeTick::Blocked(_)
+            | SyncRuntimeTick::Terminal(_)
+            | SyncRuntimeTick::Failed(_)
+    ) && !actor_has_runnable_work
+}
+
 fn take_sparse_initial_tick(pending: &mut bool) -> bool {
     std::mem::take(pending)
 }
@@ -1690,7 +1715,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 );
                                 graph.last_error = Some(message);
                             }
-                        } else {
+                        } else if sparse_error_condition_ended(&tick, actor_has_runnable_work) {
                             graph.last_error = None;
                         }
                         let _ = app.emit_to(
@@ -1861,6 +1886,69 @@ mod tests {
             managed_local_next_sequence: 0,
             managed_local_stage: None,
         }
+    }
+
+    /// One permanently blocked lane must report ONCE. The desktop repeated
+    /// `RecoveryBlocked("unsafe provider entry: enrollment: …")` because the
+    /// local lane's healthy ticks kept clearing the repeat suppression between
+    /// two identical failures (GH: desktop pairing, 2026-08-18).
+    #[test]
+    fn a_healthy_tick_from_another_lane_does_not_re_arm_a_live_failure() {
+        let blocked = SyncRuntimeTick::RecoveryBlocked("unsafe provider entry: enrollment".into());
+        let healthy = [
+            SyncRuntimeTick::Idle,
+            SyncRuntimeTick::Recovering,
+            SyncRuntimeTick::AdmittedNoop { epoch: 4 },
+            SyncRuntimeTick::AdmittedComplete { epoch: 5 },
+        ];
+
+        for tick in &healthy {
+            assert!(
+                !sparse_error_condition_ended(tick, true),
+                "{tick:?} settled one lane while the actor still holds work it cannot finish"
+            );
+        }
+        for tick in &healthy {
+            assert!(
+                sparse_error_condition_ended(tick, false),
+                "{tick:?} on a drained actor is a real recovery and must report again"
+            );
+        }
+        for runnable in [false, true] {
+            assert!(
+                !sparse_error_condition_ended(&blocked, runnable),
+                "a blocked tick never ends its own condition"
+            );
+        }
+
+        // The emission rule the watcher loop applies, replayed over the tick
+        // sequence a stuck provider lane actually produces.
+        let mut last_error: Option<String> = None;
+        let mut emitted = Vec::new();
+        for (tick, runnable) in [
+            (&blocked, true),
+            (&healthy[0], true),
+            (&blocked, true),
+            (&healthy[0], true),
+            (&blocked, true),
+        ] {
+            if matches!(
+                tick,
+                SyncRuntimeTick::RecoveryBlocked(_)
+                    | SyncRuntimeTick::Blocked(_)
+                    | SyncRuntimeTick::Terminal(_)
+                    | SyncRuntimeTick::Failed(_)
+            ) {
+                let message = format!("{tick:?}");
+                if last_error.as_deref() != Some(&message) {
+                    emitted.push(message.clone());
+                    last_error = Some(message);
+                }
+            } else if sparse_error_condition_ended(tick, runnable) {
+                last_error = None;
+            }
+        }
+        assert_eq!(emitted.len(), 1, "one condition, one report: {emitted:?}");
     }
 
     #[test]
