@@ -82,6 +82,31 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // app with `clean external reconciliation failed during Planning: decoded
   // destination logical page name … is already owned by page <uuid>`.
   "sync_runtime::tests::android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph",
+  // The journey's external leg EDITS a page its own fixture put on disk. A
+  // caller that drives it against a different graph turns that edit into a
+  // create the `archiv/` duplicate wins, and the run fails as `external edit
+  // did not reconcile: Missing` — verbatim how the resume instrumentation case
+  // failed on CI 32108957903 with the runtime behaving as specified.
+  "sync_runtime::tests::android_journey_refuses_a_graph_that_lacks_its_own_fixture",
+  // The graph the device instrumentation actually holds (1097 corpus pages
+  // under the journey's name shapes). Reconciliation advances one bounded
+  // slice per turn, so the drain must scale with the graph: this settles on
+  // tick 71 and the journey's previous fixed 64 was below it. Nothing smaller
+  // reproduces that — 600 corpus pages settle on tick 40.
+  "sync_runtime::tests::android_managed_storage_journey_settles_reconciliation_on_a_corpus_scale_graph",
+  // Which of two physical files owns one decoded page name, pinned at the
+  // application boundary: the FIRST exact path, in plain byte order, so an
+  // ordinary backup copy under a directory sorting before `pages/` takes the
+  // name from the file in `pages/` and nothing surfaces that.
+  "sync_runtime::tests::one_page_name_with_two_physical_files_is_owned_by_the_first_exact_path",
+  // Re-gated, not newly written. It armed the shadow-projection publication's
+  // injection point, which the production clean lane does not walk, so the
+  // hook never ran and the test asserted a refusal that could not happen — red
+  // on master and excluded from every gate. It now arms the final source proof
+  // itself and holds three things: the refusal NAMES the row that moved, the
+  // attempt retracts the disposable archive it created, and the retry rebuilds
+  // from current Direct Files instead of refusing SyncConflict for good.
+  "sync_runtime::tests::activation_external_edit_before_promotion_refuses_then_retries_from_current_direct_files",
   // One journey step further (CI run 32098261560: activation, load, save,
   // crash reopen and share preparation all landed, then `clean shutdown
   // failed: Err(ActorUnavailable)`). A successful enrollment cut retires its
@@ -153,7 +178,6 @@ export const PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::accepted_non_tip_object_loss_fences_checkpoint_until_repaired",
   "sync_runtime::tests::accepted_non_tip_revalidation_repairs_before_following_mutation",
   "sync_runtime::tests::accepted_ordinary_manifest_loss_without_local_archive_blocks",
-  "sync_runtime::tests::activation_external_edit_before_promotion_refuses_then_retries_from_current_direct_files",
   "sync_runtime::tests::activation_progress_is_ordered_exact_byte_and_structurally_near_linear",
   "sync_runtime::tests::activation_retires_older_shadow_import_when_direct_files_changed_before_retry",
   "sync_runtime::tests::affine_before_projection_matches_forced_generic_application_save",

@@ -1001,6 +1001,27 @@ store from the unchanged Markdown/Org source. Once enrollment has promoted the
 receipt-store identity, this recovery is forbidden: normal exact identity and
 receipt recovery rules apply.
 
+The same rule governs the archive a clean activation builds. Before the
+activation marker is committed, the archive carries no authority and is
+reconstructible from current Direct Files, and the clean lane records no private
+activation reservation that a later attempt could use to attribute it. An
+attempt that refuses before that marker therefore retracts the archive it
+created, and only that one: an archive that predates the attempt is left exactly
+where it is, so genuinely foreign residue is still refused as
+`AmbiguousOrForeignResidue { ArchiveResidue, SyncConflict }`. Without the
+retraction, one ordinary external write landing during activation — which makes
+the final source proof refuse `Retryable { durable_stage: Absent }` — leaves an
+archive that no later attempt can attribute, and every retry refuses
+`SyncConflict` permanently for a graph whose only authority is still the
+Markdown/Org tree beside it.
+
+A refusal from that final source proof names what moved: the row count and, for
+the first rows, the exact path together with the field that changed (filesystem
+resource identity, link count, or content description), and whether the row
+appeared, vanished, or changed. A file that merely appears changes neither the
+source-file nor the source-chunk count, so the inventory report is the only
+thing that localises it.
+
 The graph-local shared-provider tree is transport rather than local authority.
 Tine still creates and opens it no-follow, requires ordinary directories and
 regular files, flushes published file contents, and validates bounded bytes and

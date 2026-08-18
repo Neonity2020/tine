@@ -25,7 +25,8 @@
 //! and nothing more.
 
 use std::{
-    fs, io,
+    fmt, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -84,10 +85,7 @@ const JOURNEY_NAME_SHAPES: &[(&str, &str)] = &[
         "- lowercase horse\n",
     ),
     // An ordinary non-ASCII page with no twin, edited externally later.
-    (
-        "pages/Denn\u{ed} pozn\u{e1}mky.md",
-        "- ordinary non-ASCII page\n",
-    ),
+    (JOURNEY_EXTERNAL_EDIT_PAGE, JOURNEY_EXTERNAL_EDIT_BEFORE),
     // A nested layout with a space in a directory component.
     (
         "notes/archiv 2026/Star\u{fd} z\u{e1}pis.md",
@@ -100,41 +98,85 @@ const JOURNEY_NAME_SHAPES: &[(&str, &str)] = &[
 const JOURNEY_EXTERNAL_WRITES: &[(&str, &str)] = &[
     // A brand-new page from another editor or a filesystem sync provider.
     (
-        "pages/Extern\u{ed} novinka.md",
+        JOURNEY_EXTERNAL_CREATED_PAGE,
         "- written by another editor\n",
     ),
     // An ordinary offline edit to an existing non-ASCII page.
-    (
-        "pages/Denn\u{ed} pozn\u{e1}mky.md",
-        "- ordinary non-ASCII page\n- edited outside Tine\n",
-    ),
+    (JOURNEY_EXTERNAL_EDIT_PAGE, JOURNEY_EXTERNAL_EDIT_AFTER),
     // An honest backup copy: a second physical file whose decoded page name is
     // already owned. This is the reported refusal, arriving the ordinary way.
     ("archiv/2026/Denn\u{ed} pozn\u{e1}mky.md", "- backup copy\n"),
 ];
+
+/// The page the outside writer EDITS.
+///
+/// It is a member of [`JOURNEY_NAME_SHAPES`], so the leg is only an edit when
+/// the journey's own fixture is on disk. Driven against a graph that lacks the
+/// fixture the same write becomes a CREATE, the backup copy under `archiv/`
+/// sorts earlier and wins the decoded name, and the miss surfaces far from its
+/// cause as `external edit did not reconcile: Missing`. The journey proves the
+/// precondition instead of assuming it.
+pub const JOURNEY_EXTERNAL_EDIT_PAGE: &str = "pages/Denn\u{ed} pozn\u{e1}mky.md";
+/// What that page holds before the outside writer touches it.
+pub const JOURNEY_EXTERNAL_EDIT_BEFORE: &str = "- ordinary non-ASCII page\n";
+/// What the outside writer leaves there.
+pub const JOURNEY_EXTERNAL_EDIT_AFTER: &str = "- ordinary non-ASCII page\n- edited outside Tine\n";
+/// The block the external edit appends, as the editor surfaces it.
+pub const JOURNEY_EXTERNAL_EDIT_BLOCK: &str = "edited outside Tine";
+/// The page the outside writer CREATES.
+pub const JOURNEY_EXTERNAL_CREATED_PAGE: &str = "pages/Extern\u{ed} novinka.md";
+/// The block that created page carries, as the editor surfaces it.
+pub const JOURNEY_EXTERNAL_CREATED_BLOCK: &str = "written by another editor";
+
+/// Write one graph file and make it durable before the runtime can observe it.
+///
+/// A plain `fs::write` leaves the bytes in the page cache and the new directory
+/// entry unsynced. That is invisible on a host, and it is exactly the ambiguity
+/// a device run cannot afford: "the fixture was still landing when activation
+/// started" has to be excluded by construction rather than argued about, since
+/// activation refuses (`Retryable`) if the graph moves under it.
+fn write_journey_file(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+        let mut file = fs::File::create(target)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        sync_journey_directory(parent)
+    } else {
+        let mut file = fs::File::create(target)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+}
+
+#[cfg(unix)]
+fn sync_journey_directory(directory: &Path) -> io::Result<()> {
+    fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_journey_directory(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 /// Write the journey's graph tree. Callers own the (empty) `graph_root`.
 pub fn write_journey_graph_fixture(graph_root: &Path) -> io::Result<()> {
     fs::create_dir_all(graph_root.join("pages"))?;
     fs::create_dir_all(graph_root.join("journals"))?;
     fs::create_dir_all(graph_root.join("logseq"))?;
-    fs::write(graph_root.join("logseq/config.edn"), b"{}\n")?;
-    fs::write(
-        graph_root.join(JOURNEY_EDITED_PAGE),
+    write_journey_file(&graph_root.join("logseq/config.edn"), b"{}\n")?;
+    write_journey_file(
+        &graph_root.join(JOURNEY_EDITED_PAGE),
         b"- Android managed storage smoke\n",
     )?;
-    fs::write(
-        graph_root.join("journals/2026_08_18.md"),
+    write_journey_file(
+        &graph_root.join("journals/2026_08_18.md"),
         "- journal entry with #pilot and [[\u{17d} pilot notes #pilot]]\n".as_bytes(),
     )?;
     for (path, bytes) in JOURNEY_NAME_SHAPES {
-        let target = graph_root.join(path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(target, bytes.as_bytes())?;
+        write_journey_file(&graph_root.join(path), bytes.as_bytes())?;
     }
-    Ok(())
+    sync_journey_directory(graph_root)
 }
 
 /// Apply the outside writer's changes. Separated so the caller can prove the
@@ -142,14 +184,63 @@ pub fn write_journey_graph_fixture(graph_root: &Path) -> io::Result<()> {
 fn apply_journey_external_writes(graph_root: &Path) -> io::Result<Vec<String>> {
     let mut written = Vec::new();
     for (path, bytes) in JOURNEY_EXTERNAL_WRITES {
-        let target = graph_root.join(path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(target, bytes.as_bytes())?;
+        write_journey_file(&graph_root.join(path), bytes.as_bytes())?;
         written.push((*path).to_owned());
     }
+    sync_journey_directory(graph_root)?;
     Ok(written)
+}
+
+/// The journey drives reconciliation by hand, so it must offer the runtime as
+/// many turns as the graph it just changed needs.
+///
+/// A fixed 64 was below what the graph the device journey actually holds
+/// requires: at the host boundary the same 1104-page corpus settled on tick 71,
+/// so a correct runtime would have been reported as
+/// `external reconciliation never admitted an epoch`. Derive the bound from the
+/// graph rather than tuning a number: every turn is a bounded slice, so the
+/// count scales with the file set, and the drain still refuses rather than
+/// waiting forever.
+fn journey_reconciliation_tick_budget(graph_root: &Path) -> usize {
+    const RESERVE: usize = 256;
+    RESERVE.saturating_add(count_journey_graph_text_files(graph_root))
+}
+
+fn count_journey_graph_text_files(root: &Path) -> usize {
+    let mut stack = vec![root.to_path_buf()];
+    let mut files = 0_usize;
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                Ok(kind) if kind.is_file() => {
+                    let text = name
+                        .rsplit_once('.')
+                        .map(|(_, extension)| extension)
+                        .is_some_and(|extension| {
+                            extension.eq_ignore_ascii_case("md")
+                                || extension.eq_ignore_ascii_case("markdown")
+                                || extension.eq_ignore_ascii_case("org")
+                        });
+                    if text {
+                        files = files.saturating_add(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    files
 }
 
 fn tick_is_settled(tick: &SyncRuntimeTick) -> bool {
@@ -171,48 +262,110 @@ fn tick_is_refusal(tick: &SyncRuntimeTick) -> bool {
     )
 }
 
+/// A bounded account of one reconciliation drain.
+///
+/// The whole tick sequence used to be carried verbatim, which is unreadable the
+/// moment the budget scales with the graph. Keep the opening turns (where a
+/// refusal or an unexpected state shows up), the last turn, and the totals.
+struct ReconciliationCensus {
+    budget: usize,
+    ticks: usize,
+    admitted: usize,
+    opening: Vec<String>,
+    last: String,
+}
+
+impl ReconciliationCensus {
+    /// How many opening turns one census keeps verbatim.
+    const OPENING_TURNS: usize = 8;
+
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            ticks: 0,
+            admitted: 0,
+            opening: Vec::new(),
+            last: "none".to_owned(),
+        }
+    }
+
+    fn record(&mut self, tick: &SyncRuntimeTick) {
+        self.ticks = self.ticks.saturating_add(1);
+        if matches!(
+            tick,
+            SyncRuntimeTick::AdmittedComplete { .. } | SyncRuntimeTick::AdmittedNoop { .. }
+        ) {
+            self.admitted = self.admitted.saturating_add(1);
+        }
+        self.last = format!("{tick:?}");
+        if self.opening.len() < Self::OPENING_TURNS {
+            self.opening.push(self.last.clone());
+        }
+    }
+}
+
+impl fmt::Display for ReconciliationCensus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ticks={}/{} admitted={} last={} opening={}",
+            self.ticks,
+            self.budget,
+            self.admitted,
+            self.last,
+            self.opening.join("|")
+        )
+    }
+}
+
 /// Drive reconciliation the way the platform watcher does, and report the exact
-/// tick sequence. A refusal is returned as evidence rather than retried away:
-/// on the device it repeated forever, one red toast at a time.
-fn drain_external_reconciliation(handle: &SyncRuntimeHandle) -> Result<Vec<String>, String> {
+/// tick census. A refusal is returned as evidence rather than retried away: on
+/// the device it repeated forever, one red toast at a time.
+fn drain_external_reconciliation(
+    handle: &SyncRuntimeHandle,
+    budget: usize,
+) -> Result<ReconciliationCensus, String> {
     handle
         .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
         .map_err(|error| format!("watcher observation refused: {error}"))?;
-    let mut ticks = Vec::new();
-    let mut admitted = false;
-    for _ in 0..64 {
+    let mut census = ReconciliationCensus::new(budget);
+    let mut quiet = false;
+    for _ in 0..budget {
         let tick = handle
             .tick()
-            .map_err(|error| format!("reconciliation tick refused: {error}; ticks={ticks:?}"))?;
+            .map_err(|error| format!("reconciliation tick refused: {error}; {census}"))?;
         let settled = tick_is_settled(&tick);
-        admitted = admitted
-            || matches!(
-                tick,
-                SyncRuntimeTick::AdmittedComplete { .. } | SyncRuntimeTick::AdmittedNoop { .. }
-            );
+        census.record(&tick);
         if tick_is_refusal(&tick) {
-            ticks.push(format!("{tick:?}"));
             return Err(format!(
-                "external reconciliation refused: {tick:?}; ticks={}",
-                ticks.join("|")
+                "external reconciliation refused: {tick:?}; {census}"
             ));
         }
-        ticks.push(format!("{tick:?}"));
         let watcher = handle
             .status()
-            .map_err(|error| format!("status unavailable during reconciliation: {error}"))?
+            .map_err(|error| {
+                format!("status unavailable during reconciliation: {error}; {census}")
+            })?
             .watcher;
         if settled && !watcher.pending && !watcher.drain_in_flight {
+            quiet = true;
             break;
         }
     }
-    if !admitted {
+    // Both halves are load-bearing. Without `quiet` a drain that merely ran out
+    // of turns reads as a clean drain; without `admitted` a drain that settled
+    // without ever admitting an epoch does.
+    if !quiet {
         return Err(format!(
-            "external reconciliation never admitted an epoch; ticks={}",
-            ticks.join("|")
+            "external reconciliation did not settle within its budget; {census}"
         ));
     }
-    Ok(ticks)
+    if census.admitted == 0 {
+        return Err(format!(
+            "external reconciliation never admitted an epoch; {census}"
+        ));
+    }
+    Ok(census)
 }
 
 /// Run the whole journey and return its receipt. `Ok` receipts start with
@@ -238,9 +391,13 @@ pub fn run_managed_storage_journey(
     );
     let activation_ms = journey_started.elapsed().as_millis();
     if activation.status != SyncLocalActivationStatus::Active {
+        // The phase name alone does not say WHEN the phases ran, and the two
+        // activation refusals this journey has produced were both about timing
+        // under a graph that moved. Carry the per-phase millisecond receipt.
         return format!(
-            "activation failed after {last_progress}: {:?}",
-            activation.status
+            "activation failed after {last_progress}: {:?}; activation_ms={activation_ms}; progress={}",
+            activation.status,
+            progress_receipt.join("|")
         );
     }
     let Some(handle) = activation.handle else {
@@ -327,13 +484,35 @@ pub fn run_managed_storage_journey(
 
     // The leg this journey was missing: another writer changes the graph tree
     // under a live managed runtime, and reconciliation must plan and apply it.
+    //
+    // Prove the leg's own precondition first. The edit target must ALREADY be a
+    // page owning its decoded name, or the write below is a create racing the
+    // `archiv/` backup copy for that name, and the miss surfaces later as an
+    // uninterpretable `external edit did not reconcile: Missing`. That is
+    // exactly how the resume instrumentation case failed while the runtime was
+    // behaving as specified (CI 32108957903).
+    match handle.load_application_page(SyncApplicationPageLoadRequest {
+        page: SyncApplicationPageSelector::ExactPath {
+            path: JOURNEY_EXTERNAL_EDIT_PAGE.into(),
+        },
+    }) {
+        Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. }) if page.blocks.len() == 1 => {}
+        outcome => {
+            return format!(
+                "journey precondition failed: {JOURNEY_EXTERNAL_EDIT_PAGE} must already be an \
+                 owned single-block page before the external edit — drive the journey against \
+                 `write_journey_graph_fixture`: {outcome:?}"
+            )
+        }
+    }
     let reconciliation_started = Instant::now();
     let external = match apply_journey_external_writes(&graph_root) {
         Ok(written) => written,
         Err(error) => return format!("external write failed: {error}"),
     };
-    let reconciliation_ticks = match drain_external_reconciliation(&handle) {
-        Ok(ticks) => ticks,
+    let reconciliation_budget = journey_reconciliation_tick_budget(&graph_root);
+    let reconciliation = match drain_external_reconciliation(&handle, reconciliation_budget) {
+        Ok(census) => census,
         Err(detail) => {
             return format!(
                 "{detail}; external={}; status={}; progress={}",
@@ -348,31 +527,28 @@ pub fn run_managed_storage_journey(
     // carries the outside edit.
     match handle.load_application_page(SyncApplicationPageLoadRequest {
         page: SyncApplicationPageSelector::ExactPath {
-            path: "pages/Extern\u{ed} novinka.md".into(),
+            path: JOURNEY_EXTERNAL_CREATED_PAGE.into(),
         },
     }) {
         Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. })
             if page.blocks.first().map(|block| block.raw.as_str())
-                == Some("written by another editor") => {}
+                == Some(JOURNEY_EXTERNAL_CREATED_BLOCK) => {}
         outcome => {
             return format!(
-                "externally created page did not reconcile: {outcome:?}; ticks={}",
-                reconciliation_ticks.join("|")
+                "externally created page did not reconcile: {outcome:?}; {reconciliation}"
             )
         }
     }
     match handle.load_application_page(SyncApplicationPageLoadRequest {
         page: SyncApplicationPageSelector::ExactPath {
-            path: "pages/Denn\u{ed} pozn\u{e1}mky.md".into(),
+            path: JOURNEY_EXTERNAL_EDIT_PAGE.into(),
         },
     }) {
         Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. })
-            if page.blocks.len() == 2 && page.blocks[1].raw.as_str() == "edited outside Tine" => {}
+            if page.blocks.len() == 2
+                && page.blocks[1].raw.as_str() == JOURNEY_EXTERNAL_EDIT_BLOCK => {}
         outcome => {
-            return format!(
-                "external edit did not reconcile: {outcome:?}; ticks={}",
-                reconciliation_ticks.join("|")
-            )
+            return format!("external edit did not reconcile: {outcome:?}; {reconciliation}")
         }
     }
 
@@ -410,9 +586,8 @@ pub fn run_managed_storage_journey(
     };
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => format!(
-            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} reconciliation_ms={reconciliation_ms} total_ms={} {retained} {shared} reconciliation_ticks={} progress={}",
+            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} reconciliation_ms={reconciliation_ms} total_ms={} {retained} {shared} reconciliation[{reconciliation}] progress={}",
             journey_started.elapsed().as_millis(),
-            reconciliation_ticks.len(),
             progress_receipt.join("|")
         ),
         outcome => format!(
@@ -481,6 +656,14 @@ mod tests {
         assert!(
             journey_case.contains("privateRoot.absolutePath,\n        true,"),
             "the journey case must ask for the shared fixture"
+        );
+        // EVERY case, not just the journey case. The resume case kept its own
+        // smaller graph and so drove the shared journey against a tree the
+        // journey's external leg does not describe; it failed on the shapes
+        // that graph could not hold, not on anything the runtime got wrong.
+        assert!(
+            !instrumentation.contains("privateRoot.absolutePath,\n        false,"),
+            "no instrumentation case may hand-maintain its own copy of the journey graph"
         );
     }
 

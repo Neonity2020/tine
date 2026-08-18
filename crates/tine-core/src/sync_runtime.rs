@@ -5925,11 +5925,55 @@ fn clean_operation_archive_directory(archive_root: &Path) -> PathBuf {
     archive_root.join(CLEAN_OPERATION_ARCHIVE_DIRECTORY)
 }
 
-/// Construct the production clean runtime directly from one operation-free
-/// baseline episode. Every fallible filesystem capability is opened before
-/// the authority marker where possible; after that marker, any failed
-/// same-process adoption is recoverable through `open_clean_runtime_resources`.
+/// Construct the production clean runtime, retracting the disposable archive if
+/// the attempt refuses before any authority exists.
+///
+/// Nothing this lane builds before the activation marker is authority: the
+/// Markdown/Org tree is still the sole one, and the whole archive is
+/// reconstructible from current Direct Files. Leaving it behind is therefore not
+/// neutral, it is fatal — the next activation finds an archive with no
+/// enrollment beside it and no private activation reservation to attribute it
+/// (this lane records none), so `discover_startup` classifies it
+/// `AmbiguousOrForeignResidue { ArchiveResidue, SyncConflict }` and every later
+/// attempt refuses the same way, for good.
+///
+/// That is reachable in one ordinary step: another writer touching the graph
+/// during activation makes the final source proof refuse `Retryable {
+/// durable_stage: Absent }` — the refusal a physical Android reported on
+/// CI 32108957903 — after this lane has already created the archive. Only what
+/// THIS attempt created is retracted; a pre-existing archive is left exactly
+/// where it is, so genuinely foreign residue is still refused.
 fn activate_clean_runtime_resources(
+    request: &SyncLocalActivationRequest,
+    graph: Graph,
+    progress: &mut dyn FnMut(SyncLocalActivationProgress),
+) -> Result<CleanRuntimeResources, String> {
+    let archive_predates_this_attempt = request.archive_root.exists();
+    let result = activate_clean_runtime_resources_retaining_archive(request, graph, progress);
+    if result.is_err() && !archive_predates_this_attempt {
+        if let Err(error) = remove_disposable_clean_archive(&request.archive_root) {
+            return Err(match result {
+                Err(detail) => format!(
+                    "{detail}; retracting the disposable clean archive also failed: {error}"
+                ),
+                Ok(_) => unreachable!("the result was just observed to be an error"),
+            });
+        }
+    }
+    result
+}
+
+/// Remove an archive tree that carries no authority. It is private state under
+/// the app's own directory; no graph path is ever reachable from here.
+fn remove_disposable_clean_archive(archive_root: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(archive_root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn activate_clean_runtime_resources_retaining_archive(
     request: &SyncLocalActivationRequest,
     graph: Graph,
     progress: &mut dyn FnMut(SyncLocalActivationProgress),
@@ -45872,6 +45916,13 @@ mod tests {
     fn android_instrumentation_journey_fixture(
         name: &str,
     ) -> (PathBuf, SyncRuntimeOpenRequest, SyncLocalActivationRequest) {
+        android_instrumentation_journey_fixture_with(name, true)
+    }
+
+    fn android_instrumentation_journey_fixture_with(
+        name: &str,
+        write_journey_graph: bool,
+    ) -> (PathBuf, SyncRuntimeOpenRequest, SyncLocalActivationRequest) {
         let root = std::env::temp_dir().join(format!("tine-android-{name}-{}", Uuid::new_v4()));
         let graph_root = root.join("graph");
         let private_root = root.join("private");
@@ -45879,7 +45930,9 @@ mod tests {
         // boundaries cannot drift apart the way they had (the device hit a
         // reconciliation refusal on real-graph name shapes while the journey
         // was green on a single ASCII page).
-        crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+        if write_journey_graph {
+            crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+        }
 
         let identities = SyncLocalActivationIdentities {
             workspace_id: WorkspaceId::new(),
@@ -45974,6 +46027,155 @@ mod tests {
                 "{path} was rewritten or removed"
             );
         }
+    }
+
+    /// The journey's external-reconciliation leg EDITS a page that the
+    /// journey's own fixture put on disk. Driven against a graph that lacks
+    /// that fixture the same write is a CREATE, the `archiv/` backup copy of
+    /// the same decoded name sorts earlier and wins it, and the run fails as
+    /// `external edit did not reconcile: Ok(Missing { draft: None })` — which
+    /// says nothing about the actual mistake. That is verbatim how the resume
+    /// instrumentation case failed on CI 32108957903 while the runtime behaved
+    /// exactly as `bootstrap_authoritative_source_paths` specifies.
+    ///
+    /// The precondition is now proven where it is required, so a caller that
+    /// drives the journey against the wrong graph is told so.
+    #[test]
+    fn android_journey_refuses_a_graph_that_lacks_its_own_fixture() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("no-journey-graph", false);
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        fs::create_dir_all(graph_root.join("journals")).unwrap();
+        fs::create_dir_all(graph_root.join("logseq")).unwrap();
+        fs::write(graph_root.join("logseq/config.edn"), "{}\n").unwrap();
+        fs::write(
+            graph_root.join("pages/Resume.md"),
+            "- Android interrupted activation resume\n",
+        )
+        .unwrap();
+        fs::write(
+            graph_root.join(crate::managed_storage_journey::JOURNEY_EDITED_PAGE),
+            "- Android managed storage smoke\n",
+        )
+        .unwrap();
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root,
+            open_request,
+            activation_request,
+        );
+        assert!(
+            receipt.starts_with("journey precondition failed:"),
+            "a journey driven against the wrong graph must say so: {receipt}"
+        );
+        assert!(
+            receipt.contains(crate::managed_storage_journey::JOURNEY_EXTERNAL_EDIT_PAGE),
+            "the refusal must name the page the leg edits: {receipt}"
+        );
+    }
+
+    /// The graph the device journey actually holds: the instrumentation writes
+    /// 1097 corpus pages before it calls in, and the journey's own name shapes
+    /// are layered under them.
+    ///
+    /// Reconciliation advances one bounded slice per turn, so the number of
+    /// turns the drain must offer scales with the graph. This graph settles on
+    /// tick 71 here; the journey's previous fixed 64 was below that, so a
+    /// correct runtime would have been reported as `external reconciliation
+    /// never admitted an epoch` on the first device run that got this far.
+    /// Nothing smaller reproduces it — 600 corpus pages settle on tick 40 — so
+    /// the fixture is the device's, deliberately.
+    #[test]
+    fn android_managed_storage_journey_settles_reconciliation_on_a_corpus_scale_graph() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("corpus-scale", false);
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        for page_index in 0..1097 {
+            let mut blocks = String::new();
+            for block_index in 0..12 {
+                blocks.push_str(&format!(
+                    "- Android corpus page {page_index} block {block_index} with [[Smoke]] \
+                     and #android-corpus\n"
+                ));
+            }
+            fs::write(
+                graph_root.join(format!("pages/Corpus-{page_index}.md")),
+                blocks,
+            )
+            .unwrap();
+        }
+        crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root,
+            open_request,
+            activation_request,
+        );
+        assert!(
+            receipt.starts_with("ok "),
+            "the journey must settle its external reconciliation at the size the device \
+             instrumentation runs: {receipt}"
+        );
+    }
+
+    /// Two physical files whose decoded page name is the same: the FIRST exact
+    /// path owns the name and the later one keeps its bytes with no page of its
+    /// own (`bootstrap_authoritative_source_paths`). Exact-path order is plain
+    /// byte order over the graph-relative path, so a copy under a directory
+    /// that sorts before `pages/` takes the name from the file in `pages/`.
+    ///
+    /// This pins the rule rather than endorsing it: it is the reason a journey
+    /// leg that meant to edit `pages/Denní poznámky.md` silently addressed
+    /// `archiv/2026/Denní poznámky.md` instead, and a user with an ordinary
+    /// backup copy gets the backup as their page with no surface saying so.
+    #[test]
+    fn one_page_name_with_two_physical_files_is_owned_by_the_first_exact_path() {
+        let (graph_root, _open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("duplicate-name-order", false);
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        fs::create_dir_all(graph_root.join("journals")).unwrap();
+        fs::create_dir_all(graph_root.join("logseq")).unwrap();
+        fs::write(graph_root.join("logseq/config.edn"), "{}\n").unwrap();
+        fs::create_dir_all(graph_root.join("archiv/2026")).unwrap();
+        fs::write(graph_root.join("pages/Notes.md"), "- the page\n").unwrap();
+        fs::write(
+            graph_root.join("archiv/2026/Notes.md"),
+            "- the backup copy\n",
+        )
+        .unwrap();
+
+        let activation = SyncRuntimeHandle::activate_or_resume_local(activation_request);
+        assert_eq!(activation.status, SyncLocalActivationStatus::Active);
+        let handle = activation.handle.expect("activation opens the actor");
+        let backup = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "archiv/2026/Notes.md".into(),
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(&backup, SyncApplicationPageLoadOutcome::Loaded { page, .. }
+                if page.blocks.first().map(|block| block.raw.as_str()) == Some("the backup copy")),
+            "the earlier exact path owns the decoded name: {backup:?}"
+        );
+        let canonical = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "pages/Notes.md".into(),
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(canonical, SyncApplicationPageLoadOutcome::Missing { .. }),
+            "the later exact path acquires no page of its own: {canonical:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/Notes.md")).unwrap(),
+            "- the page\n",
+            "its bytes are still exactly where the user left them"
+        );
+        drop(handle);
     }
 
     #[test]
@@ -60213,23 +60415,51 @@ mod tests {
         );
     }
 
+    /// A graph that moves under a live activation must refuse retryably, and the
+    /// refusal must NAME what moved.
+    ///
+    /// This used to arm the shadow-projection publication's injection point,
+    /// which clean local activation no longer walks: the hook never ran, the
+    /// graph was never edited, and the test asserted a refusal that could not
+    /// happen — it has been red on master rather than guarding anything. It now
+    /// arms the proof itself, which every promoting lane calls.
+    ///
+    /// The detail assertions are the second half. CI 32108957903 reported this
+    /// refusal from a physical Android as `Retryable { durable_stage: Absent,
+    /// detail: "source capture changed before final inventory proof" }` and
+    /// nothing more, which cannot be acted on by anyone.
     #[test]
     fn activation_external_edit_before_promotion_refuses_then_retries_from_current_direct_files() {
         let fixture = ActivationFixture::nested_unicode("source-change-before-promotion", 0xa580);
         let source = fixture.graph_root.join("Root.md");
         let changed = b"title:: Changed externally\n\n- retained Direct Files edit\n".to_vec();
-        set_before_final_source_verify_hook_for_test({
+        crate::model::set_bootstrap_source_capture_before_final_proof_hook_for_test({
             let source = source.clone();
             let changed = changed.clone();
             move || fs::write(source, changed)
         });
 
         let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert!(matches!(
-            interrupted.status,
-            SyncLocalActivationStatus::Retryable { .. }
-        ));
+        let SyncLocalActivationStatus::Retryable { detail, .. } = &interrupted.status else {
+            panic!(
+                "a graph that moved before promotion must refuse retryably: {:?}",
+                interrupted.status
+            );
+        };
+        assert!(detail.contains("Root.md"), "{detail}");
+        assert!(detail.contains("changed:"), "{detail}");
+        assert!(detail.contains("content:"), "{detail}");
         assert!(interrupted.handle.is_none());
+        // The third half, and the one that makes `Retryable` true. This lane
+        // records no private activation reservation, so an archive left behind
+        // by a refused attempt is an archive the next `discover_startup` can
+        // attribute to nobody: `AmbiguousOrForeignResidue { ArchiveResidue,
+        // SyncConflict }`, permanently, for a graph whose only authority is
+        // still the Markdown tree beside it.
+        assert!(
+            !fixture.request.archive_root.exists(),
+            "a refusal before any authority must retract the archive it created"
+        );
         assert_eq!(fs::read(&source).unwrap(), changed);
 
         let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());

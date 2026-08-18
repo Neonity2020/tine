@@ -99,11 +99,7 @@ class ManagedStorageSmokeTest {
     graphRoot.deleteRecursively()
     privateRoot.deleteRecursively()
     File(graphRoot, "pages").mkdirs()
-    File(graphRoot, "journals").mkdirs()
-    File(graphRoot, "logseq").mkdirs()
     File(graphRoot, "pages/Resume.md").writeText("- Android interrupted activation resume\n")
-    File(graphRoot, "pages/Smoke.md").writeText("- Android managed storage smoke\n")
-    File(graphRoot, "logseq/config.edn").writeText("{}\n")
     // This is deliberately not a valid receipt store. It represents bytes
     // left by a killed, pre-promotion candidate; the Markdown graph is still
     // the sole authority and retry must rebuild disposable private state.
@@ -112,10 +108,19 @@ class ManagedStorageSmokeTest {
 
     System.loadLibrary("tine_lib")
     try {
+      // `writeFixture = true` here too. This case used to hand-maintain its own
+      // smaller graph, so it drove the SHARED journey against a tree the
+      // journey's external-reconciliation leg does not describe: the leg's
+      // "ordinary offline edit to an existing page" became a create, the
+      // `archiv/` backup copy won the decoded name in the same epoch, and the
+      // case failed as `external edit did not reconcile: Missing` while the
+      // runtime was behaving exactly as specified (CI 32108957903). Only the
+      // interrupted pre-promotion receipt tree and `Resume.md` belong to this
+      // case; the graph belongs to the journey.
       val result = ManagedStorageSmoke.runManagedActivationSmoke(
         graphRoot.absolutePath,
         privateRoot.absolutePath,
-        false,
+        true,
       )
       println("TINE_ANDROID_MANAGED_RESUME_RECEIPT $result")
       assertTrue(result, result.startsWith("ok "))
