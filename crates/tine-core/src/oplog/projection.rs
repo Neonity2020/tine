@@ -1647,6 +1647,10 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
     }
     let source_absent = matches!(source.target(), ManifestProjectionTarget::Absent);
     let mut effective_candidate = None;
+    // The accepted current state of this page, retained when the source intent
+    // is no longer the live authority but this receiver still owes the page a
+    // Markdown projection. See the supersession note below.
+    let mut superseded_current = None;
     let tombstone_authorization = if source_absent {
         match engine.authorize_projection_tombstone(source) {
             Ok(authorization) => Some(authorization),
@@ -1654,15 +1658,16 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             Err(error) => return Err(error.into()),
         }
     } else {
-        let current_matches_source = match engine.authorize_projection_write(source.page_id()) {
-            Ok(current) => {
-                current.state().page.path == *source.path()
-                    && current.state().frontier == *source.post_frontier()
-                    && current.state().claim_evidence == source.claim_evidence()
-            }
-            Err(EngineError::ProjectionAuthorizationUnavailable) => false,
+        let current = match engine.authorize_projection_write(source.page_id()) {
+            Ok(current) => Some(current),
+            Err(EngineError::ProjectionAuthorizationUnavailable) => None,
             Err(error) => return Err(error.into()),
         };
+        let current_matches_source = current.as_ref().is_some_and(|current| {
+            current.state().page.path == *source.path()
+                && current.state().frontier == *source.post_frontier()
+                && current.state().claim_evidence == source.claim_evidence()
+        });
         if !current_matches_source {
             // Most superseded immutable intents are historical evidence only.
             // One exception is an exact-title event selected by the current
@@ -1672,7 +1677,26 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             match engine.authenticate_effective_title_projection_candidate(source.page_id()) {
                 Ok(candidate) => effective_candidate = Some(candidate),
                 Err(EngineError::ProjectionAuthorizationUnavailable) => {
-                    return Ok(Some(false));
+                    // "Superseded" is a claim about the WHOLE merged frontier,
+                    // not about this page. An ordinary local external admission
+                    // on the receiving device commits its own batch, which
+                    // advances the shared page-catalog document; the delivered
+                    // page itself is untouched, yet its intent's post-frontier
+                    // stops matching. Dropping the intent here used to leave the
+                    // batch applied in SQLite with its Markdown file never
+                    // written, surviving Safe shutdown and reopen — durable
+                    // data-visibility loss, because Markdown is the interchange
+                    // truth. Nothing else owns this path, so project the
+                    // accepted CURRENT state instead. That is idempotent: a page
+                    // genuinely superseded by newer accepted work renders to the
+                    // bytes that already sit on disk.
+                    let Some(current) = current else {
+                        // Neither the delivered intent nor the current accepted
+                        // state can be authorized. The obligation is real and
+                        // unmet, so retain it rather than report completion.
+                        return Ok(None);
+                    };
+                    superseded_current = Some(current);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1683,7 +1707,13 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         .as_ref()
         .map(|candidate| candidate.source())
         .unwrap_or(source);
-    let local_base = graph.read_projection_input(projection_source.path())?;
+    // A page renamed after this intent was authored is projected at the path
+    // the accepted state names, never at the intent's stale one.
+    let projection_path = superseded_current.as_ref().map_or_else(
+        || projection_source.path(),
+        |current| &current.state().page.path,
+    );
+    let local_base = graph.read_projection_input(projection_path)?;
     let source_layout_base = if source_absent {
         None
     } else {
@@ -1719,6 +1749,15 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         )?;
         effective_prior_completion = Some((completed_intent, completion));
         plan
+    } else if let Some(current) = superseded_current.as_ref() {
+        plan_projection_with_layout_annotations(
+            engine.workspace_id(),
+            current.state(),
+            local_base.as_deref(),
+            source_layout_base
+                .as_ref()
+                .map(AnnotatedProjectionBase::annotations),
+        )?
     } else {
         derive_receiver_local_projection_with_layout(
             engine,

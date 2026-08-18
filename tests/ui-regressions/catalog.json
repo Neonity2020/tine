@@ -6736,6 +6736,27 @@
         "failBefore": "proven"
       },
       "notes": "The two-device journey delivered device B's edit into device A's graph-local provider tree while device A was stopped. On reopen, device A discovered the delivery (provider_pending=3) while its watcher was idle (pending=false, latest_enqueue=2, acknowledged=2), and the peer edit never appeared. The Tauri sparse scheduler decided continuation from the tick result plus the actor's watcher pending bit only, so a tick that settled a watcher epoch read as a quiet graph and cleared the retry schedule; a quiet graph produces no further inotify edge for bytes another device wrote, so the delivered work was stranded forever. The actor now publishes provider_runnable alongside provider_pending - the exact predicate tick consults, not the broad inventory that legitimately never reaches zero while durable publication intents remain - and the scheduler continues while SyncRuntimeStatusSnapshot::has_runnable_work() is true. A tick that reports Idle while still naming runnable provider work is paced by the ordinary backoff schedule instead of the progress cadence, so a blocked causal dependency cannot become a poll loop, and a genuinely quiet actor still arms no timer at all. Source regressions pin arrival across the delivery/reopen cut, arrival to a running receiver, a multi-item drain to zero with interleaved page reads, and the idle direction; the real two-device journey remains the release-blocking semantic proof."
+    },
+    {
+      "id": "UI-MANAGED-PROVIDER-PROJECTION-LOSS-001",
+      "title": "A peer edit that lands in managed SQLite always reaches the Markdown file, even when a local external edit is admitted in the same window",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "crates/tine-core/src/oplog/projection.rs"
+        ],
+        "scenario": "managed-storage.provider-batch-always-projects-markdown",
+        "failBefore": "proven"
+      },
+      "notes": "On a running receiving device, an inbound provider batch could be applied to SQLite while its Markdown file was never written. The receiver-local projection decided whether a delivered foreign intent was still the live authority by comparing the intent's post-frontier with the page's WHOLE current merged frontier. An ordinary local external admission landing in the same window commits its own batch, which advances the shared page-catalog document, so the delivered intent stopped matching a page it never touched; the intent was then treated as superseded historical evidence and dropped. Nothing else owned that path, so the page existed in ListPages at the right path with no file on disk, clean_shutdown still returned Safe, and a reopen with a full re-drive never repaired it - durable data-visibility loss, since Markdown is the interchange truth for Direct Files parity and for every external tool. A receiver that cannot prove the delivered intent is still current now projects the page's CURRENT accepted state instead of skipping it (idempotent: a genuinely superseded page renders to the bytes already on disk), projects at the path the accepted state names rather than the intent's stale one, and retains the obligation as a published continuation when neither the intent nor the current state can be authorized. Source regressions pin creates, edits and cross-page moves under that interleaving, each with a Safe shutdown and a clean reopen. NOT covered here: provider-delivered DELETES and RENAMES never converge on the clean runtime at all - with or without the interleaving - because the receiver-local tombstone authorization still requires the retired pre-0.7 durable endpoint history store; that is a separate open defect."
     }
   ]
 }
