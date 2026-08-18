@@ -6,7 +6,11 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import org.json.JSONArray
+import org.json.JSONTokener
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -20,31 +24,56 @@ import org.junit.runner.RunWith
  * WebView.goBack() and Tine's SafeBack owner is never consulted: on screen, a
  * route quietly changes behind an open modal and the modal stays open.
  *
- * The WebView history is the part that makes this observable. Without it
- * AppPlugin disables itself and re-dispatches, so Back reaches Tine's owner
- * even when Tine does not own it — which is exactly why the defect survived.
+ * The WebView history is what makes this observable. Without it AppPlugin
+ * disables itself and re-dispatches, so Back reaches Tine's owner even when
+ * Tine does not own it — which is exactly why the defect survived. A run that
+ * cannot arrange that history therefore FAILS: it has not disproved anything,
+ * and saying so is the whole point of this fixture.
+ *
+ * Startup asymmetry, established from wry 0.55.1 src/android/main_pipe.rs after
+ * the first device receipt (run 32174388299) failed here: inside the single
+ * main-thread CreateWebView block, `load_url` is called at line 250 and
+ * `on_webview_created` — which is what reaches SafeBackPlugin.load and makes
+ * the WebView handle visible to this fixture — only at line 320. The handle
+ * therefore appears while the first navigation is still pending, with the
+ * initial empty document live. A history entry pushed onto that document is
+ * discarded when the real navigation commits and replaces it, so canGoBack()
+ * stayed false forever. Waiting for the handle is not waiting for the app.
  */
 @RunWith(AndroidJUnit4::class)
 class SafeBackOwnershipTest {
   @Test
   fun tineOwnsBackAfterTauriStartupEvenWhenTheWebViewHasHistory() {
-    // Deliberately try/finally rather than `use`: ActivityScenario is a Java
-    // AutoCloseable, and this module's Kotlin settings are not something a test
-    // should depend on.
     val scenario = ActivityScenario.launch(MainActivity::class.java)
     try {
-      val webView = awaitWebView()
+      val webView = awaitWebViewHandle()
+      // Not the handle: the app's own first document, committed.
+      val document = awaitAppDocument(scenario)
 
-      // Reproduce what the mobile router does on every navigation
-      // (pushMobileHistoryEntry in src/router.ts): one real WebView history
-      // entry. Anything less and AppPlugin's fallback re-dispatches, hiding
-      // the ownership question this test exists to ask.
-      evaluateOnUiThread(scenario, "history.pushState(null, '', location.href)")
-      assertTrue(
-        "the fixture could not give the WebView a history entry, so this run " +
-          "cannot observe Back ownership at all",
-        awaitTrue { onUiThread(scenario) { webView.canGoBack() } },
-      )
+      // Exactly what the production mobile router does on every navigation
+      // (pushMobileHistoryEntry, src/router.ts). Deliberately not a loadUrl:
+      // Tine is an SPA and never performs a second real navigation, so proving
+      // ownership behind a loadUrl would prove it under conditions that never
+      // occur on Martin's phone.
+      val historyBefore = evaluateInt(scenario, "history.length")
+      evaluate(scenario, "history.pushState(null, '', location.href)")
+      val historyAfter = evaluateInt(scenario, "history.length")
+
+      if (!awaitTrue(SETTLE_TIMEOUT_MS) { onUiThread(scenario) { webView.canGoBack() } }) {
+        // Name the failure instead of leaving the next receipt to guess. If the
+        // JS history grew but the WebView's back/forward list did not, then
+        // pushState does not feed canGoBack() on this device and the production
+        // premise behind pushMobileHistoryEntry is itself wrong — a different
+        // finding, not a flaky fixture.
+        val list = onUiThread(scenario) { webView.copyBackForwardList() }
+        fail(
+          "the fixture could not give the WebView a history entry, so this run " +
+            "cannot observe Back ownership at all. document=$document " +
+            "history.length $historyBefore -> $historyAfter, " +
+            "backForwardList size=${list.size} currentIndex=${list.currentIndex}, " +
+            "canGoBack=${onUiThread(scenario) { webView.canGoBack() }}",
+        )
+      }
 
       val before = SafeBackBridge.gesturesReceived
       scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
@@ -53,14 +82,15 @@ class SafeBackOwnershipTest {
         "Back did not reach Tine's SafeBack owner: another OnBackPressedCallback " +
           "(Tauri's AppPlugin) was registered later and answered the gesture with " +
           "WebView history navigation instead",
-        awaitTrue { SafeBackBridge.gesturesReceived > before },
+        awaitTrue(SETTLE_TIMEOUT_MS) { SafeBackBridge.gesturesReceived > before },
       )
     } finally {
       scenario.close()
     }
   }
 
-  private fun awaitWebView(): WebView {
+  /** The plugin's WebView reference. Present long before the app's document is. */
+  private fun awaitWebViewHandle(): WebView {
     val deadline = SystemClock.elapsedRealtime() + STARTUP_TIMEOUT_MS
     while (SystemClock.elapsedRealtime() < deadline) {
       SafeBackBridge.webViewForTest()?.let { return it }
@@ -69,8 +99,70 @@ class SafeBackOwnershipTest {
     throw AssertionError("Tauri never loaded SafeBackPlugin's WebView")
   }
 
-  private fun awaitTrue(condition: () -> Boolean): Boolean {
+  /**
+   * Wait for the app's own first document to COMMIT. That, not the mounted
+   * Solid shell, is the precondition a pushed history entry needs in order to
+   * survive: Chromium replaces the initial empty document's navigation entry
+   * when the real navigation commits. The shell state is reported but not
+   * required, so a first-run graph-less boot (Welcome instead of the topbar)
+   * cannot turn this into a red for an unrelated reason.
+   *
+   * Returns the observed state, verbatim, for failure messages.
+   */
+  private fun awaitAppDocument(scenario: ActivityScenario<MainActivity>): String {
+    var last = "(never evaluated)"
     val deadline = SystemClock.elapsedRealtime() + STARTUP_TIMEOUT_MS
+    while (SystemClock.elapsedRealtime() < deadline) {
+      val raw = evaluate(
+        scenario,
+        "JSON.stringify([location.href, document.readyState, " +
+          "!!document.querySelector('header.topbar, .welcome-card, .startup-recovery-card')])",
+      )
+      last = raw
+      val parsed = parseJsonStringArray(raw)
+      if (parsed != null) {
+        val href = parsed.getString(0)
+        val readyState = parsed.getString(1)
+        if (!href.startsWith("about:") && href.isNotEmpty() && readyState == "complete") return raw
+      }
+      SystemClock.sleep(POLL_MS)
+    }
+    throw AssertionError(
+      "the app's first document never committed, so no history entry could be " +
+        "pushed onto it and Back ownership was not observed. last=$last",
+    )
+  }
+
+  /** `evaluateJavascript` hands back a JSON-encoded value, so a JSON.stringify
+   * result arrives double-encoded: a JSON string whose contents are the array. */
+  private fun parseJsonStringArray(raw: String): JSONArray? = runCatching {
+    JSONArray(JSONTokener(raw).nextValue() as String)
+  }.getOrNull()
+
+  private fun evaluateInt(scenario: ActivityScenario<MainActivity>, script: String): Int =
+    evaluate(scenario, script).trim('"').toIntOrNull() ?: -1
+
+  /** Blocking evaluateJavascript. Returns the raw JSON-encoded result. */
+  private fun evaluate(scenario: ActivityScenario<MainActivity>, script: String): String {
+    val result = AtomicReference("null")
+    val evaluated = CountDownLatch(1)
+    scenario.onActivity {
+      val webView = SafeBackBridge.webViewForTest()
+      if (webView == null) {
+        evaluated.countDown()
+      } else {
+        webView.evaluateJavascript(script) { value ->
+          result.set(value ?: "null")
+          evaluated.countDown()
+        }
+      }
+    }
+    evaluated.await(EVALUATE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+    return result.get()
+  }
+
+  private fun awaitTrue(timeoutMs: Long = STARTUP_TIMEOUT_MS, condition: () -> Boolean): Boolean {
+    val deadline = SystemClock.elapsedRealtime() + timeoutMs
     while (SystemClock.elapsedRealtime() < deadline) {
       if (condition()) return true
       SystemClock.sleep(POLL_MS)
@@ -78,28 +170,18 @@ class SafeBackOwnershipTest {
     return false
   }
 
-  private fun <T> onUiThread(
-    scenario: ActivityScenario<MainActivity>,
-    block: () -> T,
-  ): T {
-    var result: T? = null
-    scenario.onActivity { result = block() }
-    @Suppress("UNCHECKED_CAST")
-    return result as T
-  }
-
-  private fun evaluateOnUiThread(scenario: ActivityScenario<MainActivity>, script: String) {
-    val evaluated = CountDownLatch(1)
-    scenario.onActivity {
-      val webView = SafeBackBridge.webViewForTest()
-      if (webView == null) evaluated.countDown()
-      else webView.evaluateJavascript(script) { evaluated.countDown() }
-    }
-    evaluated.await(STARTUP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+  private fun <T> onUiThread(scenario: ActivityScenario<MainActivity>, block: () -> T): T {
+    val result = AtomicReference<T>()
+    scenario.onActivity { result.set(block()) }
+    return result.get()
   }
 
   private companion object {
     const val STARTUP_TIMEOUT_MS = 60_000L
+    const val EVALUATE_TIMEOUT_MS = 10_000L
+    /** A pushed history entry and a dispatched Back are both immediate; this is
+     * slack for the main-thread hop, not a retry budget. */
+    const val SETTLE_TIMEOUT_MS = 10_000L
     const val POLL_MS = 100L
   }
 }
