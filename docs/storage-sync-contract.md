@@ -811,6 +811,112 @@ and at the save boundary by
 (which also compares the displacement artifacts against an uninjected control
 save) plus `…::a_non_capability_errno_from_the_projection_rename_still_fails_closed`.
 
+### 2.10c The shared-provider tree without rename flags, including the exchange
+
+§2.10b left the shared-provider transport (`oplog/wire.rs`) alone as a
+follow-up. Android CI run 32094662514 turned that into the next failure: the
+managed save landed for the first time and the journey stopped one step later at
+
+```
+AssertionError: prepare shared failed: sync actor refused request:
+scenario filesystem operation failed: Invalid argument (os error 22)
+```
+
+The flagged renames in that module operate under `<graph>/.tine-sync/v2/shared`,
+and one of them — quarantining a publication's own abandoned staging entry — is
+on the **happy path of every provider `Put`**. On a filesystem without `rename2`
+flags, no object can be published at all, so share preparation cannot start.
+
+The six shared call sites are classified individually. The two remaining flagged
+renames in the same module belong to the **private** retry journal
+(`ProviderRetryJournal`, outside the graph) and keep the strict class untouched.
+
+| Site | Artifact | Class | Policy |
+| --- | --- | --- | --- |
+| `quarantine_unowned_staging` → `removed/orphan-<op>-<gen>` | An abandoned staging copy of bytes whose authority is the private retry-journal blob; the caller deletes this diagnostic again as soon as its identity matches. | Reconstructible | Reservation fallback (§2.10b). |
+| `quarantine_provider_name` → `removed/<prefix>-<digest>` | FOREIGN bytes that took a name this device expected to own, preserved for forensics before the operation refuses. | Reconstructible — *only because the fallback keeps the no-clobber guarantee*: an occupied destination fails the exclusive reservation before anything moves, and a rename that then fails leaves the foreign file exactly where it was. | Reservation fallback. |
+| `preserve_retirement_race` → `rename-evidence/retirement-race-<digest>` | The same, for a name re-created during a retirement. | Reconstructible, same argument. | Reservation fallback. |
+| `reconcile_provider_retirement`, the `RENAME_EXCHANGE` | The validated original moving to its diagnostic name, swapping with this operation's journaled placeholder. | Reconstructible; see below. | Single placeholder-consuming rename. |
+| `reconcile_provider_retirement`, the rollback exchange | Undoing the above when post-validation fails. | — | Attempted **only** while this device still holds the placeholder at the source name, i.e. only on the exchange path. After the fallback there is nothing to swap back and the refusal says so rather than pretending. |
+| `reconcile_provider_retirement` → `rename-evidence/retire-placeholder-<op>` | The displaced zero-length placeholder moving to private evidence. | Sole authority of the exchange invariant | **Strict, no fallback.** This step exists only on the exchange path, and a filesystem without `RENAME_NOREPLACE` has no `RENAME_EXCHANGE` either, so the exchange fallback has already made it unreachable there. A filesystem that somehow provided one and not the other gets an honest named refusal rather than a two-step substitute whose crash window recovery cannot read. |
+
+**The exchange decision.** An atomic swap has no no-clobber-shaped substitute, so
+the reservation fallback does not apply. A three-step rename through a scratch
+name was rejected: it introduces a window in which the retired bytes exist at
+neither name, and a second window whose leftover the recovery path cannot tell
+from a racing delivery.
+
+What retirement actually needs is narrower than a swap. Before the exchange the
+diagnostic name is already occupied by a **zero-length placeholder this operation
+created**, whose physical identity was made durable in the private journal
+(`staging_identity`) before anything moved. So the fallback is a **single plain
+`rename(2)` of the validated original onto that placeholder** — atomic on every
+POSIX filesystem, no scratch name, no third step. Its end state is exactly the
+state the exchange path reaches one step later: source name gone, original at the
+diagnostic name, placeholder inode unlinked.
+
+*Crash windows.* There are exactly two, because it is one rename:
+
+* **Before it.** The original is still at its name and the placeholder still
+  holds the diagnostic name — byte-for-byte the state the reconciler starts from.
+  Recovery re-enters the same branch and retries. No residue.
+* **After it.** The source name is free and the diagnostic name holds the
+  original. Recovery takes the "source absent" branch, validates the retired copy
+  against the recorded identity, digest and length, and completes. If the rename
+  was not yet durable in the parent directory the state is the first window
+  again, which also converges.
+
+There is no third window: `rename(2)` over an existing destination is atomic, so
+the retired bytes are never absent from both names.
+
+*What it gives up.* The exchange's **other** guarantee — that the source name is
+never free. After the fallback the source name is free, so an honest concurrent
+instance or a sync-service delivery can re-create it, and the placeholder is no
+longer available as proof that the transition happened. Recovery therefore keys
+on the diagnostic name holding the recorded original identity, digest and length;
+anything found at the source name afterwards is treated as a racing replacement,
+preserved as `rename-evidence/retirement-race-…`, and the operation refuses —
+the same terminal shape the exchange path produces for a race, and strictly
+better than the flat refusal the previous code gave in that state.
+
+*Inode reuse.* Because the fallback unlinks the placeholder, a filesystem is free
+to hand its inode number to the next file created at the freed source name, and a
+racing delivery would then match the recorded `staging_identity` exactly.
+"Is this the placeholder?" therefore requires **zero length as well as identity**.
+That cannot exclude the real placeholder, which is always empty, and a
+zero-length impostor that still slips through costs zero bytes.
+
+**Reservation residue in the diagnostic namespaces.** The reservation fallback
+publishes in two steps, so a crash between them leaves a zero-length file at a
+deterministic diagnostic name with the source still in place — and every one of
+these sites refuses an occupied destination, which would refuse that operation
+forever. `removed/` and `rename-evidence/` are diagnostic-residue namespaces and a
+zero-length entry in one of them holds no bytes to lose, so an EMPTY occupant is
+reclaimed and the next attempt converges. A NON-EMPTY occupant is still reported
+as occupied and left untouched: that is either a real quarantine copy or a file a
+sync service delivered, and neither may be destroyed.
+
+**Receipts.** Every refusal in this module names its primitive and both names —
+`renameat2(RENAME_NOREPLACE) quarantining abandoned shared provider staging
+failed at "publish-859b1a…-0" -> "orphan-859b1a…-0": Invalid argument (os error
+22)` — because Android CI returns only a string and a bare errno costs a
+~20-minute round trip to localise.
+
+Enforced by
+`oplog::wire::tests::shared_provider_publication_without_rename2_flags_matches_the_flagged_end_state`
+and `…::shared_provider_retirement_without_rename2_flags_reaches_the_exchange_end_state`
+(both compare the whole provider tree against an uninjected control run on the
+deterministic simulator), `…::shared_provider_retirement_fallback_crash_windows_converge`
+(both windows converge to the uncrashed state, and the two boundaries that belong
+to the exchange path alone are asserted unreachable),
+`…::shared_provider_retirement_fallback_preserves_a_race_at_the_freed_source_name`,
+`…::a_non_capability_errno_from_a_shared_provider_rename_still_fails_closed`, and
+at the sharing boundary by
+`sync_runtime::tests::clean_share_preparation_survives_a_shared_provider_rename_capability_refusal`
+(share preparation completes, the provider tree has the control run's shape with
+no residue, and a peer joins from it) plus
+`…::a_non_capability_errno_from_a_shared_provider_rename_still_refuses_share_preparation`.
+
 Unix UID equality and “only the current user may write this path” are
 deliberately absent. The threat model does not defend against a malicious actor
 who can already rewrite the user's private filesystem, and those checks reject

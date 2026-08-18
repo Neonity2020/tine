@@ -54,6 +54,16 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // answer, so the same call site still fails closed and names the primitive.
   "sync_runtime::tests::clean_runtime_save_survives_a_projection_rename_capability_refusal",
   "sync_runtime::tests::a_non_capability_errno_from_the_projection_rename_still_fails_closed",
+  // One journey step further (CI run 32094662514: the managed save landed and
+  // `prepare_shared` then failed with `scenario filesystem operation failed:
+  // Invalid argument (os error 22)`). Every provider publication ends by
+  // quarantining its own abandoned staging entry with a flagged rename under
+  // `<graph>/.tine-sync/v2/shared`, so on Android no object can be published at
+  // all. The reconstructible residue reaches the same tree through the
+  // reservation, a peer still joins from it, and the sibling holds the other
+  // half: EIO still refuses, naming the primitive and both names.
+  "sync_runtime::tests::clean_share_preparation_survives_a_shared_provider_rename_capability_refusal",
+  "sync_runtime::tests::a_non_capability_errno_from_a_shared_provider_rename_still_refuses_share_preparation",
   "sync_runtime::tests::clean_runtime_cross_page_move_commits_once_and_cold_reopens",
   "sync_runtime::tests::clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys",
   "sync_runtime::tests::retained_clean_reactivation_reports_each_recovery_boundary",

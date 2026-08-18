@@ -8696,20 +8696,29 @@ fn quarantine_provider_name(
     )?
     .ok_or_else(|| ScenarioError::UnsafeProviderEntry(source_name.into()))?;
     let diagnostic_name = provider_quarantine_diagnostic_name(prefix, source_name, &source.bytes);
-    if open_provider_regular_optional(
+    if shared_diagnostic_name_is_taken(
         removed,
         &diagnostic_name,
-        MAX_PROVIDER_RESCAN_BYTES,
         &format!("{PROVIDER_REMOVED_NAMESPACE}/{diagnostic_name}"),
-    )?
-    .is_some()
-    {
+    )? {
         return Err(ScenarioError::UnsafeProviderEntry(format!(
             "{PROVIDER_REMOVED_NAMESPACE}/{diagnostic_name}"
         )));
     }
-    provider_rename_named_noreplace(source_dir, source_name, removed, &diagnostic_name)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    // RECONSTRUCTIBLE, but only because the fallback keeps the no-clobber
+    // guarantee. These are FOREIGN bytes that took a name we expected to own, so
+    // the graph is not their authority and they must not be destroyed — and they
+    // are not: an occupied destination fails the exclusive reservation before
+    // anything moves, and a rename that then fails leaves the foreign file
+    // exactly where it was.
+    provider_rename_reconstructible_noreplace(
+        source_dir,
+        source_name,
+        removed,
+        &diagnostic_name,
+        "quarantining a raced shared provider name",
+    )
+    .map_err(|error| ScenarioError::Io(error.to_string()))?;
     sync_shared_provider_publication_directories(removed, Some(source_dir))
 }
 
@@ -8896,22 +8905,26 @@ fn reconcile_provider_retirement(
                     && provider_digest(&opened.bytes) == record.source_digest
                     && u64::try_from(opened.bytes.len()).ok() == Some(record.source_len)
             });
-            let source_is_placeholder = source.as_ref().is_some_and(|opened| {
-                provider_file_matches_identity(&opened.file, placeholder_identity).unwrap_or(false)
-            });
             let retired_is_original = retired.as_ref().is_some_and(|opened| {
                 provider_file_matches_identity(&opened.file, identity).unwrap_or(false)
                     && provider_digest(&opened.bytes) == record.source_digest
                     && u64::try_from(opened.bytes.len()).ok() == Some(record.source_len)
             });
             let retired_is_placeholder = retired.as_ref().is_some_and(|opened| {
-                provider_file_matches_identity(&opened.file, placeholder_identity).unwrap_or(false)
+                opened.bytes.is_empty()
+                    && provider_file_matches_identity(&opened.file, placeholder_identity)
+                        .unwrap_or(false)
             });
 
             if source_is_original && retired_is_placeholder {
                 provider_retirement_after_validation_hook();
-                provider_exchange_names(source_dir, source_name, removed, diagnostic_name)
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                provider_retire_original_into_placeholder(
+                    source_dir,
+                    source_name,
+                    removed,
+                    diagnostic_name,
+                )
+                .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 sync_shared_provider_publication_directories(removed, Some(source_dir))?;
                 provider_journal_boundary_hook(ProviderJournalBoundary::RetirementExchangeDurable)?;
                 source = open_provider_regular_optional(
@@ -8926,37 +8939,74 @@ fn reconcile_provider_retirement(
                     MAX_PROVIDER_RESCAN_BYTES,
                     diagnostic_path,
                 )?;
-            } else if !(source_is_placeholder && retired_is_original) {
+            } else if !retired_is_original {
+                // Neither "the move has not run" nor "the move landed the exact
+                // recorded original at the diagnostic name". The placeholder no
+                // longer proves completion on its own: the single-rename
+                // fallback consumes it and frees the source name, so recovery
+                // keys on the diagnostic name holding the recorded original
+                // identity, digest and length.
                 return Err(ScenarioError::UnsafeProviderEntry(source_path.into()));
             }
 
-            let exchanged_source = source
-                .as_ref()
-                .ok_or_else(|| ScenarioError::UnsafeProviderEntry(source_path.into()))?;
-            let exchanged_retired = retired
+            let retired_now = retired
                 .as_ref()
                 .ok_or_else(|| ScenarioError::UnsafeProviderEntry(diagnostic_path.into()))?;
-            if !provider_file_matches_identity(&exchanged_source.file, placeholder_identity)?
-                || !provider_file_matches_identity(&exchanged_retired.file, identity)?
-                || provider_digest(&exchanged_retired.bytes) != record.source_digest
-                || u64::try_from(exchanged_retired.bytes.len()).ok() != Some(record.source_len)
+            // The placeholder is a zero-length file this operation created, and
+            // the emptiness is load-bearing, not decoration: the single-rename
+            // fallback UNLINKS that inode, and a filesystem is free to hand the
+            // same inode number to the next file created at the freed source
+            // name — a racing delivery would then match the recorded identity
+            // exactly. Requiring zero length keeps a delivery that carries bytes
+            // from ever being mistaken for the placeholder, and a zero-length
+            // impostor that still slips through costs zero bytes.
+            let source_holds_placeholder = source.as_ref().is_some_and(|opened| {
+                opened.bytes.is_empty()
+                    && provider_file_matches_identity(&opened.file, placeholder_identity)
+                        .unwrap_or(false)
+            });
+            if !provider_file_matches_identity(&retired_now.file, identity)?
+                || provider_digest(&retired_now.bytes) != record.source_digest
+                || u64::try_from(retired_now.bytes.len()).ok() != Some(record.source_len)
             {
-                let _ = provider_exchange_names(source_dir, source_name, removed, diagnostic_name);
-                let _ = sync_shared_provider_publication_directories(removed, Some(source_dir));
+                // Only an EXCHANGE can be undone, and only while this device
+                // still holds the placeholder at the source name. After the
+                // single-rename fallback there is nothing to swap back, so the
+                // refusal is reported without pretending otherwise.
+                if source_holds_placeholder {
+                    let _ =
+                        provider_exchange_names(source_dir, source_name, removed, diagnostic_name);
+                    let _ = sync_shared_provider_publication_directories(removed, Some(source_dir));
+                }
                 return Err(ScenarioError::UnsafeProviderEntry(source_path.into()));
             }
 
-            provider_retirement_before_private_move_hook();
-            provider_rename_named_noreplace(source_dir, source_name, evidence, &evidence_name)
+            if source_holds_placeholder {
+                provider_retirement_before_private_move_hook();
+                // SOLE AUTHORITY of the exchange invariant, and deliberately
+                // strict: this step exists only on the exchange path, and a
+                // filesystem without RENAME_NOREPLACE has no RENAME_EXCHANGE
+                // either, so the fallback above has already made it unreachable
+                // there. A filesystem that somehow provided one and not the
+                // other gets an honest named refusal rather than a two-step
+                // substitute whose crash window this recovery cannot read.
+                provider_rename_named_noreplace_named(
+                    source_dir,
+                    source_name,
+                    evidence,
+                    &evidence_name,
+                    "retiring the shared provider retirement placeholder",
+                )
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            sync_shared_provider_publication_directories(evidence, Some(source_dir))?;
-            provider_journal_boundary_hook(
-                ProviderJournalBoundary::RetirementPlaceholderQuarantined,
-            )?;
-            if let Err(error) =
-                reconcile_private_retirement_evidence(evidence, &evidence_name, record)
-            {
-                return Err(error);
+                sync_shared_provider_publication_directories(evidence, Some(source_dir))?;
+                provider_journal_boundary_hook(
+                    ProviderJournalBoundary::RetirementPlaceholderQuarantined,
+                )?;
+                if let Err(error) =
+                    reconcile_private_retirement_evidence(evidence, &evidence_name, record)
+                {
+                    return Err(error);
+                }
             }
             if let Some(replacement) = open_provider_regular_optional(
                 source_dir,
@@ -9097,8 +9147,22 @@ fn preserve_retirement_race(
 ) -> Result<(), ScenarioError> {
     ensure_provider_retirement_evidence(evidence, 1, bytes.len())?;
     let race_name = provider_quarantine_diagnostic_name("retirement-race", source_name, bytes);
-    provider_rename_named_noreplace(source_dir, source_name, evidence, &race_name)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    let race_path = format!("{PROVIDER_RENAME_EVIDENCE_NAMESPACE}/{race_name}");
+    if shared_diagnostic_name_is_taken(evidence, &race_name, &race_path)? {
+        return Err(ScenarioError::UnsafeProviderEntry(race_path));
+    }
+    // RECONSTRUCTIBLE by the same argument as the raced-name quarantine: the
+    // bytes belong to whoever wrote them, the reservation refuses an occupied
+    // destination before anything moves, and a failed rename leaves them in
+    // place. The operation still refuses afterwards; only the evidence moves.
+    provider_rename_reconstructible_noreplace(
+        source_dir,
+        source_name,
+        evidence,
+        &race_name,
+        "preserving a shared provider retirement race",
+    )
+    .map_err(|error| ScenarioError::Io(error.to_string()))?;
     sync_shared_provider_publication_directories(evidence, Some(source_dir))
 }
 
@@ -10255,20 +10319,27 @@ fn quarantine_unowned_staging(
     let removed = open_provider_directory(tree, PROVIDER_REMOVED_NAMESPACE)?;
     ensure_provider_diagnostic_capacity(&removed, PROVIDER_REMOVED_NAMESPACE, 1)?;
     let diagnostic_name = format!("orphan-{operation_id}-{generation}");
-    if open_provider_regular_optional(
+    if shared_diagnostic_name_is_taken(
         &removed,
         &diagnostic_name,
-        MAX_PROVIDER_RESCAN_BYTES,
         &format!("{PROVIDER_REMOVED_NAMESPACE}/{diagnostic_name}"),
-    )?
-    .is_some()
-    {
+    )? {
         return Err(ScenarioError::UnsafeProviderEntry(format!(
             "{PROVIDER_REMOVED_NAMESPACE}/{diagnostic_name}"
         )));
     }
-    provider_rename_named_noreplace(staging, staging_name, &removed, &diagnostic_name)
-        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    // RECONSTRUCTIBLE. Abandoned staging is a second copy of bytes whose
+    // authority is the private retry-journal blob, and every caller deletes this
+    // diagnostic again as soon as its identity matches. Nothing reads
+    // `removed/orphan-…` as authority for anything.
+    provider_rename_reconstructible_noreplace(
+        staging,
+        staging_name,
+        &removed,
+        &diagnostic_name,
+        "quarantining abandoned shared provider staging",
+    )
+    .map_err(|error| ScenarioError::Io(error.to_string()))?;
     sync_shared_provider_publication_directories(&removed, Some(staging))
 }
 
@@ -11271,6 +11342,264 @@ fn provider_exchange_names(
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The exact platform primitive the shared-provider receipts name. Android CI
+/// only ever returns a string, so a receipt that says only `Invalid argument
+/// (os error 22)` costs a ~20-minute round trip to localise; every refusal in
+/// this module names its call and both names instead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const PROVIDER_NOREPLACE_RENAME_PRIMITIVE: &str = "renameat2(RENAME_NOREPLACE)";
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const PROVIDER_NOREPLACE_RENAME_PRIMITIVE: &str = "renameatx_np(RENAME_EXCL)";
+
+#[cfg(windows)]
+const PROVIDER_NOREPLACE_RENAME_PRIMITIVE: &str = "FileRenameInformation(ReplaceIfExists=false)";
+
+#[cfg(not(any(unix, windows)))]
+const PROVIDER_NOREPLACE_RENAME_PRIMITIVE: &str = "atomic no-clobber rename";
+
+// Only the Unix targets have an atomic exchange, and only they reach
+// `provider_retire_original_into_placeholder`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const PROVIDER_EXCHANGE_RENAME_PRIMITIVE: &str = "renameat2(RENAME_EXCHANGE)";
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const PROVIDER_EXCHANGE_RENAME_PRIMITIVE: &str = "renameatx_np(RENAME_SWAP)";
+
+#[cfg(unix)]
+const PROVIDER_PLACEHOLDER_CONSUMING_RENAME_PRIMITIVE: &str =
+    "rename onto the journaled retirement placeholder";
+
+fn provider_rename_failure(operation: &str, from: &str, to: &str, error: std::io::Error) -> String {
+    format!("{operation} failed at {from:?} -> {to:?}: {error}")
+}
+
+/// A `SharedReconstructibleProjection` name published without clobbering.
+///
+/// The six flagged renames in this module all operate under
+/// `<graph>/.tine-sync/v2/shared`, and Android shared storage answers every
+/// `renameat2` flag with `EINVAL` (CI run 32094662514). The three sites that
+/// move DIAGNOSTIC RESIDUE — abandoned staging, a raced name, a preserved race
+/// — reach the same reservation fallback the Markdown/Org projection uses, with
+/// the same capability predicate and the same per-`st_dev` memo. The platform
+/// primitive stays this module's own, because it carries provider-specific
+/// validation the projection leg does not have.
+fn provider_rename_reconstructible_noreplace(
+    source_dir: &Dir,
+    source_name: &str,
+    destination_dir: &Dir,
+    destination_name: &str,
+    purpose: &str,
+) -> std::io::Result<()> {
+    let operation = format!("{PROVIDER_NOREPLACE_RENAME_PRIMITIVE} {purpose}");
+    crate::model::rename_shared_reconstructible_noreplace(
+        source_dir,
+        source_name,
+        destination_dir,
+        destination_name,
+        &operation,
+        &|| {
+            #[cfg(test)]
+            if let Some(injected) = armed_shared_provider_flagged_rename() {
+                return Err(injected);
+            }
+            provider_rename_named_noreplace(
+                source_dir,
+                source_name,
+                destination_dir,
+                destination_name,
+            )
+        },
+    )
+}
+
+/// The strict, sole-authority no-clobber rename, named for its receipt. It has
+/// no fallback: see `docs/storage-sync-contract.md` §2.10c for why the
+/// retirement placeholder's private quarantine keeps the primitive.
+#[cfg(unix)]
+fn provider_rename_named_noreplace_named(
+    source_dir: &Dir,
+    source_name: &str,
+    destination_dir: &Dir,
+    destination_name: &str,
+    purpose: &str,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = armed_shared_provider_flagged_rename() {
+        return Err(std::io::Error::new(
+            injected.kind(),
+            provider_rename_failure(
+                &format!("{PROVIDER_NOREPLACE_RENAME_PRIMITIVE} {purpose}"),
+                source_name,
+                destination_name,
+                injected,
+            ),
+        ));
+    }
+    provider_rename_named_noreplace(source_dir, source_name, destination_dir, destination_name)
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                provider_rename_failure(
+                    &format!("{PROVIDER_NOREPLACE_RENAME_PRIMITIVE} {purpose}"),
+                    source_name,
+                    destination_name,
+                    error,
+                ),
+            )
+        })
+}
+
+/// Retire the validated original into the diagnostic name that this operation's
+/// journaled placeholder already occupies.
+///
+/// `RENAME_EXCHANGE` is the strict primitive: it flips both names in one step,
+/// so the source name is never free and recovery can read which side of the flip
+/// it is on from the two on-disk identities.
+///
+/// A filesystem that does not implement `renameat2` flags cannot provide that,
+/// and there is no reservation-shaped substitute for an exchange. What there IS
+/// is the observation that the placeholder was created for exactly this call and
+/// is a zero-length file this device owns: a SINGLE plain `rename(2)` of the
+/// original onto it is atomic on every POSIX filesystem, needs no scratch name,
+/// and leaves precisely the state the exchange path reaches one step later —
+/// source name gone, original at the diagnostic name, placeholder inode
+/// unlinked. So the fallback is one rename, not three, and there is no window in
+/// which the retired bytes exist at neither name.
+///
+/// What it gives up is the exchange's OTHER guarantee: afterwards the source
+/// name is free rather than holding a known placeholder. Recovery therefore
+/// keys on the diagnostic name holding the recorded original identity, and
+/// anything found at the source name is treated as a racing replacement and
+/// preserved as `rename-evidence/retirement-race-…`.
+#[cfg(unix)]
+fn provider_retire_original_into_placeholder(
+    source_dir: &Dir,
+    source_name: &str,
+    removed: &Dir,
+    diagnostic_name: &str,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    let attempt = match armed_shared_provider_flagged_rename() {
+        Some(injected) => Err(injected),
+        None => provider_exchange_names(source_dir, source_name, removed, diagnostic_name),
+    };
+    #[cfg(not(test))]
+    let attempt = provider_exchange_names(source_dir, source_name, removed, diagnostic_name);
+
+    match attempt {
+        Ok(()) => Ok(()),
+        Err(error) if crate::model::flagged_rename_capability_refusal(&error) => source_dir
+            .rename(source_name, removed, diagnostic_name)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    provider_rename_failure(
+                        PROVIDER_PLACEHOLDER_CONSUMING_RENAME_PRIMITIVE,
+                        source_name,
+                        diagnostic_name,
+                        error,
+                    ),
+                )
+            }),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            provider_rename_failure(
+                &format!("{PROVIDER_EXCHANGE_RENAME_PRIMITIVE} retiring a shared provider name"),
+                source_name,
+                diagnostic_name,
+                error,
+            ),
+        )),
+    }
+}
+
+/// Is a shared-provider diagnostic name already taken?
+///
+/// The reservation fallback publishes such a name in two steps — reserve it with
+/// an exclusive create, then rename onto it — so a crash inside that window
+/// leaves a ZERO-LENGTH file at a deterministic diagnostic name with the source
+/// still in place. `removed/` and `rename-evidence/` are diagnostic residue
+/// namespaces and a zero-length entry in one of them holds no bytes to lose, so
+/// reclaiming it lets the next attempt converge instead of refusing that
+/// operation forever. A NON-EMPTY occupant is reported as occupied and left
+/// untouched: that is either a real quarantine copy or a file a sync service
+/// delivered, and neither may be destroyed.
+fn shared_diagnostic_name_is_taken(
+    directory: &Dir,
+    name: &str,
+    path: &str,
+) -> Result<bool, ScenarioError> {
+    let Some(existing) =
+        open_provider_regular_optional(directory, name, MAX_PROVIDER_RESCAN_BYTES, path)?
+    else {
+        return Ok(false);
+    };
+    if !existing.bytes.is_empty() {
+        return Ok(true);
+    }
+    drop(existing);
+    directory
+        .remove_file(name)
+        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    sync_shared_provider_directory(directory)?;
+    Ok(false)
+}
+
+/// Make every flagged shared-provider rename fail with `errno` until the guard
+/// is dropped, so a host test can reproduce a device whose shared storage does
+/// not implement `renameat2` flags.
+///
+/// Process-global, for the same reason as the projection leg's injection: the
+/// runtime executes `prepare_shared` on its actor thread, so a thread-local
+/// armed by a test would never be observed by the code under test. The gate runs
+/// `cargo nextest`, which gives every test its own process; the lock keeps two
+/// injections from overlapping under a threaded `cargo test`.
+#[cfg(test)]
+static ARMED_SHARED_PROVIDER_FLAGGED_RENAME: std::sync::Mutex<Option<i32>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static SHARED_PROVIDER_FLAGGED_RENAME_INJECTION_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn armed_shared_provider_flagged_rename() -> Option<std::io::Error> {
+    (*ARMED_SHARED_PROVIDER_FLAGGED_RENAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    .map(std::io::Error::from_raw_os_error)
+}
+
+#[cfg(test)]
+pub(crate) struct InjectedSharedProviderFlaggedRenameFailure(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+
+#[cfg(test)]
+impl InjectedSharedProviderFlaggedRenameFailure {
+    pub(crate) fn enter(errno: i32) -> Self {
+        let exclusive = SHARED_PROVIDER_FLAGGED_RENAME_INJECTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::model::forget_flagged_rename_capabilities();
+        *ARMED_SHARED_PROVIDER_FLAGGED_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(errno);
+        Self(exclusive)
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectedSharedProviderFlaggedRenameFailure {
+    fn drop(&mut self) {
+        *ARMED_SHARED_PROVIDER_FLAGGED_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        crate::model::forget_flagged_rename_capabilities();
     }
 }
 
@@ -13700,6 +14029,372 @@ mod tests {
                 "{boundary:?}"
             );
         }
+    }
+
+    /// Every file the shared provider tree holds, keyed by its path relative to
+    /// the tree root. The fallback must reach the SAME state the flagged
+    /// primitives reach, so the comparison is against a control run rather than
+    /// a remembered shape.
+    fn provider_tree_bytes(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let mut entries = std::fs::read_dir(&directory)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if entry.file_type().unwrap().is_dir() {
+                    files.insert(format!("{relative}/"), Vec::new());
+                    pending.push(entry.path());
+                } else {
+                    files.insert(relative, std::fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    #[cfg(unix)]
+    fn publish_one_provider_object(bytes: &[u8], errno: Option<i32>) -> BTreeMap<String, Vec<u8>> {
+        let mut simulator = simulator_with_provider_item(bytes);
+        let injected = errno.map(InjectedSharedProviderFlaggedRenameFailure::enter);
+        simulator
+            .run_action(&action(
+                1,
+                ScheduledActionKind::ProviderCopy {
+                    source: ProviderSource::Mailbox {
+                        item_id: "fixture-object".into(),
+                    },
+                    destination: location("objects/source"),
+                },
+            ))
+            .unwrap();
+        drop(injected);
+        let inbox = simulator
+            .provider_tree_path("beta", ProviderTree::Inbox)
+            .unwrap();
+        provider_tree_bytes(&inbox)
+    }
+
+    /// Android CI run 32094662514: the managed save now lands, and the journey
+    /// fails one step later at `prepare_shared` with `scenario filesystem
+    /// operation failed: Invalid argument (os error 22)`. The happy path of
+    /// EVERY provider publication ends by quarantining its own abandoned
+    /// staging entry with a flagged rename under
+    /// `<graph>/.tine-sync/v2/shared`, and Android shared storage does not
+    /// implement the flag. That residue is reconstructible — the private retry
+    /// journal holds the authoritative blob and the caller deletes the
+    /// diagnostic again immediately — so the publication reaches the same tree
+    /// through the reservation fallback.
+    #[cfg(unix)]
+    #[test]
+    fn shared_provider_publication_without_rename2_flags_matches_the_flagged_end_state() {
+        let bytes = b"provider publication without rename2 flags";
+        let control = publish_one_provider_object(bytes, None);
+        assert!(
+            control
+                .keys()
+                .any(|path| path == "objects/source" || path.ends_with("/objects/source")),
+            "the control publication must have published the object: {:?}",
+            control.keys().collect::<Vec<_>>()
+        );
+        for errno in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert_eq!(
+                publish_one_provider_object(bytes, Some(errno)),
+                control,
+                "the fallback must reach the flagged path's tree exactly (errno {errno})"
+            );
+        }
+    }
+
+    /// The other half of the capability policy, and the enriched receipt. `EIO`
+    /// describes the operation, not the flag, so the same call site still fails
+    /// closed — and the refusal names the primitive and both names, because a
+    /// bare `Invalid argument (os error 22)` on a device receipt costs a
+    /// ~20-minute CI round trip to localise.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_capability_errno_from_a_shared_provider_rename_still_fails_closed() {
+        let mut simulator =
+            simulator_with_provider_item(b"a disk error is not a capability answer");
+        let _injected = InjectedSharedProviderFlaggedRenameFailure::enter(libc::EIO);
+        let refusal = simulator
+            .run_action(&action(
+                1,
+                ScheduledActionKind::ProviderCopy {
+                    source: ProviderSource::Mailbox {
+                        item_id: "fixture-object".into(),
+                    },
+                    destination: location("objects/source"),
+                },
+            ))
+            .expect_err("a real I/O error on the flagged rename must not be tolerated");
+        let ScenarioError::Io(detail) = &refusal else {
+            panic!("expected a filesystem refusal: {refusal:?}");
+        };
+        assert!(
+            detail.contains(
+                "renameat2(RENAME_NOREPLACE) quarantining abandoned shared provider staging"
+            ) && detail.contains("->"),
+            "the refusal must name its operation and both names: {detail}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn retire_one_provider_name(bytes: &[u8], errno: Option<i32>) -> BTreeMap<String, Vec<u8>> {
+        let mut simulator = simulator_with_provider_item(bytes);
+        let injected = errno.map(InjectedSharedProviderFlaggedRenameFailure::enter);
+        simulator
+            .run_action(&action(
+                1,
+                ScheduledActionKind::ProviderCopy {
+                    source: ProviderSource::Mailbox {
+                        item_id: "fixture-object".into(),
+                    },
+                    destination: location("objects/source"),
+                },
+            ))
+            .unwrap();
+        simulator
+            .run_action(&action(
+                2,
+                ScheduledActionKind::ProviderRename {
+                    device: "beta".into(),
+                    tree: ProviderTree::Inbox,
+                    from_path: "objects/source".into(),
+                    to_path: "objects/destination".into(),
+                },
+            ))
+            .unwrap();
+        drop(injected);
+        let inbox = simulator
+            .provider_tree_path("beta", ProviderTree::Inbox)
+            .unwrap();
+        provider_tree_bytes(&inbox)
+    }
+
+    /// `RENAME_EXCHANGE` has no reservation-shaped substitute: an atomic swap is
+    /// not a no-clobber publication. What retirement actually needs is narrower
+    /// than a swap — the journaled placeholder at the diagnostic name was created
+    /// by this operation and is a zero-length file this device owns, so a SINGLE
+    /// plain `rename(2)` of the validated original onto it is atomic on every
+    /// POSIX filesystem and leaves exactly the state the exchange path reaches
+    /// one step later. No scratch name, no three-step dance, and no window in
+    /// which the retired bytes exist at neither name.
+    #[cfg(unix)]
+    #[test]
+    fn shared_provider_retirement_without_rename2_flags_reaches_the_exchange_end_state() {
+        let bytes = b"provider retirement without rename2 flags";
+        let control = retire_one_provider_name(bytes, None);
+        assert!(
+            control
+                .keys()
+                .any(|path| path.ends_with("objects/destination")),
+            "the control retirement must have published the destination: {:?}",
+            control.keys().collect::<Vec<_>>()
+        );
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP] {
+            assert_eq!(
+                retire_one_provider_name(bytes, Some(errno)),
+                control,
+                "the exchange fallback must reach the exchange's tree exactly (errno {errno})"
+            );
+        }
+    }
+
+    /// The exchange fallback has exactly TWO crash windows, because it is one
+    /// rename rather than three: before it (the original is still at its name
+    /// and the placeholder still holds the diagnostic name) and after it (the
+    /// source name is free and the diagnostic name holds the original). Both
+    /// recover into the same completed state a run without a crash reaches.
+    ///
+    /// The two boundaries the strict path also has AFTER the exchange —
+    /// quarantining the displaced placeholder into private evidence and deleting
+    /// it — are unreachable here: the rename consumed the placeholder, so there
+    /// is nothing to quarantine. That is asserted rather than assumed.
+    #[cfg(unix)]
+    #[test]
+    fn shared_provider_retirement_fallback_crash_windows_converge() {
+        let bytes = b"provider retirement fallback crash window";
+        let converged = retire_one_provider_name(bytes, None);
+        for boundary in [
+            ProviderJournalBoundary::RetirementPlaceholderDurable,
+            ProviderJournalBoundary::RetirementExchangeDurable,
+        ] {
+            let mut simulator = simulator_with_provider_item(bytes);
+            let injected = InjectedSharedProviderFlaggedRenameFailure::enter(libc::EINVAL);
+            simulator
+                .run_action(&action(
+                    1,
+                    ScheduledActionKind::ProviderCopy {
+                        source: ProviderSource::Mailbox {
+                            item_id: "fixture-object".into(),
+                        },
+                        destination: location("objects/source"),
+                    },
+                ))
+                .unwrap();
+            let rename = ScheduledActionKind::ProviderRename {
+                device: "beta".into(),
+                tree: ProviderTree::Inbox,
+                from_path: "objects/source".into(),
+                to_path: "objects/destination".into(),
+            };
+            FAIL_PROVIDER_JOURNAL_BOUNDARY.with(|hook| hook.replace(Some(boundary)));
+            assert!(
+                matches!(
+                    simulator.run_action(&action(2, rename.clone())),
+                    Err(ScenarioError::Io(ref message)) if message.contains("journal crash")
+                ),
+                "{boundary:?} must be reachable on the fallback path"
+            );
+            simulator.device_mut("beta").unwrap().crash();
+            simulator
+                .run_action(&action(
+                    3,
+                    ScheduledActionKind::Restart {
+                        device: "beta".into(),
+                    },
+                ))
+                .unwrap();
+            simulator.run_action(&action(2, rename)).unwrap();
+            drop(injected);
+            let inbox = simulator
+                .provider_tree_path("beta", ProviderTree::Inbox)
+                .unwrap();
+            assert_eq!(
+                provider_tree_bytes(&inbox),
+                converged,
+                "the fallback must converge from a crash at {boundary:?}"
+            );
+        }
+
+        // The placeholder-quarantine boundaries belong to the exchange path
+        // alone. If the fallback ever reached them this test would fail here
+        // instead of silently proving nothing.
+        for boundary in [
+            ProviderJournalBoundary::RetirementPlaceholderQuarantined,
+            ProviderJournalBoundary::RetirementPlaceholderPrivateDeleted,
+        ] {
+            let mut simulator = simulator_with_provider_item(bytes);
+            let injected = InjectedSharedProviderFlaggedRenameFailure::enter(libc::EINVAL);
+            simulator
+                .run_action(&action(
+                    1,
+                    ScheduledActionKind::ProviderCopy {
+                        source: ProviderSource::Mailbox {
+                            item_id: "fixture-object".into(),
+                        },
+                        destination: location("objects/source"),
+                    },
+                ))
+                .unwrap();
+            FAIL_PROVIDER_JOURNAL_BOUNDARY.with(|hook| hook.replace(Some(boundary)));
+            simulator
+                .run_action(&action(
+                    2,
+                    ScheduledActionKind::ProviderRename {
+                        device: "beta".into(),
+                        tree: ProviderTree::Inbox,
+                        from_path: "objects/source".into(),
+                        to_path: "objects/destination".into(),
+                    },
+                ))
+                .unwrap_or_else(|error| {
+                    panic!("{boundary:?} must be unreachable on the fallback path: {error:?}")
+                });
+            drop(injected);
+            FAIL_PROVIDER_JOURNAL_BOUNDARY.with(|hook| hook.replace(None));
+        }
+    }
+
+    /// What the fallback GIVES UP relative to `RENAME_EXCHANGE`: afterwards the
+    /// source name is free rather than holding a known placeholder, so an honest
+    /// concurrent instance or a sync-service delivery can re-create it. Recovery
+    /// therefore keys on the diagnostic name holding the recorded original
+    /// identity, treats whatever is at the source name as a racing replacement,
+    /// and preserves those foreign bytes before refusing — the same terminal
+    /// shape the exchange path produces for a race.
+    #[cfg(unix)]
+    #[test]
+    fn shared_provider_retirement_fallback_preserves_a_race_at_the_freed_source_name() {
+        let bytes = b"provider retirement fallback race";
+        let foreign = b"a peer delivered these bytes after the retirement";
+        let mut simulator = simulator_with_provider_item(bytes);
+        let _injected = InjectedSharedProviderFlaggedRenameFailure::enter(libc::EINVAL);
+        simulator
+            .run_action(&action(
+                1,
+                ScheduledActionKind::ProviderCopy {
+                    source: ProviderSource::Mailbox {
+                        item_id: "fixture-object".into(),
+                    },
+                    destination: location("objects/source"),
+                },
+            ))
+            .unwrap();
+        let rename = ScheduledActionKind::ProviderRename {
+            device: "beta".into(),
+            tree: ProviderTree::Inbox,
+            from_path: "objects/source".into(),
+            to_path: "objects/destination".into(),
+        };
+        // Crash in the window immediately after the single rename landed.
+        FAIL_PROVIDER_JOURNAL_BOUNDARY
+            .with(|hook| hook.replace(Some(ProviderJournalBoundary::RetirementExchangeDurable)));
+        assert!(simulator.run_action(&action(2, rename.clone())).is_err());
+        simulator.device_mut("beta").unwrap().crash();
+        simulator
+            .run_action(&action(
+                3,
+                ScheduledActionKind::Restart {
+                    device: "beta".into(),
+                },
+            ))
+            .unwrap();
+        let inbox = simulator
+            .provider_tree_path("beta", ProviderTree::Inbox)
+            .unwrap();
+        assert!(
+            !inbox.join("objects/source").exists(),
+            "the fallback leaves the source name free, which is exactly the exposure"
+        );
+        std::fs::write(inbox.join("objects/source"), foreign).unwrap();
+
+        let raced = simulator.run_action(&action(2, rename));
+        assert!(
+            matches!(raced, Err(ScenarioError::UnsafeProviderEntry(_))),
+            "{raced:?}"
+        );
+        assert!(!inbox.join("objects/source").exists());
+        assert_eq!(
+            std::fs::read(inbox.join("objects/destination")).unwrap(),
+            bytes
+        );
+        let evidence = inbox.join(PROVIDER_RENAME_EVIDENCE_NAMESPACE);
+        let retained = std::fs::read_dir(&evidence)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1, "{retained:?}");
+        assert_eq!(std::fs::read(&retained[0]).unwrap(), foreign);
+        let removed = std::fs::read_dir(inbox.join(PROVIDER_REMOVED_NAMESPACE))
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            removed,
+            vec![bytes.to_vec()],
+            "the retired original must still be the only diagnostic copy"
+        );
     }
 
     #[test]

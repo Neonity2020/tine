@@ -46370,6 +46370,163 @@ mod tests {
         ));
     }
 
+    /// The shape of a published provider tree: how many entries each namespace
+    /// holds. Two preparations of the same graph
+    /// cannot be byte-identical — manifest ids and content digests carry the
+    /// batch identity of that run — so the exact end-state equality between the
+    /// flagged path and its fallback is proven where it CAN be exact, on the
+    /// deterministic simulator in `oplog::wire`. What must hold here is that the
+    /// fallback publishes the same namespaces with the same entry counts, and in
+    /// particular that it leaves the residue namespaces
+    /// (`temp/`, `removed/`, `rename-evidence/`) as empty as the control does —
+    /// the fallback's whole exposure is a diagnostic name it might not clean up.
+    #[cfg(unix)]
+    fn provider_namespace_shape(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, usize> {
+        let mut shape: BTreeMap<String, usize> = BTreeMap::new();
+        for path in files.keys() {
+            let namespace = path
+                .rsplit_once('/')
+                .map_or_else(|| String::from("."), |(parent, _)| parent.to_owned());
+            *shape.entry(namespace).or_default() += 1;
+        }
+        shape
+    }
+
+    /// One clean-runtime share preparation, returning its outcome and every byte
+    /// the shared provider tree holds afterwards. `errno` arms a refusal of the
+    /// flagged renames under `<graph>/.tine-sync/v2/shared` for that preparation
+    /// only. The fixture is returned so its temporary tree outlives the read.
+    #[cfg(unix)]
+    fn prepare_one_share(
+        label: &str,
+        seed: u128,
+        errno: Option<i32>,
+    ) -> (
+        Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError>,
+        BTreeMap<String, Vec<u8>>,
+        ActivationFixture,
+    ) {
+        let fixture = ActivationFixture::nested_unicode(label, seed);
+        let handle = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone())
+            .handle
+            .expect("share-preparation initiator LocalActive");
+        drive_initial_feed(&handle);
+        let _ = submit_shared_page(
+            &handle,
+            seed + 0x2000,
+            "Shared 計画",
+            "notes/層/shared before preparing.md",
+            "bytes that existed before sharing",
+        );
+        let prepared = match errno {
+            Some(errno) => {
+                let _injected =
+                    crate::oplog::wire::InjectedSharedProviderFlaggedRenameFailure::enter(errno);
+                handle.prepare_shared()
+            }
+            None => handle.prepare_shared(),
+        };
+        let provider = recursive_file_bytes(&fixture.request.provider_root);
+        drop(handle);
+        (prepared, provider, fixture)
+    }
+
+    /// Android CI run 32094662514, on `233df887`: the managed save lands for the
+    /// first time and the journey then fails at share preparation with
+    /// `scenario filesystem operation failed: Invalid argument (os error 22)`.
+    /// Every provider publication ends by quarantining its own abandoned staging
+    /// entry with a flagged rename under `<graph>/.tine-sync/v2/shared`, which
+    /// Android shared storage does not implement, so `prepare_shared` cannot
+    /// publish a single object there.
+    ///
+    /// The refused artifacts are reconstructible diagnostic residue, so the
+    /// preparation completes through the same exclusive reservation the
+    /// projection leg uses — and the resulting provider tree is compared against
+    /// an UNINJECTED control run rather than a remembered shape, because
+    /// "share preparation returned Ok" is not the property that matters.
+    #[cfg(unix)]
+    #[test]
+    fn clean_share_preparation_survives_a_shared_provider_rename_capability_refusal() {
+        let (control, control_provider, _control_fixture) =
+            prepare_one_share("share-rename-control", 0xa178_0000, None);
+        control.expect("the control share preparation must publish");
+        assert!(
+            !control_provider.is_empty(),
+            "the control preparation must have written the shared provider tree"
+        );
+
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP] {
+            let (prepared, provider, _fixture) =
+                prepare_one_share("share-rename-capability", 0xa178_0000, Some(errno));
+            let descriptor = prepared.unwrap_or_else(|error| {
+                panic!("a rename flag the filesystem cannot provide must not block sharing (errno {errno}): {error}")
+            });
+            assert_eq!(
+                provider_namespace_shape(&provider),
+                provider_namespace_shape(&control_provider),
+                "the fallback must reach the control preparation's provider shape (errno {errno})"
+            );
+            assert!(
+                !provider.keys().any(|path| path.contains("/temp/")
+                    || path.contains("/removed/")
+                    || path.contains("/rename-evidence/")),
+                "the fallback must leave no diagnostic residue behind (errno {errno}): {:?}",
+                provider.keys().collect::<Vec<_>>()
+            );
+
+            // And a peer can still join from it.
+            let mut joiner = ActivationFixture::nested_unicode("share-rename-joiner", 0xa178_0000);
+            joiner.request.identities.endpoint_id =
+                ProjectionEndpointId::from_uuid(Uuid::from_u128(0xa178_1000));
+            joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(0xa178_1001));
+            joiner.request.identities.session_id =
+                SessionId::from_uuid(Uuid::from_u128(0xa178_1002));
+            copy_provider_tree(
+                &_fixture.request.provider_root,
+                &joiner.request.provider_root,
+            );
+            let initiator_graph = user_graph_bytes(&_fixture.graph_root);
+            for (relative, bytes) in &initiator_graph {
+                let destination = joiner.graph_root.join(relative);
+                fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                fs::write(destination, bytes).unwrap();
+            }
+            let joiner_handle = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone())
+                .handle
+                .expect("share-rename joiner LocalActive");
+            drive_initial_feed(&joiner_handle);
+            joiner_handle.join_shared(descriptor).unwrap_or_else(|error| {
+                panic!("a peer must be able to join a share prepared through the fallback (errno {errno}): {error}")
+            });
+            assert_eq!(
+                user_graph_bytes(&joiner.graph_root),
+                initiator_graph,
+                "the join must not rewrite already-synchronized graph bytes (errno {errno})"
+            );
+        }
+    }
+
+    /// The other half of the capability policy. `EIO` is a disk error, not a
+    /// filesystem saying "I do not implement that flag", so share preparation
+    /// still fails closed — and the refusal names the primitive and both names
+    /// rather than reporting a bare `os error 5`, because a device receipt that
+    /// carries only an errno costs a ~20-minute CI round trip to localise.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_capability_errno_from_a_shared_provider_rename_still_refuses_share_preparation() {
+        let (prepared, _provider, _fixture) =
+            prepare_one_share("share-rename-fatal", 0xa178_2000, Some(libc::EIO));
+        let refusal =
+            prepared.expect_err("a real I/O error during share preparation must not be tolerated");
+        let detail = refusal.to_string();
+        assert!(
+            detail.contains(
+                "renameat2(RENAME_NOREPLACE) quarantining abandoned shared provider staging"
+            ) && detail.contains("->"),
+            "the refusal must name the operation and both names: {detail}"
+        );
+    }
+
     #[test]
     fn shared_provider_clean_late_join_installs_provider_history_without_rewriting_graph() {
         let initiator = ActivationFixture::nested_unicode("late-share-initiator", 0xa176_0000);

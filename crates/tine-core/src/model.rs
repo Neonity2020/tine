@@ -31112,7 +31112,7 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
 /// manifest. Android CI run 32091898520 showed the flagged rename itself failing
 /// with `EINVAL` on shared storage — `renameat2(RENAME_NOREPLACE) publishing the
 /// projection failed at "Smoke.md" -> ".Smoke.md.49a4ed18…"` — so this class
-/// carries a capability fallback; see [`reserve_and_rename_projection`].
+/// carries a capability fallback; see [`reserve_and_rename`].
 fn rename_reconstructible_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     rename_projection_noreplace_with_class(
         dir,
@@ -31220,31 +31220,36 @@ fn remember_flagged_rename_unsupported(_dir: &Dir) {}
 /// `SharedReconstructibleProjection`, where the manifest in private storage is
 /// still the authority for these bytes, and is never used for artifacts the
 /// graph tree is the sole authority for.
-fn reserve_and_rename_projection(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+fn reserve_and_rename(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+) -> io::Result<()> {
     let mut options = CapOpenOptions::new();
     options.write(true).create_new(true);
     // An occupied destination fails here, before anything has moved.
-    let reserved = dir.open_with(to, &options)?.into_std();
+    let reserved = destination_dir.open_with(to, &options)?.into_std();
     let reserved_identity = match canonical_projection_file_resource_id(&reserved) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = dir.remove_file(to);
+            let _ = destination_dir.remove_file(to);
             return Err(error);
         }
     };
     drop(reserved);
-    match dir.rename(from, dir, to) {
+    match source_dir.rename(from, destination_dir, to) {
         Ok(()) => Ok(()),
         Err(error) => {
             // Roll the reservation back, but only if the destination is still
             // the exact placeholder this call created. If someone replaced it,
             // their file stays.
-            if let Ok(current) = open_projection_file_nofollow(dir, to) {
+            if let Ok(current) = open_projection_file_nofollow(destination_dir, to) {
                 let still_ours = canonical_projection_file_resource_id(&current)
                     .is_ok_and(|identity| identity == reserved_identity);
                 drop(current);
                 if still_ours {
-                    let _ = dir.remove_file(to);
+                    let _ = destination_dir.remove_file(to);
                 }
             }
             Err(error)
@@ -31256,7 +31261,7 @@ fn reserve_and_rename_projection(dir: &Dir, from: &str, to: &str) -> io::Result<
 ///
 /// `PrivateDurableAuthority` gets the platform primitive and nothing else.
 /// `SharedReconstructibleProjection` additionally accepts a capability refusal
-/// from that primitive and falls back to [`reserve_and_rename_projection`];
+/// from that primitive and falls back to [`reserve_and_rename`];
 /// every other errno stays fatal for both classes, on every platform.
 ///
 /// The fallback is not gated on Android, unlike the durability-barrier policy in
@@ -31272,38 +31277,118 @@ fn rename_projection_noreplace_with_class(
     to: &str,
     class: crate::filesystem_durability::DurabilityArtifactClass,
 ) -> io::Result<()> {
-    let name = |operation: &str, error: io::Error| {
-        projection_platform_error(operation, &format!("{from:?} -> {to:?}"), error)
-    };
     let reconstructible = matches!(
         class,
         crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection
     );
-    if reconstructible && flagged_rename_known_unsupported(dir) {
-        return reserve_and_rename_projection(dir, from, to)
-            .map_err(|error| name(PROJECTION_RESERVED_RENAME_OPERATION, error));
-    }
-    #[cfg(test)]
-    let attempt = match armed_projection_noreplace_rename(class, dir)? {
-        Some(injected) => Err(io::Error::from_raw_os_error(injected.errno)),
-        None => rename_projection_noreplace_platform(dir, from, to),
-    };
-    #[cfg(not(test))]
-    let attempt = rename_projection_noreplace_platform(dir, from, to);
-
-    match attempt {
-        Ok(()) => Ok(()),
-        Err(error) if reconstructible && is_flagged_rename_capability_refusal(&error) => {
-            remember_flagged_rename_unsupported(dir);
-            reserve_and_rename_projection(dir, from, to)
-                .map_err(|error| name(PROJECTION_RESERVED_RENAME_OPERATION, error))
+    let (step, result) = noreplace_or_reserve(dir, from, dir, to, reconstructible, &|| {
+        #[cfg(test)]
+        if let Some(injected) = armed_projection_noreplace_rename(class, dir)? {
+            return Err(io::Error::from_raw_os_error(injected.errno));
         }
-        Err(error) => Err(name(PROJECTION_NOREPLACE_RENAME_OPERATION, error)),
+        rename_projection_noreplace_platform(dir, from, to)
+    });
+    result.map_err(|error| {
+        projection_platform_error(
+            match step {
+                FlaggedRenameStep::Platform => PROJECTION_NOREPLACE_RENAME_OPERATION,
+                FlaggedRenameStep::Reservation => PROJECTION_RESERVED_RENAME_OPERATION,
+            },
+            &format!("{from:?} -> {to:?}"),
+            error,
+        )
+    })
+}
+
+/// Which of the two primitives produced the answer, so the receipt can name the
+/// call the filesystem actually ran.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlaggedRenameStep {
+    Platform,
+    Reservation,
+}
+
+/// The single no-clobber-rename policy, shared by the Markdown/Org projection
+/// leg and by the shared-provider tree in [`crate::oplog`].
+///
+/// `platform` is the caller's own no-clobber primitive — the projection leg and
+/// the provider transport each validate different things around theirs, and
+/// neither should inherit the other's checks — so this owns only the policy: a
+/// `PrivateDurableAuthority` artifact gets that primitive and nothing else,
+/// while a `SharedReconstructibleProjection` artifact additionally reads a
+/// capability refusal from it and degrades to [`reserve_and_rename`]. Every
+/// other errno stays fatal for both classes, on every platform.
+///
+/// The device memo is keyed on the destination directory: source and
+/// destination are always on one mount here (a cross-device rename is `EXDEV`
+/// before any flag matters) and the reservation is created at the destination.
+fn noreplace_or_reserve(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+    reconstructible: bool,
+    platform: &dyn Fn() -> io::Result<()>,
+) -> (FlaggedRenameStep, io::Result<()>) {
+    if reconstructible && flagged_rename_known_unsupported(destination_dir) {
+        return (
+            FlaggedRenameStep::Reservation,
+            reserve_and_rename(source_dir, from, destination_dir, to),
+        );
     }
+    match platform() {
+        Ok(()) => (FlaggedRenameStep::Platform, Ok(())),
+        Err(error) if reconstructible && is_flagged_rename_capability_refusal(&error) => {
+            remember_flagged_rename_unsupported(destination_dir);
+            (
+                FlaggedRenameStep::Reservation,
+                reserve_and_rename(source_dir, from, destination_dir, to),
+            )
+        }
+        Err(error) => (FlaggedRenameStep::Platform, Err(error)),
+    }
+}
+
+/// The same policy for a `SharedReconstructibleProjection` artifact of the
+/// shared-provider tree, which renames ACROSS directories (staging to
+/// `removed/`, a raced name to `rename-evidence/`). `operation` names the
+/// caller's own primitive so a device receipt keeps identifying the exact call
+/// that was refused.
+pub(crate) fn rename_shared_reconstructible_noreplace(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+    operation: &str,
+    platform: &dyn Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    let (step, result) =
+        noreplace_or_reserve(source_dir, from, destination_dir, to, true, platform);
+    result.map_err(|error| {
+        projection_platform_error(
+            match step {
+                FlaggedRenameStep::Platform => operation,
+                FlaggedRenameStep::Reservation => SHARED_RESERVED_RENAME_OPERATION,
+            },
+            &format!("{from:?} -> {to:?}"),
+            error,
+        )
+    })
+}
+
+/// Is this platform error a filesystem saying "I do not implement that flag"?
+/// Re-exported for the shared-provider transport, which owns its own flagged
+/// primitives (including `RENAME_EXCHANGE`) but must read their refusals with
+/// exactly this predicate and no other.
+pub(crate) fn flagged_rename_capability_refusal(error: &io::Error) -> bool {
+    is_flagged_rename_capability_refusal(error)
 }
 
 const PROJECTION_RESERVED_RENAME_OPERATION: &str =
     "exclusive reservation and rename publishing the projection";
+
+const SHARED_RESERVED_RENAME_OPERATION: &str =
+    "exclusive reservation and rename publishing the shared provider name";
 
 /// A substitute for the platform no-replace rename, armed for exactly one graph
 /// tree, so a host test can reproduce a device whose filesystem refuses the
@@ -31384,14 +31469,14 @@ impl Drop for InjectedProjectionNoreplaceRenameFailure {
 }
 
 #[cfg(all(test, unix))]
-fn forget_flagged_rename_capabilities() {
+pub(crate) fn forget_flagged_rename_capabilities() {
     if let Ok(mut devices) = FLAGGED_RENAME_UNSUPPORTED_DEVICES.write() {
         devices.clear();
     }
 }
 
 #[cfg(all(test, not(unix)))]
-fn forget_flagged_rename_capabilities() {}
+pub(crate) fn forget_flagged_rename_capabilities() {}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn rename_managed_noreplace(
