@@ -403,13 +403,19 @@ mod tests {
     /// nothing, so that no caller's correctness depends on it having succeeded.
     #[test]
     fn an_unprobeable_root_answers_as_a_non_folding_filesystem() {
-        let root = probe_root("absent").join("does-not-exist/and-cannot-be-created");
-        // A path whose parent is a FILE cannot be created as a directory.
-        let blocker = probe_root("blocked").join("file");
+        let parent = probe_root("blocked");
+        // A path UNDER a regular file cannot be created as a directory, so the
+        // probe genuinely cannot run here — as opposed to running and finding
+        // nothing, which would make this assertion pass for the wrong reason.
+        let blocker = parent.join("file");
         fs::write(&blocker, b"x").unwrap();
-        assert!(probe_graph_name_folding(&blocker.join("under-a-file")).is_err());
-        assert_eq!(graph_name_folding(&root), GraphNameFolding::UNKNOWN);
+        let unprobeable = blocker.join("under-a-file");
+        assert!(probe_graph_name_folding(&unprobeable).is_err());
+        // `graph_name_folding` swallows that and answers as a filesystem that
+        // folds nothing, which is what makes the probe never load-bearing.
+        assert_eq!(graph_name_folding(&unprobeable), GraphNameFolding::UNKNOWN);
         assert_eq!(GraphNameFolding::UNKNOWN, GraphNameFolding::NONE);
+        let _ = fs::remove_dir_all(&parent);
     }
 
     /// The three axes are independent, and each folds exactly the pair it is
