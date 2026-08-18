@@ -193,6 +193,14 @@ export interface JournalConflict {
   files: JournalFile[];
 }
 
+/** A journal file whose name doesn't round-trip to its date, and the name it
+ *  would get. Concord invariant 4: Tine proposes these renames; opening a graph
+ *  no longer performs them. */
+export interface JournalFilenameMigration {
+  from: string;
+  to: string;
+}
+
 /** A sync-tool conflict copy (Syncthing/Dropbox) shadowing a real page — a
  *  `*.sync-conflict-*.md` (or Dropbox `(conflicted copy)`) file. Excluded from
  *  the page list; surfaced here so the user can review + merge it. */

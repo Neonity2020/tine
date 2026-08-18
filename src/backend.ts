@@ -28,6 +28,7 @@ import type {
   TemplateDto,
   TrashStats,
   JournalConflict,
+  JournalFilenameMigration,
   SyncConflict,
   SyncConflictDiff,
   VcsMarkerConflict,
@@ -406,6 +407,12 @@ export interface Backend {
   /** Journal days that resolve to >1 file (date-stem + title-named, or md/org
    *  twin) — for the user to reconcile. */
   listJournalConflicts(): Promise<JournalConflict[]>;
+  /** Journal files whose names don't round-trip to a date, with the names they
+   *  would get. Proposed only — see `applyJournalFilenameMigrations`. */
+  listJournalFilenameMigrations(): Promise<JournalFilenameMigration[]>;
+  /** Apply the proposed journal renames after taking a snapshot. Returns how
+   *  many files were renamed. */
+  applyJournalFilenameMigrations(): Promise<number>;
   /** Move one journal file (by exact filename) to the recoverable trash. */
   trashJournalFile(name: string): Promise<void>;
   /** Raw contents of one journal file (by exact filename), for inspecting a
@@ -1175,6 +1182,12 @@ class TauriBackend implements Backend {
   }
   listJournalConflicts() {
     return this.call<JournalConflict[]>("list_journal_conflicts");
+  }
+  listJournalFilenameMigrations() {
+    return this.call<JournalFilenameMigration[]>("list_journal_filename_migrations");
+  }
+  applyJournalFilenameMigrations() {
+    return this.call<number>("apply_journal_filename_migrations");
   }
   trashJournalFile(name: string) {
     return this.call<void>("trash_journal_file", { name });

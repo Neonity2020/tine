@@ -2499,6 +2499,17 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* One proposed journal rename: the current name above the name it would get. */
+.journal-rename-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.journal-rename-row .journal-conflict-preview:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
 .journal-conflict-rename {
   display: flex;
   gap: 6px;

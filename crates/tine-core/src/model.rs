@@ -967,6 +967,18 @@ pub struct JournalConflict {
     pub files: Vec<JournalFile>,
 }
 
+/// A journal file whose name does not round-trip to its date, and the name it
+/// would get. Concord invariant 4: Tine PROPOSES these renames, it no longer
+/// performs them behind the user's back at graph open — a rename in a tree the
+/// user keeps in git is a diff they did not ask for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalFilenameMigration {
+    /// Graph-relative path as it is on disk today.
+    pub from: String,
+    /// Graph-relative path it would be renamed to.
+    pub to: String,
+}
+
 /// Lifetime of the ONE authorized write to a marker-bearing file (Concord
 /// invariant 3's single exemption). Dropping it — including on an early return
 /// or a panic — re-arms the refusal for that path, so an exemption can never
@@ -12708,20 +12720,31 @@ impl Graph {
     /// empty. Rename such files to their stem — but only when the stem file
     /// doesn't already exist (never clobber/merge). Returns how many were fixed.
     pub fn has_journal_filename_migrations(&self) -> bool {
+        !self.journal_filename_migrations().is_empty()
+    }
+
+    /// The pending renames, for the user to review and authorize. Same
+    /// selection `migrate_journal_filenames_checked` acts on: a file whose stem
+    /// parses as a journal date but is not the graph's filename format, and
+    /// whose target name is free (the migration never clobbers).
+    pub fn journal_filename_migrations(&self) -> Vec<JournalFilenameMigration> {
         let dir = self.journals_path();
         let Ok(rd) = fs::read_dir(&dir) else {
-            return false;
+            return Vec::new();
         };
-        for e in rd.flatten() {
-            let p = e.path();
-            if self
-                .journal_filename_migration_target(&p)
-                .is_some_and(|target| !target.exists())
-            {
-                return true;
-            }
-        }
-        false
+        let mut out: Vec<JournalFilenameMigration> = rd
+            .flatten()
+            .filter_map(|entry| {
+                let from = entry.path();
+                let target = self.journal_filename_migration_target(&from)?;
+                (!target.exists()).then(|| JournalFilenameMigration {
+                    from: self.rel_path(&from),
+                    to: self.rel_path(&target),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.from.cmp(&b.from));
+        out
     }
 
     fn journal_filename_migration_target(&self, p: &std::path::Path) -> Option<PathBuf> {

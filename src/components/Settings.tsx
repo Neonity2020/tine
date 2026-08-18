@@ -2840,6 +2840,7 @@ function BackupsTab(props: { search: string }): JSX.Element {
         </div>
       </Show>
 
+      <JournalFilenamePanel />
       <JournalConflictsPanel />
       <SyncConflictsPanel />
             <VcsMarkerConflictsPanel />
@@ -3026,6 +3027,67 @@ function JournalConflictsPanel(): JSX.Element {
           );
         }}
       </For>
+    </Show>
+  );
+}
+
+// Journal files whose names don't round-trip to a date (a title-named
+// "Jun 18th, 2026.md" left behind by a date-format change or another tool).
+// Such a file can't be parsed back to its day, so the day looks empty in the
+// feed — a real repair. But it is a rename in a tree the user owns, and until
+// Concord P5 Tine performed it silently at every graph open, which lands as an
+// unrequested diff in a graph kept in git (invariant 4, write-shyness). It is
+// now proposed here and applied only on this button, after a snapshot.
+function JournalFilenamePanel(): JSX.Element {
+  const [pending, { refetch }] = createResource(() =>
+    backend().listJournalFilenameMigrations().catch(() => [])
+  );
+  const [busy, setBusy] = createSignal(false);
+  const apply = async () => {
+    const files = pending() ?? [];
+    if (
+      !(await backend().confirm(
+        `Rename ${files.length} journal file${files.length === 1 ? "" : "s"} to their date names?\n\n` +
+          `A snapshot is taken first, so the original names stay in Backups & recovery. ` +
+          `Nothing is overwritten — a file whose date name is already taken is left alone.`
+      ))
+    )
+      return;
+    setBusy(true);
+    try {
+      const n = await backend().applyJournalFilenameMigrations();
+      pushToast(`Renamed ${n} journal file${n === 1 ? "" : "s"}`, "success");
+      void refetch();
+      await refreshJournalConflicts();
+    } catch (e) {
+      pushToast(`Couldn’t rename them: ${String(e)}`, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Show when={(pending() ?? []).length}>
+      <div class="settings-section" style={{ "margin-top": "18px" }}>
+        Journal files named by title
+      </div>
+      <div class="settings-hint settings-block">
+        These journal files aren’t named after their date, so Tine can’t place them in the journal
+        feed and their days look empty. Renaming them fixes that — but it changes files you own, so
+        Tine never does it on its own. Your version-control tool will see these as renames.
+      </div>
+      <For each={pending() ?? []}>
+        {(m) => (
+          <div class="settings-block journal-rename-row">
+            <span class="journal-conflict-preview mono">{m.from}</span>
+            <span class="journal-conflict-preview mono">→ {m.to}</span>
+          </div>
+        )}
+      </For>
+      <span class="journal-conflict-actions">
+        <button class="settings-btn" disabled={busy()} onClick={() => void apply()}>
+          {busy() ? "Renaming…" : "Rename to date names"}
+        </button>
+      </span>
     </Show>
   );
 }

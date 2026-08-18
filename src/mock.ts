@@ -1647,6 +1647,16 @@ export function mockBackend(): Backend {
         },
       ];
     },
+    async listJournalFilenameMigrations() {
+      // Same demo gate as the duplicate-day list: only under `?conflicts`.
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
+      return [
+        { from: "journals/Thursday, 25-06-2026.org", to: "journals/2026_06_25.org" },
+      ];
+    },
+    async applyJournalFilenameMigrations(): Promise<number> {
+      return 1;
+    },
     async trashJournalFile(): Promise<void> {
       // no-op in the browser mock
     },

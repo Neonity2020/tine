@@ -3772,6 +3772,41 @@ pub(crate) fn list_journal_conflicts(
     with_filesystem_graph(&state, |g| Ok(g.journal_conflicts()))
 }
 
+/// Journal files whose names don't round-trip to a date, and the names they
+/// would get. Concord invariant 4 (write-shyness): opening a graph used to
+/// perform these renames silently; it now only proposes them here.
+#[tauri::command]
+pub(crate) fn list_journal_filename_migrations(
+    state: GraphContext<'_>,
+) -> Result<Vec<tine_core::model::JournalFilenameMigration>, String> {
+    with_filesystem_graph(&state, |g| Ok(g.journal_filename_migrations()))
+}
+
+/// Apply the proposed journal renames, on the user's explicit request. Takes the
+/// same pre-migration snapshot the open path used to take, so the original
+/// filenames stay recoverable in Backups & recovery. Returns how many were
+/// renamed (the migration never clobbers an existing target).
+///
+/// Graph-text mutation with no managed analogue: renaming graph files is the
+/// oplog's authority under managed storage and stays refused there.
+#[tauri::command]
+pub(crate) async fn apply_journal_filename_migrations(
+    state: GraphContext<'_>,
+) -> Result<usize, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let graph = slot.legacy_graph()?;
+        crate::backup::backup_graph_now(&app, &graph, "");
+        graph
+            .migrate_journal_filenames_checked()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
 /// user to review + reconcile instead of them showing as garbage pages.
 #[tauri::command]

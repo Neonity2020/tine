@@ -89,6 +89,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("activate_editor", ManagedRouted),
     ("activate_sparse_v2", NoGraphSlot),
     ("app_platform", NoGraphSlot),
+    ("apply_journal_filename_migrations", LegacyOnly),
     ("apply_spellcheck", NoGraphSlot),
     ("approve_external_assets", NoGraphSlot),
     ("asset_trash_stats", Filesystem),
@@ -144,6 +145,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("list_backups", LegacyOnly),
     ("list_installed_plugins", NoGraphSlot),
     ("list_journal_conflicts", Filesystem),
+    ("list_journal_filename_migrations", Filesystem),
     ("list_known_graphs", NoGraphSlot),
     ("list_orphan_assets", ManagedRouted),
     ("list_pages", ManagedRouted),
@@ -255,6 +257,11 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
 ///
 /// Each entry says what the command needs before it can come back.
 const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
+    (
+        "apply_journal_filename_migrations",
+        "renaming graph files is the oplog's authority under managed storage, \
+         which has no Direct Files journal filenames to repair",
+    ),
     (
         "list_backups",
         "legacy zip backups have no managed analogue",

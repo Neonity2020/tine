@@ -232,7 +232,6 @@ pub(crate) fn capture_graph_binding(
 struct LoadedGraph {
     graph: Graph,
     meta: GraphMeta,
-    launch_backup_done: bool,
 }
 
 const PARTIAL_PROVIDER_REFUSAL: &str =
@@ -337,33 +336,20 @@ fn inspect_unclaimed_sparse_archive(
     }
 }
 
-fn open_graph_for_load(
-    root: &str,
-    approved_assets: Option<&Path>,
-    take_launch_backup: impl FnOnce(&Graph) -> (usize, bool),
-) -> Result<LoadedGraph, String> {
+fn open_graph_for_load(root: &str, approved_assets: Option<&Path>) -> Result<LoadedGraph, String> {
     let graph = Graph::open_checked_with_assets(root, approved_assets)
         .map_err(|e| format!("unsafe graph layout: {e}"))?;
     let meta = graph.meta();
-    let needs_migration = graph.has_journal_filename_migrations();
-    let (backup_n, backup_complete) = if needs_migration {
-        take_launch_backup(&graph)
-    } else {
-        (0, false)
-    };
-    let launch_backup_done = backup_n > 0 && backup_complete;
-    if needs_migration && launch_backup_done {
-        // Recover any journals mis-saved under their title (see method docs),
-        // but only after the launch snapshot has captured the original names.
-        graph
-            .migrate_journal_filenames_checked()
-            .map_err(|error| format!("journal filename migration failed: {error}"))?;
-    }
-    Ok(LoadedGraph {
-        graph,
-        meta,
-        launch_backup_done,
-    })
+    // Concord invariant 4 (write-shyness). Opening a graph used to RENAME every
+    // title-named journal file to its date stem, behind a synchronous launch
+    // backup. It is a genuine repair — such a file cannot be parsed back to a
+    // date, so its day looks empty — but it is not a repair the user asked for,
+    // and in a graph kept in git or behind a sync tool it lands as a tree
+    // rewrite the moment Tine is started. The renames are now PROPOSED
+    // (`journal_filename_migrations`) and applied only by the explicit
+    // `apply_journal_filename_migrations` command, which takes the same
+    // pre-migration snapshot first. Opening touches nothing.
+    Ok(LoadedGraph { graph, meta })
 }
 
 #[derive(serde::Serialize)]
@@ -536,7 +522,6 @@ fn direct_files_projection_path(app: &tauri::AppHandle, root: &Path) -> Result<P
 pub(crate) struct PreparedDirectFilesOpen {
     graph: Graph,
     meta: GraphMeta,
-    launch_backup_done: bool,
     root_key: PathBuf,
 }
 
@@ -549,18 +534,7 @@ pub(crate) fn prepare_direct_files_open(
 ) -> Result<PreparedDirectFilesOpen, String> {
     let root = root_key.display().to_string();
     let approved_assets = approved_external_assets(app, &root_key);
-    let LoadedGraph {
-        graph,
-        meta,
-        launch_backup_done,
-    } = open_graph_for_load(&root, approved_assets.as_deref(), |graph| {
-        crate::backup::backup_graph_now(app, graph, "")
-    })?;
-    if launch_backup_done {
-        graph
-            .migrate_journal_filenames_checked()
-            .map_err(|error| format!("journal filename migration failed: {error}"))?;
-    }
+    let LoadedGraph { graph, meta } = open_graph_for_load(&root, approved_assets.as_deref())?;
     match direct_files_projection_path(app, &root_key) {
         Ok(path) => {
             if let Err(error) = graph.attach_direct_projection(path) {
@@ -586,7 +560,6 @@ pub(crate) fn prepare_direct_files_open(
     Ok(PreparedDirectFilesOpen {
         graph,
         meta,
-        launch_backup_done,
         root_key,
     })
 }
@@ -602,13 +575,12 @@ pub(crate) fn publish_prepared_direct_files(
     let PreparedDirectFilesOpen {
         graph,
         meta,
-        launch_backup_done,
         root_key,
     } = prepared;
     let (slot, warm_generation) = publish_direct_files_slot(state, window_label, graph, root_key)?;
-    if !launch_backup_done {
-        backup_async(app.clone(), slot.clone())?;
-    }
+    // Opening no longer mutates the tree, so the launch snapshot is never on a
+    // rename's critical path: it stays the ordinary background backup.
+    backup_async(app.clone(), slot.clone())?;
     remember_graph(app, &meta.root)?;
     if let Some(window) = app.get_webview_window(window_label) {
         let name = Path::new(&meta.root)
@@ -1177,34 +1149,6 @@ mod tests {
         }
     }
 
-    fn copy_graph_text_dir(src: &Path, dest: &Path) -> (usize, bool) {
-        let _ = std::fs::create_dir_all(dest);
-        let mut copied = 0usize;
-        let mut failed = false;
-        let Ok(rd) = std::fs::read_dir(src) else {
-            return (0, false);
-        };
-        for entry in rd {
-            let Ok(entry) = entry else {
-                failed = true;
-                continue;
-            };
-            let p = entry.path();
-            if !matches!(
-                p.extension().and_then(|x| x.to_str()),
-                Some("md") | Some("org")
-            ) {
-                continue;
-            }
-            if std::fs::copy(&p, dest.join(entry.file_name())).is_ok() {
-                copied += 1;
-            } else {
-                failed = true;
-            }
-        }
-        (copied, !failed)
-    }
-
     #[test]
     fn remembered_startup_lookup_has_one_bounded_terminal_receipt_without_paths() {
         let dir = scratch("startup-lookup-diagnostics");
@@ -1435,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_load_snapshots_original_journal_filename_before_migration() {
+    fn graph_load_proposes_journal_renames_instead_of_performing_them() {
         let dir = scratch("pre-migrate-backup");
         std::fs::create_dir_all(dir.join("logseq")).unwrap();
         std::fs::write(
@@ -1448,31 +1392,36 @@ mod tests {
             "* original title-named journal\n",
         )
         .unwrap();
-        let backup = dir.join("backup");
+        let before = std::fs::read(dir.join("journals").join("Thursday, 25-06-2026.org")).unwrap();
 
-        let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |g| {
-            copy_graph_text_dir(&g.journals_path(), &backup.join("journals"))
-        })
-        .unwrap();
+        let loaded = open_graph_for_load(dir.to_str().unwrap(), None).unwrap();
 
-        assert!(loaded.launch_backup_done, "pre-migration backup ran");
+        // Concord invariant 4: opening PROPOSES the rename and performs none.
+        assert_eq!(
+            loaded.graph.journal_filename_migrations(),
+            vec![tine_core::model::JournalFilenameMigration {
+                from: "journals/Thursday, 25-06-2026.org".into(),
+                to: "journals/2026_06_25.org".into(),
+            }],
+            "the rename is offered"
+        );
         assert!(
-            backup
-                .join("journals")
+            dir.join("journals")
                 .join("Thursday, 25-06-2026.org")
                 .exists(),
-            "backup must contain the original pre-migration filename"
+            "opening a graph must not rename a journal file"
         );
-        assert!(
-            dir.join("journals").join("2026_06_25.org").exists(),
-            "load still migrates the journal filename"
+        assert_eq!(
+            std::fs::read(dir.join("journals").join("Thursday, 25-06-2026.org")).unwrap(),
+            before,
+            "opening a graph must not rewrite a journal file either"
         );
-        assert!(
-            !dir.join("journals")
-                .join("Thursday, 25-06-2026.org")
-                .exists(),
-            "live graph was renamed"
-        );
+        assert!(!dir.join("journals").join("2026_06_25.org").exists());
+
+        // The repair is still one call away, and it is the SAME selection.
+        assert_eq!(loaded.graph.migrate_journal_filenames_checked().unwrap(), 1);
+        assert!(dir.join("journals").join("2026_06_25.org").exists());
+        assert!(loaded.graph.journal_filename_migrations().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1548,7 +1497,7 @@ mod tests {
         Graph::open_checked(&dir)
             .expect("inert legacy-v1 bytes must not reject a checked Direct Files open");
         let root_key = std::fs::canonicalize(&dir).unwrap();
-        let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |_| (0, false)).unwrap();
+        let loaded = open_graph_for_load(dir.to_str().unwrap(), None).unwrap();
         assert_eq!(loaded.meta.root, dir.display().to_string());
         let state = direct_test_state();
         let (slot, warm_generation) =
@@ -1580,7 +1529,7 @@ mod tests {
         std::fs::write(no_v1.join("pages/representative.md"), b"- direct only\n").unwrap();
         let no_v1_before = tree_bytes(&no_v1);
         let no_v1_root = std::fs::canonicalize(&no_v1).unwrap();
-        let loaded = open_graph_for_load(no_v1.to_str().unwrap(), None, |_| (0, false)).unwrap();
+        let loaded = open_graph_for_load(no_v1.to_str().unwrap(), None).unwrap();
         publish_direct_files_slot(&state, "direct-only", loaded.graph, no_v1_root).unwrap();
         assert!(
             !no_v1.join(".tine-sync/v1").exists(),
@@ -1605,7 +1554,7 @@ mod tests {
         Graph::open_checked(&v1_file)
             .expect("an inert non-directory v1 child must not reject Direct Files");
         let v1_file_root = std::fs::canonicalize(&v1_file).unwrap();
-        let loaded = open_graph_for_load(v1_file.to_str().unwrap(), None, |_| (0, false)).unwrap();
+        let loaded = open_graph_for_load(v1_file.to_str().unwrap(), None).unwrap();
         let (slot, _) =
             publish_direct_files_slot(&state, "inert-v1-file", loaded.graph, v1_file_root).unwrap();
         assert!(
@@ -1652,7 +1601,7 @@ mod tests {
         }
 
         let started = std::time::Instant::now();
-        let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |_| (0, false)).unwrap();
+        let loaded = open_graph_for_load(dir.to_str().unwrap(), None).unwrap();
         let elapsed = started.elapsed();
         assert_eq!(loaded.meta.root, dir.display().to_string());
         eprintln!(
