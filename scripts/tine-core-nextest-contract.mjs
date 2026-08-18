@@ -19,6 +19,11 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::pre_07_activation_oracle_has_no_production_entry_point",
   "sync_runtime::tests::clean_reopen_reads_an_unchanged_page_before_deferred_full_scan_catch_up",
   "sync_runtime::tests::clean_reopen_refuses_disk_divergence_without_hiding_it_behind_sqlite",
+  // The host analogue of the Android instrumentation receipt: one runtime that
+  // loads a page and then refuses to save it. It exists to keep that asymmetry
+  // named by stage rather than anonymous, so a platform we cannot debug
+  // interactively can be compared against it.
+  "sync_runtime::tests::managed_save_after_a_source_edit_refuses_by_name_while_the_load_succeeded",
   "sync_runtime::tests::clean_reopen_negative_lookup_settles_closed_interval_addition_and_rename",
   "sync_runtime::tests::clean_runtime_factories_adopt_marker_and_cold_reopen_without_legacy_enrollment",
   "sync_runtime::tests::clean_actor_core_retains_one_manifested_save_until_projection_finishes",
@@ -72,6 +77,7 @@ export const SYNC_RUNTIME_CONTRACT_GUARD_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::every_public_durable_open_and_activation_class_has_a_scenario",
   "sync_runtime::tests::every_blocked_reason_literal_is_in_the_refusal_contract_vocabulary",
   "sync_runtime::tests::managed_save_refusal_origins_are_closed_over_the_permitted_slice",
+  "sync_runtime::tests::managed_save_refusals_cannot_be_constructed_without_a_site_name",
   "sync_runtime::tests::managed_task_query_overlay_stays_at_exact_existing_page_seams",
   "sync_runtime::tests::actor_status_dispatch_is_snapshot_only_after_terminal",
   "sync_runtime::tests::query_rejects_over_limit_before_actor_queue_or_filesystem_work",

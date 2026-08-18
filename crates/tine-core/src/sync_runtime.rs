@@ -10901,7 +10901,9 @@ fn application_parser_indices_for_block_ids(
     block_ids: &HashSet<BlockId>,
 ) -> Result<HashSet<usize>, SyncApplicationPageRequestError> {
     if current.editor.dto.blocks.len() != flatten_application_blocks(&current.page.blocks).len() {
-        return Err(SyncApplicationPageRequestError::ActorRefused);
+        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+            "application_parser_indices_block_count",
+        ));
     }
     let allowed = current
         .editor
@@ -10911,15 +10913,23 @@ fn application_parser_indices_for_block_ids(
         .enumerate()
         .map(|(index, block)| match &block.key {
             SyncEditorBlockKey::Existing(id) => parse_editor_block_id(id).map(|id| (index, id)),
-            SyncEditorBlockKey::Temporary(_) => Err(SyncEditorRequestError::ActorRefused),
+            SyncEditorBlockKey::Temporary(_) => Err(SyncEditorRequestError::ActorRefusedAt(
+                "application_parser_indices_temporary_key",
+            )),
         })
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+        .map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_parser_indices_block_id_parse",
+            )
+        })?
         .into_iter()
         .filter_map(|(index, block_id)| block_ids.contains(&block_id).then_some(index))
         .collect::<HashSet<_>>();
     if allowed.len() != block_ids.len() {
-        return Err(SyncApplicationPageRequestError::ActorRefused);
+        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+            "application_parser_indices_block_id_coverage",
+        ));
     }
     Ok(allowed)
 }
@@ -11055,9 +11065,12 @@ fn application_page_block_reference_counts(
     while let Some(block) = stack.pop() {
         for uuid in crate::render::block_refs(&block.raw, page.format == Format::Org).block {
             let count = counts.entry(uuid).or_insert(0_usize);
-            *count = count
-                .checked_add(1)
-                .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+            *count =
+                count
+                    .checked_add(1)
+                    .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_page_reference_count_overflow",
+                    ))?;
         }
         stack.extend(block.children.iter().rev());
     }
@@ -14313,9 +14326,9 @@ impl RuntimeActor {
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = database
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        let read = database.materialized_read().map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("application_materialized_read_open")
+        })?;
         ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())
             .map_err(map_editor_application_error)?;
         Ok(read)
@@ -14358,9 +14371,11 @@ impl RuntimeActor {
                 continue;
             };
             let logseq_uuid = LogseqUuid::from_uuid(uuid_value);
-            let mut claimants = read
-                .blocks_by_logseq_uuid(logseq_uuid, 2)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let mut claimants = read.blocks_by_logseq_uuid(logseq_uuid, 2).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_block_candidates_by_logseq_uuid",
+                )
+            })?;
             if claimants.len() != 1 {
                 // Zero claims are absent; multiple claims are an explicit
                 // semantic ambiguity. Never let the physical row order choose
@@ -14368,11 +14383,15 @@ impl RuntimeActor {
                 continue;
             }
             let block = claimants.pop().expect("one Logseq UUID claimant");
-            let Some(page) = read
-                .page(block.page_id)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+            let Some(page) = read.page(block.page_id).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_block_candidates_page_lookup",
+                )
+            })?
             else {
-                return Err(SyncApplicationPageRequestError::ActorRefused);
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_block_candidates_page_missing",
+                ));
             };
             if !masked_paths.contains(&page.path) {
                 candidates
@@ -14461,15 +14480,22 @@ impl RuntimeActor {
         loop {
             let rows = read
                 .block_reference_counts_after(cursor, BATCH)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_reference_counts_scan",
+                    )
+                })?;
             if rows.is_empty() {
                 break;
             }
             let len = rows.len();
             for row in rows {
                 cursor = Some(row.raw_uuid_claim);
-                let count = usize::try_from(row.distinct_source_blocks)
-                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                let count = usize::try_from(row.distinct_source_blocks).map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_reference_counts_row_width",
+                    )
+                })?;
                 counts.insert(row.raw_uuid_claim.to_string(), count);
             }
             if len < BATCH {
@@ -14481,11 +14507,15 @@ impl RuntimeActor {
         // Per-page reads are proportional only to the committed undrained
         // suffix, which is exactly the work that must replace the derivative.
         for path in overlay.keys() {
-            let pages = read
-                .pages_by_path(path, 2)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let pages = read.pages_by_path(path, 2).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_reference_counts_overlay_pages_by_path",
+                )
+            })?;
             if pages.len() > 1 {
-                return Err(SyncApplicationPageRequestError::ActorRefused);
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_reference_counts_overlay_path_ambiguous",
+                ));
             }
             let Some(page) = pages.first() else {
                 continue;
@@ -14494,22 +14524,33 @@ impl RuntimeActor {
             loop {
                 let rows = read
                     .block_reference_counts_for_source_page_after(page.page_id, page_cursor, BATCH)
-                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_reference_counts_source_page_scan",
+                        )
+                    })?;
                 if rows.is_empty() {
                     break;
                 }
                 let len = rows.len();
                 for row in rows {
                     page_cursor = Some(row.raw_uuid_claim);
-                    let decrement = usize::try_from(row.distinct_source_blocks)
-                        .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                    let decrement = usize::try_from(row.distinct_source_blocks).map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_reference_counts_source_row_width",
+                        )
+                    })?;
                     let key = row.raw_uuid_claim.to_string();
-                    let current = counts
-                        .get_mut(&key)
-                        .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
-                    *current = current
-                        .checked_sub(decrement)
-                        .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                    let current = counts.get_mut(&key).ok_or(
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_reference_counts_missing_claim",
+                        ),
+                    )?;
+                    *current = current.checked_sub(decrement).ok_or(
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_reference_counts_underflow",
+                        ),
+                    )?;
                     if *current == 0 {
                         counts.remove(&key);
                     }
@@ -14524,9 +14565,11 @@ impl RuntimeActor {
         for current in overlay.values().flatten() {
             for (uuid, increment) in application_page_block_reference_counts(&current.1)? {
                 let count = counts.entry(uuid).or_insert(0);
-                *count = count
-                    .checked_add(increment)
-                    .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                *count = count.checked_add(increment).ok_or(
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_reference_counts_overflow",
+                    ),
+                )?;
             }
         }
         Ok(counts)
@@ -14559,7 +14602,11 @@ impl RuntimeActor {
         'rows: loop {
             let rows = read
                 .block_referrer_candidates_after(target_uuid, cursor, BATCH)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_block_referrers_scan",
+                    )
+                })?;
             if rows.is_empty() {
                 break;
             }
@@ -14571,8 +14618,14 @@ impl RuntimeActor {
                 } else {
                     let page = read
                         .page(row.source_page_id)
-                        .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-                        .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncApplicationPageRequestError::ActorRefusedAt(
+                                "application_block_referrers_page_lookup",
+                            )
+                        })?
+                        .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_block_referrers_page_missing",
+                        ))?;
                     page_paths.insert(row.source_page_id, page.path.clone());
                     page.path
                 };
@@ -14584,9 +14637,11 @@ impl RuntimeActor {
                     .or_default()
                     .insert(row.source_block_id)
                 {
-                    candidate_count = candidate_count
-                        .checked_add(1)
-                        .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                    candidate_count = candidate_count.checked_add(1).ok_or(
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_block_referrers_candidate_overflow",
+                        ),
+                    )?;
                     if candidate_count > max_rows {
                         break 'rows;
                     }
@@ -14610,7 +14665,11 @@ impl RuntimeActor {
             let entry = self
                 .graph
                 .projected_inventory_entry(path, &page.name, model_sync_page_kind(page.kind))
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_block_referrers_inventory_entry",
+                    )
+                })?;
             source_groups.push((
                 entry.date_key,
                 path.to_string(),
@@ -14636,7 +14695,11 @@ impl RuntimeActor {
                     &current.page.name,
                     current.editor.page.kind,
                 )
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_block_referrers_overlay_inventory_entry",
+                    )
+                })?;
             source_groups.push((
                 entry.date_key,
                 current.page.path.clone(),
@@ -14754,7 +14817,11 @@ impl RuntimeActor {
             loop {
                 let rows = read
                     .page_referrer_candidates_after(normalized, cursor, BATCH)
-                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_backlinks_scan",
+                        )
+                    })?;
                 if rows.is_empty() {
                     break;
                 }
@@ -14767,8 +14834,14 @@ impl RuntimeActor {
                         } else {
                             let page = read
                                 .page(row.source_page_id)
-                                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-                                .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                                .map_err(|_| {
+                                    SyncApplicationPageRequestError::ActorRefusedAt(
+                                        "application_backlinks_page_lookup",
+                                    )
+                                })?
+                                .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_backlinks_page_missing",
+                                ))?;
                             let header = (page.path, page.name);
                             page_headers.insert(row.source_page_id, header.clone());
                             header
@@ -14781,7 +14854,9 @@ impl RuntimeActor {
                     let inserted = match row.source {
                         MaterializedEntityId::Page(page_id) => {
                             if page_id != row.source_page_id {
-                                return Err(SyncApplicationPageRequestError::ActorRefused);
+                                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_backlinks_source_page_identity",
+                                ));
                             }
                             let inserted = !entry.preamble;
                             entry.preamble = true;
@@ -14790,9 +14865,11 @@ impl RuntimeActor {
                         MaterializedEntityId::Block(block_id) => entry.blocks.insert(block_id),
                     };
                     if inserted {
-                        candidate_count = candidate_count
-                            .checked_add(1)
-                            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                        candidate_count = candidate_count.checked_add(1).ok_or(
+                            SyncApplicationPageRequestError::ActorRefusedAt(
+                                "application_backlinks_candidate_overflow",
+                            ),
+                        )?;
                         if candidate_count > max_rows {
                             candidate_exceeded = true;
                             break 'names;
@@ -14829,7 +14906,11 @@ impl RuntimeActor {
             let entry = self
                 .graph
                 .projected_inventory_entry(&path, &page.name, model_sync_page_kind(page.kind))
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_backlinks_inventory_entry",
+                    )
+                })?;
             sources.push((path.as_str().to_owned(), entry.date_key, page, matches));
         }
         for (page_id, candidate) in candidates {
@@ -14857,7 +14938,11 @@ impl RuntimeActor {
                     &current.page.name,
                     current.editor.page.kind,
                 )
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_backlinks_overlay_inventory_entry",
+                    )
+                })?;
             sources.push((
                 current.editor.page.path.as_str().to_owned(),
                 entry.date_key,
@@ -14898,7 +14983,9 @@ impl RuntimeActor {
                 let current = match self.load_application_exact_ready(&entry.rel_path)? {
                     ApplicationExactLoad::Loaded(current) => current,
                     ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                        return Err(SyncApplicationPageRequestError::ActorRefused)
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_unlinked_references_page_load",
+                        ))
                     }
                 };
                 let matches = crate::query::application_page_reference_matches(
@@ -14930,7 +15017,11 @@ impl RuntimeActor {
             loop {
                 let rows = read
                     .plain_text_candidate_pages_after(normalized, cursor, BATCH)
-                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_unlinked_references_scan",
+                        )
+                    })?;
                 if rows.is_empty() {
                     break;
                 }
@@ -14942,8 +15033,14 @@ impl RuntimeActor {
                     } else {
                         let page = read
                             .page(row.page_id)
-                            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-                            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                            .map_err(|_| {
+                                SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_unlinked_references_page_lookup",
+                                )
+                            })?
+                            .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                                "application_unlinked_references_page_missing",
+                            ))?;
                         let header = (page.path, page.name);
                         page_headers.insert(row.page_id, header.clone());
                         header
@@ -14983,7 +15080,11 @@ impl RuntimeActor {
             let entry = self
                 .graph
                 .projected_inventory_entry(&path, &page.name, model_sync_page_kind(page.kind))
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_unlinked_references_inventory_entry",
+                    )
+                })?;
             sources.push((path.as_str().to_owned(), entry.date_key, page, matches));
         }
         for page_id in candidate_pages {
@@ -15010,7 +15111,11 @@ impl RuntimeActor {
                     &current.page.name,
                     current.editor.page.kind,
                 )
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_unlinked_references_overlay_inventory_entry",
+                    )
+                })?;
             sources.push((
                 current.editor.page.path.as_str().to_owned(),
                 entry.date_key,
@@ -15037,7 +15142,9 @@ impl RuntimeActor {
         loop {
             let rows = read
                 .block_property_candidates_after("template", cursor, BATCH)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt("application_templates_scan")
+                })?;
             if rows.is_empty() {
                 break;
             }
@@ -15049,8 +15156,14 @@ impl RuntimeActor {
                 } else {
                     let page = read
                         .page(row.page_id)
-                        .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-                        .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncApplicationPageRequestError::ActorRefusedAt(
+                                "application_templates_page_lookup",
+                            )
+                        })?
+                        .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_templates_page_missing",
+                        ))?;
                     page_paths.insert(row.page_id, page.path.clone());
                     page.path
                 };
@@ -15107,11 +15220,15 @@ impl RuntimeActor {
         // per base page while streaming the graph-wide facet facts.
         let mut masked_page_ids = HashSet::new();
         for path in overlay.keys() {
-            let rows = read
-                .pages_by_path(path, 2)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let rows = read.pages_by_path(path, 2).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_property_facets_overlay_pages_by_path",
+                )
+            })?;
             if rows.len() > 1 {
-                return Err(SyncApplicationPageRequestError::ActorRefused);
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_property_facets_overlay_path_ambiguous",
+                ));
             }
             masked_page_ids.extend(rows.into_iter().map(|page| page.page_id));
         }
@@ -15137,7 +15254,11 @@ impl RuntimeActor {
                             ..
                         },
                     ) if batch > 1 => batch = (batch / 2).max(1),
-                    Err(_) => return Err(SyncApplicationPageRequestError::ActorRefused),
+                    Err(_) => {
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_property_facets_row_scan",
+                        ))
+                    }
                 }
             };
             if rows.is_empty() {
@@ -15447,11 +15568,15 @@ impl RuntimeActor {
 
         let mut masked_page_ids = HashSet::new();
         for path in overlay.keys() {
-            let rows = read
-                .pages_by_path(path, 2)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let rows = read.pages_by_path(path, 2).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_simple_query_overlay_pages_by_path",
+                )
+            })?;
             if rows.len() > 1 {
-                return Err(SyncApplicationPageRequestError::ActorRefused);
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_simple_query_overlay_path_ambiguous",
+                ));
             }
             masked_page_ids.extend(rows.into_iter().map(|page| page.page_id));
         }
@@ -15465,7 +15590,11 @@ impl RuntimeActor {
                     loop {
                         let rows = read
                             .task_candidate_pages_after(marker, cursor, BATCH)
-                            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                            .map_err(|_| {
+                                SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_simple_query_task_scan",
+                                )
+                            })?;
                         if rows.is_empty() {
                             break;
                         }
@@ -15486,7 +15615,11 @@ impl RuntimeActor {
                     loop {
                         let rows = read
                             .page_referrer_candidates_after(normalized, cursor, BATCH)
-                            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                            .map_err(|_| {
+                                SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_simple_query_page_referrer_scan",
+                                )
+                            })?;
                         if rows.is_empty() {
                             break;
                         }
@@ -15507,7 +15640,11 @@ impl RuntimeActor {
                     loop {
                         let rows = read
                             .block_property_candidates_after(normalized, cursor, BATCH)
-                            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                            .map_err(|_| {
+                                SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_simple_query_block_property_scan",
+                                )
+                            })?;
                         if rows.is_empty() {
                             break;
                         }
@@ -15542,7 +15679,11 @@ impl RuntimeActor {
             loop {
                 let rows = read
                     .property_facet_rows_after(false, cursor.clone(), BATCH)
-                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_simple_query_property_facet_scan",
+                        )
+                    })?;
                 if rows.is_empty() {
                     break;
                 }
@@ -15579,7 +15720,11 @@ impl RuntimeActor {
                         cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
                         BATCH,
                     )
-                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_simple_query_navigation_scan",
+                        )
+                    })?;
                 if rows.is_empty() {
                     break;
                 }
@@ -15658,7 +15803,9 @@ impl RuntimeActor {
             let current = match self.load_application_exact_ready(&entry.rel_path)? {
                 ApplicationExactLoad::Loaded(current) => current,
                 ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                    return Err(SyncApplicationPageRequestError::ActorRefused)
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_all_query_pages_page_load",
+                    ))
                 }
             };
             pages.push(crate::query::ApplicationQueryPage {
@@ -15782,7 +15929,9 @@ impl RuntimeActor {
                 let current = match self.load_application_exact_ready(&entry.rel_path)? {
                     ApplicationExactLoad::Loaded(current) => current,
                     ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                        return Err(SyncApplicationPageRequestError::ActorRefused)
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_query_plan_page_load",
+                        ))
                     }
                 };
                 pages.push(crate::query_plan::ApplicationQueryPlanPage {
@@ -15884,7 +16033,11 @@ impl RuntimeActor {
                     cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
                     BATCH,
                 )
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_navigation_pages_scan",
+                    )
+                })?;
             if rows.is_empty() {
                 break;
             }
@@ -15897,7 +16050,11 @@ impl RuntimeActor {
                 let page = self
                     .graph
                     .projected_inventory_entry(&row.path, &row.name, row.kind)
-                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_navigation_pages_inventory_entry",
+                        )
+                    })?;
                 cursor = Some((row.path, row.page_id));
                 output.push((row.page_id, page, row.preamble));
             }
@@ -15916,7 +16073,11 @@ impl RuntimeActor {
             let entry = self
                 .graph
                 .projected_inventory_entry(&path, &page.name, kind)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_navigation_pages_overlay_inventory_entry",
+                    )
+                })?;
             output.push((page_id, entry, page.pre_block));
         }
         output.sort_by(|a, b| a.1.rel_path.cmp(&b.1.rel_path).then_with(|| a.0.cmp(&b.0)));
@@ -15942,15 +16103,20 @@ impl RuntimeActor {
             .unwrap_or_default();
         let mut overlay = BTreeMap::new();
         for path in paths {
-            let path = ManagedPath::parse(path)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let path = ManagedPath::parse(path).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_navigation_overlay_path_parse",
+                )
+            })?;
             let current = match self.load_hot_application_exact_ready(&path)? {
                 ApplicationExactLoad::Loaded(current) => {
                     Some((current.editor.page.page_id, current.page))
                 }
                 ApplicationExactLoad::Missing => None,
                 ApplicationExactLoad::Ambiguous => {
-                    return Err(SyncApplicationPageRequestError::ActorRefused)
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_navigation_overlay_page_ambiguous",
+                    ))
                 }
             };
             overlay.insert(path, current);
@@ -15974,7 +16140,11 @@ impl RuntimeActor {
                         .map(|(path, alias, page_id)| (path, alias.as_str(), *page_id)),
                     BATCH,
                 )
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_navigation_aliases_scan",
+                    )
+                })?;
             if rows.is_empty() {
                 break;
             }
@@ -16028,7 +16198,11 @@ impl RuntimeActor {
                     }),
                     BATCH,
                 )
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_navigation_reference_names_scan",
+                    )
+                })?;
             if rows.is_empty() {
                 break;
             }
@@ -16079,7 +16253,9 @@ impl RuntimeActor {
                     None,
                     INVENTORY_BATCH,
                 )
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt("application_inventory_scan")
+                })?;
             if batch.is_empty() {
                 break;
             }
@@ -16088,7 +16264,11 @@ impl RuntimeActor {
                 let entry = self
                     .graph
                     .projected_inventory_entry(&page.path, &page.name, page.kind)
-                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_inventory_entry",
+                        )
+                    })?;
                 cursor = Some((page.path, page.page_id));
                 pages.push(entry);
             }
@@ -16178,14 +16358,20 @@ impl RuntimeActor {
             let database = self
                 .active_database()
                 .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-            let read = database
-                .materialized_read()
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let read = database.materialized_read().map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_load_exact_materialized_read",
+                )
+            })?;
             ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())
                 .map_err(map_editor_application_error)?;
             let projected = match read
                 .pages_by_path(&path, 2)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_load_exact_pages_by_path",
+                    )
+                })?
                 .as_slice()
             {
                 [page] if page.path == path => Some(
@@ -16219,7 +16405,11 @@ impl RuntimeActor {
         let read = self.application_materialized_read_ready()?;
         if let [page] = read
             .pages_by_path(&path, 2)
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_load_save_exact_pages_by_path",
+                )
+            })?
             .as_slice()
         {
             if page.path == path {
@@ -16262,9 +16452,11 @@ impl RuntimeActor {
         let engine = self
             .active_engine()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let accepted_frontier = engine
-            .accepted_frontier_root()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        let accepted_frontier = engine.accepted_frontier_root().map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_take_hot_save_frontier_root",
+            )
+        })?;
         if accepted_frontier != hot.accepted_frontier {
             return Ok(None);
         }
@@ -16273,9 +16465,11 @@ impl RuntimeActor {
                 SyncApplicationPageInvalidRequest::InvalidPath,
             )
         })?;
-        let exact_owner = engine
-            .current_page_at_path(&managed_path)
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        let exact_owner = engine.current_page_at_path(&managed_path).map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_take_hot_save_current_page_at_path",
+            )
+        })?;
         if !matches!(
             exact_owner,
             CurrentPageAtPath::ExactOwner(owner)
@@ -16300,7 +16494,11 @@ impl RuntimeActor {
             .active_engine()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
             .accepted_frontier_root()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_retain_hot_save_frontier_root",
+                )
+            })?;
         self.hot_application_save_page = Some(HotApplicationSavePage {
             accepted_frontier,
             current,
@@ -16330,8 +16528,11 @@ impl RuntimeActor {
             .active_engine()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
             .current_page_at_path(path)
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-        {
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_load_hot_exact_current_page_at_path",
+                )
+            })? {
             CurrentPageAtPath::ExactOwner(owner) => owner.page_id(),
             CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {
                 return Ok(ApplicationExactLoad::Missing)
@@ -16344,9 +16545,13 @@ impl RuntimeActor {
         let current = self
             .load_active_hot_application_page(page_id)
             .map_err(map_editor_application_error)?
-            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+            .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_load_hot_exact_page_missing",
+            ))?;
         if current.editor.page.path != *path {
-            return Err(SyncApplicationPageRequestError::ActorRefused);
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_load_hot_exact_path_mismatch",
+            ));
         }
         Ok(ApplicationExactLoad::Loaded(current))
     }
@@ -16366,7 +16571,9 @@ impl RuntimeActor {
         let current = self
             .load_active_preferred_application_page(page_id, self.exact_projection_read_available())
             .map_err(map_editor_application_error)?
-            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+            .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_load_page_id_untracked_missing",
+            ))?;
         Ok(current)
     }
 
@@ -16393,7 +16600,9 @@ impl RuntimeActor {
             }
             SyncApplicationPageSaveOutcome::Saved { .. }
             | SyncApplicationPageSaveOutcome::Unchanged { .. } => {
-                Err(SyncApplicationPageRequestError::ActorRefused)
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_preflight_unexpected_durable_outcome",
+                ))
             }
         }
     }
@@ -17606,9 +17815,12 @@ impl RuntimeActor {
         let engine = self
             .active_engine()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let store = engine
-            .archive_store()
-            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        let store =
+            engine
+                .archive_store()
+                .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "rename_archive_store",
+                ))?;
         let mut query = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
@@ -17894,9 +18106,12 @@ impl RuntimeActor {
             let engine = self
                 .active_engine()
                 .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-            let store = engine
-                .archive_store()
-                .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+            let store =
+                engine
+                    .archive_store()
+                    .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "merge_archive_store",
+                    ))?;
             let mut query = self
                 .active_database()
                 .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
@@ -18265,7 +18480,9 @@ impl RuntimeActor {
         });
         match outcome {
             Ok(SyncApplicationPageSaveOutcome::Prepared) => {
-                Err(SyncApplicationPageRequestError::ActorRefused)
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "sync_conflict_unexpected_prepared",
+                ))
             }
             Ok(SyncApplicationPageSaveOutcome::Saved { .. })
             | Ok(SyncApplicationPageSaveOutcome::Unchanged { .. }) => {
@@ -18537,7 +18754,9 @@ impl RuntimeActor {
         let outcome = self.save_application_page(SyncApplicationPageSaveRequest { target, page });
         match outcome {
             Ok(SyncApplicationPageSaveOutcome::Prepared) => {
-                Err(SyncApplicationPageRequestError::ActorRefused)
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "pdf_highlights_unexpected_prepared",
+                ))
             }
             Ok(SyncApplicationPageSaveOutcome::Saved { .. })
             | Ok(SyncApplicationPageSaveOutcome::Unchanged { .. }) => {
@@ -18629,7 +18848,9 @@ impl RuntimeActor {
                 page: planned.page,
             })? {
                 SyncApplicationPageSaveOutcome::Prepared => {
-                    return Err(SyncApplicationPageRequestError::ActorRefused)
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "guide_copy_unexpected_prepared",
+                    ))
                 }
                 SyncApplicationPageSaveOutcome::Saved { .. }
                 | SyncApplicationPageSaveOutcome::Unchanged { .. } => {
@@ -18670,13 +18891,17 @@ impl RuntimeActor {
     ) -> Result<ApplicationPublicationSettlement, SyncApplicationPageRequestError> {
         self.require_pending_application_publication(expected_batch_id)?;
         for _ in 0..MAX_EDITOR_SETTLE_TURNS {
-            let outcome = self
-                .advance_local_mutation_once()
-                .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+            let outcome = self.advance_local_mutation_once().ok_or(
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "settle_publication_no_mutation_turn",
+                ),
+            )?;
             match outcome {
                 SyncLocalMutationOutcome::Durable { batch_id } => {
                     if batch_id.to_string() != expected_batch_id {
-                        return Err(SyncApplicationPageRequestError::ActorRefused);
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "settle_publication_durable_batch_mismatch",
+                        ));
                     }
                     return Ok(ApplicationPublicationSettlement::Durable);
                 }
@@ -18685,7 +18910,9 @@ impl RuntimeActor {
                     phase: next_phase,
                 } => {
                     if batch_id.to_string() != expected_batch_id {
-                        return Err(SyncApplicationPageRequestError::ActorRefused);
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "settle_publication_retry_batch_mismatch",
+                        ));
                     }
                     self.require_pending_application_publication(expected_batch_id)?;
                     phase = next_phase;
@@ -18697,7 +18924,9 @@ impl RuntimeActor {
                     ));
                 }
                 SyncLocalMutationOutcome::RetryableRetainedRecovery { batch_id: None, .. } => {
-                    return Err(SyncApplicationPageRequestError::ActorRefused)
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "settle_publication_retry_without_batch",
+                    ))
                 }
             }
         }
@@ -18720,7 +18949,9 @@ impl RuntimeActor {
             {
                 Ok(())
             }
-            _ => Err(SyncApplicationPageRequestError::ActorRefused),
+            _ => Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "require_pending_publication_absent",
+            )),
         }
     }
 
@@ -18730,9 +18961,9 @@ impl RuntimeActor {
     ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
         match self.load_application_exact_ready(path)? {
             ApplicationExactLoad::Loaded(current) => Ok(current),
-            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                Err(SyncApplicationPageRequestError::ActorRefused)
-            }
+            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => Err(
+                SyncApplicationPageRequestError::ActorRefusedAt("application_reload_page_absent"),
+            ),
         }
     }
 
@@ -18786,7 +19017,9 @@ impl RuntimeActor {
                                 self.exact_projection_read_available(),
                             )?
                             .map(|current| current.editor)
-                            .ok_or(SyncEditorRequestError::ActorRefused)?;
+                            .ok_or(SyncEditorRequestError::ActorRefusedAt(
+                                "editor_load_page_missing",
+                            ))?;
                         Ok(SyncEditorLoadOutcome::Loaded { page: current.dto })
                     }
                     EditorNameState::Missing { name, revision, .. } => {
@@ -27209,13 +27442,13 @@ fn editor_name_state_for_format_with_engine(
     let name = LogicalPageName::parse(name).map_err(|_| {
         SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
     })?;
-    let authenticated_owner = engine
-        .current_page_for_logical_name(&name)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    let authenticated_owner = engine.current_page_for_logical_name(&name).map_err(|_| {
+        SyncEditorRequestError::ActorRefusedAt("editor_name_state_current_page_for_logical_name")
+    })?;
     if let Some(page_id) = authenticated_owner {
-        let page = engine
-            .materialize_page(page_id)
-            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        let page = engine.materialize_page(page_id).map_err(|_| {
+            SyncEditorRequestError::ActorRefusedAt("editor_name_state_materialize_page")
+        })?;
         return Ok(if page.kind == page_kind.into() {
             EditorNameState::Exact(page_id)
         } else {
@@ -27230,10 +27463,9 @@ fn editor_name_state_for_format_with_engine(
     if path.as_str().len() > MAX_LOCAL_MUTATION_PATH_BYTES {
         return Err(editor_too_large(0, 0, 0, path.as_str().len()));
     }
-    match engine
-        .current_page_at_path(&path)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?
-    {
+    match engine.current_page_at_path(&path).map_err(|_| {
+        SyncEditorRequestError::ActorRefusedAt("editor_name_state_current_page_at_path")
+    })? {
         CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {}
         CurrentPageAtPath::ExactOwner(_)
         | CurrentPageAtPath::PortableCollision(_)
@@ -27274,13 +27506,15 @@ fn projected_editor_name_state_from_projection(
     let name = LogicalPageName::parse(name).map_err(|_| {
         SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
     })?;
-    let read = database
-        .materialized_read()
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    let read = database.materialized_read().map_err(|_| {
+        SyncEditorRequestError::ActorRefusedAt("projected_name_state_materialized_read")
+    })?;
     ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())?;
     let owners = read
         .pages_by_name_key_and_kind(&name.canonical_key(), page_kind.into(), 2)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| {
+            SyncEditorRequestError::ActorRefusedAt("projected_name_state_pages_by_name_key")
+        })?;
     match owners.as_slice() {
         [owner] => return Ok(EditorNameState::Exact(owner.page_id)),
         [_, ..] => {
@@ -27307,10 +27541,9 @@ fn projected_editor_name_state_from_projection(
     if path.as_str().len() > MAX_LOCAL_MUTATION_PATH_BYTES {
         return Err(editor_too_large(0, 0, 0, path.as_str().len()));
     }
-    match engine
-        .current_page_at_path(&path)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?
-    {
+    match engine.current_page_at_path(&path).map_err(|_| {
+        SyncEditorRequestError::ActorRefusedAt("projected_name_state_current_page_at_path")
+    })? {
         CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {}
         CurrentPageAtPath::ExactOwner(_)
         | CurrentPageAtPath::PortableCollision(_)
@@ -27356,14 +27589,14 @@ fn load_projected_page_from_projection(
 ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
     let read = database
         .materialized_read()
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("projected_page_materialized_read"))?;
     ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())?;
     let page = read
         .page(page_id)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("projected_page_row_lookup"))?;
     let projected_blocks = read
         .blocks_on_page(page_id, block_limit + 1)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("projected_page_blocks_lookup"))?;
     if projected_blocks.len() > block_limit {
         return Err(editor_too_large(projected_blocks.len(), 0, 0, 0));
     }
@@ -27371,7 +27604,9 @@ fn load_projected_page_from_projection(
         return if projected_blocks.is_empty() {
             Ok(None)
         } else {
-            Err(SyncEditorRequestError::ActorRefused)
+            Err(SyncEditorRequestError::ActorRefusedAt(
+                "projected_page_blocks_without_page",
+            ))
         };
     };
     let authoritative = materialized_page_from_projection(projected_page, projected_blocks)?;
@@ -27474,16 +27709,22 @@ fn load_hot_source_authenticated_page_with_block_limit_from_engine(
             crate::oplog::hot_engine::EngineError::PageNotFound(_)
             | crate::oplog::hot_engine::EngineError::PageDeleted(_),
         ) => return Ok(None),
-        Err(_) => return Err(SyncEditorRequestError::ActorRefused),
+        Err(_) => {
+            return Err(SyncEditorRequestError::ActorRefusedAt(
+                "hot_source_materialize_page",
+            ))
+        }
     };
     let current = editor_current_page_from_materialized(page, block_limit)?;
     let parsed = graph
         .load_by_path(current.page.path.as_str())
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?
-        .ok_or(SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("hot_source_load_by_path"))?
+        .ok_or(SyncEditorRequestError::ActorRefusedAt(
+            "hot_source_path_missing",
+        ))?;
     join_application_page(parsed, current)
         .map(Some)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("hot_source_join"))
 }
 
 fn load_preferred_source_authenticated_application_page(
@@ -27572,7 +27813,7 @@ fn load_projected_source_authenticated_application_page_from_parts(
     current.dto.revision = revision?;
     let parsed = graph
         .load_by_path(current.page.path.as_str())
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("projected_source_load_by_path"))?;
     let Some(parsed) = parsed else {
         #[cfg(test)]
         if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
@@ -27581,7 +27822,9 @@ fn load_projected_source_authenticated_application_page_from_parts(
                 current.page.path
             );
         }
-        return Err(SyncEditorRequestError::ActorRefused);
+        return Err(SyncEditorRequestError::ActorRefusedAt(
+            "projected_source_path_missing",
+        ));
     };
     let joined = join_application_page(parsed, current);
     #[cfg(test)]
@@ -27592,7 +27835,7 @@ fn load_projected_source_authenticated_application_page_from_parts(
     }
     joined
         .map(Some)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("projected_source_join"))
 }
 
 fn load_projected_source_rebased_application_page(
@@ -27625,12 +27868,14 @@ fn load_projected_source_rebased_application_page_from_parts(
     };
     let parsed = graph
         .load_by_path(current.page.path.as_str())
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?
-        .ok_or(SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("rebased_source_load_by_path"))?
+        .ok_or(SyncEditorRequestError::ActorRefusedAt(
+            "rebased_source_path_missing",
+        ))?;
     rebase_projected_editor_page_from_source(&mut current, &parsed)?;
     join_application_page(parsed, current)
         .map(Some)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("rebased_source_join"))
 }
 
 fn rebase_projected_editor_page_from_source(
@@ -27638,12 +27883,16 @@ fn rebase_projected_editor_page_from_source(
     parsed: &PageDto,
 ) -> Result<(), SyncEditorRequestError> {
     if parsed.guide || parsed.path != editor.page.path.as_str() {
-        return Err(SyncEditorRequestError::ActorRefused);
+        return Err(SyncEditorRequestError::ActorRefusedAt(
+            "rebase_source_path_identity",
+        ));
     }
     let parsed_blocks = flatten_application_blocks(&parsed.blocks);
     if parsed_blocks.len() != editor.dto.blocks.len() || parsed_blocks.len() != editor.blocks.len()
     {
-        return Err(SyncEditorRequestError::ActorRefused);
+        return Err(SyncEditorRequestError::ActorRefusedAt(
+            "rebase_block_count_mismatch",
+        ));
     }
     let materialized = editor
         .blocks
@@ -27657,34 +27906,47 @@ fn rebase_projected_editor_page_from_source(
         .enumerate()
         .map(|(index, block)| match &block.key {
             SyncEditorBlockKey::Existing(id) => parse_editor_block_id(id).map(|id| (id, index)),
-            SyncEditorBlockKey::Temporary(_) => Err(SyncEditorRequestError::ActorRefused),
+            SyncEditorBlockKey::Temporary(_) => Err(SyncEditorRequestError::ActorRefusedAt(
+                "rebase_sparse_temporary_key",
+            )),
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
     if materialized.len() != editor.blocks.len() || sparse_indexes.len() != editor.dto.blocks.len()
     {
-        return Err(SyncEditorRequestError::ActorRefused);
+        return Err(SyncEditorRequestError::ActorRefusedAt(
+            "rebase_block_index_cardinality",
+        ));
     }
 
     let mut source_content = HashMap::with_capacity(parsed_blocks.len());
     for (index, parsed_block) in parsed_blocks.iter().enumerate() {
         let sparse_id = match &editor.dto.blocks[index].key {
             SyncEditorBlockKey::Existing(id) => parse_editor_block_id(id)?,
-            SyncEditorBlockKey::Temporary(_) => return Err(SyncEditorRequestError::ActorRefused),
+            SyncEditorBlockKey::Temporary(_) => {
+                return Err(SyncEditorRequestError::ActorRefusedAt(
+                    "rebase_temporary_key",
+                ))
+            }
         };
-        let projected = materialized
-            .get(&sparse_id)
-            .ok_or(SyncEditorRequestError::ActorRefused)?;
-        let projected_parent_index = projected
-            .parent
-            .map(|parent| {
-                sparse_indexes
-                    .get(&parent)
-                    .copied()
-                    .ok_or(SyncEditorRequestError::ActorRefused)
-            })
-            .transpose()?;
+        let projected =
+            materialized
+                .get(&sparse_id)
+                .ok_or(SyncEditorRequestError::ActorRefusedAt(
+                    "rebase_projected_block_missing",
+                ))?;
+        let projected_parent_index =
+            projected
+                .parent
+                .map(|parent| {
+                    sparse_indexes.get(&parent).copied().ok_or(
+                        SyncEditorRequestError::ActorRefusedAt("rebase_parent_index_missing"),
+                    )
+                })
+                .transpose()?;
         if parsed_block.parent != projected_parent_index {
-            return Err(SyncEditorRequestError::ActorRefused);
+            return Err(SyncEditorRequestError::ActorRefusedAt(
+                "rebase_parent_mismatch",
+            ));
         }
         let raw_logseq_ids = parsed_block
             .block
@@ -27696,29 +27958,41 @@ fn rebase_projected_editor_page_from_source(
         match raw_logseq_ids.as_slice() {
             [] => match (projected.logseq_uuid, projected.logseq_identity_origin) {
                 (None, None) | (Some(_), Some(LogseqIdentityOrigin::PolicyGenerated { .. })) => {}
-                _ => return Err(SyncEditorRequestError::ActorRefused),
+                _ => {
+                    return Err(SyncEditorRequestError::ActorRefusedAt(
+                        "rebase_unexpected_logseq_identity",
+                    ))
+                }
             },
             [raw_uuid] => {
                 let parsed_uuid = Uuid::parse_str(raw_uuid)
                     .map(LogseqUuid::from_uuid)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    .map_err(|_| {
+                        SyncEditorRequestError::ActorRefusedAt("rebase_logseq_uuid_parse")
+                    })?;
                 if !matches!(
                     (projected.logseq_uuid, projected.logseq_identity_origin),
                     (Some(projected_uuid), Some(LogseqIdentityOrigin::ExternalImported))
                         if projected_uuid == parsed_uuid
                 ) {
-                    return Err(SyncEditorRequestError::ActorRefused);
+                    return Err(SyncEditorRequestError::ActorRefusedAt(
+                        "rebase_logseq_uuid_mismatch",
+                    ));
                 }
             }
             [_, ..] => {
-                return Err(SyncEditorRequestError::ActorRefused);
+                return Err(SyncEditorRequestError::ActorRefusedAt(
+                    "rebase_duplicate_logseq_id",
+                ));
             }
         }
         if source_content
             .insert(sparse_id, parsed_block.block.raw.clone())
             .is_some()
         {
-            return Err(SyncEditorRequestError::ActorRefused);
+            return Err(SyncEditorRequestError::ActorRefusedAt(
+                "rebase_duplicate_source_block",
+            ));
         }
     }
 
@@ -27733,11 +28007,11 @@ fn rebase_projected_editor_page_from_source(
         .iter_mut()
         .chain(editor.blocks.iter_mut())
     {
-        block.content.clone_from(
-            source_content
-                .get(&block.block_id)
-                .ok_or(SyncEditorRequestError::ActorRefused)?,
-        );
+        block
+            .content
+            .clone_from(source_content.get(&block.block_id).ok_or(
+                SyncEditorRequestError::ActorRefusedAt("rebase_source_content_missing"),
+            )?);
     }
     editor.dto.revision = existing_editor_revision(&editor.page, &editor.dto)?;
     Ok(())
@@ -27788,11 +28062,13 @@ fn materialized_page_from_projection(
     blocks: Vec<MaterializedBlockRow>,
 ) -> Result<MaterializedPage, SyncEditorRequestError> {
     let name = LogicalPageName::parse(page.name.clone())
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("materialized_page_name_parse"))?;
     if name.canonical_key() != page.name_key
         || blocks.iter().any(|block| block.page_id != page.page_id)
     {
-        return Err(SyncEditorRequestError::ActorRefused);
+        return Err(SyncEditorRequestError::ActorRefusedAt(
+            "materialized_page_row_identity",
+        ));
     }
     Ok(MaterializedPage {
         page_id: page.page_id,
@@ -27835,12 +28111,14 @@ fn ensure_editor_frontier_parts(
 ) -> Result<(), SyncEditorRequestError> {
     let frontier = engine
         .accepted_frontier_root()
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("editor_frontier_accepted_root"))?;
     let sqlite_frontier = database.required_frontier_root();
     if frontier.acceptance_sequence() != sqlite_acceptance_sequence
         || !frontier.same_accepted_authority(sqlite_frontier)
     {
-        return Err(SyncEditorRequestError::ActorRefused);
+        return Err(SyncEditorRequestError::ActorRefusedAt(
+            "editor_frontier_divergence",
+        ));
     }
     Ok(())
 }
@@ -27851,7 +28129,9 @@ fn ordered_editor_blocks(
     let mut indexes = HashMap::with_capacity(blocks.len());
     for (index, block) in blocks.iter().enumerate() {
         if indexes.insert(block.block_id, index).is_some() {
-            return Err(SyncEditorRequestError::ActorRefused);
+            return Err(SyncEditorRequestError::ActorRefusedAt(
+                "ordered_blocks_duplicate_id",
+            ));
         }
     }
     let mut children = BTreeMap::<Option<BlockId>, Vec<usize>>::new();
@@ -27860,7 +28140,9 @@ fn ordered_editor_blocks(
             .parent
             .is_some_and(|parent| !indexes.contains_key(&parent))
         {
-            return Err(SyncEditorRequestError::ActorRefused);
+            return Err(SyncEditorRequestError::ActorRefusedAt(
+                "ordered_blocks_unknown_parent",
+            ));
         }
         children.entry(block.parent).or_default().push(index);
     }
@@ -27885,7 +28167,9 @@ fn ordered_editor_blocks(
         }
         let block = &blocks[index];
         if !visited.insert(block.block_id) {
-            return Err(SyncEditorRequestError::ActorRefused);
+            return Err(SyncEditorRequestError::ActorRefusedAt(
+                "ordered_blocks_cycle",
+            ));
         }
         output.push(SyncEditorBlockDto {
             key: SyncEditorBlockKey::Existing(block.block_id.to_string()),
@@ -27904,7 +28188,9 @@ fn ordered_editor_blocks(
         }
     }
     if visited.len() != blocks.len() {
-        return Err(SyncEditorRequestError::ActorRefused);
+        return Err(SyncEditorRequestError::ActorRefusedAt(
+            "ordered_blocks_unreachable",
+        ));
     }
     Ok(output)
 }
@@ -27915,8 +28201,8 @@ fn existing_editor_revision(
 ) -> Result<String, SyncEditorRequestError> {
     let mut without_revision = page.clone();
     without_revision.revision.clear();
-    let snapshot =
-        serde_json::to_vec(&without_revision).map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    let snapshot = serde_json::to_vec(&without_revision)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("existing_revision_page_encode"))?;
     let mut hasher = Sha256::new();
     hasher.update(b"tine/sync-editor-existing-revision/v2\0");
     hasher.update(authoritative.page_id.as_uuid().as_bytes());
@@ -27937,8 +28223,9 @@ fn existing_editor_revision(
         match &block.logseq_identity_origin {
             Some(origin) => {
                 hasher.update([1]);
-                let encoded =
-                    serde_json::to_vec(origin).map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                let encoded = serde_json::to_vec(origin).map_err(|_| {
+                    SyncEditorRequestError::ActorRefusedAt("existing_revision_origin_encode")
+                })?;
                 hasher.update((encoded.len() as u64).to_be_bytes());
                 hasher.update(encoded);
             }
@@ -28429,7 +28716,9 @@ fn build_new_editor_transaction(
             content: request.blocks[index].content.clone(),
         });
     }
-    finish_editor_transaction(operations)?.ok_or(SyncEditorRequestError::ActorRefused)
+    finish_editor_transaction(operations)?.ok_or(SyncEditorRequestError::ActorRefusedAt(
+        "new_transaction_empty",
+    ))
 }
 
 fn resolve_editor_block_ids(
@@ -28508,11 +28797,11 @@ fn finish_editor_transaction(
     if operations.is_empty() {
         return Ok(None);
     }
-    let transaction =
-        OperationTransaction::new(operations).map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    let transaction = OperationTransaction::new(operations)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("finish_transaction_build"))?;
     validate_local_mutation_request(transaction)
         .map(Some)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("finish_transaction_validate"))
 }
 
 fn materialized_query_error(error: impl fmt::Display) -> SyncRuntimeRequestError {
@@ -29370,6 +29659,92 @@ mod tests {
         assert!(response.contains("SyncEditorRequestError::ActorRefused"));
         assert!(!response.contains("ActorRefusedWithCode"));
         assert!(!response.contains("SyncEditorRefusalCode"));
+    }
+
+    /// A bare `ActorRefused` on the managed application/editor surface is the
+    /// one refusal that cannot be diagnosed: it renders as "sync actor refused
+    /// application page intent" with no stage and no debug detail, so a
+    /// platform that cannot be debugged interactively (Android instrumentation,
+    /// a user's device, a bug report) learns only that *something* refused.
+    /// The Android post-activation save spent a release cycle unattributable
+    /// for exactly this reason. §3.1 of the storage contract therefore requires
+    /// every managed refusal to name its stage, and this guard is what makes
+    /// the requirement mechanical: the payload-less variants may appear only in
+    /// their own declaration, their `Display` arms, and the total error mappers
+    /// that translate an already-constructed refusal between the two surfaces.
+    /// No `?`-propagating call site may construct one.
+    #[test]
+    fn managed_save_refusals_cannot_be_constructed_without_a_site_name() {
+        let source = include_str!("sync_runtime.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the runtime source has its test boundary");
+
+        // The four arms of the two total error mappers plus the two
+        // `editor_refusal_*` promoters. Each one only re-shapes a refusal that
+        // some other site already decided; none of them is an origin.
+        const PERMITTED_PASS_THROUGH: [&str; 4] = [
+            "SyncEditorRequestError::ActorRefused => SyncApplicationPageRequestError::ActorRefused,",
+            "| SyncApplicationPageRequestError::ActorRefused => SyncEditorRequestError::ActorRefused,",
+            "SyncEditorRequestError::ActorRefused => SyncEditorRequestError::ActorRefusedAt(stage),",
+            "SyncEditorRequestError::ActorRefused | SyncEditorRequestError::ActorRefusedAt(_) => {",
+        ];
+
+        let mut unattributed = Vec::new();
+        for (index, line) in production.lines().enumerate() {
+            let mut rest = line;
+            let mut bare = false;
+            while let Some(offset) = rest.find("::ActorRefused") {
+                let (head, tail) = rest.split_at(offset);
+                let tail = &tail["::ActorRefused".len()..];
+                let managed = head.ends_with("SyncApplicationPageRequestError")
+                    || head.ends_with("SyncEditorRequestError");
+                if managed && !tail.starts_with("At") && !tail.starts_with("With") {
+                    bare = true;
+                }
+                rest = tail;
+            }
+            if bare && !PERMITTED_PASS_THROUGH.contains(&line.trim()) {
+                unattributed.push(format!("{}: {}", index + 1, line.trim()));
+            }
+        }
+        assert!(
+            unattributed.is_empty(),
+            "managed refusals must name their site (use ActorRefusedAt/…WithCode/…WithDebugDetail): {unattributed:#?}"
+        );
+
+        // The same variants are also reachable through `Self::` inside the two
+        // `Display` impls. Those two arms are the entire legitimate use; a
+        // third would be a construction site hidden behind the shorthand.
+        assert_eq!(
+            production.matches("Self::ActorRefused =>").count(),
+            2,
+            "only the two managed Display arms may name the payload-less refusal"
+        );
+
+        // The guard above is satisfied trivially if the named variants stop
+        // being used at all, so hold the inventory itself: the managed surface
+        // must keep naming hundreds of distinct stages, not collapse back onto
+        // a handful of generic ones.
+        let mut stages = Vec::new();
+        let mut rest = production;
+        while let Some(offset) = rest.find("ActorRefusedAt(") {
+            rest = rest[offset + "ActorRefusedAt(".len()..].trim_start();
+            let Some(literal) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let end = literal.find('"').expect("a closed stage literal");
+            stages.push(&literal[..end]);
+            rest = &literal[end..];
+        }
+        stages.sort_unstable();
+        stages.dedup();
+        assert!(
+            stages.len() >= 240,
+            "the attributed-site inventory collapsed to {} distinct stages",
+            stages.len()
+        );
     }
 
     #[test]
@@ -35333,10 +35708,12 @@ mod tests {
         let mut malformed = parsed.clone();
         let child = malformed.blocks[0].children.remove(0);
         malformed.blocks.push(child);
-        assert!(matches!(
+        assert_eq!(
             rebase_projected_editor_page_from_source(&mut editor.clone(), &malformed),
-            Err(SyncEditorRequestError::ActorRefused)
-        ));
+            Err(SyncEditorRequestError::ActorRefusedAt(
+                "rebase_parent_mismatch"
+            ))
+        );
         let joined = join_application_page(parsed, editor).unwrap();
         assert!(joined.page.read_only);
         assert!(joined
@@ -36521,7 +36898,7 @@ mod tests {
                     },
                     page: wrong_identity,
                 }),
-                Err(SyncApplicationPageRequestError::ActorRefused)
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(_))
                     | Ok(SyncApplicationPageSaveOutcome::Conflict {
                         reason: SyncApplicationPageConflict::UnknownOrForeignBlock
                     })
@@ -42151,6 +42528,56 @@ mod tests {
         ));
     }
 
+    /// The host analogue of the Android instrumentation shape: the same runtime
+    /// loads a page successfully and then refuses to save it. The Android
+    /// receipt reports exactly that asymmetry, so this pins which stage owns it
+    /// when the cause is the on-disk source moving out from under the accepted
+    /// projection — the failure mode a shared-storage FUSE volume can produce
+    /// without any external editor, through attribute/entry caching around the
+    /// atomic publish. If the Android run names this stage, that is the cause;
+    /// if it names another, this rules the family out.
+    #[test]
+    fn managed_save_after_a_source_edit_refuses_by_name_while_the_load_succeeded() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-save-after-source-edit");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/divergence.md";
+        admit_external_page(
+            &handle,
+            &fixture,
+            path,
+            b"title:: divergence\n\n- accepted before the edit\n",
+        );
+
+        let (mut page, revision) = load_application_exact(&handle, path);
+        fs::write(
+            fixture.graph_root().join(path),
+            b"title:: divergence\n\n- source moved after the load\n",
+        )
+        .unwrap();
+        page.blocks
+            .first_mut()
+            .expect("the loaded page has an editable block")
+            .raw = "edited by the application".into();
+
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        });
+        assert!(
+            matches!(
+                outcome,
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "hot_source_join"
+                ))
+            ),
+            "a save over a moved source must refuse by name, not anonymously: {outcome:?}"
+        );
+    }
+
     #[test]
     fn clean_reopen_refuses_disk_divergence_without_hiding_it_behind_sqlite() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-clean-reopen-disk-divergence");
@@ -42179,7 +42606,9 @@ mod tests {
             reopened.load_application_page(SyncApplicationPageLoadRequest {
                 page: SyncApplicationPageSelector::ExactPath { path: path.into() },
             }),
-            Err(SyncApplicationPageRequestError::ActorRefused)
+            Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "hot_source_join"
+            ))
         ));
         assert_eq!(
             reopened

@@ -619,6 +619,20 @@ returned value is the only evidence that exists, and an unattributed
 of a request the *application layer itself* constructed is such a refusal: it
 is never reported as an invalid caller request, and it is never anonymous.
 
+Attributability is now total rather than aspirational: no call site on the
+managed application or editor surface may construct the payload-less
+`SyncApplicationPageRequestError::ActorRefused` /
+`SyncEditorRequestError::ActorRefused`. Those variants survive only as the
+declaration, their two `Display` arms, and the total mappers that re-shape an
+already-decided refusal when it crosses between the two surfaces; every origin
+uses `ActorRefusedAt`, `ActorRefusedAtWithCode`, or
+`ActorRefusedAtWithDebugDetail`. The rule is mechanical, not editorial:
+`sync_runtime::tests::managed_save_refusals_cannot_be_constructed_without_a_site_name`
+reads the production source and fails on any new bare construction, and on a
+collapse of the named-stage inventory. This closes the gap that left the
+Android post-activation save reporting `debug_detail="none"` with no stage — a
+refusal that could have come from any of 131 unnamed sites.
+
 Unix UID equality and “only the current user may write this path” are
 deliberately absent. The threat model does not defend against a malicious actor
 who can already rewrite the user's private filesystem, and those checks reject
