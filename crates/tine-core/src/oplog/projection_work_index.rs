@@ -5743,14 +5743,111 @@ mod tests {
         ));
     }
 
+    // The v8 completed-path layout retired `MAX_COMPLETED_PATH_WORKS`, the cap
+    // on the lifetime receipt history that a completed-path leaf used to
+    // accumulate. Nothing counts completions per path any more, so this is a
+    // retired number rather than a live constant: it is the bar the bounded
+    // current-authority layout has to clear, and the tests below name it so
+    // they are checked against the real former limit rather than a literal.
+    const FORMER_COMPLETED_PATH_LIFETIME_LIMIT: u128 = 4_096;
+
+    /// The mechanism that makes the former lifetime limit unreachable: a
+    /// completed-path leaf is a bounded *current* authority, so its encoded row
+    /// stays the same size no matter how many completions land at that path.
+    ///
+    /// Invariance is the whole property. Under the retired layout the row grew
+    /// by one receipt per completion, so this fails at the second cycle rather
+    /// than only once the count passes
+    /// `FORMER_COMPLETED_PATH_LIFETIME_LIMIT`; the full-scale walk past that
+    /// limit is kept below, out of the default run because each cycle costs
+    /// three durable index transitions.
     #[test]
+    fn completed_path_authority_row_does_not_grow_with_completion_count() {
+        let fixture = Fixture::new("completed-path-bounded");
+        let page_id = PageId::from_uuid(Uuid::from_u128(80_001));
+        let path = "pages/lifetime.md";
+        let mut row_lengths = Vec::new();
+        let mut latest = None;
+
+        for sequence in 1..=64 {
+            let work = fixture.work_for_page(
+                sequence,
+                path,
+                page_id,
+                ProjectionWorkTarget::Present(BlobDescription::of(&sequence.to_be_bytes())),
+            );
+            let fingerprint = fixture.prepare(&work);
+            fixture
+                .index
+                .accept_batch(work.batch_id(), fingerprint)
+                .unwrap();
+            fixture
+                .index
+                .mark_completed(fixture.completion_authority(&work))
+                .unwrap();
+
+            let receipts = fixture
+                .index
+                .completed_receipts_for_path(work.path())
+                .unwrap();
+            assert_eq!(receipts.len(), 1, "cycle {sequence} kept a receipt history");
+            assert_eq!(receipts[0].page_id(), page_id);
+            assert_eq!(receipts[0].target(), work.target());
+            let (_, root) = fixture.index.load_head_root().unwrap();
+            let row = fixture
+                .index
+                .tree_lookup(root.completed_paths_root, &path_key(work.path()))
+                .unwrap()
+                .unwrap();
+            assert!(row.len() < 1_024);
+            row_lengths.push(row.len());
+            latest = Some(work);
+        }
+
+        let latest = latest.unwrap();
+        assert_eq!(
+            latest.target(),
+            fixture
+                .index
+                .completed_receipts_for_path(latest.path())
+                .unwrap()[0]
+                .target()
+        );
+        // A row whose size is independent of the completion count cannot reach
+        // a per-path entry cap at any count, which is what the ignored
+        // full-scale walk below re-checks end to end at
+        // `FORMER_COMPLETED_PATH_LIFETIME_LIMIT + 1` completions.
+        let first = row_lengths[0];
+        assert!(
+            row_lengths.iter().all(|length| *length == first),
+            "completed-path row grew with the completion count: {row_lengths:?}"
+        );
+    }
+
+    // Deliberately outside the default run. The property is already proved by
+    // `completed_path_authority_row_does_not_grow_with_completion_count`; this
+    // is the end-to-end walk past the retired limit, and it costs
+    // `FORMER_COMPLETED_PATH_LIFETIME_LIMIT + 1` prepare/accept/complete
+    // cycles. Each cycle publishes 11 immutable files at an empty index and 44
+    // once the insert-only work history holds ~4k entries (the growth is the
+    // Merkle depth of the rows/accepted trees, not the completed-path leaf), and
+    // every published file carries its own file and directory durability
+    // barrier. That is ~320k barriers for one test: about 55 s on a host whose
+    // filesystem elides fsync, and over the 10-minute CI budget on one that
+    // does not.
+    //
+    // Run it with:
+    //   cargo nextest run -p tine-core --run-ignored all \
+    //     -E 'test(=oplog::projection_work_index::tests::completed_path_authority_exceeds_the_former_lifetime_limit)'
+    #[test]
+    #[ignore = "~320k durability barriers; the bounded-row property is covered by completed_path_authority_row_does_not_grow_with_completion_count"]
     fn completed_path_authority_exceeds_the_former_lifetime_limit() {
         let fixture = Fixture::new("completed-path-lifetime");
         let page_id = PageId::from_uuid(Uuid::from_u128(80_001));
         let path = "pages/lifetime.md";
         let mut latest = None;
 
-        for sequence in 1..=4_097 {
+        for sequence in 1..=FORMER_COMPLETED_PATH_LIFETIME_LIMIT + 1 {
             let work = fixture.work_for_page(
                 sequence,
                 path,
