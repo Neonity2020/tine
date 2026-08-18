@@ -28,7 +28,11 @@ import org.junit.runner.RunWith
 class SafeBackOwnershipTest {
   @Test
   fun tineOwnsBackAfterTauriStartupEvenWhenTheWebViewHasHistory() {
-    ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+    // Deliberately try/finally rather than `use`: ActivityScenario is a Java
+    // AutoCloseable, and this module's Kotlin settings are not something a test
+    // should depend on.
+    val scenario = ActivityScenario.launch(MainActivity::class.java)
+    try {
       val webView = awaitWebView()
 
       // Reproduce what the mobile router does on every navigation
@@ -51,6 +55,8 @@ class SafeBackOwnershipTest {
           "WebView history navigation instead",
         awaitTrue { SafeBackBridge.gesturesReceived > before },
       )
+    } finally {
+      scenario.close()
     }
   }
 
