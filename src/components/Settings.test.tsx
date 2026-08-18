@@ -145,10 +145,15 @@ describe("Settings storage transitions", () => {
 
     expect(experimental.getAttribute("aria-expanded")).toBe("true");
     expect(root.textContent).toContain("Tine-managed storage is for testing and is not yet mature.");
-    expect(root.textContent).toContain("You can keep using Direct files in the meantime.");
-    expect(root.textContent).toContain("Uses your graph’s Markdown or Org files directly.");
+    // Direct files and Tine-managed storage are peers. Neither description may
+    // present the other as the destination, and the panel says so where a user
+    // deciding between them will read it.
+    expect(root.textContent).toContain(
+      "Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything."
+    );
+    expect(root.textContent).toContain("Many people will want to stay here.");
     expect(root.textContent).toContain("Enable Tine-managed storage");
-    expect(root.textContent).toContain("Join an existing synced graph");
+    expect(root.textContent).toContain("Join a synced graph from another device");
     dispose();
   });
 
@@ -167,7 +172,7 @@ describe("Settings storage transitions", () => {
 
     expect(join).not.toHaveBeenCalled();
     const button = [...root.querySelectorAll("button")].find((candidate) =>
-      candidate.textContent?.includes("Join an existing synced graph")
+      candidate.textContent?.includes("Join a synced graph from another device")
     ) as HTMLButtonElement;
     button.click();
     await tick();
@@ -178,6 +183,124 @@ describe("Settings storage transitions", () => {
       message: "Couldn't join the synced graph: managed join could not find a shared provider descriptor",
       sticky: true,
     });
+    dispose();
+  });
+
+  const sharedActive = (): SparseV2Status => {
+    const base = localActive();
+    return {
+      ...base,
+      runtime: { ...base.runtime!, shared_role: "initiator", shared_phase: "active" },
+    };
+  };
+
+  it("offers the join action from Tine-managed storage and names what happens to this device's own history", async () => {
+    // The native join branch accepts a device that already holds managed
+    // storage (`prepare_sparse_v2_join`'s `slot.sparse_binding().is_some()`
+    // path), so hiding the action behind Direct files made a supported action
+    // invisible — the worst of the three options.
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(false);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    const join = vi.spyOn(backend(), "joinSparseV2Shared");
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join a synced graph from another device")
+    ) as HTMLButtonElement;
+    expect(button).toBeTruthy();
+    button.click();
+    await tick();
+    await tick();
+
+    const prompt = confirm.mock.calls[0][0];
+    // The exact consequence, not "this may replace data": the shared baseline
+    // and operation archive REPLACE this device's own, the replaced pair is
+    // deleted, and the swap happens only when the notes already match.
+    expect(prompt).toContain("its own operation history and baseline are replaced by the shared ones");
+    expect(prompt).toContain("the replaced pair is deleted");
+    expect(prompt).toContain("already identical on both sides");
+    // And the other branch: a different history changes nothing at all.
+    expect(prompt).toContain("Tine changes nothing at all");
+    expect(prompt).toContain("archives its managed history rather than deleting it");
+    // Declining leaves the graph exactly as it was.
+    expect(join).not.toHaveBeenCalled();
+    expect(toasts()).toEqual([]);
+    dispose();
+  });
+
+  it("answers a refused managed join with the action that resolves it", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
+      new Error(
+        "managed sync join failed at provider scan: sync actor refused request: "
+          + "clean shared descriptor names another managed graph"
+      )
+    );
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join a synced graph from another device")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+
+    const message = toasts().at(-1)?.message ?? "";
+    expect(message).toContain("Nothing was changed on either device");
+    expect(message).toContain("Return to Direct files");
+    expect(message).toContain("archives this device's");
+    dispose();
+  });
+
+  it("leaves the graph exactly as it is when the share confirmation is declined", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(false);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    const share = vi.spyOn(backend(), "prepareSparseV2Share");
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Set up sync with another device")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+
+    // The confirmation is the last moment at which nothing has been written,
+    // and it says so rather than letting the user find out afterwards.
+    expect(confirm.mock.calls[0][0]).toContain("Cancel now and this graph is left exactly as it is");
+    expect(confirm.mock.calls[0][0]).toContain("cannot be un-shared");
+    expect(share).not.toHaveBeenCalled();
+    expect(toasts()).toEqual([]);
+    expect(root.textContent).toContain("Set up sync with another device");
+    dispose();
+  });
+
+  it("says what a shared graph's state is and where its only exit is", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(sharedActive());
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    expect(root.textContent).toContain("This graph is shared.");
+    expect(root.textContent).toContain("Join a synced graph from another device");
+    expect(root.textContent).toContain("Sharing cannot be switched off again");
+    expect(root.textContent).toContain("Return to Direct files");
     dispose();
   });
 

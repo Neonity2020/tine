@@ -2137,6 +2137,19 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
   const [sharing, setSharing] = createSignal(false);
   const [cancelling, setCancelling] = createSignal(false);
+  // Every managed-storage command in this panel brackets its native call with
+  // these two. `graphTransitioning` fences the editor; the runtime bracket
+  // additionally tells the shared bridge that the sync cut's own retired-actor
+  // window is expected, so it is not toasted as a failure the command is about
+  // to resolve by itself.
+  const beginStorageTransition = () => {
+    managedStorageRuntime.beginTransition();
+    setGraphTransitioning(true);
+  };
+  const endStorageTransition = () => {
+    setGraphTransitioning(false);
+    managedStorageRuntime.endTransition();
+  };
   const activeNativeTransition = () => storageTransitionRuntime.active();
   const enabling = () => activeNativeTransition()?.kind === "activate_managed";
   const retryable = () => {
@@ -2242,9 +2255,82 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     return null;
   };
 
-  const reportManagedFailure = (summary: string, detail: string) => {
-    pushToast(`${summary}: ${detail}`, "error", { sticky: true });
+  const reportManagedFailure = (summary: string, detail: string, remedy?: string | null) => {
+    pushToast(`${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`, "error", { sticky: true });
   };
+
+  /**
+   * Translate the two refusals the native join branch raises into the action
+   * that actually resolves them. Both leave every authority untouched, which is
+   * the part a raw refusal string never says.
+   * (`join_shared_clean` in crates/tine-core/src/sync_runtime.rs.)
+   */
+  const joinFailureRemedy = (detail: string): string | null => {
+    if (detail.includes("names another managed graph")) {
+      return (
+        "Nothing was changed on either device. This device's Tine-managed storage is its own separate history, "
+        + "not the one the other device is sharing, and Tine will not merge two histories. "
+        + "To adopt the other device's graph, use \"Return to Direct files\" here first — that archives this device's "
+        + "managed history under Tine's app data instead of deleting it — and then Join."
+      );
+    }
+    if (detail.includes("not in the shared provider frontier")) {
+      return (
+        "Nothing was changed on either device. This device's notes differ from the shared graph, and a join can only "
+        + "adopt a history whose notes already match. Let the other device's changes finish arriving, or reconcile the "
+        + "differing pages, then Join again."
+      );
+    }
+    return null;
+  };
+
+  /**
+   * What the native join branch actually does, said before it happens.
+   * The native join command (src-tauri/src/sync_runtime.rs) has two branches.
+   * From Direct Files it bootstraps a binding out of the shared descriptor.
+   * From Tine-managed storage it hands the descriptor to this device's live
+   * actor, and `join_shared_clean` then either refuses — because the descriptor
+   * names a different managed graph, or because this device's notes are not
+   * already equal to the shared ones — or installs the shared baseline and
+   * operation archive in place of this device's own and deletes the replaced
+   * pair. The managed variant is the dangerous-looking one, so it names that
+   * outcome rather than warning vaguely about "data".
+   */
+  const joinConfirmation = (fromManaged: boolean) => {
+    if (!fromManaged) {
+      return (
+        "Join a synced graph from another device?\n\n"
+        + "Tine verifies that this device is joining the same graph history before it continues. "
+        + "Existing Markdown/Org files stay in place and remain Logseq-compatible."
+      );
+    }
+    return (
+      "Join a synced graph from another device?\n\n"
+      + "This device already has Tine-managed storage of its own, so exactly one of two things will happen:\n\n"
+      + "1. If the other device is sharing the SAME managed history this device holds, this device adopts the shared "
+      + "copy: its own operation history and baseline are replaced by the shared ones and the replaced pair is deleted. "
+      + "Tine performs that swap only when every live page, its outline and its text are already identical on both "
+      + "sides, so no note text is lost.\n\n"
+      + "2. If the other device is sharing a DIFFERENT history — which is the normal case when this device set up "
+      + "Tine-managed storage on its own — Tine changes nothing at all and stops with an explanation. Joining then "
+      + "means returning this device to Direct files first, which archives its managed history rather than deleting it.\n\n"
+      + "Either way your Markdown/Org files stay in place and remain Logseq-compatible."
+    );
+  };
+
+  /**
+   * The share cut is one-way. The storage contract never retires an active
+   * shared graph, so this confirmation is the last moment at which the
+   * graph is exactly as it was, and the dialog says so instead of letting the
+   * user discover it afterwards.
+   */
+  const shareConfirmation = () =>
+    "Set up sync with another device?\n\n"
+    + "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place "
+    + "and remain Logseq-compatible.\n\n"
+    + "Cancel now and this graph is left exactly as it is. Once the sync data is written it cannot be un-shared: the "
+    + "only way out is \"Return to Direct files\", which archives this device's managed storage and reopens the "
+    + "Markdown/Org files.";
 
   const managedDiagnostics = () => {
     const current = status();
@@ -2268,6 +2354,37 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } catch (error) {
       reportManagedFailure("Couldn't copy managed storage details", safeManagedErrorDetail(error));
     }
+  };
+
+  /**
+   * Say what a shared graph's state IS and where the exit is. Until this, a
+   * completed share left the panel looking identical to a purely local managed
+   * graph: the one success toast scrolled away and nothing named either the
+   * next step on the other device or the fact that sharing is one-way.
+   */
+  const sharedDisclosure = () => {
+    const runtime = status()?.runtime;
+    const phase = runtime?.shared_phase;
+    if (!phase) return null;
+    if (phase === "share_prepared") {
+      return (
+        "Sync setup did not finish writing this graph's sync data. “Retry setup” completes it. "
+        + "Until it does, no other device can join."
+      );
+    }
+    if (phase === "joining") {
+      return "This device is joining a graph shared by another device and has not finished.";
+    }
+    const exit =
+      " Sharing cannot be switched off again: the only exit is “Return to Direct files” below, which archives "
+      + "this device's managed storage and reopens the Markdown/Org files.";
+    if (runtime?.shared_role === "joiner") {
+      return `This device is syncing with a graph shared by another device.${exit}`;
+    }
+    return (
+      "This graph is shared. On your other device, open this same graph folder and use “Join a synced graph "
+      + `from another device” — it is offered in both Direct files and Tine-managed storage.${exit}`
+    );
   };
 
   const directFilesWarning = () => {
@@ -2328,20 +2445,20 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
 
   const forceDirectFiles = async (detail: string) => {
     setCancelling(true);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     try {
       await emergencyDirectFiles(detail);
     } catch (error) {
       reportManagedFailure("Couldn't open the current files in Direct Files", safeManagedErrorDetail(error));
     } finally {
-      setGraphTransitioning(false);
+      endStorageTransition();
       setCancelling(false);
     }
   };
 
   const enable = async () => {
     setActivationProgress(null);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     let unlisten: (() => void) | undefined;
     try {
       const flushed = await flushAll();
@@ -2388,22 +2505,19 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } finally {
       unlisten?.();
       setActivationProgress(null);
-      setGraphTransitioning(false);
+      endStorageTransition();
     }
   };
 
   const prepareShare = async () => {
     setSharing(true);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     try {
       if (!(await flushAll())) {
         pushToast("Resolve pending save conflicts before preparing sharing.", "error");
         return;
       }
-      if (!(await backend().confirm(
-        "Set up sync with another device?\n\n" +
-          "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place and remain Logseq-compatible."
-      ))) return;
+      if (!(await backend().confirm(shareConfirmation()))) return;
       const result = await backend().prepareSparseV2Share();
       if (result.state === "active") {
         if (!acceptNativeAuthority(result)) return;
@@ -2415,45 +2529,47 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } catch (error) {
       reportManagedFailure("Couldn't set up sync", safeManagedErrorDetail(error));
     } finally {
-      setGraphTransitioning(false);
+      endStorageTransition();
       setSharing(false);
     }
   };
 
-  const joinShare = async () => {
+  const joinShare = async (options: { fromManaged: boolean } = { fromManaged: false }) => {
     setSharing(true);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     try {
       if (!(await flushAll())) {
         pushToast("Resolve pending save conflicts before joining.", "error");
         return;
       }
-      if (!(await backend().confirm(
-        "Join this synced graph?\n\n" +
-          "Tine verifies that this device is joining the same graph history before it continues. Existing Markdown/Org files stay in place and remain Logseq-compatible."
-      ))) return;
+      if (!(await backend().confirm(joinConfirmation(options.fromManaged)))) return;
       const result = await backend().joinSparseV2Shared();
       if (result.state === "active") {
         if (!acceptNativeAuthority(result)) return;
         pushToast("This device joined the synced graph.", "success");
       } else {
         if (!managedStorageRuntime.acceptNativeTransition(result)) return;
+        const detail = failureDetail(result) ?? "Tine-managed storage did not become active.";
         reportManagedFailure(
           "Joining the synced graph did not complete",
-          failureDetail(result) ?? "Tine-managed storage did not become active."
+          detail,
+          joinFailureRemedy(detail)
         );
       }
     } catch (error) {
-      reportManagedFailure("Couldn't join the synced graph", safeManagedErrorDetail(error));
+      // The refusal that matters most here is raw native text. Read the remedy
+      // off the untruncated message, then report the redacted one.
+      const remedy = joinFailureRemedy(String(error));
+      reportManagedFailure("Couldn't join the synced graph", safeManagedErrorDetail(error), remedy);
     } finally {
-      setGraphTransitioning(false);
+      endStorageTransition();
       setSharing(false);
     }
   };
 
   const cancelSparse = async () => {
     setCancelling(true);
-    setGraphTransitioning(true);
+    beginStorageTransition();
     try {
       try {
         await flushAll();
@@ -2495,7 +2611,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } catch (error) {
       reportManagedFailure("Couldn't return to Direct files", safeManagedErrorDetail(error));
     } finally {
-      setGraphTransitioning(false);
+      endStorageTransition();
       setCancelling(false);
     }
   };
@@ -2505,7 +2621,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       <div class="settings-section">Storage &amp; sync</div>
       <ExperimentalSection forceOpen={props.forceOpen}>
         <div class="settings-experimental-warning" role="note">
-          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. You can keep using Direct files in the meantime.
+          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything.
         </div>
         <Show
           when={!loading()}
@@ -2548,7 +2664,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                   <Show when={current().state === "legacy_default"}>
                     <span class="settings-value">Direct files</span>
                     <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                      Uses your graph’s Markdown or Org files directly.
+                      Tine reads and writes your graph’s Markdown or Org files directly. Many people will want to stay here.
                     </div>
                     <div style={{ "margin-top": "6px" }}>
                       <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
@@ -2557,7 +2673,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                     </div>
                     <div style={{ "margin-top": "6px" }}>
                       <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
-                        {sharing() ? "Joining..." : "Join an existing synced graph..."}
+                        {sharing() ? "Joining..." : "Join a synced graph from another device..."}
                       </button>
                     </div>
                   </Show>
@@ -2600,13 +2716,47 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                               : "Set up sync with another device..."}
                         </button>
                       </div>
+                      {/* The native join branch accepts a device that already
+                          holds managed storage, so the action is offered here
+                          rather than hidden until the device is back in Direct
+                          files. Its confirmation, and its refusal, say what
+                          becomes of this device's own managed history. */}
+                      <div style={{ "margin-top": "6px" }}>
+                        <button
+                          class="settings-btn"
+                          disabled={sharing()}
+                          onClick={() => void joinShare({ fromManaged: true })}
+                        >
+                          {sharing() ? "Joining..." : "Join a synced graph from another device..."}
+                        </button>
+                      </div>
                     </Show>
                     <Show when={current().runtime?.shared_phase === "joining"}>
                       <div style={{ "margin-top": "6px" }}>
-                        <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                        <button
+                          class="settings-btn"
+                          disabled={sharing()}
+                          onClick={() => void joinShare({ fromManaged: true })}
+                        >
                           {sharing() ? "Joining..." : "Join this synced graph..."}
                         </button>
                       </div>
+                    </Show>
+                    {/* The share cut is a single durable native step: it is
+                        the confirmation, not this moment, that is the point of
+                        no return, and saying so beats a silent spinner. */}
+                    <Show when={sharing()}>
+                      <div class="settings-hint" role="status" aria-live="polite" style={{ "margin-top": "6px" }}>
+                        This step writes durable sync data and cannot be interrupted. If it fails, the panel keeps
+                        “Return to Direct files” below.
+                      </div>
+                    </Show>
+                    <Show when={sharedDisclosure()}>
+                      {(disclosure) => (
+                        <div class="settings-hint" role="note" style={{ "margin-top": "6px" }}>
+                          {disclosure()}
+                        </div>
+                      )}
                     </Show>
                   </Show>
                   <Show when={blocked()}>
@@ -2678,7 +2828,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                     </div>
                   </Show>
                   <div class="settings-hint" style={{ "margin-top": "6px" }}>
-                    Tine keeps durable history and a local index while continuously maintaining your compatible Markdown/Org tree.
+                    Tine-managed storage keeps a durable operation history and a local index while continuously maintaining the same Logseq-compatible Markdown/Org tree. That history is what makes syncing a graph across devices possible; it is the reason to choose this mode, not a newer replacement for Direct files.
                   </div>
                 </div>
               </div>

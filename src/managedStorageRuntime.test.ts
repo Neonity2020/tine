@@ -175,6 +175,77 @@ describe("managed-storage runtime event bridge", () => {
     expect(notices).toEqual([1, 2, 3]);
   });
 
+  const silentBridge = () =>
+    createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn(),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+
+  it("keeps one notice object while a condition is still the same report", () => {
+    // The sequence is the dedupe, but the consumer subscribes to the notice by
+    // REFERENCE. Minting an equal-but-new object per repeat re-armed the very
+    // toast the sequence exists to suppress.
+    const bridge = silentBridge();
+    bridge.bind(3);
+    const message = 'Failed("clean external reconciliation failed")';
+    bridge.receiveError({ binding_generation: 3, message });
+    const first = bridge.snapshot().notice;
+    expect(first).toMatchObject({ message, sequence: 1 });
+    bridge.receiveTick({ binding_generation: 3, tick: { state: "recovering", detail: null, epoch: null } });
+    bridge.receiveError({ binding_generation: 3, message });
+    expect(bridge.snapshot().notice).toBe(first);
+  });
+
+  it("never reports the retired-actor window an enrollment cut opens on purpose", () => {
+    // A successful share/join cut STOPS the actor that committed it
+    // (`observe_retired_actor`), so the watcher lane reports a runtime failure
+    // for the seconds before the command republishes a reopened actor. That
+    // window is expected and self-resolving; a red toast followed by a green
+    // one is worse than silence.
+    const bridge = silentBridge();
+    bridge.bind(3);
+    bridge.beginTransition();
+    bridge.receiveError({ binding_generation: 3, message: "sync actor is unavailable" });
+    expect(bridge.snapshot().notice).toBeNull();
+    // The panel still knows, so the condition is not hidden from the user who
+    // goes looking for it.
+    expect(bridge.snapshot().error).toBe("sync actor is unavailable");
+    bridge.receiveError({ binding_generation: 3, message: "Blocked(\"provider scan\")" });
+    expect(bridge.snapshot().notice).toBeNull();
+
+    // The command finishes by publishing its reopened runtime.
+    expect(bridge.acceptNativeTransition(active(4))).toBe(true);
+    bridge.endTransition();
+    expect(bridge.snapshot().notice).toBeNull();
+    expect(bridge.snapshot().error).toBeNull();
+  });
+
+  it("reports a failure that outlives the transition exactly once", () => {
+    const bridge = silentBridge();
+    bridge.bind(3);
+    bridge.beginTransition();
+    bridge.receiveError({ binding_generation: 3, message: 'Terminal("projection repair failed")' });
+    expect(bridge.snapshot().notice).toBeNull();
+    bridge.endTransition();
+    const notice = bridge.snapshot().notice;
+    expect(notice).toMatchObject({ message: 'Terminal("projection repair failed")', sequence: 1 });
+    bridge.receiveError({ binding_generation: 3, message: 'Terminal("projection repair failed")' });
+    expect(bridge.snapshot().notice).toBe(notice);
+  });
+
+  it("drops a held report the runtime resolved on its own before the transition ended", () => {
+    const bridge = silentBridge();
+    bridge.bind(3);
+    bridge.beginTransition();
+    bridge.receiveError({ binding_generation: 3, message: "sync actor is unavailable" });
+    bridge.receiveTick({ binding_generation: 3, tick: { state: "idle", detail: null, epoch: 7 } });
+    bridge.endTransition();
+    expect(bridge.snapshot().notice).toBeNull();
+    expect(bridge.snapshot().error).toBeNull();
+  });
+
   it("drops events and late status reads from a graph binding that has been replaced", async () => {
     let resolveStatus: ((status: SparseV2Status) => void) | undefined;
     const bridge = createManagedStorageRuntimeBridge({
