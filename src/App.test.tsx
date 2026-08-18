@@ -22,6 +22,14 @@ import { endEdit, startEditing } from "./editorController";
 import { clearConflict, isConflicted, pageInventoryRev } from "./ui";
 import { flushPage, forceSave, isDirty, markDirty, resetSaveState } from "./persistence";
 import { managedStorageRuntime } from "./managedStorageRuntime";
+import {
+  applyHeldExternalChange,
+  clearHeldExternalChanges,
+  dismissHeldExternalChange,
+  heldExternalChangeCount,
+  heldExternalChangeFor,
+  setConflictPolicyAlwaysAskForTest,
+} from "./conflictPolicy";
 import type { SparseV2CancelResult } from "./types";
 
 function addAnchor(href: string): HTMLAnchorElement {
@@ -625,6 +633,78 @@ describe("deferred replay of externally changed pages skipped mid-edit", () => {
     setBlockMoving(false);
 
     await vi.waitFor(() => expect(visibleRaws()).toEqual(["fresh from disk"]));
+  });
+
+  // Concord P5: the one user-visible conflict policy switch (Obsidian 1.9.7).
+  // The DEFAULT is unchanged — a clean loaded page reloads silently — and the
+  // switch converts only that silent case into an asked one. Everything that
+  // already asked or deferred is untouched, which is the property that makes it
+  // safe to ship on by choice.
+  describe("with always-ask on", () => {
+    afterEach(() => {
+      clearHeldExternalChanges();
+      setConflictPolicyAlwaysAskForTest(false);
+    });
+
+    it("holds the change instead of applying it, and applies it on request", async () => {
+      loadedStalePage();
+      setConflictPolicyAlwaysAskForTest(true);
+      const getPage = vi.spyOn(backend(), "getPage").mockResolvedValue(diskPage());
+
+      await handleGraphChange({ name, kind: "page", created: false, removed: false });
+
+      // Nothing was read and nothing was replaced: the user asked to be told.
+      expect(getPage).not.toHaveBeenCalled();
+      expect(visibleRaws()).toEqual(["loaded elsewhere"]);
+      expect(heldExternalChangeFor(name)).toBeTruthy();
+      expect(heldExternalChangeCount()).toBe(1);
+
+      applyHeldExternalChange(name);
+
+      await vi.waitFor(() => expect(visibleRaws()).toEqual(["fresh from disk"]));
+      expect(heldExternalChangeFor(name)).toBeUndefined();
+    });
+
+    it("keeps mine without writing anything, and stops holding it", async () => {
+      loadedStalePage();
+      setConflictPolicyAlwaysAskForTest(true);
+      vi.spyOn(backend(), "getPage").mockResolvedValue(diskPage());
+
+      await handleGraphChange({ name, kind: "page", created: false, removed: false });
+      dismissHeldExternalChange(name);
+
+      expect(visibleRaws()).toEqual(["loaded elsewhere"]);
+      expect(heldExternalChangeFor(name)).toBeUndefined();
+    });
+
+    it("does not take over the paths that already ask or defer", async () => {
+      // Mid-edit: P1's deferral still wins, so the caret is safe and the change
+      // is replayed rather than parked behind a bar the user must click.
+      loadedStalePage();
+      setConflictPolicyAlwaysAskForTest(true);
+      startEditing("b1");
+      vi.spyOn(backend(), "getPage").mockResolvedValue(diskPage());
+
+      await handleGraphChange({ name, kind: "page", created: false, removed: false });
+      expect(heldExternalChangeFor(name)).toBeUndefined();
+      expect(visibleRaws()).toEqual(["loaded elsewhere"]);
+
+      endEdit("blur");
+      // Still not held: the replay re-enters with the page clean, and only then
+      // does the policy see it.
+      await vi.waitFor(() => expect(heldExternalChangeFor(name)).toBeTruthy());
+      expect(visibleRaws()).toEqual(["loaded elsewhere"]);
+    });
+
+    it("is off by default, so a clean page still reloads silently", async () => {
+      loadedStalePage();
+      vi.spyOn(backend(), "getPage").mockResolvedValue(diskPage());
+
+      await handleGraphChange({ name, kind: "page", created: false, removed: false });
+
+      expect(heldExternalChangeFor(name)).toBeUndefined();
+      await vi.waitFor(() => expect(visibleRaws()).toEqual(["fresh from disk"]));
+    });
   });
 
   it("replays a reload declined by an editor lease once the lease is released", async () => {

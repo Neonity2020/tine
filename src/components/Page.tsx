@@ -18,6 +18,7 @@ import { QueryMacro } from "./Macro";
 import { SheetTable } from "./SheetTable";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
 import { PageConflictResolution } from "./ConflictResolution";
+import { ExternalChangeBar } from "./ExternalChangeBar";
 import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText, PageRef } from "../render/inline";
 import { EmojiText } from "../render/emoji";
@@ -736,6 +737,8 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
           </div>
         )}
       </Show>
+      {/* Concord P5: with "always ask" on, an external change waits here. */}
+      <ExternalChangeBar name={props.page.name} />
       {/* Concord L4: the conflict is resolved AT the page, block by block. */}
       <Show when={conflictObjectFor(props.page.path)}>
         {(conflict) => <PageConflictResolution conflict={conflict()} />}

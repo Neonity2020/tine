@@ -77,6 +77,7 @@ import {
 import { navReuseTabs, setNavReuseTabs } from "../navSettings";
 import { spaceAfterRefCompletion, setSpaceAfterRefCompletion } from "../refCompletionSettings";
 import { allowLocalFileImages, setAllowLocalFileImages } from "../localFileSettings";
+import { conflictPolicyAlwaysAsk, setConflictPolicyAlwaysAsk } from "../conflictPolicy";
 import { linkAutocompletePolicy, setLinkAutocompletePolicy, type LinkAutocompletePolicy } from "../editor/linkDefault";
 import {
   spellcheckEnabled,
@@ -224,6 +225,11 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "files", label: "Watch for external edits", description: "inotify polling network filesystem" },
   { tab: "files", label: "Diagram editors", description: "drawio Excalidraw commands", level: "advanced" },
   { tab: "backups", label: "Snapshots to keep", description: "recovery retention conflicts" },
+  {
+    tab: "backups",
+    label: "Always ask before applying an external change",
+    description: "external edits conflict policy silent reload sync merge ask",
+  },
   { tab: "graph", label: "Graph", description: "folder export publish" },
   { tab: "graph", label: "Home page", description: "home start startup open automatically landing" },
   {
@@ -2834,6 +2840,20 @@ function BackupsTab(props: { search: string }): JSX.Element {
           </For>
         </div>
       </Show>
+
+      {/* Concord P5 — the one user-visible conflict policy switch. */}
+      <div class="settings-section" style={{ "margin-top": "18px" }}>
+        External changes
+      </div>
+      <Field
+        label="Always ask before applying an external change"
+        hint="By default a page you have open with nothing unsaved updates silently when another editor or a sync tool changes its file — the same as VS Code. Turn this on and Tine holds the change instead: the page keeps showing what you were reading and offers Reload from disk / Keep mine. Everything that already asks keeps asking — a page with unsaved edits, or one being edited, is unaffected either way."
+      >
+        <Toggle
+          on={conflictPolicyAlwaysAsk()}
+          onClick={() => setConflictPolicyAlwaysAsk(!conflictPolicyAlwaysAsk())}
+        />
+      </Field>
 
       <SettingsConflictPanels />
     </>

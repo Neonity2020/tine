@@ -2499,6 +2499,32 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Concord P5: an external change held for review ("always ask"). A calm bar
+   above the page, in the same family as the VCS-marker banner — never a modal. */
+.external-change-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--accent, #3b82f6);
+  border-radius: 6px;
+  background: var(--bg-secondary, transparent);
+  font-size: 13px;
+}
+.external-change-text {
+  color: var(--text-muted);
+  flex: 1 1 320px;
+}
+.external-change-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 /* One proposed journal rename: the current name above the name it would get. */
 .journal-rename-row {
   display: flex;

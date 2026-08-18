@@ -4289,6 +4289,30 @@
       "notes": "Network mounts, some sync clients and a suspended app deliver no inotify edge at all, so a page could sit stale indefinitely with the watcher healthy. Returning to the window now (a) calls sweepReplaceable() -- the P1 net, for a reload deferred mid-edit whose page never announced it became replaceable because the user alt-tabbed away -- and (b) invokes rescan_graph_now, which arms one full stat diff on the watcher thread. Findings arrive as ordinary graph-changed/graph-changed-bulk events, so the disposition, divergence proof and deferred replay all apply exactly as for a live event and no caret is stolen. The rescan is throttled (1.5 s); the sweep never is. Fail-before: with refreshOnReturnToWindow's body removed, 4 of the 6 cases fail with rescanGraphNow called 0 times. Concord P5."
     },
     {
+      "id": "REG-CONCORD-ALWAYS-ASK-POLICY-337",
+      "title": "The always-ask policy converts only the SILENT external-change case into an asked one, and leaves every path that already asks or defers alone",
+      "family": "external-change-freshness",
+      "sources": {
+        "issues": [
+          337
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/App.test.tsx::with always-ask on"
+        ],
+        "scenario": "watch.always-ask-policy",
+        "failBefore": "proven"
+      },
+      "notes": "Obsidian 1.9.7's one user-visible conflict policy switch (landscape survey U3). Tine's only silent adoption of external bytes is L0 freshness: a loaded, clean page is replaced with the disk version. With concord_always_ask on that change is HELD and the page offers Reload from disk / Keep mine, never a modal. The gate sits AFTER the skip and conflict branches and requires disp === reload plus a loaded page, so a dirty page still gets applyDivergenceVerdict and a mid-edit page still defers through the P1 replay machinery -- proved by the third case, where a mid-edit change is deferred, not held, and is only held once the replay re-enters with the page clean. Default is OFF and the fourth case pins the unchanged silent reload. Holding is frontend-only by design: the backend cache has already adopted the bytes, so Keep mine is honest -- the next save meets the base_rev guard and raises the ordinary conflict banner, which is Obsidian's create-a-conflict mode. Fail-before: with the policy gate removed from applyExternalChange, 3 of the 4 cases fail (getPage called once, the page shows 'fresh from disk', nothing is held). Concord P5."
+    },
+    {
       "id": "REG-MANAGED-ACTIVATION-FAILURE-RETRYABLE-SLOT-001",
       "title": "Managed-storage activation and join build and prove a private candidate while Direct Files keeps serving, then publish it exactly once",
       "family": "managed-storage-transition",

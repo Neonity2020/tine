@@ -32,6 +32,7 @@ import type { Route } from "./router";
 import { parseOutline, type OutlineNode } from "./editor/outline";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
+import { clearHeldExternalChanges } from "./conflictPolicy";
 import { managedStorageRuntime } from "./managedStorageRuntime";
 import { resetReferenceSectionState } from "./referenceSectionState";
 import {
@@ -1253,6 +1254,7 @@ export function resetStore() {
   managedHistoryReplayRunning = false;
   managedHistoryCommands.length = 0;
   clearDeferredExternalReloads();
+  clearHeldExternalChanges(); // Concord P5: a held change belongs to its graph
   clearPendingHlsRefreshes();
   clearPendingBlockRefStamps();
   // Cancel pending/in-flight saves and clear all save guard state (timers, graph

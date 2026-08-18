@@ -108,6 +108,13 @@ import { initCopySettings } from "./copySettings";
 import { initRefCompletionSettings } from "./refCompletionSettings";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
+import {
+  conflictPolicyAlwaysAsk,
+  holdExternalChange,
+  initConflictPolicy,
+  installHeldExternalChangeApplier,
+  setConflictPolicyAlwaysAskForTest,
+} from "./conflictPolicy";
 import { initAssetSettings } from "./assetSettings";
 import { initMediaEditorSettings } from "./mediaEditorSettings";
 import { initSpellcheckSettings } from "./spellcheckSettings";
@@ -233,6 +240,18 @@ installExternalReloadReplayHandler((change) => void handleGraphChange(change));
 // funnel into the machinery above; neither applies anything by itself.
 installReloadOnFocus();
 
+// Read BEFORE the router normalizes the URL on load (the mock reads `?conflicts`
+// at call time instead, which is why that gate needs no snapshot).
+const ALWAYS_ASK_DEMO =
+  typeof location !== "undefined" && /[?&]alwaysask\b/.test(location.search);
+
+// Concord P5 policy toggle: "Reload from disk" on a held change re-enters the
+// ordinary external-change path with the policy bypassed for that one change, so
+// every other gate (disposition, editor leases, deferred replay) still applies.
+installHeldExternalChangeApplier((change, binding) => {
+  void applyExternalChange(change, binding, { bypassPolicy: true });
+});
+
 // Console-only diagnostic for external-change latency reports (GH #337; see
 // docs/concord.md). Release builds ship the devtools but not `withGlobalTauri`,
 // so a reporter needs one named callable to reach the backend's receipt ring.
@@ -267,7 +286,7 @@ export async function handleGraphChange(c: GraphChange) {
 async function applyExternalChange(
   c: GraphChange,
   binding: number,
-  opts: { suppressFeedRestart?: boolean } = {},
+  opts: { suppressFeedRestart?: boolean; bypassPolicy?: boolean } = {},
 ) {
   const routes = layoutPaneIds().map((paneId) => ({ paneId, router: paneRouter(paneId), route: paneRouter(paneId).route() }));
   const requestJournalFeedRestart = (
@@ -307,6 +326,14 @@ async function applyExternalChange(
   if (disp === "skip") {
     deferExternalReload(c, binding);
     if (c.kind === "journal") requestJournalFeedRestart(routes);
+    return;
+  }
+  // Concord P5 — "always ask". Reached only AFTER the skip/conflict branches, so
+  // it converts the one SILENT case (a loaded, clean page) into an asked one and
+  // changes nothing that already asked or deferred. A page Tine does not hold has
+  // nothing to ask about: navigation refetches from the backend anyway.
+  if (!opts.bypassPolicy && conflictPolicyAlwaysAsk() && disp === "reload" && pageByName(c.name)) {
+    holdExternalChange(c, binding);
     return;
   }
   if (disp === "conflict") {
@@ -873,6 +900,26 @@ export function App(): JSX.Element {
   onMount(() => void initNavSettings());
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
+  onMount(() => void initConflictPolicy());
+  // Demo gate for the screenshot harness (mirrors `?conflicts`): turn the
+  // always-ask policy on and hold one external change, so the bar is visible
+  // without a real second writer. Browser mock only — never in the app.
+  onMount(() => {
+    if (isTauri() || !ALWAYS_ASK_DEMO) return;
+    setConflictPolicyAlwaysAskForTest(true);
+    (window as unknown as { __tineHoldExternalChange?: (name: string) => void })
+      .__tineHoldExternalChange = (name: string) => {
+      holdExternalChange(
+        {
+          name,
+          kind: doc.pages.find((p) => p.name === name)?.kind ?? "page",
+          created: false,
+          removed: false,
+        },
+        graphBinding()
+      );
+    };
+  });
   // A conflict copy appearing/vanishing on disk (watcher) refreshes the list.
   onMount(() => {
     let unsub = () => {};
