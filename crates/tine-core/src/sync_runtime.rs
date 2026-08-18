@@ -303,6 +303,11 @@ const MAX_CLEAN_DRAIN_TURNS: usize = 64;
 const CLEAN_FULL_SCAN_SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 const MAX_PROVIDER_EXACT_PATHS: usize = 256;
 const MAX_PROVIDER_EXACT_PATH_BYTES: usize = 64 * 1024;
+/// How many times one actor session will republish its own shared-enrollment
+/// descriptor after something outside Tine removed it. One or two rounds cover
+/// an ordinary file-sync delivery window; past that, the removal is not a
+/// window and the condition is reported instead of written around forever.
+const MAX_PROVIDER_DESCRIPTOR_REPUBLICATIONS: u32 = 3;
 const MAX_PROVIDER_PUBLICATION_REPAIR_PROBES_PER_TICK: usize = 16;
 const MAX_PROVIDER_INTENT_RETIREMENT_PROBES_PER_TICK: usize = 16;
 const MAX_PROVIDER_RECOVERY_EXACT_QUEUE: usize = 256;
@@ -11914,6 +11919,7 @@ struct RuntimeActor {
     provider_publication_cursor: Option<SharedProviderPublicationCursor>,
     provider_publication_forced: VecDeque<BatchId>,
     provider_descriptor_repair_requested: bool,
+    provider_descriptor_republications: u32,
     provider_namespace_repair_active: bool,
     provider_publication_repair_requested: bool,
     provider_publication_repair_cursor: Option<ObjectStoreManifestCursor>,
@@ -13518,6 +13524,7 @@ impl RuntimeActor {
             provider_publication_cursor: None,
             provider_publication_forced: VecDeque::new(),
             provider_descriptor_repair_requested,
+            provider_descriptor_republications: 0,
             provider_namespace_repair_active: provider_descriptor_repair_requested,
             provider_publication_repair_requested: (unsafe_reopen
                 || provider_descriptor_repair_requested)
@@ -13708,6 +13715,7 @@ impl RuntimeActor {
             provider_publication_cursor: None,
             provider_publication_forced: VecDeque::new(),
             provider_descriptor_repair_requested: false,
+            provider_descriptor_republications: 0,
             provider_namespace_repair_active: false,
             provider_publication_repair_requested: shared_phase == Some(SyncSharedPhase::Active),
             provider_publication_repair_cursor: None,
@@ -22292,14 +22300,22 @@ impl RuntimeActor {
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
             return Ok(());
         }
-        let bytes = provider
+        let Some(bytes) = provider
             .read_exact(path)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-            .ok_or_else(|| {
-                SyncRuntimeRequestError::ActorRefused(format!(
-                    "clean provider evidence disappeared at {path}"
-                ))
-            })?;
+        else {
+            // Exact callbacks describe removal as well as creation. Re-reading
+            // a path that is now absent can never produce evidence, and this
+            // one was the FRONT of the exact queue: refusing it left the same
+            // entry there and produced the same blocked tick on every retry.
+            // The descriptor is different from the rest — it is the file this
+            // device publishes and another device joins by, so its absence is
+            // a repair request rather than merely something to settle.
+            if path == SHARED_ENROLLMENT_DESCRIPTOR_PATH {
+                self.provider_descriptor_repair_requested = true;
+            }
+            return Ok(());
+        };
         if path == SHARED_ENROLLMENT_DESCRIPTOR_PATH {
             if SharedEnrollmentDescriptor::decode(&bytes)
                 .map_err(SyncRuntimeRequestError::ActorRefused)?
@@ -22407,6 +22423,43 @@ impl RuntimeActor {
             return match published {
                 Ok(()) => {
                     self.provider_publication_forced.pop_front();
+                    SyncRuntimeTick::Recovering
+                }
+                Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
+        }
+        if self.provider_descriptor_repair_requested {
+            // Republish the one file another device joins by. A file-sync tool
+            // that removed it — propagating a peer's deletion, or mid-delete —
+            // left this device advertising nothing while its own state still
+            // says it is a member of the shared graph, and the joining device
+            // is left with "does not yet contain sync data".
+            //
+            // Bounded on purpose. One or two rounds cover an ordinary delivery
+            // window. Beyond that this is not a window, it is a fight with
+            // something that keeps removing the file, and a write loop we hide
+            // is worse than a condition we name once.
+            if self.provider_descriptor_republications >= MAX_PROVIDER_DESCRIPTOR_REPUBLICATIONS {
+                self.provider_descriptor_repair_requested = false;
+                return SyncRuntimeTick::RecoveryBlocked(format!(
+                    "something outside Tine keeps removing {}, so this device cannot advertise \
+                     its shared graph; check whether your file-sync tool is deleting or excluding \
+                     the hidden .tine-sync folder",
+                    self.provider_root
+                        .join("outbox")
+                        .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
+                        .display()
+                ));
+            }
+            let republished = publish_clean_descriptor_exact(
+                self.provider.as_mut().expect("provider checked"),
+                &descriptor,
+            );
+            return match republished {
+                Ok(()) => {
+                    self.provider_descriptor_repair_requested = false;
+                    self.provider_descriptor_republications =
+                        self.provider_descriptor_republications.saturating_add(1);
                     SyncRuntimeTick::Recovering
                 }
                 Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
@@ -45994,6 +46047,134 @@ mod tests {
             identities,
         };
         (graph_root, open_request, activation_request)
+    }
+
+    /// A first local activation writes NOTHING into the graph's `.tine-sync/`.
+    ///
+    /// Two comments in the Tauri shell claimed the opposite — that activation
+    /// creates the provider directory skeleton — and the "Return to Direct
+    /// files" escape hatch reasons from that claim. It is false: the skeleton
+    /// is written by the SHARED TRANSPORT, on prepare/join/shared-reopen. This
+    /// pins the real behaviour so the premise cannot come back, and it is the
+    /// product property too: managed storage is write-shy about the graph
+    /// folder until the user asks to share it.
+    #[test]
+    fn local_activation_writes_nothing_into_the_graphs_sync_folder() {
+        let (graph_root, _open_request, activation_request) =
+            android_instrumentation_journey_fixture("activation-write-shyness");
+        let activation = SyncRuntimeHandle::activate_or_resume_local(activation_request);
+        assert_eq!(activation.status, SyncLocalActivationStatus::Active);
+        let handle = activation.handle.expect("activated");
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(handle);
+
+        assert!(
+            !graph_root.join(".tine-sync").exists(),
+            "activation alone must not create anything under the graph's .tine-sync"
+        );
+    }
+
+    /// The initiator must put back the one file another device joins by.
+    ///
+    /// A file-sync tool can remove `outbox/enrollment/shared-enrollment-v1.json`
+    /// while Tine is running — propagating a peer's deletion, or mid-delete.
+    /// Before this, the exact callback for the now-absent path refused
+    /// ("clean provider evidence disappeared at …") and, because the entry is
+    /// only popped on success, produced that same blocked tick on every retry
+    /// while the share stayed unadvertised and the second device kept reading
+    /// "does not yet contain sync data from another device".
+    #[test]
+    fn the_initiator_republishes_a_descriptor_something_else_removed() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture("descriptor-repair");
+        let activation = SyncRuntimeHandle::activate_or_resume_local(activation_request);
+        assert_eq!(activation.status, SyncLocalActivationStatus::Active);
+        let handle = activation.handle.expect("activated");
+        handle.prepare_shared().expect("share prepared");
+        drop(handle);
+
+        let descriptor_path = graph_root
+            .join(".tine-sync/v2/shared/outbox")
+            .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH);
+        assert!(descriptor_path.exists(), "preparation published it");
+        let original_descriptor = fs::read(&descriptor_path).unwrap();
+
+        let reopened = SyncRuntimeHandle::open(open_request);
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened.handle.expect("reopened");
+        assert_eq!(
+            handle.status().unwrap().shared_phase,
+            Some(SyncSharedPhase::Active)
+        );
+        // Let the ordinary reopen repair finish first, so what this test
+        // observes afterwards is the running-actor path and not that one.
+        drain_ticks(&handle);
+        assert!(descriptor_path.exists());
+
+        for round in 1..=MAX_PROVIDER_DESCRIPTOR_REPUBLICATIONS {
+            fs::remove_file(&descriptor_path).unwrap();
+            handle
+                .observe_provider_paths(vec![SHARED_ENROLLMENT_DESCRIPTOR_PATH.into()], false)
+                .unwrap();
+            let ticks = drain_ticks(&handle);
+            assert!(
+                descriptor_path.exists(),
+                "round {round}: the initiator did not put its descriptor back: {ticks:?}"
+            );
+            assert!(
+                !ticks.iter().any(|tick| matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Blocked(_)
+                )),
+                "round {round}: repairing must not block: {ticks:?}"
+            );
+            // Byte-exact: a republished descriptor is the SAME enrollment, so
+            // a device that already joined is still joined to it.
+            assert_eq!(
+                fs::read(&descriptor_path).unwrap(),
+                original_descriptor,
+                "round {round}: the republished descriptor is not the enrolled one"
+            );
+        }
+
+        // Something that keeps removing the file is not a delivery window. The
+        // actor stops writing around it and names the condition once.
+        fs::remove_file(&descriptor_path).unwrap();
+        handle
+            .observe_provider_paths(vec![SHARED_ENROLLMENT_DESCRIPTOR_PATH.into()], false)
+            .unwrap();
+        let ticks = drain_ticks(&handle);
+        let blocked = ticks
+            .iter()
+            .filter_map(|tick| match tick {
+                SyncRuntimeTick::RecoveryBlocked(detail) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(blocked.len(), 1, "one condition, one report: {ticks:?}");
+        assert!(
+            blocked[0].contains("shared-enrollment-v1.json") && blocked[0].contains(".tine-sync"),
+            "the report must name the file it wants: {}",
+            blocked[0]
+        );
+        let _ = handle.clean_shutdown();
+    }
+
+    /// Tick until the actor stops making progress, returning what it reported.
+    fn drain_ticks(handle: &SyncRuntimeHandle) -> Vec<SyncRuntimeTick> {
+        let mut ticks = Vec::new();
+        for _ in 0..64 {
+            let tick = handle.tick().expect("actor available");
+            let done = matches!(tick, SyncRuntimeTick::Idle);
+            ticks.push(tick);
+            if done {
+                break;
+            }
+        }
+        ticks
     }
 
     /// The complete Android instrumentation journey, run at the HOST boundary.
