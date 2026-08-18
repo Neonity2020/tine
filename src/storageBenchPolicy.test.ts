@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -6,10 +6,15 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const roots: string[] = [];
 
+const policyRounds: number = JSON.parse(
+  readFileSync(resolve("scripts/bench-policy.json"), "utf8"),
+).reliability.rounds;
+
 function report(fileCount = 1_045, managedColdOpenMs = 2_700) {
+  const rounds = (value: number) => Array.from({ length: policyRounds }, () => value);
   const metric = (direct: number, managed: number) => ({
-    direct: { rawMedianOfRoundMins: direct, roundSpreadPct: 2, roundMins: [direct, direct, direct] },
-    managed: { rawMedianOfRoundMins: managed, roundSpreadPct: 2, roundMins: [managed, managed, managed] },
+    direct: { rawMedianOfRoundMins: direct, roundSpreadPct: 2, roundMins: rounds(direct) },
+    managed: { rawMedianOfRoundMins: managed, roundSpreadPct: 2, roundMins: rounds(managed) },
   });
   const values = {
     coldOpenMs: metric(600, managedColdOpenMs),
@@ -20,7 +25,9 @@ function report(fileCount = 1_045, managedColdOpenMs = 2_700) {
   return {
     schemaVersion: 2,
     kind: "storage-mode",
-    rounds: [{}, {}, {}],
+    // Policy-driven: the checker requires reliability.rounds entries, and that
+    // knob deliberately tightens for the A/B gate and this one together.
+    rounds: Array.from({ length: policyRounds }, () => ({})),
     modes: {
       direct: { metrics: Object.fromEntries(Object.entries(values).map(([name, value]) => [name, value.direct])) },
       managed: { metrics: Object.fromEntries(Object.entries(values).map(([name, value]) => [name, value.managed])) },

@@ -16,7 +16,22 @@ function measurement(label, bigLoad, scrollBig) {
     metrics: { bigLoad: { rawMin: load }, scrollBig: { rawMin: scroll } },
     parseStats: { calls: 12, hits: 0, misses: 12 },
   });
-  const median = (values) => [...values].sort((a, b) => a - b)[1];
+  const median = (values) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  };
+  // Each scenario is written as three values whose min/median/max encode the
+  // shape under test. The policy's round count is higher than three, so pad
+  // with copies of the median: min, max, spread and median are all preserved,
+  // and every scenario keeps meaning exactly what its three values say.
+  const pad = (values) => {
+    const padded = [...values];
+    while (padded.length < policy.reliability.rounds) padded.push(median(values));
+    return padded;
+  };
+  bigLoad = pad(bigLoad);
+  scrollBig = pad(scrollBig);
   const spread = (values) => Number(((Math.max(...values) / Math.min(...values) - 1) * 100).toFixed(1));
   return {
     schemaVersion: 2,
@@ -222,7 +237,9 @@ try {
     "calibration instability remains a blocker",
   );
 
-  assert.equal(policy.reliability.rounds, 3);
+  // The scenarios above are POLICY-DRIVEN (fixtures pad to the configured
+  // round count), so this guard only pins the floor the padding logic needs.
+  assert.ok(policy.reliability.rounds >= 3, "bench policy must run at least 3 rounds");
   console.log("Performance A/B multi-round reliability fixtures passed.");
 } finally {
   rmSync(temporary, { recursive: true, force: true });
