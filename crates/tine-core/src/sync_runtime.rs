@@ -6202,7 +6202,13 @@ fn open_clean_runtime_resources_with_progress(
                     .clone()
             };
             crate::oplog::projection::execute_receiver_local_projection_under_handoff(
-                &graph, &receipts, &engine, &source, &published, true,
+                &graph,
+                &receipts,
+                &engine,
+                Some(projection.database()),
+                &source,
+                &published,
+                true,
             )
             .map_err(display)?;
         }
@@ -25758,10 +25764,14 @@ impl RuntimeActor {
             let detail = clean.pending.as_ref().map_or_else(
                 || "clean shutdown awaits retained external reconciliation".to_owned(),
                 |pending| {
+                    // Name WHY, not just which batch: a delivered deletion that
+                    // this device cannot apply must be explained in the refusal
+                    // rather than left as a phase name.
                     format!(
-                        "clean shutdown awaits committed batch {} at {:?}",
+                        "clean shutdown awaits committed batch {} at {:?}: {}",
                         pending.batch_id(),
-                        pending.failure().phase()
+                        pending.failure().phase(),
+                        pending.failure().detail()
                     )
                 },
             );
@@ -48940,6 +48950,438 @@ mod tests {
             !receiver_handle.status().unwrap().has_runnable_work(),
             "a drained running receiver must return the scheduler to sleep",
         );
+    }
+
+    /// Deliver every provider batch the initiator has published to the receiver
+    /// and drive the receiver exactly as the production scheduler would.
+    fn deliver_provider_to_receiver(
+        initiator: &ActivationFixture,
+        receiver: &ActivationFixture,
+        receiver_handle: &SyncRuntimeHandle,
+    ) {
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        drive_like_the_production_scheduler(receiver_handle);
+    }
+
+    /// A peer's DELETE, delivered to a running receiver with no concurrent local
+    /// work of any kind. The user-visible outcome is the only thing asserted:
+    /// the Markdown file the peer deleted is gone from this device's graph.
+    #[test]
+    fn provider_delete_removes_the_receiver_markdown() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-delete-converges", 0xbf00);
+        let path = "notes/provider-delete-converges.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            0xbf20,
+            "Provider Delete Converges",
+            path,
+            "peer page that will be deleted",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(
+            receiver.graph_root.join(path).is_file(),
+            "the peer's page never reached the receiver's graph: {:?}",
+            receiver_handle.status().unwrap()
+        );
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
+        assert!(
+            !initiator.graph_root.join(path).exists(),
+            "the initiator's own deletion did not reach its own graph"
+        );
+
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+
+        assert!(
+            !receiver.graph_root.join(path).exists(),
+            "a delivered peer DELETE never removed the receiver's Markdown: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(
+            matches!(
+                receiver_handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ),
+            "a converged receiver must publish a Safe shutdown"
+        );
+    }
+
+    /// A peer's RENAME (a path release plus a path acquisition) delivered to a
+    /// running receiver with no concurrent local work.
+    #[test]
+    fn provider_rename_moves_the_receiver_markdown() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-rename-converges", 0xbf40);
+        let old_path = "notes/provider-rename-converges.md";
+        let new_path = "notes/provider-rename-converges-renamed.md";
+        let (create_batch, page_id, _, _) = submit_shared_page(
+            &initiator_handle,
+            0xbf60,
+            "Provider Rename Converges",
+            old_path,
+            "peer page that will be renamed",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(
+            receiver.graph_root.join(old_path).is_file(),
+            "the peer's page never reached the receiver's graph: {:?}",
+            receiver_handle.status().unwrap()
+        );
+
+        let rename_batch = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id,
+                    new_name: LogicalPageName::parse("Provider Rename Converges Renamed").unwrap(),
+                    new_path: ManagedPath::parse(new_path).unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, rename_batch);
+        settle_shared_provider(&initiator_handle);
+        assert!(!initiator.graph_root.join(old_path).exists());
+        assert!(initiator.graph_root.join(new_path).is_file());
+
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+
+        assert!(
+            receiver.graph_root.join(new_path).is_file(),
+            "a delivered peer RENAME never created the receiver's new Markdown: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert_eq!(
+            fs::read(receiver.graph_root.join(new_path)).unwrap(),
+            b"- peer page that will be renamed\n"
+        );
+        assert!(
+            !receiver.graph_root.join(old_path).exists(),
+            "a delivered peer RENAME left the receiver's old Markdown behind: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(
+            matches!(
+                receiver_handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ),
+            "a converged receiver must publish a Safe shutdown"
+        );
+    }
+
+    /// A peer moves a block subtree to another page and then deletes the page it
+    /// emptied. The delivered batch carries a `Present` intent for the target and
+    /// an `Absent` intent for the source in one manifest, so both halves have to
+    /// converge on this device.
+    #[test]
+    fn provider_cross_page_move_then_delete_converges_on_the_receiver() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-move-then-delete", 0xbf80);
+        let source_path = "notes/provider-move-then-delete-source.md";
+        let target_path = "notes/provider-move-then-delete-target.md";
+        let (source_batch, source_page_id, block_id, home_document_id) = submit_shared_page(
+            &initiator_handle,
+            0xbfa0,
+            "Provider Move Then Delete Source",
+            source_path,
+            "carried subtree",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, source_batch);
+        let (target_batch, target_page_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xbfc0,
+            "Provider Move Then Delete Target",
+            target_path,
+            "target base",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, target_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(receiver.graph_root.join(source_path).is_file());
+        assert!(receiver.graph_root.join(target_path).is_file());
+
+        let move_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    from_page_id: source_page_id,
+                    to_page_id: target_page_id,
+                    parent: None,
+                    order: "z".into(),
+                },
+                SemanticOperation::DeletePage {
+                    page_id: source_page_id,
+                },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, move_batch);
+        settle_shared_provider(&initiator_handle);
+        assert!(!initiator.graph_root.join(source_path).exists());
+
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+
+        assert!(
+            !receiver.graph_root.join(source_path).exists(),
+            "the emptied source page's Markdown survived a delivered delete: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert_eq!(
+            fs::read(receiver.graph_root.join(target_path)).unwrap(),
+            b"- target base\n- carried subtree\n",
+            "the delivered cross-page move never reached the target Markdown"
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// A peer's DELETE for a path this device does not hold. Removing nothing is
+    /// the convergent answer, and it must be reported as done rather than retried
+    /// forever.
+    #[test]
+    fn provider_delete_of_a_path_absent_from_the_receiver_converges() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-delete-absent-locally", 0xc000);
+        let path = "notes/provider-delete-absent-locally.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            0xc020,
+            "Provider Delete Absent Locally",
+            path,
+            "peer page removed underneath the receiver",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(receiver.graph_root.join(path).is_file());
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        // The file is already gone here -- another tool removed it, or a prior
+        // attempt completed the removal and crashed before its receipt landed.
+        fs::remove_file(receiver.graph_root.join(path)).unwrap();
+        receiver_handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+            .unwrap();
+        receiver_handle.observe_provider().unwrap();
+        drive_like_the_production_scheduler(&receiver_handle);
+
+        assert!(
+            !receiver.graph_root.join(path).exists(),
+            "a delivered DELETE re-created a path that was already absent: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// A peer's DELETE arriving against a receiver-local external edit of the
+    /// same page. The edit must be in immutable local history, the deletion must
+    /// reach a settled outcome, and the device must never spin.
+    #[test]
+    fn provider_delete_racing_a_local_edit_of_the_same_page_settles() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-delete-races-local-edit", 0xc040);
+        let path = "notes/provider-delete-races-local-edit.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            0xc060,
+            "Provider Delete Races Local Edit",
+            path,
+            "shared base",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert!(receiver.graph_root.join(path).is_file());
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        let sentinel = "receiver edited this while the peer was deleting it";
+        fs::write(
+            receiver.graph_root.join(path),
+            format!("- {sentinel}\n").as_bytes(),
+        )
+        .unwrap();
+        receiver_handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+            .unwrap();
+        receiver_handle.observe_provider().unwrap();
+        drive_like_the_production_scheduler(&receiver_handle);
+
+        assert!(
+            archive_root_contains_bytes(&receiver, sentinel.as_bytes()),
+            "the racing local edit was destroyed instead of captured in immutable \
+             local history: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        // Either side may win the race; a spin is not an outcome. If the edit
+        // won, the file keeps exactly the receiver's bytes and nothing else.
+        if receiver.graph_root.join(path).exists() {
+            assert_eq!(
+                fs::read(receiver.graph_root.join(path)).unwrap(),
+                format!("- {sentinel}\n").as_bytes(),
+                "a retained remote deletion rewrote the receiver's external bytes"
+            );
+        }
+        assert!(
+            !receiver_handle.status().unwrap().has_runnable_work(),
+            "a settled receiver must name no runnable work: {:?}",
+            receiver_handle.status().unwrap()
+        );
+    }
+
+    /// A peer deletes a page and then gives its exact path to a different page.
+    /// The delivered release must never remove the file the new owner owns:
+    /// path ownership, not the deleted page's lifecycle, is what authorizes a
+    /// removal.
+    #[test]
+    fn provider_delete_then_reuse_of_the_same_path_keeps_the_new_owner() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-delete-then-reuse-path", 0xc080);
+        let path = "notes/provider-delete-then-reuse-path.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            0xc0a0,
+            "Provider Delete Then Reuse Path",
+            path,
+            "first owner",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- first owner\n"
+        );
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
+        let (reuse_batch, ..) = submit_shared_page(
+            &initiator_handle,
+            0xc0c0,
+            "Provider Delete Then Reuse Path Second",
+            path,
+            "second owner",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, reuse_batch);
+        settle_shared_provider(&initiator_handle);
+        assert_eq!(
+            fs::read(initiator.graph_root.join(path)).unwrap(),
+            b"- second owner\n"
+        );
+
+        // Both batches arrive together, so the release and the reacquisition of
+        // the same exact path are settled in one delivery.
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- second owner\n",
+            "the delivered release removed or stale-kept the path its new owner \
+             owns: {:?}",
+            receiver_handle.status().unwrap()
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// Whether the receiver's immutable local history retains these exact bytes.
+    ///
+    /// Deliberately NOT `archive_contains_payload`, which only walks
+    /// `committed_manifests()` -> `required_objects()` and returns false for
+    /// bytes that are demonstrably retained on disk. This scans what the device
+    /// actually kept.
+    fn archive_root_contains_bytes(fixture: &ActivationFixture, expected: &[u8]) -> bool {
+        let mut stack = vec![fixture.request.archive_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if fs::read(&path).is_ok_and(|bytes| {
+                    bytes
+                        .windows(expected.len())
+                        .any(|window| window == expected)
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The direct provider lane only ever advances its front entry, so a batch

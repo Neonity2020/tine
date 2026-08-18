@@ -21,14 +21,15 @@ use std::fmt;
 use std::io;
 
 use super::{
-    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlockId, EngineError,
-    LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition, ManifestProjectionTarget,
-    ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
-    PageId, ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
-    ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
-    ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionWork,
-    ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget,
-    ReceiptError, ShardedHotEngine, SqliteFrontier, StructuralLocator, StructuralSpan, WorkspaceId,
+    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlockId, CleanTombstoneAuthorization,
+    EngineError, LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition,
+    ManifestProjectionTarget, ManifestedProjectionIntent, MaterializedBlock, MaterializedPage,
+    ObjectKind, ObjectStore, PageId, ProjectionCompletedReceipt, ProjectionCompletion,
+    ProjectionEndpointBinding, ProjectionEndpointId, ProjectionIntent, ProjectionPageState,
+    ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError,
+    ProjectionTombstoneAuthorization, ProjectionWork, ProjectionWorkBlockAuthority,
+    ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget, ReceiptError,
+    ShardedHotEngine, SqliteFrontier, StructuralLocator, StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
@@ -1629,10 +1630,19 @@ fn authenticated_source_layout_base(
 /// repeated from accepted semantic state and the receiver's exact current
 /// bytes. Authenticated source-base identities preserve the same blocks'
 /// structural layout across an edit without copying source-local trivia.
+///
+/// `clean_projection` is `Some` exactly on the index-free clean runtime, whose
+/// deletions are authorized against the disposable SQLite projection instead of
+/// the retired pre-0.7 endpoint history and portable-path index. `None` keeps
+/// the enrolled pre-0.7 runtime on its own authorization unchanged.
+///
+/// `Ok(Some(_))` means the intent is finished for this device, `Ok(None)` means
+/// the caller must retain a continuation.
 pub(crate) fn execute_receiver_local_projection_under_handoff(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
+    clean_projection: Option<&SqliteFrontier>,
     source: &ManifestedProjectionIntent,
     handoff: &crate::model::PublishedHandoffLatch,
     allow_mutation: bool,
@@ -1648,10 +1658,38 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
     let source_absent = matches!(source.target(), ManifestProjectionTarget::Absent);
     let mut effective_candidate = None;
     let tombstone_authorization = if source_absent {
-        match engine.authorize_projection_tombstone(source) {
-            Ok(authorization) => Some(authorization),
-            Err(EngineError::ProjectionAuthorizationUnavailable) => return Ok(Some(false)),
-            Err(error) => return Err(error.into()),
+        // The engine names the regime, not the caller: only an index-free clean
+        // runtime may take the clean authorization, and a clean runtime may not
+        // silently fall back to the pre-0.7 one it can never satisfy.
+        let clean_runtime = engine.require_index_free_clean_projection_runtime().is_ok();
+        match clean_runtime.then_some(clean_projection).flatten() {
+            Some(projection) => {
+                match engine.authorize_clean_projection_tombstone(projection, source)? {
+                    CleanTombstoneAuthorization::Authorized(authorization) => Some(*authorization),
+                    // A live page owns this exact path in current accepted
+                    // state, so the delivered release is historical evidence
+                    // and its owner projects the path. Finishing here is the
+                    // convergent answer, not a dropped deletion.
+                    CleanTombstoneAuthorization::Superseded(_) => return Ok(Some(false)),
+                    // Nothing is wrong; this device cannot answer yet. Retain a
+                    // continuation so the batch stays DurablePending and
+                    // clean_shutdown keeps refusing Safe.
+                    CleanTombstoneAuthorization::Deferred(_) => return Ok(None),
+                }
+            }
+            // A clean runtime that reached here without its disposable
+            // projection cannot prove a path release at all; refuse by name
+            // rather than fall through to an authorization it cannot satisfy.
+            None if clean_runtime => {
+                return Err(ProjectionError::Engine(EngineError::ProjectionWork(
+                    "clean receiver-local deletion has no disposable SQLite projection".into(),
+                )))
+            }
+            None => match engine.authorize_projection_tombstone(source) {
+                Ok(authorization) => Some(authorization),
+                Err(EngineError::ProjectionAuthorizationUnavailable) => return Ok(Some(false)),
+                Err(error) => return Err(error.into()),
+            },
         }
     } else {
         let current_matches_source = match engine.authorize_projection_write(source.page_id()) {
@@ -1691,14 +1729,14 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
     };
     let mut effective_prior_completion = None;
     let plan = if source_absent {
-        receiver_tombstone_plan(
-            receipts,
-            engine,
-            tombstone_authorization
-                .as_ref()
-                .expect("Absent source has tombstone authorization"),
-            local_base.as_deref(),
-        )?
+        let authorization = tombstone_authorization
+            .as_ref()
+            .expect("Absent source has tombstone authorization");
+        if engine.require_index_free_clean_projection_runtime().is_ok() {
+            receiver_clean_tombstone_plan(engine, authorization, local_base.as_deref())?
+        } else {
+            receiver_tombstone_plan(receipts, engine, authorization, local_base.as_deref())?
+        }
     } else if let Some(candidate) = effective_candidate.as_ref() {
         let (completed_intent, completion) =
             receipts.load_completed_receipt(candidate.lifecycle_completion())?;
@@ -1841,6 +1879,50 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         }
     }
     Ok(Some(!already_complete))
+}
+
+/// Plan one clean-runtime receiver-local deletion.
+///
+/// The pre-0.7 sibling below reconstructs the removal precondition from the
+/// enrolled projection work index, which the clean runtime does not build. The
+/// clean runtime already holds the stronger operand: the receiver's own exact
+/// bytes on disk. They are the mutation precondition everywhere else on this
+/// path — a delivered edit renders against them too — and `remove_page_projection`
+/// re-checks them under the page lock at the publication boundary, so a write
+/// that races the removal refuses instead of clobbering.
+fn receiver_clean_tombstone_plan(
+    engine: &ShardedHotEngine,
+    authorization: &ProjectionTombstoneAuthorization,
+    local_base: Option<&[u8]>,
+) -> Result<ProjectionPlan, ProjectionError> {
+    let make_intent = |precondition| {
+        ProjectionIntent::new(
+            engine.workspace_id(),
+            authorization.page_id(),
+            authorization.path().clone(),
+            authorization.frontier().clone(),
+            Vec::new(),
+            precondition,
+            super::BlobDescription::of(&[]),
+            Vec::new(),
+        )
+    };
+    let (intent, base) = match local_base {
+        Some(bytes) => (
+            make_intent(ProjectionPrecondition::Base(super::BlobDescription::of(
+                bytes,
+            )))?,
+            Some(BaseBlob::new(bytes.to_vec())),
+        ),
+        None => (make_intent(ProjectionPrecondition::Absent)?, None),
+    };
+    Ok(ProjectionPlan {
+        intent,
+        base,
+        target: Vec::new(),
+        guarded_layout: GuardedProjectionLayout::empty(),
+        generated_anchors: Vec::new(),
+    })
 }
 
 fn receiver_tombstone_plan(

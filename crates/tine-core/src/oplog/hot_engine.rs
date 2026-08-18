@@ -5735,6 +5735,42 @@ impl ProjectionTombstoneAuthorization {
     }
 }
 
+/// Outcome of authorizing one receiver-local deletion on the clean runtime.
+///
+/// Every arm is a convergent answer. A deletion is applied, is proven already
+/// overtaken by later accepted work, or is deferred with a named reason — it
+/// is never a refusal without a scenario.
+pub(crate) enum CleanTombstoneAuthorization {
+    /// Remove the page's exact path.
+    Authorized(Box<ProjectionTombstoneAuthorization>),
+    /// Later accepted work owns the exact path this deletion releases, so the
+    /// intent is historical evidence only. Completing it without touching the
+    /// file is the convergent outcome: the current owner projects that path.
+    Superseded(CleanTombstoneSupersession),
+    /// Nothing is wrong, but this device cannot answer yet. The caller retains
+    /// a continuation, the batch stays `DurablePending`, and `clean_shutdown`
+    /// keeps refusing `Safe` while naming the retained batch.
+    Deferred(CleanTombstoneDeferral),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanTombstoneSupersession {
+    /// A live page owns the exact path in the current accepted projection.
+    PathIsOwned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanTombstoneDeferral {
+    /// The batch carrying the intent has not finished arriving.
+    BatchNotArchiveReady,
+    /// The batch carrying the intent is not accepted by this runtime yet.
+    BatchNotAccepted,
+    /// A declared frontier head has not become durable on this device.
+    FrontierNotDurable,
+    /// The disposable SQLite projection has not reached the accepted frontier.
+    SqliteBehindAcceptedFrontier,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogseqUuidClaim {
     pub logseq_uuid: LogseqUuid,
@@ -22514,6 +22550,191 @@ impl ShardedHotEngine {
             prior_frontier,
             frontier: source.post_frontier().clone(),
         })
+    }
+
+    /// Authorize receiver-local completion of one accepted foreign deletion on
+    /// the index-free clean runtime.
+    ///
+    /// [`Self::authorize_projection_tombstone`] proves its release against two
+    /// pre-0.7 durable trees the clean runtime deliberately does not build: the
+    /// endpoint history store and the persistent portable-path index. Those are
+    /// not different invariants, so this is not a weaker authorization — it is
+    /// the same questions asked of the structures the clean runtime keeps.
+    ///
+    /// * *Did this runtime accept the batch that carries this intent, and do
+    ///   the archived bytes still match what it accepted?* — answered by the
+    ///   accepted batch evidence rather than a durable history record.
+    /// * *Is the exact path free right now?* — answered by the disposable
+    ///   SQLite projection pinned to the engine's accepted frontier, which is
+    ///   the same question [`Self::authorize_clean_projection_work`] already
+    ///   asks for an own-endpoint deletion. It is the live fact rather than a
+    ///   historical release record, and unlike `ephemeral_portable_paths` it
+    ///   survives a restart.
+    ///
+    /// Path ownership — not the page's catalog lifecycle — is the whole
+    /// authorization, exactly as on the own-endpoint path. A rename releases
+    /// its old path while its page stays live, so requiring a catalog tombstone
+    /// here would refuse every delivered rename.
+    pub(crate) fn authorize_clean_projection_tombstone(
+        &self,
+        projection: &super::SqliteFrontier,
+        source: &ManifestedProjectionIntent,
+    ) -> Result<CleanTombstoneAuthorization, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        let (store, _endpoint) = self.clean_projection_runtime_binding()?;
+        if source.workspace_id() != self.workspace_id
+            || !matches!(source.target(), ManifestProjectionTarget::Absent)
+            || !source.claim_evidence().is_empty()
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        // The delivered bytes are transport evidence. Authority comes from this
+        // runtime's own acceptance of the batch that carries the intent, and
+        // from the archived manifest still matching what was accepted — the
+        // torn-write / partial-delivery check the durable history record used
+        // to perform.
+        let batch = match store
+            .inspect_batch(source.source_batch_id())
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+        {
+            BatchInspection::Ready(batch) => batch,
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                return Ok(CleanTombstoneAuthorization::Deferred(
+                    CleanTombstoneDeferral::BatchNotArchiveReady,
+                ));
+            }
+        };
+        let evidence = match self.accepted_batch_evidence(source.source_batch_id()) {
+            Ok(evidence) => evidence,
+            Err(EngineError::MissingDependency(_)) => {
+                return Ok(CleanTombstoneAuthorization::Deferred(
+                    CleanTombstoneDeferral::BatchNotAccepted,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if evidence.manifest_fingerprint != batch_fingerprint(&batch) {
+            return Err(EngineError::Archive(format!(
+                "clean tombstone batch {} archive bytes differ from its accepted manifest",
+                source.source_batch_id()
+            )));
+        }
+
+        // The intent must be carried by that batch, exactly once. A duplicate
+        // is malformed imported content, not an ambiguity to resolve.
+        let mut matched_source = false;
+        for object in batch
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
+        {
+            let manifested = ManifestedProjectionIntent::decode(object.payload())
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+            if manifested == *source {
+                if matched_source {
+                    return Err(EngineError::ProjectionAuthorizationUnavailable);
+                }
+                matched_source = true;
+            }
+        }
+        if !matched_source {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        // The declared render base, when present, must be the authenticated
+        // object the batch names and must bind to this page and path.
+        let prior_frontier = match source.precondition() {
+            ManifestProjectionPrecondition::Absent => None,
+            ManifestProjectionPrecondition::Present { base } => {
+                let object = batch
+                    .objects()
+                    .iter()
+                    .find(|object| {
+                        object.kind() == ObjectKind::AnnotatedBaseBlob
+                            && object.document_id() == base.document_id()
+                            && object.descriptor().is_ok_and(|descriptor| {
+                                descriptor.content_digest() == base.content_digest()
+                                    && descriptor.encoded_byte_length()
+                                        == base.encoded_byte_length()
+                            })
+                    })
+                    .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+                let base = AnnotatedProjectionBase::decode(object.payload())
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                if base.workspace_id() != self.workspace_id
+                    || base.source_page_id() != source.page_id()
+                    || base.source_path() != source.path()
+                {
+                    return Err(EngineError::ProjectionAuthorizationUnavailable);
+                }
+                Some(base.prior_frontier().clone())
+            }
+        };
+
+        // Every causal head the intent declares must be accepted and durable
+        // here. A provider tree that is still arriving is deferred, never
+        // treated as a licence to remove bytes.
+        let mut accepted_heads = 0_usize;
+        for document in source.post_frontier().documents() {
+            for batch_id in document.direct_dependency_heads() {
+                accepted_heads = accepted_heads.saturating_add(1);
+                let accepted = matches!(
+                    self.archive_status(*batch_id)?,
+                    Some(ArchiveStatus::Accepted { .. })
+                );
+                let ordinary_ready = matches!(
+                    store
+                        .inspect_batch(*batch_id)
+                        .map_err(|error| EngineError::Archive(error.to_string()))?,
+                    BatchInspection::Ready(_)
+                );
+                let bootstrap_ready =
+                    !ordinary_ready && self.load_retained_bootstrap_part(*batch_id)?.is_some();
+                if !accepted || (!ordinary_ready && !bootstrap_ready) {
+                    return Ok(CleanTombstoneAuthorization::Deferred(
+                        CleanTombstoneDeferral::FrontierNotDurable,
+                    ));
+                }
+            }
+        }
+        if accepted_heads == 0 {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        // The release itself: nobody may own this exact path in the current
+        // accepted state. Pin the projection to the engine's accepted frontier
+        // first, so the answer is the current one and not a stale read.
+        let current_root = self.accepted_frontier_root()?;
+        let projected_root = projection
+            .frontier_root()
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        if projected_root != current_root {
+            return Ok(CleanTombstoneAuthorization::Deferred(
+                CleanTombstoneDeferral::SqliteBehindAcceptedFrontier,
+            ));
+        }
+        let read = projection
+            .materialized_read()
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        let owners = read
+            .pages_by_path(source.path(), 2)
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        if !owners.is_empty() {
+            return Ok(CleanTombstoneAuthorization::Superseded(
+                CleanTombstoneSupersession::PathIsOwned,
+            ));
+        }
+
+        Ok(CleanTombstoneAuthorization::Authorized(Box::new(
+            ProjectionTombstoneAuthorization {
+                page_id: source.page_id(),
+                path: source.path().clone(),
+                prior_frontier,
+                frontier: source.post_frontier().clone(),
+            },
+        )))
     }
 
     pub(crate) fn projection_completion_history_authority(

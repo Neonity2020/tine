@@ -99,6 +99,20 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::provider_arrival_while_active_becomes_scheduled_work",
   "sync_runtime::tests::multiple_delivered_provider_items_drain_to_zero_without_starving_reads",
   "sync_runtime::tests::a_quiet_shared_actor_names_no_runnable_work",
+  // Receiver-local tombstone authority on the clean runtime. A peer's DELETE
+  // or RENAME releases an exact path here, and the pre-0.7 authorization that
+  // proved the release from the retired durable endpoint history could never
+  // be satisfied -- every delivered deletion spun forever. These assert the
+  // user-visible outcome (the file is gone / moved on disk) under the
+  // production scheduler's own contract, plus the paths a removal must never
+  // take: a path a newer accepted page owns, a path already absent, and a
+  // deletion racing a receiver-local external edit.
+  "sync_runtime::tests::provider_delete_removes_the_receiver_markdown",
+  "sync_runtime::tests::provider_rename_moves_the_receiver_markdown",
+  "sync_runtime::tests::provider_cross_page_move_then_delete_converges_on_the_receiver",
+  "sync_runtime::tests::provider_delete_of_a_path_absent_from_the_receiver_converges",
+  "sync_runtime::tests::provider_delete_racing_a_local_edit_of_the_same_page_settles",
+  "sync_runtime::tests::provider_delete_then_reuse_of_the_same_path_keeps_the_new_owner",
   // The direct provider lane advances only its front entry, so a batch whose
   // causal dependency is queued behind it deadlocks the pair and strands a
   // peer's edit. Deterministic ordering guard for that rule.

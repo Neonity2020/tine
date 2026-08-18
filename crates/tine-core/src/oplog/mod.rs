@@ -113,7 +113,8 @@ pub use batch::{
     OPLOG_PROTOCOL_VERSION,
 };
 pub(crate) use hot_engine::{
-    append_managed_local_record, ManagedLocalAppendError, ManagedLocalAppendProof,
+    append_managed_local_record, CleanTombstoneAuthorization, CleanTombstoneDeferral,
+    CleanTombstoneSupersession, ManagedLocalAppendError, ManagedLocalAppendProof,
     ManagedLocalJournalAppend, ProjectionTombstoneAuthorization,
 };
 pub use hot_engine::{
