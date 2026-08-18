@@ -6250,14 +6250,68 @@ mod tests {
         assert!(error.contains("intent target"), "{error}");
     }
 
+    // Forced small, not production-sized. What this guards is a shadow
+    // projection verified over an aggregate that really was split into more
+    // than one part, and the part limit is the supported way to reach that.
+    // Packing a real MAX_OPERATIONS_PER_BOOTSTRAP_PART page instead cost 267-270
+    // s in the `ci` profile on an idle host and 336-395 s on a merely quiet one
+    // — against that profile's 600 s hard kill, which it went over outright
+    // whenever the host was busy — without proving more. The scale-dependent
+    // half is kept below under `#[ignore]`.
     #[test]
-    fn inactive_shadow_projection_forced_multipart_4096_operations_uses_default_stack() {
+    fn inactive_shadow_projection_forced_multipart_uses_default_stack() {
+        // The override partitions the operation sequence and nothing else, so
+        // the production ceiling it stands in for must not have moved.
+        assert_eq!(MAX_OPERATIONS_PER_BOOTSTRAP_PART, 100_000);
+        force_next_bootstrap_part_operation_limit(8);
+        let mut source = String::new();
+        for ordinal in 0..64 {
+            source.push_str(&format!("- operation {ordinal}\n"));
+        }
+        let fixture = Fixture::new(
+            "multipart-forced",
+            None,
+            vec![("pages/multipart.md".into(), source.into_bytes())],
+        );
+        let parts = fixture.prepared.aggregate().parts();
+        assert!(
+            parts.len() > 1,
+            "the fixture must be genuinely multipart, not one part"
+        );
+        assert_ne!(
+            parts.first().map(|part| part.batch_id()),
+            parts.last().map(|part| part.batch_id()),
+            "a multipart aggregate must have a non-terminal predecessor"
+        );
+        assert_eq!(fixture.verified.part_count() as usize, parts.len());
+        let proof = fixture.verify().unwrap();
+        assert_eq!(proof.file_count(), 1);
+        assert!(proof.instrumentation().peak_owned_catalog_rows <= 1);
+        fixture.assert_graph_unchanged();
+    }
+
+    // Deliberately outside the default run. The forced sibling above proves
+    // the multipart verification path itself; this is the same walk at the
+    // production partition ceiling, so it additionally proves that a page of
+    // MAX_OPERATIONS_PER_BOOTSTRAP_PART blocks splits with no test hook in
+    // play, and that neither preparation nor verification grows the stack with
+    // the operation count — this body runs on libtest's default worker stack,
+    // not `run_on_deep_stack`. It costs 267-270 s in the `ci` profile (debug) on
+    // an idle 12-core host and 336-395 s on a merely quiet one, against that
+    // profile's 600 s hard kill, and 57-82 s in release.
+    //
+    // Run it with:
+    //   cargo nextest run -p tine-core --run-ignored all \
+    //     -E 'test(=oplog::shadow_projection::tests::inactive_shadow_projection_production_ceiling_multipart_uses_default_stack)'
+    #[test]
+    #[ignore = "packs MAX_OPERATIONS_PER_BOOTSTRAP_PART blocks; the multipart path is covered by inactive_shadow_projection_forced_multipart_uses_default_stack"]
+    fn inactive_shadow_projection_production_ceiling_multipart_uses_default_stack() {
         let mut source = String::new();
         for ordinal in 0..MAX_OPERATIONS_PER_BOOTSTRAP_PART {
             source.push_str(&format!("- operation {ordinal}\n"));
         }
         let fixture = Fixture::new(
-            "multipart-4096",
+            "multipart-production-ceiling",
             None,
             vec![("pages/multipart.md".into(), source.into_bytes())],
         );
