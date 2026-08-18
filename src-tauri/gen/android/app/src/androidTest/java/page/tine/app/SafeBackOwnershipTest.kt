@@ -100,12 +100,20 @@ class SafeBackOwnershipTest {
   }
 
   /**
-   * Wait for the app's own first document to COMMIT. That, not the mounted
-   * Solid shell, is the precondition a pushed history entry needs in order to
+   * Wait for the app's own first document to COMMIT, and for nothing more than
+   * that. Commit is the precondition a pushed history entry needs in order to
    * survive: Chromium replaces the initial empty document's navigation entry
-   * when the real navigation commits. The shell state is reported but not
-   * required, so a first-run graph-less boot (Welcome instead of the topbar)
-   * cannot turn this into a red for an unrelated reason.
+   * when the real navigation commits, which is precisely what discarded the
+   * entry in run 32174388299.
+   *
+   * A committed document is already observable from `location.href` alone, so
+   * neither `readyState` nor the mounted Solid shell is required — both are
+   * only reported. Demanding either would make this fixture red for reasons
+   * that have nothing to do with Back ownership: `readyState` can sit at
+   * `interactive` indefinitely if one subresource is slow on a software-GL
+   * emulator, and a graph-less first boot shows Welcome rather than the topbar.
+   * Under-constraining here is deliberate; the fail-closed guard is the
+   * canGoBack() check below, which is the condition that actually matters.
    *
    * Returns the observed state, verbatim, for failure messages.
    */
@@ -122,8 +130,7 @@ class SafeBackOwnershipTest {
       val parsed = parseJsonStringArray(raw)
       if (parsed != null) {
         val href = parsed.getString(0)
-        val readyState = parsed.getString(1)
-        if (!href.startsWith("about:") && href.isNotEmpty() && readyState == "complete") return raw
+        if (href.isNotEmpty() && !href.startsWith("about:")) return raw
       }
       SystemClock.sleep(POLL_MS)
     }
