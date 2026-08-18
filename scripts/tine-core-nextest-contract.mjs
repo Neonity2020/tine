@@ -28,6 +28,12 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::clean_runtime_factories_adopt_marker_and_cold_reopen_without_legacy_enrollment",
   "sync_runtime::tests::clean_actor_core_retains_one_manifested_save_until_projection_finishes",
   "sync_runtime::tests::clean_full_scan_yields_between_bounded_path_slices",
+  // The two halves of "a full scan cannot starve the actor lane": no turn
+  // reads more documents than its path budget, and a rescan arriving mid-scan
+  // is absorbed by the running pass instead of chaining a second whole-graph
+  // one behind it.
+  "sync_runtime::tests::clean_full_scan_reads_no_more_documents_per_turn_than_its_path_budget",
+  "sync_runtime::tests::clean_full_scan_overrun_redoes_only_the_prefix_the_rescan_did_not_cover",
   "sync_runtime::tests::clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit",
   "sync_runtime::tests::clean_runtime_actor_assembles_without_legacy_authority_and_saves_one_edit",
   "sync_runtime::tests::clean_runtime_handle_serves_sqlite_queries_and_stops_without_legacy_handoff",

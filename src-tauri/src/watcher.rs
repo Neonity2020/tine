@@ -589,9 +589,26 @@ struct GraphTextSnapshot {
 }
 
 fn collect_graph_text_files(graph: &Graph) -> GraphTextSnapshot {
+    collect_scoped_text_files(
+        &graph.root,
+        &|path| graph.graph_text_watch_descend(path),
+        &|path| graph.graph_text_watch_relevant(path),
+    )
+}
+
+/// The stat sweep both regimes gate their poll cycle on.
+///
+/// `descend`/`relevant` are the only scope authority; the Direct lane passes the
+/// graph's own `GraphTextScope` predicates and the managed lane passes the
+/// deliberately widest ones (see `collect_managed_text_files`).
+fn collect_scoped_text_files(
+    root: &Path,
+    descend: &dyn Fn(&Path) -> bool,
+    relevant: &dyn Fn(&Path) -> bool,
+) -> GraphTextSnapshot {
     let mut files: HashMap<PathBuf, FileStamp> = HashMap::new();
     let mut complete = true;
-    let mut stack = vec![graph.root.clone()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
         let Ok(read_dir) = std::fs::read_dir(&directory) else {
             complete = false;
@@ -612,12 +629,12 @@ fn collect_graph_text_files(graph: &Graph) -> GraphTextSnapshot {
                 continue;
             };
             if file_type.is_dir() {
-                if graph.graph_text_watch_descend(&path) {
+                if descend(&path) {
                     stack.push(path);
                 }
                 continue;
             }
-            if !file_type.is_file() || !graph.graph_text_watch_relevant(&path) {
+            if !file_type.is_file() || !relevant(&path) {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -633,6 +650,80 @@ fn collect_graph_text_files(graph: &Graph) -> GraphTextSnapshot {
         }
     }
     GraphTextSnapshot { files, complete }
+}
+
+/// The managed lane has no `Graph` lease here — sparse-v2 owns its graph inside
+/// the actor — so the poll gate cannot ask `Graph::graph_text_watch_relevant`
+/// for the scope. It uses an **unconfigured** `GraphTextScope` instead, which is
+/// a deliberate superset of every configured one: hidden prefixes only ever
+/// remove paths, so a sweep with none configured covers every path any real
+/// configuration could make eligible. Provider conflict copies are folded in for
+/// the same reason the Direct predicate admits them.
+///
+/// A gate that is a superset can only over-arm a rescan. It cannot miss a change
+/// the Direct lane's gate would catch, which is the one thing it must not do.
+fn managed_poll_scope() -> &'static tine_core::graph_text_scope::GraphTextScope {
+    static SCOPE: OnceLock<tine_core::graph_text_scope::GraphTextScope> = OnceLock::new();
+    SCOPE.get_or_init(|| tine_core::graph_text_scope::GraphTextScope::new(&[], false))
+}
+
+fn managed_poll_relative(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let relative = relative.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
+    (!relative.is_empty()).then_some(relative)
+}
+
+fn managed_poll_descend(root: &Path, path: &Path) -> bool {
+    managed_poll_relative(root, path)
+        .is_some_and(|relative| managed_poll_scope().should_descend(&relative))
+}
+
+fn managed_poll_relevant(root: &Path, path: &Path) -> bool {
+    let Some(relative) = managed_poll_relative(root, path) else {
+        return false;
+    };
+    if managed_poll_scope().is_eligible(&relative) {
+        return true;
+    }
+    if !tine_core::model::path_is_sync_conflict(path) {
+        return false;
+    }
+    let (parent, filename) = match relative.rsplit_once('/') {
+        Some((parent, filename)) => (parent, filename),
+        None => ("", relative.as_str()),
+    };
+    managed_poll_scope().should_descend(parent)
+        && filename.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.eq_ignore_ascii_case("md")
+                || extension.eq_ignore_ascii_case("markdown")
+                || extension.eq_ignore_ascii_case("org")
+        })
+}
+
+fn collect_managed_text_files(root: &Path) -> GraphTextSnapshot {
+    collect_scoped_text_files(root, &|path| managed_poll_descend(root, path), &|path| {
+        managed_poll_relevant(root, path)
+    })
+}
+
+/// One managed poll cycle's gate decision.
+///
+/// Returns true when this cycle must arm `RescanRequired`. The snapshot is
+/// advanced in place exactly as `full_diff_reconcile` advances the Direct lane's,
+/// so a delta is reported once and then becomes the new baseline.
+fn managed_poll_rescan_required(
+    root: &Path,
+    snap: &mut HashMap<PathBuf, FileStamp>,
+    baseline: &mut bool,
+) -> bool {
+    let current = collect_managed_text_files(root);
+    // No baseline yet, or a walk that could not be read in full: arm. A partial
+    // sweep must never be mistaken for "nothing changed" — same reason
+    // `GraphTextSnapshot::complete` exists for the Direct lane.
+    let armed = !*baseline || !current.complete || current.files != *snap;
+    *snap = current.files;
+    *baseline = true;
+    armed
 }
 
 fn file_snapshot(path: &Path) -> Option<FileStamp> {
@@ -1324,6 +1415,12 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             last_error: Option<String>,
             retry: RetrySchedule,
             initial_tick_pending: bool,
+            // The managed twin of `WatchedGraph::snap`/`baseline`. Poll mode
+            // used to push `RescanRequired` every cycle unconditionally; it now
+            // arms on the same (mtime, len) stat diff the Direct lane has always
+            // used.
+            snap: HashMap<PathBuf, FileStamp>,
+            baseline: bool,
         }
 
         let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
@@ -1367,6 +1464,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                     // so application and enrollment work can
                                     // run between those turns.
                                     initial_tick_pending: true,
+                                    snap: HashMap::new(),
+                                    baseline: false,
                                 },
                             );
                         }
@@ -1600,6 +1699,24 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let retry_due = graph.retry.take_due(Instant::now());
                 let initial_tick = take_sparse_initial_tick(&mut graph.initial_tick_pending);
                 let poll_cycle = !inotify && !retry_due;
+                // The managed poll gate. Before this, every poll cycle armed a
+                // whole-graph `RescanRequired` whether or not anything on disk
+                // had changed, so a quiet graph paid a full actor-lane rescan
+                // every cycle. The Direct lane thirty lines above has always
+                // gated on a (mtime, len) stat diff; this is that same contract,
+                // not a second mechanism. Kept unconditional on `initial_tick`,
+                // on `event_need_full` (which carries the `rescan_graph_now`
+                // focus refresh), and on an incomplete sweep.
+                let poll_rescan = if inotify {
+                    // Poll snapshots go stale the moment the OS watcher owns the
+                    // graph; drop the baseline so a later switch back to poll
+                    // re-arms once instead of trusting a stale sweep.
+                    graph.baseline = false;
+                    graph.snap.clear();
+                    false
+                } else {
+                    managed_poll_rescan_required(&graph.root, &mut graph.snap, &mut graph.baseline)
+                };
                 // A graph may contain another device's shared provider tree
                 // while this device has enabled only local managed storage.
                 // Provider callbacks are advisory and belong exclusively to a
@@ -1623,7 +1740,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     &graph.root,
                     &paths,
                     &full_paths,
-                    event_need_full || initial_tick || poll_cycle,
+                    event_need_full || initial_tick || poll_rescan,
                     notify_error,
                 );
                 let (provider_paths, provider_imprecise) =
@@ -2696,6 +2813,109 @@ mod tests {
             retry.remaining(now + Duration::from_millis(10)),
             None,
             "a consumed continuation must not re-arm itself without another tick result",
+        );
+    }
+
+    /// The managed poll cycle arms a whole-graph rescan only when the graph
+    /// actually changed — the same stat-diff contract the Direct lane has always
+    /// used, not a second mechanism.
+    ///
+    /// Before this, `sparse_observations` was handed `need_full = poll_cycle`,
+    /// so poll mode (the Android default) pushed `RescanRequired` every 3 s
+    /// whether or not anything on disk had moved, and a quiet 1,000-page graph
+    /// paid a whole-graph actor rescan every cycle on the one lane every read
+    /// needs.
+    #[test]
+    fn a_quiet_managed_graph_does_not_arm_a_poll_rescan() {
+        let graph = TempGraph::new("managed-poll-gate");
+        graph.write("pages/Quiet.md", "- quiet\n");
+        graph.write("journals/2026_08_18.md", "- journal\n");
+        let mut snap = HashMap::new();
+        let mut baseline = false;
+
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "the first cycle has no baseline and must arm"
+        );
+        assert!(
+            !managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "a quiet graph must not arm a whole-graph rescan"
+        );
+        assert!(
+            !managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "and must keep not arming"
+        );
+    }
+
+    /// Everything the Direct lane's gate catches, the managed gate must catch.
+    /// A gate that is a superset can only over-arm; one that is a subset loses
+    /// external changes, which is the one outcome forbidden here.
+    #[test]
+    fn the_managed_poll_gate_arms_on_every_shape_the_direct_gate_catches() {
+        let graph = TempGraph::new("managed-poll-gate-shapes");
+        graph.write("pages/Existing.md", "- existing\n");
+        let mut snap = HashMap::new();
+        let mut baseline = false;
+        assert!(managed_poll_rescan_required(
+            &graph.root,
+            &mut snap,
+            &mut baseline
+        ));
+
+        // A create, anywhere an eligible document can live -- including outside
+        // the configured page/journal roots (GH #268).
+        graph.write("notes/Created.md", "- created\n");
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "a create outside pages/ and journals/ must arm"
+        );
+        assert!(!managed_poll_rescan_required(
+            &graph.root,
+            &mut snap,
+            &mut baseline
+        ));
+
+        // An edit that changes length.
+        graph.write("pages/Existing.md", "- existing, edited externally\n");
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "an external edit must arm"
+        );
+        assert!(!managed_poll_rescan_required(
+            &graph.root,
+            &mut snap,
+            &mut baseline
+        ));
+
+        // A delete.
+        std::fs::remove_file(graph.path("notes/Created.md")).unwrap();
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "a delete must arm"
+        );
+        assert!(!managed_poll_rescan_required(
+            &graph.root,
+            &mut snap,
+            &mut baseline
+        ));
+
+        // A provider conflict copy: never eligible text, but its appearance
+        // still has to reach reconciliation, exactly as on the Direct lane.
+        graph.write(
+            "pages/Existing.sync-conflict-20260818-000000-ABCDEFG.md",
+            "- conflict copy\n",
+        );
+        assert!(
+            managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "a sync conflict copy must arm"
+        );
+
+        // Excluded trees must NOT arm: an image drop cannot cost a rescan.
+        graph.write("assets/note.md", "- not graph text\n");
+        graph.write("logseq/bak/pages/Existing.md", "- backup\n");
+        assert!(
+            !managed_poll_rescan_required(&graph.root, &mut snap, &mut baseline),
+            "excluded trees must not arm a whole-graph rescan"
         );
     }
 

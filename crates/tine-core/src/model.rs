@@ -9501,6 +9501,182 @@ impl Graph {
     /// This capture never reads, advances, or consumes the process-local live
     /// admission state. Import must always obtain current retained-capability
     /// evidence of its own.
+    /// Enumerate the eligible managed-text paths that exist on disk, reading no
+    /// file contents at all.
+    ///
+    /// The clean watcher's full scan used to seed itself from
+    /// [`Graph::fresh_initial_shadow_raw_managed_text_inventory`] — a two-pass,
+    /// byte-retaining capture of every eligible document — inside ONE unbudgeted
+    /// actor turn. The scan never needed those bytes up front: it uses them only
+    /// to decide which paths to hand to reconciliation, and reconciliation
+    /// recaptures every affected path under its own two-pass authority
+    /// (`plan_clean_affected_import` → `capture_inventory`). Reading them up
+    /// front is what made the first turn of every rescan `2 × N` file opens,
+    /// which is the turn that scales worst to Android scoped storage.
+    ///
+    /// So this walk answers only "which paths are there", and the scan reads
+    /// each one lazily inside its existing per-turn budget. The directory walk
+    /// keeps the capture's no-follow discipline and its limits; per-file
+    /// identity, link-count and alias checks move to the per-path read, which
+    /// `Graph::read_raw_managed_text` performs.
+    pub(crate) fn clean_watcher_managed_text_paths(&self) -> io::Result<Vec<ManagedPath>> {
+        struct PendingDirectory {
+            directory: Dir,
+            relative: String,
+            depth: usize,
+        }
+
+        require_projection_platform()?;
+        let limits = INITIAL_SHADOW_LIMITS;
+        self.ensure_projection_root_binding()?;
+        let root = self
+            .projection_root
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "graph has no retained no-follow projection capability",
+                )
+            })?
+            .try_clone()?;
+
+        let mut paths: Vec<ManagedPath> = Vec::new();
+        let mut all_entries = 0_usize;
+        let mut directory_count = 1_usize;
+        let mut path_bytes = 0_u64;
+        let mut pending = vec![PendingDirectory {
+            directory: root,
+            relative: String::new(),
+            depth: 0,
+        }];
+
+        while let Some(PendingDirectory {
+            directory,
+            relative,
+            depth,
+        }) = pending.pop()
+        {
+            count_graph_text_admission_builder_enumeration();
+            for entry in directory.entries()? {
+                all_entries = all_entries
+                    .checked_add(1)
+                    .ok_or_else(|| initial_shadow_limit_error("all directory entries"))?;
+                if all_entries > limits.all_entries {
+                    return Err(initial_shadow_limit_error("all directory entries"));
+                }
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed text entry name is not UTF-8",
+                    )
+                })?;
+                let relative_len = relative
+                    .len()
+                    .checked_add(usize::from(!relative.is_empty()))
+                    .and_then(|length| length.checked_add(name.len()))
+                    .ok_or_else(allocation_overflow)?;
+                path_bytes = path_bytes
+                    .checked_add(
+                        usize_to_u64(relative_len)
+                            .map_err(|_| initial_shadow_limit_error("aggregate path bytes"))?,
+                    )
+                    .ok_or_else(|| initial_shadow_limit_error("aggregate path bytes"))?;
+                if path_bytes > limits.path_bytes {
+                    return Err(initial_shadow_limit_error("aggregate path bytes"));
+                }
+                let child_relative = if relative.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    // Same rule as the capture walk (GH #267 / F3): a symlink is
+                    // not a graph-text document anywhere else in Tine, so it is
+                    // skipped rather than escalated into an error that would
+                    // cost the user every other page.
+                    continue;
+                }
+                if file_type.is_dir() {
+                    if !self.graph_text_scope.should_descend(&child_relative) {
+                        continue;
+                    }
+                    let child_depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| initial_shadow_limit_error("managed directory depth"))?;
+                    if child_depth > limits.directory_depth {
+                        return Err(initial_shadow_limit_error("managed directory depth"));
+                    }
+                    directory_count = directory_count
+                        .checked_add(1)
+                        .ok_or_else(|| initial_shadow_limit_error("directory count"))?;
+                    if directory_count > limits.directories {
+                        return Err(initial_shadow_limit_error("directory count"));
+                    }
+                    projection_real_directory(&directory, name)?;
+                    let child = open_projection_dir_nofollow(&directory, name)?;
+                    if pending.len() == limits.pending_directories {
+                        return Err(initial_shadow_limit_error("pending directories"));
+                    }
+                    pending.push(PendingDirectory {
+                        directory: child,
+                        relative: child_relative,
+                        depth: child_depth,
+                    });
+                    continue;
+                }
+                if !file_type.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("managed text entry is not a regular file: {child_relative}"),
+                    ));
+                }
+                if !self.graph_text_scope.is_eligible(&child_relative) {
+                    continue;
+                }
+                if paths.len() == limits.managed_files {
+                    return Err(initial_shadow_limit_error("managed file count"));
+                }
+                paths.push(ManagedPath::parse(child_relative).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                })?);
+            }
+        }
+
+        paths.sort_unstable();
+        if paths.windows(2).any(|window| window[0] == window[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed text path inventory contains duplicate managed paths",
+            ));
+        }
+        Ok(paths)
+    }
+
+    /// Read one candidate's on-disk bytes for the clean watcher's full scan, or
+    /// `None` when the path holds nothing this graph would ever have projected.
+    ///
+    /// The eligibility test is not decoration. The scan's candidate list is the
+    /// union of the on-disk walk, the SQLite inventory and the manifest
+    /// projection paths, so it can contain a path SQLite still owns while the
+    /// current `GraphTextScope` no longer admits it. The capture this replaced
+    /// filtered such a path out by never putting it in the inventory; keeping
+    /// the same filter here keeps the changed-path set byte-identical to what
+    /// the capture produced.
+    pub(crate) fn clean_watcher_managed_text_read(
+        &self,
+        path: &ManagedPath,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if !self.graph_text_scope.is_eligible(path.as_str()) {
+            return Ok(None);
+        }
+        Ok(self
+            .read_raw_managed_text(path)?
+            .map(ManagedTextObservation::into_bytes))
+    }
+
     pub(crate) fn fresh_initial_shadow_raw_managed_text_inventory(
         &self,
     ) -> io::Result<Vec<(ManagedPath, Vec<u8>)>> {
@@ -24183,11 +24359,35 @@ fn read_projection_optional_bound_capture_with_limits(
     read_projection_optional_bound_capture_impl(dir, name, Some((content_limit, peak_limit)))
 }
 
+/// How many managed documents this thread has physically opened and read
+/// through the one projection capture primitive.
+///
+/// Deliberately NOT test-only. It is what lets the clean watcher publish the
+/// document-read cost of its slowest full-scan turn, which is the property the
+/// bounded full scan exists to hold — and an architectural claim of that kind
+/// has to be observable in production, not asserted in a comment. A thread-local
+/// increment is free next to the open + read + SHA-256 it counts.
+thread_local! {
+    static MANAGED_TEXT_CAPTURE_READS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Reads performed on THIS thread so far. The clean actor samples the delta
+/// across one turn; the counter is monotone and saturating, never reset, so
+/// concurrent actors on other threads cannot perturb each other.
+pub(crate) fn managed_text_capture_reads() -> usize {
+    MANAGED_TEXT_CAPTURE_READS.with(Cell::get)
+}
+
+fn count_managed_text_capture_read() {
+    MANAGED_TEXT_CAPTURE_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+}
+
 fn read_projection_optional_bound_capture_impl(
     dir: &Dir,
     name: &str,
     limits: Option<(u64, u64)>,
 ) -> io::Result<Option<(Vec<u8>, BlobDescription, ContentDigest, u64, u64)>> {
+    count_managed_text_capture_read();
     let rebound_limit = limits
         .map(|(content_limit, _)| content_limit)
         .unwrap_or(MAX_PROJECTION_EVIDENCE_BYTES);
