@@ -190,14 +190,40 @@ that cannot be opened for any reason other than absence. Refusals name the path
 on disk, not the bare component. Nothing about this relaxes what happens once
 bytes ARE present: descriptor, manifest and object validation is unchanged.
 
+The same rule governs the outbox's own children. Only a CANONICAL namespace
+that is present as something other than a real no-follow directory is refused.
+Every other entry there is skipped — a file-sync client writes its temporary
+files and conflict copies into the directories it is delivering, and a future
+Tine may add a namespace this build has never heard of. None of them is on a
+path the scan reads, so none can grant authority, and refusing them stranded a
+device over litter. The rule is about WHAT IS READ, so no sync tool is named in
+it. (Conflict copies INSIDE a namespace remain classified by
+`sync_conflict_base`, which recognizes the Syncthing, Seafile and Dropbox
+formats from their upstream sources.)
+
 `ProviderRuntime::open` creates the whole namespace inventory
 (`tine_core::oplog::SHARED_PROVIDER_TREE_NAMESPACES`) in both trees before any
 publication, and share preparation opens the transport before it writes a byte.
 A preparation that fails at any later step therefore leaves a complete tree
 with no descriptor in it, which discovers as "nothing to join yet" — never as a
 half-built tree another device could act on. Any reader that claims to
-recognize an untouched local skeleton takes that inventory from the same
-constant rather than re-listing it.
+recognize an untouched skeleton takes that inventory from the same constant
+rather than re-listing it.
+
+A first local activation writes NOTHING under the graph's `.tine-sync/`.
+Managed storage is write-shy about the graph folder until the user asks to
+share it, so the empty skeleton above appears only when the shared transport is
+opened: share preparation, join, and every shared reopen. Anything reasoning
+about "an untouched provider tree" is reasoning about that state, not about
+activation.
+
+The device that prepared a share owns the descriptor in its own outbox. If
+something outside Tine removes it, the actor republishes it byte-for-byte, so a
+graph whose sync tool propagated a peer's deletion becomes joinable again
+without the user re-running setup. That republication is bounded per actor
+session: one or two rounds cover an ordinary delivery window, and past that the
+actor stops and reports one condition naming the file, rather than writing
+against something that keeps deleting it.
 
 Shared-provider paths and files may be owned by a different operating-system
 user than the Tine process. This is normal for Android shared storage, NFS,

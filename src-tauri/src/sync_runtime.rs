@@ -907,11 +907,20 @@ pub(crate) fn shutdown_status(outcome: SyncShutdownOutcome) -> SparseV2RuntimeSt
 /// What the graph-local provider namespace proves for the narrowly scoped
 /// "Return to Direct files" escape hatch.
 ///
-/// The first local activation creates the provider directory skeleton before
-/// any shared enrollment exists.  Its mere presence is therefore not proof
-/// that another device can depend on this graph.  In contrast, a descriptor,
-/// provider work, or anything that does not exactly match that empty local
-/// skeleton is treated as shared/unknown and remains fail-closed.
+/// A first local activation writes NOTHING under `.tine-sync/` — it is
+/// write-shy about the graph folder until the user asks to share, and
+/// `tine_core::sync_runtime::tests::local_activation_writes_nothing_into_the_graphs_sync_folder`
+/// holds it to that. The empty namespace skeleton is written by the SHARED
+/// TRANSPORT (`ProviderRuntime::open`), which runs when a share is prepared or
+/// joined and on every shared reopen — always before any descriptor or
+/// publication exists. A file-sync client can also deliver that skeleton to a
+/// second device ahead of its contents.
+///
+/// So an exactly-empty skeleton still proves what this check needs — no other
+/// device can depend on this graph through it — but not for the reason this
+/// comment used to give. A descriptor, provider work, or anything that does not
+/// exactly match the empty skeleton is treated as shared/unknown and remains
+/// fail-closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderNamespaceEvidence {
     LocalOnly,
@@ -919,12 +928,12 @@ enum ProviderNamespaceEvidence {
 }
 
 const PROVIDER_SCAFFOLD_TREES: [&str; 2] = [PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR];
-/// Exactly what a first local activation writes — taken from the core that
-/// writes it, never re-listed here. A hand-copied list drifted the moment
-/// clean baselines were added: activation wrote eleven namespaces while this
-/// check still expected ten, so an ordinary local-only graph failed to match
-/// its own skeleton and the escape hatch warned every user that their graph
-/// might be shared with another device.
+/// Exactly what the shared provider transport writes when it opens a tree —
+/// taken from the core that writes it, never re-listed here. A hand-copied list
+/// drifted the moment clean baselines were added: the transport wrote eleven
+/// namespaces while this check still expected ten, so a tree that had only ever
+/// been opened failed to match its own skeleton and the escape hatch warned the
+/// user their graph might be shared with another device.
 const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 11] = SHARED_PROVIDER_TREE_NAMESPACES;
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
@@ -945,6 +954,9 @@ fn has_exact_directory_names(entries: &[std::fs::DirEntry], expected: &[&str]) -
         })
 }
 
+/// Is this tree exactly what opening a shared provider transport leaves, with
+/// nothing published into it? Not "what activation writes" — activation writes
+/// nothing here at all.
 fn is_empty_local_provider_scaffold(shared_root: &Path) -> Result<bool, String> {
     let root_entries = sorted_directory_entries(shared_root)?;
     if !has_exact_directory_names(&root_entries, &PROVIDER_SCAFFOLD_TREES) {
@@ -1006,8 +1018,8 @@ fn provider_namespace_evidence(path: &Path) -> Result<ProviderNamespaceEvidence,
 
     match inspect_shared_enrollment_for_cold_discovery(&shared.path()) {
         Ok(Some(_)) => Ok(ProviderNamespaceEvidence::SharedOrUnknown),
-        // A canonical empty provider topology is made by a first local
-        // activation, before any authority/share publication.  Any other
+        // A canonical empty provider topology is what opening the shared
+        // transport leaves, before any authority/share publication.  Any other
         // descriptor-inspection failure remains evidence, rather than being
         // guessed to be local-only.
         Ok(None) | Err(_) if is_empty_local_provider_scaffold(&shared.path())? => {
@@ -3642,10 +3654,11 @@ mod tests {
     }
 
     /// One source of truth for what a provider tree contains: the check that
-    /// recognizes an untouched local skeleton must expect exactly what a first
-    /// local activation writes, or an ordinary local graph reads as shared.
+    /// recognizes an untouched skeleton must expect exactly what the shared
+    /// provider transport writes when it opens a tree, or a graph that has only
+    /// ever opened one reads as shared.
     #[test]
-    fn the_local_scaffold_check_expects_what_activation_actually_writes() {
+    fn the_scaffold_check_expects_what_the_shared_transport_actually_writes() {
         assert_eq!(
             PROVIDER_SCAFFOLD_NAMESPACES.len(),
             SHARED_PROVIDER_TREE_NAMESPACES.len()
@@ -4022,7 +4035,7 @@ mod tests {
         found
     }
 
-    fn create_empty_local_provider_scaffold(graph_root: &Path) {
+    fn create_empty_provider_transport_scaffold(graph_root: &Path) {
         let shared = graph_root.join(".tine-sync/v2/shared");
         for tree in PROVIDER_SCAFFOLD_TREES {
             for namespace in PROVIDER_SCAFFOLD_NAMESPACES {
@@ -4171,7 +4184,7 @@ mod tests {
     #[test]
     fn cold_return_without_slot_archives_local_and_shared_provider_evidence_preserving_bytes() {
         let local = cold_fixture(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&local.graph_root);
+        create_empty_provider_transport_scaffold(&local.graph_root);
         let local_provider = snapshot_tree(&local.graph_root.join(".tine-sync/v2"));
         let local_result = cancel_sparse_v2_cold_at_paths(
             &local.state,
@@ -4253,7 +4266,7 @@ mod tests {
     #[test]
     fn cold_return_archive_failure_keeps_private_provider_and_markdown_bytes_retryable() {
         let fixture = cold_fixture(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let private_before = snapshot_tree(&fixture.private_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
         let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
@@ -4541,7 +4554,7 @@ mod tests {
     #[test]
     fn incomplete_local_activation_retires_without_touching_markdown_and_preserves_private_bytes() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
         assert_eq!(
             provider_namespace_evidence(&fixture.graph_root.join(".tine-sync/v2")).unwrap(),
@@ -4866,7 +4879,7 @@ mod tests {
     #[test]
     fn archive_failure_publishes_a_fresh_retryable_slot_after_shutdown() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let private_before = snapshot_tree(&fixture.private_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
         let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
