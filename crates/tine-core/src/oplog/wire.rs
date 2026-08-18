@@ -3204,6 +3204,15 @@ impl SharedProviderTransport {
     /// The cursor visits enrollment and manifests before immutable objects, so
     /// ingress can remain manifest-driven while still eventually surfacing a
     /// pre-existing generated-object conflict copy.
+    ///
+    /// Phase 0 sweeps the outbox's own children. It refuses ONLY a canonical
+    /// namespace that is present as something other than a real no-follow
+    /// directory. Every other entry is skipped: a file-sync client writes its
+    /// own temporary files and conflict copies into the very directories it is
+    /// delivering, and a future Tine may add a namespace this build has never
+    /// heard of. None of them are on a path this scan reads — phases 1 onwards
+    /// open canonical namespaces by name — so none of them can grant
+    /// authority, and refusing them stranded a device over litter.
     pub(crate) fn next_observed_path(
         &self,
         cursor: &mut SharedProviderObservationCursor,
@@ -3224,30 +3233,25 @@ impl SharedProviderTransport {
                     continue;
                 };
                 let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| ScenarioError::UnsafeProviderEntry("outbox/non-UTF-8".into()))?;
-                let known_namespace = matches!(
-                    name.as_str(),
-                    PROVIDER_ENROLLMENT_NAMESPACE
-                        | PROVIDER_MANIFESTS_NAMESPACE
-                        | PROVIDER_OBJECTS_NAMESPACE
-                        | SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE
-                        | SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE
-                        | SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE
-                        | SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE
-                        | SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE
-                        | PROVIDER_TEMP_NAMESPACE
-                        | PROVIDER_REMOVED_NAMESPACE
-                        | PROVIDER_RENAME_EVIDENCE_NAMESPACE
-                );
-                let is_directory = entry
+                // A name this build cannot even spell is a name no canonical
+                // namespace has, so it is one more entry nothing reads.
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if !SHARED_PROVIDER_TREE_NAMESPACES.contains(&name.as_str()) {
+                    continue;
+                }
+                let kind = entry
                     .file_type()
-                    .map_err(|error| ScenarioError::Io(error.to_string()))?
-                    .is_dir();
-                if !known_namespace || !is_directory {
-                    return Err(ScenarioError::UnsafeProviderEntry(name));
+                    .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                if kind.is_symlink() || !kind.is_dir() {
+                    return Err(ScenarioError::UnsafeProviderEntry(format!(
+                        "{}: expected a real no-follow directory",
+                        self.runtime
+                            .tree_path(ProviderTree::Outbox)
+                            .join(&name)
+                            .display()
+                    )));
                 }
                 continue;
             }
@@ -16455,18 +16459,94 @@ mod tests {
         );
     }
 
+    /// A file-sync client writes its own litter into the directories it is
+    /// delivering. Syncthing leaves `.syncthing.<name>.tmp` and
+    /// `<name>.sync-conflict-<date>-<device>` copies, Dropbox leaves
+    /// `<name> (conflicted copy …)`, Seafile leaves `<name> (SFConflict …)`.
+    /// None of them are on a path the provider scan reads, so none of them may
+    /// stop it — and the rule is about WHAT IS READ, not about which tool wrote
+    /// the litter, so no tool is named in the check.
+    #[test]
+    fn provider_litter_beside_the_namespaces_does_not_stop_the_scan() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        provider.publish_descriptor(b"descriptor").unwrap();
+
+        let outbox = provider_root.join("outbox");
+        for stray in [
+            ".syncthing.enrollment.tmp",
+            "enrollment.sync-conflict-20260705-141233-A2B3C4D",
+            "objects (conflicted copy 2026-08-18).txt",
+            "notes (SFConflict martin 2026-08-18-15-04-05).md",
+            ".stfolder",
+            ".DS_Store",
+            "namespace-from-a-newer-tine-v9",
+        ] {
+            fs::write(outbox.join(stray), b"litter").unwrap();
+        }
+        // A directory-shaped stray, and one whose name this build cannot spell.
+        fs::create_dir(outbox.join("~syncthing~staging")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = std::ffi::OsStr::from_bytes(b"stray-\xff-name");
+            fs::write(outbox.join(non_utf8), b"litter").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.0.join("elsewhere"), outbox.join("dangling-stray"))
+            .unwrap();
+
+        assert_eq!(
+            drain_observed_paths(&provider),
+            vec![SHARED_ENROLLMENT_DESCRIPTOR_PATH.to_owned()],
+            "the scan reads the canonical namespaces and ignores everything beside them"
+        );
+
+        // A CANONICAL namespace that is not a real directory is the shape this
+        // sweep exists for, and it still refuses.
+        fs::remove_dir_all(outbox.join(PROVIDER_REMOVED_NAMESPACE)).unwrap();
+        fs::write(outbox.join(PROVIDER_REMOVED_NAMESPACE), b"not a directory").unwrap();
+        assert!(matches!(
+            drain_observed_paths_result(&provider),
+            Err(ScenarioError::UnsafeProviderEntry(detail))
+                if detail.contains(PROVIDER_REMOVED_NAMESPACE)
+                    && detail.contains("real no-follow directory")
+        ));
+        fs::remove_file(outbox.join(PROVIDER_REMOVED_NAMESPACE)).unwrap();
+
+        #[cfg(unix)]
+        {
+            let elsewhere = root.0.join("elsewhere-namespace");
+            fs::create_dir(&elsewhere).unwrap();
+            fs::remove_dir_all(outbox.join(PROVIDER_TEMP_NAMESPACE)).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, outbox.join(PROVIDER_TEMP_NAMESPACE)).unwrap();
+            assert!(matches!(
+                drain_observed_paths_result(&provider),
+                Err(ScenarioError::UnsafeProviderEntry(_))
+            ));
+        }
+    }
+
     fn drain_observed_paths(provider: &SharedProviderTransport) -> Vec<String> {
-        let mut cursor = provider.full_observation_cursor().unwrap();
+        drain_observed_paths_result(provider).unwrap()
+    }
+
+    fn drain_observed_paths_result(
+        provider: &SharedProviderTransport,
+    ) -> Result<Vec<String>, ScenarioError> {
+        let mut cursor = provider.full_observation_cursor()?;
         let mut paths = Vec::new();
         loop {
-            match provider.next_observed_path(&mut cursor).unwrap() {
+            match provider.next_observed_path(&mut cursor)? {
                 SharedProviderObservation::Path(path) => paths.push(path),
                 SharedProviderObservation::ChunkBoundary => cursor.begin_next_chunk(),
                 SharedProviderObservation::Complete => break,
             }
         }
         paths.sort();
-        paths
+        Ok(paths)
     }
 }
 
