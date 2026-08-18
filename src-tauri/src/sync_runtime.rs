@@ -2220,6 +2220,18 @@ enum ProviderNamespaceArchive {
 /// namespace, so archiving only private app-data would leave a delayed
 /// lockout.  This is a same-filesystem rename, never a delete or copy.
 fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespaceArchive, String> {
+    archive_graph_provider_namespace_with(graph_root, |shared| {
+        matches!(
+            inspect_shared_enrollment_for_cold_discovery(shared),
+            Ok(Some(_))
+        )
+    })
+}
+
+fn archive_graph_provider_namespace_with(
+    graph_root: &Path,
+    joinable: impl FnOnce(&Path) -> bool,
+) -> Result<ProviderNamespaceArchive, String> {
     let source = graph_root.join(".tine-sync/v2");
     let metadata = match std::fs::symlink_metadata(&source) {
         Ok(metadata) => metadata,
@@ -2234,6 +2246,19 @@ fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespa
     };
     if metadata.file_type().is_symlink() {
         return Err("Graph-local managed-storage state is a symbolic link, so it could not be archived safely.".into());
+    }
+    // A COMPLETE provider tree is the other device's live enrollment, and this
+    // folder is synced: archiving it here removes the descriptor from the
+    // device that is still sharing, which is how Martin's graph ended up with
+    // two `recovery/v2-*` archives and no `v2` at all. The archive exists only
+    // to stop an UNCLAIMED namespace from locking a later Direct Files open
+    // out, and a joinable tree does not — `refuse_unclaimed_sparse_archive`
+    // admits it and the panel offers Join beside it.
+    if joinable(&source.join("shared")) {
+        crate::debug::diag(
+            "sparse-v2 direct-files return: phase=graph_provider; outcome=preserved_joinable_peer_evidence",
+        );
+        return Ok(ProviderNamespaceArchive::Absent);
     }
     let tine_sync = source
         .parent()
@@ -4963,6 +4988,44 @@ mod tests {
             .unwrap()
             .legacy_graph()
             .is_ok());
+    }
+
+    /// A Direct Files return must not take the OTHER device's enrollment with
+    /// it. The graph folder is synced, so archiving a live provider tree here
+    /// removes the descriptor from the device that is still sharing — Martin's
+    /// graph reached two `recovery/v2-*` archives and no `v2` exactly that way,
+    /// and the phone was then told the graph "does not yet contain sync data".
+    ///
+    /// The archive exists only so that an UNCLAIMED namespace cannot lock a
+    /// later Direct Files open out. A joinable tree does not: the cold check
+    /// admits it and the panel offers Join beside it.
+    #[test]
+    fn a_direct_files_return_preserves_a_joinable_peer_tree_and_archives_an_unclaimed_one() {
+        let joinable =
+            std::env::temp_dir().join(format!("tine-df-return-joinable-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(joinable.join(".tine-sync/v2/shared")).unwrap();
+        std::fs::write(joinable.join(".tine-sync/v2/shared/evidence"), b"peer").unwrap();
+        let before = snapshot_tree(&joinable.join(".tine-sync/v2"));
+        let archived = archive_graph_provider_namespace_with(&joinable, |shared| {
+            assert_eq!(shared, joinable.join(".tine-sync/v2/shared"));
+            true
+        })
+        .unwrap();
+        assert!(matches!(archived, ProviderNamespaceArchive::Absent));
+        assert_eq!(snapshot_tree(&joinable.join(".tine-sync/v2")), before);
+        assert!(!joinable.join(".tine-sync/recovery").exists());
+
+        let unclaimed =
+            std::env::temp_dir().join(format!("tine-df-return-unclaimed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(unclaimed.join(".tine-sync/v2/shared")).unwrap();
+        std::fs::write(unclaimed.join(".tine-sync/v2/shared/evidence"), b"mine").unwrap();
+        let before = snapshot_tree(&unclaimed.join(".tine-sync/v2"));
+        let archived = archive_graph_provider_namespace_with(&unclaimed, |_| false).unwrap();
+        let ProviderNamespaceArchive::Moved { destination, .. } = archived else {
+            panic!("an unclaimed namespace must still be archived");
+        };
+        assert!(!unclaimed.join(".tine-sync/v2").exists());
+        assert_eq!(snapshot_tree(&destination), before);
     }
 
     #[test]
