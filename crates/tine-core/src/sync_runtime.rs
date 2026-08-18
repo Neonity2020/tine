@@ -46097,7 +46097,7 @@ mod tests {
         clear_graph_name_folding_for_tests(&graph_root);
         assert!(
             receipt.starts_with("ok "),
-            "a filesystem that cannot hold two of the graph's page names must not deny the              whole graph: {receipt}"
+            "a filesystem that cannot hold two of the graph's page names must not deny the whole graph: {receipt}"
         );
         assert!(
             receipt.contains("graph_name_folding=ascii_case+unicode_case"),

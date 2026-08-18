@@ -870,7 +870,7 @@ pub fn run_managed_storage_journey(
                 && page.blocks[0].raw.as_str() == expected_owner_block => {}
         outcome => {
             return format!(
-                "the case pair's owning page did not hold what this filesystem holds                  (expected one block {expected_owner_block:?}): {outcome:?}; {folding_receipt};                  {reconciliation}"
+                "the case pair's owning page did not hold what this filesystem holds (expected one block {expected_owner_block:?}): {outcome:?}; {folding_receipt}; {reconciliation}"
             )
         }
     }
@@ -885,14 +885,14 @@ pub fn run_managed_storage_journey(
     }) {
         Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. }) => {
             return format!(
-                "the case twin became a second page: path={} blocks={}; {folding_receipt};                  {reconciliation}",
+                "the case twin became a second page: path={} blocks={}; {folding_receipt}; {reconciliation}",
                 escape_journey_path(page.path.as_str()),
                 page.blocks.len()
             )
         }
         Err(error) => {
             return format!(
-                "loading the case twin failed instead of reporting it is not a page: {error};                  {folding_receipt}"
+                "loading the case twin failed instead of reporting it is not a page: {error}; {folding_receipt}"
             )
         }
         Ok(_) => {}
@@ -910,9 +910,9 @@ pub fn run_managed_storage_journey(
         Ok(bytes) if bytes == twin_expectation => {}
         other => {
             return format!(
-                "the outside writer's bytes at {} were not left alone: {other:?};                  {folding_receipt}",
-                escape_journey_path(twin_on_disk)
-            )
+            "the outside writer's bytes at {} were not left alone: {other:?}; {folding_receipt}",
+            escape_journey_path(twin_on_disk)
+        )
         }
     }
 
