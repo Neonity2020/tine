@@ -409,6 +409,66 @@ fn is_tine_atomic_page_temp_path(path: &Path) -> bool {
         && is_page_file_path(Path::new(page_name))
 }
 
+/// Directories whose churn a graph's watcher must never be woken by (Concord
+/// P5). A repository or sync client parked inside the graph tree generates
+/// thousands of events that CANNOT describe graph text — a `git gc`, an index
+/// lock taken and dropped per command, a `.stversions` sweep — and every one of
+/// them used to cross the channel, take the app-state read lock, lease each
+/// graph and run two scope classifications before being discarded.
+///
+/// The scope is deliberately an explicit NAME LIST rather than "anything the
+/// graph-text scope excludes": `.tine-sync` is also excluded from graph text,
+/// but it is Tine's OWN provider tree and the managed lane's observations
+/// depend on those events. A name here must be provably outside graph text on
+/// its own — `vcs_and_tool_noise_dirs_can_never_hold_graph_text` asserts
+/// exactly that against `GraphTextScope`, so this list can never hide a page.
+///
+/// Matched against components of the path RELATIVE to a watched graph root, so
+/// a graph that itself lives under (say) `/repo/.git/notes` is unaffected.
+const VCS_AND_TOOL_NOISE_DIRS: &[&str] = &[
+    ".bzr",
+    ".git",
+    ".hg",
+    ".jj",
+    ".stfolder",
+    ".stversions",
+    ".svn",
+    // NOT `_darcs`: it carries no leading dot and is not in the core's fixed
+    // exclusions, so `_darcs/Page.md` IS eligible graph text. The guard test
+    // below caught it on the first run — which is the whole reason this list is
+    // asserted against `GraphTextScope` rather than assumed.
+    "node_modules",
+];
+
+fn path_is_tool_noise(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative.components().any(|component| {
+        let Some(name) = component.as_os_str().to_str() else {
+            return false;
+        };
+        VCS_AND_TOOL_NOISE_DIRS.contains(&name)
+    })
+}
+
+/// True when EVERY path this event reports is tool noise under some watched
+/// root — the only case it is safe to drop the event outright.
+///
+/// Never true for a rescan-required event (a kernel queue overflow says nothing
+/// about which paths were lost) or a pathless one, and never true for a
+/// multi-path event with even one ordinary path: a rename that moves a file OUT
+/// of `.git` reports both sides and must still be seen.
+fn watch_event_is_tool_noise(event: &notify::Event, roots: &HashSet<PathBuf>) -> bool {
+    if event.need_rescan() || event.paths.is_empty() || roots.is_empty() {
+        return false;
+    }
+    event
+        .paths
+        .iter()
+        .all(|path| roots.iter().any(|root| path_is_tool_noise(root, path)))
+}
+
 fn incremental_page_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
 
@@ -1197,6 +1257,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
     use notify::Watcher;
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let pending = Arc::new(Mutex::new(Pending::default()));
+    // The roots the OS watcher currently covers, shared with its callback so
+    // the callback can drop VCS/tool noise before it costs anything. Written by
+    // the loop each cycle, read once per event.
+    let watched_roots: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
     if let Ok(mut slot) = app.state::<AppState>().watch_ctl.lock() {
         *slot = Some(tx.clone());
     }
@@ -1306,6 +1370,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 .iter()
                 .map(|(_, root)| root.clone())
                 .collect();
+            if let Ok(mut roots) = watched_roots.lock() {
+                if *roots != desired {
+                    roots.clone_from(&desired);
+                }
+            }
 
             // Bring the OS watcher in line with the current mode + graph roots.
             if inotify {
@@ -1313,8 +1382,20 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     let txc = tx.clone();
                     let pendingc = pending.clone();
                     let appc = app.clone();
+                    let rootsc = watched_roots.clone();
                     watcher =
                         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                            // A repository's own churn is not a graph change.
+                            // Dropped here, before the app-state lock, the graph
+                            // leases, the scope classifications and the wake.
+                            if let Ok(event) = &res {
+                                if rootsc
+                                    .lock()
+                                    .is_ok_and(|roots| watch_event_is_tool_noise(event, &roots))
+                                {
+                                    return;
+                                }
+                            }
                             match &res {
                                 Ok(event) => observe_legacy_graph_text_callback(&appc, Some(event)),
                                 Err(_) => observe_legacy_graph_text_callback(&appc, None),
@@ -1979,6 +2060,167 @@ mod tests {
         assert_eq!(pending.paths, paths.into_iter().collect());
         assert!(pending.full_paths.is_empty());
         assert!(!pending.need_full);
+    }
+
+    /// Concord P5: what the watcher admits from `.git/**` and its equivalents,
+    /// stated explicitly and tested. A repository parked in the graph tree is
+    /// the loudest event source a Direct Files user has; none of its churn can
+    /// describe graph text, so none of it may cost anything.
+    #[test]
+    fn vcs_and_tool_churn_never_wakes_the_watcher() {
+        use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
+
+        let roots = HashSet::from([PathBuf::from("/graphs/a")]);
+        let noise: &[(EventKind, &str)] = &[
+            (
+                EventKind::Create(CreateKind::File),
+                "/graphs/a/.git/index.lock",
+            ),
+            (
+                EventKind::Remove(RemoveKind::File),
+                "/graphs/a/.git/index.lock",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "/graphs/a/.git/objects/ab/cdef0123456789",
+            ),
+            (
+                EventKind::Create(CreateKind::Any),
+                "/graphs/a/.git/refs/heads/main",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+                "/graphs/a/.hg/store/data/page.md.i",
+            ),
+            (
+                EventKind::Create(CreateKind::File),
+                "/graphs/a/.jj/repo/op_store/x",
+            ),
+            (EventKind::Create(CreateKind::File), "/graphs/a/.svn/wc.db"),
+            (
+                EventKind::Create(CreateKind::File),
+                "/graphs/a/.stversions/pages/Note~20260818.md",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "/graphs/a/.stfolder/marker",
+            ),
+            (
+                EventKind::Create(CreateKind::File),
+                "/graphs/a/node_modules/pkg/readme.md",
+            ),
+        ];
+        for (kind, path) in noise {
+            let event = notify::Event {
+                kind: *kind,
+                paths: vec![PathBuf::from(path)],
+                attrs: Default::default(),
+            };
+            assert!(
+                watch_event_is_tool_noise(&event, &roots),
+                "{path} must not wake the watcher"
+            );
+        }
+
+        // Everything else still gets through, including the cases a name list
+        // is most likely to over-reach on.
+        let admitted: &[(EventKind, Vec<&str>)] = &[
+            // Tine's own provider tree is hidden from graph text too, but the
+            // managed lane's observations are made of exactly these events.
+            (
+                EventKind::Create(CreateKind::File),
+                vec!["/graphs/a/.tine-sync/v2/shared/outbox/0001"],
+            ),
+            // An ordinary page, and configuration.
+            (
+                EventKind::Create(CreateKind::File),
+                vec!["/graphs/a/pages/Note.md"],
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                vec!["/graphs/a/logseq/config.edn"],
+            ),
+            // A rename OUT of .git reports both sides: one ordinary path is
+            // enough to keep the whole event.
+            (
+                EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+                vec!["/graphs/a/.git/tmp_obj_x", "/graphs/a/pages/Note.md"],
+            ),
+            // A path under no watched root is not ours to judge.
+            (
+                EventKind::Create(CreateKind::File),
+                vec!["/elsewhere/.git/index"],
+            ),
+        ];
+        for (kind, paths) in admitted {
+            let event = notify::Event {
+                kind: *kind,
+                paths: paths.iter().map(PathBuf::from).collect(),
+                attrs: Default::default(),
+            };
+            assert!(
+                !watch_event_is_tool_noise(&event, &roots),
+                "{paths:?} must still be seen"
+            );
+        }
+
+        // A kernel queue overflow says nothing about which paths were lost, so
+        // its rescan demand survives even when its paths look like noise.
+        let mut overflow = notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/graphs/a/.git/objects")],
+            attrs: Default::default(),
+        };
+        overflow = overflow.set_flag(notify::event::Flag::Rescan);
+        assert!(!watch_event_is_tool_noise(&overflow, &roots));
+
+        // With no watched root there is nothing to strip a prefix against.
+        let event = notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/graphs/a/.git/index.lock")],
+            attrs: Default::default(),
+        };
+        assert!(!watch_event_is_tool_noise(&event, &HashSet::new()));
+    }
+
+    /// The list is only safe because every name on it is provably outside graph
+    /// text on its own authority — the core's `GraphTextScope`, which discovery
+    /// and the full-diff walk also use. If a name ever became page-bearing,
+    /// dropping its events would hide pages; this fails first.
+    #[test]
+    fn vcs_and_tool_noise_dirs_can_never_hold_graph_text() {
+        let scope = tine_core::graph_text_scope::GraphTextScope::new(&[], false);
+        for name in VCS_AND_TOOL_NOISE_DIRS {
+            assert!(
+                !scope.should_descend(name),
+                "{name} must be outside graph text"
+            );
+            assert!(
+                !scope.is_eligible(&format!("{name}/Page.md")),
+                "{name}/Page.md must never be a page"
+            );
+            assert!(
+                !scope.is_eligible(&format!("pages/{name}/Page.md")),
+                "pages/{name}/Page.md must never be a page"
+            );
+        }
+        // ...and the one Tine-owned hidden tree that is deliberately NOT here.
+        assert!(!VCS_AND_TOOL_NOISE_DIRS.contains(&".tine-sync"));
+    }
+
+    /// A graph that itself lives inside a repository's directory must not have
+    /// every one of its own events dropped.
+    #[test]
+    fn a_graph_under_a_noise_directory_is_judged_relative_to_its_root() {
+        use notify::event::{CreateKind, EventKind};
+
+        let roots = HashSet::from([PathBuf::from("/repo/.git/notes")]);
+        let event = notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![PathBuf::from("/repo/.git/notes/pages/Note.md")],
+            attrs: Default::default(),
+        };
+        assert!(!watch_event_is_tool_noise(&event, &roots));
     }
 
     #[test]
