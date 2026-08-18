@@ -8691,16 +8691,17 @@ fn preflight_desired_page_names(
             owner != page_id && !transition.released_name_owners.contains(&owner)
         }) {
             // Said in the user's words, because this is the text a device
-            // showed Martin once per tick: a page name and a UUID, neither of
+            // showed the user once per tick: a page name and a UUID, neither of
             // which appears anywhere in the app. Page names fold case and
             // Unicode normalization here exactly as they do in Logseq
             // (`canonical_page_name_key`), so "differ by more than
             // capitalisation, accent spelling, or # vs %23" is the action that
-            // actually resolves it — Martin's real graph carried
-            // "ŠCS task dump #scs.md" beside "ŠCS task dump %23scs.md", both
-            // written by Logseq itself in 2024, so the escape case is the one a
-            // real user actually meets — and it
-            // is the same sentence on a filesystem that folds those names into
+            // actually resolves it. The escape case is not hypothetical: a
+            // reported graph held one title twice, once with a literal `#` and
+            // once with `%23`, both files written by Logseq years earlier — so
+            // a message naming only capitalisation would read as "not my
+            // problem" to the person actually hitting it. The sentence is the
+            // same on a filesystem that folds those names into
             // one file (`docs/storage-sync-contract.md` §2.10d). The owning
             // page id stays at the end for diagnosis.
             return Err(authority_block(
@@ -13624,15 +13625,15 @@ mod tests {
     /// physical spellings that `decode_page_name` maps back to one name.
     #[test]
     fn clean_reconciliation_admits_a_name_twin_activation_deduplicated() {
-        // "ŠCS task dump #scs" written twice: once with the literal `#` an
+        // "Želva sample page #alpha" written twice: once with the literal `#` an
         // outside editor produces, once with the `%23` Tine's own filename
         // encoder produces for the same title. Both decode to one page name.
-        const PRECOMPOSED: &str = "pages/\u{160}CS task dump #scs.md";
-        const ENCODED: &str = "pages/\u{160}CS task dump %23scs.md";
+        const PRECOMPOSED: &str = "pages/\u{17d}elva sample page #alpha.md";
+        const ENCODED: &str = "pages/\u{17d}elva sample page %23alpha.md";
         // The same title again, this time as a decomposed FILE NAME: one
         // portable path identity, two exact spellings, which is what syncing a
         // graph between a decomposing and a precomposing filesystem produces.
-        const DECOMPOSED: &str = "pages/S\u{30c}CS task dump #scs.md";
+        const DECOMPOSED: &str = "pages/Z\u{30c}elva sample page #alpha.md";
         let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
             "clean-duplicate-name-twin",
             &[
