@@ -729,6 +729,88 @@ at the primitive, and
 plus `…::a_projection_directory_barrier_refusal_still_fails_closed_off_android`
 at the save boundary.
 
+### 2.10b No-clobber publication when the filesystem has no rename flags
+
+The directory barrier is not the only primitive Android shared storage refuses.
+Android CI run 32091898520 recorded the **flagged rename itself** failing:
+
+```
+retained_publication=… phase:ProjectionDrain settled:false turns:2
+detail:projecting "pages/Smoke.md": renameat2(RENAME_NOREPLACE) publishing the
+projection failed at "Smoke.md" -> ".Smoke.md.49a4ed18…"
+```
+
+with `Invalid argument (os error 22)` underneath. Two earlier lanes eliminated
+this call by reading AOSP `FuseDaemon.cpp`, whose `do_rename` accepts exactly
+that flag. The device disagreed. `RENAME_NOREPLACE` has to be provided by every
+layer — the kernel FUSE client, the daemon, and the filesystem underneath it —
+and on this path it is not. **Upstream source is evidence about upstream intent,
+not proof about the running device; the receipt wins.** The same `EINVAL` is
+reachable off Android on any filesystem without `rename2` flags (FAT/exFAT
+removable media, some FUSE and network mounts).
+
+`model::rename_projection_noreplace_with_class` therefore applies a capability
+policy to the no-clobber publication, keyed on the same
+`DurabilityArtifactClass`:
+
+| Class | Policy for the flagged rename |
+| --- | --- |
+| `PrivateDurableAuthority` | The platform primitive and nothing else, on every platform. There is no second copy to rebuild these bytes from, so a non-atomic publication could leave a reserved-but-empty file at a live graph name after a crash. A filesystem that cannot provide the primitive fails the write. |
+| `SharedReconstructibleProjection` | `EINVAL`, `ENOSYS` and `EOPNOTSUPP`/`ENOTSUP` from the flagged rename — and **only** those three, matched on the raw `errno`, not on `ErrorKind` — are read as "this filesystem does not implement that flag" and retried through the reservation fallback below. Every other errno (`EIO`, `ENOSPC`, `EACCES`, `EXDEV`, `EEXIST`, `ENOENT`) describes the operation rather than the flag and stays fatal. |
+
+Unlike the directory barrier in §2.10a, this policy is **not gated on Android**.
+The barrier policy gives a guarantee up, so it is confined to the platform that
+forces the choice; this one keeps its guarantee and gives up only atomicity, and
+failing the write closed on a FAT stick would be an availability bug with no
+in-scope threat behind it.
+
+**The fallback (`model::reserve_and_rename_projection`).** Reserve the
+destination name with an exclusive create (`O_CREAT|O_EXCL`), then perform a
+plain `rename` onto the reservation.
+
+* *What it keeps.* Never silently destroy a file already at the destination —
+  the one guarantee `RENAME_NOREPLACE` was there to provide. An occupied
+  destination fails the reservation before anything has moved, and is reported
+  as `AlreadyExists`, the exact error the flagged rename raises, so every
+  guarded-conflict caller above is unchanged. A failed reservation is fatal, never
+  a silent overwrite. If the plain rename then fails, the reservation is rolled
+  back — but only when the destination is still, by physical identity, the
+  placeholder that call created — so a failed publication leaves no zero-length
+  file at a live page name.
+* *What it gives up.* Atomicity of the name transition. Inside the window
+  between the reservation and the rename the destination exists as a zero-length
+  file, so (a) a crash there leaves a zero-length name, which the projection
+  drain rebuilds from the accepted manifest on the next open exactly as it
+  rebuilds any interrupted projection, and (b) an external writer that replaces
+  the placeholder inside that window is overwritten rather than winning the race.
+  Both are why the fallback is confined to the reconstructible class.
+
+The answer is a property of the mounted filesystem, so it is remembered per
+`st_dev` after the first capability refusal instead of costing a failed syscall
+on every publication. The memo is consulted only for the reconstructible class
+and is never load-bearing: an unknown device simply attempts the flagged rename
+and learns from it.
+
+The reconstructible-projection call sites are the ones bracketed by
+`preflight_reconstructible_projection_chain` /
+`sync_reconstructible_projection_chain`: retiring a live page to its attempt
+recovery name, publishing the staged bytes onto the live name, withdrawing an
+unsafe publication, restoring a displaced target, retiring a recovery artifact
+into quarantine, and preserving a changed recovery artifact as a projection
+conflict. The graph-tree write paths that are *not* on that leg —
+`managed_atomic_create_with_proof`, `managed_atomic_write_with_conflict`,
+`managed_atomic_replace_bound`, `managed_move_noreplace` — keep the strict
+class, because in Direct Files the graph tree is the sole authority for those
+bytes.
+
+Enforced by `model::tests::only_the_reconstructible_projection_rename_falls_back_when_the_flag_is_unsupported`,
+`…::the_projection_rename_fallback_refuses_an_occupied_destination_rather_than_clobbering_it`,
+`…::a_projection_rename_fallback_that_cannot_complete_leaves_no_empty_destination`,
+and at the save boundary by
+`sync_runtime::tests::clean_runtime_save_survives_a_projection_rename_capability_refusal`
+(which also compares the displacement artifacts against an uninjected control
+save) plus `…::a_non_capability_errno_from_the_projection_rename_still_fails_closed`.
+
 Unix UID equality and “only the current user may write this path” are
 deliberately absent. The threat model does not defend against a malicious actor
 who can already rewrite the user's private filesystem, and those checks reject

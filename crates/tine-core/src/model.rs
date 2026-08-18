@@ -17944,7 +17944,7 @@ impl Graph {
                             target,
                         )?;
                         publish_name = Some(publication.clone());
-                        rename_projection_noreplace(
+                        rename_reconstructible_projection_noreplace(
                             parent.final_dir(),
                             &publication,
                             &target_path.filename,
@@ -18964,7 +18964,7 @@ impl Graph {
         preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         projection_recovery_retirement_after_validation_hook()?;
-        rename_projection_noreplace(
+        rename_reconstructible_projection_noreplace(
             parent.final_dir(),
             record.recovery_filename(),
             &quarantine_name,
@@ -23945,7 +23945,7 @@ fn retain_projection_recovery_conflict(
             "projection recovery changed identity while preserving a conflict",
         ));
     }
-    rename_projection_noreplace(parent.final_dir(), source_name, &conflict_name)?;
+    rename_reconstructible_projection_noreplace(parent.final_dir(), source_name, &conflict_name)?;
     sync_reconstructible_projection_chain(&parent.chain)?;
     projection_recovery_relative_path(&target.relative_path, &conflict_name)
 }
@@ -30633,7 +30633,7 @@ fn create_projection_staging_file(
 }
 
 fn retire_projection_target(dir: &Dir, filename: &str, recovery: &str) -> io::Result<()> {
-    rename_projection_noreplace(dir, filename, recovery)
+    rename_reconstructible_projection_noreplace(dir, filename, recovery)
 }
 
 fn projection_attempt_target_recovery_filename(
@@ -30665,7 +30665,7 @@ fn withdraw_projection_target_to_named_recovery(
     filename: &str,
     recovery: &str,
 ) -> io::Result<()> {
-    rename_projection_noreplace(dir, filename, recovery)
+    rename_reconstructible_projection_noreplace(dir, filename, recovery)
 }
 
 fn withdraw_projection_target_to_recovery(dir: &Dir, filename: &str) -> io::Result<String> {
@@ -30674,7 +30674,7 @@ fn withdraw_projection_target_to_recovery(dir: &Dir, filename: &str) -> io::Resu
             ".{filename}.{}.projection.recovery",
             uuid::Uuid::new_v4().simple()
         );
-        match rename_projection_noreplace(dir, filename, &recovery) {
+        match rename_reconstructible_projection_noreplace(dir, filename, &recovery) {
             Ok(()) => return Ok(recovery),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -30793,7 +30793,8 @@ fn preserve_and_restore_projection_recovery(
         let _ = parent.final_dir().remove_file(&temp);
         return Ok(());
     }
-    let restore = rename_projection_noreplace(parent.final_dir(), &temp, &target.filename);
+    let restore =
+        rename_reconstructible_projection_noreplace(parent.final_dir(), &temp, &target.filename);
     match restore {
         Ok(()) => {
             preflight_reconstructible_projection_chain(&parent.chain)?;
@@ -30893,8 +30894,36 @@ fn preflight_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
     )
 }
 
+/// The exact platform primitive named by the projection receipt. It is a
+/// per-target constant so the enriched failure detail keeps naming the call the
+/// device actually refused.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
+    "renameat2(RENAME_NOREPLACE) publishing the projection";
+
+#[cfg(target_os = "macos")]
+const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
+    "renameatx_np(RENAME_EXCL) publishing the projection";
+
+#[cfg(windows)]
+const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
+    "FileRenameInformation(ReplaceIfExists=false) publishing the projection";
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+)))]
+const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
+    "atomic no-clobber rename publishing the projection";
+
+/// The raw platform no-replace rename. It deliberately returns the untouched
+/// platform error: [`rename_projection_noreplace_with_class`] needs the exact
+/// `errno` to tell a filesystem that cannot provide the flag from a filesystem
+/// that refused the operation, and `io::Error::new` would discard it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
 
@@ -30915,17 +30944,13 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
             libc::RENAME_NOREPLACE as libc::c_uint,
         )
     };
-    (result == 0).then_some(()).ok_or_else(|| {
-        projection_platform_error(
-            "renameat2(RENAME_NOREPLACE) publishing the projection",
-            &format!("{from:?} -> {to:?}"),
-            io::Error::last_os_error(),
-        )
-    })
+    (result == 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error)
 }
 
 #[cfg(target_os = "macos")]
-fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
 
@@ -30948,7 +30973,7 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
 }
 
 #[cfg(windows)]
-fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     rename_projection_between_noreplace(dir, from, dir, to)
 }
 
@@ -31062,12 +31087,311 @@ fn rename_projection_between_noreplace(
     target_os = "android",
     windows
 )))]
-fn rename_projection_noreplace(_dir: &Dir, _from: &str, _to: &str) -> io::Result<()> {
+fn rename_projection_noreplace_platform(_dir: &Dir, _from: &str, _to: &str) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-clobber projection publication is unsupported on this platform",
     ))
 }
+
+/// The strict, sole-authority no-clobber publication. Every caller here writes a
+/// graph-tree artifact the graph itself is the only authority for, so the atomic
+/// primitive is the contract: there is no second copy to rebuild from, and a
+/// two-step publication would leave a reserved-but-empty live name behind a
+/// crash. A filesystem that cannot provide the primitive fails the write.
+fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+    rename_projection_noreplace_with_class(
+        dir,
+        from,
+        to,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+    )
+}
+
+/// The same publication for the Markdown/Org projection of an already-accepted
+/// manifest. Android CI run 32091898520 showed the flagged rename itself failing
+/// with `EINVAL` on shared storage — `renameat2(RENAME_NOREPLACE) publishing the
+/// projection failed at "Smoke.md" -> ".Smoke.md.49a4ed18…"` — so this class
+/// carries a capability fallback; see [`reserve_and_rename_projection`].
+fn rename_reconstructible_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+    rename_projection_noreplace_with_class(
+        dir,
+        from,
+        to,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+    )
+}
+
+/// Is this platform error the filesystem saying "I do not implement that flag"?
+///
+/// `renameat2` reports an unsupported flag as `EINVAL` on most filesystems, as
+/// `ENOSYS` when the syscall itself is absent, and as `EOPNOTSUPP`/`ENOTSUP` on
+/// some stacked filesystems. Those three, and only those three, are capability
+/// answers. Every other errno — `EIO`, `ENOSPC`, `EACCES`, `EXDEV`, `EEXIST`,
+/// `ENOENT` — describes the operation, not the flag, and stays fatal.
+#[cfg(unix)]
+fn is_flagged_rename_capability_refusal(error: &io::Error) -> bool {
+    // Written as comparisons rather than a `match`: on Linux `ENOTSUP` and
+    // `EOPNOTSUPP` are the same value, and repeating them as patterns is an
+    // unreachable-pattern lint.
+    error.raw_os_error().is_some_and(|errno| {
+        errno == libc::EINVAL
+            || errno == libc::ENOSYS
+            || errno == libc::EOPNOTSUPP
+            || errno == libc::ENOTSUP
+    })
+}
+
+/// Windows has one no-replace primitive and it is `FileRenameInformation` with
+/// `ReplaceIfExists = FALSE`, which NTFS/ReFS/FAT all implement. There is no
+/// capability answer to recognise, so nothing degrades there.
+#[cfg(not(unix))]
+fn is_flagged_rename_capability_refusal(_error: &io::Error) -> bool {
+    false
+}
+
+/// Filesystems (by `st_dev`) already known to refuse the flagged rename.
+///
+/// The answer is a property of the mounted filesystem, not of one file, so it is
+/// remembered once instead of costing a failed syscall on every publication. It
+/// is only ever consulted for the reconstructible projection class, so the
+/// strict class cannot read or write it.
+#[cfg(unix)]
+static FLAGGED_RENAME_UNSUPPORTED_DEVICES: RwLock<std::collections::BTreeSet<u64>> =
+    RwLock::new(std::collections::BTreeSet::new());
+
+#[cfg(unix)]
+fn projection_device_id(dir: &Dir) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(dir.try_clone()?.into_std_file().metadata()?.dev())
+}
+
+/// A miss is never load-bearing: an unknown device simply attempts the flagged
+/// rename and learns the answer from it. Correctness does not depend on the
+/// cache, only the syscall count does.
+#[cfg(unix)]
+fn flagged_rename_known_unsupported(dir: &Dir) -> bool {
+    let Ok(device) = projection_device_id(dir) else {
+        return false;
+    };
+    FLAGGED_RENAME_UNSUPPORTED_DEVICES
+        .read()
+        .is_ok_and(|devices| devices.contains(&device))
+}
+
+#[cfg(unix)]
+fn remember_flagged_rename_unsupported(dir: &Dir) {
+    if let Ok(device) = projection_device_id(dir) {
+        if let Ok(mut devices) = FLAGGED_RENAME_UNSUPPORTED_DEVICES.write() {
+            devices.insert(device);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn flagged_rename_known_unsupported(_dir: &Dir) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn remember_flagged_rename_unsupported(_dir: &Dir) {}
+
+/// Publish without the flag, on a filesystem that does not implement it.
+///
+/// **What it keeps.** The destination name is reserved with an exclusive create
+/// (`O_CREAT|O_EXCL`), which fails with `EEXIST` if anything already occupies
+/// that name. So the one guarantee `RENAME_NOREPLACE` was there to provide —
+/// never silently destroy a file that is already at the destination — still
+/// holds, and a failure to reserve is returned as `AlreadyExists`, the exact
+/// error the flagged rename raises, so every guarded-conflict caller above is
+/// unchanged. If the rename itself then fails, the reservation is rolled back
+/// (only when the destination is still byte-for-byte the placeholder this call
+/// created, checked by physical identity), so a failed publication does not
+/// leave an empty file at a live page name.
+///
+/// **What it gives up.** Atomicity of the name transition. Between the
+/// reservation and the rename the destination exists as a zero-length file, so
+/// (a) a crash inside that window leaves a zero-length name that the projection
+/// drain rebuilds from the accepted manifest on the next open — exactly as it
+/// rebuilds an interrupted projection today — and (b) an external writer that
+/// replaces the placeholder inside that window is overwritten rather than
+/// winning the race. Both are why this is confined to
+/// `SharedReconstructibleProjection`, where the manifest in private storage is
+/// still the authority for these bytes, and is never used for artifacts the
+/// graph tree is the sole authority for.
+fn reserve_and_rename_projection(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+    let mut options = CapOpenOptions::new();
+    options.write(true).create_new(true);
+    // An occupied destination fails here, before anything has moved.
+    let reserved = dir.open_with(to, &options)?.into_std();
+    let reserved_identity = match canonical_projection_file_resource_id(&reserved) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = dir.remove_file(to);
+            return Err(error);
+        }
+    };
+    drop(reserved);
+    match dir.rename(from, dir, to) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Roll the reservation back, but only if the destination is still
+            // the exact placeholder this call created. If someone replaced it,
+            // their file stays.
+            if let Ok(current) = open_projection_file_nofollow(dir, to) {
+                let still_ours = canonical_projection_file_resource_id(&current)
+                    .is_ok_and(|identity| identity == reserved_identity);
+                drop(current);
+                if still_ours {
+                    let _ = dir.remove_file(to);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The single place the projection leg publishes a name without clobbering.
+///
+/// `PrivateDurableAuthority` gets the platform primitive and nothing else.
+/// `SharedReconstructibleProjection` additionally accepts a capability refusal
+/// from that primitive and falls back to [`reserve_and_rename_projection`];
+/// every other errno stays fatal for both classes, on every platform.
+///
+/// The fallback is not gated on Android, unlike the durability-barrier policy in
+/// [`crate::filesystem_durability`]. That policy gives a guarantee up, so it is
+/// confined to the platform that forces the choice; this one keeps its guarantee
+/// and only loses atomicity, and the same `EINVAL` is reachable on any host
+/// whose graph lives on a filesystem without `rename2` flags (FAT/exFAT media,
+/// some FUSE and network mounts). Failing those writes closed would be an
+/// availability bug with no in-scope threat behind it.
+fn rename_projection_noreplace_with_class(
+    dir: &Dir,
+    from: &str,
+    to: &str,
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+) -> io::Result<()> {
+    let name = |operation: &str, error: io::Error| {
+        projection_platform_error(operation, &format!("{from:?} -> {to:?}"), error)
+    };
+    let reconstructible = matches!(
+        class,
+        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection
+    );
+    if reconstructible && flagged_rename_known_unsupported(dir) {
+        return reserve_and_rename_projection(dir, from, to)
+            .map_err(|error| name(PROJECTION_RESERVED_RENAME_OPERATION, error));
+    }
+    #[cfg(test)]
+    let attempt = match armed_projection_noreplace_rename(class, dir)? {
+        Some(injected) => Err(io::Error::from_raw_os_error(injected.errno)),
+        None => rename_projection_noreplace_platform(dir, from, to),
+    };
+    #[cfg(not(test))]
+    let attempt = rename_projection_noreplace_platform(dir, from, to);
+
+    match attempt {
+        Ok(()) => Ok(()),
+        Err(error) if reconstructible && is_flagged_rename_capability_refusal(&error) => {
+            remember_flagged_rename_unsupported(dir);
+            reserve_and_rename_projection(dir, from, to)
+                .map_err(|error| name(PROJECTION_RESERVED_RENAME_OPERATION, error))
+        }
+        Err(error) => Err(name(PROJECTION_NOREPLACE_RENAME_OPERATION, error)),
+    }
+}
+
+const PROJECTION_RESERVED_RENAME_OPERATION: &str =
+    "exclusive reservation and rename publishing the projection";
+
+/// A substitute for the platform no-replace rename, armed for exactly one graph
+/// tree, so a host test can reproduce a device whose filesystem refuses the
+/// flagged call. Process-global for the same reason as
+/// [`ArmedProjectionDirectoryBarrier`]: the runtime saves on its actor thread.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct ArmedProjectionNoreplaceRename {
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    errno: i32,
+    root: (u64, u64),
+}
+
+#[cfg(test)]
+static ARMED_PROJECTION_NOREPLACE_RENAME: std::sync::Mutex<Option<ArmedProjectionNoreplaceRename>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn armed_projection_noreplace_rename(
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+    dir: &Dir,
+) -> io::Result<Option<ArmedProjectionNoreplaceRename>> {
+    let armed = *ARMED_PROJECTION_NOREPLACE_RENAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(armed) = armed.filter(|armed| armed.class == class) else {
+        return Ok(None);
+    };
+    Ok((projection_dir_identity(dir)? == armed.root).then_some(armed))
+}
+
+/// Make every no-replace projection rename of `class` directly inside `root`
+/// fail with `errno` until the returned guard is dropped.
+#[cfg(test)]
+pub(crate) struct InjectedProjectionNoreplaceRenameFailure(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+
+#[cfg(test)]
+static PROJECTION_NOREPLACE_RENAME_INJECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+impl InjectedProjectionNoreplaceRenameFailure {
+    pub(crate) fn enter(
+        class: crate::filesystem_durability::DurabilityArtifactClass,
+        errno: i32,
+        root: &Path,
+    ) -> io::Result<Self> {
+        let exclusive = PROJECTION_NOREPLACE_RENAME_INJECTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
+        let armed = ArmedProjectionNoreplaceRename {
+            class,
+            errno,
+            root: projection_dir_identity(&root_dir)?,
+        };
+        // The device-capability memo is process-global and this fixture's
+        // scratch tree shares a device with every other test's, so a previous
+        // injection must not leave the fallback latched on for tests that arm a
+        // fatal errno.
+        forget_flagged_rename_capabilities();
+        *ARMED_PROJECTION_NOREPLACE_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(armed);
+        Ok(Self(exclusive))
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectedProjectionNoreplaceRenameFailure {
+    fn drop(&mut self) {
+        *ARMED_PROJECTION_NOREPLACE_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        forget_flagged_rename_capabilities();
+    }
+}
+
+#[cfg(all(test, unix))]
+fn forget_flagged_rename_capabilities() {
+    if let Ok(mut devices) = FLAGGED_RENAME_UNSUPPORTED_DEVICES.write() {
+        devices.clear();
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+fn forget_flagged_rename_capabilities() {}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn rename_managed_noreplace(
@@ -33663,6 +33987,189 @@ mod tests {
                 "a real I/O failure must stay fatal even on Android: {error}"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same split at the *rename* primitive, which is what Android CI run
+    /// 32091898520 actually caught: `renameat2(RENAME_NOREPLACE) publishing the
+    /// projection failed at "Smoke.md" -> ".Smoke.md.49a4ed18…"` with `EINVAL`.
+    /// The reconstructible projection publishes through an exclusive
+    /// reservation instead; the sole-authority class keeps the atomic primitive
+    /// and fails.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_reconstructible_projection_rename_falls_back_when_the_flag_is_unsupported() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("projection-noreplace-artifact-class");
+        let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
+
+        for errno in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP, libc::ENOTSUP] {
+            fs::write(dir.join("source"), b"staged projection bytes").unwrap();
+            let staged =
+                canonical_projection_file_resource_id(&fs::File::open(dir.join("source")).unwrap())
+                    .unwrap();
+
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                errno,
+                &dir,
+            )
+            .unwrap();
+            rename_reconstructible_projection_noreplace(&capability, "source", "destination")
+                .expect("a filesystem without rename2 flags must still publish");
+
+            assert!(!dir.join("source").exists());
+            assert_eq!(
+                fs::read(dir.join("destination")).unwrap(),
+                b"staged projection bytes"
+            );
+            // The published name must be the staged INODE, not a copy of its
+            // bytes into the reservation placeholder.
+            assert_eq!(
+                canonical_projection_file_resource_id(
+                    &fs::File::open(dir.join("destination")).unwrap()
+                )
+                .unwrap(),
+                staged,
+                "the fallback must publish the exact staged inode ({errno})"
+            );
+            fs::remove_file(dir.join("destination")).unwrap();
+        }
+
+        {
+            // The sole-authority class never degrades: no second copy exists to
+            // rebuild these bytes from, so the atomic primitive is the contract.
+            fs::write(dir.join("source"), b"sole authority bytes").unwrap();
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::PrivateDurableAuthority,
+                libc::EINVAL,
+                &dir,
+            )
+            .unwrap();
+            let error =
+                rename_projection_noreplace(&capability, "source", "destination").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("renameat2(RENAME_NOREPLACE) publishing the projection"),
+                "the enriched detail is what made this diagnosable: {error}"
+            );
+            assert!(!dir.join("destination").exists());
+            assert_eq!(
+                fs::read(dir.join("source")).unwrap(),
+                b"sole authority bytes"
+            );
+            fs::remove_file(dir.join("source")).unwrap();
+        }
+
+        {
+            // A real I/O failure is not a capability answer. It stays fatal for
+            // the reconstructible class too, and nothing is reserved.
+            fs::write(dir.join("source"), b"unmoved bytes").unwrap();
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EIO,
+                &dir,
+            )
+            .unwrap();
+            let error =
+                rename_reconstructible_projection_noreplace(&capability, "source", "destination")
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("Input/output error"),
+                "a real I/O failure must stay fatal: {error}"
+            );
+            assert!(
+                !dir.join("destination").exists(),
+                "a fatal errno must not reserve the destination name"
+            );
+            assert_eq!(fs::read(dir.join("source")).unwrap(), b"unmoved bytes");
+            fs::remove_file(dir.join("source")).unwrap();
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The guarantee the flag was there to provide, kept by the fallback: an
+    /// occupied destination is refused, never overwritten, and it is refused
+    /// with the same `AlreadyExists` the flagged rename raises so every guarded
+    /// conflict caller above is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn the_projection_rename_fallback_refuses_an_occupied_destination_rather_than_clobbering_it() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("projection-noreplace-fallback-occupied");
+        fs::write(dir.join("source"), b"staged projection bytes").unwrap();
+        fs::write(dir.join("destination"), b"live bytes that must survive").unwrap();
+        let live = canonical_projection_file_resource_id(
+            &fs::File::open(dir.join("destination")).unwrap(),
+        )
+        .unwrap();
+        let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
+
+        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+            DurabilityArtifactClass::SharedReconstructibleProjection,
+            libc::EINVAL,
+            &dir,
+        )
+        .unwrap();
+        let error =
+            rename_reconstructible_projection_noreplace(&capability, "source", "destination")
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            fs::read(dir.join("destination")).unwrap(),
+            b"live bytes that must survive"
+        );
+        assert_eq!(
+            canonical_projection_file_resource_id(
+                &fs::File::open(dir.join("destination")).unwrap()
+            )
+            .unwrap(),
+            live,
+            "the occupied destination must keep its exact inode"
+        );
+        assert_eq!(
+            fs::read(dir.join("source")).unwrap(),
+            b"staged projection bytes"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A reservation that cannot be completed is rolled back. Otherwise a failed
+    /// publication would leave a zero-length file at a live page name — which is
+    /// worse than the refusal it replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_projection_rename_fallback_that_cannot_complete_leaves_no_empty_destination() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("projection-noreplace-fallback-rollback");
+        let capability = Dir::open_ambient_dir(&dir, ambient_authority()).unwrap();
+
+        let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+            DurabilityArtifactClass::SharedReconstructibleProjection,
+            libc::EINVAL,
+            &dir,
+        )
+        .unwrap();
+        // The source never existed, so the plain rename fails after the
+        // destination has already been reserved.
+        let error =
+            rename_reconstructible_projection_noreplace(&capability, "absent", "Live Page.md")
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert!(
+            !dir.join("Live Page.md").exists(),
+            "a failed publication must not leave the reservation behind"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

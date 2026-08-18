@@ -44,6 +44,16 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // closed, and the deferred receipt names the operation and the page.
   "sync_runtime::tests::clean_runtime_save_survives_an_android_projection_directory_barrier_refusal",
   "sync_runtime::tests::a_projection_directory_barrier_refusal_still_fails_closed_off_android",
+  // One layer below that barrier: the flagged rename ITSELF is unsupported on
+  // Android shared storage (CI run 32091898520 — `renameat2(RENAME_NOREPLACE)
+  // publishing the projection failed at "Smoke.md" -> ".Smoke.md.49a4ed18…"`,
+  // EINVAL). The reconstructible projection publishes through an exclusive
+  // reservation instead, keeping the no-clobber guarantee, and still displaces
+  // the previous bytes through the same artifact family a control save uses.
+  // The sibling holds the other half: EIO is a disk error, not a capability
+  // answer, so the same call site still fails closed and names the primitive.
+  "sync_runtime::tests::clean_runtime_save_survives_a_projection_rename_capability_refusal",
+  "sync_runtime::tests::a_non_capability_errno_from_the_projection_rename_still_fails_closed",
   "sync_runtime::tests::clean_runtime_cross_page_move_commits_once_and_cold_reopens",
   "sync_runtime::tests::clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys",
   "sync_runtime::tests::retained_clean_reactivation_reports_each_recovery_boundary",
