@@ -28,7 +28,7 @@ icon:: 🗄️
 	- Settings → **Files** → **Orphan assets and trash** can find media no block links to (a deleted block keeps its files, so unused media accumulates) and trash it, and **Empty asset trash** deletes *asset* trash permanently — page, journal, and conflict recovery files are always kept.
 - ## Sync tools and conflict copies
 	- Keep Syncthing or Dropbox on your graph — Tine is built to coexist with them. Two files that resolve to the same journal day are kept, not dropped: Settings → **Backups & recovery** → **Duplicate journal days** offers **Open**, **Merge**, **Rename**, or **Trash** per file.
-	- A `*.sync-conflict-*` (or `(conflicted copy)`) file never appears as a page. Review it under **Sync conflict copies**: **Review & merge** shows a block-by-block diff against the current page with a per-block keep-current / keep-copy / keep-both choice; **Discard copy** moves it to the trash. Nothing is auto-merged or auto-deleted.
+	- A `*.sync-conflict-*` (or `(conflicted copy)`) file never appears as a page. It is listed under **Sync conflict copies**: **Review in page…** opens the page and resolves it there, block by block, with a per-block keep-mine / keep-theirs / keep-both choice; **Discard copy** moves it to the trash. Nothing is auto-merged or auto-deleted.
 	- Tine's own operation-backed sync is a separate, opt-in **Testing only** mode — see [[Features/Managed sync]]. Ordinary provider sync needs no setup at all.
 - ## Export
 	- Settings → **Graph** → **Export graph to HTML** publishes your `public:: true` pages as a standalone site with fuzzy block search.

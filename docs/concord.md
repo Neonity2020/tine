@@ -38,6 +38,41 @@ run again from scratch — if you typed into the page in the meantime, the reloa
 is not applied; the normal conflict protocol takes over so your keystrokes are
 never silently overwritten.
 
+### When your filesystem tells us nothing: returning to the window
+
+Some setups deliver no filesystem event at all — a network mount, a sync client
+that writes through a path the kernel does not report, an app the operating
+system suspended while you were elsewhere. Tine therefore also checks **when you
+come back to the window**: returning to Tine replays any reload that was deferred
+while you were editing, and asks the watcher for one full pass over the graph's
+text files. Anything that changed is then handled exactly as a live change would
+be, with the same protections — a page you are editing is still deferred, never
+yanked. The check is throttled, so alt-tabbing repeatedly costs nothing.
+
+### Being asked instead of shown
+
+By default a clean page updates silently, the way a code editor does. If you
+would rather be told, turn on **Settings → Backups & recovery → Always ask
+before applying an external change**. The page then keeps showing the version
+you were reading and offers **Reload from disk** / **Keep mine** in a small bar
+above the content — never a dialog, never blocking.
+
+The switch only affects the case that was silent. A page with unsaved edits, or
+one you are actively editing, behaves identically whether the switch is on or
+off: it is proven, deferred or refused exactly as described above. Choosing
+*Keep mine* writes nothing; the next time you save that page, Tine notices the
+file moved on and raises the ordinary conflict banner.
+
+### Your version-control tool's own churn is ignored
+
+A repository living inside your graph folder generates a great deal of
+filesystem noise that has nothing to do with your notes — index locks, object
+files, ref updates, a `git gc`. Tine ignores events under `.git`, `.hg`, `.svn`,
+`.jj`, `.bzr`, Syncthing's `.stfolder`/`.stversions`, and `node_modules`
+entirely: they cannot contain graph text, so they never wake the watcher and
+never cost a rescan. Everything else, including `logseq/config.edn` and pages in
+custom folders, is watched as before.
+
 ### Reporting slow or missed external changes
 
 An external change should show up in Tine well under a second with the OS
@@ -218,8 +253,7 @@ Nothing is applied until you click **Apply resolution**.
 ### What resolving does
 
 - For a **conflict copy**: the merged result is written to the page and the copy
-  moves to the recoverable trash (Settings → Backups & recovery), exactly as the
-  Settings merge dialog has always done.
+  moves to the recoverable trash (Settings → Backups & recovery).
 - For a **marker-bearing page**: the merged result is written *without any
   markers* — the file becomes ordinary Markdown again and the save quarantine
   lifts by itself, because there is no longer anything to quarantine. This is
@@ -232,9 +266,50 @@ sync tool moved it in the meantime, the write is refused and the review reloads)
 `.org` pages that would not survive a round trip are refused rather than risked,
 and the losing side stays recoverable.
 
-The older **Settings → Backups & recovery → Sync conflict copies → Review &
-merge** dialog is still there as a fallback surface; it shows the same rows,
-rendered by the same code.
+### Where each surface lives
+
+Resolution happens **only on the page**. **Settings → Backups & recovery** is
+the *inventory*: it lists the conflict copies and marker-bearing files in your
+graph, offers **Review in page…** to take you to the one you pick, and keeps the
+two actions the page cannot offer — **Discard copy**, and the case of a copy
+whose original page no longer exists at all.
+
+(Earlier versions also had a block-by-block merge dialog inside Settings. It is
+gone: two surfaces over the same conflict opened with different pre-selections,
+which is exactly the kind of quiet disagreement Concord exists to prevent.)
+
+## Tine does not touch files it has nothing to say about
+
+Tine never rewrites bytes it did not semantically change. Opening a graph,
+reading a page, or re-saving a page you did not edit leaves every file
+byte-identical — same indentation (tabs or spaces, as you wrote them), same
+trailing newline (or absence of one), same line endings, same blank lines. This
+matters most if you keep your graph in git: a spurious rewrite is a diff you did
+not make, and behind a sync tool it is a wake for every device.
+
+The same rule applies to files Tine writes for you. Re-saving a PDF's
+annotation page (`hls__…`) with an unchanged highlight set writes nothing at
+all, and adding a highlight leaves the rest of that page's formatting — including
+notes you typed under an annotation — exactly as it was.
+
+One deliberate exception, unchanged: navigating to a block by reference stamps
+an `id::` property on it, because that is how a durable block reference is
+expressed in the Logseq file format.
+
+### Journal files named by title
+
+A journal file whose name is not its date — `Jun 18th, 2026.md` rather than
+`2026_06_18.md`, usually left behind by a date-format change or another tool —
+cannot be matched back to its day, so that day looks empty in the journal feed.
+Renaming it fixes that, and Tine will do it, but **only when you ask**: the files
+are listed under **Settings → Backups & recovery → Journal files named by
+title** with one button to rename them all. A snapshot is taken first, so the
+original names remain in Backups & recovery, and a file whose date name is
+already taken is left alone rather than overwritten.
+
+(Earlier versions performed this rename automatically at every graph open. It is
+a repair you did not ask for, applied to files you own — your version-control
+tool would see it as a batch of renames the moment Tine started.)
 
 ## The base ledger
 
@@ -244,8 +319,7 @@ version is the common ancestor of any later divergence, which is what turns a
 conflict from a guessing game into a mostly-answered question: comparing each
 side against the ancestor tells Tine *who changed what*.
 
-When you review a conflict — on the page, or in the Settings dialog — Tine
-uses that ancestor when it has one:
+When you review a conflict, Tine uses that ancestor when it has one:
 
 - A block only **you** changed arrives with *your* version pre-selected.
 - A block only the **other device** changed arrives with *its* version

@@ -55,9 +55,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   block-tree engine the conflict merge uses — the seam the upcoming in-page
   conflict review builds on.
 
+- **Tine now refreshes when you return to its window.** Some setups deliver no filesystem event at all — a network mount, a sync client writing through a path the kernel doesn't report, an app the OS suspended while you were away — and a page could sit stale indefinitely with nothing apparently wrong. Coming back to the Tine window now replays any reload that was deferred while you were editing and asks the watcher for one full pass over the graph. Anything that changed is handled exactly as a live change: a page you are editing is still deferred, never yanked. Throttled, so alt-tabbing costs nothing. (Concord P5, part of GH #337.)
+
+- **A new "Always ask before applying an external change" setting** (Settings → Backups & recovery, off by default). By default a page you have open with nothing unsaved updates silently when another editor or a sync tool changes its file, the same as a code editor. Turn this on and Tine holds the change instead: the page keeps showing what you were reading and offers *Reload from disk* / *Keep mine* in a small bar above the content — never a dialog, never blocking. Everything that already asked keeps asking; only the silent case changes. (Concord P5, part of GH #337.)
+
 - **The file watcher now keeps always-on latency receipts for external-change batches.** Each batch that surfaces a change (or an error scheduling a retry) records how long it spent between the OS callback, the post-debounce reconcile, and the `graph-changed` events reaching the UI, logs one structured line, and lands in a small in-memory ring the new `watcher_latency_recent` debug command returns — so slow-external-change reports (GH #337's 5–20 s) can be diagnosed from the reporter's machine instead of guessed at. Works in both inotify and poll watch modes.
 
 - **Managed-storage activation no longer rejects a complete graph because Direct Files or the startup path catalog retained a different one-page inventory.** Readiness is now proved inside the candidate managed generation by opening its transactionally complete, exact-frontier-stamped SQLite inventory and a real page; the candidate remains unpublished until that proof succeeds.
+
+### Changed
+
+- **Conflicts are now resolved in one place: the page.** The block-by-block merge dialog inside Settings is gone. Settings → Backups & recovery keeps the *inventory* — which conflict copies and marker-bearing files exist, **Review in page…** to go to one, **Discard copy**, and the case of a copy whose original page no longer exists — while the review itself happens next to the blocks. The two surfaces had drifted into opening with different pre-selections for the same conflict, which is exactly what Concord exists to prevent; the in-page resolver gained the dialog's one exclusive capability (choosing what happens to the page's own properties when the two sides disagree) so nothing was lost. The VCS-merge-markers panel, which previously offered no action at all, now also links to the page. (Concord P5, part of GH #337.)
+
+- **Opening a graph no longer renames journal files.** A journal file whose name is not its date (`Jun 18th, 2026.md` rather than `2026_06_18.md`) can't be matched to its day, so that day looks empty — and Tine used to fix this silently at every graph open, and after any settings change. It is a repair you didn't ask for, applied to files you own: in a graph kept in git it appeared as a batch of renames the moment Tine started. The files are now listed under Settings → Backups & recovery → **Journal files named by title** with one button to rename them, which takes a snapshot first and never overwrites a name that is already taken. (Concord P5, part of GH #337.)
+
+### Fixed
+
+- **Saving PDF highlights no longer reformats the annotation page.** The `hls__…` page was written with default formatting rather than its own, so every highlight save re-indented the whole file — including notes you had typed under an annotation — and re-terminated it, even when the highlight set was unchanged. It now reproduces the file's own indentation, line endings and blank lines, and an unchanged highlight set writes nothing at all. (Concord P5 write-shyness, part of GH #337.)
+
+- **A repository inside your graph folder no longer wakes the file watcher.** Events under `.git`, `.hg`, `.svn`, `.jj`, `.bzr`, Syncthing's `.stfolder`/`.stversions`, and `node_modules` are now discarded before they cost anything — a `git gc` or a rebase used to push thousands of events through the watcher's per-event work before each was discarded further down. Nothing that can contain notes is affected. (Concord P5, part of GH #337.)
 
 ### Added
 

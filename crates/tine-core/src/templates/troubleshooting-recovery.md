@@ -16,9 +16,9 @@ icon:: 🛟
 	- 2. Choose **Restore** beside it and confirm.
 	- 3. What you should see: your current state is snapshotted first, backed-up graph text returns to its original paths, config and sidecars are restored, and the graph reloads — so even a mistaken restore can be undone by restoring the snapshot it just made.
 - ## Merge a sync-conflict copy
-	- 1. Open Settings → **Backups & recovery** → **Sync conflict copies** and choose **Review & merge** on the copy.
-	- 2. In the block-by-block diff, pick keep-current, keep-copy, or keep-both per block (page properties merge too).
-	- 3. What you should see: your choices are saved to the current page through the normal save path, and the conflict copy moves to the trash. If the shadowed page no longer exists, discard the copy or restore it in Logseq.
+	- 1. Open Settings → **Backups & recovery** → **Sync conflict copies** and choose **Review in page…** on the copy.
+	- 2. On the page, in the block-by-block diff, pick keep-mine, keep-theirs, or keep-both per block (the page's own properties get their own choice), then **Apply resolution**.
+	- 3. What you should see: your choices are saved to the page through the normal save path, and the conflict copy moves to the trash. If the shadowed page no longer exists, there is nothing to resolve it at — discard the copy in Settings, or restore the page in Logseq.
 - ## Reconcile a duplicate journal day
 	- 1. Open Settings → **Backups & recovery** → **Duplicate journal days** — usually left over from a journal date-format change or a sync.
 	- 2. Choose **Open** to view a file (it saves back to itself), **Merge** to fold it into the canonical day, **Rename** to turn it into a normal page, or **Trash** (recoverable).

@@ -524,12 +524,13 @@ within a column; merged cells are still v2+.
 - **Sync-conflict merge** — Syncthing/Dropbox leave a `*.sync-conflict-*` (or
   `(conflicted copy)`) file when the same page was edited on two devices. Tine keeps
   these **out of your page list** (they're not real pages) and surfaces them under
-  Settings → *Backups & recovery* → **Sync conflict copies**. **Review & merge** shows a
-  **block-by-block diff** against the current page — matched by `id::`, then by
-  content, then by first-line similarity — with a per-block **keep-current /
-  keep-copy / keep-both** choice (and page-property merge); **Discard copy** trashes
-  it. The merge writes through the normal save path (base-revision-guarded, atomic)
-  and moves the copy to the recoverable **trash** — never auto-merged, never unlinked.
+  Settings → *Backups & recovery* → **Sync conflict copies**. **Review in page…** opens
+  the page and resolves it there: a **block-by-block diff** against the current page —
+  matched by `id::`, then by content, then by first-line similarity — with a per-block
+  **keep-mine / keep-theirs / keep-both** choice (and page-property merge); **Discard
+  copy** trashes it from the Settings list. The merge writes through the normal save
+  path (base-revision-guarded, atomic) and moves the copy to the recoverable **trash**
+  — never auto-merged, never unlinked.
 - **Pages throughout the graph are found** — like Logseq, Tine finds eligible
   Markdown/Org pages at the graph root and in nested directories, not only under
   `pages/` and `journals/`. A nested page is keyed by its **file name**
