@@ -633,6 +633,55 @@ collapse of the named-stage inventory. This closes the gap that left the
 Android post-activation save reporting `debug_detail="none"` with no stage — a
 refusal that could have come from any of 131 unnamed sites.
 
+### 3.2 Clean-runtime save settlement
+
+The clean baseline-plus-manifest runtime and the retired legacy coordinator are
+two **distinct** retained-publication state machines, and a request may never be
+routed from one into the other.
+
+A clean local mutation that reaches its manifest commit and then fails to apply
+disposable derived state (SQLite and/or exact Markdown projection) returns
+`CleanActorMutationOutcome::DurablePending` and retains an affine continuation
+in `CleanRuntimeActorCore::pending`. That continuation is advanced only by
+`retry_pending`. The legacy coordinator's `PendingLocalMutation::Published`
+continuation is a different object that the clean actor never writes.
+
+Therefore, when the clean runtime is installed, an application save that lands in
+`DurablePending` settles through the clean actor, bounded by
+`MAX_EDITOR_SETTLE_TURNS`. Exactly two outcomes are permitted:
+
+- the retained continuation settles, and the request reports **applied/saved**;
+- it does not settle within the budget, and the request reports
+  **`Deferred { RetryableRetainedPublication }`**.
+
+A **refusal is forbidden here**, and has no entry in the §3.1 table, because it
+would defend against no in-scope failure: the manifest commit is already
+durable, and the outstanding work is disposable derived state whose contract is
+recovery, not refusal (G2). A refusal with no in-scope scenario is an
+availability bug. This is not hypothetical — routing the clean outcome into the
+legacy settlement returned `ActorRefusedAt("require_pending_publication_absent")`
+for *every* clean-runtime save, which is why Android managed saves never worked.
+
+Two further rules keep the settlement honest:
+
+- A retained continuation belonging to an **earlier** batch is reported as
+  `CleanActorMutationOutcome::RetainedPriorPending`, never as the caller's own
+  `DurablePending`. That submission never executed, so settling the earlier
+  batch must defer the request rather than report it saved with the page's old
+  bytes.
+- The failure that caused the retention is reported separately from the save's
+  own outcome (`SyncRuntimeHandle::last_retained_publication`). A converged
+  retry produces an ordinary successful save while the underlying cause still
+  costs a retry on every write; the Android instrumentation receipt carries this
+  report on both the success and the failure path so that cause stays visible.
+
+The structural claim — a clean runtime never reaches the legacy publication
+settlement — is enforced by tests
+(`clean_runtime_application_save_settles_its_own_retained_publication`,
+`clean_runtime_application_save_defers_when_retained_publication_cannot_settle`),
+which assert the actor's legacy-settlement counter stays at zero, not by this
+paragraph.
+
 Unix UID equality and “only the current user may write this path” are
 deliberately absent. The threat model does not defend against a malicious actor
 who can already rewrite the user's private filesystem, and those checks reject

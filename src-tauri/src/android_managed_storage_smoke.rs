@@ -100,13 +100,26 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         return "post-activation page has no editable block".into();
     };
     first.raw = "Android managed storage edited".into();
-    match handle.save_application_page(SyncApplicationPageSaveRequest {
+    let save_outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
         target: SyncApplicationPageSaveTarget::Existing {
             path: page.path.clone(),
             revision,
         },
         page,
-    }) {
+    });
+    // A clean-runtime save can succeed only after settling a RETAINED
+    // publication, and settling it consumes the failure that caused it. Read
+    // the report either way: a converged retry still costs a retry on every
+    // write, and a bare "ok" receipt would hide the underlying cause.
+    let retained = match handle.last_retained_publication() {
+        Ok(Some(report)) => format!(
+            "retained_publication=batch:{} phase:{:?} settled:{} turns:{} detail:{}",
+            report.batch_id, report.phase, report.settled, report.settle_turns, report.detail
+        ),
+        Ok(None) => "retained_publication=none".to_owned(),
+        Err(error) => format!("retained_publication=unavailable:{error}"),
+    };
+    match save_outcome {
         Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {}
         // The instrumentation boundary can only report the returned value, so
         // carry everything that distinguishes one refusal from another: the
@@ -121,7 +134,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
                 Ok(_) => "not a refusal".to_owned(),
             };
             return format!(
-                "post-activation page save failed: {outcome:?}; {detail}; status={:?}; progress={}",
+                "post-activation page save failed: {outcome:?}; {detail}; {retained}; status={:?}; progress={}",
                 handle.status(),
                 progress_receipt.join("|")
             );
@@ -169,7 +182,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
     };
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => format!(
-            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} total_ms={} progress={}",
+            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} total_ms={} {retained} progress={}",
             journey_started.elapsed().as_millis(),
             progress_receipt.join("|")
         ),

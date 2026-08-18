@@ -2334,6 +2334,27 @@ pub enum SyncEditorConflict {
     UnknownOrForeignBlock,
 }
 
+/// Why the clean runtime most recently had to retain a publication, and what
+/// settling it cost.
+///
+/// A retained publication means the manifest commit is already durable and the
+/// disposable derived state (SQLite, exact Markdown projection) failed and was
+/// kept for retry. The retry can converge and produce an ordinary successful
+/// save, which is exactly why this report exists: the underlying failure —
+/// on Android, a durability barrier on shared storage — still costs a retry on
+/// every write, and a green save receipt would otherwise hide it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncRetainedPublicationReport {
+    pub batch_id: String,
+    pub phase: SyncLocalMutationPhase,
+    /// The retained continuation's own failure detail, verbatim.
+    pub detail: String,
+    /// `retry_pending` turns spent settling it, or the budget when it never
+    /// settled.
+    pub settle_turns: usize,
+    pub settled: bool,
+}
+
 /// Work that remains actor-owned and can be retried without resubmitting
 /// durable identity or order data.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4671,6 +4692,49 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    /// Why the clean runtime most recently had to retain a publication.
+    ///
+    /// Observational: it never advances retained work. A save can succeed
+    /// while this still reports a failure, which is the point — the retry that
+    /// made the save succeed is a per-write cost that must stay visible.
+    pub fn last_retained_publication(
+        &self,
+    ) -> Result<Option<SyncRetainedPublicationReport>, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::LastRetainedPublication {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn install_repeated_projection_fault(&self, times: u32) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::InstallRepeatedProjectionFault {
+            times,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn legacy_publication_settlements(&self) -> Result<usize, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::LegacyPublicationSettlements {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
     #[cfg(test)]
     fn engine_instrumentation(
         &self,
@@ -5376,7 +5440,19 @@ impl CleanWatcherState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CleanActorMutationOutcome {
     Durable(BatchId),
+    /// THIS submission's manifest commit is durable; only disposable derived
+    /// state (SQLite and/or exact Markdown projection) is still retained in
+    /// `CleanRuntimeActorCore::pending`. `batch_id` names the caller's own
+    /// batch, so a caller may settle it and then report its request applied.
     DurablePending {
+        batch_id: BatchId,
+        phase: OperationalPhase,
+    },
+    /// A retained continuation from an EARLIER batch still occupies the clean
+    /// actor, so this submission was never executed. `batch_id` names that
+    /// earlier batch, never the caller's work: settling it says nothing about
+    /// this request, and reporting the request applied would be a lie.
+    RetainedPriorPending {
         batch_id: BatchId,
         phase: OperationalPhase,
     },
@@ -5430,7 +5506,7 @@ impl CleanRuntimeActorCore {
         transaction: &OperationTransaction,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
-            return Ok(CleanActorMutationOutcome::DurablePending {
+            return Ok(CleanActorMutationOutcome::RetainedPriorPending {
                 batch_id: pending.batch_id(),
                 phase: pending.failure().phase(),
             });
@@ -5457,7 +5533,7 @@ impl CleanRuntimeActorCore {
         persist_fingerprint: impl FnMut(ContentDigest) -> Result<(), String>,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
-            return Ok(CleanActorMutationOutcome::DurablePending {
+            return Ok(CleanActorMutationOutcome::RetainedPriorPending {
                 batch_id: pending.batch_id(),
                 phase: pending.failure().phase(),
             });
@@ -5489,7 +5565,7 @@ impl CleanRuntimeActorCore {
         prepared: &PreparedBatch,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
-            return Ok(CleanActorMutationOutcome::DurablePending {
+            return Ok(CleanActorMutationOutcome::RetainedPriorPending {
                 batch_id: pending.batch_id(),
                 phase: pending.failure().phase(),
             });
@@ -5507,9 +5583,27 @@ impl CleanRuntimeActorCore {
         let outcome = self.retain_outcome(state);
         self.provider_change_pending_notification = Some(match outcome {
             CleanActorMutationOutcome::Durable(batch_id)
-            | CleanActorMutationOutcome::DurablePending { batch_id, .. } => batch_id,
+            | CleanActorMutationOutcome::DurablePending { batch_id, .. }
+            | CleanActorMutationOutcome::RetainedPriorPending { batch_id, .. } => batch_id,
         });
         Ok(outcome)
+    }
+
+    /// The retained continuation's own failure, verbatim.
+    ///
+    /// `DurablePending` only says derived work remains; this says WHY it was
+    /// retained. On Android that reason is the real defect (a durability
+    /// barrier that fails or defers on shared storage), and it survives only
+    /// until `retry_pending` consumes the continuation — so callers that
+    /// intend to settle must read it first.
+    fn pending_failure(&self) -> Option<(BatchId, OperationalPhase, String)> {
+        self.pending.as_ref().map(|pending| {
+            (
+                pending.batch_id(),
+                pending.failure().phase(),
+                pending.failure().detail().to_owned(),
+            )
+        })
     }
 
     fn retry_pending(
@@ -9451,6 +9545,13 @@ enum ActorRequest {
             Result<SyncApplicationPageInventoryOutcome, SyncApplicationPageRequestError>,
         >,
     },
+    LastRetainedPublication {
+        reply: mpsc::Sender<Option<SyncRetainedPublicationReport>>,
+    },
+    #[cfg(test)]
+    LegacyPublicationSettlements { reply: mpsc::Sender<usize> },
+    #[cfg(test)]
+    InstallRepeatedProjectionFault { times: u32, reply: mpsc::Sender<()> },
     ApplicationNavigation {
         request: SyncApplicationNavigationRequest,
         cancellation: Option<ApplicationSearchCancellation>,
@@ -9887,6 +9988,22 @@ fn run_actor_loop(
                 // Status is observational. In particular, it must not cause
                 // retained work to advance after the actor becomes terminal.
                 let _ = reply.send(actor.snapshot());
+                false
+            }
+            ActorRequest::LastRetainedPublication { reply } => {
+                let _ = reply.send(actor.last_retained_publication.clone());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::LegacyPublicationSettlements { reply } => {
+                let _ = reply.send(actor.legacy_publication_settlements.get());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::InstallRepeatedProjectionFault { times, reply } => {
+                // Arm on the ACTOR thread: the hook is thread-local.
+                crate::oplog::projection::fail_manifested_projection_repeatedly_for_harness(times);
+                let _ = reply.send(());
                 false
             }
             #[cfg(test)]
@@ -11629,6 +11746,22 @@ struct RuntimeActor {
     fail_next_correlated_move_after_blocked: bool,
     #[cfg(test)]
     forced_next_move_episode_batch_id: Option<BatchId>,
+    /// The clean-runtime batch the request currently in flight published and
+    /// left durable-pending. Only this batch may be settled and then reported
+    /// as the request's own result: a retained continuation from an earlier
+    /// batch means the current request never executed, so claiming it saved
+    /// would hand the caller the page's OLD bytes as if they were the new ones.
+    clean_request_retained_batch: Option<BatchId>,
+    /// The most recent retained clean publication and the failure that caused
+    /// it. Kept after settlement so a converged retry still reports the
+    /// underlying cost instead of looking like an ordinary save.
+    last_retained_publication: Option<SyncRetainedPublicationReport>,
+    /// Legacy-publication settlements observed since this actor started.
+    /// A clean runtime must never reach that path (it never populates
+    /// `local_mutation`), and this counter is what lets a test enforce the
+    /// claim instead of a comment asserting it.
+    #[cfg(test)]
+    legacy_publication_settlements: std::cell::Cell<usize>,
     prepared_application_reply: Option<(String, ApplicationCurrentPage)>,
     /// Exact application response from the latest successful save, bound to
     /// the accepted frontier that produced it. This is a single-page,
@@ -13239,6 +13372,10 @@ impl RuntimeActor {
             fail_next_correlated_move_after_blocked: false,
             #[cfg(test)]
             forced_next_move_episode_batch_id: None,
+            clean_request_retained_batch: None,
+            last_retained_publication: None,
+            #[cfg(test)]
+            legacy_publication_settlements: std::cell::Cell::new(0),
             prepared_application_reply: None,
             hot_application_save_page: None,
             #[cfg(test)]
@@ -13425,6 +13562,10 @@ impl RuntimeActor {
             fail_next_correlated_move_after_blocked: false,
             #[cfg(test)]
             forced_next_move_episode_batch_id: None,
+            clean_request_retained_batch: None,
+            last_retained_publication: None,
+            #[cfg(test)]
+            legacy_publication_settlements: std::cell::Cell::new(0),
             prepared_application_reply: None,
             hot_application_save_page: None,
             #[cfg(test)]
@@ -18889,6 +19030,16 @@ impl RuntimeActor {
         expected_batch_id: &str,
         mut phase: SyncLocalMutationPhase,
     ) -> Result<ApplicationPublicationSettlement, SyncApplicationPageRequestError> {
+        // The clean runtime and the legacy coordinator are two DIFFERENT
+        // retained-publication state machines. A clean runtime never populates
+        // `local_mutation`, so routing its retained work through the legacy
+        // settlement below can only ever refuse — which is precisely the
+        // Android defect this dispatch exists to prevent. Settle the clean
+        // actor on its own terms; never fabricate a `PendingLocalMutation` to
+        // satisfy the legacy check.
+        if self.clean.is_some() {
+            return self.settle_clean_retained_publication(expected_batch_id, phase);
+        }
         self.require_pending_application_publication(expected_batch_id)?;
         for _ in 0..MAX_EDITOR_SETTLE_TURNS {
             let outcome = self.advance_local_mutation_once().ok_or(
@@ -18939,10 +19090,167 @@ impl RuntimeActor {
         ))
     }
 
+    /// Drive the clean actor's retained pending mutation to durability.
+    ///
+    /// `CleanRuntimeActorCore::pending` is advanced by `retry_pending`, not by
+    /// the legacy publication machinery, and a `DurablePending` outcome already
+    /// means the manifest commit succeeded — only disposable derived state is
+    /// outstanding. So the honest results here are exactly two: settle it and
+    /// report the request applied, or run out of budget and DEFER. There is no
+    /// refusal: refusing would defend against no in-scope failure while making
+    /// every clean-runtime save impossible.
+    fn settle_clean_retained_publication(
+        &mut self,
+        expected_batch_id: &str,
+        mut phase: SyncLocalMutationPhase,
+    ) -> Result<ApplicationPublicationSettlement, SyncApplicationPageRequestError> {
+        let owned = self
+            .clean_request_retained_batch
+            .take()
+            .is_some_and(|batch_id| batch_id.to_string() == expected_batch_id);
+        let retained = self
+            .clean
+            .as_ref()
+            .expect("clean settlement is routed only to a clean actor")
+            .pending_failure();
+        let detail = retained
+            .as_ref()
+            .map_or_else(
+                || "retained clean publication was already settled",
+                |(_, _, detail)| detail.as_str(),
+            )
+            .to_owned();
+        if !owned {
+            // The retained continuation belongs to an earlier batch, so this
+            // request was never executed. Advancing it is still useful work,
+            // but the caller must retry rather than be told it saved.
+            let settled = self.advance_clean_retained_publication();
+            self.note_retained_publication(expected_batch_id, phase, detail, settled.0, settled.1);
+            return Ok(ApplicationPublicationSettlement::Deferred(
+                SyncEditorDeferred::RetryableRetainedPublication {
+                    batch_id: expected_batch_id.to_owned(),
+                    phase,
+                },
+            ));
+        }
+        for turn in 0..MAX_EDITOR_SETTLE_TURNS {
+            let outcome = self
+                .clean
+                .as_mut()
+                .expect("clean settlement retains its clean actor")
+                .retry_pending(&self.graph, &self.receipts);
+            match outcome {
+                // No continuation remains. `DurablePending` reported a durable
+                // manifest commit, so the batch is durable and its derived
+                // state has been applied.
+                None => {
+                    self.note_retained_publication(expected_batch_id, phase, detail, turn, true);
+                    return Ok(ApplicationPublicationSettlement::Durable);
+                }
+                Some(CleanActorMutationOutcome::Durable(batch_id)) => {
+                    if batch_id.to_string() != expected_batch_id {
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "settle_clean_publication_durable_batch_mismatch",
+                        ));
+                    }
+                    self.queue_clean_provider_publication(batch_id);
+                    self.note_retained_publication(
+                        expected_batch_id,
+                        phase,
+                        detail,
+                        turn + 1,
+                        true,
+                    );
+                    return Ok(ApplicationPublicationSettlement::Durable);
+                }
+                Some(
+                    CleanActorMutationOutcome::DurablePending {
+                        batch_id,
+                        phase: next_phase,
+                    }
+                    | CleanActorMutationOutcome::RetainedPriorPending {
+                        batch_id,
+                        phase: next_phase,
+                    },
+                ) => {
+                    if batch_id.to_string() != expected_batch_id {
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "settle_clean_publication_retry_batch_mismatch",
+                        ));
+                    }
+                    phase = map_local_phase(next_phase);
+                }
+            }
+        }
+        self.note_retained_publication(
+            expected_batch_id,
+            phase,
+            detail,
+            MAX_EDITOR_SETTLE_TURNS,
+            false,
+        );
+        Ok(ApplicationPublicationSettlement::Deferred(
+            SyncEditorDeferred::RetryableRetainedPublication {
+                batch_id: expected_batch_id.to_owned(),
+                phase,
+            },
+        ))
+    }
+
+    /// Advance a retained clean continuation that this request does not own,
+    /// so a blocked save still makes the runtime progress. Returns the turns
+    /// spent and whether it settled.
+    fn advance_clean_retained_publication(&mut self) -> (usize, bool) {
+        for turn in 0..MAX_EDITOR_SETTLE_TURNS {
+            let outcome = self
+                .clean
+                .as_mut()
+                .expect("clean settlement retains its clean actor")
+                .retry_pending(&self.graph, &self.receipts);
+            match outcome {
+                None => return (turn, true),
+                Some(CleanActorMutationOutcome::Durable(batch_id)) => {
+                    self.queue_clean_provider_publication(batch_id);
+                    return (turn + 1, true);
+                }
+                Some(
+                    CleanActorMutationOutcome::DurablePending { .. }
+                    | CleanActorMutationOutcome::RetainedPriorPending { .. },
+                ) => {}
+            }
+        }
+        (MAX_EDITOR_SETTLE_TURNS, false)
+    }
+
+    fn note_retained_publication(
+        &mut self,
+        batch_id: &str,
+        phase: SyncLocalMutationPhase,
+        detail: String,
+        settle_turns: usize,
+        settled: bool,
+    ) {
+        self.last_retained_publication = Some(SyncRetainedPublicationReport {
+            batch_id: batch_id.to_owned(),
+            phase,
+            detail,
+            settle_turns,
+            settled,
+        });
+    }
+
     fn require_pending_application_publication(
         &self,
         expected_batch_id: &str,
     ) -> Result<(), SyncApplicationPageRequestError> {
+        debug_assert!(
+            self.clean.is_none(),
+            "a clean runtime never populates `local_mutation`; \
+             clean retained publications settle through the clean actor"
+        );
+        #[cfg(test)]
+        self.legacy_publication_settlements
+            .set(self.legacy_publication_settlements.get() + 1);
         match &self.local_mutation {
             Some(PendingLocalMutation::Published(continuation))
                 if continuation.batch_id().to_string() == expected_batch_id =>
@@ -19065,6 +19373,8 @@ impl RuntimeActor {
         preflight: bool,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
         self.prepared_application_reply = None;
+        // A claim is valid only for the request that made it.
+        self.clean_request_retained_batch = None;
         #[cfg(test)]
         reset_prepared_editor_projection_instrumentation();
         #[cfg(test)]
@@ -19733,14 +20043,15 @@ impl RuntimeActor {
                 .retry_pending(&self.graph, &self.receipts)
             {
                 None | Some(CleanActorMutationOutcome::Durable(_)) => EditorTurnReadiness::Ready,
-                Some(CleanActorMutationOutcome::DurablePending { batch_id, phase }) => {
-                    EditorTurnReadiness::Deferred(
-                        SyncEditorDeferred::RetryableRetainedPublication {
-                            batch_id: batch_id.to_string(),
-                            phase: map_local_phase(phase),
-                        },
-                    )
-                }
+                Some(
+                    CleanActorMutationOutcome::DurablePending { batch_id, phase }
+                    | CleanActorMutationOutcome::RetainedPriorPending { batch_id, phase },
+                ) => EditorTurnReadiness::Deferred(
+                    SyncEditorDeferred::RetryableRetainedPublication {
+                        batch_id: batch_id.to_string(),
+                        phase: map_local_phase(phase),
+                    },
+                ),
             };
         }
         if self.managed_local.as_ref().is_some_and(|managed| {
@@ -20365,6 +20676,23 @@ impl RuntimeActor {
                 })
             }
             CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
+                // This save's own manifest commit is durable. Record the batch
+                // so the application layer may settle it and report the save,
+                // instead of routing it into the legacy publication machinery
+                // a clean runtime never populates.
+                self.clean_request_retained_batch = Some(batch_id);
+                Ok(SyncEditorSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::RetryableRetainedPublication {
+                        batch_id: batch_id.to_string(),
+                        phase: map_local_phase(phase),
+                    },
+                    affected_page_ids,
+                })
+            }
+            CleanActorMutationOutcome::RetainedPriorPending { batch_id, phase } => {
+                // An EARLIER batch still occupies the clean actor, so this
+                // transaction never ran. Deliberately do NOT claim the batch:
+                // settling it must not be reported as this save succeeding.
                 Ok(SyncEditorSaveOutcome::Deferred {
                     state: SyncEditorDeferred::RetryableRetainedPublication {
                         batch_id: batch_id.to_string(),
@@ -21525,7 +21853,8 @@ impl RuntimeActor {
                     // SQLite and Markdown. Reconcile any observations that
                     // queued behind it before acknowledging the watcher epoch.
                 }
-                CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
+                CleanActorMutationOutcome::DurablePending { batch_id, phase }
+                | CleanActorMutationOutcome::RetainedPriorPending { batch_id, phase } => {
                     self.refresh_watcher();
                     return SyncRuntimeTick::LocalMutation(
                         SyncLocalMutationOutcome::RetryableRetainedRecovery {
@@ -22219,6 +22548,13 @@ impl RuntimeActor {
                 Ok(CleanActorMutationOutcome::DurablePending { .. }) => {
                     self.provider_direct_manifests.pop_front();
                     self.provider_direct_queued.remove(&batch_id);
+                    SyncRuntimeTick::Recovering
+                }
+                Ok(CleanActorMutationOutcome::RetainedPriorPending { .. }) => {
+                    // An earlier retained continuation blocked the ingest, so
+                    // this manifest was NOT consumed. Leaving it queued is the
+                    // whole point: dequeuing it here would drop delivered
+                    // provider evidence on the floor.
                     SyncRuntimeTick::Recovering
                 }
                 Err(error) => SyncRuntimeTick::RecoveryBlocked(error.detail),
@@ -24764,6 +25100,8 @@ impl RuntimeActor {
         &mut self,
         transaction: OperationTransaction,
     ) -> SyncLocalMutationOutcome {
+        // A claim is valid only for the request that made it.
+        self.clean_request_retained_batch = None;
         if self.terminal.is_some() {
             let (batch_id, phase) = self
                 .local_mutation
@@ -24784,8 +25122,22 @@ impl RuntimeActor {
                     SyncLocalMutationOutcome::Durable { batch_id }
                 }
                 Ok(CleanActorMutationOutcome::DurablePending { batch_id, phase }) => {
+                    // This transaction's own manifest commit is durable, so
+                    // the application layer may settle the retained derived
+                    // work and report the request applied.
+                    self.clean_request_retained_batch = Some(batch_id);
                     SyncLocalMutationOutcome::RetryableRetainedRecovery {
                         batch_id: Some(batch_id),
+                        phase: map_local_phase(phase),
+                    }
+                }
+                Ok(CleanActorMutationOutcome::RetainedPriorPending { phase, .. }) => {
+                    // An earlier retained continuation blocked this submission,
+                    // so nothing of this transaction was published. Report it
+                    // without a batch id: the application layer defers, and the
+                    // caller resubmits once the clean actor is free.
+                    SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: None,
                         phase: map_local_phase(phase),
                     }
                 }
@@ -24929,8 +25281,22 @@ impl RuntimeActor {
                     SyncLocalMutationOutcome::Durable { batch_id }
                 }
                 Ok(CleanActorMutationOutcome::DurablePending { batch_id, phase }) => {
+                    // This transaction's own manifest commit is durable, so
+                    // the application layer may settle the retained derived
+                    // work and report the request applied.
+                    self.clean_request_retained_batch = Some(batch_id);
                     SyncLocalMutationOutcome::RetryableRetainedRecovery {
                         batch_id: Some(batch_id),
+                        phase: map_local_phase(phase),
+                    }
+                }
+                Ok(CleanActorMutationOutcome::RetainedPriorPending { phase, .. }) => {
+                    // An earlier retained continuation blocked this submission,
+                    // so nothing of this transaction was published. Report it
+                    // without a batch id: the application layer defers, and the
+                    // caller resubmits once the clean actor is free.
+                    SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: None,
                         phase: map_local_phase(phase),
                     }
                 }
@@ -44490,19 +44856,26 @@ mod tests {
                 assert_eq!(phase, OperationalPhase::Publication);
                 batch_id
             }
-            CleanActorMutationOutcome::Durable(_) => panic!("fault must retain durable work"),
+            CleanActorMutationOutcome::Durable(_)
+            | CleanActorMutationOutcome::RetainedPriorPending { .. } => {
+                panic!("fault must retain this submission's own durable work")
+            }
         };
         assert_eq!(
             fs::read(fixture.graph_root.join("Root.md")).unwrap(),
             before,
             "manifest commit must not pretend Markdown projection completed"
         );
+        // A second submission while a continuation is retained is NOT this
+        // submission's own pending work: it never executed. The distinct
+        // outcome is what stops a caller settling the earlier batch and then
+        // reporting the second request as saved.
         let same_pending = actor
             .execute_local(&graph, &receipts, &transaction)
             .unwrap();
         assert!(matches!(
             same_pending,
-            CleanActorMutationOutcome::DurablePending { batch_id, .. }
+            CleanActorMutationOutcome::RetainedPriorPending { batch_id, .. }
                 if batch_id == pending_batch
         ));
         assert_eq!(
@@ -44582,6 +44955,134 @@ mod tests {
         assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
             .unwrap()
             .contains("clean production actor save"));
+    }
+
+    /// Android activation produces a CLEAN runtime, and a clean save whose
+    /// derived state fails lands in `CleanActorMutationOutcome::DurablePending`.
+    /// Before the fix that outcome was routed into the LEGACY publication
+    /// settlement, whose first act demands a `PendingLocalMutation::Published`
+    /// the clean actor never writes — so every such save was refused with
+    /// `ActorRefusedAt("require_pending_publication_absent")` and no managed
+    /// save could ever succeed on Android.
+    #[test]
+    fn clean_runtime_application_save_settles_its_own_retained_publication() {
+        let fixture = ActivationFixture::nested_unicode("clean-retained-save", 0xa1781);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+        assert_eq!(
+            handle.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::CleanActivation)
+        );
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let mut edited = page.clone();
+        edited.blocks[0].raw = "clean retained publication save".into();
+
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page: edited,
+        });
+        assert!(
+            matches!(outcome, Ok(SyncApplicationPageSaveOutcome::Saved { .. })),
+            "a clean save that retains its own durable publication must settle it, not refuse: {outcome:?}"
+        );
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("clean retained publication save"));
+
+        // Architectural fact, enforced rather than asserted in a comment: a
+        // clean runtime never reaches the legacy publication settlement.
+        assert_eq!(handle.legacy_publication_settlements().unwrap(), 0);
+
+        // The converged retry must still name the underlying failure. On
+        // Android that detail is the real defect; a green save would hide it.
+        let retained = handle
+            .last_retained_publication()
+            .unwrap()
+            .expect("a settled retained publication is still reported");
+        assert!(retained.settled);
+        assert_eq!(retained.settle_turns, 1);
+        assert!(
+            retained.detail.contains("deterministic operational fault"),
+            "retained publication must carry the underlying failure: {retained:?}"
+        );
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The complement of the settlement contract: when the retained work
+    /// cannot be settled the save DEFERS. A refusal here would name no
+    /// in-scope threat scenario — the manifest commit is already durable — so
+    /// it would be an availability bug, not hardening.
+    #[test]
+    fn clean_runtime_application_save_defers_when_retained_publication_cannot_settle() {
+        let fixture = ActivationFixture::nested_unicode("clean-retained-defer", 0xa1782);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let mut edited = page.clone();
+        edited.blocks[0].raw = "clean retained publication never settles".into();
+
+        // Persistently fail the derived Markdown projection: the manifest
+        // commit stays durable and the continuation is retained on every turn.
+        handle
+            .install_repeated_projection_fault(u32::try_from(MAX_EDITOR_SETTLE_TURNS).unwrap() + 8)
+            .unwrap();
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page: edited,
+            })
+            .expect("an unsettled clean publication defers, it does not refuse");
+        assert!(
+            matches!(
+                outcome,
+                SyncApplicationPageSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::RetryableRetainedPublication { .. }
+                }
+            ),
+            "unsettled retained work must defer: {outcome:?}"
+        );
+        assert_eq!(handle.legacy_publication_settlements().unwrap(), 0);
+        let retained = handle
+            .last_retained_publication()
+            .unwrap()
+            .expect("a deferred retained publication is reported");
+        assert!(!retained.settled);
+        assert_eq!(retained.settle_turns, MAX_EDITOR_SETTLE_TURNS);
     }
 
     #[test]

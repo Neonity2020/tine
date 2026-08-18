@@ -43,6 +43,11 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static HARNESS_FAIL_AFTER_FORMATTING_INTENT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    // Repeats of the same manifested-projection fault. A one-shot fault always
+    // converges on the first retry, which cannot exercise a retained
+    // publication that does NOT settle.
+    static HARNESS_FAIL_MANIFESTED_PROJECTION_REPEATS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -198,7 +203,21 @@ pub(crate) fn fail_next_formatting_adoption_after_intent_for_harness() {
     HARNESS_FAIL_AFTER_FORMATTING_INTENT.with(|fail| fail.set(true));
 }
 
+pub(crate) fn fail_manifested_projection_repeatedly_for_harness(times: u32) {
+    HARNESS_FAIL_MANIFESTED_PROJECTION_REPEATS.with(|fail| fail.set(times));
+}
+
 fn fail_during_manifested_projection_for_harness() -> Result<(), ProjectionError> {
+    let repeated = HARNESS_FAIL_MANIFESTED_PROJECTION_REPEATS.with(|fail| {
+        let remaining = fail.get();
+        fail.set(remaining.saturating_sub(1));
+        remaining > 0
+    });
+    if repeated {
+        return Err(ProjectionError::Work(
+            "deterministic failure during manifested projection".into(),
+        ));
+    }
     HARNESS_FAIL_DURING_MANIFESTED_PROJECTION.with(|fail| {
         if fail.replace(false) {
             Err(ProjectionError::Work(

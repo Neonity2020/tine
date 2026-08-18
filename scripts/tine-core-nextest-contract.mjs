@@ -31,6 +31,12 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   "sync_runtime::tests::clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit",
   "sync_runtime::tests::clean_runtime_actor_assembles_without_legacy_authority_and_saves_one_edit",
   "sync_runtime::tests::clean_runtime_handle_serves_sqlite_queries_and_stops_without_legacy_handoff",
+  // The clean runtime settles its OWN retained publication instead of routing
+  // it into the legacy publication machinery it never populates. The first is
+  // the Linux analogue of the refused Android save; the second holds the other
+  // half of the contract — unsettled retained work DEFERS, never refuses.
+  "sync_runtime::tests::clean_runtime_application_save_settles_its_own_retained_publication",
+  "sync_runtime::tests::clean_runtime_application_save_defers_when_retained_publication_cannot_settle",
   "sync_runtime::tests::clean_runtime_cross_page_move_commits_once_and_cold_reopens",
   "sync_runtime::tests::clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys",
   "sync_runtime::tests::retained_clean_reactivation_reports_each_recovery_boundary",
