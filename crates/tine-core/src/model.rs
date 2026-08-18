@@ -28435,15 +28435,38 @@ const BOOTSTRAP_SOURCE_CHANGE_REPORT_ROWS: usize = 4;
 /// in an ordinary graph, short enough that four rows stay readable.
 const BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES: usize = 120;
 
+/// Render one reported path so that two spellings can never read as one.
+///
+/// The device evidence this reporting exists for printed
+/// `pages/\u{17d} pilot notes #pilot.md` on BOTH sides of a `changed:` row. The
+/// graph held two files whose names differ only by Unicode normalization
+/// (`U+017D` against `Z` + `U+030C`), and both render as the same glyph in
+/// every log, terminal and issue tracker — so the refusal named a row nobody
+/// could tell apart from its neighbour, and the first reading of it was wrong.
+/// Escaping every non-ASCII scalar makes the two spellings different strings.
+/// ASCII paths, which are the overwhelming majority, are untouched.
 fn bootstrap_source_change_report_path(path: &str) -> String {
-    if path.len() <= BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES {
-        return path.to_owned();
+    let rendered = if path.is_ascii() {
+        path.to_owned()
+    } else {
+        let mut rendered = String::with_capacity(path.len());
+        for character in path.chars() {
+            if character.is_ascii() {
+                rendered.push(character);
+            } else {
+                rendered.push_str(&format!("\\u{{{:x}}}", character as u32));
+            }
+        }
+        rendered
+    };
+    if rendered.len() <= BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES {
+        return rendered;
     }
     let mut end = BOOTSTRAP_SOURCE_CHANGE_REPORT_PATH_BYTES;
-    while end > 0 && !path.is_char_boundary(end) {
+    while end > 0 && !rendered.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...", &path[..end])
+    format!("{}...", &rendered[..end])
 }
 
 fn bootstrap_source_change_report_digest(bytes: &[u8]) -> String {
@@ -50830,6 +50853,56 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
             let _ = fs::remove_dir_all(&capture_scratch);
         }
+    }
+
+    /// A named row is worth nothing if the name cannot be told from its twin.
+    ///
+    /// CI 32115065229 reported `changed: file pages/\u{17d} pilot notes
+    /// #pilot.md … -> file pages/\u{17d} pilot notes #pilot.md …` for a graph
+    /// holding TWO files whose names differ only by Unicode normalization
+    /// (`U+017D` against `Z` + `U+030C`). Both spellings print as the same
+    /// glyph sequence in every log, so the refusal could not say which file
+    /// moved, and the first reading of that evidence — content normalization —
+    /// was wrong. The report escapes non-ASCII; ASCII paths are untouched.
+    #[test]
+    fn a_capture_change_refusal_distinguishes_two_spellings_of_one_glyph() {
+        let root = scratch("bootstrap-source-normalization-twins");
+        let precomposed = root.join("pages/\u{17d} pilot notes.md");
+        let decomposed = root.join("pages/Z\u{30c} pilot notes.md");
+        fs::write(&precomposed, b"- precomposed\n").unwrap();
+        fs::write(&decomposed, b"- decomposed\n").unwrap();
+        let capture_scratch = bootstrap_capture_scratch("normalization-twins");
+        let graph = Graph::open(&root);
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_scratch)
+            .unwrap();
+        BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new({
+                let decomposed = decomposed.clone();
+                move || fs::write(decomposed, b"- decomposed, changed under the activation\n")
+            }));
+        });
+        let detail = capture
+            .verify_before_inactive_bootstrap_authoring(&graph)
+            .expect_err("the final proof must refuse a graph that moved")
+            .to_string();
+        assert!(detail.contains("1 row(s) differ"), "{detail}");
+        assert!(
+            detail.contains("pages/Z\\u{30c} pilot notes.md"),
+            "the refusal must name the DECOMPOSED twin as the row that moved: {detail}"
+        );
+        assert!(
+            !detail.contains("pages/\u{17d} pilot notes.md")
+                && !detail.contains("pages/Z\u{30c} pilot notes.md"),
+            "no raw glyph spelling may reach the refusal, or the twins read alike: {detail}"
+        );
+        // An ASCII path is still reported exactly as it is on disk.
+        assert_eq!(
+            bootstrap_source_change_report_path("pages/one.md"),
+            "pages/one.md"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&capture_scratch);
     }
 
     #[test]

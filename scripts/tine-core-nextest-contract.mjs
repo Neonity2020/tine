@@ -94,6 +94,14 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // tick 71 and the journey's previous fixed 64 was below it. Nothing smaller
   // reproduces that — 600 corpus pages settle on tick 40.
   "sync_runtime::tests::android_managed_storage_journey_settles_reconciliation_on_a_corpus_scale_graph",
+  // The device shape of CI 32115065229, at the host boundary: another writer
+  // changes a graph file between the sealed source capture and the final
+  // inventory proof. The runtime already answers that scenario — `Retryable`
+  // plus a retracted archive — but nothing proved the JOURNEY converges, so
+  // three device rounds reported "activation failed" about something the
+  // product handles. This drives the whole journey through one such write and
+  // holds the retried-past refusal in the receipt.
+  "sync_runtime::tests::android_managed_storage_journey_converges_when_a_graph_file_changes_during_activation",
   // Which of two physical files owns one decoded page name, pinned at the
   // application boundary: the FIRST exact path, in plain byte order, so an
   // ordinary backup copy under a directory sorting before `pages/` takes the

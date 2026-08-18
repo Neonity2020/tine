@@ -1022,6 +1022,23 @@ appeared, vanished, or changed. A file that merely appears changes neither the
 source-file nor the source-chunk count, so the inventory report is the only
 thing that localises it.
 
+Reported paths escape every non-ASCII scalar (`pages/\u{17d} pilot notes.md`);
+ASCII paths are reported exactly as they are on disk. A graph may hold two files
+whose names differ only by Unicode normalization, and those two names print as
+one glyph sequence in every log and issue tracker — a refusal that named such a
+row unescaped named a row nobody could tell from its neighbour. Escaping is a
+reporting rule only: nothing normalizes, folds, or rewrites a name or a byte on
+disk.
+
+`Retryable` from that proof means retryable, and callers are expected to retry
+rather than surface the first refusal as a failed activation. An external
+editor, a filesystem sync provider, or a second window saving while Tine is
+still importing is an ordinary in-scope event; the attempt retracts the
+disposable archive it created, and the next attempt rebuilds from the current
+Direct Files bytes. A caller that retries must still carry every refusal it
+retried past, so that a graph refusing on every attempt cannot read as a graph
+that never refused.
+
 The graph-local shared-provider tree is transport rather than local authority.
 Tine still creates and opens it no-follow, requires ordinary directories and
 regular files, flushes published file contents, and validates bounded bytes and

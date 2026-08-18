@@ -159,6 +159,74 @@ fn sync_journey_directory(_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Render a graph-relative path so two spellings cannot read as one.
+///
+/// `pages/\u{17d} pilot notes #pilot.md` and `pages/Z\u{30c} pilot notes #pilot.md`
+/// are different files that print as the same glyph sequence everywhere. A
+/// refusal about one of them is unreadable unless the non-ASCII is escaped.
+fn escape_journey_path(path: &str) -> String {
+    if path.is_ascii() {
+        return path.to_owned();
+    }
+    let mut rendered = String::with_capacity(path.len());
+    for character in path.chars() {
+        if character.is_ascii() {
+            rendered.push(character);
+        } else {
+            rendered.push_str(&format!("\\u{{{:x}}}", character as u32));
+        }
+    }
+    rendered
+}
+
+/// Prove the fixture actually landed as the fixture, before anything reads it.
+///
+/// [`JOURNEY_NAME_SHAPES`] deliberately contains two pairs of names that a
+/// filesystem may or may not treat as distinct: one pair differing only by
+/// Unicode normalization, one only by case. On a filesystem that folds either
+/// pair the second write lands on the FIRST file, and the tree the journey then
+/// activates is not the tree it wrote — it is one file short, holding another
+/// shape's bytes. Nothing downstream can attribute that: it surfaced on Android
+/// as `source capture changed before final inventory proof … content:<26 bytes>
+/// -> content:<25 bytes>` on a path that printed identically on both sides, and
+/// reading it as content normalization was wrong (the 25 bytes are the sibling
+/// shape's, verbatim).
+///
+/// So the fixture proves its own precondition, the way the external-edit leg
+/// already proves its own: every shape must read back exactly the bytes written
+/// for it, and a shape holding a SIBLING's bytes is reported as the folding it
+/// is, naming both spellings.
+fn verify_journey_graph_fixture(graph_root: &Path) -> io::Result<()> {
+    for (path, bytes) in JOURNEY_NAME_SHAPES {
+        let actual = fs::read(graph_root.join(path))?;
+        if actual == bytes.as_bytes() {
+            continue;
+        }
+        let folded = JOURNEY_NAME_SHAPES
+            .iter()
+            .find(|(other, other_bytes)| other != path && actual == other_bytes.as_bytes());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            match folded {
+                Some((other, _)) => format!(
+                    "graph filesystem folds two journey page names into one file: {} reads back                      the bytes written for {} ({} bytes, not {}) — the two names differ only by                      Unicode normalization or by case, and this graph tree cannot hold both",
+                    escape_journey_path(path),
+                    escape_journey_path(other),
+                    actual.len(),
+                    bytes.len()
+                ),
+                None => format!(
+                    "journey fixture shape {} reads back {} bytes, not the {} written for it",
+                    escape_journey_path(path),
+                    actual.len(),
+                    bytes.len()
+                ),
+            },
+        ));
+    }
+    Ok(())
+}
+
 /// Write the journey's graph tree. Callers own the (empty) `graph_root`.
 pub fn write_journey_graph_fixture(graph_root: &Path) -> io::Result<()> {
     fs::create_dir_all(graph_root.join("pages"))?;
@@ -176,7 +244,8 @@ pub fn write_journey_graph_fixture(graph_root: &Path) -> io::Result<()> {
     for (path, bytes) in JOURNEY_NAME_SHAPES {
         write_journey_file(&graph_root.join(path), bytes.as_bytes())?;
     }
-    sync_journey_directory(graph_root)
+    sync_journey_directory(graph_root)?;
+    verify_journey_graph_fixture(graph_root)
 }
 
 /// Apply the outside writer's changes. Separated so the caller can prove the
@@ -368,6 +437,21 @@ fn drain_external_reconciliation(
     Ok(census)
 }
 
+/// How many times the journey re-drives an activation that refused `Retryable`.
+///
+/// A graph that moves under a live activation is an IN-SCOPE scenario, not a
+/// harness artefact: an external editor, a filesystem sync provider, or the
+/// user's own second window saving while Tine is still importing. The runtime
+/// answers it by refusing `Retryable` and retracting the disposable archive that
+/// attempt created, so the next attempt starts from the current Direct Files
+/// bytes. A journey that reports the first refusal proves the refusal and
+/// nothing about the recovery — which is how this journey spent three device
+/// rounds red. A journey that retried SILENTLY would be worse: it would hide a
+/// device that refuses on every attempt. So the retries are bounded, and every
+/// refusal retried past is carried verbatim in the receipt as
+/// `activation_retried=`.
+const JOURNEY_ACTIVATION_ATTEMPTS: usize = 3;
+
 /// Run the whole journey and return its receipt. `Ok` receipts start with
 /// `"ok "`; every other string is the refusal, carrying what localises it.
 pub fn run_managed_storage_journey(
@@ -378,24 +462,43 @@ pub fn run_managed_storage_journey(
     let journey_started = Instant::now();
     let mut last_progress = "activation-not-started".to_string();
     let mut progress_receipt = Vec::new();
-    let activation = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
-        activation_request,
-        |progress| {
-            last_progress = format!("{progress:?}");
-            progress_receipt.push(format!(
-                "{}@{}ms",
-                progress.diagnostic_name(),
-                journey_started.elapsed().as_millis()
-            ));
-        },
-    );
+    let mut retried: Vec<String> = Vec::new();
+    let mut attempts = 1_usize;
+    let activation = loop {
+        progress_receipt.clear();
+        let result = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
+            activation_request.clone(),
+            |progress| {
+                last_progress = format!("{progress:?}");
+                progress_receipt.push(format!(
+                    "{}@{}ms",
+                    progress.diagnostic_name(),
+                    journey_started.elapsed().as_millis()
+                ));
+            },
+        );
+        let retryable = matches!(result.status, SyncLocalActivationStatus::Retryable { .. });
+        if !retryable || attempts >= JOURNEY_ACTIVATION_ATTEMPTS {
+            break result;
+        }
+        retried.push(format!(
+            "attempt {attempts} after {last_progress}: {:?}",
+            result.status
+        ));
+        attempts = attempts.saturating_add(1);
+    };
     let activation_ms = journey_started.elapsed().as_millis();
+    let retried_receipt = if retried.is_empty() {
+        "none".to_owned()
+    } else {
+        retried.join(" || ")
+    };
     if activation.status != SyncLocalActivationStatus::Active {
         // The phase name alone does not say WHEN the phases ran, and the two
         // activation refusals this journey has produced were both about timing
         // under a graph that moved. Carry the per-phase millisecond receipt.
         return format!(
-            "activation failed after {last_progress}: {:?}; activation_ms={activation_ms}; progress={}",
+            "activation failed after {last_progress}: {:?}; activation_attempts={attempts}; activation_retried={retried_receipt}; activation_ms={activation_ms}; progress={}",
             activation.status,
             progress_receipt.join("|")
         );
@@ -586,7 +689,7 @@ pub fn run_managed_storage_journey(
     };
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => format!(
-            "ok activation_ms={activation_ms} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} reconciliation_ms={reconciliation_ms} total_ms={} {retained} {shared} reconciliation[{reconciliation}] progress={}",
+            "ok activation_ms={activation_ms} activation_attempts={attempts} activation_retried={retried_receipt} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} reconciliation_ms={reconciliation_ms} total_ms={} {retained} {shared} reconciliation[{reconciliation}] progress={}",
             journey_started.elapsed().as_millis(),
             progress_receipt.join("|")
         ),
@@ -665,6 +768,54 @@ mod tests {
             !instrumentation.contains("privateRoot.absolutePath,\n        false,"),
             "no instrumentation case may hand-maintain its own copy of the journey graph"
         );
+    }
+
+    /// The fixture must refuse a graph tree that could not hold it.
+    ///
+    /// Two of [`JOURNEY_NAME_SHAPES`] differ from a sibling only by Unicode
+    /// normalization, two only by case. A filesystem that folds either pair
+    /// silently swallows one write: the tree the journey activates is a file
+    /// short and holds a sibling's bytes, and every refusal downstream is about
+    /// something else. On Android that arrived as `source capture changed
+    /// before final inventory proof … content:…@26 -> content:…@25` on a path
+    /// that printed identically on both sides — 25 bytes being the SIBLING
+    /// shape's content verbatim, not a normalized copy of the 26.
+    ///
+    /// The folding is simulated here rather than waited for: no host filesystem
+    /// this suite runs on folds those names, which is precisely why the journey
+    /// has to carry the proof to the platforms that might.
+    #[test]
+    fn the_fixture_refuses_a_graph_tree_that_folds_two_of_its_shapes() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-journey-fixture-folding-{}",
+            uuid::Uuid::new_v4()
+        ));
+        super::write_journey_graph_fixture(&root).expect("an ordinary tree holds every shape");
+
+        // Exactly what a folding filesystem leaves behind: the decomposed
+        // write landed on the precomposed file.
+        std::fs::write(
+            root.join("pages/\u{17d} pilot notes #pilot.md"),
+            "- decomposed pilot notes\n",
+        )
+        .unwrap();
+        let refusal = super::verify_journey_graph_fixture(&root)
+            .expect_err("a folded shape must be refused where it happened")
+            .to_string();
+        assert!(
+            refusal.contains("folds two journey page names into one file"),
+            "{refusal}"
+        );
+        // Both spellings, escaped: they print as one glyph sequence otherwise.
+        assert!(
+            refusal.contains("pages/\\u{17d} pilot notes #pilot.md"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("pages/Z\\u{30c} pilot notes #pilot.md"),
+            "{refusal}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The shapes are the point. If someone trims this list, the journey stops

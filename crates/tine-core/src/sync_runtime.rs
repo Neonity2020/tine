@@ -46029,6 +46029,74 @@ mod tests {
         }
     }
 
+    /// The device shape, at the host boundary: another writer changes a graph
+    /// file WHILE activation is running — after the source capture is sealed and
+    /// before the final inventory proof.
+    ///
+    /// CI 32115065229 reported it from an Android emulator as
+    /// `activation failed after Phase { phase: ImmutablePublicationInstall }:
+    /// Retryable { … "source capture changed before final inventory proof: 1
+    /// row(s) differ; first 1: changed: file pages/Ž pilot notes #pilot.md …
+    /// content:4371a8010f63@26 -> … content:888a74373a30@25" }` — and both
+    /// spellings of that path print identically, which is why the escaped
+    /// rendering is asserted here rather than the raw one.
+    ///
+    /// An external editor saving mid-activation is in scope, and the runtime
+    /// already answers it: the refusal is `Retryable` and the attempt retracts
+    /// the disposable archive it created. What was NOT proven anywhere is that
+    /// the journey converges — the instrumentation reported the first refusal
+    /// and stopped, so three device rounds said "activation failed" about a
+    /// scenario the product handles. This drives the whole journey through it.
+    #[test]
+    fn android_managed_storage_journey_converges_when_a_graph_file_changes_during_activation() {
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture("external-write-during-activation");
+        let moved = graph_root.join("pages/\u{17d} pilot notes #pilot.md");
+        let changed = "- precomposed pilot notes edited by another editor\n";
+        crate::model::set_bootstrap_source_capture_before_final_proof_hook_for_test({
+            let moved = moved.clone();
+            move || fs::write(&moved, changed)
+        });
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        assert!(
+            receipt.starts_with("ok "),
+            "an external write during activation must converge on retry, not fail forever: \
+             {receipt}"
+        );
+        assert!(
+            receipt.contains("activation_attempts=2"),
+            "the receipt must say the journey needed a second attempt: {receipt}"
+        );
+        assert!(
+            receipt.contains("source capture changed before final inventory proof"),
+            "a retried-past refusal must stay in the receipt verbatim, or a device that \
+             refuses on every attempt looks the same as one that never refused: {receipt}"
+        );
+        assert!(
+            receipt.contains("u{17d} pilot notes #pilot.md"),
+            "the refusal must name the moved row in a spelling its normalization twin \
+             cannot be confused with: {receipt}"
+        );
+        assert!(
+            !receipt.contains("pages/\u{17d} pilot notes #pilot.md"),
+            "the raw glyph spelling reads exactly like its decomposed twin, so it must not \
+             be what the refusal reports: {receipt}"
+        );
+        // Write-shyness: the retry rebuilt from the OTHER writer's bytes and
+        // rewrote nothing of its own, here or on the twin that differs from it
+        // only by Unicode normalization.
+        assert_eq!(fs::read_to_string(&moved).unwrap(), changed);
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/Z\u{30c} pilot notes #pilot.md")).unwrap(),
+            "- decomposed pilot notes\n"
+        );
+    }
+
     /// The journey's external-reconciliation leg EDITS a page that the
     /// journey's own fixture put on disk. Driven against a graph that lacks
     /// that fixture the same write is a CREATE, the `archiv/` backup copy of
