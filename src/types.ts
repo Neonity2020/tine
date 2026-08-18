@@ -262,6 +262,10 @@ export interface SparseV2RuntimeStatus {
   shared_role: "initiator" | "joiner" | null;
   shared_phase: "share_prepared" | "joining" | "active" | null;
   provider_pending: number;
+  /** The actor's own scheduling predicate: shared-active and holding provider
+   * work a tick can advance. Diagnostic only; `provider_pending` is a broad
+   * inventory that legitimately stays non-zero. */
+  provider_runnable: boolean;
 }
 
 export type SparseV2Availability =
