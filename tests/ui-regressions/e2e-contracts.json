@@ -880,13 +880,27 @@
      "class": "core-operation",
      "userOutcome": "A fresh second device remains in Direct Files until the user explicitly asks to join, then discovers the provider state and becomes a writable managed-sync member.",
      "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "While a file-sync tool is still delivering the shared provider tree, asking to join says the data is not ready yet rather than calling it unsafe, says it once instead of repeating, and the same running app joins successfully once the remaining bytes arrive, without a restart.",
+     "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A device that already runs Tine-managed storage on its own graph is offered the same explicit join action, is told what happens to its own history, and its own post-activation edit stays readable across the attempt and the next restart.",
+     "blocking": true,
+     "authority": "Tine cross-device managed-storage enrollment and local managed-history retention contract"
     }
    ],
    "acceptableVariations": [
-    "Filesystem provider delivery timing and managed bootstrap duration may vary within the scenario timeout."
+    "Filesystem provider delivery timing and managed bootstrap duration may vary within the scenario timeout.",
+    "The exact wording of the not-ready-yet notice, and the label of the join action in either storage mode.",
+    "The order in which a provider delivers files outside the canonical enrollment prefix."
    ],
    "nonRequirements": [
-    "Android UI chrome, a physical network provider, exact progress wording, exact synchronization latency, or exact internal private-storage layout."
+    "Android UI chrome, a physical network provider, exact progress wording, exact synchronization latency, or exact internal private-storage layout.",
+    "Enumerating every possible provider delivery ordering; the journey drives one fixed order through the enrollment prefix the discovery path keys on."
    ],
    "stability": "burn-in"
   },
