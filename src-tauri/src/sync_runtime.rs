@@ -4593,7 +4593,7 @@ mod tests {
     fn adoption_seam_shutdown_failure_keeps_the_managed_device_serving_its_own_history() {
         let mut fixture = RollbackFixture::new(Some("local_active"));
         fixture.make_active();
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let private_before = snapshot_tree(&fixture.private_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
 
@@ -4631,7 +4631,7 @@ mod tests {
     #[test]
     fn adoption_seam_archive_failure_keeps_both_histories_where_they_were() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let private_before = snapshot_tree(&fixture.private_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
 
@@ -4671,7 +4671,7 @@ mod tests {
     #[test]
     fn adoption_seam_direct_publication_failure_keeps_the_archive_and_the_shared_evidence() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let private_before = snapshot_tree(&fixture.private_root);
         let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
 
@@ -4715,7 +4715,7 @@ mod tests {
     #[test]
     fn adoption_set_aside_archives_the_predecessor_and_leaves_the_shared_namespace_in_place() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
-        create_empty_local_provider_scaffold(&fixture.graph_root);
+        create_empty_provider_transport_scaffold(&fixture.graph_root);
         let descriptor = fixture
             .graph_root
             .join(".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json");
