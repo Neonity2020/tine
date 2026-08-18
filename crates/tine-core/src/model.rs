@@ -31399,7 +31399,7 @@ const SHARED_RESERVED_RENAME_OPERATION: &str =
 pub(crate) struct ArmedProjectionNoreplaceRename {
     class: crate::filesystem_durability::DurabilityArtifactClass,
     errno: i32,
-    root: (u64, u64),
+    root: ProjectionDirIdentity,
 }
 
 #[cfg(test)]
@@ -31674,7 +31674,7 @@ pub(crate) struct ArmedProjectionDirectoryBarrier {
     class: crate::filesystem_durability::DurabilityArtifactClass,
     errno: i32,
     android: bool,
-    root: (u64, u64),
+    root: ProjectionDirIdentity,
 }
 
 #[cfg(test)]
@@ -31745,6 +31745,15 @@ impl Drop for InjectedProjectionDirectoryBarrierFailure {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
+
+/// The platform's directory identity pair as [`projection_dir_identity`]
+/// reports it: `(device, inode)` on unix, `(volume, file id)` on Windows.
+/// Test harnesses that pin an armed injection to one graph store this, so the
+/// type must follow the platform rather than assume the unix shape.
+#[cfg(unix)]
+pub(crate) type ProjectionDirIdentity = (u64, u64);
+#[cfg(windows)]
+pub(crate) type ProjectionDirIdentity = (u64, [u8; 16]);
 
 #[cfg(unix)]
 fn projection_dir_identity(dir: &Dir) -> io::Result<(u64, u64)> {
