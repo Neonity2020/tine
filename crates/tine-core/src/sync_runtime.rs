@@ -46016,8 +46016,11 @@ mod tests {
                 "- encoded pilot notes\n",
             ),
             (
-                "pages/k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md",
-                "- lowercase horse\n",
+                crate::managed_storage_journey::JOURNEY_CASE_TWIN_PAGE,
+                // The journey's external leg now rewrites this file after
+                // activation, so the byte assertion is about write-shyness on
+                // the OUTSIDE writer's bytes rather than on the fixture's.
+                crate::managed_storage_journey::JOURNEY_CASE_TWIN_AFTER,
             ),
             ("archiv/2026/Denn\u{ed} pozn\u{e1}mky.md", "- backup copy\n"),
         ] {
@@ -46027,6 +46030,160 @@ mod tests {
                 "{path} was rewritten or removed"
             );
         }
+        // The host filesystem holds every spelling apart, and the receipt has
+        // to say so: a device receipt is read against this one, and "the
+        // journey passed" means different things on the two filesystem classes.
+        assert!(
+            receipt.contains("graph_name_folding=none"),
+            "the receipt must state what the graph filesystem folds: {receipt}"
+        );
+    }
+
+    /// The same journey on a filesystem that CANNOT hold two of its page names.
+    ///
+    /// Android shared storage folds case (CI 32123012366): the fixture's
+    /// `pages/K\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md` read back the 18
+    /// bytes written for `pages/k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md`
+    /// instead of its own 8. The fixture's precondition check caught that and
+    /// refused — correctly, but it took Android's ONLY coverage with it.
+    ///
+    /// So the journey now models what the filesystem does and asserts the
+    /// product behavior on the tree that filesystem can actually hold:
+    /// * exactly ONE page for the folded pair, never two and never none;
+    /// * that page holds the bytes the storage really has;
+    /// * the outside writer's write to the twin spelling is an ordinary EDIT
+    ///   there, reconciled rather than refused;
+    /// * and nothing about it refuses the rest of the graph.
+    ///
+    /// No host filesystem this suite runs on folds anything, so the fold is
+    /// forced. That is the same reason the Android instrumentation exists at
+    /// all: the behavior is unreachable here and reachable there.
+    #[test]
+    fn android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem() {
+        use crate::graph_name_folding::{
+            clear_graph_name_folding_for_tests, force_graph_name_folding_for_tests,
+            GraphNameFolding,
+        };
+
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("case-folding", false);
+        fs::create_dir_all(&graph_root).unwrap();
+        let folding = GraphNameFolding {
+            ascii_case: true,
+            unicode_case: true,
+            normalization: false,
+        };
+        force_graph_name_folding_for_tests(&graph_root, folding);
+        crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        clear_graph_name_folding_for_tests(&graph_root);
+        assert!(
+            receipt.starts_with("ok "),
+            "a filesystem that cannot hold two of the graph's page names must not deny the              whole graph: {receipt}"
+        );
+        assert!(
+            receipt.contains("graph_name_folding=ascii_case+unicode_case"),
+            "the receipt must name the folding it ran on: {receipt}"
+        );
+        // The twin never became a file of its own, and the one file the pair
+        // shares holds exactly what the outside writer last wrote. Tine neither
+        // recreated the twin nor rewrote the survivor.
+        assert!(
+            !graph_root
+                .join(crate::managed_storage_journey::JOURNEY_CASE_TWIN_PAGE)
+                .exists(),
+            "Tine must not manufacture a file this storage cannot hold"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                graph_root.join(crate::managed_storage_journey::JOURNEY_CASE_OWNER_PAGE)
+            )
+            .unwrap(),
+            crate::managed_storage_journey::JOURNEY_CASE_TWIN_AFTER,
+        );
+        // The pair that this filesystem does NOT fold is still two files. A
+        // fixture that dropped every twin as soon as anything folded would stop
+        // covering the normalization shape that reproduced the field report.
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/Z\u{30c} pilot notes #pilot.md")).unwrap(),
+            "- decomposed pilot notes\n"
+        );
+    }
+
+    /// The other axis, probed independently because it is a different platform
+    /// fact: a filesystem that folds NFC against NFD but keeps case apart —
+    /// HFS+, and what AOSP's casefold implementation suggests Android should
+    /// also do, though CI 32123012366 says it does not (see
+    /// `docs/storage-sync-contract.md` §2.10d).
+    ///
+    /// The pair that folds is the other one, so this is not the same test with
+    /// a different constant: it proves the journey reads its expectations out
+    /// of the probe rather than out of a hard-coded idea of which pair folds.
+    #[test]
+    fn android_managed_storage_journey_holds_one_page_on_a_normalizing_graph_filesystem() {
+        use crate::graph_name_folding::{
+            clear_graph_name_folding_for_tests, force_graph_name_folding_for_tests,
+            GraphNameFolding,
+        };
+
+        let (graph_root, open_request, activation_request) =
+            android_instrumentation_journey_fixture_with("normalization-folding", false);
+        fs::create_dir_all(&graph_root).unwrap();
+        force_graph_name_folding_for_tests(
+            &graph_root,
+            GraphNameFolding {
+                ascii_case: false,
+                unicode_case: false,
+                normalization: true,
+            },
+        );
+        crate::managed_storage_journey::write_journey_graph_fixture(&graph_root).unwrap();
+
+        let receipt = crate::managed_storage_journey::run_managed_storage_journey(
+            graph_root.clone(),
+            open_request,
+            activation_request,
+        );
+        clear_graph_name_folding_for_tests(&graph_root);
+        assert!(
+            receipt.starts_with("ok "),
+            "a normalizing filesystem must not deny the whole graph either: {receipt}"
+        );
+        assert!(
+            receipt.contains("graph_name_folding=normalization"),
+            "the receipt must name the folding it ran on: {receipt}"
+        );
+        // The decomposed spelling has no file of its own; the precomposed one
+        // holds the last write for the pair.
+        assert!(!graph_root
+            .join("pages/Z\u{30c} pilot notes #pilot.md")
+            .exists());
+        assert_eq!(
+            fs::read_to_string(graph_root.join("pages/\u{17d} pilot notes #pilot.md")).unwrap(),
+            "- decomposed pilot notes\n"
+        );
+        // Case is a different axis: this filesystem holds that pair apart, and
+        // the twin still carries the outside writer's bytes with no page of its
+        // own.
+        assert_eq!(
+            fs::read_to_string(
+                graph_root.join(crate::managed_storage_journey::JOURNEY_CASE_TWIN_PAGE)
+            )
+            .unwrap(),
+            crate::managed_storage_journey::JOURNEY_CASE_TWIN_AFTER,
+        );
+        assert_eq!(
+            fs::read_to_string(
+                graph_root.join(crate::managed_storage_journey::JOURNEY_CASE_OWNER_PAGE)
+            )
+            .unwrap(),
+            "- horse\n"
+        );
     }
 
     /// The device shape, at the host boundary: another writer changes a graph

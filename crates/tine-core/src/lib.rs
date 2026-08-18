@@ -12,6 +12,7 @@ pub mod edn;
 pub mod fast_commit;
 mod filesystem_durability;
 
+pub mod graph_name_folding;
 pub mod graph_text_scope;
 pub mod html_sanitize;
 pub mod logbook;

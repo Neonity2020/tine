@@ -25,12 +25,14 @@
 //! and nothing more.
 
 use std::{
+    collections::BTreeMap,
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
 
+use crate::graph_name_folding::{graph_name_folding, GraphNameFolding};
 use crate::sync_runtime::{
     SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
     SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
@@ -128,6 +130,24 @@ pub const JOURNEY_EXTERNAL_CREATED_PAGE: &str = "pages/Extern\u{ed} novinka.md";
 /// The block that created page carries, as the editor surfaces it.
 pub const JOURNEY_EXTERNAL_CREATED_BLOCK: &str = "written by another editor";
 
+/// The upper-case member of the fixture's case pair — the one that is written
+/// FIRST, so it is the spelling a case-preserving-but-folding filesystem keeps
+/// as the directory entry, and the one that owns the decoded page name in plain
+/// byte order everywhere else (`K` sorts before `k`).
+pub const JOURNEY_CASE_OWNER_PAGE: &str = "pages/K\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md";
+/// Its lower-case twin: a second physical file on a filesystem that holds the
+/// two apart, and no file at all on one that folds case.
+pub const JOURNEY_CASE_TWIN_PAGE: &str = "pages/k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md";
+/// What an outside writer leaves at the twin spelling after activation.
+///
+/// This is the leg that separates the two filesystem classes at the PRODUCT
+/// boundary rather than at the fixture boundary. Off a folding filesystem it is
+/// a create whose decoded page name is already owned — the shape that flooded
+/// the device — and it must be admitted and left on disk without a page. On a
+/// folding filesystem the same write IS the owner's file, so it is an ordinary
+/// external edit and the one page's content changes.
+pub const JOURNEY_CASE_TWIN_AFTER: &str = "- lowercase horse, edited outside Tine\n";
+
 /// Write one graph file and make it durable before the runtime can observe it.
 ///
 /// A plain `fs::write` leaves the bytes in the page cache and the new directory
@@ -179,47 +199,192 @@ fn escape_journey_path(path: &str) -> String {
     rendered
 }
 
-/// Prove the fixture actually landed as the fixture, before anything reads it.
+/// The graph tree the journey INTENDS, expressed as the filesystem will hold it.
 ///
 /// [`JOURNEY_NAME_SHAPES`] deliberately contains two pairs of names that a
 /// filesystem may or may not treat as distinct: one pair differing only by
-/// Unicode normalization, one only by case. On a filesystem that folds either
-/// pair the second write lands on the FIRST file, and the tree the journey then
-/// activates is not the tree it wrote — it is one file short, holding another
-/// shape's bytes. Nothing downstream can attribute that: it surfaced on Android
-/// as `source capture changed before final inventory proof … content:<26 bytes>
-/// -> content:<25 bytes>` on a path that printed identically on both sides, and
-/// reading it as content normalization was wrong (the 25 bytes are the sibling
-/// shape's, verbatim).
+/// Unicode normalization, one only by case. Android shared storage folds the
+/// case pair (CI 32123012366), so the tree the journey writes there is one file
+/// short of the tree it asked for, and that file holds the LAST write's bytes.
 ///
-/// So the fixture proves its own precondition, the way the external-edit leg
-/// already proves its own: every shape must read back exactly the bytes written
-/// for it, and a shape holding a SIBLING's bytes is reported as the folding it
-/// is, naming both spellings.
-fn verify_journey_graph_fixture(graph_root: &Path) -> io::Result<()> {
+/// This type is the journey's model of that. Every intended write is `place`d,
+/// which folds the path the way the detected filesystem does and answers the
+/// name the bytes actually land under. The journey then asserts against the
+/// model rather than against the wish, so the same code proves the same product
+/// contract on both filesystem classes instead of refusing to run on one of
+/// them.
+#[derive(Clone, Debug)]
+pub struct JourneyGraphTree {
+    folding: GraphNameFolding,
+    /// Folded path -> (the spelling that is actually the directory entry, bytes).
+    files: BTreeMap<String, (String, Vec<u8>)>,
+}
+
+impl JourneyGraphTree {
+    fn new(folding: GraphNameFolding) -> Self {
+        Self {
+            folding,
+            files: BTreeMap::new(),
+        }
+    }
+
+    /// Record one intended write and answer where it really lands.
+    ///
+    /// A case-folding filesystem is case-PRESERVING: the directory entry keeps
+    /// the spelling of whoever created it first, and every later write to a
+    /// folded spelling replaces that file's bytes under the original name. So
+    /// the first `place` for a folded key fixes the name and each later one
+    /// replaces the bytes — exactly what the device reported, where the
+    /// upper-case name read back the lower-case content.
+    fn place(&mut self, path: &str, bytes: &[u8]) -> String {
+        let key = self.folding.effective_path(path);
+        let entry = self
+            .files
+            .entry(key)
+            .or_insert_with(|| (path.to_owned(), Vec::new()));
+        entry.1 = bytes.to_vec();
+        entry.0.clone()
+    }
+
+    /// The bytes this filesystem holds for a path, under whatever spelling.
+    #[must_use]
+    pub fn bytes_at(&self, path: &str) -> Option<&[u8]> {
+        self.files
+            .get(&self.folding.effective_path(path))
+            .map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// Does this exact spelling have a file of its own here?
+    ///
+    /// False for the folded-away twin, and that single difference is what the
+    /// journey's folding leg turns into a product assertion.
+    #[must_use]
+    pub fn has_its_own_file(&self, path: &str) -> bool {
+        self.files
+            .get(&self.folding.effective_path(path))
+            .is_some_and(|(name, _)| name == path)
+    }
+
+    /// What this filesystem folds. Carried verbatim into the receipt.
+    #[must_use]
+    pub const fn folding(&self) -> GraphNameFolding {
+        self.folding
+    }
+
+    /// The first block of a page here, as the editor surfaces it.
+    #[must_use]
+    pub fn first_block_at(&self, path: &str) -> Option<String> {
+        let text = std::str::from_utf8(self.bytes_at(path)?).ok()?;
+        Some(
+            text.lines()
+                .next()?
+                .trim_start_matches("- ")
+                .trim()
+                .to_owned(),
+        )
+    }
+}
+
+/// The fixture's intended writes, replayed against a filesystem that folds like
+/// this one.
+///
+/// Pure, so the writer and the runner derive the same tree independently and
+/// nothing has to be carried across the JNI boundary.
+#[must_use]
+pub fn journey_graph_tree(folding: GraphNameFolding) -> JourneyGraphTree {
+    let mut tree = JourneyGraphTree::new(folding);
+    for (path, bytes) in JOURNEY_FIXTURE_PRELUDE {
+        tree.place(path, bytes.as_bytes());
+    }
     for (path, bytes) in JOURNEY_NAME_SHAPES {
+        tree.place(path, bytes.as_bytes());
+    }
+    tree
+}
+
+/// The same replay, continued through the outside writer's changes.
+#[must_use]
+pub fn journey_graph_tree_after_external_writes(folding: GraphNameFolding) -> JourneyGraphTree {
+    let mut tree = journey_graph_tree(folding);
+    for (path, bytes) in journey_external_writes() {
+        tree.place(path, bytes.as_bytes());
+    }
+    tree
+}
+
+/// The graph files that carry no name-shape argument: config, the edited page,
+/// and one journal that references a shape by `[[…]]` and by `#hashtag`.
+const JOURNEY_FIXTURE_PRELUDE: &[(&str, &str)] = &[
+    ("logseq/config.edn", "{}\n"),
+    (JOURNEY_EDITED_PAGE, "- Android managed storage smoke\n"),
+    (
+        "journals/2026_08_18.md",
+        "- journal entry with #pilot and [[\u{17d} pilot notes #pilot]]\n",
+    ),
+];
+
+/// Everything the outside writer does, in order — the three ordinary changes
+/// plus the case twin, which is last because it is the one write whose MEANING
+/// depends on the filesystem.
+fn journey_external_writes() -> impl Iterator<Item = (&'static str, &'static str)> {
+    JOURNEY_EXTERNAL_WRITES
+        .iter()
+        .map(|(path, bytes)| (*path, *bytes))
+        .chain(std::iter::once((
+            JOURNEY_CASE_TWIN_PAGE,
+            JOURNEY_CASE_TWIN_AFTER,
+        )))
+}
+
+/// Prove the fixture actually landed as the fixture, before anything reads it.
+///
+/// The check is against the MODEL above, not against the wish list: on a
+/// filesystem whose probe says it folds the case pair, one file short IS the
+/// correct tree and is not an error.
+///
+/// What stays an error — and this is the half that must not be weakened — is a
+/// fold the probe did NOT predict. That is a filesystem we have mis-modelled,
+/// and everything downstream would then be attributed to the wrong cause: it
+/// surfaced on Android as `source capture changed before final inventory proof
+/// … content:<26 bytes> -> content:<25 bytes>` on a path that printed
+/// identically on both sides, and reading it as content normalization was wrong
+/// (the 25 bytes are the sibling shape's, verbatim).
+fn verify_journey_graph_fixture(graph_root: &Path, tree: &JourneyGraphTree) -> io::Result<()> {
+    for (path, expected) in tree.files.values() {
         let actual = fs::read(graph_root.join(path))?;
-        if actual == bytes.as_bytes() {
+        if actual == *expected {
             continue;
         }
-        let folded = JOURNEY_NAME_SHAPES
-            .iter()
-            .find(|(other, other_bytes)| other != path && actual == other_bytes.as_bytes());
+        let folded = tree
+            .files
+            .values()
+            .find(|(other, other_bytes)| other != path && actual == *other_bytes)
+            .map(|(other, _)| other.as_str())
+            .or_else(|| {
+                JOURNEY_NAME_SHAPES
+                    .iter()
+                    .find(|(other, other_bytes)| other != path && actual == other_bytes.as_bytes())
+                    .map(|(other, _)| *other)
+            });
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             match folded {
-                Some((other, _)) => format!(
-                    "graph filesystem folds two journey page names into one file: {} reads back                      the bytes written for {} ({} bytes, not {}) — the two names differ only by                      Unicode normalization or by case, and this graph tree cannot hold both",
+                Some(other) => format!(
+                    "graph filesystem folds two journey page names into one file and the \
+                     name-folding probe did not predict it (probe answered {}): {} reads back \
+                     the bytes written for {} ({} bytes, not {}) — the two names differ only by \
+                     Unicode normalization or by case",
+                    tree.folding.diagnostic(),
                     escape_journey_path(path),
                     escape_journey_path(other),
                     actual.len(),
-                    bytes.len()
+                    expected.len()
                 ),
                 None => format!(
                     "journey fixture shape {} reads back {} bytes, not the {} written for it",
                     escape_journey_path(path),
                     actual.len(),
-                    bytes.len()
+                    expected.len()
                 ),
             },
         ));
@@ -228,33 +393,49 @@ fn verify_journey_graph_fixture(graph_root: &Path) -> io::Result<()> {
 }
 
 /// Write the journey's graph tree. Callers own the (empty) `graph_root`.
+///
+/// The filesystem is asked what it folds BEFORE anything is written, so the
+/// tree written is one this filesystem can hold and the verification knows
+/// which files to expect. The probe answer is memoized per device, so this
+/// costs a handful of writes once per filesystem rather than once per graph.
 pub fn write_journey_graph_fixture(graph_root: &Path) -> io::Result<()> {
     fs::create_dir_all(graph_root.join("pages"))?;
     fs::create_dir_all(graph_root.join("journals"))?;
     fs::create_dir_all(graph_root.join("logseq"))?;
-    write_journey_file(&graph_root.join("logseq/config.edn"), b"{}\n")?;
-    write_journey_file(
-        &graph_root.join(JOURNEY_EDITED_PAGE),
-        b"- Android managed storage smoke\n",
-    )?;
-    write_journey_file(
-        &graph_root.join("journals/2026_08_18.md"),
-        "- journal entry with #pilot and [[\u{17d} pilot notes #pilot]]\n".as_bytes(),
-    )?;
-    for (path, bytes) in JOURNEY_NAME_SHAPES {
-        write_journey_file(&graph_root.join(path), bytes.as_bytes())?;
+    let mut tree = JourneyGraphTree::new(graph_name_folding(graph_root));
+    for (path, bytes) in JOURNEY_FIXTURE_PRELUDE
+        .iter()
+        .chain(JOURNEY_NAME_SHAPES.iter())
+    {
+        // `place` answers the name this filesystem really stores the bytes
+        // under. On a folding filesystem that redirects a twin onto its
+        // survivor — which is what the filesystem would do to the write anyway
+        // — and off one it is always the path itself. Writing through it keeps
+        // host and device driving one code path instead of branching on the
+        // platform.
+        let landed = tree.place(path, bytes.as_bytes());
+        write_journey_file(&graph_root.join(landed), bytes.as_bytes())?;
     }
     sync_journey_directory(graph_root)?;
-    verify_journey_graph_fixture(graph_root)
+    verify_journey_graph_fixture(graph_root, &tree)
 }
 
 /// Apply the outside writer's changes. Separated so the caller can prove the
 /// runtime was already live when they landed.
-fn apply_journey_external_writes(graph_root: &Path) -> io::Result<Vec<String>> {
+///
+/// The last write is the case twin, and it is what makes this journey cover
+/// BOTH filesystem classes: off a folding filesystem it is a create for an
+/// already-owned page name — the shape that flooded Martin's device — and on
+/// one it is an ordinary external edit of the single file the pair shares.
+fn apply_journey_external_writes(
+    graph_root: &Path,
+    tree: &mut JourneyGraphTree,
+) -> io::Result<Vec<String>> {
     let mut written = Vec::new();
-    for (path, bytes) in JOURNEY_EXTERNAL_WRITES {
-        write_journey_file(&graph_root.join(path), bytes.as_bytes())?;
-        written.push((*path).to_owned());
+    for (path, bytes) in journey_external_writes() {
+        let landed = tree.place(path, bytes.as_bytes());
+        write_journey_file(&graph_root.join(&landed), bytes.as_bytes())?;
+        written.push(landed);
     }
     sync_journey_directory(graph_root)?;
     Ok(written)
@@ -460,6 +641,13 @@ pub fn run_managed_storage_journey(
     activation_request: SyncLocalActivationRequest,
 ) -> String {
     let journey_started = Instant::now();
+    // Ask the graph's filesystem what it folds BEFORE activation starts. The
+    // probe writes and removes a hidden directory, which a live source capture
+    // would report as the graph moving under it, so it can only run here. The
+    // answer is memoized per device, so on the device the fixture writer has
+    // already paid for it.
+    let folding = graph_name_folding(&graph_root);
+    let folding_receipt = format!("graph_name_folding={}", folding.diagnostic());
     let mut last_progress = "activation-not-started".to_string();
     let mut progress_receipt = Vec::new();
     let mut retried: Vec<String> = Vec::new();
@@ -498,7 +686,7 @@ pub fn run_managed_storage_journey(
         // activation refusals this journey has produced were both about timing
         // under a graph that moved. Carry the per-phase millisecond receipt.
         return format!(
-            "activation failed after {last_progress}: {:?}; activation_attempts={attempts}; activation_retried={retried_receipt}; activation_ms={activation_ms}; progress={}",
+            "activation failed after {last_progress}: {:?}; activation_attempts={attempts}; activation_retried={retried_receipt}; activation_ms={activation_ms}; {folding_receipt}; progress={}",
             activation.status,
             progress_receipt.join("|")
         );
@@ -609,9 +797,10 @@ pub fn run_managed_storage_journey(
         }
     }
     let reconciliation_started = Instant::now();
-    let external = match apply_journey_external_writes(&graph_root) {
+    let mut tree = journey_graph_tree(folding);
+    let external = match apply_journey_external_writes(&graph_root, &mut tree) {
         Ok(written) => written,
-        Err(error) => return format!("external write failed: {error}"),
+        Err(error) => return format!("external write failed: {error}; {folding_receipt}"),
     };
     let reconciliation_budget = journey_reconciliation_tick_budget(&graph_root);
     let reconciliation = match drain_external_reconciliation(&handle, reconciliation_budget) {
@@ -655,6 +844,78 @@ pub fn run_managed_storage_journey(
         }
     }
 
+    // The folding leg. One outside write, two correct outcomes, and which one
+    // is correct is a property of the filesystem rather than of the runtime:
+    //
+    // * where the two spellings are two files, this was a CREATE whose decoded
+    //   page name is already owned — the shape that flooded Martin's device.
+    //   It must be admitted (the drain above already refused any refusal), the
+    //   owner must be untouched, and the twin must stay on disk as ordinary
+    //   graph text with no page of its own.
+    // * where they are one file, this WAS the owner's file, so it is an
+    //   ordinary external edit and the one page carries the new bytes.
+    //
+    // Nothing in this block branches on the platform: both expectations are
+    // read out of the model of what the filesystem did.
+    let Some(expected_owner_block) = tree.first_block_at(JOURNEY_CASE_OWNER_PAGE) else {
+        return format!("journey model lost the case-pair owner page; {folding_receipt}");
+    };
+    match handle.load_application_page(SyncApplicationPageLoadRequest {
+        page: SyncApplicationPageSelector::ExactPath {
+            path: JOURNEY_CASE_OWNER_PAGE.into(),
+        },
+    }) {
+        Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. })
+            if page.blocks.len() == 1
+                && page.blocks[0].raw.as_str() == expected_owner_block => {}
+        outcome => {
+            return format!(
+                "the case pair's owning page did not hold what this filesystem holds                  (expected one block {expected_owner_block:?}): {outcome:?}; {folding_receipt};                  {reconciliation}"
+            )
+        }
+    }
+    // Never a SECOND page, on either filesystem. This is the assertion that
+    // says Tine did not silently split one page in two, nor merge two into one:
+    // there is exactly one page for this name, whatever the storage did with
+    // the spellings.
+    match handle.load_application_page(SyncApplicationPageLoadRequest {
+        page: SyncApplicationPageSelector::ExactPath {
+            path: JOURNEY_CASE_TWIN_PAGE.into(),
+        },
+    }) {
+        Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. }) => {
+            return format!(
+                "the case twin became a second page: path={} blocks={}; {folding_receipt};                  {reconciliation}",
+                escape_journey_path(page.path.as_str()),
+                page.blocks.len()
+            )
+        }
+        Err(error) => {
+            return format!(
+                "loading the case twin failed instead of reporting it is not a page: {error};                  {folding_receipt}"
+            )
+        }
+        Ok(_) => {}
+    }
+    // Write-shyness on the file Tine deliberately does not own: the outside
+    // writer's exact bytes are still there, under whichever spelling this
+    // filesystem stored them.
+    let twin_expectation = tree.bytes_at(JOURNEY_CASE_TWIN_PAGE).unwrap_or_default();
+    let twin_on_disk = if tree.has_its_own_file(JOURNEY_CASE_TWIN_PAGE) {
+        JOURNEY_CASE_TWIN_PAGE
+    } else {
+        JOURNEY_CASE_OWNER_PAGE
+    };
+    match fs::read(graph_root.join(twin_on_disk)) {
+        Ok(bytes) if bytes == twin_expectation => {}
+        other => {
+            return format!(
+                "the outside writer's bytes at {} were not left alone: {other:?};                  {folding_receipt}",
+                escape_journey_path(twin_on_disk)
+            )
+        }
+    }
+
     let shared = match handle.prepare_shared() {
         Ok(descriptor) => format!("shared_descriptor={}", descriptor.descriptor_digest),
         Err(error) => return format!("prepare shared failed: {error}"),
@@ -689,7 +950,7 @@ pub fn run_managed_storage_journey(
     };
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => format!(
-            "ok activation_ms={activation_ms} activation_attempts={attempts} activation_retried={retried_receipt} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} reconciliation_ms={reconciliation_ms} total_ms={} {retained} {shared} reconciliation[{reconciliation}] progress={}",
+            "ok activation_ms={activation_ms} activation_attempts={attempts} activation_retried={retried_receipt} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} reconciliation_ms={reconciliation_ms} total_ms={} {folding_receipt} {retained} {shared} reconciliation[{reconciliation}] progress={}",
             journey_started.elapsed().as_millis(),
             progress_receipt.join("|")
         ),
@@ -799,11 +1060,19 @@ mod tests {
             "- decomposed pilot notes\n",
         )
         .unwrap();
-        let refusal = super::verify_journey_graph_fixture(&root)
+        // The probe answered "folds nothing" on this host, so this fold is one
+        // the model did not predict — still a refusal, and now one that says
+        // the model and the filesystem disagree.
+        let tree = super::journey_graph_tree(crate::graph_name_folding::GraphNameFolding::NONE);
+        let refusal = super::verify_journey_graph_fixture(&root, &tree)
             .expect_err("a folded shape must be refused where it happened")
             .to_string();
         assert!(
             refusal.contains("folds two journey page names into one file"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("the name-folding probe did not predict it (probe answered none)"),
             "{refusal}"
         );
         // Both spellings, escaped: they print as one glyph sequence otherwise.
@@ -816,6 +1085,101 @@ mod tests {
             "{refusal}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half, and the one the device needs: where the probe DID
+    /// predict the fold, the fixture must write a tree the filesystem can hold
+    /// and accept it — not refuse and take Android's only coverage with it.
+    ///
+    /// The fold is forced rather than waited for: no host filesystem this suite
+    /// runs on folds anything, which is exactly why the journey has to carry
+    /// the proof to the platform that does.
+    #[test]
+    fn the_fixture_writes_and_accepts_a_tree_a_folding_filesystem_can_hold() {
+        use crate::graph_name_folding::{
+            clear_graph_name_folding_for_tests, force_graph_name_folding_for_tests,
+            GraphNameFolding,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "tine-journey-fixture-folds-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let folding = GraphNameFolding {
+            ascii_case: true,
+            unicode_case: true,
+            normalization: false,
+        };
+        force_graph_name_folding_for_tests(&root, folding);
+        super::write_journey_graph_fixture(&root)
+            .expect("a folding filesystem must get a tree it can hold, not a refusal");
+
+        // The twin has no file of its own, and the survivor holds the LAST
+        // write's bytes — verbatim what Android reported (the upper-case name
+        // read back 18 bytes, the lower-case content, not its own 8).
+        assert!(!root.join(super::JOURNEY_CASE_TWIN_PAGE).exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(super::JOURNEY_CASE_OWNER_PAGE)).unwrap(),
+            "- lowercase horse\n"
+        );
+        // The normalization pair is NOT folded by this filesystem, so both of
+        // those files must still be there. A fixture that dropped every twin
+        // whenever anything folded would silently stop covering the shapes that
+        // reproduced Martin's failure.
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/\u{17d} pilot notes #pilot.md")).unwrap(),
+            "- precomposed pilot notes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/Z\u{30c} pilot notes #pilot.md")).unwrap(),
+            "- decomposed pilot notes\n"
+        );
+
+        clear_graph_name_folding_for_tests(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The model must describe both filesystem classes, and must not describe
+    /// them the same way — every assertion in the journey's folding leg is read
+    /// out of it.
+    #[test]
+    fn the_graph_tree_model_separates_the_two_filesystem_classes() {
+        use crate::graph_name_folding::GraphNameFolding;
+
+        let apart = super::journey_graph_tree_after_external_writes(GraphNameFolding::NONE);
+        assert!(apart.has_its_own_file(super::JOURNEY_CASE_TWIN_PAGE));
+        assert_eq!(
+            apart
+                .first_block_at(super::JOURNEY_CASE_OWNER_PAGE)
+                .unwrap(),
+            "horse"
+        );
+        assert_eq!(
+            apart.bytes_at(super::JOURNEY_CASE_TWIN_PAGE).unwrap(),
+            super::JOURNEY_CASE_TWIN_AFTER.as_bytes()
+        );
+
+        let folded = super::journey_graph_tree_after_external_writes(GraphNameFolding {
+            ascii_case: true,
+            unicode_case: true,
+            normalization: false,
+        });
+        assert!(!folded.has_its_own_file(super::JOURNEY_CASE_TWIN_PAGE));
+        assert!(folded.has_its_own_file(super::JOURNEY_CASE_OWNER_PAGE));
+        // One file, and it holds the outside writer's bytes: on this storage
+        // that write WAS an edit of the owner, not a create beside it.
+        assert_eq!(
+            folded
+                .first_block_at(super::JOURNEY_CASE_OWNER_PAGE)
+                .unwrap(),
+            "lowercase horse, edited outside Tine"
+        );
+        assert_eq!(
+            folded.bytes_at(super::JOURNEY_CASE_TWIN_PAGE).unwrap(),
+            folded.bytes_at(super::JOURNEY_CASE_OWNER_PAGE).unwrap()
+        );
+        assert_eq!(folded.folding().diagnostic(), "ascii_case+unicode_case");
     }
 
     /// The shapes are the point. If someone trims this list, the journey stops
@@ -834,6 +1198,10 @@ mod tests {
         // One pair differs only by case, one only by normalization.
         assert!(paths.contains(&"pages/K\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md"));
         assert!(paths.contains(&"pages/k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md"));
+        // The folding leg addresses that pair by name, so the two must stay the
+        // same two strings the fixture writes.
+        assert!(paths.contains(&super::JOURNEY_CASE_OWNER_PAGE));
+        assert!(paths.contains(&super::JOURNEY_CASE_TWIN_PAGE));
         assert!(paths.contains(&"pages/\u{17d} pilot notes #pilot.md"));
         assert!(paths.contains(&"pages/Z\u{30c} pilot notes #pilot.md"));
         // The external leg must keep creating a second physical file for an

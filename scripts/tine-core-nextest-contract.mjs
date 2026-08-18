@@ -88,6 +88,18 @@ export const CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES = Object.freeze([
   // did not reconcile: Missing` — verbatim how the resume instrumentation case
   // failed on CI 32108957903 with the runtime behaving as specified.
   "sync_runtime::tests::android_journey_refuses_a_graph_that_lacks_its_own_fixture",
+  // The two filesystem classes the journey now has to cover. Android shared
+  // storage CANNOT hold two of the journey's page names (CI 32123012366:
+  // `pages/K\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md reads back the bytes
+  // written for pages/k\u{16f}\u{148}…`), and the fixture's precondition check
+  // correctly refused — which left Android with no coverage at all. These drive
+  // the WHOLE journey against a forced fold and hold the product contract on
+  // it: one page for the folded pair, never two and never none, carrying the
+  // bytes the storage really has, with the twin write reconciled as the edit it
+  // is there. The second is the other axis, so neither can pass by hard-coding
+  // which pair folds.
+  "sync_runtime::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem",
+  "sync_runtime::tests::android_managed_storage_journey_holds_one_page_on_a_normalizing_graph_filesystem",
   // The graph the device instrumentation actually holds (1097 corpus pages
   // under the journey's name shapes). Reconciliation advances one bounded
   // slice per turn, so the drain must scale with the graph: this settles on

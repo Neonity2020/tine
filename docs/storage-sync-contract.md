@@ -1104,6 +1104,101 @@ only that derived representation and costs one rebuild; it must not migrate or
 reinterpret authoritative oplog bytes. Authoritative format changes require an
 explicit versioned migration and cannot be treated as a cache rebuild.
 
+### 2.10d When the graph filesystem folds two page names into one file
+
+Android CI run 32123012366 recorded the managed-storage journey's fixture
+refusing to write itself on real shared storage
+(`/storage/emulated/0/Download/…`):
+
+```
+journey graph fixture could not be written: graph filesystem folds two journey
+page names into one file: pages/K\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md reads
+back the bytes written for pages/k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}.md
+(18 bytes, not 8)
+```
+
+Two files whose names differ only by case cannot both exist there. This is not
+confined to Android: FAT/exFAT removable media, NTFS, APFS in its default
+configuration and any `ext4` directory carrying the casefold attribute fold
+case, and HFS+ additionally folds Unicode normalization.
+
+**Which folding, measured rather than assumed.** Three axes are probed
+independently — ASCII case, non-ASCII (Unicode) case, and NFC against NFD —
+because they are separable platform facts and a graph that is legal under one is
+illegal under another. On the API-35 emulator the answer was **case folds,
+normalization does not**: the fixture verifies its shapes in list order, and the
+run above reported the case pair while the normalization pair
+(`pages/\u{17d} pilot notes #pilot.md` against
+`pages/Z\u{30c} pilot notes #pilot.md`) had already read back byte-exact.
+
+AOSP disagrees with that. Android shared storage folds case through
+`ext4`'s casefold attribute, whose comparison (`fs/unicode`, `utf8_strncasecmp`)
+is defined over the NFDICF form, and NFC and NFD share that form — so on the
+source, normalization should fold too. §2.10b already settled how that
+disagreement is resolved: **upstream source is evidence about upstream intent,
+not proof about the running device; the receipt wins.** The probe therefore
+reports what the filesystem in front of it does, and the managed-storage journey
+receipt carries the verdict verbatim as `graph_name_folding=…`, so no future
+round trip is needed to learn it.
+
+**Why this is not, by itself, a merge of two pages.** Tine's logical page name
+is already case- and normalization-insensitive: `LogicalPageName::key_digest`
+hashes `canonical_page_name_key`, which lowercases and then applies NFC,
+matching Logseq. Every pair of file names a case-folding or normalization-folding
+filesystem cannot tell apart is therefore a pair Tine **already treats as one
+page**. Such a filesystem cannot merge two distinct Tine pages, because two
+names it folds were never two pages here. This is the load-bearing fact behind
+everything below, and it is bound to the code by
+`graph_name_folding::tests::filesystem_folding_never_separates_names_tine_already_treats_as_one`.
+
+What folding does change is that the non-authoritative DUPLICATE file — the one
+`retain_authoritative_desired_pages` deliberately leaves on disk as ordinary
+graph text with no page of its own — cannot exist there at all. Whoever wrote
+the second spelling (a sync client, a file manager, the user) overwrote the
+authoritative file instead of landing beside it.
+
+**The contract.**
+
+| | On a folding graph filesystem |
+| --- | --- |
+| Pages | Exactly ONE page per folded name — never two, never none. The twin spelling never becomes a second page, and never displaces the first. |
+| Bytes | The page carries whatever the storage actually holds. An outside write to the twin spelling IS a write to that one file, so it reconciles as an ordinary external edit, not as a create for an already-owned name. |
+| Availability | Folding never refuses activation, never refuses a reconciliation transaction, and never converts to an `ImportBlock`. One folded pair may not deny the rest of the graph — the same rule §3.1 imposes on the duplicate-name case, in its filesystem-shaped variant. |
+| Direct Files | Unchanged and required to work. Tine writes a graph path only when it either learned that exact path from the filesystem's own directory entry or created it with an exclusive create (`O_CREAT|O_EXCL`, §2.10b), so Tine can never be the writer that destroys a folded twin: an occupied fold resolves to `AlreadyExists` before anything has moved. |
+| Reporting | A fold performed by ANOTHER writer before Tine ever saw the graph is not detectable and is not reported — Tine has no evidence two files ever existed, and inventing a warning from a bare capability answer would put an unactionable message in front of every Android user. What is reported is the actionable case: a name the user asks for that this storage cannot hold beside a name it already holds, phrased by `GraphNameFolding::explain_one_file_two_names` — both spellings, which one is kept, and the one action that works. Reported once: the runtime bridge (`src/managedStorageRuntime.ts`) advances its notice sequence only for a message the user has not already been shown, so a live condition cannot re-arm the toast on every retry. |
+
+**The probe** (`graph_name_folding::graph_name_folding`). A write/read-back pair
+per axis inside one hidden, uniquely named directory under the graph root, which
+is removed before returning. Deliberately a write probe rather than an
+inspection of the mount table, for the reason §2.10b gives. The answer is a
+property of the mounted filesystem, so it is remembered per `st_dev` — the same
+key and the same reasoning as `model::FLAGGED_RENAME_UNSUPPORTED_DEVICES` — and
+it is **never load-bearing**: a probe that cannot run answers
+`GraphNameFolding::UNKNOWN`, which is byte-identical to "folds nothing", so no
+behavior depends on it having succeeded. It writes and removes files under the
+graph root, so it must not run inside a live source capture, which would report
+the graph as moving underneath it; the managed-storage journey calls it before
+activation starts, and the memo means the device pays for it once.
+
+**What is deliberately NOT promised.** Tine does not reconstruct a side of a
+folded pair that another writer already destroyed, and does not claim a merge it
+has no evidence of. On such a device the user's graph can hold only one of the
+two spellings; keeping both requires a name that differs by more than
+capitalisation or accent spelling.
+
+Enforced by `graph_name_folding::tests` (nine cases: the three axes are
+independent, every path component folds, the probe leaves no residue, an
+unprobeable root degrades to non-folding, a forced answer is scoped to one graph
+root, and the equivalence-class fact above),
+`managed_storage_journey::tests::the_fixture_writes_and_accepts_a_tree_a_folding_filesystem_can_hold`,
+`…::the_fixture_refuses_a_graph_tree_that_folds_two_of_its_shapes` (a fold the
+probe did NOT predict is still a refusal, and now says so),
+`…::the_graph_tree_model_separates_the_two_filesystem_classes`, and at the whole-
+journey boundary by
+`sync_runtime::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem`
+and
+`…::android_managed_storage_journey_holds_one_page_on_a_normalizing_graph_filesystem`.
+
 ## 4. Concord base ledger (Direct Files)
 
 The Concord base ledger (ADR 0056) is **disposable state**, in the invariant-3
