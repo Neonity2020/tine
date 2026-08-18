@@ -8695,7 +8695,11 @@ fn preflight_desired_page_names(
             // which appears anywhere in the app. Page names fold case and
             // Unicode normalization here exactly as they do in Logseq
             // (`canonical_page_name_key`), so "differ by more than
-            // capitalisation" is the action that actually resolves it — and it
+            // capitalisation, accent spelling, or # vs %23" is the action that
+            // actually resolves it — Martin's real graph carried
+            // "ŠCS task dump #scs.md" beside "ŠCS task dump %23scs.md", both
+            // written by Logseq itself in 2024, so the escape case is the one a
+            // real user actually meets — and it
             // is the same sentence on a filesystem that folds those names into
             // one file (`docs/storage-sync-contract.md` §2.10d). The owning
             // page id stays at the end for diagnosis.
@@ -8704,9 +8708,12 @@ fn preflight_desired_page_names(
                 Some(&path),
                 format!(
                     "another file in this graph is already the page \u{201c}{}\u{201d}, so \
-                     {} cannot take that name too — give one of them a name that differs by \
-                     more than capitalisation or accent spelling (decoded destination logical \
-                     page name is already owned by page {})",
+                     {} cannot take that name too — the two file names differ only in a way \
+                     Tine and Logseq both ignore when they read a page name: capitalisation, \
+                     accent spelling, or writing a character literally where the other escapes \
+                     it (a title containing # can be stored as # or as %23). Rename one file \
+                     if you meant two different pages (decoded destination logical page name \
+                     is already owned by page {})",
                     name.as_str(),
                     path.as_str(),
                     owner.expect("checked above")
