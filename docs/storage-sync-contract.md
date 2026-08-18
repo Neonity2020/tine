@@ -597,6 +597,29 @@ index. The old Patricia values remain only as a differential oracle until the
 single production cutover, and are then deleted rather than retained as a
 second ready route.
 
+A receiver-local projection intent authored by another endpoint whose target is
+`Absent` releases one exact path on this device. On the clean runtime its
+authority is: the batch carrying the intent is archive-ready and is exactly the
+batch this runtime accepted (accepted-batch evidence, manifest fingerprint
+matched against the archived bytes), the batch carries that intent exactly once,
+any declared render base is the authenticated annotated base bound to this
+workspace/page/path, every declared frontier head is accepted and durable here,
+and — the release itself — no live page owns the exact path in the
+frontier-matched SQLite projection. Path ownership, not the page's catalog
+lifecycle, is what authorizes a removal; a rename releases its old path while
+its page stays live. This is deliberately the same question the own-endpoint
+clean deletion asks, and it replaces the pre-0.7 proof built from the durable
+endpoint-history record and the portable-path release record, neither of which
+the clean runtime persists.
+
+That authorization is total: it either authorizes the removal, proves the
+release superseded because a live page now owns the path (complete without
+touching that file — the owner projects it), or defers with a named reason and
+retains the published continuation. Only malformed delivered content is an
+error. A deferred receiver-local deletion keeps its batch `DurablePending`, and
+clean shutdown refuses `Safe` naming the batch, the phase, the operation and the
+path.
+
 The clean engine does not hydrate those baseline UUID introductions into a
 resident identity map. During ordinary operation the exact-frontier SQLite
 projection supplies bounded baseline candidates, the engine unions them with
