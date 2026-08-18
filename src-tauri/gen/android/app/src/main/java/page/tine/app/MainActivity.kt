@@ -21,13 +21,46 @@ class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
-    // Added after TauriActivity/AppPlugin setup so this is the permanent
-    // topmost owner of every physical/gesture Back event.
+    // Earliest possible owner: until Tauri is up there is no other callback at
+    // all, and the platform default for an unhandled Back is finish(). This
+    // registration is NOT sufficient by itself — see takeBackOwnership.
     onBackPressedDispatcher.addCallback(this, safeBackCallback)
     // `enableEdgeToEdge` follows the OS theme, but Tine has its own persisted
     // light/dark choice. Restore that native appearance before the frontend's
     // first theme sync so system icons never remain light on a light Tine bar.
     SystemBarAppearance.restore(this)
+  }
+
+  /**
+   * Move Tine's Back owner back to the top of the dispatcher.
+   *
+   * OnBackPressedDispatcher keeps its callbacks in an ArrayDeque and gives a
+   * gesture to the LAST enabled one that was added, so "topmost owner" means
+   * "most recently added", not "added first".
+   *
+   * Registering in onCreate can never win that race. tao's Android entry point
+   * spawns the Rust `main` on its own thread from `Rust.create()`, so Tauri
+   * builds the app — and constructs the Kotlin plugins, each of which may add
+   * its own callback from its constructor — only after this Activity's
+   * onCreate has already returned. Tauri's core AppPlugin does exactly that,
+   * and its callback is always enabled, so it landed ABOVE this one.
+   *
+   * AppPlugin's handler takes the no-listener branch (Tine registers
+   * "android-safe-back" on its own plugin, never "back-button" on Tauri's) and
+   * calls WebView.goBack() whenever the WebView has history. The mobile router
+   * pushes one history entry per navigation, so after the user's first
+   * navigation every Back silently popped a route BEHIND whatever was on
+   * screen: an open modal never saw the gesture and never closed. Before that
+   * first navigation canGoBack() is false, AppPlugin re-dispatches, and Back
+   * behaves correctly — which is why this looked intermittent rather than
+   * broken.
+   *
+   * SafeBackPlugin calls this once it is constructed and again when its WebView
+   * loads, both of which are strictly after every plugin registered so far.
+   */
+  internal fun takeBackOwnership() {
+    safeBackCallback.remove()
+    onBackPressedDispatcher.addCallback(this, safeBackCallback)
   }
 
   override fun onResume() {
