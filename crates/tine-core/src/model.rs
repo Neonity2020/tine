@@ -17473,10 +17473,14 @@ impl Graph {
         // artifact if it still equals the exact bytes we merged. A concurrent
         // legacy update stays at its original path. Unchanged files are moved to
         // recoverable trash rather than hard-deleted.
-        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-        self.managed_create_dir_all(&write, &trash)?;
         if let (Some(path), Some(baseline)) = (&legacy_page, &legacy_page_baseline) {
             if self.managed_read_optional_text(&write, path)?.as_ref() == Some(baseline) {
+                // Create the trash directory only when something is actually
+                // going into it. Unconditionally mkdir-ing it made every
+                // highlight save materialize `logseq/.tine-trash/conflict/` in a
+                // tree that may never need it (invariant 4).
+                let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+                self.managed_create_dir_all(&write, &trash)?;
                 let name = path
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -39753,6 +39757,119 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Concord invariant 4, as a standing guard rather than a per-defect test.
+    /// Opening a graph and READING every page in it must not touch one byte of
+    /// the tree — no reformat, no rename, no new file. A graph kept in git turns
+    /// every spurious write into a diff, and this is the one invariant a user
+    /// notices immediately.
+    ///
+    /// The fixture is deliberately hostile to a default serializer: two-space
+    /// indent, no trailing newline, CRLF, an extra blank line after the page
+    /// preamble, a title-named journal the filename migration would rename, an
+    /// org page, and a `.markdown` spelling.
+    #[test]
+    fn opening_and_reading_a_graph_rewrites_nothing() {
+        let dir = scratch("write-shy-open");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        let files: &[(&str, &str)] = &[
+            (
+                "logseq/config.edn",
+                "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+            ),
+            // two-space indent, no trailing newline
+            (
+                "pages/Two Space.md",
+                "- parent\n  - child\n    - grandchild",
+            ),
+            // CRLF, three trailing newlines
+            (
+                "pages/Crlf.md",
+                "title:: Crlf\r\n\r\n- one\r\n- two\r\n\r\n\r\n",
+            ),
+            // two blank lines after the preamble
+            ("pages/Preamble.md", "alias:: p\ntags:: a, b\n\n\n- body\n"),
+            ("pages/Org.org", "#+TITLE: Org\n* head\n** child\n"),
+            ("pages/Long.markdown", "- long extension spelling\n"),
+            // a journal whose name does not round-trip to its date
+            (
+                "journals/Thursday, 25-06-2026.md",
+                "- title-named journal\n",
+            ),
+            ("journals/2026_06_26.md", "- canonical journal\n"),
+        ];
+        for (relative, content) in files {
+            let path = dir.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, content).unwrap();
+        }
+        let before = graph_tree_snapshot(&dir);
+
+        let g = Graph::open(&dir);
+        let entries = g.list_pages();
+        assert!(entries.len() >= 5, "the fixture pages were discovered");
+        for entry in &entries {
+            let _ = g.load_page(entry);
+        }
+        for entry in g.journals_desc() {
+            let _ = g.load_page(&entry);
+        }
+        let _ = g.list_sync_conflicts();
+        let _ = g.list_vcs_marker_conflicts();
+        let _ = g.conflict_queue();
+        let _ = g.journal_conflicts();
+        let _ = g.journal_filename_migrations();
+
+        assert_eq!(
+            graph_tree_snapshot(&dir),
+            before,
+            "opening and reading a graph must leave every file byte-identical"
+        );
+
+        // ...and the same for a save that changes nothing: load each page, hand
+        // the untouched DTO straight back to `save_page`. Anything the round
+        // trip normalizes would be a rewrite of bytes the user did not change.
+        for entry in &entries {
+            let Ok(dto) = g.load_page(entry) else {
+                continue;
+            };
+            let rev = dto.rev.clone();
+            g.save_page(&dto, rev.as_deref()).unwrap_or_else(|error| {
+                panic!("re-saving unchanged {} failed: {error}", entry.rel_path)
+            });
+        }
+        assert_eq!(
+            graph_tree_snapshot(&dir),
+            before,
+            "re-saving an unchanged page must leave every file byte-identical"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every file under `root`, by graph-relative path, with its exact bytes.
+    fn graph_tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let Ok(read_dir) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    stack.push(path);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(relative, fs::read(&path).unwrap_or_default());
+            }
+        }
+        out
+    }
+
     /// Concord invariant 4 (write-shyness). An `hls__` page is an ordinary
     /// Logseq page: the user (or OG) may have written it with two-space
     /// indentation and no trailing newline, and it may carry hand-written note
@@ -39784,6 +39901,10 @@ mod tests {
             fs::read_to_string(&page_path).unwrap(),
             restyled,
             "re-saving the same highlights must not rewrite the page"
+        );
+        assert!(
+            !dir.join("logseq").join(".tine-trash").exists(),
+            "a highlight save must not materialize a trash directory it never uses"
         );
         let _ = fs::remove_dir_all(&dir);
     }
