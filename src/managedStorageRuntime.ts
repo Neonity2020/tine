@@ -81,8 +81,19 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
   // reuse a sequence the effect has already seen.
   let noticeSequence = 0;
   let noticedMessage: string | null = null;
+  // A storage transition this window asked for is in flight. The share and join
+  // cuts deliberately STOP the actor that committed them (core's
+  // `observe_retired_actor`), so the watcher lane that keeps ticking meanwhile
+  // reports the retired actor as a runtime failure. That window is expected and
+  // self-resolving — the command republishes a reopened actor before it
+  // returns — so it must not reach the user as a red toast followed by a green
+  // one. Reports raised inside the window are held; `endTransition` re-raises
+  // only what an authoritative status or a healthy tick has NOT cleared.
+  let transitionDepth = 0;
+  let heldMessage: string | null = null;
   const clearNotice = () => {
     noticedMessage = null;
+    heldMessage = null;
   };
 
   const accepts = (bindingGeneration: number) => snapshot().bindingGeneration === bindingGeneration;
@@ -106,6 +117,7 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
 
   const clear = () => {
     clearNotice();
+    transitionDepth = 0;
     setSnapshot(initialSnapshot());
   };
 
@@ -197,13 +209,24 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     return true;
   };
 
-  const receiveError = (event: SparseV2ErrorEvent): boolean => {
-    if (!accepts(event.binding_generation)) return false;
-    if (noticedMessage !== event.message) {
-      noticedMessage = event.message;
-      noticeSequence += 1;
+  /**
+   * Record one runtime failure. `raise` decides whether the user is told now:
+   * a transient window the caller itself is about to close (a share/join cut
+   * that retires its actor on purpose) records the condition for the panel but
+   * holds the report.
+   */
+  const applyError = (message: string, raise: boolean) => {
+    let raised: ManagedStorageRuntimeSnapshot["notice"] | null = null;
+    if (raise) {
+      if (noticedMessage !== message) {
+        noticedMessage = message;
+        noticeSequence += 1;
+      }
+      heldMessage = null;
+      raised = { message, sequence: noticeSequence };
+    } else {
+      heldMessage = message;
     }
-    const notice = { message: event.message, sequence: noticeSequence };
     setSnapshot((current) => {
       // A `managed_writable` admission is evidence that a live actor will save
       // what we accept. A failing tick withdraws that evidence, so writability
@@ -216,12 +239,21 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
         admission?.authority === "managed_writable"
           ? { binding_generation: admission.binding_generation, authority: "managed_unavailable" }
           : admission;
-      if (current.error === event.message && notice === current.notice && revoked === admission) {
+      // Keep the EXACT notice object when the sequence has not advanced. The
+      // consumer subscribes to `notice` by reference, so minting an equal-but-
+      // new object for every repeat re-armed the toast the sequence exists to
+      // suppress — one blocked condition retried six times still produced six
+      // identical red toasts.
+      const notice =
+        raised && !(current.notice && current.notice.sequence === raised.sequence)
+          ? raised
+          : current.notice;
+      if (current.error === message && notice === current.notice && revoked === admission) {
         return current;
       }
       return {
         ...current,
-        error: event.message,
+        error: message,
         notice,
         applicationPageAdmission: revoked,
         status: current.status && revoked
@@ -229,7 +261,36 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
           : current.status,
       };
     });
+  };
+
+  const receiveError = (event: SparseV2ErrorEvent): boolean => {
+    if (!accepts(event.binding_generation)) return false;
+    applyError(event.message, transitionDepth === 0);
     return true;
+  };
+
+  /**
+   * A storage transition this window requested is starting. Held reports are
+   * about the enrollment cut's own expected window, never about the user's
+   * ordinary editing session, so only these explicit brackets suppress.
+   */
+  const beginTransition = () => {
+    transitionDepth += 1;
+  };
+
+  /**
+   * The transition finished. Anything an authoritative status or a healthy tick
+   * has already cleared stays silent; a condition that is STILL live gets its
+   * one report now, so a genuine failure is never swallowed.
+   */
+  const endTransition = () => {
+    if (transitionDepth > 0) transitionDepth -= 1;
+    if (transitionDepth > 0) return;
+    const message = heldMessage;
+    heldMessage = null;
+    if (message === null) return;
+    if (snapshot().error !== message) return;
+    applyError(message, true);
   };
 
   const refresh = async (): Promise<SparseV2Status | null> => {
@@ -267,6 +328,8 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     receiveRuntimeStatus,
     receiveTick,
     receiveError,
+    beginTransition,
+    endTransition,
     refresh,
     listen,
   };
