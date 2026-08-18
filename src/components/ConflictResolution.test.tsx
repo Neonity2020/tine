@@ -239,6 +239,65 @@ describe("in-page conflict resolution", () => {
     }
   });
 
+  // Concord P5. The Settings modal was the only surface that let the user choose
+  // what happens to the page's OWN properties when the two sides' pre-blocks
+  // differ; the in-page resolver hardcoded "union". Retiring the modal without
+  // this would have silently dropped a capability.
+  it("offers the page-property choice the retired Settings modal used to own", async () => {
+    const resolve = vi.fn(async () => {});
+    const preDiff: MarkerConflictDiff = {
+      ...markerDiff,
+      diff: {
+        ...markerDiff.diff,
+        mine_pre: "alias:: here",
+        theirs_pre: "alias:: there",
+        pre_differs: true,
+      },
+    };
+    stubBackend({
+      vcsMarkerConflictDiff: (async () => preDiff) as unknown as Backend["vcsMarkerConflictDiff"],
+      resolveVcsMarkerConflict: resolve as unknown as Backend["resolveVcsMarkerConflict"],
+    });
+    const { host, dispose } = mount(markerObject);
+    try {
+      await flush();
+      await flush();
+      const choice = host.querySelector<HTMLSelectElement>(".page-conflict-preblock-choice")!;
+      // No-loss by default, consistent with this surface's row policy.
+      expect(choice.value).toBe("union");
+      expect([...choice.options].map((o) => o.value)).toEqual(["union", "mine", "theirs"]);
+
+      choice.value = "mine";
+      choice.dispatchEvent(new Event("change"));
+      [...host.querySelectorAll("button")]
+        .find((b) => b.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      await flush();
+      const [, , , preChoice] = resolve.mock.calls[0] as unknown as [
+        string,
+        Record<string, string>,
+        string,
+        string,
+      ];
+      expect(preChoice).toBe("mine");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("hides the page-property choice when the two sides agree on them", async () => {
+    stubBackend({});
+    const { host, dispose } = mount(markerObject);
+    try {
+      await flush();
+      await flush();
+      expect(host.querySelector(".page-conflict-preblock-choice")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
   it("warns quietly — never blocks — when the page is left unresolved", async () => {
     stubBackend({});
     setConflictQueue([markerObject]);

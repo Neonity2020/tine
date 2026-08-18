@@ -1,11 +1,13 @@
-// The ONE block-diff row renderer, shared by every conflict surface.
+// The block-diff row renderer.
 //
-// There are two surfaces on purpose — the Settings modal (the fallback, reached
-// from Backups & recovery) and the in-page resolver (Concord L4) — but only one
-// renderer. Two independently-written renderers over the same data drift apart
-// silently: it already happened once in this codebase with the two block-facet
-// renderers. Anything a surface needs to differ about (column labels, the
-// initial decision policy) is a prop here, not a second copy of the component.
+// It was extracted (P4) because two surfaces rendered the same data — the
+// Settings merge modal and the in-page resolver — and two independently-written
+// renderers drift apart silently; it had already happened in this codebase with
+// the two block-facet renderers. P5 finished the job at the level above: the
+// modal is gone, so the in-page resolver (Concord L4) is now the ONE resolution
+// surface and this is its renderer. The surface-shaped props (column labels, the
+// default decision) are kept — they are what a second surface would have to use
+// instead of a second copy, should one ever be justified.
 import { For, Show, type JSX } from "solid-js";
 import type { DiffRow, MergeDecision, RowKind } from "../types";
 
@@ -25,20 +27,6 @@ export function noLossDecision(kind: RowKind): MergeDecision {
   if (kind === "added") return "mine"; // present only here — keeping it loses nothing
   if (kind === "removed") return "theirs"; // present only there — pull it in
   return "both";
-}
-
-/** Pre-select each row's 3-way suggestion (Concord base ledger, ADR 0056) as its
- *  initial decision. Only "theirs" needs seeding — "mine" is already the modal's
- *  default. The user still confirms; nothing is applied without the merge click. */
-export function seedDecisionsFromSuggestions(
-  rows: DiffRow[],
-  out: Record<string, MergeDecision> = {}
-): Record<string, MergeDecision> {
-  for (const r of rows) {
-    if (r.suggestion === "theirs") out[r.id] = "theirs";
-    if (r.children.length) seedDecisionsFromSuggestions(r.children, out);
-  }
-  return out;
 }
 
 /** The in-page resolver's opening position: the SUGGESTED resolution wherever the

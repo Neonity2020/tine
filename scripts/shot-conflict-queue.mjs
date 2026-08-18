@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 
-const PORT = 5207;
+const PORT = 5217;
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 async function waitForServer(url, tries = 60) {
   for (let i = 0; i < tries; i++) {
@@ -39,6 +39,23 @@ try {
   await page.waitForSelector(".page-conflict", { timeout: 5000 });
   await page.locator(".page-conflict").screenshot({ path: "/tmp/shot-conflict-inpage.png" });
   await page.screenshot({ path: "/tmp/shot-conflict-queue.png" });
+  // Concord P5: the Settings surfaces are the INVENTORY only — no merge modal.
+  await page.locator("body").click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press("t");
+  await page.keyboard.press("s");
+  await sleep(700);
+  const backupsTab = page.locator("button", { hasText: "Backups & recovery" }).first();
+  if (await backupsTab.count()) {
+    await backupsTab.click();
+    await sleep(800);
+    await page.screenshot({ path: "/tmp/shot-conflict-settings.png" });
+    const panel = page.locator(".sync-conflict-row").first();
+    if (await panel.count()) {
+      await panel.screenshot({ path: "/tmp/shot-conflict-inventory.png" });
+    }
+  } else {
+    console.error("could not open Settings for the inventory shot");
+  }
   if (errors.length) console.error("page errors:", errors);
   await browser.close();
   server.kill("SIGKILL");

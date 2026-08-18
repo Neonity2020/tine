@@ -1764,9 +1764,12 @@ export function mockBackend(): Backend {
           { id: "2", kind: "added" as const, mine: v("write the release notes"), theirs: null, children: [], verdict: "mine-only" as const, suggestion: "mine" as const },
           { id: "3", kind: "removed" as const, mine: null, theirs: v("ask marketing for the banner"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
         ],
-        mine_pre: "title:: Project Plan",
-        theirs_pre: "title:: Project Plan",
-        pre_differs: false,
+        // The page's OWN properties differ too, so the resolver shows its
+        // pre-block choice — the one thing the retired Settings modal used to
+        // own exclusively (Concord P5).
+        mine_pre: "title:: Project Plan\ntags:: launch",
+        theirs_pre: "title:: Project Plan\ntags:: launch, marketing",
+        pre_differs: true,
         blocks_identical: false,
         three_way: true,
       };
@@ -1857,9 +1860,12 @@ export function mockBackend(): Backend {
             { id: "2", kind: "modified" as const, mine: v("Reads a real Logseq graph"), theirs: v("Reads a real Logseq graph, Markdown and Org"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
             { id: "3", kind: "modified" as const, mine: v("Written in Rust and SolidJS"), theirs: v("Built on Tauri"), children: [], verdict: "both-changed" as const },
           ],
-          mine_pre: null,
-          theirs_pre: null,
-          pre_differs: false,
+          // The page's own properties diverged too, so the resolver shows its
+          // pre-block choice — the one capability the retired Settings modal
+          // used to own exclusively (Concord P5).
+          mine_pre: "title:: Tine\ntags:: outliner",
+          theirs_pre: "title:: Tine\ntags:: outliner, concord",
+          pre_differs: true,
           blocks_identical: false,
           three_way: true,
         },

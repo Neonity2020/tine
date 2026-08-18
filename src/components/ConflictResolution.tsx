@@ -54,6 +54,11 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   const conflict = () => props.conflict;
   const labels = createMemo(() => sideLabels(conflict()));
   const [decisions, setDecisions] = createSignal<Record<string, MergeDecision>>({});
+  // The page-header (pre-block) properties are one decision for the whole page,
+  // not a row — `alias::`/`tags::` lines aren't outline blocks. Keeping BOTH is
+  // the no-loss default, consistent with this surface's row policy; the other
+  // two options exist because a union is not always what the user wants.
+  const [preChoice, setPreChoice] = createSignal<"mine" | "theirs" | "union">("union");
   const [showUnchanged, setShowUnchanged] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
   const [cursor, setCursor] = createSignal(0);
@@ -85,6 +90,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     const next = `${current.base_rev}\0${current.conflict_rev}`;
     if (alignment !== next) {
       setDecisions(seedSuggestedOrNoLoss(current.rows));
+      setPreChoice("union");
       setCursor(0);
     }
     alignment = next;
@@ -125,7 +131,12 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     setBusy(true);
     try {
       if (c.source === "vcs-markers") {
-        await backend().resolveVcsMarkerConflict(c.page_path, decisions(), current.base_rev, "union");
+        await backend().resolveVcsMarkerConflict(
+          c.page_path,
+          decisions(),
+          current.base_rev,
+          preChoice()
+        );
         pushToast(`Resolved the merge in “${c.page_name}”`, "success");
       } else {
         const copy = c.sides.find((s) => s.role === "theirs")?.path;
@@ -136,7 +147,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           decisions(),
           current.base_rev,
           current.conflict_rev,
-          "union"
+          preChoice()
         );
         pushToast(`Merged into “${c.page_name}”`, "success");
       }
@@ -269,6 +280,24 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
                 )}
               </For>
             </div>
+            <Show when={d().pre_differs}>
+              <div class="sync-merge-preblock">
+                <div class="settings-hint">
+                  The page’s own properties differ. Keep{" "}
+                  <select
+                    class="page-conflict-preblock-choice"
+                    value={preChoice()}
+                    onChange={(e) =>
+                      setPreChoice(e.currentTarget.value as "mine" | "theirs" | "union")
+                    }
+                  >
+                    <option value="union">both (merge)</option>
+                    <option value="mine">{segLabel(labels().mine, "mine")}</option>
+                    <option value="theirs">{segLabel(labels().theirs, "theirs")}</option>
+                  </select>
+                </div>
+              </div>
+            </Show>
             <div class="page-conflict-foot">
               <span class="settings-hint">
                 <Show
