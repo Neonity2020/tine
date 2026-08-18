@@ -865,6 +865,11 @@ function Rendered(props: {
       style={bgColor() ? { background: bgColor() } : undefined}
       onMouseDown={onMouseDown}
     >
+      {/* One gate for the whole header-chip group. Every chip below needs a
+          marker or a priority, so an ordinary prose block — the overwhelming
+          majority on a large page — evaluates ONE condition instead of three,
+          and allocates no reactive node for the chips it will never show. */}
+      <Show when={facets().marker || facets().priority}>
       <Show when={taskCheckboxState(facets().marker) !== null}>
         <span
           class="block-task-checkbox"
@@ -896,10 +901,15 @@ function Rendered(props: {
       <Show when={facets().priority}>
         <span class={`block-priority priority-${facets().priority}`}>[#{facets().priority}]</span>{" "}
       </Show>
+      </Show>
       {/* Heading size is applied inside AstBody to ONLY the heading's first line
           (see renderBlocks headingLevel), so a `> quote`/table/etc. continuation in
           the same block renders at normal size — matching OG. */}
       {body}
+      {/* Same gate for the trailing chips. `clock()` can only be non-null for a
+          DONE/TODO/LATER block, so keying the group on the marker also keeps
+          `logbookInfo` off every ordinary block's raw text. */}
+      <Show when={facets().marker || facets().scheduled || facets().deadline || displayProps().length > 0}>
       <Show when={clock()}>
         {(info) => <ClockBadge info={info()} />}
       </Show>
@@ -941,6 +951,7 @@ function Rendered(props: {
             )}
           </For>
         </span>
+      </Show>
       </Show>
       {props.trailing}
     </div>
