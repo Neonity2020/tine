@@ -89,7 +89,13 @@ const suites = {
   // coverage so it is run only with the exact sparse-v2 candidate receipt.
   "sparse-v2-recovery": [
     ["sparse-v2-recovery", "scripts/e2e-sparse-v2-recovery.mjs", {}],
+    // Direct Files and Tine-managed storage are peers, so BOTH joining-device
+    // starting states are first-class legs of this gate. Neither is a smoke
+    // test of the other and neither may be dropped to save wall clock.
     ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
+    ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
+      TINE_E2E_JOIN_ORDERING: "join-from-managed",
+    }],
   ],
   // Release-only local proof on a copied private corpus. This suite is kept
   // separate from hosted coverage so neither the source graph nor a derivative
@@ -137,6 +143,9 @@ const suites = {
     ["plugin-graph-ownership", "scripts/e2e-plugin-graph-ownership.mjs", {}],
     ["external-assets", "scripts/e2e-external-assets.mjs", {}],
     ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
+    ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
+      TINE_E2E_JOIN_ORDERING: "join-from-managed",
+    }],
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: process.env.E2E_WINDOW_MANAGER || "openbox" }],
     ["native-titlebar", "scripts/e2e-native-titlebar.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],

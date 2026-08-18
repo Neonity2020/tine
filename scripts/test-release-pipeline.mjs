@@ -647,6 +647,11 @@ assert.match(
 );
 assert.match(
   e2eRunner,
+  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device-managed-join", "scripts\/e2e-sparse-v2-two-device\.mjs", \{\s*TINE_E2E_JOIN_ORDERING: "join-from-managed",\s*\}\]/,
+  "the mandatory Linux release catalog does not prove joining from a device that already runs Tine-managed storage"
+);
+assert.match(
+  e2eRunner,
   /"linux-managed-real-release": \[[\s\S]*?TINE_MANAGED_RECOVERY_KILL_CYCLES: "2"[\s\S]*?\["sparse-v2-two-device-real", "scripts\/e2e-sparse-v2-two-device\.mjs"/,
   "the local private-corpus release suite does not prove repeated forced-close recovery and real two-device sync"
 );

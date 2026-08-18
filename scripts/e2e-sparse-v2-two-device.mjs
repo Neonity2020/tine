@@ -33,6 +33,19 @@ const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4665);
 const SOURCE = process.env.TINE_MANAGED_SYNC_GRAPH
   ? fs.realpathSync(path.resolve(process.env.TINE_MANAGED_SYNC_GRAPH))
   : null;
+// Direct Files and Tine-managed storage are PEERS: a device may live in either
+// one permanently. The joining device therefore has two equally first-class
+// starting states, and this journey proves the same join contract from both.
+// Neither ordering is a smoke test of the other; the only thing they do not
+// share is the post-join lifecycle, because the product's own answer differs.
+const JOIN_ORDERINGS = ["join-from-df", "join-from-managed"];
+const JOIN_ORDERING = process.env.TINE_E2E_JOIN_ORDERING || "join-from-df";
+if (!JOIN_ORDERINGS.includes(JOIN_ORDERING)) {
+  throw new Error(
+    `unknown TINE_E2E_JOIN_ORDERING ${JSON.stringify(JOIN_ORDERING)}; choose ${JOIN_ORDERINGS.join(", ")}`,
+  );
+}
+const JOIN_FROM_MANAGED = JOIN_ORDERING === "join-from-managed";
 let PAGE = "Two Device Managed Sync";
 const MARKER = SOURCE
   ? `managed real sync ${Date.now()}`
@@ -100,6 +113,7 @@ let phase = "setup";
 const receipt = {
   schemaVersion: 1,
   scenario: "sparse-v2-two-device",
+  joinOrdering: JOIN_ORDERING,
   testedCommit: gitRevision(),
   app: APP,
   sourceCorpus: SOURCE,
@@ -414,6 +428,121 @@ async function exactElement(selector, text) {
   return index >= 0 ? (await browser.$$(selector))[index] : undefined;
 }
 
+async function toastMessages() {
+  return browser.execute(() =>
+    [...document.querySelectorAll(".toast-msg")].map((element) => (element.textContent ?? "").trim()));
+}
+
+async function dismissToasts() {
+  await browser.waitUntil(async () => {
+    await browser.execute(() => {
+      for (const close of [...document.querySelectorAll(".toast-close")]) close.click();
+    });
+    return (await toastMessages()).length === 0;
+  }, { timeout: 15_000, interval: 200, timeoutMsg: "visible notifications could not be dismissed" });
+}
+
+// `Join an existing synced graph...` (Direct Files) and `Join this synced
+// graph...` (already-managed) are the same user action in two storage states,
+// and this journey must not encode a preference between them. Select the join
+// affordance by role rather than by one label; `Joining...` is the disabled
+// in-flight label and is deliberately not matched.
+const JOIN_BUTTON_PATTERN = "^Join\\s";
+
+async function settingsButtonMatching(patternSource) {
+  const index = await browser.execute((source) =>
+    [...document.querySelectorAll(".settings-modal button")]
+      .findIndex((element) => new RegExp(source).test((element.textContent ?? "").trim())), patternSource);
+  return index >= 0 ? (await browser.$$(".settings-modal button"))[index] : undefined;
+}
+
+async function clickSettingsButtonMatchingAndConfirm(patternSource, label) {
+  await waitFor(() => settingsButtonMatching(patternSource), 15_000,
+    `${label}: no settings action matching ${patternSource} was visible`);
+  const before = new Set(windowIds(".*"));
+  const clicked = await browser.execute((source) => {
+    const button = [...document.querySelectorAll(".settings-modal button")]
+      .find((candidate) => new RegExp(source).test((candidate.textContent ?? "").trim()));
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  }, patternSource);
+  if (!clicked) throw new Error(`${label}: the join action disappeared before it could be clicked`);
+  await acceptNativeConfirmation(label, before);
+}
+
+// Vocabulary reserved for a genuinely hostile provider entry (a symlink, a file
+// where a directory is required, a traversal attempt). A tree a sync tool has
+// not finished delivering must never be reported with any of it.
+const HOSTILE_PROVIDER_NOTICE = /unsafe provider|UnsafeProviderEntry|RecoveryBlocked|unsafe filesystem kind/i;
+// What "not ready yet" is allowed to sound like. Deliberately broad: the exact
+// wording is an acceptable variation, the meaning is not.
+const NOT_READY_NOTICE = /not yet|still arriving|incomplete|has not finished|hasn.t finished|no sync data/i;
+const JOIN_SUCCESS_NOTICE = "This device joined the synced graph.";
+// A repeated identical notice is the reported symptom, so the quiet window has
+// to outlast the retry cadence rather than sample once: `RETRY_BACKOFF`
+// (src-tauri/src/watcher.rs) saturates at 8 s, so a window longer than that
+// guarantees at least one further attempt would have spoken up.
+const NOTICE_QUIET_MS = Number(process.env.E2E_JOIN_NOTICE_QUIET_MS || 9000);
+
+function assertNoRepeatedNotice(messages, label) {
+  const counts = new Map();
+  for (const message of messages) counts.set(message, (counts.get(message) ?? 0) + 1);
+  const repeated = [...counts].filter(([, count]) => count > 1);
+  if (repeated.length) {
+    throw new Error(`${label} repeated the same notice: ${JSON.stringify(repeated)}`);
+  }
+}
+
+async function joinNoticeAfter(label) {
+  const notice = await waitFor(async () =>
+    (await toastMessages()).find((message) => /join/i.test(message)), 90_000,
+    `${label}: the join action reported nothing to the user`);
+  // The reported symptom is a condition that says its piece over and over. Hold
+  // still afterwards and require the app to stay quiet about it.
+  await sleep(NOTICE_QUIET_MS);
+  const settled = await toastMessages();
+  assertNoRepeatedNotice(settled, label);
+  if (settled.some((message) => HOSTILE_PROVIDER_NOTICE.test(message))) {
+    throw new Error(`${label} reported an unfinished provider tree as hostile: ${JSON.stringify(settled)}`);
+  }
+  return { notice, settled };
+}
+
+// A refused join may not destroy what the provider has already delivered. New
+// entries are ordinary (a live managed runtime keeps its own bookkeeping), so
+// this is a retention check, not a whole-tree freeze.
+function providerFileBytes(graph) {
+  const root = path.join(graph, ".tine-sync", "v2");
+  return new Map(providerFiles(graph).map((relative) =>
+    [relative, crypto.createHash("sha256").update(fs.readFileSync(path.join(root, relative))).digest("hex")]));
+}
+
+function assertDeliveredBytesRetained(before, graph, label) {
+  const after = providerFileBytes(graph);
+  for (const [relative, digest] of before) {
+    if (after.get(relative) !== digest) {
+      throw new Error(`${label} changed or removed already-delivered provider bytes at ${relative}`);
+    }
+  }
+}
+
+async function attemptJoinInPartialState(state, label, toGraph) {
+  const before = providerFileBytes(toGraph);
+  await dismissToasts();
+  await clickSettingsButtonMatchingAndConfirm(JOIN_BUTTON_PATTERN, `${label}-join`);
+  const { notice, settled } = await joinNoticeAfter(label);
+  if (settled.includes(JOIN_SUCCESS_NOTICE)) {
+    throw new Error(`${label} reported a completed join from an unfinished provider tree`);
+  }
+  if (!NOT_READY_NOTICE.test(notice)) {
+    throw new Error(`${label} did not present the unfinished delivery as "not ready yet": ${JSON.stringify(notice)}`);
+  }
+  assertDeliveredBytesRetained(before, toGraph, label);
+  receipt.milestones[`partial-join-${state}`] = { notice, presentedAsNotReady: true, repeatedNotice: false };
+  return notice;
+}
+
 async function openSyncSettings() {
   const trigger = await browser.$('button[title^="Settings"]');
   await trigger.waitForExist({ timeout: 15_000 });
@@ -596,6 +725,98 @@ function deliverProviderFiles(fromGraph, toGraph, relatives) {
   for (const relative of relatives) deliverProviderFile(fromGraph, toGraph, relative);
 }
 
+// ---------------------------------------------------------------------------
+// A join transport that behaves like a file-sync tool.
+//
+// `copyProvider` materialises a complete provider tree in one atomic step. No
+// sync tool does that: Syncthing/Dropbox create directories before their
+// contents, deliver files in arbitrary order, and can leave the tree half built
+// for minutes. The join boundary therefore uses the same ordered-partial
+// delivery primitives (`deliverProviderFile`/`stageProviderFile`) that the
+// later delivery-cut leg already relies on, driven through named states.
+// ---------------------------------------------------------------------------
+
+const SHARED_ENROLLMENT_DIRECTORIES = ["shared/outbox/enrollment", "shared/inbox/enrollment"];
+const SHARED_ENROLLMENT_DESCRIPTOR = "shared/outbox/enrollment/shared-enrollment-v1.json";
+
+function providerRelative(root, absolute) {
+  return path.relative(root, absolute).split(path.sep).join("/");
+}
+
+function providerDirectories(graph) {
+  const root = path.join(graph, ".tine-sync", "v2");
+  const directories = [];
+  const visit = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const absolute = path.join(dir, entry.name);
+      directories.push(providerRelative(root, absolute));
+      visit(absolute);
+    }
+  };
+  visit(root);
+  return directories.sort();
+}
+
+function isEnrollmentPath(relative) {
+  return SHARED_ENROLLMENT_DIRECTORIES.some(
+    (directory) => relative === directory || relative.startsWith(`${directory}/`),
+  );
+}
+
+function createProviderDirectories(toGraph, relatives) {
+  const root = path.join(toGraph, ".tine-sync", "v2");
+  for (const relative of relatives) fs.mkdirSync(path.join(root, relative), { recursive: true });
+}
+
+function providerPath(graph, relative) {
+  return path.join(graph, ".tine-sync", "v2", relative);
+}
+
+// A real mid-transfer descriptor: the canonical name exists, the bytes do not.
+// This reuses the exact shape the cold-return leg already writes.
+function truncateDeliveredDescriptor(toGraph) {
+  const target = providerPath(toGraph, SHARED_ENROLLMENT_DESCRIPTOR);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, "{\n");
+}
+
+/**
+ * The four join-boundary delivery states this journey drives, in the fixed
+ * order a sync tool that creates directories before contents produces. The
+ * space of orderings is larger than this — a provider may also deliver the
+ * descriptor before the object namespaces exist, or interleave both trees — and
+ * this journey does NOT enumerate it. What it does cover is the prefix the
+ * discovery path actually keys on (`shared/outbox/enrollment/` and its single
+ * canonical descriptor), which is where the product decides "not yet" versus
+ * "unsafe".
+ */
+function deliverJoinState(state, fromGraph, toGraph) {
+  const directories = providerDirectories(fromGraph);
+  const files = providerFiles(fromGraph);
+  const scaffold = directories.filter((relative) => !isEnrollmentPath(relative));
+  const ordinary = files.filter((relative) => !isEnrollmentPath(relative));
+  switch (state) {
+    case "directories-before-contents":
+      createProviderDirectories(toGraph, scaffold);
+      return { directories: scaffold.length, files: 0, descriptor: "absent" };
+    case "enrollment-directory-empty":
+      createProviderDirectories(toGraph, directories);
+      return { directories: directories.length, files: 0, descriptor: "absent" };
+    case "descriptor-truncated":
+      createProviderDirectories(toGraph, directories);
+      deliverProviderFiles(fromGraph, toGraph, ordinary);
+      truncateDeliveredDescriptor(toGraph);
+      return { directories: directories.length, files: ordinary.length, descriptor: "truncated" };
+    case "complete":
+      createProviderDirectories(toGraph, directories);
+      deliverProviderFiles(fromGraph, toGraph, files);
+      return { directories: directories.length, files: files.length, descriptor: "complete" };
+    default:
+      throw new Error(`unknown join delivery state ${JSON.stringify(state)}`);
+  }
+}
+
 try {
   phase = "window-manager";
   wmLog = fs.openSync(path.join(ARTIFACTS, "openbox.log"), "w");
@@ -632,20 +853,101 @@ try {
   // generic "active" label raced a partial provider snapshot.
   await assertBody("Sync is ready to use on another device.", "device A shared activation", 120_000);
   await stopCurrent();
-  copyProvider(GRAPH_A, GRAPH_B);
 
-  phase = "device-b-discovery-and-join";
+  phase = "device-b-starting-state";
+  // Device B is connected BEFORE any provider bytes arrive, in both orderings.
+  // That is what a user sees: the app is already running when the sync tool
+  // starts filling the folder, so the join must recover in place rather than
+  // depend on a restart that happens to observe a finished tree.
   await connect("device-b-join", GRAPH_B, XDG_B);
   await assertPageContains(SOURCE ? selectedRaw : MARKER, "device B source page");
+  let deviceBOwnEdit;
+  if (JOIN_FROM_MANAGED) {
+    // The joining device is not blank: it already runs Tine-managed storage on
+    // its own graph and has written history there after activating.
+    await openSyncSettings();
+    await clickButtonAndConfirm("Enable Tine-managed storage...", "device-b-enable-managed");
+    await assertBody("Tine-managed storage active", "device B own managed activation", 120_000);
+    await closeSettingsIfOpen();
+    await leaseCurrentGraph(GRAPH_B);
+    deviceBOwnEdit = `${MARKER} device-b own managed history`;
+    if (SOURCE) await appendThroughVisibleEditor(GRAPH_B, deviceBOwnEdit, "device-b-own-managed-edit");
+    else await saveManagedRaw(deviceBOwnEdit);
+    await settleManaged("device B own managed edit");
+    await assertVisiblePageContains(deviceBOwnEdit, "device B own managed edit before joining");
+  }
+
+  phase = "device-b-partial-provider-delivery";
+  // Which partial states a joining device can reach depends on what its OWN
+  // storage already left in the graph, so read that rather than assume it. A
+  // Direct Files device must have no provider tree at all — opening a Direct
+  // Files graph is not an implicit managed-storage probe, and that invariant is
+  // asserted here rather than taken on trust. A device with its own managed
+  // storage may or may not have published an empty enrollment scaffold; if it
+  // has, "the enrollment directory has not arrived yet" is genuinely
+  // unreachable for it and the receipt records that instead of pretending.
+  const enrollmentPreexists = fs.existsSync(providerPath(GRAPH_B, SHARED_ENROLLMENT_DIRECTORIES[0]));
+  if (!JOIN_FROM_MANAGED && fs.existsSync(path.join(GRAPH_B, ".tine-sync"))) {
+    throw new Error("a Direct Files device grew managed-storage provider state without being asked");
+  }
+  const partialStates = enrollmentPreexists
+    ? ["enrollment-directory-empty", "descriptor-truncated"]
+    : ["directories-before-contents", "enrollment-directory-empty", "descriptor-truncated"];
+  receipt.partialDeliveryStates = { covered: [...partialStates, "complete"], enrollmentPreexists };
   await openSyncSettings();
+  for (const state of partialStates) {
+    receipt.milestones[`delivery-${state}`] = deliverJoinState(state, GRAPH_A, GRAPH_B);
+    await attemptJoinInPartialState(state, `device B with ${state}`, GRAPH_B);
+  }
+  receipt.milestones["delivery-complete"] = deliverJoinState("complete", GRAPH_A, GRAPH_B);
+  await dismissToasts();
+
+  phase = "device-b-discovery-and-join";
   // Opening an ordinary Direct Files graph is intentionally not an implicit
   // managed-storage/provider probe. The explicit Join action performs cold
-  // discovery and then transitions this fresh installation to SharedActive.
-  await clickButtonAndConfirm("Join an existing synced graph...", "device-b-join");
-  await assertBody("This device joined the synced graph.", "device B joined state", 120_000);
-  await leaseCurrentGraph(GRAPH_B);
-  receipt.milestones.join = { openedWithoutLocalBinding: true, joined: true };
-  if (SOURCE) {
+  // discovery and then transitions this installation to SharedActive. The same
+  // action is offered from either storage mode, so it is selected by role.
+  await clickSettingsButtonMatchingAndConfirm(JOIN_BUTTON_PATTERN, "device-b-join");
+  if (JOIN_FROM_MANAGED) {
+    // What happens to device B's OWN pre-join managed history is quoted from
+    // the backend, not inferred. `join_shared_clean`
+    // (crates/tine-core/src/sync_runtime.rs) compares the delivered descriptor
+    // against this device's own binding and refuses before touching anything:
+    //   "clean shared descriptor names another managed graph"
+    // Two independent activations mint independent `WorkspaceId::new()` values,
+    // so that is the branch a second managed device always takes. Nothing is
+    // retired, archived or merged: the assertion is therefore that device B
+    // keeps exactly what it had, including the edit it made after its own
+    // activation, and that the user is told why the join did not happen.
+    const { notice, settled } = await joinNoticeAfter("device B joining from its own managed storage");
+    if (settled.includes(JOIN_SUCCESS_NOTICE)) {
+      throw new Error("device B reported a completed join while holding its own managed history");
+    }
+    if (!notice.includes("another managed graph")) {
+      throw new Error(`device B was not told why the join stopped: ${JSON.stringify(notice)}`);
+    }
+    await closeSettingsIfOpen();
+    await leaseCurrentGraph(GRAPH_B);
+    await assertVisiblePageContains(deviceBOwnEdit, "device B own managed edit after the refused join");
+    await assertManagedActive("device B managed state after the refused join");
+    await stopCurrent();
+    // The refusal must also be durable: the delivered provider tree it declined
+    // must not strand device B behind its own storage on the next open.
+    await connect("device-b-after-refused-join", GRAPH_B, XDG_B);
+    await waitForManagedText(deviceBOwnEdit, "device B own managed edit after reopen", 180_000);
+    await assertVisiblePageContains(deviceBOwnEdit, "device B own managed edit visible after reopen");
+    await assertManagedActive("device B managed state after reopen");
+    receipt.milestones.joinFromManaged = {
+      refusalNotice: notice,
+      ownHistoryReadable: true,
+      ownHistoryReadableAfterReopen: true,
+      managedStillActive: true,
+    };
+    await stopCurrent();
+  } else if (SOURCE) {
+    await assertBody("This device joined the synced graph.", "device B joined state", 120_000);
+    await leaseCurrentGraph(GRAPH_B);
+    receipt.milestones.join = { openedWithoutLocalBinding: true, joinedAfterPartialDelivery: true };
     const fromB = `${MARKER} device-b`;
     await appendThroughVisibleEditor(GRAPH_B, fromB, "device-b-visible-edit");
     await settleManaged("device B outbound edit");
@@ -712,6 +1014,9 @@ try {
     };
     await stopCurrent();
   } else {
+    await assertBody("This device joined the synced graph.", "device B joined state", 120_000);
+    await leaseCurrentGraph(GRAPH_B);
+    receipt.milestones.join = { openedWithoutLocalBinding: true, joinedAfterPartialDelivery: true };
     const fromB = `${MARKER} edited on device B`;
     await saveManagedRaw(fromB);
     await settleManaged("device B outbound edit");
@@ -776,21 +1081,27 @@ try {
   }
 
   receipt.result = "pass";
-  fs.writeFileSync(path.join(ARTIFACTS, "sparse-v2-two-device-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
-  console.log(`PASS: sparse-v2 two-device discovery, join, bidirectional edits, and fresh-device Direct Files return held: ${JSON.stringify(receipt.milestones)}`);
+  fs.writeFileSync(
+    path.join(ARTIFACTS, `sparse-v2-two-device-${JOIN_ORDERING}-receipt.json`),
+    `${JSON.stringify(receipt, null, 2)}\n`,
+  );
+  console.log(`PASS: sparse-v2 two-device ${JOIN_ORDERING} held through ordered partial provider delivery: ${JSON.stringify(receipt.milestones)}`);
 } catch (error) {
-  try { await browser?.saveScreenshot(path.join(ARTIFACTS, "failure.png")); } catch {}
+  try { await browser?.saveScreenshot(path.join(ARTIFACTS, `failure-${JOIN_ORDERING}.png`)); } catch {}
   const failure = {
     testedCommit: receipt.testedCommit,
     journey: "sparse-v2-two-device",
+    joinOrdering: JOIN_ORDERING,
     phase,
-    expected: "A fresh second device can explicitly discover and join the synchronized graph, exchange edits in both directions, and instead return to writable Direct Files.",
+    expected: JOIN_FROM_MANAGED
+      ? "A device that already runs Tine-managed storage on its own graph is offered the join it supports, is never told that an unfinished provider delivery is unsafe, and keeps its own post-activation history whatever the join decides."
+      : "A Direct Files device is never told that an unfinished provider delivery is unsafe, can join once the bytes land without restarting, exchanges edits in both directions, and can instead return to writable Direct Files.",
     observed: String(error).split("\n").slice(0, 4).join(" | "),
     classification: /HARNESS UNAVAILABLE|tauri-driver|WebKit|xdotool|window manager|DISPLAY/i.test(String(error))
       ? "infrastructure"
       : "product",
   };
-  fs.writeFileSync(path.join(ARTIFACTS, "failure-capsule.json"), `${JSON.stringify(failure, null, 2)}\n`);
+  fs.writeFileSync(path.join(ARTIFACTS, `failure-capsule-${JOIN_ORDERING}.json`), `${JSON.stringify(failure, null, 2)}\n`);
   console.error(`E2E FAILURE CAPSULE ${JSON.stringify(failure)}`);
   process.exitCode = 1;
 } finally {
