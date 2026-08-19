@@ -17,14 +17,16 @@ function deferred<T>() {
 function dispatchDeps(): AndroidBackDispatchDeps & {
   transient: boolean;
   drawer: boolean;
+  movedBack: boolean;
 } {
   const state = {
     transient: false,
     drawer: false,
+    movedBack: true,
     dismissTransient: vi.fn(() => state.transient),
     dismissDrawer: vi.fn(() => state.drawer),
     restoreDrawerFocus: vi.fn(),
-    historyBack: vi.fn(),
+    historyBack: vi.fn(() => state.movedBack),
     closeRoot: vi.fn(),
   };
   return state;
@@ -49,8 +51,11 @@ describe("GH #161 Android SafeBack owner", () => {
     expect(deps.historyBack).toHaveBeenCalledOnce();
     expect(deps.closeRoot).not.toHaveBeenCalled();
 
+    // Root is reached by the router having nothing left to pop, which is the
+    // only thing that distinguishes it from the rung above.
+    deps.movedBack = false;
     expect(dispatchAndroidBack({ canGoBack: false }, deps)).toBe("root");
-    expect(deps.historyBack).toHaveBeenCalledOnce();
+    expect(deps.historyBack).toHaveBeenCalledTimes(2);
     expect(deps.closeRoot).toHaveBeenCalledOnce();
   });
 
@@ -86,26 +91,19 @@ describe("GH #161 Android SafeBack owner", () => {
     expect(subscribe).not.toHaveBeenCalled();
   });
 
-  it("reports the rung it chose, without letting the report change the choice", () => {
-    const seen: string[] = [];
-    const state = { transient: false, drawer: false };
-    const deps = {
-      dismissTransient: () => state.transient,
-      dismissDrawer: () => state.drawer,
-      restoreDrawerFocus: () => {},
-      historyBack: () => seen.push("historyBack"),
-      closeRoot: () => seen.push("closeRoot"),
-      dispatched: (disposition: string) => seen.push(`dispatched:${disposition}`),
-    };
-    expect(dispatchAndroidBack({ canGoBack: true }, deps)).toBe("history");
-    expect(dispatchAndroidBack({ canGoBack: false }, deps)).toBe("root");
-    // The report always follows the action it describes.
-    expect(seen).toEqual([
-      "historyBack",
-      "dispatched:history",
-      "closeRoot",
-      "dispatched:root",
-    ]);
+  it("takes the router's answer, not the WebView's, for the history rung", () => {
+    // A phone reported canGoBack=true with nothing for the router to pop, so
+    // Back landed on the history rung and silently did nothing. The rung is
+    // chosen by whether the router actually moved.
+    const deps = dispatchDeps();
+    deps.movedBack = false;
+    expect(dispatchAndroidBack({ canGoBack: true }, deps)).toBe("root");
+    expect(deps.historyBack).toHaveBeenCalledOnce();
+    expect(deps.closeRoot).toHaveBeenCalledOnce();
+
+    deps.movedBack = true;
+    expect(dispatchAndroidBack({ canGoBack: false }, deps)).toBe("history");
+    expect(deps.closeRoot).toHaveBeenCalledOnce();
   });
 
   it("leaves the native SafeBack owner blocking when platform or subscription setup rejects", async () => {

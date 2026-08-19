@@ -45,8 +45,10 @@ function pressBack() {
       dismissTransient: () => dismissTopTransient("back"),
       dismissDrawer: () => dismissMobileDrawer("back"),
       restoreDrawerFocus: () => restoreDrawerFocus("back"),
-      historyBack: () => fallbacks.push("history"),
-      closeRoot: () => fallbacks.push("root"),
+      // Records instead of navigating, and reports that it moved: a Back that
+      // reached this rung with the Settings modal on screen is the defect.
+      historyBack: () => { fallbacks.push("history"); return true; },
+      closeRoot: () => { fallbacks.push("root"); },
     },
   );
   return { disposition, fallbacks };

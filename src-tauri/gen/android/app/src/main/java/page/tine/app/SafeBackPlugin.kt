@@ -35,11 +35,6 @@ internal object SafeBackBridge {
 
   fun dispatchIfReady(): Boolean {
     gesturesReceived += 1
-    // Prove native delivery independently of the plugin listener AND of
-    // Android's Toast, either of which can be the thing that is broken. A DOM
-    // CustomEvent needs only a live WebView, so a receipt that shows this and
-    // no rung report isolates the fault to the plugin event path.
-    plugin?.noteGestureInWebView(gesturesReceived)
     val delivered = plugin?.dispatchIfReady() ?: false
     if (delivered) dispatchesDelivered += 1
     return delivered
@@ -95,14 +90,6 @@ class SafeBackPlugin(private val activity: Activity) : Plugin(activity) {
       put("canGoBack", loadedWebView.canGoBack())
     })
     return true
-  }
-
-  /** Runs on the Back gesture's own (main) thread; see SafeBackBridge. */
-  fun noteGestureInWebView(count: Int) {
-    webView?.evaluateJavascript(
-      "window.dispatchEvent(new CustomEvent('tine-native-back', {detail: $count}))",
-      null,
-    )
   }
 
   internal fun webViewForTest(): WebView? = webView

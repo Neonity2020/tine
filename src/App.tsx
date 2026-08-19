@@ -784,24 +784,6 @@ export function App(): JSX.Element {
     { defer: true },
   ));
 
-  // A same-document history move is synchronous plus one task; this is slack
-  // for the WebView's main-thread hop, not a retry budget.
-  const BACK_SETTLE_MS = 350;
-
-  // Native delivery, observed without the plugin event path and without
-  // Android's Toast — the two mechanisms that could themselves be the fault.
-  // SafeBackBridge fires this on every gesture that reaches Tine's owner, so
-  // "this fires and no rung is reported" and "nothing fires at all" are
-  // different defects with different repairs.
-  onMount(() => {
-    const observe = (event: Event) => {
-      const count = (event as CustomEvent<number>).detail;
-      pushToast(`Back reached Tine's native owner (#${count}).`, "info");
-    };
-    window.addEventListener("tine-native-back", observe);
-    onCleanup(() => window.removeEventListener("tine-native-back", observe));
-  });
-
   // SafeBackPlugin is the single Android native Back owner. A drawer/transient
   // is never represented by synthetic history; route history remains the JS
   // dispatch fallback once the native listener is explicitly ready.
@@ -816,40 +798,14 @@ export function App(): JSX.Element {
       dismissTransient: () => dismissTopTransient("back"),
       dismissDrawer: () => dismissMobileDrawer("back"),
       restoreDrawerFocus: () => restoreDrawerFocus("back"),
-      historyBack: () => window.history.back(),
-      closeRoot: () => { void closeAndroidRootSafely(); },
-      // A Back that lands on the history rung and moves nothing is
-      // indistinguishable, on the phone, from a Back that was never delivered.
-      // Martin hit exactly that: no toast, no navigation, no modal close, and
-      // nothing to tell the two apart. Say so instead of swallowing it.
-      dispatched: (disposition, payload) => {
-        // EVERY rung reports, not only the history one. Reporting a single
-        // rung was the same mistake one level down: a gesture answered by a
-        // stale transient layer, or by a drawer that was not on screen, is
-        // just as silent as one that never arrived, and the first build of
-        // this report could not tell Martin's phone apart from a dead
-        // listener. A rung that leaves the screen unchanged is exactly the
-        // defect being hunted, so it must never be the quiet case.
-        if (disposition !== "history") {
-          pushToast(`Back → ${disposition} (canGoBack=${payload.canGoBack}).`, "info");
-          return;
-        }
-        // Observed by comparing the address, never by listening for popstate:
-        // this file must not grow a second back-navigation path beside the
-        // router's (androidBack.test.ts pins that).
-        const before = window.location.href;
-        const entries = window.history.length;
-        window.setTimeout(() => {
-          const moved =
-            window.location.href !== before || window.history.length !== entries;
-          pushToast(
-            moved
-              ? `Back → history, moved (entries=${window.history.length}).`
-              : `Back had nowhere to go (canGoBack=${payload.canGoBack}, entries=${window.history.length}).`,
-            moved ? "info" : "error",
-          );
-        }, BACK_SETTLE_MS);
+      // The router's own back, not the WebView's: it knows whether Tine has an
+      // entry to pop, and it is what every other Back affordance already uses.
+      historyBack: () => {
+        if (!canGoBack()) return false;
+        goBack();
+        return true;
       },
+      closeRoot: () => { void closeAndroidRootSafely(); },
       // Listener absence/rejection remains owned by the native SafeBackPlugin,
       // which consumes Back rather than delegating to AppPlugin's unsafe
       // WebView/activity fallback.
