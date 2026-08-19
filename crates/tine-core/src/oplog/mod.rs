@@ -23,8 +23,6 @@ pub(crate) mod enrollment;
 pub(crate) mod enrollment_legacy_hmac;
 pub(crate) use enrollment_legacy_hmac as legacy_enrollment_verifier;
 pub(crate) mod evidence_index;
-#[allow(dead_code)] // mixed live/runtime and test instrumentation surface
-pub(crate) mod exact_external_feed;
 pub(crate) mod external_import;
 pub mod hot_engine;
 #[cfg(test)]
