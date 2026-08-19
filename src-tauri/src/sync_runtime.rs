@@ -442,6 +442,17 @@ impl SparseV2Availability {
                     detail,
                 },
             },
+            // Not a durable refusal: the startup path retires the state and
+            // reopens the graph in Direct Files. This mapping only surfaces if
+            // a non-startup caller races the retirement.
+            SyncRuntimeOpenStatus::SupersededLegacyState => Self::Refused {
+                reason_code: SUPERSEDED_LEGACY_REASON.into(),
+                scenario_id: SUPERSEDED_LEGACY_REASON.into(),
+                detail: Some(
+                    "Pre-0.7 managed-storage state was found; it is set aside and the graph opens in Direct files."
+                        .into(),
+                ),
+            },
         }
     }
 
@@ -525,9 +536,24 @@ fn ambiguous_name(evidence: SyncAmbiguousEvidence) -> &'static str {
     }
 }
 
+/// Reason code for pre-0.7 managed state discovered at open. The graph-open
+/// path treats it as an instruction (set aside, reopen Direct), never as an
+/// error to show.
+pub(crate) const SUPERSEDED_LEGACY_REASON: &str = "superseded_legacy_state";
+
 pub(crate) struct SparseV2Binding {
     availability: SparseV2Availability,
     handle: Option<SyncRuntimeHandle>,
+}
+
+impl SparseV2Binding {
+    pub(crate) fn superseded_legacy(&self) -> bool {
+        matches!(
+            &self.availability,
+            SparseV2Availability::Refused { reason_code, .. }
+                if reason_code == SUPERSEDED_LEGACY_REASON
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1133,6 +1159,51 @@ impl SyncRuntimeFacade {
         Ok(record)
     }
 
+    /// True when a binding file exists but predates the current schema. Such
+    /// a file cannot decode into `SparseV2ActivationRecord`, so ordinary
+    /// discovery reports corruption; startup instead retires it. A current-
+    /// version file that fails to decode stays an error - that IS corruption.
+    pub(crate) fn superseded_binding_file(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> bool {
+        let Ok(private) = sparse_private_root(app, graph_root) else {
+            return false;
+        };
+        let Ok(bytes) = std::fs::read(private.join(SPARSE_BINDING_FILE)) else {
+            return false;
+        };
+        binding_bytes_are_superseded(&bytes)
+    }
+
+    /// Pre-0.7 policy (Martin, Aug 19): experimental state is not migrated.
+    /// Archive the whole app-private root into the recovery directory - never
+    /// hard-delete - and select Direct Files so the next open is ordinary.
+    pub(crate) fn retire_superseded_legacy(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> Result<(), String> {
+        let private = sparse_private_root(app, graph_root)?;
+        let recovery = sparse_recovery_root(app)?;
+        let archived = archive_private_root(&private, &recovery).map_err(|error| {
+            format!("Couldn't set aside pre-0.7 managed-storage state: {error}")
+        })?;
+        crate::debug::diag(format!(
+            "pre-0.7 managed state retired: archived={}",
+            archived
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "nothing-to-archive".into())
+        ));
+        publish_direct_selection(
+            app,
+            graph_root,
+            "superseded pre-0.7 managed state set aside",
+        )
+    }
+
     pub(crate) fn prepare_binding_record(
         &self,
         app: &tauri::AppHandle,
@@ -1397,6 +1468,7 @@ fn managed_open_outcome_code(status: &SyncRuntimeOpenStatus) -> &'static str {
             "existing_verified_local"
         }
         SyncRuntimeOpenStatus::Blocked { .. } => "blocked",
+        SyncRuntimeOpenStatus::SupersededLegacyState => "superseded_legacy_state",
         SyncRuntimeOpenStatus::UnsupportedOrIncompatible {
             component: SyncRuntimeComponent::Enrollment,
             ..
@@ -2166,6 +2238,19 @@ pub(crate) struct SparseV2CancelResult {
 /// in-app Direct Files return.  The caller's attempt is validated at the
 /// mutation boundary, not trusted as storage authority or reflected to the UI.
 pub(crate) type SparseV2ColdCancelResult = SparseV2CancelResult;
+
+/// A binding file from a schema before the current one is pre-0.7 state.
+/// Undecodable JSON is NOT superseded: a current-format file that fails to
+/// parse is corruption and must keep failing loudly.
+fn binding_bytes_are_superseded(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(u64::from(BINDING_SCHEMA_VERSION))
+}
 
 fn archive_private_root(
     private_root: &Path,
@@ -5847,6 +5932,24 @@ mod tests {
         assert_eq!(opened.status, SyncRuntimeOpenStatus::LegacyDefault);
         assert!(opened.handle.is_none());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn superseded_classification_spares_current_and_corrupt_bindings() {
+        // Pre-0.7 shapes: an explicit older version, and a record from before
+        // the version field existed at all.
+        assert!(binding_bytes_are_superseded(
+            br#"{"schema_version":1,"graph_root":"/g"}"#
+        ));
+        assert!(binding_bytes_are_superseded(
+            br#"{"graph_root":"/g","workspace":"w"}"#
+        ));
+        // The current version is not superseded even when the record is
+        // otherwise incomplete - that failure must stay a loud one.
+        assert!(!binding_bytes_are_superseded(br#"{"schema_version":2}"#));
+        // Not JSON at all: corruption, not an old format.
+        assert!(!binding_bytes_are_superseded(b"\x00\x01managed"));
+        assert!(!binding_bytes_are_superseded(b""));
     }
 
     #[test]

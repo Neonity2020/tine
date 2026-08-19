@@ -672,6 +672,23 @@ pub(crate) fn load_graph_for_label(
     }
     let binding_record = match state.sync_runtime.binding_record(app, &root_key) {
         Ok(binding_record) => binding_record,
+        // A binding file from before the current schema is pre-0.7
+        // experimental state, not corruption: set it aside and open the graph
+        // in Direct Files. A CURRENT-version file that fails to decode still
+        // fails the open - that is real corruption.
+        Err(_) if state.sync_runtime.superseded_binding_file(app, &root_key) => {
+            if let Err(error) = state.sync_runtime.retire_superseded_legacy(app, &root_key) {
+                let _ = state.storage_supervisor.finish_transition(
+                    app,
+                    lookup_id,
+                    StorageTransitionOutcome::Failed,
+                    None,
+                    Some("superseded_legacy_retire_failed".into()),
+                );
+                return Err(error);
+            }
+            None
+        }
         Err(error) => {
             let _ = state.storage_supervisor.finish_transition(
                 app,
@@ -684,7 +701,11 @@ pub(crate) fn load_graph_for_label(
         }
     };
     graph_load_phase(started, &mut previous, "private storage discovery");
-    if let Some(record) = binding_record {
+    let mut lookup_finished = false;
+    'managed: {
+        let Some(record) = binding_record else {
+            break 'managed;
+        };
         state.storage_supervisor.finish_transition(
             app,
             lookup_id,
@@ -692,6 +713,7 @@ pub(crate) fn load_graph_for_label(
             None,
             None,
         )?;
+        lookup_finished = true;
         let managed_id = state.storage_supervisor.begin_transition(
             app,
             window_label,
@@ -726,6 +748,28 @@ pub(crate) fn load_graph_for_label(
             }
         };
         graph_load_phase(started, &mut previous, "managed storage recovery");
+        if binding.superseded_legacy() {
+            // Pre-0.7 runtime state under a readable binding. Same policy as
+            // the unreadable-binding case above: set aside, open Direct Files.
+            if let Err(error) = state.sync_runtime.retire_superseded_legacy(app, &root_key) {
+                let _ = state.storage_supervisor.finish_transition(
+                    app,
+                    managed_id,
+                    StorageTransitionOutcome::Failed,
+                    None,
+                    Some("superseded_legacy_retire_failed".into()),
+                );
+                return Err(error);
+            }
+            state.storage_supervisor.finish_transition(
+                app,
+                managed_id,
+                StorageTransitionOutcome::Cancelled,
+                None,
+                Some("superseded_legacy_retired".into()),
+            )?;
+            break 'managed;
+        }
         let slot = Arc::new(GraphSlot::from_sparse_v2(
             binding,
             root_key.clone(),
@@ -809,13 +853,15 @@ pub(crate) fn load_graph_for_label(
         }
     }
     graph_load_phase(started, &mut previous, "shared storage discovery");
-    state.storage_supervisor.finish_transition(
-        app,
-        lookup_id,
-        StorageTransitionOutcome::Succeeded,
-        None,
-        None,
-    )?;
+    if !lookup_finished {
+        state.storage_supervisor.finish_transition(
+            app,
+            lookup_id,
+            StorageTransitionOutcome::Succeeded,
+            None,
+            None,
+        )?;
+    }
     let direct_id = state.storage_supervisor.begin_transition(
         app,
         window_label,

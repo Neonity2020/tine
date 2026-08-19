@@ -1902,6 +1902,10 @@ pub enum SyncRuntimeOpenStatus {
     OpenRefused {
         detail: String,
     },
+    /// Pre-0.7 managed-storage state was discovered. It is not a runtime
+    /// authority and not an error: the caller sets the private state aside and
+    /// opens the graph in Direct Files.
+    SupersededLegacyState,
 }
 
 impl SyncRuntimeOpenStatus {
@@ -1916,7 +1920,11 @@ impl SyncRuntimeOpenStatus {
             | Self::CorruptOrUnreadable { scenario, .. }
             | Self::AmbiguousOrForeignResidue { scenario, .. } => Some(*scenario),
             Self::OpenRefused { detail } => ManagedStorageRefusalScenario::marked_in(detail),
-            Self::LegacyDefault | Self::Absent | Self::ExistingNonActive(_) | Self::Active => None,
+            Self::LegacyDefault
+            | Self::Absent
+            | Self::ExistingNonActive(_)
+            | Self::Active
+            | Self::SupersededLegacyState => None,
         }
     }
 }
@@ -3714,10 +3722,10 @@ impl SyncRuntimeHandle {
         #[cfg(not(test))]
         {
             let _ = advisory;
-            return refused(
-                "pre-0.7 managed-storage state is no longer a runtime authority; return this graph to Direct Files, then enable managed storage again"
-                    .into(),
-            );
+            return SyncRuntimeOpenResult {
+                status: SyncRuntimeOpenStatus::SupersededLegacyState,
+                handle: None,
+            };
         }
         #[cfg(test)]
         let workspace_id = advisory.binding.workspace_id();
@@ -30011,6 +30019,21 @@ mod tests {
         assert!(contract.contains("Before an enrollment binding exists"));
         assert!(contract.contains("receipts.pre-promotion-failed"));
         assert!(contract.contains("Once enrollment has promoted"));
+    }
+
+    /// The startup contract for discovered pre-0.7 state: a typed
+    /// self-resolving status, not an error string. The Tauri layer archives
+    /// the private root and reopens the graph in Direct Files.
+    #[test]
+    fn pre_07_discovery_supersedes_instead_of_refusing_in_production_builds() {
+        let source = include_str!("sync_runtime.rs");
+        let arm = source
+            .find("#[cfg(not(test))]\n        {\n            let _ = advisory;")
+            .expect("the production-only discovery arm must exist");
+        assert!(
+            source[arm..arm + 400].contains("SyncRuntimeOpenStatus::SupersededLegacyState"),
+            "discovered pre-0.7 state must map to SupersededLegacyState, never to a refusal"
+        );
     }
 
     #[test]
