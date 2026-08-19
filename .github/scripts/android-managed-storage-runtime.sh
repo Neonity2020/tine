@@ -21,6 +21,10 @@ fi
 adb install -r "${app_apks[0]}"
 adb install -r "${test_apks[0]}"
 adb shell appops set --uid page.tine.app MANAGE_EXTERNAL_STORAGE allow
+# A device-only defect can only be diagnosed from the device's own log, and
+# "Process crashed." on its own names nothing. Clear the buffer first so what
+# is dumped on failure belongs to this run.
+adb logcat -c || true
 instrumentation_output="$(
   adb shell am instrument -w page.tine.app.test/androidx.test.runner.AndroidJUnitRunner
 )"
@@ -32,5 +36,16 @@ printf '%s\n' "$instrumentation_output"
 if grep -Fq 'FAILURES!!!' <<<"$instrumentation_output" ||
   ! grep -Eq 'OK \([0-9]+ tests?\)' <<<"$instrumentation_output"; then
   printf 'Android managed-storage instrumentation did not pass\n' >&2
+  # The crash trace is the finding. Print the app's and the runner's own lines
+  # plus every fatal one, rather than the whole buffer.
+  printf '\n===== logcat (app, runner, crashes) =====\n' >&2
+  adb logcat -d -v time \
+    AndroidRuntime:E \
+    DEBUG:V \
+    Tine:V \
+    chromium:E \
+    TestRunner:V \
+    libc:F \
+    '*:S' >&2 || true
   exit 1
 fi
