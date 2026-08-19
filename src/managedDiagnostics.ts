@@ -42,16 +42,32 @@ export function safeManagedErrorDetail(error: unknown): string {
       if (/^["'][a-z][a-z0-9_]*["']$/u.test(quoted)) return quoted;
       return '"[redacted]"';
     })
+    // A debug-formatted value (`Os { code: 2, … }`, a `<…>` type name) carries
+    // whatever the OS or the type system put inside it. Collapse the group
+    // rather than reasoning about its insides.
+    .replace(/\{[^{}]*\}/gu, "[details]")
+    .replace(/<[^<>]*>/gu, "[details]")
     .replace(/\s+/g, " ")
     .trim();
+  // Whatever still carries a structural character is one token we cannot vouch
+  // for — so redact THAT TOKEN. Never the sentence. Throwing the line away is
+  // how a phone came to be told "The command failed without a safe diagnostic
+  // detail" for an ordinary relative path, and then a second time for
+  // something else; the stage name in front of the residue is the entire
+  // diagnostic value of the message. This is not a weaker boundary: the same
+  // sentence carrying no structural character already reached the screen.
+  safe = safe
+    .split(" ")
+    .map((token) =>
+      /[{}<>\\/]|[\u0000-\u001f\u007f]/u.test(token) || token.length >= 80
+        ? "[redacted]"
+        : token,
+    )
+    .join(" ")
+    .replace(/\[redacted\](?: \[redacted\])+/gu, "[redacted]")
+    .trim();
   const hasDiagnosticClass = /\b(?:activation|archive|actor|binding|blocked|bridge|close|command|conflict|corrupt|database|denied|dispatch|drain|error|failed|failure|invalid|join|lookup|malformed|managed|materialization|open|operation|parse|parser|permission|projection|provider|read-only|reason|recovery|refused|save|scratch|serialization|setup|source|sqlite|storage|sync|timeout|unavailable|unresponsive)\b/iu.test(safe) || /lease|contended/iu.test(safe);
-  if (
-    !safe ||
-    !hasDiagnosticClass ||
-    /[\u0000-\u001f\u007f]/u.test(safe) ||
-    /[{}<>\\/]/u.test(safe) ||
-    /\S{80,}/u.test(safe)
-  ) {
+  if (!safe || !hasDiagnosticClass) {
     return "The command failed without a safe diagnostic detail.";
   }
   const maxLength = 280;

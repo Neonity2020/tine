@@ -63,6 +63,29 @@ describe("managed-storage diagnostics", () => {
     );
   });
 
+  // Martin's phone, Aug 19: a join refusal was ONCE MORE reduced to "The
+  // command failed without a safe diagnostic detail". The structural check was
+  // all-or-nothing, so any residue it could not vouch for cost the whole
+  // sentence — and the stage name in front of that residue is the entire
+  // diagnostic value. Redact the token, keep the sentence.
+  it("keeps the failing stage when a debug-formatted value trails it", () => {
+    expect(safeManagedErrorDetail(
+      'managed sync join failed at provider discovery: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }',
+    )).toBe("managed sync join failed at provider discovery: Os [details]");
+  });
+
+  it("keeps the failing stage when an unvouched token trails it", () => {
+    expect(safeManagedErrorDetail(
+      "managed sync join failed at runtime reopen: expected <SharedDescriptor>, found nothing",
+    )).toBe("managed sync join failed at runtime reopen: expected [details], found nothing");
+  });
+
+  it("redacts one opaque token rather than the sentence carrying it", () => {
+    expect(safeManagedErrorDetail(
+      `managed sync join failed at provider scan: unreadable marker ${"a".repeat(120)}`,
+    )).toBe("managed sync join failed at provider scan: unreadable marker [redacted]");
+  });
+
   // A page path is the one path whose last segment routinely contains spaces,
   // and every whitespace-terminated rule leaked the remainder of the name.
   it("redacts a page path whose last segment contains spaces", () => {
