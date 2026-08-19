@@ -103,6 +103,7 @@ class SafeBackOwnershipTest {
       }
 
       val before = SafeBackBridge.gesturesReceived
+      val deliveredBefore = SafeBackBridge.dispatchesDelivered
       scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
 
       assertTrue(
@@ -111,6 +112,18 @@ class SafeBackOwnershipTest {
           "registered later and answered the gesture with WebView history " +
           "navigation instead",
         awaitTrue(SETTLE_TIMEOUT_MS) { SafeBackBridge.gesturesReceived > before },
+      )
+
+      // Owning Back and DELIVERING it are different things, and this fixture
+      // used to prove only the first. An inlined plugin with no ACL manifest
+      // has `plugin:safe-back|registerListener` refused before it reaches
+      // Android, so `hasListener` stays false, every gesture is consumed with
+      // nowhere to send it, and the counter above still climbs. That shipped.
+      assertTrue(
+        "Back reached Tine's owner but was never handed to the frontend: the " +
+          "\"android-safe-back\" listener is not registered, which is what an " +
+          "ACL refusal of plugin:safe-back|registerListener looks like from here",
+        awaitTrue(SETTLE_TIMEOUT_MS) { SafeBackBridge.dispatchesDelivered > deliveredBefore },
       )
     } finally {
       scenario.close()

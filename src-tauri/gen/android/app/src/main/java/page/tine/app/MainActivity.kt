@@ -7,7 +7,11 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 
 class MainActivity : TauriActivity() {
-  private var lastBlockedBackNoticeAt = Long.MIN_VALUE
+  /** `elapsedRealtime` of the last notice, or null while none has been shown.
+   * NOT a sentinel Long: `now - Long.MIN_VALUE` overflows to a negative value,
+   * which is below any throttle, so the first notice suppressed itself and the
+   * stamp was never written — the notice could never appear at all. */
+  private var lastBlockedBackNoticeAt: Long? = null
 
   private val safeBackCallback = object : OnBackPressedCallback(true) {
     override fun handleOnBackPressed() {
@@ -75,7 +79,8 @@ class MainActivity : TauriActivity() {
 
   private fun showBlockedBackNotice() {
     val now = SystemClock.elapsedRealtime()
-    if (now - lastBlockedBackNoticeAt < BACK_NOTICE_THROTTLE_MS) return
+    val previous = lastBlockedBackNoticeAt
+    if (previous != null && now - previous < BACK_NOTICE_THROTTLE_MS) return
     lastBlockedBackNoticeAt = now
     Toast.makeText(
       this,

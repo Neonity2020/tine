@@ -187,6 +187,15 @@ describe("GH #161 Android SafeBack owner", () => {
     expect(safeBackPlugin).toContain('hasListener("android-safe-back")');
     expect(safeBackPlugin).toContain('trigger("android-safe-back"');
     expect(safeBackPlugin).toContain("fun dispatchIfReady(): Boolean");
+    // An inlined plugin gets no ACL manifest unless the build script declares
+    // one, and without it the frontend's listener registration is refused
+    // before it reaches Android — Back is owned, never delivered, in silence.
+    const buildScript = readFileSync("src-tauri/build.rs", "utf8");
+    expect(buildScript).toMatch(/\.plugin\(\s*"safe-back",/u);
+    expect(buildScript).toContain('.commands(&["registerListener", "removeListener"])');
+    const mobileCapability = readFileSync("src-tauri/capabilities/mobile.json", "utf8");
+    expect(JSON.parse(mobileCapability).permissions).toContain("safe-back:default");
+    expect(JSON.parse(mobileCapability).platforms).toContain("android");
     expect(safeBackPlugin).not.toContain(".goBack()");
     expect(safeBackPlugin).not.toContain("activity.onBackPressed()");
     expect(safeBackPlugin).not.toContain("isEnabled = false");

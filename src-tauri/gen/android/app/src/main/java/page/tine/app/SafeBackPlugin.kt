@@ -21,6 +21,14 @@ internal object SafeBackBridge {
   internal var gesturesReceived: Int = 0
     private set
 
+  /** Gestures actually handed to the frontend listener. Ownership and
+   * DELIVERY are different failures: an ACL that refuses
+   * `plugin:safe-back|registerListener` leaves this at zero while every
+   * gesture still reaches the owner, which is exactly how Back became a
+   * silent no-op on a real device while the emulator run stayed green. */
+  internal var dispatchesDelivered: Int = 0
+    private set
+
   fun install(plugin: SafeBackPlugin) {
     this.plugin = plugin
   }
@@ -32,7 +40,9 @@ internal object SafeBackBridge {
     // CustomEvent needs only a live WebView, so a receipt that shows this and
     // no rung report isolates the fault to the plugin event path.
     plugin?.noteGestureInWebView(gesturesReceived)
-    return plugin?.dispatchIfReady() ?: false
+    val delivered = plugin?.dispatchIfReady() ?: false
+    if (delivered) dispatchesDelivered += 1
+    return delivered
   }
 
   /** The live WebView, for the instrumentation that has to arrange real
