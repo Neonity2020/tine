@@ -2582,15 +2582,11 @@ mod tests {
     /// surface it was designed not to have — not that the test is stale.
     #[test]
     fn the_activation_path_can_only_reach_the_sealed_resume_entry_points() {
-        const ACTIVATION_SOURCES: [(&str, &str); 3] = [
+        const ACTIVATION_SOURCES: [(&str, &str); 2] = [
             ("local_active.rs", include_str!("local_active.rs")),
             (
                 "operational_coordinator.rs",
                 include_str!("operational_coordinator.rs"),
-            ),
-            (
-                "reconciliation_session.rs",
-                include_str!("reconciliation_session.rs"),
             ),
         ];
         const OBJECT_STORE_SOURCE: &str = include_str!("object_store.rs");

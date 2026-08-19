@@ -40,18 +40,6 @@ use crate::oplog::operational_coordinator::{
     OperationalCoordinatorState, OperationalFaultPoint, OperationalPhase, RetainedBlockReason,
 };
 use crate::oplog::projection::write_projection_exact;
-use crate::oplog::reconciliation_baseline::{
-    BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
-    TrustedPrivateApplicationRuntimeRoot,
-};
-use crate::oplog::reconciliation_scan::{
-    scan_graph_text, take_bootstrap_page_materializations_for_test, GraphTextCandidateKind,
-    GraphTextScanLimits, JoinedAuthenticatedExpectedPathSource, ReconciliationSchedulerLimits,
-    ReconciliationTrigger,
-};
-use crate::oplog::reconciliation_session::{
-    ReconciliationSession, ReconciliationSessionDependencies, ReconciliationSessionStep,
-};
 use crate::oplog::shadow_projection::{
     verify_inactive_bootstrap_shadow_projection, VerifiedShadowProjection,
 };
@@ -432,31 +420,6 @@ impl Fixture {
         )
         .unwrap()
         .database
-    }
-
-    /// A fresh device-local reconciliation baseline bound to this exact
-    /// enrolled workspace, endpoint, graph resource, and graph-text scope.
-    fn reconciliation_baseline(&self, label: &str) -> ReconciliationBaseline {
-        let runtime = ApplicationRuntimeRoot::open_for_test(
-            &self.root.path().join(format!("baseline-rt-{label}")),
-        )
-        .unwrap();
-        let binding = ReconciliationBaselineBinding::new(
-            self.workspace,
-            self.authority
-                .binding()
-                .storage_binding()
-                .endpoint
-                .endpoint_id(),
-            self.graph.canonical_resource_id().unwrap(),
-            self.graph.graph_text_scope_binding().unwrap(),
-        )
-        .unwrap();
-        ReconciliationBaseline::create_fresh(
-            &TrustedPrivateApplicationRuntimeRoot::from_application_runtime_root(&runtime),
-            binding,
-        )
-        .unwrap()
     }
 
     fn compose(&self, root: &EnrollmentApplicationRoot) -> VerifiedLocalEvidence {
@@ -1812,233 +1775,8 @@ fn blocked_and_non_verified_lifecycles_never_activate() {
     fixture.assert_graph_unchanged();
 }
 
-/// A full-scan reconciliation dispatch owns the first durable baseline
-/// mutation of a step (`begin_epoch` plus the scan row appends). It must
-/// therefore authorize the exact live graph and engine *before* that mutation,
-/// not only later inside the coordinator.
-///
-/// The refused authority here is a genuine promoted admission — a real
-/// `LocalActiveAuthority` plus the real `PromotedLocalRuntime` minted for a
-/// second, separately enrolled graph — so this is a live wrong-authority
-/// dispatch rather than a synthetic admission value.
 #[test]
-fn full_scan_dispatch_with_wrong_authority_never_mutates_the_baseline() {
-    let fixture = Fixture::new(
-        "full-scan-authority",
-        None,
-        vec![("pages/scan.md".into(), b"- scan\n".to_vec())],
-    );
-    // The foreign enrollment is deliberately empty so its own live runtime
-    // engine is admissible: the refusal under test must come from the graph and
-    // engine identity, not from a stale accepted frontier.
-    let mut foreign = Fixture::new("full-scan-foreign", None, Vec::new());
-
-    // A genuine live promoted admission that belongs to the *other* graph.
-    let foreign_root = foreign.enrollment_root("foreign-admission");
-    let foreign_paths = PromotedPaths::new(&foreign, "foreign-admission");
-    let (mut foreign_authority, mut foreign_runtime) = promote(
-        &mut foreign,
-        &foreign_root,
-        SessionId::new(),
-        &foreign_paths,
-    );
-    let foreign_session = foreign_runtime
-        .admit_promoted_mutation(&mut foreign_authority, &foreign.graph)
-        .unwrap();
-    let wrong_admission = foreign_session.admission();
-
-    // One coherent live runtime for the graph actually being reconciled.
-    let mut engine = fixture.runtime_engine("scan");
-    let archive = ObjectStore::open(
-        &fixture.root.path().join("runtime-archive-scan"),
-        fixture.workspace,
-    )
-    .unwrap();
-    let mut database = fixture.runtime_projection(&engine, &archive, "scan");
-    let source = RebuildSource::new(&engine, &archive).unwrap();
-    let mut tail = TailOverlay::from_durable(&database, &source).unwrap();
-    let mut baseline = fixture.reconciliation_baseline("scan");
-    let baseline_directory = baseline.path().parent().unwrap().to_path_buf();
-
-    // A fresh baseline has no clean head yet, so the head observation is the
-    // exact `Option`, not an unwrapped value.
-    let head_before = baseline.head().ok();
-    let epochs_before = baseline.epoch_rows_for_test();
-    let bytes_before = durable_sqlite_digests(&baseline_directory);
-    let projection_before = ContentDigest::of(&fs::read(database.path()).unwrap());
-    let frontier_before = database.frontier_root().unwrap();
-    let accepted_before = engine.accepted_frontier_root().unwrap();
-
-    let mut session = ReconciliationSession::new(ReconciliationSchedulerLimits::default());
-    session.trigger(ReconciliationTrigger::Explicit);
-    assert_eq!(
-        session.step(ReconciliationSessionDependencies {
-            admission: &wrong_admission,
-            graph: &fixture.graph,
-            receipts: &fixture.receipts,
-            engine: &mut engine,
-            database: &mut database,
-            tail: &mut tail,
-            bootstrap: None,
-            baseline: &mut baseline,
-            observed_at: BaselineTimestamp::from_millis(1).unwrap(),
-        }),
-        Ok(ReconciliationSessionStep::Blocked),
-        "a full scan that is not admitted must fail closed"
-    );
-
-    // Nothing scan-owned may have been written: not the baseline bytes, not a
-    // building epoch, not a row, not the head, and not the projection.
-    assert_eq!(
-        durable_sqlite_digests(&baseline_directory),
-        bytes_before,
-        "a refused full scan must leave the baseline database byte-identical"
-    );
-    assert_eq!(baseline.epoch_rows_for_test(), epochs_before);
-    assert_eq!(baseline.head().ok(), head_before);
-    assert_eq!(
-        ContentDigest::of(&fs::read(database.path()).unwrap()),
-        projection_before
-    );
-    assert_eq!(database.frontier_root().unwrap(), frontier_before);
-    assert_eq!(engine.accepted_frontier_root().unwrap(), accepted_before);
-    fixture.assert_graph_unchanged();
-    foreign.assert_graph_unchanged();
-
-    // Control: the identical dispatch under an admitted runtime does reach the
-    // baseline, so the assertions above are not vacuous.
-    let admitted = LocalRuntimeAdmission::unenrolled_pre_activation();
-    let mut control = ReconciliationSession::new(ReconciliationSchedulerLimits::default());
-    control.trigger(ReconciliationTrigger::Explicit);
-    assert!(control
-        .step(ReconciliationSessionDependencies {
-            admission: &admitted,
-            graph: &fixture.graph,
-            receipts: &fixture.receipts,
-            engine: &mut engine,
-            database: &mut database,
-            tail: &mut tail,
-            bootstrap: None,
-            baseline: &mut baseline,
-            observed_at: BaselineTimestamp::from_millis(2).unwrap(),
-        })
-        .is_ok());
-    assert_ne!(
-        baseline.epoch_rows_for_test(),
-        epochs_before,
-        "an admitted full scan must reach the baseline"
-    );
-    fixture.assert_graph_unchanged();
-}
-
-#[test]
-fn unchanged_bootstrap_full_scan_never_materializes_crdt_pages_at_any_graph_size() {
-    for page_count in [1, 17] {
-        let files = (0..page_count)
-            .map(|index| {
-                (
-                    format!("pages/unchanged-{index:03}.md"),
-                    format!("- unchanged {index}\n").into_bytes(),
-                )
-            })
-            .collect();
-        let label = format!("unchanged-bootstrap-scan-{page_count}");
-        let mut fixture = Fixture::new(&label, None, files);
-        let root = fixture.enrollment_root(&label);
-        let paths = PromotedPaths::new(&fixture, &label);
-        let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
-        let mut window = runtime
-            .admit_promoted_mutation(&mut authority, &fixture.graph)
-            .unwrap();
-        let (_admission, engine, database, _tail, bootstrap) =
-            window.parts_with_bootstrap().unwrap();
-        engine.reconcile_expected_path_history().unwrap();
-        let projection = engine.projection_work_index().unwrap();
-        let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
-            engine, projection, bootstrap, database,
-        );
-
-        take_bootstrap_page_materializations_for_test();
-        let scan = scan_graph_text(&fixture.graph, &source, GraphTextScanLimits::default())
-            .expect("unchanged bootstrap scan must be semantically exact");
-        let materialized = take_bootstrap_page_materializations_for_test();
-
-        assert!(scan.candidates.is_empty());
-        assert_eq!(
-            materialized, 0,
-            "{page_count} unchanged bootstrap pages must require no CRDT materialization"
-        );
-    }
-}
-
-#[test]
-fn one_accepted_pending_page_uses_authenticated_work_without_touching_bootstrap_pages() {
-    let files = (0..17)
-        .map(|index| {
-            (
-                format!("pages/pending-control-{index:03}.md"),
-                format!("- unchanged control {index}\n").into_bytes(),
-            )
-        })
-        .collect();
-    let mut fixture = Fixture::new("pending-bootstrap-suffix", None, files);
-    let root = fixture.enrollment_root("pending-bootstrap-suffix");
-    let paths = PromotedPaths::new(&fixture, "pending-bootstrap-suffix");
-    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
-    const SEED: u128 = 0xB005_7000;
-    append_local_batch(&fixture, &mut authority, &mut runtime, SEED);
-    let pending_path = ManagedPath::parse(&format!("pages/promoted-{SEED}.md")).unwrap();
-
-    let mut window = runtime
-        .admit_promoted_mutation(&mut authority, &fixture.graph)
-        .unwrap();
-    let (_admission, engine, database, _tail, bootstrap) = window.parts_with_bootstrap().unwrap();
-    engine.reconcile_expected_path_history().unwrap();
-    let exceptions = database
-        .authenticated_bootstrap_projection_exceptions(
-            engine,
-            bootstrap.binding(),
-            1_000_000,
-            512 * 1024 * 1024,
-        )
-        .unwrap();
-    assert_eq!(exceptions.len(), 1);
-
-    let projection = engine.projection_work_index().unwrap();
-    let work = projection
-        .next()
-        .unwrap()
-        .expect("one Ready projection row");
-    assert_eq!(work.path(), &pending_path);
-    let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
-        engine, projection, bootstrap, database,
-    );
-    take_bootstrap_page_materializations_for_test();
-    let pending_scan = scan_graph_text(&fixture.graph, &source, GraphTextScanLimits::default())
-        .expect("authenticated Ready target must drive the pending scan");
-    assert_eq!(take_bootstrap_page_materializations_for_test(), 0);
-    assert_eq!(pending_scan.candidates.len(), 1);
-    assert_eq!(pending_scan.candidates[0].path, pending_path);
-    assert_eq!(
-        pending_scan.candidates[0].change,
-        GraphTextCandidateKind::Absence
-    );
-    drop(source);
-
-    execute_manifested_projection_work(&fixture.graph, &fixture.receipts, engine, &work).unwrap();
-    let projection = engine.projection_work_index().unwrap();
-    let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
-        engine, projection, bootstrap, database,
-    );
-    take_bootstrap_page_materializations_for_test();
-    let completed_scan = scan_graph_text(&fixture.graph, &source, GraphTextScanLimits::default())
-        .expect("completed projection and Ready target must describe the same bytes");
-    assert!(completed_scan.candidates.is_empty());
-    assert_eq!(take_bootstrap_page_materializations_for_test(), 0);
-}
-
-#[test]
-fn corrupt_bootstrap_payload_is_refused_without_crdt_fallback() {
+fn corrupt_bootstrap_payload_is_refused() {
     let fixture = Fixture::new(
         "corrupt-bootstrap-reconciliation",
         None,
@@ -2056,45 +1794,11 @@ fn corrupt_bootstrap_payload_is_refused_without_crdt_fallback() {
         .join(pack_name);
     fs::write(payload, b"unauthenticated replacement pack").unwrap();
 
-    take_bootstrap_page_materializations_for_test();
     assert!(
         reopen_inactive_bootstrap_accepted_authority(&fixture.verified, fixture.archive(),)
             .is_err()
     );
-    assert_eq!(take_bootstrap_page_materializations_for_test(), 0);
     fixture.assert_graph_unchanged();
-}
-
-#[test]
-fn stale_sqlite_bootstrap_suffix_binding_is_never_treated_as_unchanged() {
-    let mut fixture = Fixture::new(
-        "stale-bootstrap-suffix",
-        None,
-        vec![("pages/stale.md".into(), b"- bootstrap\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("stale-bootstrap-suffix");
-    let paths = PromotedPaths::new(&fixture, "stale-bootstrap-suffix");
-    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
-    stage_local_batch_at(
-        &fixture,
-        &mut authority,
-        &mut runtime,
-        0xB005_7100,
-        "pages",
-        false,
-    );
-
-    let engine = &runtime.engine;
-    let projection = engine.projection_work_index().unwrap();
-    let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
-        engine,
-        projection,
-        &runtime.bootstrap_projection,
-        runtime.projection.database(),
-    );
-    assert!(source
-        .current_scan_identity(GraphTextScanLimits::default().retained_bytes)
-        .is_err());
 }
 
 /// Compile-time proof that the authority cannot be cloned, serialized, or

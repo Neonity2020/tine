@@ -41,9 +41,8 @@
 //!
 //! The queue has no filesystem authority, holds no [`crate::model::Graph`], and
 //! writes no enrollment or projection state. Its only output is a
-//! [`ReconciliationTrigger`], which the existing
-//! [`super::reconciliation_scan::ReconciliationScheduler`] already knows how to
-//! coalesce; reconciliation semantics are not restated here.
+//! [`ReconciliationTrigger`]: a freshness signal a reconciliation consumer may
+//! coalesce. Reconciliation semantics are not restated here.
 //!
 //! The threat model is the campaign's: honest single-user watcher/process races
 //! and crashes, not a hostile peer. A crash loses only in-memory intake, and the
@@ -58,8 +57,19 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 
 use super::hot_engine::ProjectionStorageBinding;
-use super::reconciliation_scan::ReconciliationTrigger;
 use super::ManagedPath;
+
+/// A freshness signal. It does not grant filesystem, graph, or write
+/// authority; a consumer must recapture every selected path.
+///
+/// Only the two shapes this queue can produce exist. It was carried over from
+/// the deleted `oplog::reconciliation_scan`, whose remaining variants were
+/// minted exclusively by that module's scheduler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReconciliationTrigger {
+    WatcherPaths(BTreeSet<ManagedPath>),
+    WatcherUncertain,
+}
 
 /// Bounded retention for one endpoint's watcher intake.
 ///

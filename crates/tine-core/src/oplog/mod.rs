@@ -49,16 +49,6 @@ pub mod projection_manifest;
 pub mod projection_store;
 pub mod projection_work_index;
 pub mod receipt;
-#[allow(dead_code)] // mixed live/runtime and diagnostic/test surface
-pub(crate) mod reconciliation_baseline;
-#[allow(dead_code)] // mixed live/runtime and test-composition surface
-pub(crate) mod reconciliation_baseline_adapter;
-#[allow(dead_code)] // mixed live/runtime and test-composition surface
-pub(crate) mod reconciliation_import;
-#[allow(dead_code)] // mixed live/runtime and test instrumentation surface
-pub(crate) mod reconciliation_scan;
-#[allow(dead_code)] // mixed live/runtime and test-composition surface
-pub(crate) mod reconciliation_session;
 pub mod reference_catalog;
 pub mod refusal;
 #[allow(dead_code)] // retained recovery format plus test construction surface

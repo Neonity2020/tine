@@ -128,10 +128,6 @@ use crate::oplog::projection::{
 };
 use crate::oplog::projection::{render_requested_page_document, PreparedEditorProjection};
 use crate::oplog::projection_store::ProjectionReceiptStore;
-use crate::oplog::reconciliation_baseline::{
-    BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
-    TrustedPrivateApplicationRuntimeRoot,
-};
 #[cfg(test)]
 use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
 use crate::oplog::shadow_projection::{
@@ -3925,24 +3921,11 @@ impl SyncRuntimeHandle {
                 if !identities_match_binding(&request.identities, &advisory.binding) {
                     return activation_blocked("explicit_identity_binding_mismatch");
                 }
-                #[cfg(not(test))]
                 return activation_retryable(
                     SyncLocalActivationStage::LocalActive,
                     "pre-0.7 managed-storage state must return to Direct Files before clean activation"
                         .into(),
                 );
-                #[cfg(test)]
-                {
-                    progress(SyncLocalActivationProgress::Phase {
-                        phase: SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
-                    });
-                    if let Err(detail) =
-                        ensure_reconciliation_baseline(&request, &graph, &advisory.binding)
-                    {
-                        return activation_retryable(SyncLocalActivationStage::LocalActive, detail);
-                    }
-                    return activation_open_runtime(request);
-                }
             }
             DiscoveryClassification::Blocked(advisory) => {
                 return activation_blocked(advisory.reason_code.clone());
@@ -6309,28 +6292,6 @@ fn archive_pre_promotion_receipts(receipt_root: &Path) -> Result<(), String> {
     })
 }
 
-fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActivationResult {
-    let session_id = request.identities.session_id;
-    let opened = SyncRuntimeHandle::open_with_session(
-        runtime_open_request_from_activation(&request),
-        session_id,
-        |_| {},
-    );
-    match opened {
-        SyncRuntimeOpenResult {
-            status: SyncRuntimeOpenStatus::Active,
-            handle: Some(handle),
-        } => SyncLocalActivationResult {
-            status: SyncLocalActivationStatus::Active,
-            handle: Some(handle),
-        },
-        SyncRuntimeOpenResult { status, .. } => activation_retryable(
-            SyncLocalActivationStage::LocalActive,
-            format!("LocalActive runtime reopen refused after proof: {status:?}"),
-        ),
-    }
-}
-
 fn runtime_open_request_from_activation(
     request: &SyncLocalActivationRequest,
 ) -> SyncRuntimeOpenRequest {
@@ -6542,43 +6503,6 @@ fn local_activation_identity(
         PreparationId::from_uuid(request.identities.preparation_id),
         request.identities.session_id,
     )
-}
-
-fn ensure_reconciliation_baseline(
-    request: &SyncLocalActivationRequest,
-    graph: &Graph,
-    binding: &EnrollmentBindingV1,
-) -> Result<(), String> {
-    let runtime = ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-        .map_err(display)?;
-    ensure_reconciliation_baseline_with_runtime(&runtime, graph, binding)
-}
-
-fn ensure_reconciliation_baseline_with_runtime(
-    runtime: &ApplicationRuntimeRoot,
-    graph: &Graph,
-    binding: &EnrollmentBindingV1,
-) -> Result<(), String> {
-    drop(open_reconciliation_baseline_with_runtime(
-        runtime, graph, binding,
-    )?);
-    Ok(())
-}
-
-fn open_reconciliation_baseline_with_runtime(
-    runtime: &ApplicationRuntimeRoot,
-    graph: &Graph,
-    binding: &EnrollmentBindingV1,
-) -> Result<ReconciliationBaseline, String> {
-    let trusted = TrustedPrivateApplicationRuntimeRoot::from_application_runtime_root(runtime);
-    let baseline_binding = ReconciliationBaselineBinding::new(
-        binding.workspace_id(),
-        binding.endpoint_id(),
-        graph.canonical_resource_id().map_err(display)?,
-        graph.graph_text_scope_binding().map_err(display)?,
-    )
-    .map_err(display)?;
-    ReconciliationBaseline::open_or_rebuild(&trusted, baseline_binding).map_err(display)
 }
 
 struct ApplicationBlockRef<'a> {
@@ -23099,16 +23023,6 @@ fn sync_reference_hit(hit: FrontierReferenceHit) -> SyncReferenceHitDto {
     }
 }
 
-fn current_timestamp() -> Result<BaselineTimestamp, String> {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
-        .as_millis();
-    let millis =
-        u64::try_from(millis).map_err(|_| "system timestamp exceeds u64 range".to_owned())?;
-    BaselineTimestamp::from_millis(millis).map_err(display)
-}
-
 fn display(error: impl fmt::Display) -> String {
     error.to_string()
 }
@@ -26497,18 +26411,17 @@ mod tests {
             let resources = open_clean_runtime_resources(&self.request())
                 .expect("clean runtime resources reopen")
                 .expect("a Safe clean host has recoverable runtime resources");
-            resources.runtime.engine().materialize_page(page_id).unwrap()
+            resources
+                .runtime
+                .engine()
+                .materialize_page(page_id)
+                .unwrap()
         }
     }
 
     /// Write `body` at `path` inside the host graph and settle the one watcher
     /// observation it produces.
-    fn admit_external_page(
-        handle: &SyncRuntimeHandle,
-        graph_root: &Path,
-        path: &str,
-        body: &[u8],
-    ) {
+    fn admit_external_page(handle: &SyncRuntimeHandle, graph_root: &Path, path: &str, body: &[u8]) {
         let file = graph_root.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(file, body).unwrap();
@@ -42314,7 +42227,6 @@ mod tests {
         assert!(!fixture.graph_root.join(".tine-sync/v2").exists());
     }
 
-
     /// Deterministic per-label workspace seed, so a restored runtime-host test
     /// keeps one stable identity across runs without colliding with its peers.
     fn label_seed(label: &str) -> u128 {
@@ -42325,7 +42237,6 @@ mod tests {
         }
         hash | 1
     }
-
 
     fn run_existing_editor_identity_scenario(
         scenario: &ExistingEditorIdentityScenario,
@@ -42339,8 +42250,11 @@ mod tests {
             );
             opened.handle.expect("active scenario startup has a handle")
         };
-        let fixture =
-            CleanRuntimeHost::safe_with_config(scenario.label, label_seed(scenario.label), scenario.config);
+        let fixture = CleanRuntimeHost::safe_with_config(
+            scenario.label,
+            label_seed(scenario.label),
+            scenario.config,
+        );
         let request = fixture.request();
         fs::create_dir_all(
             fixture
@@ -42352,7 +42266,12 @@ mod tests {
         .unwrap();
         let handle = open_scenario("initial", SyncRuntimeHandle::open(request.clone()));
         drive_initial_feed(&handle);
-        admit_external_page(&handle, fixture.graph_root(), scenario.path, scenario.initial);
+        admit_external_page(
+            &handle,
+            fixture.graph_root(),
+            scenario.path,
+            scenario.initial,
+        );
 
         let loaded = load_editor_named(&handle, scenario.initial_name, scenario.initial_kind);
         assert_eq!(loaded.path, scenario.path);
@@ -42759,6 +42678,4 @@ mod tests {
             );
         });
     }
-
-
 }
