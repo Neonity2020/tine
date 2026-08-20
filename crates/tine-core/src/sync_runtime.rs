@@ -11460,6 +11460,11 @@ struct RuntimeActor {
     /// a batch is re-queued only after it authored a resolution, so the
     /// queue converges once the engine reports the pair resolved.
     pending_conflict_resolutions: VecDeque<BatchId>,
+    /// The queue above is process-local; on the first resolution tick after
+    /// open it is reseeded from the accepted non-linear batches so a crash
+    /// between acceptance and authoring cannot strand owed conflict work
+    /// (audit 4, finding 3).
+    conflict_backlog_seeded: bool,
     provider_direct_queued: BTreeSet<BatchId>,
     provider_discovery_scan_complete: bool,
     provider_head_dirty: bool,
@@ -12802,6 +12807,7 @@ impl RuntimeActor {
             provider_own_heads: BTreeMap::new(),
             provider_direct_manifests: VecDeque::new(),
             pending_conflict_resolutions: VecDeque::new(),
+            conflict_backlog_seeded: false,
             provider_direct_queued: BTreeSet::new(),
             provider_discovery_scan_complete: false,
             provider_head_dirty: false,
@@ -19486,6 +19492,17 @@ impl RuntimeActor {
             self.note_provider_batch_needs_conflict_check(batch_id);
             return SyncRuntimeTick::ProviderMutation { batch_id };
         }
+        if !self.conflict_backlog_seeded {
+            self.conflict_backlog_seeded = true;
+            let backlog = self
+                .active_engine()
+                .ok()
+                .and_then(|engine| engine.accepted_nonlinear_batch_ids().ok())
+                .unwrap_or_default();
+            for batch_id in backlog {
+                self.note_provider_batch_needs_conflict_check(batch_id);
+            }
+        }
         if let Some(tick) = self.resolve_pending_conflict() {
             return tick;
         }
@@ -19675,13 +19692,22 @@ impl RuntimeActor {
     fn resolve_pending_conflict(&mut self) -> Option<SyncRuntimeTick> {
         let batch_id = self.pending_conflict_resolutions.pop_front()?;
         let my_device = self.binding.device_id();
-        let (transaction, reconciliation_path) = {
-            let engine = self.active_engine().ok()?;
+        // For keep-both this device can be the SOLE author (minimum-batch
+        // election), so a transient failure must requeue rather than drop —
+        // dropping strands the resolution forever, and the counterpart is not
+        // allowed to author it (audit 4, finding 3).
+        let mut derivation_incomplete = false;
+        let resolved = 'derive: {
+            let Ok(engine) = self.active_engine() else {
+                derivation_incomplete = true;
+                break 'derive None;
+            };
             let intents = match engine.conflict_resolution_intents(batch_id) {
                 Ok(intents) => intents,
-                // Dropping the derivation is safe: the counterpart device
-                // derives the same intents from the same pair.
-                Err(_) => return None,
+                Err(_) => {
+                    derivation_incomplete = true;
+                    break 'derive None;
+                }
             };
             let mut resolution = None;
             for intent in intents {
@@ -19704,6 +19730,7 @@ impl RuntimeActor {
                             continue;
                         }
                         let Ok(page) = engine.materialize_page(page_id) else {
+                            derivation_incomplete = true;
                             continue;
                         };
                         resolution =
@@ -19713,6 +19740,9 @@ impl RuntimeActor {
                             }])
                             .ok()
                             .map(|transaction| (transaction, page.path));
+                        if resolution.is_none() {
+                            derivation_incomplete = true;
+                        }
                     }
                     crate::oplog::ConflictResolutionIntent::KeepBothTexts {
                         page_id,
@@ -19726,6 +19756,7 @@ impl RuntimeActor {
                             continue;
                         }
                         let Ok(page) = engine.materialize_page(page_id) else {
+                            derivation_incomplete = true;
                             continue;
                         };
                         let Some(original) = page
@@ -19733,9 +19764,25 @@ impl RuntimeActor {
                             .iter()
                             .find(|candidate| candidate.block_id == block.block_id)
                         else {
+                            // Transient at worst: if the block was genuinely
+                            // deleted after the race, the next derivation
+                            // suppresses the pair (descendant-touch gate) and
+                            // the requeue converges.
+                            derivation_incomplete = true;
                             continue;
                         };
-                        if original.order.len() >= 511 {
+                        // MembershipClaim allows order keys up to 512 bytes,
+                        // so appending is safe through length 511. A 512-byte
+                        // key cannot take the suffix; it is unreachable
+                        // through honest fractional-index growth (~256 nested
+                        // midpoint insertions), so skip it deliberately and
+                        // loudly rather than author an invalid claim or
+                        // retry forever (audit 4, finding 3).
+                        if original.order.len() >= 512 {
+                            eprintln!(
+                                "[tine] keep-both resolution skipped: order key at maximum length for block {}",
+                                block.block_id
+                            );
                             continue;
                         }
                         // "-" sorts before every digit, so this key lands
@@ -19759,13 +19806,22 @@ impl RuntimeActor {
                         ])
                         .ok()
                         .map(|transaction| (transaction, page.path.clone()));
+                        if resolution.is_none() {
+                            derivation_incomplete = true;
+                        }
                     }
                 }
                 if resolution.is_some() {
                     break;
                 }
             }
-            resolution?
+            resolution
+        };
+        let Some((transaction, reconciliation_path)) = resolved else {
+            if derivation_incomplete {
+                self.note_provider_batch_needs_conflict_check(batch_id);
+            }
+            return None;
         };
         let outcome = self.submit_local_mutation(transaction);
         // Re-derive on a later tick: the gates in the engine suppress the

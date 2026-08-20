@@ -7987,6 +7987,16 @@ fn verify_lazy_genesis_page_checkpoint(
 }
 
 pub struct ShardedHotEngine {
+    /// Lazy cache for `nonlinear_accepted_since` (audit 4, P2). `nonlinear_watermark`
+    /// holds the highest acceptance sequence whose batch is known causally
+    /// non-linear (0 = none known); `linearity_scanned_count` /
+    /// `linearity_scanned_sequence` record how far classification has scanned.
+    /// The accepted set only grows within a run, so all three are monotonic;
+    /// Relaxed atomics suffice (the engine is actor-owned, and a racy
+    /// duplicate scan is benign).
+    nonlinear_watermark: std::sync::atomic::AtomicU64,
+    linearity_scanned_count: std::sync::atomic::AtomicU64,
+    linearity_scanned_sequence: std::sync::atomic::AtomicU64,
     runtime_authority: EngineAuthority,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -8263,6 +8273,9 @@ impl ShardedHotEngine {
         let page_name_root = PageNameOwnershipRootV1::empty();
         let logseq_claim_root = LogseqClaimIndexRoot::empty();
         Self {
+            nonlinear_watermark: std::sync::atomic::AtomicU64::new(0),
+            linearity_scanned_count: std::sync::atomic::AtomicU64::new(0),
+            linearity_scanned_sequence: std::sync::atomic::AtomicU64::new(0),
             runtime_authority: EngineAuthority::mint(),
             workspace_id,
             lineage_digest,
@@ -9120,10 +9133,16 @@ impl ShardedHotEngine {
                             // CURRENT rendering — comparing against the stale
                             // recorded bytes would classify a superseded disk
                             // file as up to date forever (GH #351 audit
-                            // finding 1). Pages whose current path moved away
-                            // are left to the recorded bytes; the move's own
-                            // projection work owns that path transition.
-                            if !self.accepted_batch_is_causally_linear(work.batch_id())? {
+                            // finding 1). Supersession includes a LINEAR head
+                            // followed by a later concurrent merge (audit 4,
+                            // D2): the merge can change this page's rendering
+                            // from another document without re-rendering it,
+                            // and the full scan would otherwise never
+                            // reconcile the stale file. Pages whose current
+                            // path moved away are left to the recorded bytes;
+                            // the move's own projection work owns that path
+                            // transition.
+                            if self.accepted_batch_projection_is_superseded(work.batch_id())? {
                                 let current = self.authorize_projection_write(page_id)?;
                                 if current.state().page.path == *path {
                                     let replay =
@@ -21854,23 +21873,74 @@ impl ShardedHotEngine {
         let since = self
             .accepted_batch_evidence(work_batch)?
             .acceptance_sequence();
-        for accepted in self.status().accepted_batches()? {
-            let batch_id = accepted.batch_id;
-            if batch_id == work_batch {
-                continue;
-            }
+        self.refresh_nonlinear_watermark()?;
+        Ok(self
+            .nonlinear_watermark
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > since)
+    }
+
+    /// Bring the non-linearity watermark up to date. O(1) when no batch was
+    /// accepted since the last refresh; otherwise classifies only the batches
+    /// not yet scanned, so the expensive causal-containment walk runs once
+    /// per accepted batch over the engine's lifetime instead of once per
+    /// query (audit 4, P2 — the eager per-save O(history) scan).
+    fn refresh_nonlinear_watermark(&self) -> Result<(), EngineError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let status = self.status();
+        let accepted = status.accepted_batches()?;
+        let count = accepted.len() as u64;
+        if self.linearity_scanned_count.load(Relaxed) == count {
+            return Ok(());
+        }
+        let scanned = self.linearity_scanned_sequence.load(Relaxed);
+        let mut max_sequence = scanned;
+        let mut watermark = self.nonlinear_watermark.load(Relaxed);
+        let ids: Vec<BatchId> = accepted.iter().map(|entry| entry.batch_id).collect();
+        drop(status);
+        for batch_id in ids {
             let evidence = match self.accepted_batch_evidence(batch_id) {
                 Ok(evidence) => evidence,
+                // An unreadable evidence row errs toward "linear", which is
+                // the strict (refusing) direction for every consumer of the
+                // watermark — same posture as the scan this replaces.
                 Err(_) => continue,
             };
-            if evidence.acceptance_sequence() <= since {
+            let sequence = evidence.acceptance_sequence();
+            if sequence <= scanned {
                 continue;
             }
+            max_sequence = max_sequence.max(sequence);
             if !self.accepted_batch_is_causally_linear(batch_id)? {
-                return Ok(true);
+                watermark = watermark.max(sequence);
             }
         }
-        Ok(false)
+        self.nonlinear_watermark.store(watermark, Relaxed);
+        self.linearity_scanned_sequence.store(max_sequence, Relaxed);
+        self.linearity_scanned_count.store(count, Relaxed);
+        Ok(())
+    }
+
+    /// Every accepted batch that was admitted against a concurrent prefix.
+    /// Used once per open to reseed the runtime's conflict-resolution queue:
+    /// the queue is process-local, so a crash between acceptance and
+    /// resolution authoring would otherwise strand the owed work forever
+    /// (audit 4, finding 3). Already-settled pairs are suppressed by the
+    /// descendant-touch gate during derivation, so reseeding is idempotent.
+    pub(crate) fn accepted_nonlinear_batch_ids(&self) -> Result<Vec<BatchId>, EngineError> {
+        let ids: Vec<BatchId> = self
+            .status()
+            .accepted_batches()?
+            .iter()
+            .map(|entry| entry.batch_id)
+            .collect();
+        let mut nonlinear = Vec::new();
+        for batch_id in ids {
+            if !self.accepted_batch_is_causally_linear(batch_id)? {
+                nonlinear.push(batch_id);
+            }
+        }
+        Ok(nonlinear)
     }
 
     /// Whether later accepted history has superseded state recorded by this
@@ -27562,6 +27632,41 @@ impl ShardedHotEngine {
         Ok(intents)
     }
 
+    /// True when some accepted batch outside `pair` touches `block_id` and
+    /// causally descends from BOTH pair members — i.e. an authored post-race
+    /// decision about this block already exists (a keep-both resolution, a
+    /// restore, a later human edit, or a deliberate re-delete), so the pair
+    /// is settled and must not derive again.
+    fn pair_superseded_by_descendant_touch(
+        &self,
+        block_id: BlockId,
+        pair: &ConflictPair,
+    ) -> Result<bool, EngineError> {
+        let accepted = self.status().accepted_batches()?.to_vec();
+        for candidate in accepted {
+            let w_id = candidate.batch_id;
+            if w_id == pair.min_batch || w_id == pair.max_batch {
+                continue;
+            }
+            let w_batch = self.load_accepted_validated_batch(w_id)?;
+            let w_effect = self.accepted_semantic_effect(&w_batch)?;
+            if !w_effect
+                .blocks()
+                .iter()
+                .any(|delta| delta.block_id == block_id)
+            {
+                continue;
+            }
+            let w_heads = declared_batch_heads(w_batch.manifest().dependency_frontier());
+            let w_ancestry = self.collect_batch_ancestry(&w_heads, false)?;
+            if w_ancestry.contains_key(&pair.min_batch) && w_ancestry.contains_key(&pair.max_batch)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn classify_block_race(
         &self,
         x_delta: &BlockDelta,
@@ -27578,6 +27683,19 @@ impl ShardedHotEngine {
             block_id,
             home_document_id: home,
         };
+        // A race is owed a resolution only while the block's current state is
+        // the UNAUTHORED CRDT merge of the pair. Once any accepted non-pair
+        // batch that causally descends from BOTH pair members touches this
+        // block — our own resolution, a later human edit, or a deliberate
+        // re-delete — the current state is an authored post-race decision and
+        // deriving again would duplicate siblings or resurrect re-deleted
+        // content (audit 4, D1). Text equality with one authored version is
+        // NOT such evidence: an honest merge can land exactly on one side
+        // (e.g. one deletion subsuming the other) with the other author's
+        // text silently gone.
+        if self.pair_superseded_by_descendant_touch(block_id, pair)? {
+            return Ok(());
+        }
         let merged_doc = self.clone_validation_document(home, 1)?;
         let Some(merged_state) = read_block_state(home, &merged_doc, block_id)? else {
             return Ok(());
@@ -27692,15 +27810,6 @@ impl ShardedHotEngine {
                     super::text_merge::TextMergeClassification::Conflict
                 };
                 if classification == super::text_merge::TextMergeClassification::CleanUnion {
-                    return Ok(());
-                }
-                if merged_state.content == x_after.content
-                    || merged_state.content == z_after.content
-                {
-                    // The visible text is exactly one authored version — never
-                    // an interleave — either because the merge landed on it or
-                    // because a keep-both resolution already rewrote the block.
-                    // Deriving again would author duplicate siblings forever.
                     return Ok(());
                 }
                 let (keep_text, sibling_text) = if pair.min_batch == x_batch_id {

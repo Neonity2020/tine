@@ -7453,6 +7453,182 @@ fn projection_supersession_distinguishes_a_linear_prefix_from_a_later_concurrent
 }
 
 #[test]
+fn nested_concurrent_deletions_still_derive_keep_both_when_the_merge_lands_on_one_side() {
+    // Audit 4, D1: one deletion subsumes the other, so the CRDT merge equals
+    // the wider deletion's after-state byte-for-byte. That equality is NOT
+    // resolution evidence — the narrower author's text must still surface as
+    // a keep-both sibling.
+    let ids = Ids::new();
+    let dir = TestDir::new("intents-nested-deletions");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let wider = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "home".into(),
+    }]);
+    let narrower = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "home content".into(),
+    }]);
+    let (wider, narrower) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(56_100, 561),
+        wider,
+        author(56_200, 562),
+        narrower,
+    );
+    let engine = apply_pair(ids, &baseline, wider.clone(), narrower.clone());
+    assert_eq!(
+        engine.materialize_page(ids.page_a).unwrap().blocks[0].content,
+        "home",
+        "the union of nested deletions lands exactly on the wider deletion"
+    );
+    let mut intents = engine
+        .conflict_resolution_intents(wider.manifest().batch_id())
+        .unwrap();
+    intents.extend(
+        engine
+            .conflict_resolution_intents(narrower.manifest().batch_id())
+            .unwrap(),
+    );
+    let keep_both: Vec<_> = intents
+        .iter()
+        .filter_map(|intent| match intent {
+            ConflictResolutionIntent::KeepBothTexts {
+                keep_text,
+                sibling_text,
+                ..
+            } => Some((keep_text.clone(), sibling_text.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !keep_both.is_empty(),
+        "a merge landing on one authored version must still derive keep-both: {intents:?}"
+    );
+    let min_is_wider = wider.manifest().batch_id() <= narrower.manifest().batch_id();
+    let expected = if min_is_wider {
+        ("home".to_owned(), "home content".to_owned())
+    } else {
+        ("home content".to_owned(), "home".to_owned())
+    };
+    assert!(
+        keep_both.iter().all(|pair| *pair == expected),
+        "keep-both texts follow batch-id order: {keep_both:?}"
+    );
+}
+
+#[test]
+fn a_post_race_redelete_settles_an_edit_delete_pair_without_resurrection() {
+    // Audit 4, finding 3 companion: the conflict queue is reseeded from
+    // accepted non-linear batches at reopen, so a deliberate re-delete that
+    // causally descends from both pair members must suppress re-derivation —
+    // otherwise reseeding would resurrect content the user re-deleted.
+    let ids = Ids::new();
+    let dir = TestDir::new("intents-redelete-settles");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "edit racing the delete".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(56_300, 563),
+        edited,
+        author(56_400, 564),
+        deleted,
+    );
+    let mut engine = apply_pair(ids, &baseline, edited.clone(), deleted.clone());
+    assert!(
+        !engine
+            .conflict_resolution_intents(deleted.manifest().batch_id())
+            .unwrap()
+            .is_empty(),
+        "the unresolved race owes a restore"
+    );
+    // Restore, then re-delete — both authored on top of the merged history.
+    let restore = tx(vec![SemanticOperation::RestoreSubtree {
+        page_id: ids.page_a,
+        blocks: vec![BlockRestore {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: ids.home_a,
+            },
+            claim: MembershipClaim {
+                home_document_id: ids.home_a,
+                parent: None,
+                order: "a".into(),
+            },
+        }],
+    }]);
+    let restore = {
+        let mut author_engine = ids.engine();
+        author_engine.stage_ready(baseline.clone());
+        author_engine.stage_ready(edited.clone());
+        author_engine.stage_ready(deleted.clone());
+        let prepared = author_engine
+            .prepare_bootstrap_transaction(author(56_500, 565), &restore)
+            .unwrap();
+        ready(&archive, &prepared)
+    };
+    assert!(!matches!(
+        engine.stage_ready(restore.clone()).disposition,
+        BatchDisposition::Rejected { .. }
+    ));
+    let redelete = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let redelete = {
+        let mut author_engine = ids.engine();
+        author_engine.stage_ready(baseline.clone());
+        author_engine.stage_ready(edited.clone());
+        author_engine.stage_ready(deleted.clone());
+        author_engine.stage_ready(restore.clone());
+        let prepared = author_engine
+            .prepare_bootstrap_transaction(author(56_600, 566), &redelete)
+            .unwrap();
+        ready(&archive, &prepared)
+    };
+    assert!(!matches!(
+        engine.stage_ready(redelete).disposition,
+        BatchDisposition::Rejected { .. }
+    ));
+    assert!(
+        engine
+            .materialize_page(ids.page_a)
+            .unwrap()
+            .blocks
+            .is_empty(),
+        "the re-delete holds"
+    );
+    for batch in [edited.manifest().batch_id(), deleted.manifest().batch_id()] {
+        assert!(
+            engine.conflict_resolution_intents(batch).unwrap().is_empty(),
+            "a settled pair must not derive again after reseeding"
+        );
+    }
+}
+
+#[test]
 fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
     let ids = Ids::new();
     let dir = TestDir::new("intents-text-races");
