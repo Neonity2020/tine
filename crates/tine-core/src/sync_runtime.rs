@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -27,18 +27,14 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tine_storage::{read_optional_regular, DurableDirectoryPublication, LocalJournalFrame};
 #[cfg(test)]
-use tine_storage::LocalJournalSegment;
-use tine_storage::{
-    publish_immutable_exact, read_optional_regular, sync_dir_required, DurableDirectoryPublication,
-    LocalJournalFrame, LocalJournalSegmentV2, LockedLocalJournalV1Segment,
-};
+use tine_storage::{LocalJournalSegment, LocalJournalSegmentV2};
 
 #[cfg(test)]
 use crate::fast_commit::{
@@ -51,26 +47,18 @@ use crate::model::{
 };
 use crate::oplog::discovery::{
     classify_enrollment_error, discover_startup, AmbiguousEvidence, DiscoveryClassification,
-    DiscoveryComponent, DiscoveryRequest, LocalActiveAdvisory, NonActiveStage,
-    StartupStorageProfile,
+    DiscoveryComponent, DiscoveryRequest, NonActiveStage, StartupStorageProfile,
 };
 use crate::oplog::enrollment::{
-    activate_shared_initiator, activate_shared_joiner,
-    begin_or_resume_local_activation_reservation, begin_or_resume_shadow_import,
-    compose_verified_local_retaining_validation, inspect_local_activation_reservation_at,
-    inspect_shared_enrollment_descriptor, open_existing_enrollment_application_root,
-    prepare_shared_enrollment, prepare_shared_join, EnrollmentApplicationRoot, EnrollmentBindingV1,
-    EnrollmentDiscoveryHandoff, EnrollmentError, LocalActivationIdentityV1,
-    LocalActivationReservationBindingV1, PreparationId, SharedEnrollmentDescriptorV1,
-    SharedEnrollmentPhase, SharedEnrollmentRole, VerifiedLocalProofSet,
+    inspect_local_activation_reservation_at, open_existing_enrollment_application_root,
+    EnrollmentApplicationRoot, EnrollmentBindingV1, EnrollmentError, LocalActivationIdentityV1,
+    PreparationId, SharedEnrollmentDescriptorV1,
 };
+use crate::oplog::hot_engine::ProjectionEndpointBinding;
 use crate::oplog::hot_engine::{AcceptedFrontierRoot, ShardedHotEngine};
-use crate::oplog::hot_engine::{ProjectionEndpointBinding, ProjectionStorageBinding};
 use crate::oplog::import::{
     commit_clean_activation, open_clean_activation, prepare_clean_activation,
-    prepare_inactive_bootstrap_import_with_progress, publish_install_verify_inactive_bootstrap,
-    retain_inactive_bootstrap_accepted_authority, BootstrapPreparationProgress,
-    BootstrapPreparationSubphase, BootstrapPreparationSummary,
+    BootstrapPreparationProgress, BootstrapPreparationSubphase, BootstrapPreparationSummary,
 };
 #[cfg(test)]
 use crate::oplog::import::{
@@ -83,31 +71,21 @@ use crate::oplog::lazy_genesis::{
     CleanSharedStateV1, LazyGenesisActivationMarkerV1, LazyGenesisCandidate,
     LazyGenesisProviderIndexV1, LAZY_GENESIS_PROVIDER_CHUNK_BYTES,
 };
+use crate::oplog::local_active::CleanLocalRuntime;
 #[cfg(test)]
 use crate::oplog::local_active::{
     act_once_at_resume_lifecycle_cut_for_workspace_for_test,
     reset_promoted_runtime_open_instrumentation, take_promoted_runtime_open_instrumentation,
     PromotedRuntimeOpenInstrumentation, ResumeLifecycleCut,
 };
-use crate::oplog::local_active::{
-    activate_verified_local_with_retained_validation, reopen_promoted_local_runtime,
-    seal_local_runtime_promotion, take_over_promoted_local_runtime_recovering_projection,
-    CleanLocalRuntime, InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
-    PromotedLocalRuntime, PromotedRuntimeOpen, PromotedRuntimeRecoveryDiagnostics,
-    RuntimeRecoveryState,
-};
 use crate::oplog::local_journal_drain::{
-    resume_managed_local_journal_drain_with_superseding_projection,
     ManagedLocalDerivativeAuthority, ManagedLocalDerivativePublisher, ManagedLocalDrainCheckpoint,
-    ManagedLocalDrainContinuation, ManagedLocalDrainOutcome, ManagedLocalDrainStage,
-    ManagedLocalPublicationState,
+    ManagedLocalDrainContinuation, ManagedLocalPublicationState,
 };
 #[cfg(test)]
 use crate::oplog::migration_backup::MigrationBackupInstrumentation;
-use crate::oplog::migration_backup::{verify_migration_source_backup, MigrationBackupRoot};
 use crate::oplog::object_store::{
-    ensure_directory_nofollow, open_dir_nofollow, prepare_object_store_parent_nofollow,
-    ObjectStore, ObjectStoreManifestCursor,
+    ensure_directory_nofollow, open_dir_nofollow, ObjectStore, ObjectStoreManifestCursor,
 };
 #[cfg(test)]
 use crate::oplog::operational_coordinator::{
@@ -116,10 +94,8 @@ use crate::oplog::operational_coordinator::{
 };
 use crate::oplog::operational_coordinator::{
     CleanExternalMutationState, CleanLocalMutationState, CleanPublishedContinuation,
-    CorrelatedPublishedLocalResume, LocalMutationBlockReason, LocalMutationCoordinatorState,
-    LocalMutationRecovery, LocalPublishedContinuation, OperationalCoordinator,
-    OperationalCoordinatorError, OperationalPhase, PreparedLocalMutationState,
-    ProviderArchiveContinuation, ProviderArchiveIngress,
+    LocalPublishedContinuation, OperationalCoordinator, OperationalCoordinatorError,
+    OperationalPhase, ProviderArchiveContinuation,
 };
 #[cfg(test)]
 use crate::oplog::projection::{
@@ -130,10 +106,6 @@ use crate::oplog::projection::{render_requested_page_document, PreparedEditorPro
 use crate::oplog::projection_store::ProjectionReceiptStore;
 #[cfg(test)]
 use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
-use crate::oplog::shadow_projection::{
-    verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence,
-    AdjacentTerminalShadowConstruction,
-};
 #[cfg(test)]
 use crate::oplog::sqlite::{
     reset_full_digest_scan_instrumentation, take_full_digest_scan_instrumentation,
@@ -143,20 +115,16 @@ use crate::oplog::sqlite::{
     ApplicationRuntimeRoot, LeasedWorkspaceProjection, WorkspaceRuntimeLease,
 };
 use crate::oplog::sqlite_materialization::MaterializedTaskCandidateBlockRow;
-use crate::oplog::sync_layout::{
-    LOCAL_AUTHORSHIP_RECEIPT_DIR as LOCAL_AUTHORSHIP_RECEIPT_NAMESPACE,
-    MANAGED_LOCAL_JOURNAL_DIR as MANAGED_LOCAL_JOURNAL_NAMESPACE,
-};
+#[cfg(test)]
+use crate::oplog::sync_layout::MANAGED_LOCAL_JOURNAL_DIR as MANAGED_LOCAL_JOURNAL_NAMESPACE;
 #[cfg(test)]
 use crate::oplog::trusted_local_commit::{
     last_commit_stage_timings, TrustedLocalCommitStageTimings,
 };
 use crate::oplog::trusted_local_commit::{
-    TrustedLocalCommitCoordinator, TrustedLocalCommitError, TrustedLocalCommitOutcome,
     TrustedLocalCommitted, TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
-    TrustedLocalResponseEvidence, TrustedLocalRestartProjectionOutcome,
+    TrustedLocalResponseEvidence,
 };
-use crate::oplog::watcher_queue::WatcherObservation;
 #[cfg(test)]
 use crate::oplog::wire::{
     fail_next_pending_publication_marker_creation,
@@ -166,31 +134,28 @@ use crate::oplog::wire::{
     inspect_cold_shared_provider_prefix, inspect_shared_provider_descriptor,
     provider_transient_path, ColdSharedProviderPrefix, SharedProviderFrontierHeadV1,
     SharedProviderObservation, SharedProviderObservationCursor, SharedProviderPublicationCursor,
-    SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES, SHARED_ENROLLMENT_DESCRIPTOR_PATH,
+    SharedProviderTransport, SHARED_ENROLLMENT_DESCRIPTOR_PATH,
     SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
     SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
     SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
     SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
 };
 pub use crate::oplog::ManagedStorageRefusalScenario;
-use crate::oplog::{
-    classify_managed_local_anchor, decode_managed_local_record, managed_local_v2_anchor_name,
-    parse_managed_local_v2_anchor_name, BatchId, BatchOrigin, BlobDescription, BlockId,
-    BlockLocation, CanonicalGraphResourceId, CanonicalSnapshot, ContentDigest, CurrentPageAtPath,
-    DeviceId, DocumentId, FrontierReferenceHit, LineageDigest, LogicalPageName,
-    LogseqIdentityOrigin, LogseqUuid, ManagedLocalAnchorEncoding, ManagedLocalAppendError,
-    ManagedLocalGenerationAnchorV2, ManagedLocalJournal, ManagedLocalJournalPayloadKind,
-    ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind, MaterializedBlock,
-    MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
-    MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
-    OperationBatch, OperationObject, OperationTransaction, PageId, PageState, PreparedBatch,
-    ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
-    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
-    SessionId, SqliteMaterializedRead, WorkspaceId, MANAGED_LOCAL_ANCHOR_V2_BYTES,
-    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
-};
 #[cfg(test)]
 use crate::oplog::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
+use crate::oplog::{
+    BatchId, BatchOrigin, BlobDescription, BlockId, BlockLocation, CanonicalGraphResourceId,
+    CanonicalSnapshot, ContentDigest, CurrentPageAtPath, DeviceId, DocumentId,
+    FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin, LogseqUuid,
+    ManagedLocalJournal, ManagedLocalJournalPayloadKind, ManagedLocalJournalProtocol, ManagedPath,
+    ManagedTextKind, MaterializedBlock, MaterializedBlockRow, MaterializedEntityId,
+    MaterializedPage, MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit,
+    MaterializedTagRow, MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction,
+    PageId, PageState, PreparedBatch, ProjectionClaim, ProjectionEndpointId,
+    ProjectionReceiptStoreId, RebuildSource, ReferenceCatalogPolicyV1, ReferenceFactV1,
+    ReferenceSourceLocatorV1, SemanticOperation, SessionId, SqliteMaterializedRead, WorkspaceId,
+    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+};
 use uuid::Uuid;
 
 const ACTOR_CHANNEL_CAPACITY: usize = 64;
@@ -201,32 +166,8 @@ const RUNTIME_OPEN_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);
 #[cfg(test)]
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_secs(30);
-const MANAGED_LOCAL_CHECKPOINT_BYTES: u64 = 4096;
-const MANAGED_LOCAL_GENERATION_ANCHOR_SCHEMA_VERSION: u32 = 1;
-const MANAGED_LOCAL_GENERATION_ANCHOR_BYTES: u64 = 8192;
-#[cfg(not(test))]
-const MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD: u64 = 64;
 #[cfg(test)]
 const MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD: u64 = 4;
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ManagedLocalCompactionFaultPoint {
-    AfterCheckpointPublication,
-    AfterV2Prepare,
-    BeforeAnchorPublication,
-    AfterAnchorBeforeVerification,
-    AfterInMemorySwitch,
-    RetireExactRefusal,
-    AfterAnchorRetirement,
-    AfterSegmentDeletion,
-    AfterFrontierDeletion,
-    AfterRetiredMarkerDeletion,
-}
-
-#[cfg(test)]
-static MANAGED_LOCAL_COMPACTION_FAULTS: Mutex<BTreeMap<Uuid, ManagedLocalCompactionFaultPoint>> =
-    Mutex::new(BTreeMap::new());
-
 #[cfg(test)]
 static MANAGED_LOCAL_DIRECTORY_ENUMERATIONS: Mutex<BTreeMap<Uuid, u64>> =
     Mutex::new(BTreeMap::new());
@@ -250,45 +191,6 @@ fn record_managed_local_directory_enumeration(device_id: Uuid) {
         .or_default() += 1;
 }
 
-#[cfg(test)]
-fn fail_managed_local_compaction_once_at(device_id: Uuid, point: ManagedLocalCompactionFaultPoint) {
-    MANAGED_LOCAL_COMPACTION_FAULTS
-        .lock()
-        .unwrap()
-        .insert(device_id, point);
-}
-
-#[cfg(test)]
-fn managed_local_compaction_fault(
-    device_id: Uuid,
-    point: ManagedLocalCompactionFaultPoint,
-) -> bool {
-    let mut faults = MANAGED_LOCAL_COMPACTION_FAULTS.lock().unwrap();
-    if faults.get(&device_id) == Some(&point) {
-        faults.remove(&device_id);
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(not(test))]
-fn managed_local_compaction_fault(_device_id: Uuid, _point: ()) -> bool {
-    false
-}
-
-macro_rules! managed_local_compaction_cut {
-    ($device_id:expr, $point:ident) => {{
-        #[cfg(test)]
-        {
-            managed_local_compaction_fault($device_id, ManagedLocalCompactionFaultPoint::$point)
-        }
-        #[cfg(not(test))]
-        {
-            managed_local_compaction_fault($device_id, ())
-        }
-    }};
-}
 const MAX_WATCHER_OBSERVATIONS: usize = 256;
 const MAX_WATCHER_PATH_BYTES: usize = 64 * 1024;
 const MAX_CLEAN_DRAIN_TURNS: usize = 64;
@@ -300,13 +202,6 @@ const MAX_PROVIDER_EXACT_PATH_BYTES: usize = 64 * 1024;
 /// an ordinary file-sync delivery window; past that, the removal is not a
 /// window and the condition is reported instead of written around forever.
 const MAX_PROVIDER_DESCRIPTOR_REPUBLICATIONS: u32 = 3;
-const MAX_PROVIDER_PUBLICATION_REPAIR_PROBES_PER_TICK: usize = 16;
-const MAX_PROVIDER_INTENT_RETIREMENT_PROBES_PER_TICK: usize = 16;
-const MAX_PROVIDER_RECOVERY_EXACT_QUEUE: usize = 256;
-const MAX_PROVIDER_ACCEPTED_AUDIT_PROBES_PER_TICK: usize = 16;
-const LOCAL_AUTHORSHIP_RECEIPT_SCHEMA_VERSION: u32 = 1;
-const MAX_LOCAL_AUTHORSHIP_RECEIPT_BYTES: u64 = 4096;
-static LOCAL_AUTHORSHIP_RECEIPT_LOCK: Mutex<()> = Mutex::new(());
 /// Maximum top-level operations plus nested rename rows in one submission.
 pub const MAX_LOCAL_MUTATION_ROWS: usize = 1024;
 /// Maximum managed-path references retained by one submission.
@@ -570,6 +465,9 @@ impl ApplicationSimpleQueryMemo {
         });
     }
 
+    /// Drop every memoized result. Reached only from the `#[cfg(test)]
+    /// actor request that lets a receipt measure repeated cold evaluations.
+    #[cfg(test)]
     fn clear(&mut self) {
         self.stamp = None;
         self.entries.clear();
@@ -899,80 +797,9 @@ struct ProviderAcceptedManifestAudit {
     advances_coverage: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProviderAcceptedManifestAuditTick {
-    Complete(ProviderRecoveryCoverageRoot),
-    AwaitingExactProof,
-    PageExhausted,
-}
+impl ProviderAcceptedManifestAudit {}
 
-impl ProviderAcceptedManifestAudit {
-    fn after_coverage(covered_sequence: u64, target_sequence: u64) -> Option<Self> {
-        (covered_sequence < target_sequence).then_some(Self {
-            next_sequence: covered_sequence.saturating_add(1),
-            target_sequence,
-            advances_coverage: true,
-        })
-    }
-
-    fn revalidation(next_sequence: u64, target_sequence: u64) -> Option<Self> {
-        (target_sequence != 0).then_some(Self {
-            next_sequence: next_sequence.clamp(1, target_sequence),
-            target_sequence,
-            advances_coverage: false,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LocalAuthorshipReceiptBindingV1 {
-    schema_version: u32,
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    device_id: DeviceId,
-    endpoint_id: ProjectionEndpointId,
-    graph_resource_id: CanonicalGraphResourceId,
-    promotion_session_id: SessionId,
-    promoted_state_digest: ContentDigest,
-    author_session_id: SessionId,
-    batch_id: BatchId,
-    manifest_fingerprint: ContentDigest,
-    accepted_event_binding_digest: ContentDigest,
-    acceptance_sequence: u64,
-    prior_frontier_state_digest: ContentDigest,
-    post_frontier_state_digest: ContentDigest,
-}
-
-impl LocalAuthorshipReceiptBindingV1 {
-    fn receipt_digest(&self) -> Result<ContentDigest, SyncRuntimeRequestError> {
-        let canonical = serde_json::to_vec(self).map_err(|error| {
-            SyncRuntimeRequestError::ActorRefused(format!(
-                "cannot encode local authorship receipt binding: {error}"
-            ))
-        })?;
-        let mut digest = Sha256::new();
-        digest.update(b"tine/local-authorship-receipt/v1\0");
-        digest.update(canonical);
-        Ok(ContentDigest::from_bytes(digest.finalize().into()))
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LocalAuthorshipReceiptV1 {
-    binding: LocalAuthorshipReceiptBindingV1,
-    receipt_digest: ContentDigest,
-}
-
-impl ProviderRecoveryCoverageRoot {
-    fn from_frontier(root: &crate::oplog::hot_engine::AcceptedFrontierRoot) -> Self {
-        Self {
-            acceptance_sequence: root.acceptance_sequence(),
-            state_digest: root.state_digest(),
-        }
-    }
-}
+impl ProviderRecoveryCoverageRoot {}
 
 #[cfg(test)]
 static ACTOR_THREADS_STARTED: std::sync::atomic::AtomicUsize =
@@ -1202,37 +1029,6 @@ fn fail_once_at_provider_accepted_audit_cut(
         .insert(workspace_id, (batch_id, cut));
 }
 
-fn provider_accepted_audit_cut(
-    workspace_id: WorkspaceId,
-    batch_id: BatchId,
-    cut: &'static str,
-) -> Result<(), SyncRuntimeRequestError> {
-    #[cfg(test)]
-    {
-        let expected = match cut {
-            "provider_read" => ProviderAcceptedAuditTestCut::ProviderRead,
-            "repair_publication" => ProviderAcceptedAuditTestCut::RepairPublication,
-            _ => return Ok(()),
-        };
-        let should_fail = {
-            let mut pending = PROVIDER_ACCEPTED_AUDIT_TEST_CUTS.lock().unwrap();
-            if pending.get(&workspace_id) == Some(&(batch_id, expected)) {
-                pending.remove(&workspace_id);
-                true
-            } else {
-                false
-            }
-        };
-        if should_fail {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "injected accepted-manifest audit {cut} failure for {batch_id}"
-            )));
-        }
-    }
-    let _ = (workspace_id, batch_id, cut);
-    Ok(())
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SharedJoinTestPausePoint {
@@ -1279,59 +1075,12 @@ fn fail_once_at_provider_recovery_publication_cut(
         .insert(workspace_id, cut);
 }
 
-fn provider_recovery_publication_cut(
-    workspace_id: WorkspaceId,
-    cut: &'static str,
-) -> Result<(), SyncRuntimeRequestError> {
-    #[cfg(test)]
-    {
-        let expected = match cut {
-            "before_recovery" => ProviderRecoveryPublicationTestCut::BeforeRecovery,
-            "after_recovery_before_canonical" => {
-                ProviderRecoveryPublicationTestCut::AfterRecoveryBeforeCanonical
-            }
-            _ => return Ok(()),
-        };
-        let should_fail = {
-            let mut pending = PROVIDER_RECOVERY_PUBLICATION_TEST_CUTS.lock().unwrap();
-            if pending.get(&workspace_id) == Some(&expected) {
-                pending.remove(&workspace_id);
-                true
-            } else {
-                false
-            }
-        };
-        if should_fail {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "injected provider recovery publication cut: {cut}"
-            )));
-        }
-    }
-    let _ = (workspace_id, cut);
-    Ok(())
-}
-
 #[cfg(test)]
 fn fail_once_after_provider_head_publication(workspace_id: WorkspaceId) {
     PROVIDER_HEAD_PUBLICATION_TEST_CUTS
         .lock()
         .unwrap()
         .insert(workspace_id);
-}
-
-fn provider_head_publication_cut(workspace_id: WorkspaceId) -> Result<(), SyncRuntimeRequestError> {
-    #[cfg(test)]
-    if PROVIDER_HEAD_PUBLICATION_TEST_CUTS
-        .lock()
-        .unwrap()
-        .remove(&workspace_id)
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(
-            "injected cut after durable provider head publication".into(),
-        ));
-    }
-    let _ = workspace_id;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1355,48 +1104,9 @@ fn fail_once_at_activation_cut(cut: ActivationTestCut) {
     ACTIVATION_TEST_CUT.with(|pending| pending.set(Some(cut)));
 }
 
-fn activation_cut(cut: &'static str) -> Result<(), String> {
-    #[cfg(test)]
-    {
-        let expected = match cut {
-            "before_archive_creation" => ActivationTestCut::BeforeArchiveCreation,
-            "after_archive_claim_before_enrollment_head" => {
-                ActivationTestCut::AfterArchiveClaimBeforeEnrollmentHead
-            }
-            "after_shadow_import" => ActivationTestCut::AfterShadowImport,
-            "after_verified_local" => ActivationTestCut::AfterVerifiedLocal,
-            _ => return Ok(()),
-        };
-        if ACTIVATION_TEST_CUT.with(|pending| {
-            (pending.get() == Some(expected))
-                .then(|| pending.set(None))
-                .is_some()
-        }) {
-            return Err(format!("injected activation crash cut: {cut}"));
-        }
-    }
-    let _ = cut;
-    Ok(())
-}
-
 #[cfg(test)]
 fn fail_once_after_share_prepared(workspace_id: WorkspaceId) {
     *PREPARE_SHARED_TEST_CUT.lock().unwrap() = Some(workspace_id);
-}
-
-fn share_prepared_cut(workspace_id: WorkspaceId) -> Result<(), SyncRuntimeRequestError> {
-    #[cfg(test)]
-    {
-        let mut pending = PREPARE_SHARED_TEST_CUT.lock().unwrap();
-        if *pending == Some(workspace_id) {
-            *pending = None;
-            return Err(SyncRuntimeRequestError::ActorRefused(
-                "injected crash after SharePrepared".into(),
-            ));
-        }
-    }
-    let _ = workspace_id;
-    Ok(())
 }
 
 /// Storage selection at the inactive facade boundary.
@@ -1559,6 +1269,12 @@ pub fn inspect_shared_provider_cold_prefix(
 }
 
 impl SyncSharedEnrollmentDescriptor {
+    /// Build the public descriptor from a legacy core descriptor.
+    ///
+    /// Retained for the provider-recovery regressions that construct a
+    /// descriptor straight from decoded provider bytes; production reaches
+    /// the public surface through [`Self::from_descriptor`].
+    #[cfg(test)]
     fn from_core(descriptor: SharedEnrollmentDescriptorV1) -> Result<Self, String> {
         Self::from_descriptor(SharedEnrollmentDescriptor::Legacy(descriptor))
     }
@@ -1979,15 +1695,6 @@ impl SyncWatcherObservation {
             Self::UnknownPath | Self::NotifyError | Self::RescanRequired => 0,
         }
     }
-
-    fn into_core(self) -> WatcherObservation {
-        match self {
-            Self::ManagedPath(path) => WatcherObservation::ManagedPath(path),
-            Self::UnknownPath => WatcherObservation::UnknownPath,
-            Self::NotifyError => WatcherObservation::NotifyError,
-            Self::RescanRequired => WatcherObservation::RescanRequired,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2062,53 +1769,6 @@ pub struct SyncRuntimeRecoveryDiagnostics {
     pub replay_base_generation: u64,
     pub live_history_generation: u64,
     pub replayed_generations: u64,
-}
-
-fn map_promoted_runtime_recovery_diagnostics(
-    value: PromotedRuntimeRecoveryDiagnostics,
-) -> SyncRuntimeRecoveryDiagnostics {
-    SyncRuntimeRecoveryDiagnostics {
-        recovery: value.recovery,
-        retention_plan: value.retention_plan,
-        retained_run_count: value.retained_run_count,
-        resume_candidate: value.resume_candidate,
-        detached_bootstrap_reconstruction: value.detached_bootstrap_reconstruction,
-        full_bootstrap_replay: value.full_bootstrap_replay,
-        manifest_count: value.manifest_count,
-        manifest_enumeration: value.manifest_enumeration,
-        resume_selection: value.resume_selection,
-        bootstrap_reconstruction: value.bootstrap_reconstruction,
-        engine_open: value.engine_open,
-        sqlite_open: value.sqlite_open,
-        tail_construction: value.tail_construction,
-        total: value.total,
-        projection_recovery: value.projection.recovery,
-        projection_reason: value.projection.reason.clone(),
-        projection_sidecar_shape: value.projection.sidecar_shape,
-        projection_checkpoint_authentication: value.projection.checkpoint_authentication,
-        projection_read_only_open: value.projection.read_only_open,
-        projection_schema_and_claim: value.projection.schema_and_claim,
-        projection_structural_validation: value.projection.structural_validation,
-        projection_materialization_stamp: value.projection.materialization_stamp,
-        projection_forensics_preservation: value.projection.forensics_preservation,
-        projection_rebuild: value.projection.rebuild,
-        projection_applied_batches: value.projection.applied_batches,
-        projection_bulk_pages_materialized: value.projection.bulk_pages_materialized,
-        projection_ancestry_full_scans: value.projection.ancestry_full_scans,
-        prepare_replay: value.engine_stages.prepare_replay,
-        predecessor_restore: value.engine_stages.predecessor_restore,
-        bootstrap_part_replay: value.engine_stages.bootstrap_part_replay,
-        archived_tail_replay: value.engine_stages.archived_tail_replay,
-        finish_replay: value.engine_stages.finish_replay,
-        bootstrap_parts_replayed: value.engine_stages.bootstrap_parts_replayed,
-        archived_manifests_offered: value.engine_stages.archived_manifests_offered,
-        archived_manifests_replayed: value.engine_stages.archived_manifests_replayed,
-        resume_adopted: value.resume_adopted,
-        resume_refused: value.resume_refused,
-        replay_base_generation: value.replay_base_generation,
-        live_history_generation: value.live_history_generation,
-        replayed_generations: value.replayed_generations,
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6506,81 +6166,6 @@ fn activation_open_clean_resources(
     }
 }
 
-fn activation_failure_after(
-    request: &SyncLocalActivationRequest,
-    graph_resource_id: crate::oplog::CanonicalGraphResourceId,
-    fallback_stage: SyncLocalActivationStage,
-    detail: String,
-) -> SyncLocalActivationResult {
-    let reservation = match inspect_local_activation_reservation_at(&request.enrollment_root) {
-        Ok(reservation) => reservation,
-        Err(error) => return activation_enrollment_failure(fallback_stage, error),
-    };
-    let matching_reservation = reservation.as_ref().is_some_and(|reservation| {
-        reservation.identity() == &local_activation_identity(request, graph_resource_id)
-    });
-    match discover_startup(&DiscoveryRequest {
-        profile: StartupStorageProfile::ExperimentalSparse,
-        graph_resource_id,
-        runtime_root: &request.enrollment_root,
-        archive_root: &request.archive_root,
-    }) {
-        DiscoveryClassification::Blocked(advisory) => activation_blocked(advisory.reason_code),
-        DiscoveryClassification::ExistingNonActive(advisory) => activation_retryable(
-            match advisory.stage {
-                NonActiveStage::ShadowImport => SyncLocalActivationStage::ShadowImport,
-                NonActiveStage::VerifiedLocal => SyncLocalActivationStage::VerifiedLocal,
-            },
-            detail,
-        ),
-        DiscoveryClassification::ExistingLocalActive(_) => {
-            activation_retryable(SyncLocalActivationStage::LocalActive, detail)
-        }
-        DiscoveryClassification::Retryable(_, retry_detail) => activation_retryable(
-            fallback_stage,
-            retain_activation_failure_detail(detail, retry_detail),
-        ),
-        DiscoveryClassification::UnsupportedOrIncompatible(component, scenario) => {
-            SyncLocalActivationResult {
-                status: SyncLocalActivationStatus::UnsupportedOrIncompatible {
-                    component: map_component(component),
-                    scenario,
-                },
-                handle: None,
-            }
-        }
-        DiscoveryClassification::CorruptOrUnreadable(component, scenario) => {
-            SyncLocalActivationResult {
-                status: SyncLocalActivationStatus::CorruptOrUnreadable {
-                    component: map_component(component),
-                    scenario,
-                },
-                handle: None,
-            }
-        }
-        DiscoveryClassification::AmbiguousOrForeignResidue(
-            AmbiguousEvidence::ArchiveResidue,
-            _,
-        ) if matching_reservation => activation_retryable(fallback_stage, detail),
-        DiscoveryClassification::AmbiguousOrForeignResidue(evidence, scenario) => {
-            SyncLocalActivationResult {
-                status: SyncLocalActivationStatus::AmbiguousOrForeignResidue {
-                    evidence: map_ambiguous_evidence(evidence),
-                    scenario,
-                },
-                handle: None,
-            }
-        }
-        DiscoveryClassification::Absent | DiscoveryClassification::LegacyDefault => {
-            activation_retryable(fallback_stage, detail)
-        }
-    }
-}
-
-fn retain_activation_failure_detail(detail: String, retry_detail: String) -> String {
-    format!("{detail}; storage rediscovery: {retry_detail}")
-}
-
 fn activation_retryable(
     durable_stage: SyncLocalActivationStage,
     detail: String,
@@ -7615,67 +7200,6 @@ fn prepare_activation_private_paths(request: &SyncLocalActivationRequest) -> Res
     Ok(())
 }
 
-/// Preserve and detach every downstream artifact from a pre-promotion attempt
-/// whose source inventory no longer matches Direct Files. The current sealed
-/// capture is intentionally excluded: it was created after the mismatch was
-/// observed and is the input to the replacement attempt. Archive first and
-/// enrollment last, so an interrupted reset always retains the old reservation
-/// which makes the next retry repeat and finish the same cleanup episode.
-fn archive_stale_pre_promotion_construction(
-    request: &SyncLocalActivationRequest,
-) -> Result<(), String> {
-    let episode = Uuid::new_v4();
-    let mut database_wal = request.database_path.as_os_str().to_os_string();
-    database_wal.push("-wal");
-    let mut database_shm = request.database_path.as_os_str().to_os_string();
-    database_shm.push("-shm");
-    let mut database_journal = request.database_path.as_os_str().to_os_string();
-    database_journal.push("-journal");
-    for (path, label) in [
-        (&request.archive_root, "archive"),
-        (&request.receipt_root, "projection receipts"),
-        (&request.database_path, "SQLite database"),
-        (&PathBuf::from(database_wal), "SQLite WAL"),
-        (&PathBuf::from(database_shm), "SQLite shared-memory file"),
-        (&PathBuf::from(database_journal), "SQLite rollback journal"),
-        (&request.application_runtime_root, "application runtime"),
-        (&request.migration_backup_root, "migration backup"),
-        (&request.preparation_root, "bootstrap preparation"),
-        (&request.enrollment_root, "enrollment and reservation"),
-    ] {
-        archive_stale_pre_promotion_entry(path, label, episode)?;
-    }
-    Ok(())
-}
-
-fn archive_stale_pre_promotion_entry(
-    path: &Path,
-    label: &str,
-    episode: Uuid,
-) -> Result<(), String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("inspect stale {label}: {error}")),
-    };
-    if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
-        return Err(format!("stale {label} is not a real file or directory"));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("stale {label} has no parent directory"))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("stale {label} has no UTF-8 filename"))?;
-    let destination = parent.join(format!("{name}.pre-promotion-source-changed-{episode}"));
-    fs::rename(path, &destination).map_err(|error| format!("archive stale {label}: {error}"))?;
-    let parent = Dir::open_ambient_dir(parent, ambient_authority())
-        .map_err(|error| format!("open stale {label} parent after archival: {error}"))?;
-    crate::filesystem_durability::sync_reconstructible_directory(&parent)
-        .map_err(|error| format!("record stale {label} archival: {error}"))
-}
-
 fn require_private_path_outside_graph(
     path: &Path,
     label: &str,
@@ -8477,13 +8001,6 @@ fn publish_clean_archive_batch(
     publish_clean_manifest_exact(provider, batch_id, &bytes)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ProviderManifestIngress {
-    Ready(OperationBatch),
-    Incomplete(OperationBatch),
-    Absent(BatchId),
-}
-
 fn provider_manifest_id(path: &str) -> Option<BatchId> {
     path.strip_prefix("manifests/")
         .and_then(|name| name.strip_suffix(".manifest"))
@@ -8617,337 +8134,6 @@ fn canonical_generated_provider_conflict(path: &str) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn stage_provider_manifest_exact(
-    store: &ObjectStore,
-    provider: &SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    path: &str,
-) -> Result<(ProviderManifestIngress, bool), SyncRuntimeRequestError> {
-    let batch_id = provider_manifest_id(path).ok_or_else(|| {
-        SyncRuntimeRequestError::ActorRefused(format!(
-            "unknown shared provider evidence retained at {path}"
-        ))
-    })?;
-    let Some(bytes) = provider
-        .read_exact(path)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-    else {
-        return Ok((ProviderManifestIngress::Absent(batch_id), false));
-    };
-    let manifest = OperationBatch::decode(&bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    if manifest.batch_id() != batch_id
-        || path != format!("manifests/{}.manifest", manifest.batch_id())
-        || manifest.workspace_id() != descriptor.workspace_id()
-        || manifest.lineage_digest() != descriptor.lineage_digest()
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "conflicting provider manifest retained at {path}"
-        )));
-    }
-    let ingress = descriptor
-        .provider_ingress()
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    store
-        .stage_shared_provider_manifest_bytes(&ingress, &bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    let mut object_arrived = false;
-    for object in manifest.required_objects() {
-        let object_path = format!("objects/{}.object", object.content_digest());
-        let Some(object_bytes) = provider
-            .read_exact(&object_path)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-        else {
-            return Ok((
-                ProviderManifestIngress::Incomplete(manifest),
-                object_arrived,
-            ));
-        };
-        let digest = ContentDigest::of(&object_bytes);
-        if digest != object.content_digest() {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "conflicting provider object retained at {object_path}"
-            )));
-        }
-        let already_present = store
-            .contains_object(digest)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        store
-            .stage_object_bytes(&object_bytes)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        object_arrived |= !already_present;
-    }
-    let ingress = match store
-        .inspect_batch(batch_id)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-    {
-        crate::oplog::BatchInspection::Ready(_) => ProviderManifestIngress::Ready(manifest),
-        crate::oplog::BatchInspection::Staged { .. } => {
-            ProviderManifestIngress::Incomplete(manifest)
-        }
-        crate::oplog::BatchInspection::Absent => ProviderManifestIngress::Incomplete(manifest),
-    };
-    Ok((ingress, object_arrived))
-}
-
-fn provider_manifest_present(
-    provider: &SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    batch_id: BatchId,
-) -> Result<bool, SyncRuntimeRequestError> {
-    let path = format!("manifests/{batch_id}.manifest");
-    let Some(bytes) = provider
-        .read_exact(&path)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-    else {
-        return Ok(false);
-    };
-    let manifest = OperationBatch::decode(&bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    if manifest.batch_id() != batch_id
-        || manifest.workspace_id() != descriptor.workspace_id()
-        || manifest.lineage_digest() != descriptor.lineage_digest()
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "conflicting provider manifest retained at {path}"
-        )));
-    }
-    Ok(true)
-}
-
-fn load_provider_manifest_with_fingerprint(
-    provider: &SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    batch_id: BatchId,
-    expected_fingerprint: ContentDigest,
-) -> Result<Option<(OperationBatch, Vec<u8>)>, SyncRuntimeRequestError> {
-    let path = format!("manifests/{batch_id}.manifest");
-    provider_accepted_audit_cut(descriptor.workspace_id(), batch_id, "provider_read")?;
-    let Some(bytes) = provider
-        .read_exact(&path)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    let manifest = OperationBatch::decode(&bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    if manifest.batch_id() != batch_id
-        || manifest.workspace_id() != descriptor.workspace_id()
-        || manifest.lineage_digest() != descriptor.lineage_digest()
-        || ContentDigest::of(&bytes) != expected_fingerprint
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "accepted provider manifest fingerprint conflicts at {path}"
-        )));
-    }
-    Ok(Some((manifest, bytes)))
-}
-
-fn local_archive_manifest_digest(
-    store: &ObjectStore,
-    manifest: &OperationBatch,
-) -> Result<ContentDigest, SyncRuntimeRequestError> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"tine/joiner-local-archive-entry/v2\0");
-    let bytes = store
-        .read_manifest_bytes(manifest.batch_id())
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    hasher.update((bytes.len() as u64).to_be_bytes());
-    hasher.update(&bytes);
-    for object in manifest.required_objects() {
-        let bytes = store
-            .read_object_bytes(object.content_digest())
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(&bytes);
-    }
-    Ok(ContentDigest::from_bytes(hasher.finalize().into()))
-}
-
-fn local_authorship_receipt_directory(provider_journal_root: &Path) -> Result<PathBuf, String> {
-    provider_journal_root
-        .parent()
-        .map(|parent| parent.join(LOCAL_AUTHORSHIP_RECEIPT_NAMESPACE))
-        .ok_or_else(|| "provider journal root has no private device directory".to_owned())
-}
-
-fn local_authorship_receipt_path(
-    provider_journal_root: &Path,
-    batch_id: BatchId,
-) -> Result<PathBuf, String> {
-    Ok(local_authorship_receipt_directory(provider_journal_root)?
-        .join(format!("{batch_id}.receipt")))
-}
-
-fn inspect_local_authorship_receipt_directory(path: &Path) -> Result<bool, String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "cannot inspect private local-authorship receipt directory: {error}"
-            ));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("private local-authorship receipt namespace has unsafe shape".into());
-    }
-    Ok(true)
-}
-
-fn load_local_authorship_receipt(
-    provider_journal_root: &Path,
-    batch_id: BatchId,
-) -> Result<Option<LocalAuthorshipReceiptV1>, SyncRuntimeRequestError> {
-    let directory = local_authorship_receipt_directory(provider_journal_root)
-        .map_err(SyncRuntimeRequestError::ActorRefused)?;
-    if !inspect_local_authorship_receipt_directory(&directory)
-        .map_err(SyncRuntimeRequestError::ActorRefused)?
-    {
-        return Ok(None);
-    }
-    let path = local_authorship_receipt_path(provider_journal_root, batch_id)
-        .map_err(SyncRuntimeRequestError::ActorRefused)?;
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "cannot inspect local-authorship receipt for {batch_id}: {error}"
-            )));
-        }
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_LOCAL_AUTHORSHIP_RECEIPT_BYTES
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "local-authorship receipt for {batch_id} has unsafe shape"
-        )));
-    }
-    let bytes = fs::read(&path).map_err(|error| {
-        SyncRuntimeRequestError::ActorRefused(format!(
-            "cannot read local-authorship receipt for {batch_id}: {error}"
-        ))
-    })?;
-    let receipt: LocalAuthorshipReceiptV1 = serde_json::from_slice(&bytes).map_err(|error| {
-        SyncRuntimeRequestError::ActorRefused(format!(
-            "local-authorship receipt for {batch_id} is corrupt: {error}"
-        ))
-    })?;
-    let canonical = serde_json::to_vec(&receipt).map_err(|error| {
-        SyncRuntimeRequestError::ActorRefused(format!(
-            "cannot encode local-authorship receipt for {batch_id}: {error}"
-        ))
-    })?;
-    if canonical != bytes
-        || receipt.binding.schema_version != LOCAL_AUTHORSHIP_RECEIPT_SCHEMA_VERSION
-        || receipt.binding.batch_id != batch_id
-        || receipt.receipt_digest != receipt.binding.receipt_digest()?
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "local-authorship receipt for {batch_id} is noncanonical or fails its digest"
-        )));
-    }
-    Ok(Some(receipt))
-}
-
-fn persist_local_authorship_receipt(
-    provider_journal_root: &Path,
-    receipt: &LocalAuthorshipReceiptV1,
-) -> Result<(), SyncRuntimeRequestError> {
-    let directory = local_authorship_receipt_directory(provider_journal_root)
-        .map_err(SyncRuntimeRequestError::ActorRefused)?;
-    fs::create_dir_all(&directory).map_err(|error| {
-        SyncRuntimeRequestError::ActorRefused(format!(
-            "cannot create private local-authorship receipt directory: {error}"
-        ))
-    })?;
-    inspect_local_authorship_receipt_directory(&directory)
-        .map_err(SyncRuntimeRequestError::ActorRefused)?;
-    let path = local_authorship_receipt_path(provider_journal_root, receipt.binding.batch_id)
-        .map_err(SyncRuntimeRequestError::ActorRefused)?;
-    let encoded = serde_json::to_string(receipt).map_err(|error| {
-        SyncRuntimeRequestError::ActorRefused(format!(
-            "cannot encode local-authorship receipt: {error}"
-        ))
-    })?;
-    crate::model::atomic_update(&path, &LOCAL_AUTHORSHIP_RECEIPT_LOCK, |content| {
-        if content != "{}\n" {
-            let existing: LocalAuthorshipReceiptV1 =
-                serde_json::from_str(content).map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("local-authorship receipt is corrupt: {error}"),
-                    )
-                })?;
-            if &existing != receipt {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "local-authorship receipt conflicts with an existing batch receipt",
-                ));
-            }
-        }
-        Ok(encoded.clone())
-    })
-    .map_err(|error| {
-        SyncRuntimeRequestError::ActorRefused(format!(
-            "cannot persist local-authorship receipt for {}: {error}",
-            receipt.binding.batch_id
-        ))
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn local_authorship_is_proven(
-    provider_journal_root: &Path,
-    binding: &EnrollmentBindingV1,
-    promotion_session_id: SessionId,
-    promoted_state_digest: ContentDigest,
-    engine: &crate::oplog::ShardedHotEngine,
-    store: &ObjectStore,
-    manifest: &OperationBatch,
-) -> Result<bool, SyncRuntimeRequestError> {
-    let batch_id = manifest.batch_id();
-    let Some(receipt) = load_local_authorship_receipt(provider_journal_root, batch_id)? else {
-        return Ok(false);
-    };
-    let manifest_bytes = store
-        .read_manifest_bytes(batch_id)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    let evidence = engine
-        .accepted_batch_evidence(batch_id)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    let expected = LocalAuthorshipReceiptBindingV1 {
-        schema_version: LOCAL_AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
-        workspace_id: binding.workspace_id(),
-        lineage_digest: binding.lineage_digest(),
-        device_id: binding.device_id(),
-        endpoint_id: binding.endpoint_id(),
-        graph_resource_id: binding.graph_resource_id(),
-        promotion_session_id,
-        promoted_state_digest,
-        author_session_id: manifest.author_session_id(),
-        batch_id,
-        manifest_fingerprint: ContentDigest::of(&manifest_bytes),
-        accepted_event_binding_digest: evidence.event_binding_digest(),
-        acceptance_sequence: evidence.acceptance_sequence(),
-        prior_frontier_state_digest: evidence.prior_frontier_root().state_digest(),
-        post_frontier_state_digest: evidence.post_frontier_root().state_digest(),
-    };
-    if manifest.origin() != BatchOrigin::LocalMutation
-        || manifest.workspace_id() != binding.workspace_id()
-        || manifest.lineage_digest() != binding.lineage_digest()
-        || manifest.author_device_id() != binding.device_id()
-        || receipt.binding != expected
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "local-authorship receipt for {batch_id} does not bind this accepted LocalActive mutation"
-        )));
-    }
-    Ok(true)
 }
 
 fn map_ambiguous_evidence(evidence: AmbiguousEvidence) -> SyncAmbiguousEvidence {
@@ -9735,178 +8921,6 @@ impl ManagedLocalRuntimeState {
             .map(|continuation| format!("{:?}", continuation.stage()).to_ascii_lowercase())
             .or_else(|| (!self.frames.is_empty()).then(|| "authenticate".into()))
     }
-
-    fn note_latest_projection_frame(
-        &mut self,
-        path: ManagedPath,
-        frame: LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    ) {
-        let key = path.as_str().to_owned();
-        self.latest_projection_frames
-            .insert(key.clone(), frame.clone());
-        self.latest_task_query_overlay.insert(
-            key,
-            LatestTaskQueryOverlayEntry {
-                sequence: frame.sequence(),
-                path,
-                state: LatestTaskQueryOverlayState::Incomplete,
-            },
-        );
-    }
-
-    fn install_latest_task_query_overlay(
-        &mut self,
-        sequence: u64,
-        page: LatestTaskQueryOverlayPage,
-    ) {
-        let key = page.path.as_str().to_owned();
-        if self
-            .latest_projection_frames
-            .get(&key)
-            .is_some_and(|frame| frame.sequence() == sequence)
-            && self
-                .latest_task_query_overlay
-                .get(&key)
-                .is_some_and(|entry| entry.sequence == sequence)
-        {
-            self.latest_task_query_overlay.insert(
-                key,
-                LatestTaskQueryOverlayEntry {
-                    sequence,
-                    path: page.path.clone(),
-                    state: LatestTaskQueryOverlayState::Complete(page),
-                },
-            );
-        }
-    }
-
-    fn retire_latest_task_query_overlay(&mut self, path: &ManagedPath, sequence: u64) {
-        let key = path.as_str();
-        if self
-            .latest_task_query_overlay
-            .get(key)
-            .is_some_and(|entry| entry.sequence == sequence)
-        {
-            self.latest_task_query_overlay.remove(key);
-        }
-    }
-}
-
-fn latest_task_query_overlay_page_from_application(
-    current: &ApplicationCurrentPage,
-) -> Result<LatestTaskQueryOverlayPage, ()> {
-    let parsed = flatten_application_blocks(&current.page.blocks);
-    if parsed.len() != current.editor.dto.blocks.len()
-        || parsed.len() != current.editor.blocks.len()
-    {
-        return Err(());
-    }
-    let materialized = current
-        .editor
-        .blocks
-        .iter()
-        .map(|block| (block.block_id, block))
-        .collect::<HashMap<_, _>>();
-    if materialized.len() != current.editor.blocks.len() {
-        return Err(());
-    }
-    let mut structures = BTreeMap::new();
-    let mut candidates = BTreeMap::new();
-    let mut candidate_ids_by_marker = BTreeMap::<String, Vec<BlockId>>::new();
-    for (index, parsed_block) in parsed.iter().enumerate() {
-        let SyncEditorBlockKey::Existing(id) = &current.editor.dto.blocks[index].key else {
-            return Err(());
-        };
-        let block_id = parse_editor_block_id(id).map_err(|_| ())?;
-        let materialized = materialized.get(&block_id).ok_or(())?;
-        if materialized.content != parsed_block.block.raw
-            || !sparse_task_query_order_is_valid(&materialized.order)
-            || structures
-                .insert(
-                    block_id,
-                    LatestTaskQueryOverlayStructure {
-                        parent: materialized.parent,
-                        order: materialized.order.clone(),
-                    },
-                )
-                .is_some()
-        {
-            return Err(());
-        }
-        if let Some(marker) = parsed_block.block.marker.as_deref() {
-            let marker = marker.to_ascii_uppercase();
-            if marker.is_empty()
-                || candidates
-                    .insert(
-                        block_id,
-                        LatestTaskQueryOverlayCandidate {
-                            raw: parsed_block.block.raw.clone(),
-                            logseq_uuid: materialized.logseq_uuid,
-                        },
-                    )
-                    .is_some()
-            {
-                return Err(());
-            }
-            candidate_ids_by_marker
-                .entry(marker)
-                .or_default()
-                .push(block_id);
-        }
-    }
-    if structures.len() != materialized.len()
-        || structures.values().any(|structure| {
-            structure
-                .parent
-                .is_some_and(|parent| !structures.contains_key(&parent))
-        })
-    {
-        return Err(());
-    }
-    Ok(LatestTaskQueryOverlayPage {
-        page_id: current.editor.page.page_id,
-        name: current.page.name.clone(),
-        path: current.editor.page.path.clone(),
-        kind: current.editor.page.kind,
-        format: current.page.format,
-        preamble: current.page.pre_block.clone(),
-        structures,
-        candidates,
-        candidate_ids_by_marker,
-    })
-}
-
-fn latest_task_query_overlay_after_recovery(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    path: ManagedPath,
-    sequence: u64,
-) -> LatestTaskQueryOverlayEntry {
-    let state = match runtime.engine().current_page_at_path(&path) {
-        Ok(CurrentPageAtPath::ExactOwner(owner)) => {
-            match load_hot_source_authenticated_application_page(runtime, graph, owner.page_id()) {
-                Ok(Some(current)) if current.editor.page.path == path => {
-                    latest_task_query_overlay_page_from_application(&current)
-                        .map(LatestTaskQueryOverlayState::Complete)
-                        .unwrap_or(LatestTaskQueryOverlayState::Incomplete)
-                }
-                Ok(None) | Ok(Some(_)) | Err(_) => LatestTaskQueryOverlayState::Incomplete,
-            }
-        }
-        Ok(CurrentPageAtPath::Released(_) | CurrentPageAtPath::Unowned) => {
-            LatestTaskQueryOverlayState::Incomplete
-        }
-        Ok(
-            CurrentPageAtPath::PortableCollision(_)
-            | CurrentPageAtPath::ReleasedPortableCollision(_),
-        )
-        | Err(_) => LatestTaskQueryOverlayState::Incomplete,
-    };
-    LatestTaskQueryOverlayEntry {
-        sequence,
-        path,
-        state,
-    }
 }
 
 /// One complete sparse input after the actor has proved the page identity and
@@ -10166,20 +9180,6 @@ impl ManagedLocalDerivativePublisher for ManagedLocalPublisherAttempt {
     }
 }
 
-enum TrustedLocalRuntimeAttempt {
-    Declined,
-    Reconciliation(Vec<ManagedPath>),
-    Committed(TrustedLocalCommitOutcome),
-    CommitRefused(TrustedLocalCommitError),
-}
-
-enum EditorCoordinatorExecution {
-    Trusted(TrustedLocalCommitOutcome),
-    Reconciliation(Vec<ManagedPath>),
-    Declined,
-    CommitRefused(TrustedLocalCommitError),
-}
-
 #[cfg(test)]
 thread_local! {
     /// Counts the parser fallback inside `application_from_trusted_local_commit`.
@@ -10205,62 +9205,6 @@ fn note_trusted_local_response_parse_fallback() {
     TRUSTED_LOCAL_RESPONSE_PARSE_FALLBACKS.with(|counter| {
         counter.set(counter.get().saturating_add(1));
     });
-}
-
-fn prepare_trusted_local_runtime_commit(
-    session: &mut crate::oplog::local_active::PromotedRuntimeSession<'_>,
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    journal: &mut ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
-    target_page: &PageDto,
-    response_evidence: Option<TrustedLocalResponseEvidence>,
-    prepared_editor_projection: Option<PreparedEditorProjection>,
-    transaction: &OperationTransaction,
-) -> Result<TrustedLocalRuntimeAttempt, SyncEditorRequestError> {
-    let base_revision =
-        target_page
-            .rev
-            .as_deref()
-            .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
-                SyncEditorRefusalCode::TrustedLocalMissingBaseRevision,
-            ))?;
-    let prepared = OperationalCoordinator::prepare_trusted_local(
-        session,
-        graph,
-        receipts,
-        transaction,
-        prepared_editor_projection,
-    )
-    .map_err(trusted_local_preparation_refusal)?;
-    let prepared = match prepared {
-        PreparedLocalMutationState::Prepared(prepared) => prepared,
-        PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
-            return Ok(TrustedLocalRuntimeAttempt::Reconciliation(
-                reconciliation.paths().to_vec(),
-            ));
-        }
-    };
-    let engine = session.engine().map_err(|_| {
-        SyncEditorRequestError::ActorRefusedWithCode(
-            SyncEditorRefusalCode::TrustedLocalEngineAuthority,
-        )
-    })?;
-    let outcome = match TrustedLocalCommitCoordinator::commit_with_response_evidence(
-        graph,
-        journal,
-        engine,
-        target_page,
-        response_evidence,
-        base_revision,
-        prepared,
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => return Ok(TrustedLocalRuntimeAttempt::CommitRefused(error)),
-    };
-    Ok(match outcome {
-        TrustedLocalCommitOutcome::Declined { .. } => TrustedLocalRuntimeAttempt::Declined,
-        committed => TrustedLocalRuntimeAttempt::Committed(committed),
-    })
 }
 
 enum EditorTurnReadiness {
@@ -10716,26 +9660,7 @@ struct SharedJoinMultisetSummary {
     digest_xor: [u8; 32],
 }
 
-impl SharedJoinMultisetSummary {
-    fn observe(
-        &mut self,
-        domain: &'static [u8],
-        value: &[u8],
-    ) -> Result<(), SyncRuntimeRequestError> {
-        let mut digest = Sha256::new();
-        digest.update(domain);
-        digest.update((value.len() as u64).to_be_bytes());
-        digest.update(value);
-        let digest = digest.finalize();
-        for (target, byte) in self.digest_xor.iter_mut().zip(digest) {
-            *target ^= byte;
-        }
-        self.entries = self.entries.checked_add(1).ok_or_else(|| {
-            SyncRuntimeRequestError::ActorRefused("shared join summary count overflow".into())
-        })?;
-        Ok(())
-    }
-}
+impl SharedJoinMultisetSummary {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SharedJoinProviderCut {
@@ -10747,51 +9672,7 @@ struct SharedJoinProviderCut {
     recovery_blobs: SharedJoinMultisetSummary,
 }
 
-impl SharedJoinProviderCut {
-    fn observe(&mut self, path: &str, bytes: &[u8]) -> Result<(), SyncRuntimeRequestError> {
-        let content_digest = ContentDigest::of(bytes);
-        let mut entry = Vec::with_capacity(path.len() + content_digest.as_bytes().len() + 8);
-        entry.extend_from_slice(&(path.len() as u64).to_be_bytes());
-        entry.extend_from_slice(path.as_bytes());
-        entry.extend_from_slice(content_digest.as_bytes());
-        // Each namespace is a filesystem directory and ReadDir yields each
-        // retained filename once, so paths already have set semantics. Count
-        // plus a domain-separated cryptographic XOR commits that complete set
-        // without retaining it; the second full cursor detects any changed
-        // path or content under the realistic provider threat model.
-        self.entries
-            .observe(b"tine/shared-join-provider-entry/v1\0", &entry)
-    }
-
-    fn observe_recovery_link(
-        &mut self,
-        manifest_digest: ContentDigest,
-    ) -> Result<(), SyncRuntimeRequestError> {
-        self.recovery_links.observe(
-            b"tine/shared-join-recovery-manifest/v1\0",
-            manifest_digest.as_bytes(),
-        )
-    }
-
-    fn observe_recovery_blob(
-        &mut self,
-        manifest_digest: ContentDigest,
-    ) -> Result<(), SyncRuntimeRequestError> {
-        self.recovery_blobs.observe(
-            b"tine/shared-join-recovery-manifest/v1\0",
-            manifest_digest.as_bytes(),
-        )
-    }
-
-    fn has_partial_recovery(&self) -> bool {
-        // Blob filenames are content digests. Link filenames are unique batch
-        // IDs, and each validated manifest encodes that batch ID, so distinct
-        // valid links also have distinct manifest digests absent a SHA-256
-        // collision. The equal count therefore preserves set cardinality while
-        // the shared domain/XOR commits the same recovery-manifest members.
-        self.recovery_links != self.recovery_blobs
-    }
-}
+impl SharedJoinProviderCut {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SharedJoinArchiveCut {
@@ -10799,17 +9680,7 @@ struct SharedJoinArchiveCut {
     digest_xor: [u8; 32],
 }
 
-impl SharedJoinArchiveCut {
-    fn observe(&mut self, digest: ContentDigest) -> Result<(), SyncRuntimeRequestError> {
-        for (target, byte) in self.digest_xor.iter_mut().zip(digest.as_bytes()) {
-            *target ^= *byte;
-        }
-        self.entries = self.entries.checked_add(1).ok_or_else(|| {
-            SyncRuntimeRequestError::ActorRefused("local archive entry count overflow".into())
-        })?;
-        Ok(())
-    }
-}
+impl SharedJoinArchiveCut {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SharedJoinLocalPass {
@@ -10875,95 +9746,6 @@ impl ProviderDependencyIndex {
     fn len(&self) -> usize {
         self.pending.len()
     }
-
-    fn contains(&self, batch_id: BatchId) -> bool {
-        self.pending.contains_key(&batch_id)
-    }
-
-    fn ready_front(&self) -> Option<BatchId> {
-        self.ready.front().copied()
-    }
-
-    fn register<E>(
-        &mut self,
-        batch_id: BatchId,
-        causal_dependencies: Vec<BatchId>,
-        mut dependency_is_satisfied: impl FnMut(BatchId) -> Result<bool, E>,
-    ) -> Result<bool, E> {
-        if self.contains(batch_id) {
-            return Ok(false);
-        }
-        let mut unmet_dependencies = Vec::new();
-        for dependency in &causal_dependencies {
-            if !dependency_is_satisfied(*dependency)? {
-                unmet_dependencies.push(*dependency);
-            }
-        }
-        let unmet_count = unmet_dependencies.len();
-        self.pending.insert(
-            batch_id,
-            PendingProviderBatch {
-                causal_dependencies,
-                unmet_dependencies: unmet_count,
-            },
-        );
-        if unmet_count == 0 {
-            self.ready.push_back(batch_id);
-        } else {
-            for dependency in unmet_dependencies {
-                self.blocked_by
-                    .entry(dependency)
-                    .or_default()
-                    .insert(batch_id);
-            }
-        }
-        Ok(true)
-    }
-
-    fn accept_ready(&mut self, accepted: BatchId) {
-        assert_eq!(
-            self.ready.pop_front(),
-            Some(accepted),
-            "accepted provider batch is the deterministic ready front"
-        );
-        self.pending
-            .remove(&accepted)
-            .expect("ready provider batch is registered");
-        self.satisfy_dependency(accepted);
-    }
-
-    fn recheck_satisfied<E>(
-        &mut self,
-        mut dependency_is_satisfied: impl FnMut(BatchId) -> Result<bool, E>,
-    ) -> Result<(), E> {
-        let dependencies = self.blocked_by.keys().copied().collect::<Vec<_>>();
-        for dependency in dependencies {
-            if dependency_is_satisfied(dependency)? {
-                self.satisfy_dependency(dependency);
-            }
-        }
-        Ok(())
-    }
-
-    fn satisfy_dependency(&mut self, satisfied: BatchId) {
-        let Some(dependents) = self.blocked_by.remove(&satisfied) else {
-            return;
-        };
-        for dependent in dependents {
-            let pending = self
-                .pending
-                .get_mut(&dependent)
-                .expect("blocked provider dependent is registered");
-            debug_assert!(pending.causal_dependencies.contains(&satisfied));
-            pending.unmet_dependencies = pending
-                .unmet_dependencies
-                .checked_sub(1)
-                .expect("blocked provider dependent has an unmet dependency");
-            if pending.unmet_dependencies == 0 {
-                self.ready.push_back(dependent);
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11019,20 +9801,8 @@ impl ActorRuntimeBinding {
         self.catalog_document_id
     }
 
-    const fn endpoint_id(&self) -> ProjectionEndpointId {
-        self.endpoint_id
-    }
-
     const fn device_id(&self) -> DeviceId {
         self.device_id
-    }
-
-    const fn graph_resource_id(&self) -> CanonicalGraphResourceId {
-        self.graph_resource_id
-    }
-
-    const fn receipt_store_id(&self) -> ProjectionReceiptStoreId {
-        self.receipt_store_id
     }
 }
 
@@ -11161,1094 +9931,6 @@ struct RuntimeActor {
     provider_recovery_backfill_cursor: Option<ObjectStoreManifestCursor>,
     pending_join: Option<PendingSharedJoin>,
     _not_send_or_sync: PhantomData<Rc<()>>,
-}
-
-fn managed_local_checkpoint_filename(next_sequence: u64) -> String {
-    format!("checkpoint-{next_sequence:020}.bin")
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManagedLocalGenerationAnchor {
-    schema_version: u32,
-    generation: u64,
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    device_id: Uuid,
-    checkpoint: ManagedLocalDrainCheckpoint,
-    accepted_batch_id: BatchId,
-}
-
-impl ManagedLocalGenerationAnchor {
-    #[cfg(test)]
-    fn new(
-        generation: u64,
-        checkpoint: ManagedLocalDrainCheckpoint,
-        accepted_batch_id: BatchId,
-    ) -> Self {
-        Self {
-            schema_version: MANAGED_LOCAL_GENERATION_ANCHOR_SCHEMA_VERSION,
-            generation,
-            workspace_id: checkpoint.workspace_id(),
-            lineage_digest: checkpoint.lineage_digest(),
-            device_id: checkpoint.device_id(),
-            checkpoint,
-            accepted_batch_id,
-        }
-    }
-
-    #[cfg(test)]
-    fn encode(&self) -> Result<Vec<u8>, String> {
-        postcard::to_allocvec(self).map_err(|error| error.to_string())
-    }
-
-    fn decode(
-        bytes: &[u8],
-        generation: u64,
-        binding: &EnrollmentBindingV1,
-    ) -> Result<Self, String> {
-        let anchor: Self =
-            postcard::from_bytes(bytes).map_err(|error| format!("invalid encoding: {error}"))?;
-        let checkpoint_bytes = anchor.checkpoint.encode()?;
-        let checkpoint = ManagedLocalDrainCheckpoint::decode(
-            &checkpoint_bytes,
-            binding.device_id().as_uuid(),
-            binding.workspace_id(),
-            binding.lineage_digest(),
-        )?;
-        if anchor.schema_version != MANAGED_LOCAL_GENERATION_ANCHOR_SCHEMA_VERSION
-            || anchor.generation != generation
-            || anchor.workspace_id != binding.workspace_id()
-            || anchor.lineage_digest != binding.lineage_digest()
-            || anchor.device_id != binding.device_id().as_uuid()
-            || checkpoint.next_sequence() != generation
-            || postcard::to_allocvec(&anchor).map_err(|error| error.to_string())? != bytes
-        {
-            return Err("managed-local generation anchor binding is invalid".into());
-        }
-        Ok(anchor)
-    }
-}
-
-fn managed_local_generation_anchor_filename(device_id: Uuid, generation: u64) -> String {
-    format!(
-        "device-{}-generation-{generation:020}.anchor",
-        device_id.simple()
-    )
-}
-
-fn managed_local_generation_segment_filename(device_id: Uuid, generation: u64) -> String {
-    format!(
-        "device-{}-generation-{generation:020}.segment",
-        device_id.simple()
-    )
-}
-
-fn managed_local_generation_from_name(name: &str, device_id: Uuid, suffix: &str) -> Option<u64> {
-    let prefix = format!("device-{}-generation-", device_id.simple());
-    let digits = name.strip_prefix(&prefix)?.strip_suffix(suffix)?;
-    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let generation = digits.parse().ok()?;
-    (format!("{generation:020}") == digits).then_some(generation)
-}
-
-fn managed_local_directory_names(
-    directory: &Dir,
-    #[cfg(test)] device_id: Uuid,
-) -> Result<Vec<String>, String> {
-    #[cfg(test)]
-    record_managed_local_directory_enumeration(device_id);
-    let entries = directory
-        .entries()
-        .map_err(|error| format!("cannot enumerate managed-local generations: {error}"))?;
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry
-            .map_err(|error| format!("cannot enumerate managed-local generation entry: {error}"))?;
-        if let Ok(name) = entry.file_name().into_string() {
-            names.push(name);
-        }
-    }
-    Ok(names)
-}
-
-fn managed_local_checkpoint_sequence(name: &str) -> Option<u64> {
-    let digits = name.strip_prefix("checkpoint-")?.strip_suffix(".bin")?;
-    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let sequence = digits.parse().ok()?;
-    (format!("{sequence:020}") == digits).then_some(sequence)
-}
-
-#[derive(Clone, Debug)]
-enum ManagedLocalAnchorTuple {
-    LegacyV1 {
-        segment_name: String,
-    },
-    SchemaV2 {
-        selection: tine_storage::LocalJournalSegmentV2Selection,
-    },
-}
-
-impl ManagedLocalAnchorTuple {
-    fn names(&self) -> BTreeSet<String> {
-        match self {
-            Self::LegacyV1 { segment_name } => BTreeSet::from([segment_name.clone()]),
-            Self::SchemaV2 { selection } => BTreeSet::from([
-                selection.segment_name().to_owned(),
-                selection.frontier_name().to_owned(),
-            ]),
-        }
-    }
-
-    fn remove_exact(&self, directory: &Dir, device_id: Uuid) -> Result<(), String> {
-        match self {
-            Self::LegacyV1 { segment_name } => {
-                remove_managed_local_entry_if_present(directory, segment_name)?;
-                if managed_local_compaction_cut!(device_id, AfterSegmentDeletion) {
-                    return Err(
-                        "injected crash after retired managed-local segment deletion".into(),
-                    );
-                }
-            }
-            Self::SchemaV2 { selection } => {
-                remove_managed_local_entry_if_present(directory, selection.segment_name())?;
-                if managed_local_compaction_cut!(device_id, AfterSegmentDeletion) {
-                    return Err(
-                        "injected crash after retired managed-local segment deletion".into(),
-                    );
-                }
-                remove_managed_local_entry_if_present(directory, selection.frontier_name())?;
-                if managed_local_compaction_cut!(device_id, AfterFrontierDeletion) {
-                    return Err(
-                        "injected crash after retired managed-local frontier deletion".into(),
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ManagedLocalActiveAnchor {
-    name: String,
-    bytes: Vec<u8>,
-    generation: u64,
-    checkpoint_sequence: u64,
-    tuple: ManagedLocalAnchorTuple,
-}
-
-#[derive(Clone, Debug)]
-struct ManagedLocalRetiredAnchor {
-    marker_name: String,
-    active: ManagedLocalActiveAnchor,
-}
-
-fn managed_local_active_anchor_names(names: &[String], device_id: Uuid) -> Vec<String> {
-    names
-        .iter()
-        .filter(|name| {
-            managed_local_generation_from_name(name, device_id, ".anchor").is_some()
-                || parse_managed_local_v2_anchor_name(name, device_id).is_some()
-        })
-        .cloned()
-        .collect()
-}
-
-fn decode_managed_local_active_anchor_bytes(
-    name: &str,
-    bytes: Vec<u8>,
-    binding: &EnrollmentBindingV1,
-) -> Result<ManagedLocalActiveAnchor, String> {
-    let device_id = binding.device_id().as_uuid();
-    if let Some(generation) = managed_local_generation_from_name(name, device_id, ".anchor") {
-        let anchor = ManagedLocalGenerationAnchor::decode(&bytes, generation, binding)
-            .map_err(|error| format!("schema-1 anchor {name} is invalid: {error}"))?;
-        return Ok(ManagedLocalActiveAnchor {
-            name: name.to_owned(),
-            bytes,
-            generation,
-            checkpoint_sequence: anchor.checkpoint.next_sequence(),
-            tuple: ManagedLocalAnchorTuple::LegacyV1 {
-                segment_name: managed_local_generation_segment_filename(device_id, generation),
-            },
-        });
-    }
-    if let Some(generation) = parse_managed_local_v2_anchor_name(name, device_id) {
-        let anchor = ManagedLocalGenerationAnchorV2::decode(
-            &bytes,
-            generation,
-            binding.workspace_id(),
-            binding.lineage_digest(),
-            device_id,
-        )
-        .map_err(|error| format!("schema-2 anchor {name} is invalid: {error}"))?;
-        return Ok(ManagedLocalActiveAnchor {
-            name: name.to_owned(),
-            bytes,
-            generation,
-            checkpoint_sequence: anchor.checkpoint().next_sequence(),
-            tuple: ManagedLocalAnchorTuple::SchemaV2 {
-                selection: anchor.selection().clone(),
-            },
-        });
-    }
-    Err(format!(
-        "{name} is not a canonical managed-local active anchor"
-    ))
-}
-
-fn decode_managed_local_active_anchor(
-    directory: &Dir,
-    name: &str,
-    binding: &EnrollmentBindingV1,
-) -> Result<ManagedLocalActiveAnchor, String> {
-    let device_id = binding.device_id().as_uuid();
-    let limit = if parse_managed_local_v2_anchor_name(name, device_id).is_some() {
-        MANAGED_LOCAL_ANCHOR_V2_BYTES as u64
-    } else if managed_local_generation_from_name(name, device_id, ".anchor").is_some() {
-        MANAGED_LOCAL_GENERATION_ANCHOR_BYTES
-    } else {
-        return Err(format!(
-            "{name} is not a canonical managed-local active anchor"
-        ));
-    };
-    let bytes = read_optional_regular(directory, name, limit, None)
-        .map_err(|error| format!("cannot read managed-local active anchor {name}: {error}"))?
-        .ok_or_else(|| format!("managed-local active anchor {name} disappeared"))?;
-    decode_managed_local_active_anchor_bytes(name, bytes, binding)
-}
-
-fn managed_local_retired_marker_name(active_name: &str, exact_anchor_bytes: &[u8]) -> String {
-    format!(
-        "retired-{active_name}-{:x}.anchor-retired",
-        Sha256::digest(exact_anchor_bytes)
-    )
-}
-
-fn decode_managed_local_retired_anchor(
-    directory: &Dir,
-    marker_name: &str,
-    binding: &EnrollmentBindingV1,
-) -> Result<ManagedLocalRetiredAnchor, String> {
-    let body = marker_name
-        .strip_prefix("retired-")
-        .and_then(|name| name.strip_suffix(".anchor-retired"))
-        .ok_or_else(|| format!("retired marker {marker_name} has a noncanonical name"))?;
-    let (active_name, digest) = body
-        .rsplit_once('-')
-        .ok_or_else(|| format!("retired marker {marker_name} has no anchor digest"))?;
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(format!(
-            "retired marker {marker_name} has a noncanonical anchor digest"
-        ));
-    }
-    let bytes = read_optional_regular(
-        directory,
-        marker_name,
-        MANAGED_LOCAL_GENERATION_ANCHOR_BYTES,
-        None,
-    )
-    .map_err(|error| format!("cannot read retired marker {marker_name}: {error}"))?
-    .ok_or_else(|| format!("retired marker {marker_name} disappeared"))?;
-    if managed_local_retired_marker_name(active_name, &bytes) != marker_name {
-        return Err(format!(
-            "retired marker {marker_name} does not bind its exact anchor bytes"
-        ));
-    }
-    let active = decode_managed_local_active_anchor_bytes(active_name, bytes, binding)?;
-    Ok(ManagedLocalRetiredAnchor {
-        marker_name: marker_name.to_owned(),
-        active,
-    })
-}
-
-fn remove_managed_local_entry_if_present(directory: &Dir, name: &str) -> Result<(), String> {
-    match directory.remove_file(name) {
-        Ok(()) => sync_dir_required(directory)
-            .map_err(|error| format!("cannot synchronize managed-local cleanup {name}: {error}")),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "cannot remove managed-local cleanup {name}: {error}"
-        )),
-    }
-}
-
-fn managed_local_v2_artifact_base(name: &str, device_id: Uuid) -> Option<String> {
-    let base = name
-        .strip_suffix(tine_storage::formats::LOCAL_JOURNAL_FRONTIER_SUFFIX)
-        .unwrap_or(name);
-    crate::oplog::local_journal_v2_anchor::parse_managed_local_v2_segment_name(base, device_id)
-        .map(|_| base.to_owned())
-}
-
-fn managed_local_anchor_tuple_names(anchors: &[ManagedLocalActiveAnchor]) -> BTreeSet<String> {
-    anchors
-        .iter()
-        .flat_map(|anchor| anchor.tuple.names())
-        .collect()
-}
-
-fn remove_managed_local_anchor_tuple_unless_retained(
-    directory: &Dir,
-    tuple: &ManagedLocalAnchorTuple,
-    retained: &BTreeSet<String>,
-    device_id: Uuid,
-    retained_refusal: &str,
-) -> Result<(), String> {
-    if !tuple.names().is_disjoint(retained) {
-        return Err(retained_refusal.to_owned());
-    }
-    tuple.remove_exact(directory, device_id)
-}
-
-fn managed_local_cleanup_is_pending_on_open(
-    directory: &Dir,
-    names: &[String],
-    binding: &EnrollmentBindingV1,
-    selected_schema2_generation: Option<u64>,
-) -> bool {
-    let Some(selected_generation) = selected_schema2_generation else {
-        return false;
-    };
-    let device_id = binding.device_id().as_uuid();
-    let active_names = managed_local_active_anchor_names(names, device_id);
-    if active_names.len() > 2 {
-        return true;
-    }
-    let mut anchors = Vec::with_capacity(active_names.len());
-    for name in &active_names {
-        match decode_managed_local_active_anchor(directory, name, binding) {
-            Ok(anchor) => anchors.push(anchor),
-            Err(_) => return true,
-        }
-    }
-    let Some(selected) = anchors.iter().find(|anchor| {
-        anchor.generation == selected_generation
-            && matches!(anchor.tuple, ManagedLocalAnchorTuple::SchemaV2 { .. })
-    }) else {
-        return true;
-    };
-    let tuple_names = managed_local_anchor_tuple_names(&anchors);
-    let base_segment = format!("device-{}.segment", device_id.simple());
-    for name in names {
-        if active_names.iter().any(|active| active == name) || tuple_names.contains(name) {
-            continue;
-        }
-        if name.starts_with("retired-")
-            || name.ends_with(".anchor-retired")
-            || name == &base_segment
-        {
-            return true;
-        }
-        if managed_local_generation_from_name(name, device_id, ".segment").is_some()
-            || managed_local_v2_artifact_base(name, device_id).is_some()
-        {
-            return true;
-        }
-        if let Some(sequence) = managed_local_checkpoint_sequence(name) {
-            if sequence <= selected.checkpoint_sequence {
-                return true;
-            }
-            continue;
-        }
-        return true;
-    }
-    false
-}
-
-fn verify_managed_local_anchor_tuple_complete(
-    directory: &Dir,
-    anchor: &ManagedLocalActiveAnchor,
-    current_schema2_generation: u64,
-    device_id: Uuid,
-) -> Result<(), String> {
-    match &anchor.tuple {
-        ManagedLocalAnchorTuple::LegacyV1 { segment_name } => {
-            let journal = LockedLocalJournalV1Segment::<ManagedLocalJournalPayloadKind>::inspect(
-                directory,
-                segment_name,
-                device_id,
-                anchor.generation,
-            )
-            .map_err(|error| {
-                format!(
-                    "managed-local active schema-1 tuple {} is incomplete: {error}",
-                    anchor.name
-                )
-            })?;
-            drop(journal);
-        }
-        ManagedLocalAnchorTuple::SchemaV2 { selection } => {
-            if anchor.generation != current_schema2_generation {
-                let (journal, _) =
-                    LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::open_selected(
-                        directory, selection,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "managed-local active schema-2 tuple {} is incomplete: {error}",
-                            anchor.name
-                        )
-                    })?;
-                drop(journal);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn retained_managed_local_anchor_tuples(
-    directory: &Dir,
-    binding: &EnrollmentBindingV1,
-    expected_schema2_generation: u64,
-) -> Result<BTreeSet<String>, String> {
-    let device_id = binding.device_id().as_uuid();
-    let names = managed_local_directory_names(
-        directory,
-        #[cfg(test)]
-        device_id,
-    )?;
-    match select_managed_local_authority_generation(&names, device_id)? {
-        Some(ManagedLocalAuthorityGeneration::SchemaV2(generation))
-            if generation == expected_schema2_generation => {}
-        Some(authority) => {
-            return Err(format!(
-                "managed-local cleanup observed authority generation {} while retaining {expected_schema2_generation}",
-                authority.generation()
-            ));
-        }
-        None => return Err("managed-local cleanup lost its schema-2 authority".into()),
-    }
-    let mut active = managed_local_active_anchor_names(&names, device_id)
-        .into_iter()
-        .map(|name| {
-            let generation = managed_local_generation_from_name(&name, device_id, ".anchor")
-                .or_else(|| parse_managed_local_v2_anchor_name(&name, device_id))
-                .expect("active managed-local anchor name was parsed above");
-            (generation, name)
-        })
-        .collect::<Vec<_>>();
-    active.sort_unstable_by(|left, right| right.0.cmp(&left.0));
-    let mut retained = Vec::new();
-    for (_, name) in active.into_iter().take(2) {
-        retained.push(decode_managed_local_active_anchor(
-            directory, &name, binding,
-        )?);
-    }
-    Ok(managed_local_anchor_tuple_names(&retained))
-}
-
-/// Schema-1 and schema-2 anchors share one authority-generation namespace.
-///
-/// A newer schema-1 generation must therefore outrank an older schema-2
-/// selector during the rolling protocol migration.  A same-generation pair
-/// has no unambiguous authority order and must fail closed rather than letting
-/// the implementation detail of either branch choose a winner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ManagedLocalAuthorityGeneration {
-    LegacyV1(u64),
-    SchemaV2(u64),
-}
-
-impl ManagedLocalAuthorityGeneration {
-    const fn generation(self) -> u64 {
-        match self {
-            Self::LegacyV1(generation) | Self::SchemaV2(generation) => generation,
-        }
-    }
-}
-
-fn select_managed_local_authority_generation(
-    names: &[String],
-    device_id: Uuid,
-) -> Result<Option<ManagedLocalAuthorityGeneration>, String> {
-    let schema1 = names
-        .iter()
-        .filter_map(|name| managed_local_generation_from_name(name, device_id, ".anchor"))
-        .collect::<BTreeSet<_>>();
-    let schema2 = names
-        .iter()
-        .filter_map(|name| parse_managed_local_v2_anchor_name(name, device_id))
-        .collect::<BTreeSet<_>>();
-
-    if let Some(generation) = schema1.intersection(&schema2).next() {
-        return Err(format!(
-            "managed-local schema-1/schema-2 authority generation {generation} is ambiguous"
-        ));
-    }
-
-    Ok(match (schema1.last().copied(), schema2.last().copied()) {
-        (Some(schema1), Some(schema2)) if schema1 > schema2 => {
-            Some(ManagedLocalAuthorityGeneration::LegacyV1(schema1))
-        }
-        (Some(_), Some(schema2)) => Some(ManagedLocalAuthorityGeneration::SchemaV2(schema2)),
-        (Some(schema1), None) => Some(ManagedLocalAuthorityGeneration::LegacyV1(schema1)),
-        (None, Some(schema2)) => Some(ManagedLocalAuthorityGeneration::SchemaV2(schema2)),
-        (None, None) => None,
-    })
-}
-
-fn next_managed_local_authority_generation(
-    names: &[String],
-    device_id: Uuid,
-) -> Result<u64, String> {
-    match select_managed_local_authority_generation(names, device_id)? {
-        Some(authority) => authority
-            .generation()
-            .checked_add(1)
-            .ok_or_else(|| "managed-local authority generation overflow".to_owned()),
-        None => Ok(1),
-    }
-}
-
-fn open_exact_managed_local_v2_successor(
-    directory: &Dir,
-    binding: &EnrollmentBindingV1,
-    selector_generation: u64,
-    expected: &ManagedLocalGenerationAnchorV2,
-) -> Result<ManagedLocalJournal<ManagedLocalJournalPayloadKind>, String> {
-    let anchor_name =
-        managed_local_v2_anchor_name(expected.checkpoint().device_id(), selector_generation);
-    let bytes = read_optional_regular(
-        directory,
-        &anchor_name,
-        MANAGED_LOCAL_ANCHOR_V2_BYTES as u64,
-        None,
-    )
-    .map_err(|error| format!("cannot resolve managed-local successor {anchor_name}: {error}"))?
-    .ok_or_else(|| format!("managed-local successor {anchor_name} is absent"))?;
-    if classify_managed_local_anchor(&bytes) != ManagedLocalAnchorEncoding::SchemaV2 {
-        return Err(format!(
-            "managed-local successor {anchor_name} is not schema 2"
-        ));
-    }
-    let resolved = ManagedLocalGenerationAnchorV2::decode(
-        &bytes,
-        selector_generation,
-        binding.workspace_id(),
-        binding.lineage_digest(),
-        expected.checkpoint().device_id(),
-    )
-    .map_err(|error| format!("managed-local successor {anchor_name} is corrupt: {error}"))?;
-    if &resolved != expected {
-        return Err(format!(
-            "managed-local successor {anchor_name} is mismatched"
-        ));
-    }
-    let (journal, recovery) = LocalJournalSegmentV2::open_selected(directory, resolved.selection())
-        .map_err(|error| {
-            format!(
-                "cannot open managed-local successor tuple {}: {error}",
-                resolved.selection().segment_name()
-            )
-        })?;
-    if recovery.frames_recovered != 0 || recovery.discarded_tail_bytes != 0 {
-        return Err("managed-local successor is not the exact empty rollover tuple".into());
-    }
-    Ok(ManagedLocalJournal::from_open_v2(
-        selector_generation,
-        journal,
-    ))
-}
-
-fn prepare_fresh_managed_local_v2_journal(
-    directory: &Dir,
-    checkpoint: ManagedLocalDrainCheckpoint,
-    selector_generation: u64,
-) -> Result<
-    (
-        ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
-        ManagedLocalGenerationAnchorV2,
-    ),
-    String,
-> {
-    // This retained object is deliberately obtained before the segment,
-    // frontier, or authority name exists. On Windows that makes unsupported
-    // write-through publication a refusal-before-mutation rather than a
-    // best-effort recovery problem.
-    let publication = DurableDirectoryPublication::open(directory).map_err(|error| {
-        format!("managed-local schema-2 durable publication is unavailable: {error}")
-    })?;
-    let anchor =
-        ManagedLocalGenerationAnchorV2::new(selector_generation, checkpoint, None, Uuid::new_v4())
-            .map_err(|error| {
-                format!("cannot construct fresh managed-local schema-2 anchor: {error}")
-            })?;
-    let anchor_name = managed_local_v2_anchor_name(
-        anchor.checkpoint().device_id(),
-        anchor.selector_generation(),
-    );
-    let anchor_bytes = anchor
-        .encode()
-        .map_err(|error| format!("cannot encode fresh managed-local schema-2 anchor: {error}"))?;
-    LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(directory, anchor.selection())
-        .map_err(|error| format!("cannot prepare fresh managed-local schema-2 segment: {error}"))?;
-    let (journal, recovery) = LocalJournalSegmentV2::open_selected(directory, anchor.selection())
-        .map_err(|error| {
-        format!("cannot open fresh managed-local schema-2 segment: {error}")
-    })?;
-    if recovery.frames_recovered != 0
-        || recovery.discarded_tail_bytes != 0
-        || journal.next_sequence() != anchor.checkpoint().next_sequence()
-    {
-        return Err("fresh managed-local schema-2 tuple is not empty".into());
-    }
-    publication
-        .publish_new_exact(&anchor_name, &anchor_bytes)
-        .map_err(|error| {
-            format!("cannot publish fresh managed-local schema-2 anchor {anchor_name}: {error}")
-        })?;
-    Ok((
-        ManagedLocalJournal::from_open_v2(selector_generation, journal),
-        anchor,
-    ))
-}
-
-fn open_managed_local_runtime(
-    application_runtime_root: &Path,
-    binding: &EnrollmentBindingV1,
-    graph: &Graph,
-    authority: &mut LocalActiveAuthority,
-    runtime: &mut PromotedLocalRuntime,
-) -> Result<ManagedLocalRuntimeState, String> {
-    let root = Dir::open_ambient_dir(application_runtime_root, ambient_authority())
-        .map_err(|error| format!("cannot retain private managed-local runtime root: {error}"))?;
-    ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
-    let namespace = open_dir_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
-    let workspace_name = format!(
-        "workspace-{}-{}",
-        binding.workspace_id(),
-        binding.lineage_digest()
-    );
-    ensure_directory_nofollow(&namespace, &workspace_name).map_err(display)?;
-    let directory = open_dir_nofollow(&namespace, &workspace_name).map_err(display)?;
-    let device_id = binding.device_id().as_uuid();
-    let names = managed_local_directory_names(
-        &directory,
-        #[cfg(test)]
-        device_id,
-    )?;
-    let (journal, mut checkpoint, mut checkpoint_batch_id) =
-        match select_managed_local_authority_generation(&names, device_id)? {
-            Some(ManagedLocalAuthorityGeneration::SchemaV2(selector_generation)) => {
-                let anchor_name = managed_local_v2_anchor_name(device_id, selector_generation);
-                let anchor_bytes = read_optional_regular(
-                    &directory,
-                    &anchor_name,
-                    MANAGED_LOCAL_ANCHOR_V2_BYTES as u64,
-                    None,
-                )
-                .map_err(|error| {
-                    format!(
-                        "cannot read authoritative managed-local selector {anchor_name}: {error}"
-                    )
-                })?
-                .ok_or_else(|| {
-                    format!("authoritative managed-local selector {anchor_name} disappeared")
-                })?;
-                if classify_managed_local_anchor(&anchor_bytes)
-                    != ManagedLocalAnchorEncoding::SchemaV2
-                {
-                    return Err(format!(
-                "authoritative managed-local selector {anchor_name} is corrupt: not schema 2"
-            ));
-                }
-                let anchor = ManagedLocalGenerationAnchorV2::decode(
-                    &anchor_bytes,
-                    selector_generation,
-                    binding.workspace_id(),
-                    binding.lineage_digest(),
-                    device_id,
-                )
-                .map_err(|error| {
-                    format!(
-                        "authoritative managed-local selector {anchor_name} is corrupt: {error}"
-                    )
-                })?;
-                let (journal, _) =
-                    LocalJournalSegmentV2::open_selected(&directory, anchor.selection()).map_err(
-                        |error| {
-                            format!(
-                    "cannot open authoritative managed-local selector tuple {}: {error}",
-                    anchor.selection().segment_name()
-                )
-                        },
-                    )?;
-                (
-                    ManagedLocalJournal::from_open_v2(selector_generation, journal),
-                    anchor.checkpoint().clone(),
-                    anchor.accepted_batch_id(),
-                )
-            }
-            Some(ManagedLocalAuthorityGeneration::LegacyV1(generation)) => {
-                let anchor_name = managed_local_generation_anchor_filename(device_id, generation);
-                let anchor_bytes = read_optional_regular(
-                    &directory,
-                    &anchor_name,
-                    MANAGED_LOCAL_GENERATION_ANCHOR_BYTES,
-                    None,
-                )
-                .map_err(|error| {
-                    format!(
-                        "cannot read authoritative managed-local generation {anchor_name}: {error}"
-                    )
-                })?
-                .ok_or_else(|| {
-                    format!("authoritative managed-local generation {anchor_name} disappeared")
-                })?;
-                let anchor =
-                    ManagedLocalGenerationAnchor::decode(&anchor_bytes, generation, binding)
-                        .map_err(|error| {
-                            format!(
-                        "authoritative managed-local generation {anchor_name} is corrupt: {error}"
-                    )
-                        })?;
-                let segment_name = managed_local_generation_segment_filename(device_id, generation);
-                let journal = LockedLocalJournalV1Segment::inspect(
-                    &directory,
-                    &segment_name,
-                    device_id,
-                    generation,
-                )
-                .map_err(|error| {
-                    format!(
-                "cannot open authoritative managed-local generation segment {segment_name}: {error}"
-            )
-                })?;
-                (
-                    ManagedLocalJournal::from_locked_v1(journal),
-                    anchor.checkpoint,
-                    Some(anchor.accepted_batch_id),
-                )
-            }
-            None => {
-                let segment_name = format!("device-{}.segment", device_id.simple());
-                if names.iter().any(|name| name == &segment_name) {
-                    let journal = LockedLocalJournalV1Segment::inspect(
-                        &directory,
-                        &segment_name,
-                        device_id,
-                        0,
-                    )
-                    .map_err(|error| {
-                        format!("cannot inspect enrolled managed-local journal: {error}")
-                    })?;
-                    (
-                        ManagedLocalJournal::from_locked_v1(journal),
-                        ManagedLocalDrainCheckpoint::initial(
-                            device_id,
-                            binding.workspace_id(),
-                            binding.lineage_digest(),
-                        ),
-                        None,
-                    )
-                } else {
-                    let checkpoint = ManagedLocalDrainCheckpoint::initial(
-                        device_id,
-                        binding.workspace_id(),
-                        binding.lineage_digest(),
-                    );
-                    let selector_generation =
-                        next_managed_local_authority_generation(&names, device_id)?;
-                    let (journal, anchor) = prepare_fresh_managed_local_v2_journal(
-                        &directory,
-                        checkpoint.clone(),
-                        selector_generation,
-                    )?;
-                    (
-                        journal,
-                        anchor.checkpoint().clone(),
-                        anchor.accepted_batch_id(),
-                    )
-                }
-            }
-        };
-    let mut recovered_frames = Vec::new();
-    journal
-        .replay(|frame| recovered_frames.push(frame))
-        .map_err(|error| format!("cannot scan enrolled managed-local journal: {error}"))?;
-    if journal
-        .base_sequence()
-        .checked_add(recovered_frames.len() as u64)
-        != Some(journal.next_sequence())
-    {
-        return Err("managed-local journal sequence/count binding is inconsistent".into());
-    }
-
-    if journal.protocol() == ManagedLocalJournalProtocol::LegacyV1 && journal.base_sequence() == 0 {
-        let mut missing_checkpoint = false;
-        let checkpoint_probe_end = journal
-            .next_sequence()
-            .checked_add(1)
-            .ok_or_else(|| "managed-local checkpoint sequence overflow".to_owned())?;
-        for next_sequence in 1..=checkpoint_probe_end {
-            let filename = managed_local_checkpoint_filename(next_sequence);
-            let bytes =
-                read_optional_regular(&directory, &filename, MANAGED_LOCAL_CHECKPOINT_BYTES, None)
-                    .map_err(|error| {
-                        format!("cannot read managed-local checkpoint {filename}: {error}")
-                    })?;
-            let Some(bytes) = bytes else {
-                missing_checkpoint = true;
-                continue;
-            };
-            if missing_checkpoint || next_sequence > journal.next_sequence() {
-                return Err(format!(
-                    "managed-local checkpoint {filename} is divergent from the journal prefix"
-                ));
-            }
-            let decoded = ManagedLocalDrainCheckpoint::decode(
-                &bytes,
-                device_id,
-                binding.workspace_id(),
-                binding.lineage_digest(),
-            )
-            .map_err(|error| format!("managed-local checkpoint {filename} is invalid: {error}"))?;
-            if decoded.next_sequence() != next_sequence {
-                return Err(format!(
-                    "managed-local checkpoint {filename} names sequence {}",
-                    decoded.next_sequence()
-                ));
-            }
-            checkpoint = decoded;
-        }
-    } else {
-        // A schema-2 anchor binds its compacted base.  Later drained frames
-        // retain their immutable checkpoints beside that tuple just like a
-        // non-initial schema-1 generation, so reopen must consume them before
-        // deciding which physical suffix remains pending.
-        let mut checkpoint_sequences = names
-            .iter()
-            .filter_map(|name| managed_local_checkpoint_sequence(name))
-            .filter(|sequence| *sequence > checkpoint.next_sequence())
-            .collect::<Vec<_>>();
-        checkpoint_sequences.sort_unstable();
-        checkpoint_sequences.dedup();
-        for next_sequence in checkpoint_sequences {
-            let filename = managed_local_checkpoint_filename(next_sequence);
-            if next_sequence > journal.next_sequence() {
-                return Err(format!(
-                    "managed-local checkpoint {filename} is ahead of the authoritative generation"
-                ));
-            }
-            let bytes =
-                read_optional_regular(&directory, &filename, MANAGED_LOCAL_CHECKPOINT_BYTES, None)
-                    .map_err(|error| {
-                        format!("cannot read managed-local checkpoint {filename}: {error}")
-                    })?
-                    .ok_or_else(|| format!("managed-local checkpoint {filename} disappeared"))?;
-            checkpoint = ManagedLocalDrainCheckpoint::decode(
-                &bytes,
-                device_id,
-                binding.workspace_id(),
-                binding.lineage_digest(),
-            )
-            .map_err(|error| format!("managed-local checkpoint {filename} is invalid: {error}"))?;
-            if checkpoint.next_sequence() != next_sequence {
-                return Err(format!(
-                    "managed-local checkpoint {filename} names sequence {}",
-                    checkpoint.next_sequence()
-                ));
-            }
-        }
-    }
-
-    let checkpointed = checkpoint
-        .next_sequence()
-        .checked_sub(journal.base_sequence())
-        .ok_or_else(|| "managed-local checkpoint is behind the physical generation".to_owned())?;
-    let checkpointed = usize::try_from(checkpointed)
-        .map_err(|_| "managed-local checkpoint exceeds addressable memory".to_owned())?;
-    if checkpointed > recovered_frames.len() {
-        return Err("managed-local checkpoint is ahead of the authenticated journal".into());
-    }
-    let cleanup_pending = match journal.v2_selector_generation() {
-        Some(selected_generation) => {
-            let cleanup_names = managed_local_directory_names(
-                &directory,
-                #[cfg(test)]
-                device_id,
-            )?;
-            managed_local_cleanup_is_pending_on_open(
-                &directory,
-                &cleanup_names,
-                binding,
-                Some(selected_generation),
-            )
-        }
-        None => false,
-    };
-    if recovered_frames.is_empty() && checkpoint.next_sequence() == 0 {
-        return Ok(ManagedLocalRuntimeState {
-            directory,
-            journal,
-            frames: VecDeque::new(),
-            latest_projection_frames: BTreeMap::new(),
-            latest_task_query_overlay: BTreeMap::new(),
-            checkpoint,
-            checkpoint_batch_id,
-            continuation: None,
-            pending_commit: None,
-            authorship_complete: BTreeSet::new(),
-            last_failure: None,
-            cleanup_pending,
-        });
-    }
-    let mut session = runtime
-        .admit_promoted_mutation(authority, graph)
-        .map_err(|error| format!("cannot authorize managed-local startup recovery: {error}"))?;
-    let engine = session
-        .engine()
-        .map_err(|error| format!("cannot retain managed-local startup engine: {error}"))?;
-
-    for frame in &recovered_frames[..checkpointed] {
-        let record = decode_managed_local_record(frame).map_err(|error| {
-            format!(
-                "managed-local journal record {}:{} is invalid: {error}",
-                frame.device_id(),
-                frame.sequence()
-            )
-        })?;
-        let batch_id = record.prepared_batch().manifest().batch_id();
-        if !engine.accepted_batch_is_active(batch_id).map_err(display)? {
-            return Err(format!(
-                "checkpointed managed-local record {}:{}, batch {batch_id}, is not accepted",
-                frame.device_id(),
-                frame.sequence()
-            ));
-        }
-        checkpoint_batch_id = Some(batch_id);
-    }
-    if checkpointed != 0 {
-        engine
-            .seed_compacted_managed_local_prefix(
-                checkpoint.next_sequence(),
-                checkpoint_batch_id.ok_or_else(|| {
-                    "managed-local checkpoint has no accepted batch evidence".to_owned()
-                })?,
-            )
-            .map_err(|error| format!("cannot seed checkpointed managed-local prefix: {error}"))?;
-    } else if journal.base_sequence() != 0 {
-        engine
-            .seed_compacted_managed_local_prefix(
-                checkpoint.next_sequence(),
-                checkpoint_batch_id.ok_or_else(|| {
-                    "compacted managed-local anchor has no accepted batch evidence".to_owned()
-                })?,
-            )
-            .map_err(|error| format!("cannot seed compacted managed-local prefix: {error}"))?;
-    }
-
-    let mut frames = VecDeque::new();
-    let mut latest_projection_frames = BTreeMap::new();
-    let mut latest_task_query_overlay = BTreeMap::new();
-    for frame in recovered_frames.iter().skip(checkpointed) {
-        let record = decode_managed_local_record(frame).map_err(|error| {
-            format!(
-                "managed-local journal record {}:{} is invalid: {error}",
-                frame.device_id(),
-                frame.sequence()
-            )
-        })?;
-        let path = record.projection().intent().path().clone();
-        let key = path.as_str().to_owned();
-        latest_projection_frames.insert(key.clone(), frame.clone());
-        latest_task_query_overlay.insert(
-            key,
-            LatestTaskQueryOverlayEntry {
-                sequence: frame.sequence(),
-                path,
-                state: LatestTaskQueryOverlayState::Incomplete,
-            },
-        );
-    }
-    for frame in recovered_frames.into_iter().skip(checkpointed) {
-        let record = decode_managed_local_record(&frame).map_err(|error| {
-            format!(
-                "managed-local journal record {}:{} is invalid: {error}",
-                frame.device_id(),
-                frame.sequence()
-            )
-        })?;
-        let input = TrustedLocalCommitCoordinator::restart_projection_input(&record).map_err(
-            |error| {
-                format!(
-                    "managed-local journal record {}:{} has invalid projection recovery input: {error}",
-                    frame.device_id(),
-                    frame.sequence()
-                )
-            },
-        )?;
-        let is_latest_projection = latest_projection_frames
-            .get(record.projection().intent().path().as_str())
-            .is_some_and(|latest| latest.sequence() == frame.sequence());
-        if is_latest_projection {
-            match TrustedLocalCommitCoordinator::recover_projection_after_restart(
-                graph,
-                frame.clone(),
-                input,
-            ) {
-                TrustedLocalRestartProjectionOutcome::Durable(_) => {}
-                TrustedLocalRestartProjectionOutcome::CommittedPending(pending) => {
-                    return Err(format!(
-                        "managed-local journal record {}:{} cannot finish exact graph target {}: {}",
-                        frame.device_id(),
-                        frame.sequence(),
-                        pending.relative_path(),
-                        pending.last_error()
-                    ));
-                }
-            }
-        }
-        engine
-            .restore_managed_local_record(&frame)
-            .map_err(|error| {
-                format!(
-                    "cannot restore managed-local journal record {}:{}: {error}",
-                    frame.device_id(),
-                    frame.sequence()
-                )
-            })?;
-        frames.push_back(frame);
-    }
-
-    // This is an open-time recovery seam, before the actor can admit
-    // application requests.  Recreate only exact hot-page authority; a
-    // malformed or ambiguous entry deliberately remains `Incomplete` so a
-    // future sparse reader can take one whole-query fallback.
-    drop(session);
-    for entry in latest_task_query_overlay.values_mut() {
-        *entry = latest_task_query_overlay_after_recovery(
-            runtime,
-            graph,
-            entry.path.clone(),
-            entry.sequence,
-        );
-    }
-
-    Ok(ManagedLocalRuntimeState {
-        directory,
-        journal,
-        frames,
-        latest_projection_frames,
-        latest_task_query_overlay,
-        checkpoint,
-        checkpoint_batch_id,
-        continuation: None,
-        pending_commit: None,
-        authorship_complete: BTreeSet::new(),
-        last_failure: None,
-        cleanup_pending,
-    })
 }
 
 impl RuntimeActor {
@@ -12501,10 +10183,6 @@ impl RuntimeActor {
             pending_join: None,
             _not_send_or_sync: PhantomData,
         })
-    }
-
-    fn take_startup_recovery_diagnostics(&mut self) -> Option<SyncRuntimeRecoveryDiagnostics> {
-        self.startup_recovery_diagnostics.take()
     }
 
     #[cfg(test)]
@@ -17755,30 +15433,6 @@ impl RuntimeActor {
         });
     }
 
-    fn require_pending_application_publication(
-        &self,
-        expected_batch_id: &str,
-    ) -> Result<(), SyncApplicationPageRequestError> {
-        debug_assert!(
-            self.clean.is_none(),
-            "a clean runtime never populates `local_mutation`; \
-             clean retained publications settle through the clean actor"
-        );
-        #[cfg(test)]
-        self.legacy_publication_settlements
-            .set(self.legacy_publication_settlements.get() + 1);
-        match &self.local_mutation {
-            Some(PendingLocalMutation::Published(continuation))
-                if continuation.batch_id().to_string() == expected_batch_id =>
-            {
-                Ok(())
-            }
-            _ => Err(SyncApplicationPageRequestError::ActorRefusedAt(
-                "require_pending_publication_absent",
-            )),
-        }
-    }
-
     fn reload_application_page(
         &self,
         path: &str,
@@ -18530,14 +16184,6 @@ impl RuntimeActor {
         })
     }
 
-    fn managed_local_pending_commit_batch_id(&self) -> Option<BatchId> {
-        match self.managed_local.as_ref()?.pending_commit.as_ref()? {
-            PendingManagedLocalCommit::Projection(pending) => Some(pending.batch_id()),
-            PendingManagedLocalCommit::Overlay(recovery) => Some(recovery.batch_id()),
-            PendingManagedLocalCommit::Response(committed) => Some(committed.batch_id()),
-        }
-    }
-
     fn prepare_page_read_turn(&mut self) -> EditorTurnReadiness {
         self.prepare_editor_turn()
     }
@@ -18641,423 +16287,6 @@ impl RuntimeActor {
                         phase: map_local_phase(phase),
                     },
                     affected_page_ids,
-                })
-            }
-        }
-    }
-
-    fn application_from_trusted_local_commit(
-        &self,
-        committed: &TrustedLocalCommitted,
-    ) -> Result<ApplicationCurrentPage, SyncEditorRequestError> {
-        let parsed = match committed.trusted_target_page() {
-            Some(page) => {
-                // `TrustedLocalCommitCoordinator::commit` accepts this DTO
-                // only after it parsed the target bytes, and Graph returns the
-                // final reread target plus its content-derived durable revision.
-                // Check that private evidence remains bound to that durable
-                // target before using it as the immediate response.
-                if page.path != committed.relative_path()
-                    || page.rev.as_deref() != Some(committed.revision())
-                    || std::str::from_utf8(committed.exact_target()).map_or(true, |target| {
-                        crate::model::content_rev(target) != committed.revision()
-                    })
-                {
-                    return Err(SyncEditorRequestError::ActorRefusedAt(
-                        "editor_response_revision_shape",
-                    ));
-                }
-                page.clone()
-            }
-            None => {
-                // Recovery and foreign committed outcomes have no process-local
-                // parser-owned DTO.  Preserve the established exact-byte
-                // parser fallback rather than treating durable bytes as a DTO.
-                #[cfg(test)]
-                note_trusted_local_response_parse_fallback();
-                let path = ManagedPath::parse(committed.relative_path().to_owned())
-                    .map_err(|_| SyncEditorRequestError::ActorRefusedAt("editor_response_path"))?;
-                let parsed = self
-                    .graph
-                    .parse_exact_page_dto(&path, committed.exact_target())
-                    .map_err(|_| SyncEditorRequestError::ActorRefusedAt("editor_response_parse"))?;
-                if parsed.rev.as_deref() != Some(committed.revision()) {
-                    return Err(SyncEditorRequestError::ActorRefusedAt(
-                        "editor_response_revision",
-                    ));
-                }
-                parsed
-            }
-        };
-        let editor = editor_current_page_from_materialized(
-            committed.post_page().clone(),
-            MAX_SYNC_APPLICATION_PAGE_BLOCKS,
-        )?;
-        join_application_page(parsed, editor).map_err(map_application_editor_error)
-    }
-
-    fn install_latest_task_query_overlay(
-        &mut self,
-        sequence: u64,
-        current: &ApplicationCurrentPage,
-    ) {
-        let Ok(page) = latest_task_query_overlay_page_from_application(current) else {
-            return;
-        };
-        if let Some(managed) = self.managed_local.as_mut() {
-            managed.install_latest_task_query_overlay(sequence, page);
-        }
-    }
-
-    fn cleanup_retired_managed_local_history(&mut self) -> Result<(), String> {
-        let (directory, device_id, current_schema2_generation) = {
-            let managed = self
-                .managed_local
-                .as_ref()
-                .ok_or_else(|| "managed-local cleanup has no runtime state".to_owned())?;
-            let generation = managed.journal.v2_selector_generation().ok_or_else(|| {
-                "managed-local cleanup requires an already selected schema-2 authority".to_owned()
-            })?;
-            (
-                managed.directory.try_clone().map_err(display)?,
-                managed.journal.device_id(),
-                generation,
-            )
-        };
-        let names = managed_local_directory_names(
-            &directory,
-            #[cfg(test)]
-            device_id,
-        )?;
-        match select_managed_local_authority_generation(&names, device_id)? {
-            Some(ManagedLocalAuthorityGeneration::SchemaV2(generation))
-                if generation == current_schema2_generation => {}
-            Some(authority) => {
-                return Err(format!(
-                    "managed-local cleanup observed authority generation {} instead of selected schema-2 generation {current_schema2_generation}",
-                    authority.generation()
-                ));
-            }
-            None => return Err("managed-local cleanup lost its schema-2 authority".into()),
-        }
-
-        // Decode and prove every active tuple before changing any authority.
-        // A corrupt lower selector is not an excuse to discard it, and a
-        // corrupt highest selector was already refused during open.
-        let mut active = managed_local_active_anchor_names(&names, device_id)
-            .into_iter()
-            .map(|name| {
-                decode_managed_local_active_anchor(
-                    &directory,
-                    &name,
-                    self.legacy_binding
-                        .as_ref()
-                        .expect("managed-local runtime retains its legacy enrollment binding"),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        active.sort_unstable_by(|left, right| right.generation.cmp(&left.generation));
-        for anchor in &active {
-            verify_managed_local_anchor_tuple_complete(
-                &directory,
-                anchor,
-                current_schema2_generation,
-                device_id,
-            )?;
-        }
-        let retained_generations = active
-            .iter()
-            .take(2)
-            .map(|anchor| anchor.generation)
-            .collect::<BTreeSet<_>>();
-        let obsolete = active
-            .iter()
-            .filter(|anchor| !retained_generations.contains(&anchor.generation))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if !obsolete.is_empty() {
-            // Opening this capability before the first rename makes unsupported
-            // hosted-Windows retirement a refusal-before-mutation as well.
-            let publication = DurableDirectoryPublication::open(&directory).map_err(|error| {
-                format!("managed-local retirement durable publication is unavailable: {error}")
-            })?;
-            for obsolete_anchor in obsolete {
-                let marker_name = managed_local_retired_marker_name(
-                    &obsolete_anchor.name,
-                    &obsolete_anchor.bytes,
-                );
-                if marker_name.len() > 255 {
-                    return Err(format!(
-                        "managed-local retired marker for {} exceeds one-entry bounds",
-                        obsolete_anchor.name
-                    ));
-                }
-                if managed_local_compaction_cut!(device_id, RetireExactRefusal) {
-                    return Err("injected managed-local retire_exact refusal".into());
-                }
-                publication
-                    .retire_exact(&obsolete_anchor.name, &marker_name, &obsolete_anchor.bytes)
-                    .map_err(|error| {
-                        format!(
-                            "cannot retire managed-local active anchor {}: {error}",
-                            obsolete_anchor.name
-                        )
-                    })?;
-                if managed_local_compaction_cut!(device_id, AfterAnchorRetirement) {
-                    return Err("injected crash after exact managed-local anchor retirement".into());
-                }
-                let retained = retained_managed_local_anchor_tuples(
-                    &directory,
-                    self.legacy_binding
-                        .as_ref()
-                        .expect("managed-local runtime retains its legacy enrollment binding"),
-                    current_schema2_generation,
-                )?;
-                let retained_refusal = format!(
-                    "managed-local cleanup refuses to delete tuple still named by a retained anchor: {}",
-                    obsolete_anchor.name
-                );
-                remove_managed_local_anchor_tuple_unless_retained(
-                    &directory,
-                    &obsolete_anchor.tuple,
-                    &retained,
-                    device_id,
-                    &retained_refusal,
-                )?;
-                remove_managed_local_entry_if_present(&directory, &marker_name)?;
-                if managed_local_compaction_cut!(device_id, AfterRetiredMarkerDeletion) {
-                    return Err("injected crash after managed-local retired marker deletion".into());
-                }
-            }
-        }
-
-        // A cut after the exact rename leaves the marker as the only durable
-        // recipe for its tuple.  Finish all such recipes before considering
-        // loose artifacts, and never reinterpret a marker as authority.
-        let names = managed_local_directory_names(
-            &directory,
-            #[cfg(test)]
-            device_id,
-        )?;
-        let marker_names = names
-            .iter()
-            .filter(|name| name.starts_with("retired-") || name.ends_with(".anchor-retired"))
-            .cloned()
-            .collect::<Vec<_>>();
-        for marker_name in marker_names {
-            let retired = decode_managed_local_retired_anchor(
-                &directory,
-                &marker_name,
-                self.legacy_binding
-                    .as_ref()
-                    .expect("managed-local runtime retains its legacy enrollment binding"),
-            )?;
-            let active_names = managed_local_directory_names(
-                &directory,
-                #[cfg(test)]
-                device_id,
-            )?;
-            if active_names.iter().any(|name| name == &retired.active.name) {
-                return Err(format!(
-                    "managed-local cleanup refuses retired marker {marker_name}: its active anchor still exists"
-                ));
-            }
-            let retained = retained_managed_local_anchor_tuples(
-                &directory,
-                self.legacy_binding
-                    .as_ref()
-                    .expect("managed-local runtime retains its legacy enrollment binding"),
-                current_schema2_generation,
-            )?;
-            let retained_refusal = format!(
-                "managed-local cleanup refuses retired marker {marker_name}: its tuple is retained"
-            );
-            remove_managed_local_anchor_tuple_unless_retained(
-                &directory,
-                &retired.active.tuple,
-                &retained,
-                device_id,
-                &retained_refusal,
-            )?;
-            remove_managed_local_entry_if_present(&directory, &retired.marker_name)?;
-            if managed_local_compaction_cut!(device_id, AfterRetiredMarkerDeletion) {
-                return Err("injected crash after managed-local retired marker deletion".into());
-            }
-        }
-
-        let retained = retained_managed_local_anchor_tuples(
-            &directory,
-            self.legacy_binding
-                .as_ref()
-                .expect("managed-local runtime retains its legacy enrollment binding"),
-            current_schema2_generation,
-        )?;
-        let names = managed_local_directory_names(
-            &directory,
-            #[cfg(test)]
-            device_id,
-        )?;
-        let base_v1_segment = format!("device-{}.segment", device_id.simple());
-        let mut unanchored_v2_segments = BTreeSet::new();
-        for name in &names {
-            if let Some(segment) = managed_local_v2_artifact_base(name, device_id) {
-                if !retained.contains(&segment) {
-                    unanchored_v2_segments.insert(segment);
-                }
-            }
-        }
-        for segment_name in unanchored_v2_segments {
-            remove_managed_local_entry_if_present(&directory, &segment_name)?;
-            remove_managed_local_entry_if_present(
-                &directory,
-                &format!(
-                    "{segment_name}{}",
-                    tine_storage::formats::LOCAL_JOURNAL_FRONTIER_SUFFIX
-                ),
-            )?;
-        }
-        for name in &names {
-            if name == &base_v1_segment
-                || managed_local_generation_from_name(name, device_id, ".segment").is_some()
-            {
-                if !retained.contains(name) {
-                    remove_managed_local_entry_if_present(&directory, name)?;
-                }
-            }
-        }
-        let selected_checkpoint = active
-            .iter()
-            .find(|anchor| anchor.generation == current_schema2_generation)
-            .map(|anchor| anchor.checkpoint_sequence)
-            .ok_or_else(|| {
-                "managed-local cleanup lost the selected schema-2 checkpoint".to_owned()
-            })?;
-        for name in &names {
-            if managed_local_checkpoint_sequence(name)
-                .is_some_and(|sequence| sequence <= selected_checkpoint)
-            {
-                remove_managed_local_entry_if_present(&directory, name)?;
-            }
-        }
-
-        // The final namespace check is intentionally exact.  We only delete
-        // names proved by a retained anchor or one of the bounded cleanup
-        // grammars above; unfamiliar names remain visible as a refusal.
-        let names = managed_local_directory_names(
-            &directory,
-            #[cfg(test)]
-            device_id,
-        )?;
-        let retained = retained_managed_local_anchor_tuples(
-            &directory,
-            self.legacy_binding
-                .as_ref()
-                .expect("managed-local runtime retains its legacy enrollment binding"),
-            current_schema2_generation,
-        )?;
-        let active_names = managed_local_active_anchor_names(&names, device_id);
-        for name in &names {
-            if active_names.iter().any(|active_name| active_name == name)
-                || retained.contains(name)
-                || managed_local_checkpoint_sequence(name)
-                    .is_some_and(|sequence| sequence > selected_checkpoint)
-            {
-                continue;
-            }
-            return Err(format!(
-                "managed-local cleanup refuses unknown or malformed artifact {name}"
-            ));
-        }
-        Ok(())
-    }
-
-    fn prepare_publish_and_open_managed_local_v2_successor(
-        &mut self,
-        directory: &Dir,
-        device_id: Uuid,
-        selector_generation: u64,
-        checkpoint: ManagedLocalDrainCheckpoint,
-        accepted_batch_id: Option<BatchId>,
-        next_sequence: u64,
-    ) -> Result<ManagedLocalJournal<ManagedLocalJournalPayloadKind>, String> {
-        // Probe before any caller-owned v2 artifact is created. The retained
-        // publication is also the sole anchor publisher below.
-        let publication = DurableDirectoryPublication::open(directory).map_err(|error| {
-            format!("managed-local successor durable publication is unavailable: {error}")
-        })?;
-        let anchor = ManagedLocalGenerationAnchorV2::new(
-            selector_generation,
-            checkpoint,
-            accepted_batch_id,
-            Uuid::new_v4(),
-        )
-        .map_err(|error| format!("cannot construct managed-local successor anchor: {error}"))?;
-        let anchor_name = managed_local_v2_anchor_name(device_id, selector_generation);
-        let anchor_bytes = anchor
-            .encode()
-            .map_err(|error| format!("cannot encode managed-local successor anchor: {error}"))?;
-        LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(
-            directory,
-            anchor.selection(),
-        )
-        .map_err(|error| format!("cannot prepare managed-local successor tuple: {error}"))?;
-        if managed_local_compaction_cut!(device_id, AfterV2Prepare) {
-            return Err("injected crash after managed-local v2 tuple preparation".into());
-        }
-        let (prepared, recovery) =
-            LocalJournalSegmentV2::open_selected(directory, anchor.selection())
-                .map_err(|error| format!("cannot open managed-local successor tuple: {error}"))?;
-        if recovery.frames_recovered != 0
-            || recovery.discarded_tail_bytes != 0
-            || prepared.next_sequence() != next_sequence
-        {
-            return Err("managed-local successor tuple is not empty at the checkpoint".into());
-        }
-        if managed_local_compaction_cut!(device_id, BeforeAnchorPublication) {
-            return Err("injected crash before managed-local schema-2 anchor publication".into());
-        }
-
-        match publication.publish_new_exact(&anchor_name, &anchor_bytes) {
-            Ok(()) if !managed_local_compaction_cut!(device_id, AfterAnchorBeforeVerification) => {
-                Ok(ManagedLocalJournal::from_open_v2(
-                    selector_generation,
-                    prepared,
-                ))
-            }
-            Ok(()) => {
-                drop(prepared);
-                open_exact_managed_local_v2_successor(
-                    directory,
-                    self.legacy_binding
-                        .as_ref()
-                        .expect("managed-local runtime retains its legacy enrollment binding"),
-                    selector_generation,
-                    &anchor,
-                )
-                .map_err(|error| {
-                    self.latch_terminal(format!(
-                        "managed-local successor resolution failed after anchor publication: {error}"
-                    ));
-                    error
-                })
-            }
-            Err(publication_error) => {
-                drop(prepared);
-                open_exact_managed_local_v2_successor(
-                    directory,
-                    self.legacy_binding
-                        .as_ref()
-                        .expect("managed-local runtime retains its legacy enrollment binding"),
-                    selector_generation,
-                    &anchor,
-                )
-                .map_err(|resolution_error| {
-                    let detail = format!(
-                        "managed-local successor anchor publication failed ({publication_error}) and exact successor resolution failed: {resolution_error}"
-                    );
-                    self.latch_terminal(detail.clone());
-                    detail
                 })
             }
         }
@@ -20029,40 +17258,6 @@ impl RuntimeActor {
         SyncRuntimeTick::Idle
     }
 
-    fn provider_accepted_manifest_audit_matches_current_frontier(
-        &self,
-        current: &ProviderRecoveryCoverageRoot,
-    ) -> bool {
-        self.provider_accepted_manifest_audit_covered_sequence == current.acceptance_sequence
-            && self.provider_accepted_manifest_audit.is_none()
-    }
-
-    fn schedule_provider_incomplete_recheck_after_object_arrival(&mut self) {
-        // Coalesce any number of archive-object arrivals into one bounded pass
-        // over only manifests already known to be incomplete. If another new
-        // object is staged while that pass is active, retain one later wave so
-        // entries visited earlier can observe it without a history scan.
-        if !self.provider_incomplete.is_empty() {
-            self.provider_objects_changed = true;
-        }
-    }
-
-    fn adopt_provider_accepted_manifest_audit_coverage(
-        &mut self,
-        covered_sequence: u64,
-        target_sequence: u64,
-    ) -> Result<(), SyncRuntimeRequestError> {
-        if covered_sequence > target_sequence {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "accepted manifest audit coverage {covered_sequence} outruns frontier {target_sequence}"
-            )));
-        }
-        self.provider_accepted_manifest_audit_covered_sequence = self
-            .provider_accepted_manifest_audit_covered_sequence
-            .max(covered_sequence);
-        Ok(())
-    }
-
     fn submit_local_mutation(
         &mut self,
         transaction: OperationTransaction,
@@ -20122,13 +17317,6 @@ impl RuntimeActor {
             batch_id: None,
             phase: SyncLocalMutationPhase::Bindings,
         }
-    }
-
-    fn execute_local_transaction(
-        &mut self,
-        transaction: OperationTransaction,
-    ) -> SyncLocalMutationOutcome {
-        self.execute_local_transaction_with_batch_id(transaction, None, None)
     }
 
     fn execute_local_transaction_with_batch_id(
@@ -20613,12 +17801,6 @@ impl RuntimeActor {
             .map_err(SyncRuntimeRequestError::ActorRefused)
     }
 
-    fn latch_terminal(&mut self, detail: String) {
-        self.terminal = Some(detail);
-        self.refresh_watcher();
-        self.clean.take();
-    }
-
     fn refresh_watcher(&mut self) {
         if let Some(clean) = &self.clean {
             self.last_watcher = clean.watcher_status();
@@ -20779,42 +17961,6 @@ fn derived_editor_invalid_request_stage(reason: SyncEditorInvalidRequest) -> &'s
     }
 }
 
-/// Carry an application-layer refusal back into the editor error surface
-/// without discarding where it came from.
-fn map_application_editor_error(error: SyncApplicationPageRequestError) -> SyncEditorRequestError {
-    match error {
-        SyncApplicationPageRequestError::ActorUnavailable => {
-            SyncEditorRequestError::ActorUnavailable
-        }
-        SyncApplicationPageRequestError::ActorRefusedAt(stage) => {
-            SyncEditorRequestError::ActorRefusedAt(stage)
-        }
-        SyncApplicationPageRequestError::ActorRefusedWithCode(code) => {
-            SyncEditorRequestError::ActorRefusedWithCode(code)
-        }
-        SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage, code } => {
-            SyncEditorRequestError::ActorRefusedAtWithCode { stage, code }
-        }
-        SyncApplicationPageRequestError::ActorRefusedWithDebugDetail { code, debug_detail } => {
-            SyncEditorRequestError::ActorRefusedWithDebugDetail { code, debug_detail }
-        }
-        SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
-            stage,
-            code,
-            debug_detail,
-        } => SyncEditorRequestError::ActorRefusedAtWithDebugDetail {
-            stage,
-            code,
-            debug_detail,
-        },
-        SyncApplicationPageRequestError::RequestTooLarge(size) => {
-            SyncEditorRequestError::RequestTooLarge(size)
-        }
-        SyncApplicationPageRequestError::InvalidRequest(_)
-        | SyncApplicationPageRequestError::ActorRefused => SyncEditorRequestError::ActorRefused,
-    }
-}
-
 fn editor_refusal_at(error: SyncEditorRequestError, stage: &'static str) -> SyncEditorRequestError {
     match error {
         SyncEditorRequestError::ActorRefused => SyncEditorRequestError::ActorRefusedAt(stage),
@@ -20841,20 +17987,6 @@ fn editor_refusal_with_code(
             SyncEditorRequestError::ActorRefusedWithCode(code)
         }
         other => other,
-    }
-}
-
-fn trusted_local_preparation_refusal(
-    error: crate::oplog::operational_coordinator::OperationalCoordinatorError,
-) -> SyncEditorRequestError {
-    let code = trusted_local_preparation_refusal_code(error.phase());
-    if runtime_debug_diagnostics_enabled() {
-        SyncEditorRequestError::ActorRefusedWithDebugDetail {
-            code,
-            debug_detail: error.to_string(),
-        }
-    } else {
-        SyncEditorRequestError::ActorRefusedWithCode(code)
     }
 }
 
@@ -20885,59 +18017,6 @@ fn trusted_local_preparation_refusal_code(phase: OperationalPhase) -> SyncEditor
 fn runtime_debug_diagnostics_enabled() -> bool {
     matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
         || std::env::args().any(|argument| argument == "--debug")
-}
-
-fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorRequestError {
-    let code = match error {
-        TrustedLocalCommitError::InvalidPreparedInput(_) => {
-            SyncEditorRefusalCode::TrustedLocalCommitInvalidPreparedInput
-        }
-        TrustedLocalCommitError::ManagedRecord(_) => {
-            SyncEditorRefusalCode::TrustedLocalCommitManagedRecord
-        }
-        TrustedLocalCommitError::PrecommitGraph(_) => {
-            SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph
-        }
-        TrustedLocalCommitError::JournalAppend(ManagedLocalAppendError::DefinitelyNotAppended(
-            _,
-        ))
-        | TrustedLocalCommitError::JournalAppend(
-            ManagedLocalAppendError::DefinitelyNotAppendedStorage(_),
-        ) => SyncEditorRefusalCode::TrustedLocalCommitAppendRefused,
-        TrustedLocalCommitError::JournalAppend(ManagedLocalAppendError::AppendOutcomeUnknown(
-            _,
-        )) => SyncEditorRefusalCode::TrustedLocalAppendOutcomeUnknown,
-    };
-    SyncEditorRequestError::ActorRefusedWithCode(code)
-}
-
-fn decode_managed_editor_record(
-    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-) -> Result<crate::oplog::ManagedLocalRecord, SyncEditorRequestError> {
-    decode_managed_local_record(frame).map_err(|_| {
-        SyncEditorRequestError::ActorRefusedWithCode(SyncEditorRefusalCode::ManagedRecordDecode)
-    })
-}
-
-fn validate_managed_editor_queue_admission(
-    journal_next_sequence: u64,
-    committed_sequence: u64,
-    queued_last_sequence: Option<u64>,
-) -> Result<(), SyncEditorRequestError> {
-    let expected_next =
-        committed_sequence
-            .checked_add(1)
-            .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
-                SyncEditorRefusalCode::ManagedSequenceOverflow,
-            ))?;
-    if journal_next_sequence != expected_next
-        || queued_last_sequence.is_some_and(|sequence| sequence >= committed_sequence)
-    {
-        return Err(SyncEditorRequestError::ActorRefusedWithCode(
-            SyncEditorRefusalCode::ManagedQueueMonotonicity,
-        ));
-    }
-    Ok(())
 }
 
 fn map_application_conflict(reason: SyncEditorConflict) -> SyncApplicationPageConflict {
@@ -21407,31 +18486,6 @@ fn relabel_application_blocks_for_merge(blocks: &mut [BlockDto], next: &mut usiz
     }
 }
 
-fn editor_name_state(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    name: String,
-    page_kind: SyncPageKind,
-) -> Result<EditorNameState, SyncEditorRequestError> {
-    editor_name_state_for_format_with_engine(
-        runtime.engine(),
-        graph,
-        name,
-        page_kind,
-        graph.preferred_format(),
-    )
-}
-
-fn editor_name_state_for_format(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    name: String,
-    page_kind: SyncPageKind,
-    format: Format,
-) -> Result<EditorNameState, SyncEditorRequestError> {
-    editor_name_state_for_format_with_engine(runtime.engine(), graph, name, page_kind, format)
-}
-
 fn editor_name_state_for_format_with_engine(
     engine: &ShardedHotEngine,
     graph: &Graph,
@@ -21479,21 +18533,6 @@ fn editor_name_state_for_format_with_engine(
         path,
         revision,
     })
-}
-
-fn projected_editor_name_state(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    name: String,
-    page_kind: SyncPageKind,
-) -> Result<EditorNameState, SyncEditorRequestError> {
-    projected_editor_name_state_from_projection(
-        runtime.engine(),
-        runtime.database(),
-        graph,
-        name,
-        page_kind,
-    )
 }
 
 fn projected_editor_name_state_from_projection(
@@ -21559,28 +18598,6 @@ fn projected_editor_name_state_from_projection(
     })
 }
 
-fn load_projected_editor_page(
-    runtime: &PromotedLocalRuntime,
-    page_id: PageId,
-) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    load_projected_page_with_block_limit(runtime, page_id, MAX_SYNC_EDITOR_BLOCKS)
-}
-
-fn load_projected_application_page(
-    runtime: &PromotedLocalRuntime,
-    page_id: PageId,
-) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    load_projected_page_with_block_limit(runtime, page_id, MAX_SYNC_APPLICATION_PAGE_BLOCKS)
-}
-
-fn load_projected_page_with_block_limit(
-    runtime: &PromotedLocalRuntime,
-    page_id: PageId,
-    block_limit: usize,
-) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    load_projected_page_from_projection(runtime.engine(), runtime.database(), page_id, block_limit)
-}
-
 fn load_projected_page_from_projection(
     engine: &ShardedHotEngine,
     database: &crate::oplog::SqliteFrontier,
@@ -21628,13 +18645,6 @@ fn load_projected_page_from_projection(
     }))
 }
 
-fn load_current_editor_page(
-    runtime: &PromotedLocalRuntime,
-    page_id: PageId,
-) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    load_current_editor_page_from_projection(runtime.engine(), runtime.database(), page_id)
-}
-
 fn load_current_editor_page_from_projection(
     engine: &ShardedHotEngine,
     database: &crate::oplog::SqliteFrontier,
@@ -21670,33 +18680,6 @@ fn editor_current_page_from_materialized(
     Ok(EditorCurrentPage { page, blocks, dto })
 }
 
-fn load_hot_source_authenticated_application_page(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    page_id: PageId,
-) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    load_hot_source_authenticated_page_with_block_limit_from_engine(
-        runtime.engine(),
-        graph,
-        page_id,
-        MAX_SYNC_APPLICATION_PAGE_BLOCKS,
-    )
-}
-
-fn load_hot_source_authenticated_page_with_block_limit(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    page_id: PageId,
-    block_limit: usize,
-) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    load_hot_source_authenticated_page_with_block_limit_from_engine(
-        runtime.engine(),
-        graph,
-        page_id,
-        block_limit,
-    )
-}
-
 fn load_hot_source_authenticated_page_with_block_limit_from_engine(
     engine: &ShardedHotEngine,
     graph: &Graph,
@@ -21727,21 +18710,6 @@ fn load_hot_source_authenticated_page_with_block_limit_from_engine(
         .map_err(|_| SyncEditorRequestError::ActorRefusedAt("hot_source_join"))
 }
 
-fn load_preferred_source_authenticated_application_page(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    page_id: PageId,
-    projected_available: bool,
-) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    load_preferred_source_authenticated_application_page_from_parts(
-        runtime.engine(),
-        runtime.database(),
-        graph,
-        page_id,
-        projected_available,
-    )
-}
-
 fn load_preferred_source_authenticated_application_page_from_parts(
     engine: &ShardedHotEngine,
     database: &crate::oplog::SqliteFrontier,
@@ -21763,19 +18731,6 @@ fn load_preferred_source_authenticated_application_page_from_parts(
         graph,
         page_id,
         MAX_SYNC_APPLICATION_PAGE_BLOCKS,
-    )
-}
-
-fn load_projected_source_authenticated_application_page(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    page_id: PageId,
-) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    load_projected_source_authenticated_application_page_from_parts(
-        runtime.engine(),
-        runtime.database(),
-        graph,
-        page_id,
     )
 }
 
@@ -21836,19 +18791,6 @@ fn load_projected_source_authenticated_application_page_from_parts(
     joined
         .map(Some)
         .map_err(|_| SyncEditorRequestError::ActorRefusedAt("projected_source_join"))
-}
-
-fn load_projected_source_rebased_application_page(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    page_id: PageId,
-) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    load_projected_source_rebased_application_page_from_parts(
-        runtime.engine(),
-        runtime.database(),
-        graph,
-        page_id,
-    )
 }
 
 fn load_projected_source_rebased_application_page_from_parts(
@@ -22017,20 +18959,6 @@ fn rebase_projected_editor_page_from_source(
     Ok(())
 }
 
-fn load_hot_source_authenticated_editor_page(
-    runtime: &PromotedLocalRuntime,
-    graph: &Graph,
-    page_id: PageId,
-) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    load_hot_source_authenticated_page_with_block_limit_from_engine(
-        runtime.engine(),
-        graph,
-        page_id,
-        MAX_SYNC_EDITOR_BLOCKS,
-    )
-    .map(|current| current.map(|current| current.editor))
-}
-
 fn editor_materialization_matches(
     authoritative: &MaterializedPage,
     projected: &MaterializedPage,
@@ -22091,17 +19019,6 @@ fn materialized_page_from_projection(
             .collect(),
         stats: crate::oplog::MaterializationStats::default(),
     })
-}
-
-fn ensure_editor_frontier(
-    runtime: &PromotedLocalRuntime,
-    sqlite_acceptance_sequence: u64,
-) -> Result<(), SyncEditorRequestError> {
-    ensure_editor_frontier_parts(
-        runtime.engine(),
-        runtime.database(),
-        sqlite_acceptance_sequence,
-    )
 }
 
 fn ensure_editor_frontier_parts(
@@ -22935,17 +19852,6 @@ fn display(error: impl fmt::Display) -> String {
     error.to_string()
 }
 
-fn map_recovery(recovery: RuntimeRecoveryState) -> SyncRuntimeRecovery {
-    match recovery {
-        RuntimeRecoveryState::FirstPromotion => SyncRuntimeRecovery::FirstPromotion,
-        RuntimeRecoveryState::ResumedOwnUnsafe => SyncRuntimeRecovery::ResumedOwnUnsafe,
-        RuntimeRecoveryState::AdoptedSafeHandoff => SyncRuntimeRecovery::AdoptedSafeHandoff,
-        RuntimeRecoveryState::TookOverCrashedUnsafe { .. } => {
-            SyncRuntimeRecovery::TookOverCrashedUnsafe
-        }
-    }
-}
-
 fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {
     match phase {
         OperationalPhase::Bindings => SyncLocalMutationPhase::Bindings,
@@ -22974,37 +19880,6 @@ fn pending_local_identity(
     }
 }
 
-fn local_outcome_identity(
-    outcome: SyncLocalMutationOutcome,
-) -> (Option<BatchId>, SyncLocalMutationPhase) {
-    match outcome {
-        SyncLocalMutationOutcome::Durable { batch_id } => {
-            (Some(batch_id), SyncLocalMutationPhase::ProjectionDrain)
-        }
-        SyncLocalMutationOutcome::RetryableRetainedRecovery { batch_id, phase }
-        | SyncLocalMutationOutcome::Blocked {
-            batch_id, phase, ..
-        }
-        | SyncLocalMutationOutcome::Revoked { batch_id, phase } => (batch_id, phase),
-    }
-}
-
-fn map_watcher(status: crate::oplog::watcher_queue::WatcherQueueStatus) -> SyncWatcherStatus {
-    SyncWatcherStatus {
-        latest_enqueue: status.latest_enqueue.sequence(),
-        acknowledged: status.acknowledged.sequence(),
-        drain_in_flight: status.drain_in_flight.is_some(),
-        pending: status.pending,
-        pending_requires_full_scan: status.pending_requires_full_scan,
-        deferred: status.deferred,
-        quiescing: status.quiescing,
-        sequence_exhausted: status.sequence_exhausted,
-        // The legacy managed-local queue has no bounded full scan to report.
-        full_scan_documents_read_in_slowest_turn: 0,
-        full_scan_documents_read: 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -23018,18 +19893,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use uuid::Uuid;
-
-    #[test]
-    fn activation_rediscovery_does_not_erase_the_physical_failure() {
-        let detail = retain_activation_failure_detail(
-            "initialize private receipt store: open namespace: permission denied".into(),
-            "activation can be resumed".into(),
-        );
-        assert_eq!(
-            detail,
-            "initialize private receipt store: open namespace: permission denied; storage rediscovery: activation can be resumed"
-        );
-    }
 
     #[test]
     fn pre_promotion_receipt_retry_preserves_one_diagnostic_tree() {
@@ -23207,37 +20070,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_local_compaction_faults_are_isolated_per_device() {
-        let first = Uuid::from_u128(0xf001_0001);
-        let second = Uuid::from_u128(0xf001_0002);
-        fail_managed_local_compaction_once_at(
-            first,
-            ManagedLocalCompactionFaultPoint::AfterAnchorRetirement,
-        );
-        fail_managed_local_compaction_once_at(
-            second,
-            ManagedLocalCompactionFaultPoint::AfterSegmentDeletion,
-        );
-
-        assert!(managed_local_compaction_fault(
-            first,
-            ManagedLocalCompactionFaultPoint::AfterAnchorRetirement
-        ));
-        assert!(managed_local_compaction_fault(
-            second,
-            ManagedLocalCompactionFaultPoint::AfterSegmentDeletion
-        ));
-        assert!(!managed_local_compaction_fault(
-            first,
-            ManagedLocalCompactionFaultPoint::AfterAnchorRetirement
-        ));
-        assert!(!managed_local_compaction_fault(
-            second,
-            ManagedLocalCompactionFaultPoint::AfterSegmentDeletion
-        ));
-    }
-
-    #[test]
     fn application_search_lane_epoch_cancels_only_the_older_same_lane_request() {
         let lanes = Mutex::new(HashMap::new());
         let first = begin_application_search_cancellation(&lanes, "ctrl-k");
@@ -23390,33 +20222,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_save_queue_refusals_distinguish_overflow_from_monotonicity() {
-        assert_eq!(
-            validate_managed_editor_queue_admission(u64::MAX, u64::MAX, None),
-            Err(SyncEditorRequestError::ActorRefusedWithCode(
-                SyncEditorRefusalCode::ManagedSequenceOverflow,
-            ))
-        );
-        assert_eq!(
-            validate_managed_editor_queue_admission(8, 8, None),
-            Err(SyncEditorRequestError::ActorRefusedWithCode(
-                SyncEditorRefusalCode::ManagedQueueMonotonicity,
-            ))
-        );
-        assert_eq!(
-            validate_managed_editor_queue_admission(8, 7, Some(7)),
-            Err(SyncEditorRequestError::ActorRefusedWithCode(
-                SyncEditorRefusalCode::ManagedQueueMonotonicity,
-            ))
-        );
-        assert_eq!(
-            validate_managed_editor_queue_admission(8, 7, Some(6)),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn trusted_local_preparation_and_commit_substages_map_without_nested_detail() {
+    fn trusted_local_preparation_substages_map_without_nested_detail() {
         let preparation = [
             (
                 OperationalPhase::Bindings,
@@ -23466,37 +20272,6 @@ mod tests {
         for (phase, code) in preparation {
             assert_eq!(trusted_local_preparation_refusal_code(phase), code);
         }
-
-        let nested = "private/page.md user-id page text";
-        let commit_errors = [
-            (
-                TrustedLocalCommitError::InvalidPreparedInput(nested.into()),
-                SyncEditorRefusalCode::TrustedLocalCommitInvalidPreparedInput,
-            ),
-            (
-                TrustedLocalCommitError::ManagedRecord(
-                    crate::oplog::ManagedLocalRecordError::CorruptPayload(nested.into()),
-                ),
-                SyncEditorRefusalCode::TrustedLocalCommitManagedRecord,
-            ),
-            (
-                TrustedLocalCommitError::PrecommitGraph(std::io::Error::other(nested)),
-                SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph,
-            ),
-            (
-                TrustedLocalCommitError::JournalAppend(
-                    ManagedLocalAppendError::DefinitelyNotAppended(
-                        crate::oplog::ManagedLocalRecordError::WrongDurabilityProof,
-                    ),
-                ),
-                SyncEditorRefusalCode::TrustedLocalCommitAppendRefused,
-            ),
-        ];
-        for (error, code) in commit_errors {
-            let mapped = trusted_local_commit_refusal(error);
-            assert_eq!(mapped, SyncEditorRequestError::ActorRefusedWithCode(code));
-            assert!(!mapped.to_string().contains(nested));
-        }
     }
 
     #[test]
@@ -23523,22 +20298,6 @@ mod tests {
         );
         assert!(!application.to_string().contains(nested));
         assert_eq!(application.debug_detail(), Some(nested));
-    }
-
-    #[test]
-    fn managed_save_record_decode_has_an_exact_code() {
-        let invalid = LocalJournalFrame::new(
-            Uuid::new_v4(),
-            0,
-            ManagedLocalJournalPayloadKind::RecordV1,
-            vec![0xff],
-        );
-        assert!(matches!(
-            decode_managed_editor_record(&invalid),
-            Err(SyncEditorRequestError::ActorRefusedWithCode(
-                SyncEditorRefusalCode::ManagedRecordDecode
-            ))
-        ));
     }
 
     #[test]
@@ -23891,6 +20650,31 @@ mod tests {
         }
     }
 
+    /// Legacy managed-local generation filenames. Production no longer mints
+    /// or rotates these names (stage 2d retired the anchor-tuple family); the
+    /// crash-history regressions still read journals that older fixtures left
+    /// behind, so the two decoders live here with their only remaining caller.
+    fn managed_local_generation_segment_filename(device_id: Uuid, generation: u64) -> String {
+        format!(
+            "device-{}-generation-{generation:020}.segment",
+            device_id.simple()
+        )
+    }
+
+    fn managed_local_generation_from_name(
+        name: &str,
+        device_id: Uuid,
+        suffix: &str,
+    ) -> Option<u64> {
+        let prefix = format!("device-{}-generation-", device_id.simple());
+        let digits = name.strip_prefix(&prefix)?.strip_suffix(suffix)?;
+        if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let generation = digits.parse().ok()?;
+        (format!("{generation:020}") == digits).then_some(generation)
+    }
+
     fn managed_local_journal_frames(
         request: &SyncRuntimeOpenRequest,
     ) -> Vec<LocalJournalFrame<ManagedLocalJournalPayloadKind>> {
@@ -24019,51 +20803,6 @@ mod tests {
             .expect("managed-local segment has a canonical device UUID")
     }
 
-    fn managed_local_file_names(request: &SyncRuntimeOpenRequest) -> Vec<String> {
-        let mut names = fs::read_dir(managed_local_workspace_directory(request))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
-    fn install_empty_legacy_managed_local_journal(request: &SyncRuntimeOpenRequest) -> Uuid {
-        let fresh = active_handle(SyncRuntimeHandle::open(request.clone()));
-        assert!(matches!(
-            fresh.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-        let directory_path = managed_local_workspace_directory(request);
-        let names = managed_local_file_names(request);
-        let segment_names = names
-            .iter()
-            .filter(|name| name.ends_with(".journal-v2"))
-            .cloned()
-            .collect::<Vec<_>>();
-        let device_id = managed_local_test_device_id(&segment_names);
-        let anchor_name = names
-            .iter()
-            .filter(|name| name.ends_with(".anchor-v2"))
-            .max()
-            .expect("fresh managed state has one schema-2 anchor");
-        // Deliberately leave the former segment/frontier pair in place. It is
-        // now unanchored residue and must neither authorize nor block legacy
-        // rollover's random retry tuple.
-        fs::remove_file(directory_path.join(anchor_name)).unwrap();
-        let directory = Dir::open_ambient_dir(&directory_path, ambient_authority()).unwrap();
-        let legacy_name = format!("device-{}.segment", device_id.simple());
-        let (legacy, recovery) = LocalJournalSegment::<ManagedLocalJournalPayloadKind>::open(
-            &directory,
-            &legacy_name,
-            device_id,
-        )
-        .unwrap();
-        assert_eq!(recovery.frames_recovered, 0);
-        drop(legacy);
-        device_id
-    }
-
     fn drain_managed_local(handle: &SyncRuntimeHandle) {
         for _ in 0..4096 {
             if handle.status().unwrap().managed_local_pending == 0 {
@@ -24073,53 +20812,6 @@ mod tests {
             handle.tick().unwrap();
         }
         panic!("managed-local drain did not settle");
-    }
-
-    fn cross_managed_local_schema2_compaction_threshold(
-        handle: &SyncRuntimeHandle,
-        mut page: PageDto,
-        mut revision: String,
-        label: &str,
-    ) -> (PageDto, String) {
-        for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
-            (page, revision) =
-                save_application_block_text(handle, page, revision, &format!("{label} {index}"));
-        }
-        drain_managed_local(handle);
-        (page, revision)
-    }
-
-    fn managed_local_active_anchor_names_for_test(
-        request: &SyncRuntimeOpenRequest,
-        device_id: Uuid,
-    ) -> Vec<String> {
-        managed_local_file_names(request)
-            .into_iter()
-            .filter(|name| {
-                managed_local_generation_from_name(name, device_id, ".anchor").is_some()
-                    || parse_managed_local_v2_anchor_name(name, device_id).is_some()
-            })
-            .collect()
-    }
-
-    fn managed_local_tuple_bytes_for_test(
-        request: &SyncRuntimeOpenRequest,
-    ) -> BTreeMap<String, Vec<u8>> {
-        let directory = managed_local_workspace_directory(request);
-        managed_local_file_names(request)
-            .into_iter()
-            .filter(|name| {
-                name.ends_with(".anchor")
-                    || name.ends_with(".anchor-v2")
-                    || name.ends_with(".segment")
-                    || name.ends_with(".journal-v2")
-                    || name.ends_with(tine_storage::formats::LOCAL_JOURNAL_FRONTIER_SUFFIX)
-            })
-            .map(|name| {
-                let bytes = fs::read(directory.join(&name)).unwrap();
-                (name, bytes)
-            })
-            .collect()
     }
 
     fn save_application_block_text(
@@ -24476,13 +21168,6 @@ mod tests {
             .expect("application unit transaction retains a narrow boundary");
         assert!(unit.contains("SyncLocalMutationOutcome::Durable"));
         assert!(unit.contains("settle_application_publication"));
-
-        let recovery = production
-            .split_once("fn open_managed_local_runtime(")
-            .and_then(|(_, tail)| tail.split_once("\nimpl RuntimeActor").map(|(body, _)| body))
-            .expect("managed-local open retains a narrow boundary");
-        assert!(recovery.contains("latest_task_query_overlay_after_recovery"));
-        assert!(recovery.contains("drop(session)"));
     }
 
     fn assert_managed_sparse_task_query_hot_overlay_is_candidate_bounded(
@@ -28491,14 +25176,6 @@ mod tests {
                 "unexpected stage {stage}"
             );
         }
-        // The reverse direction must not discard a named application refusal
-        // either: the trusted-response join runs inside the editor turn.
-        assert_eq!(
-            map_application_editor_error(SyncApplicationPageRequestError::ActorRefusedAt(
-                "managed_read_block_count"
-            )),
-            SyncEditorRequestError::ActorRefusedAt("managed_read_block_count")
-        );
     }
 
     #[test]
@@ -30247,146 +26924,6 @@ mod tests {
             joined.is_ok(),
             "canonical manifest reappearance did not resume the recovery-backed join: {joined:?}"
         );
-    }
-
-    #[test]
-    fn shared_join_stable_independent_local_tail_remains_terminal() {
-        let initiator = make_shared_fixture("join-independent-tail-initiator", 0xa220);
-        let mut joiner = make_shared_fixture("join-independent-tail-joiner", 0xa220);
-        joiner.request.identities.endpoint_id =
-            ProjectionEndpointId::from_uuid(Uuid::from_u128(0xa230));
-        joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(0xa231));
-        joiner.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(0xa232));
-
-        let initiator_active =
-            SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone());
-        let initiator_handle = initiator_active.handle.expect("initiator LocalActive");
-        drive_initial_feed(&initiator_handle);
-        let descriptor = initiator_handle.prepare_shared().unwrap();
-        copy_provider_tree(
-            &initiator.request.provider_root,
-            &joiner.request.provider_root,
-        );
-
-        let joiner_active = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone());
-        let joiner_handle = joiner_active.handle.expect("joiner LocalActive");
-        drive_initial_feed(&joiner_handle);
-        let (local_batch, ..) = submit_shared_page(
-            &joiner_handle,
-            0xa238,
-            "Independent Local Tail",
-            "notes/independent-local-tail.md",
-            "must never be silently discarded into another lineage",
-        );
-        let receipt =
-            local_authorship_receipt_path(&joiner.request.provider_journal_root, local_batch)
-                .unwrap();
-        assert!(
-            receipt.is_file(),
-            "local acceptance did not mint provenance"
-        );
-        drop(joiner_handle);
-        let joiner_handle = active_handle(SyncRuntimeHandle::open(reopen_request(&joiner.request)));
-        let graph_before = user_graph_bytes(&joiner.graph_root);
-        let refusal = joiner_handle.join_shared(descriptor);
-        assert!(
-            matches!(
-                refusal,
-                Err(SyncRuntimeRequestError::ActorRefused(ref detail))
-                    if detail.contains("unique unprojected local operations")
-            ),
-            "stable independent local tail did not block terminally: {refusal:?}"
-        );
-        assert_eq!(
-            user_graph_bytes(&joiner.graph_root),
-            graph_before,
-            "dirty-tail refusal changed projection bytes"
-        );
-        let graph = Graph::open_checked(&joiner.graph_root).unwrap();
-        let classification = discover_startup(&DiscoveryRequest {
-            profile: StartupStorageProfile::ExperimentalSparse,
-            graph_resource_id: graph.canonical_resource_id().unwrap(),
-            runtime_root: &joiner.request.enrollment_root,
-            archive_root: &joiner.request.archive_root,
-        });
-        assert!(
-            matches!(
-                classification,
-                DiscoveryClassification::Blocked(ref blocked)
-                    if blocked.reason_code == "shared.dirty-unique-tail"
-            ),
-            "stable dirty-tail evidence was not durably terminal: {classification:?}"
-        );
-    }
-
-    #[test]
-    fn shared_join_missing_or_tampered_local_authorship_receipt_is_retryable() {
-        for (index, tamper) in [false, true].into_iter().enumerate() {
-            let seed = 0xa240 + (index as u128) * 0x20;
-            let initiator =
-                make_shared_fixture(&format!("join-provenance-initiator-{index}"), seed);
-            let mut joiner = make_shared_fixture(&format!("join-provenance-joiner-{index}"), seed);
-            joiner.request.identities.endpoint_id =
-                ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 0x10));
-            joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
-            joiner.request.identities.session_id =
-                SessionId::from_uuid(Uuid::from_u128(seed + 0x12));
-
-            let initiator_active =
-                SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone());
-            let initiator_handle = initiator_active.handle.expect("initiator LocalActive");
-            drive_initial_feed(&initiator_handle);
-            let descriptor = initiator_handle.prepare_shared().unwrap();
-            copy_provider_tree(
-                &initiator.request.provider_root,
-                &joiner.request.provider_root,
-            );
-
-            let joiner_active = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone());
-            let joiner_handle = joiner_active.handle.expect("joiner LocalActive");
-            drive_initial_feed(&joiner_handle);
-            let (local_batch, ..) = submit_shared_page(
-                &joiner_handle,
-                seed + 0x18,
-                "Ambiguous Local Tail",
-                "notes/ambiguous-local-tail.md",
-                "missing positive provenance must not become terminal",
-            );
-            let receipt =
-                local_authorship_receipt_path(&joiner.request.provider_journal_root, local_batch)
-                    .unwrap();
-            assert!(receipt.is_file());
-            if tamper {
-                fs::write(&receipt, b"{}").unwrap();
-            } else {
-                fs::remove_file(&receipt).unwrap();
-            }
-
-            let refusal = joiner_handle.join_shared(descriptor);
-            assert!(
-                matches!(
-                    refusal,
-                    Err(SyncRuntimeRequestError::ActorRefused(ref detail))
-                        if detail.contains("local-authorship receipt")
-                            || detail.contains("LocalActive authorship receipt")
-                ),
-                "ambiguous local provenance was not retryable: tamper={tamper}, {refusal:?}"
-            );
-            let graph = Graph::open_checked(&joiner.graph_root).unwrap();
-            let classification = discover_startup(&DiscoveryRequest {
-                profile: StartupStorageProfile::ExperimentalSparse,
-                graph_resource_id: graph.canonical_resource_id().unwrap(),
-                runtime_root: &joiner.request.enrollment_root,
-                archive_root: &joiner.request.archive_root,
-            });
-            assert!(
-                matches!(
-                    classification,
-                    DiscoveryClassification::ExistingLocalActive(_)
-                ),
-                "ambiguous local provenance mutated enrollment: {classification:?}"
-            );
-        }
     }
 
     fn make_shared_fixture(label: &str, seed: u128) -> ActivationFixture {
@@ -35710,104 +32247,6 @@ mod tests {
             restarted.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
-    }
-
-    #[test]
-    fn provider_dependency_index_handles_multiple_parents_active_heads_and_duplicates() {
-        let active_base = BatchId::from_uuid(Uuid::from_u128(0xd800));
-        let first_parent = BatchId::from_uuid(Uuid::from_u128(0xd801));
-        let second_parent = BatchId::from_uuid(Uuid::from_u128(0xd802));
-        let unrelated = BatchId::from_uuid(Uuid::from_u128(0xd803));
-        let child_low = BatchId::from_uuid(Uuid::from_u128(0xd810));
-        let child_high = BatchId::from_uuid(Uuid::from_u128(0xd811));
-        let child_dependencies = vec![active_base, first_parent, second_parent];
-        let mut index = ProviderDependencyIndex::default();
-        let mut inspected_dependencies = Vec::new();
-
-        assert!(index
-            .register(child_high, vec![second_parent], |dependency| {
-                inspected_dependencies.push(dependency);
-                Ok::<_, ()>(dependency == active_base)
-            },)
-            .unwrap());
-        assert!(index
-            .register(child_low, child_dependencies.clone(), |dependency| {
-                inspected_dependencies.push(dependency);
-                Ok::<_, ()>(dependency == active_base)
-            },)
-            .unwrap());
-        assert_eq!(
-            index.pending[&child_low].causal_dependencies,
-            child_dependencies
-        );
-        assert_eq!(index.pending[&child_low].unmet_dependencies, 2);
-        assert_eq!(index.ready_front(), None);
-
-        assert!(!index
-            .register(child_low, Vec::new(), |_| -> Result<bool, ()> {
-                panic!("duplicate registration reinspected dependencies")
-            })
-            .unwrap());
-        assert!(index
-            .register(first_parent, Vec::new(), |_| Ok::<_, ()>(false))
-            .unwrap());
-        assert_eq!(index.ready_front(), Some(first_parent));
-        index.accept_ready(first_parent);
-        assert_eq!(index.pending[&child_low].unmet_dependencies, 1);
-        assert_eq!(index.ready_front(), None);
-
-        assert!(index
-            .register(unrelated, Vec::new(), |_| Ok::<_, ()>(false))
-            .unwrap());
-        index.accept_ready(unrelated);
-        assert_eq!(index.ready_front(), None);
-
-        assert!(index
-            .register(second_parent, Vec::new(), |_| Ok::<_, ()>(false))
-            .unwrap());
-        index.accept_ready(second_parent);
-        assert_eq!(
-            index.ready_front(),
-            Some(child_low),
-            "dependents awakened together must use deterministic BatchId order"
-        );
-        index.accept_ready(child_low);
-        assert_eq!(index.ready_front(), Some(child_high));
-        index.accept_ready(child_high);
-        assert!(index.is_empty());
-        assert_eq!(
-            inspected_dependencies,
-            vec![second_parent, active_base, first_parent, second_parent],
-            "each declared dependency edge must be inspected exactly once"
-        );
-    }
-
-    #[test]
-    fn provider_dependency_index_rechecks_authenticated_frontier_ancestors() {
-        let direct = BatchId::from_uuid(Uuid::from_u128(0xd820));
-        let transitive = BatchId::from_uuid(Uuid::from_u128(0xd821));
-        let missing = BatchId::from_uuid(Uuid::from_u128(0xd822));
-        let child = BatchId::from_uuid(Uuid::from_u128(0xd823));
-        let mut index = ProviderDependencyIndex::default();
-        index
-            .register(child, vec![direct, transitive, missing], |dependency| {
-                Ok::<_, ()>(dependency == direct)
-            })
-            .unwrap();
-        assert_eq!(index.pending[&child].unmet_dependencies, 2);
-
-        index
-            .recheck_satisfied(|dependency| Ok::<_, ()>(dependency == transitive))
-            .unwrap();
-        assert_eq!(index.pending[&child].unmet_dependencies, 1);
-        assert_eq!(index.ready_front(), None);
-
-        index
-            .recheck_satisfied(|dependency| Ok::<_, ()>(dependency == missing))
-            .unwrap();
-        assert_eq!(index.ready_front(), Some(child));
-        index.accept_ready(child);
-        assert!(index.is_empty());
     }
 
     #[test]
