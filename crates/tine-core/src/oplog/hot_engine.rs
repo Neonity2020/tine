@@ -8949,11 +8949,48 @@ impl ShardedHotEngine {
                                 &archive, &work,
                             )
                             .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                            decoded.target_bytes().map(<[u8]>::to_vec).ok_or_else(|| {
-                                EngineError::ProjectionManifest(format!(
-                                    "clean observed projection for {path} has no present bytes"
-                                ))
-                            })?
+                            let recorded =
+                                decoded.target_bytes().map(<[u8]>::to_vec).ok_or_else(|| {
+                                    EngineError::ProjectionManifest(format!(
+                                        "clean observed projection for {path} has no present bytes"
+                                    ))
+                                })?;
+                            // A head batch superseded by concurrently accepted
+                            // history recorded only a locator: observers (the
+                            // watcher and the reopen scan) compare disk against
+                            // these bytes to decide whether a path needs
+                            // reconciling, so they must see the deterministic
+                            // CURRENT rendering — comparing against the stale
+                            // recorded bytes would classify a superseded disk
+                            // file as up to date forever (GH #351 audit
+                            // finding 1). Pages whose current path moved away
+                            // are left to the recorded bytes; the move's own
+                            // projection work owns that path transition.
+                            if !self.accepted_batch_is_causally_linear(work.batch_id())? {
+                                let current = self.authorize_projection_write(page_id)?;
+                                if current.state().page.path == *path {
+                                    let replay =
+                                        super::projection::plan_projection_with_layout_annotations(
+                                            self.workspace_id,
+                                            current.state(),
+                                            decoded
+                                                .annotated_base()
+                                                .map(AnnotatedProjectionBase::bytes),
+                                            decoded
+                                                .annotated_base()
+                                                .map(AnnotatedProjectionBase::annotations),
+                                        )
+                                        .map_err(
+                                            |error| {
+                                                EngineError::ProjectionManifest(error.to_string())
+                                            },
+                                        )?;
+                                    return Ok(Some(CleanObservedProjection::Present(
+                                        replay.target().to_vec(),
+                                    )));
+                                }
+                            }
+                            recorded
                         }
                         ProjectionWorkTarget::Absent => {
                             return Err(EngineError::ProjectionManifest(format!(
@@ -18416,9 +18453,17 @@ impl ShardedHotEngine {
                 .receiver_local_intent()
                 .matches_replay_except_frontier(source_replay.intent())
         {
-            return Err(EngineError::ProjectionManifest(
-                "clean manifest predecessor authority has an invalid source projection".into(),
-            ));
+            // Mirror of `clean_manifest_projection_predecessor`: a head batch
+            // superseded by a concurrently accepted history records only a
+            // locator, so the recorded target cannot be held to the current
+            // rendering. The captured predecessor is still proven against the
+            // CURRENT semantic state by the exact-source binding below, which
+            // stays fully strict (GH #351).
+            if self.accepted_batch_is_causally_linear(work.batch_id())? {
+                return Err(EngineError::ProjectionManifest(
+                    "clean manifest predecessor authority has an invalid source projection".into(),
+                ));
+            }
         }
         if decoded.target_bytes() == Some(prior.bytes.as_slice())
             && decoded

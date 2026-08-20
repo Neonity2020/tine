@@ -315,22 +315,30 @@ pub struct MaterializationChange {
     portable_path_identity_records: Vec<MaterializedIdentityRecord>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EffectValidationMode {
-    /// Demand per-delta equality with the effective effect.
-    LinearExact,
-    /// A concurrently accepted batch: merge supersedes authored deltas; check
-    /// only structural completeness. See `validate_for_event`.
-    ConcurrentSuperseded,
+/// Per-page validation authority for one accepted event.
+///
+/// Global causal linearity is too coarse an authority switch: one unrelated
+/// concurrently accepted batch must not relax validation for pages it never
+/// touched. A page is CONTESTED only when its home document's authored
+/// dependency view differs from the receiver's accepted view — i.e. a
+/// concurrent batch actually touched that document. Contested pages are not
+/// exempted from validation; they are validated against `merged_*`, the
+/// engine's own deterministic rendering at this event's accepted root,
+/// instead of the authored effect the merge superseded.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EffectValidationContext {
+    pub(crate) contested_pages: BTreeSet<PageId>,
+    pub(crate) merged_replacements: BTreeMap<PageId, MaterializedPageInput>,
+    pub(crate) merged_deletions: BTreeSet<PageId>,
 }
 
-impl EffectValidationMode {
-    pub(crate) fn for_event(event: &AcceptedBatchEvent) -> Self {
-        if event.causally_linear() {
-            Self::LinearExact
-        } else {
-            Self::ConcurrentSuperseded
-        }
+impl EffectValidationContext {
+    /// Every page validated byte-exactly against the authored effect: the
+    /// correct context for any batch with no concurrent history, and the
+    /// fail-closed default everywhere the engine is unavailable (a contested
+    /// page without a merged expectation is refused, never waved through).
+    pub(crate) fn linear() -> Self {
+        Self::default()
     }
 }
 
@@ -449,7 +457,7 @@ impl MaterializationChange {
         }
         let effect = SemanticEffect::decode(event.semantic_effect())
             .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-        self.validate_against_effect(&effect, EffectValidationMode::for_event(event))?;
+        self.validate_against_effect(&effect, event.effect_validation_context())?;
         self.digest()
     }
 
@@ -459,19 +467,19 @@ impl MaterializationChange {
         batch_id: BatchId,
         semantic_effect: &[u8],
     ) -> Result<ContentDigest, MaterializationError> {
-        self.validate_against_stored_with_mode(
+        self.validate_against_stored_with_context(
             batch_id,
             semantic_effect,
-            EffectValidationMode::LinearExact,
+            &EffectValidationContext::linear(),
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn validate_against_stored_with_mode(
+    pub(crate) fn validate_against_stored_with_context(
         &self,
         batch_id: BatchId,
         semantic_effect: &[u8],
-        mode: EffectValidationMode,
+        context: &EffectValidationContext,
     ) -> Result<ContentDigest, MaterializationError> {
         if self.batch_id != batch_id {
             return Err(MaterializationError::BatchMismatch {
@@ -481,7 +489,7 @@ impl MaterializationChange {
         }
         let effect = SemanticEffect::decode(semantic_effect)
             .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-        self.validate_against_effect(&effect, mode)?;
+        self.validate_against_effect(&effect, context)?;
         self.digest()
     }
 
@@ -622,10 +630,10 @@ impl MaterializationChange {
     fn validate_against_effect(
         &self,
         effect: &SemanticEffect,
-        mode: EffectValidationMode,
+        context: &EffectValidationContext,
     ) -> Result<(), MaterializationError> {
         self.validate_shape()?;
-        let exact = matches!(mode, EffectValidationMode::LinearExact);
+        let exact = |page_id: PageId| !context.contested_pages.contains(&page_id);
         let replacements = self
             .replacements
             .iter()
@@ -659,11 +667,11 @@ impl MaterializationChange {
                     home_document_id,
                     kind,
                 }) => {
-                    if !exact {
-                        // A concurrent sibling may have deleted or reshaped
-                        // this page; the merge is the authority. The final
-                        // supplied-equals-affected check still demands the
-                        // page appear as a replacement or a deletion.
+                    if !exact(delta.page_id) {
+                        // A concurrent sibling deleted or reshaped this page;
+                        // the merge is the authority, and the contested pass
+                        // below holds the supplied replacement to the merged
+                        // rendering instead.
                         continue;
                     }
                     let page = replacements.get(&delta.page_id).ok_or_else(|| {
@@ -698,7 +706,7 @@ impl MaterializationChange {
         }
         for delta in effect.page_preambles() {
             affected.insert(delta.page_id);
-            if !exact {
+            if !exact(delta.page_id) {
                 continue;
             }
             let page = replacements.get(&delta.page_id).ok_or_else(|| {
@@ -722,7 +730,7 @@ impl MaterializationChange {
         }
         for delta in effect.memberships() {
             affected.insert(delta.page_id);
-            if !exact || required_deletions.contains(&delta.page_id) {
+            if !exact(delta.page_id) || required_deletions.contains(&delta.page_id) {
                 continue;
             }
             let blocks = replacement_blocks.get(&delta.page_id).ok_or_else(|| {
@@ -768,7 +776,7 @@ impl MaterializationChange {
                 continue;
             };
             affected.insert(page_id);
-            if !exact || required_deletions.contains(&page_id) {
+            if !exact(page_id) || required_deletions.contains(&page_id) {
                 continue;
             }
             let blocks = replacement_blocks.get(&page_id).ok_or_else(|| {
@@ -806,6 +814,40 @@ impl MaterializationChange {
             }
         }
 
+        // Contested pages are validated against the engine's merged rendering
+        // at this event's accepted root — recompute-and-compare, never skip.
+        // A contested page with no merged expectation means the event was
+        // built without engine authority; refusing is the only safe answer.
+        for page_id in &context.contested_pages {
+            if !affected.contains(page_id) {
+                return Err(MaterializationError::Contradiction(format!(
+                    "contested page {page_id} is not an affected page of the effect"
+                )));
+            }
+            if let Some(expected) = context.merged_replacements.get(page_id) {
+                let supplied_page = replacements.get(page_id).ok_or_else(|| {
+                    MaterializationError::Incomplete(format!(
+                        "contested live page {page_id} has no complete replacement"
+                    ))
+                })?;
+                if **supplied_page != *expected {
+                    return Err(MaterializationError::Contradiction(format!(
+                        "page {page_id} replacement differs from the merged accepted rendering"
+                    )));
+                }
+            } else if context.merged_deletions.contains(page_id) {
+                if replacements.contains_key(page_id) {
+                    return Err(MaterializationError::Contradiction(format!(
+                        "merge-deleted page {page_id} is supplied as a replacement"
+                    )));
+                }
+            } else {
+                return Err(MaterializationError::Incomplete(format!(
+                    "contested page {page_id} has no merged expectation"
+                )));
+            }
+        }
+
         let supplied = replacements
             .keys()
             .copied()
@@ -816,16 +858,25 @@ impl MaterializationChange {
                 "supplied pages {supplied:?} differ from accepted affected pages {affected:?}"
             )));
         }
-        if exact && deletions != required_deletions {
+        // A contested page's authored deletion polarity is superseded by the
+        // merge: the expected deletion set keeps the authored tombstones of
+        // every uncontested page and takes the merged answer for the rest.
+        let expected_deletions = required_deletions
+            .iter()
+            .copied()
+            .filter(|page_id| exact(*page_id))
+            .chain(context.merged_deletions.iter().copied())
+            .collect::<BTreeSet<_>>();
+        if deletions != expected_deletions {
             return Err(MaterializationError::Contradiction(format!(
-                "supplied deletions {deletions:?} differ from accepted deletions {required_deletions:?}"
+                "supplied deletions {deletions:?} differ from accepted deletions {expected_deletions:?}"
             )));
         }
         Ok(())
     }
 }
 
-fn canonicalize_page_blocks(page: &mut MaterializedPageInput) {
+pub(crate) fn canonicalize_page_blocks(page: &mut MaterializedPageInput) {
     page.blocks.sort_unstable_by(|left, right| {
         (&left.order, left.block_id).cmp(&(&right.order, right.block_id))
     });
@@ -1026,7 +1077,7 @@ fn validate_alias_declaration(
     )
 }
 
-fn block_owner_page(state: &super::BlockState) -> Option<PageId> {
+pub(crate) fn block_owner_page(state: &super::BlockState) -> Option<PageId> {
     match state.owner {
         BlockOwner::Page(page_id) => Some(page_id),
         BlockOwner::Tombstone => None,
@@ -1319,7 +1370,7 @@ pub(crate) fn apply_change(
         change,
         semantic_effect,
         None,
-        EffectValidationMode::LinearExact,
+        &EffectValidationContext::linear(),
     )?;
     storage::apply_materialization_change_for_test(
         transaction,
@@ -1335,12 +1386,12 @@ pub(crate) fn lower_validated_change(
     change: &MaterializationChange,
     semantic_effect: &[u8],
     causal_dot: Option<BatchCausalDot>,
-    mode: EffectValidationMode,
+    context: &EffectValidationContext,
 ) -> Result<storage::PhysicalMaterializationChange, MaterializationError> {
     change.validate_shape()?;
     let effect = SemanticEffect::decode(semantic_effect)
         .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    change.validate_against_effect(&effect, mode)?;
+    change.validate_against_effect(&effect, context)?;
 
     let pages_with_live_metadata_delta = effect
         .pages()

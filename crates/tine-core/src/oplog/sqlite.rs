@@ -167,16 +167,17 @@ pub struct AcceptedBatchEvent {
     causal_dot: BatchCausalDot,
     retained_bytes: usize,
     prepared_identity_transition: Option<PreparedSqliteIdentityTransition>,
-    /// True when this batch's causal past is the ENTIRE accepted prefix before
-    /// it, so its effective semantic effect describes exactly the merged
-    /// post-state and per-delta materialization validation may demand
-    /// equality. A concurrently accepted batch (some earlier-accepted history
-    /// is outside its causal past) is superseded by merge: its authored
-    /// per-delta values are not statements about the merged post-state at all
-    /// (GH #351). Bootstrap authoring/replay is sequential by construction and
-    /// keeps the default `true`; the two engine-backed constructors recompute
-    /// it from the authenticated causal index in `with_effective_view`.
-    causally_linear: bool,
+    /// Per-page validation authority (GH #351). A page is contested when its
+    /// home document's authored dependency view (manifest frontier) differs
+    /// from the receiver's accepted view (root-authenticated evidence) — i.e.
+    /// a CONCURRENTLY accepted batch touched that document, so this batch's
+    /// authored per-delta values for it are superseded by merge. Contested
+    /// pages are validated against the engine's merged rendering captured in
+    /// the context; every other page stays byte-exact against the authored
+    /// effect. Bootstrap authoring/replay is sequential by construction and
+    /// keeps the strict default; the two engine-backed constructors compute
+    /// the real context in `with_effective_view`.
+    effect_validation_context: super::sqlite_materialization::EffectValidationContext,
 }
 
 /// Move-only result of evaluating one not-yet-durable operation against the
@@ -494,28 +495,12 @@ impl AcceptedBatchEvent {
             causal_dot: manifest.causal_dot(),
             retained_bytes,
             prepared_identity_transition: None,
-            causally_linear: true,
+            effect_validation_context:
+                super::sqlite_materialization::EffectValidationContext::linear(),
         })
     }
 
     fn with_effective_view(mut self, engine: &ShardedHotEngine) -> Result<Self, ProjectionError> {
-        let containment = engine
-            .batch_causal_containment(
-                self.batch_id,
-                self.causal_dot,
-                &self.causal_dependency_heads,
-            )
-            .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
-        // Clocks are downward-closed and per-peer gapless, so the counter sum
-        // is |past ∪ {self}|; causal parents are always accepted before their
-        // dependents, so that set is a subset of the accepted prefix and
-        // equality of sizes is equality of sets.
-        let causal_past: u64 = containment
-            .clock()
-            .iter()
-            .map(|(_, counter)| *counter)
-            .sum();
-        self.causally_linear = causal_past == self.acceptance_sequence;
         let authored = SemanticEffect::decode(&self.semantic_effect).map_err(|error| {
             ProjectionError::InvalidAcceptedEvent(format!(
                 "accepted batch {} authored effect cannot be decoded: {error}",
@@ -532,6 +517,122 @@ impl AcceptedBatchEvent {
             ))
         })?;
         self.effective_transitions = view.transitions().to_vec();
+        // Per-document contested classification (GH #351): a document was
+        // touched by a CONCURRENTLY accepted batch iff the author's PRE-batch
+        // dependency view of it (the manifest's dependency frontier) differs
+        // from what the receiver had actually accepted for that document just
+        // before this batch (the accepted view at the PRIOR frontier root).
+        // Pre-vs-pre keeps the batch's own contribution out of the compare,
+        // and the comparison is exact and page-scoped: an unrelated concurrent
+        // batch must not relax validation for pages it never touched, which is
+        // why no global linearity switch appears here. (The shared catalog
+        // document advancing under an unrelated batch never homes a page, so
+        // its contested-ness marks no pages — the same tolerance
+        // `projection_frontiers_match_except_catalog` encodes.)
+        let mut contested_documents = BTreeSet::new();
+        if self.prior_frontier_root.has_persistent_point_index() {
+            let authored_pre = self
+                .dependency_frontier
+                .documents()
+                .iter()
+                .map(|deps| (deps.document_id(), deps.causal_state_digest()))
+                .collect::<BTreeMap<_, _>>();
+            for accepted in &self.affected_documents {
+                let accepted_pre = engine
+                    .accepted_frontier_document(&self.prior_frontier_root, accepted.document_id())
+                    .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
+                if authored_pre.get(&accepted.document_id()).copied()
+                    != accepted_pre.map(|deps| deps.causal_state_digest())
+                {
+                    contested_documents.insert(accepted.document_id());
+                }
+            }
+        }
+        let mut context = super::sqlite_materialization::EffectValidationContext::linear();
+        if !contested_documents.is_empty() {
+            let effective =
+                SemanticEffect::decode(&self.effective_semantic_effect).map_err(|error| {
+                    ProjectionError::InvalidAcceptedEvent(format!(
+                        "accepted batch {} effective effect cannot be decoded: {error}",
+                        self.batch_id
+                    ))
+                })?;
+            for delta in effective.pages() {
+                let document = delta
+                    .after
+                    .as_ref()
+                    .or(delta.before.as_ref())
+                    .map(super::PageState::home_document_id);
+                if document.is_some_and(|document| contested_documents.contains(&document)) {
+                    context.contested_pages.insert(delta.page_id);
+                }
+            }
+            for delta in effective.page_preambles() {
+                if contested_documents.contains(&delta.home_document_id) {
+                    context.contested_pages.insert(delta.page_id);
+                }
+            }
+            for delta in effective.memberships() {
+                let document = delta
+                    .after
+                    .as_ref()
+                    .or(delta.before.as_ref())
+                    .map(|claim| claim.home_document_id);
+                if document.is_some_and(|document| contested_documents.contains(&document)) {
+                    context.contested_pages.insert(delta.page_id);
+                }
+            }
+            for delta in effective.blocks() {
+                if !contested_documents.contains(&delta.home_document_id) {
+                    continue;
+                }
+                let owner = delta
+                    .after
+                    .as_ref()
+                    .and_then(super::sqlite_materialization::block_owner_page)
+                    .or_else(|| {
+                        delta
+                            .before
+                            .as_ref()
+                            .and_then(super::sqlite_materialization::block_owner_page)
+                    });
+                if let Some(page_id) = owner {
+                    context.contested_pages.insert(page_id);
+                }
+            }
+            // Contested pages are validated against the engine's own merged
+            // rendering at this event's accepted root — the same deterministic
+            // authority `materialize_accepted_event` reads — never skipped.
+            if !context.contested_pages.is_empty() {
+                let transitions = effective_transition_index(&self);
+                let mut materializer = engine
+                    .accepted_root_materializer(&self.post_frontier_root)
+                    .map_err(ProjectionError::materialization_from_engine)?;
+                for page_id in context.contested_pages.clone() {
+                    match materializer
+                        .materialize_page(page_id)
+                        .map_err(ProjectionError::materialization_from_engine)?
+                    {
+                        Some(mut page) => {
+                            if let Some(transition) = transitions.get(&page_id) {
+                                transition
+                                    .apply_to_materialized(&mut page)
+                                    .map_err(|error| {
+                                        ProjectionError::Materialization(error.to_string())
+                                    })?;
+                            }
+                            let mut input = materialized_page_input(page);
+                            super::sqlite_materialization::canonicalize_page_blocks(&mut input);
+                            context.merged_replacements.insert(page_id, input);
+                        }
+                        None => {
+                            context.merged_deletions.insert(page_id);
+                        }
+                    }
+                }
+            }
+        }
+        self.effect_validation_context = context;
         Ok(self)
     }
 
@@ -561,10 +662,12 @@ impl AcceptedBatchEvent {
         &self.effective_transitions
     }
 
-    /// See the field: whether per-delta materialization validation may demand
-    /// equality with this event's effective semantic effect.
-    pub(crate) fn causally_linear(&self) -> bool {
-        self.causally_linear
+    /// See the field: the per-page authority materialization validation holds
+    /// this event's supplied change to.
+    pub(crate) fn effect_validation_context(
+        &self,
+    ) -> &super::sqlite_materialization::EffectValidationContext {
+        &self.effect_validation_context
     }
 
     pub const fn semantic_effect_digest(&self) -> SemanticEffectDigest {
@@ -5119,32 +5222,15 @@ impl SqliteFrontier {
             if let Some(engine) = reference_engine {
                 change = attach_parser_derived_graph_facts(engine, change)?;
             }
-            // The accepted causal record is keyed by batch id alone, so an
-            // empty dependency-head slice still classifies an already-indexed
-            // batch; without a reference engine this test-only rebuild keeps
-            // the exact contract.
-            let mode = match reference_engine {
-                Some(engine) => {
-                    let containment = engine
-                        .batch_causal_containment(stored.batch_id, stored.causal_dot()?, &[])
-                        .map_err(ProjectionError::materialization_from_engine)?;
-                    let causal_past: u64 = containment
-                        .clock()
-                        .iter()
-                        .map(|(_, counter)| *counter)
-                        .sum();
-                    if causal_past == sequence {
-                        super::sqlite_materialization::EffectValidationMode::LinearExact
-                    } else {
-                        super::sqlite_materialization::EffectValidationMode::ConcurrentSuperseded
-                    }
-                }
-                None => super::sqlite_materialization::EffectValidationMode::LinearExact,
-            };
-            let input_digest = change.validate_against_stored_with_mode(
+            // This test-only rebuild validates every stored change with the
+            // strict linear context; a stored concurrent history that needs a
+            // merged-authority context must be validated through the
+            // production event path instead (fail closed, never waved on).
+            let context = super::sqlite_materialization::EffectValidationContext::linear();
+            let input_digest = change.validate_against_stored_with_context(
                 stored.batch_id,
                 &stored.semantic_effect,
-                mode,
+                &context,
             )?;
             let prior_digest = decode_content_digest(&stored.prior_frontier_root_digest)?;
             let post_digest = decode_content_digest(&stored.post_frontier_root_digest)?;
@@ -5154,7 +5240,7 @@ impl SqliteFrontier {
                 &change,
                 &stored.semantic_effect,
                 Some(stored.causal_dot()?),
-                mode,
+                &context,
             )?;
             self.physical.apply_materialization_for_test(
                 &physical,
@@ -6222,7 +6308,7 @@ impl SqliteFrontier {
                 change,
                 event.semantic_effect(),
                 Some(event.causal_dot()),
-                super::sqlite_materialization::EffectValidationMode::for_event(event),
+                event.effect_validation_context(),
             )?),
             None => None,
         };
@@ -15360,6 +15446,187 @@ mod tests {
         assert_eq!(
             database.apply_accepted(&right).unwrap(),
             ApplyDisposition::Applied
+        );
+    }
+
+    fn with_corrupted_first_block_content(
+        change: &crate::oplog::MaterializationChange,
+    ) -> crate::oplog::MaterializationChange {
+        let mut value = serde_json::to_value(change).unwrap();
+        let content = &mut value["replacements"][0]["blocks"][0]["content"];
+        *content = serde_json::Value::String(format!("{} CORRUPTED", content.as_str().unwrap()));
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// GH #351 audit finding 2: concurrency must not buy a divergent
+    /// materializer anything. A batch accepted after an UNRELATED concurrent
+    /// batch keeps full byte-exact validation for its own pages, and a
+    /// genuinely contested page is validated against the engine's merged
+    /// rendering — recompute-and-compare, never a skipped check.
+    #[test]
+    fn concurrent_validation_stays_exact_per_page_and_merged_for_contested_pages() {
+        // Disjoint pages, the audit's repro: two concurrent bootstraps. The
+        // second accepted event has concurrent history but touches its own
+        // document only, so nothing about it is contested and a corrupted
+        // supplied change for its page must still be refused. (Pre-fix, the
+        // global linearity switch waved exactly this corruption through.)
+        let base = TestIds::new(2_860);
+        let right_ids = TestIds {
+            workspace: base.workspace,
+            lineage: base.lineage,
+            catalog: base.catalog,
+            document: DocumentId::from_uuid(uuid(2_863)),
+            page: PageId::from_uuid(uuid(2_864)),
+            block: BlockId::from_uuid(uuid(2_865)),
+        };
+        let dir = TestDir::new("concurrent-disjoint-page-validation");
+        let store = ObjectStore::open(&dir.path().join("objects"), base.workspace).unwrap();
+        let left_batch = base
+            .engine()
+            .prepare_bootstrap_transaction(
+                author(2_866),
+                &root_transaction_named(base, "pages/left.md", "Disjoint Left", "left"),
+            )
+            .unwrap();
+        let right_batch = right_ids
+            .engine()
+            .prepare_bootstrap_transaction(
+                author(2_867),
+                &root_transaction_named(right_ids, "pages/right.md", "Disjoint Right", "right"),
+            )
+            .unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&left_batch)
+            .unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&right_batch)
+            .unwrap();
+        let mut receiver = base.engine();
+        for batch in [&left_batch, &right_batch] {
+            assert!(matches!(
+                receiver
+                    .stage_from_store(&store, batch.manifest().batch_id())
+                    .unwrap()
+                    .disposition(),
+                BatchDisposition::Accepted { .. }
+            ));
+        }
+        let right_event =
+            AcceptedBatchEvent::from_accepted(&receiver, &store, right_batch.manifest().batch_id())
+                .unwrap();
+        assert!(
+            right_event
+                .effect_validation_context()
+                .contested_pages
+                .is_empty(),
+            "an unrelated concurrent batch must not mark disjoint pages contested"
+        );
+        let honest = rich_materialization(
+            &right_event,
+            right_ids,
+            "pages/right.md",
+            ManagedTextKind::Page,
+            "Disjoint Right",
+            "right",
+        );
+        honest.validate_for_event(&right_event).unwrap();
+        let corrupted = with_corrupted_first_block_content(&honest);
+        assert!(
+            corrupted.validate_for_event(&right_event).is_err(),
+            "a corrupted materialization for an uncontested page must be refused"
+        );
+
+        // The same block: two authors rewrite the same block from the same
+        // accepted base. The later-accepted edit's page is contested and is
+        // validated against the engine's merged rendering, which a corrupted
+        // supply fails.
+        let same = TestIds::new(2_870);
+        let same_dir = TestDir::new("concurrent-contested-page-validation");
+        let same_objects = same_dir.path().join("objects");
+        let same_store = ObjectStore::open(&same_objects, same.workspace).unwrap();
+        let archive_engine = || {
+            ShardedHotEngine::with_archive_store(
+                ObjectStore::open(&same_objects, same.workspace).unwrap(),
+                same.lineage,
+                same.catalog,
+            )
+        };
+        let mut author_a = archive_engine();
+        let boot = author_a
+            .prepare_bootstrap_transaction(
+                author(2_871),
+                &root_transaction_named(same, "pages/shared.md", "Shared Page", "base text"),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut author_a, &same_store, &boot);
+        let mut author_b = archive_engine();
+        assert!(matches!(
+            author_b
+                .stage_archive_batch(boot.manifest().batch_id())
+                .unwrap()
+                .disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let edit_a = author_a
+            .prepare_bootstrap_transaction(
+                author(2_872),
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: same.block,
+                        home_document_id: same.document,
+                    },
+                    content: "alpha edit".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut author_a, &same_store, &edit_a);
+        let edit_b = author_b
+            .prepare_bootstrap_transaction(
+                author(2_873),
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: same.block,
+                        home_document_id: same.document,
+                    },
+                    content: "beta edit".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut author_b, &same_store, &edit_b);
+        let mut same_receiver = archive_engine();
+        for batch in [&boot, &edit_a, &edit_b] {
+            assert!(matches!(
+                same_receiver
+                    .stage_archive_batch(batch.manifest().batch_id())
+                    .unwrap()
+                    .disposition,
+                BatchDisposition::Accepted { .. }
+            ));
+        }
+        let event_b = AcceptedBatchEvent::from_accepted(
+            &same_receiver,
+            &same_store,
+            edit_b.manifest().batch_id(),
+        )
+        .unwrap();
+        assert_eq!(
+            event_b
+                .effect_validation_context()
+                .contested_pages
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![same.page],
+            "a genuinely concurrent same-document edit marks its page contested"
+        );
+        let honest = materialize_accepted_event(&same_receiver, &event_b).unwrap();
+        honest.validate_for_event(&event_b).unwrap();
+        let corrupted = with_corrupted_first_block_content(&honest);
+        assert!(
+            corrupted.validate_for_event(&event_b).is_err(),
+            "a contested page is held to the merged rendering, not waved through"
         );
     }
 

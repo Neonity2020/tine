@@ -5367,9 +5367,10 @@ enum CleanActorMutationOutcome {
         phase: OperationalPhase,
     },
     /// The retained continuation failed identically on consecutive attempts
-    /// and is not a bounded-slice resume: retrying inside this process cannot
-    /// succeed until something outside it changes. The durable commit stays
-    /// retained; the runtime names the block instead of spinning on it.
+    /// and is not a bounded-slice resume. The durable commit stays retained
+    /// and every tick keeps retrying (identical text does not prove the
+    /// failure is deterministic); this outcome only NAMES the persisting
+    /// failure instead of reporting it as an ordinary pending retry.
     DurableStuck {
         batch_id: BatchId,
         phase: OperationalPhase,
@@ -5552,17 +5553,12 @@ impl CleanRuntimeActorCore {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
     ) -> Option<CleanActorMutationOutcome> {
-        if let (Some(pending), Some(fingerprint)) =
-            (self.pending.as_ref(), self.retry_fingerprint.as_ref())
-        {
-            if fingerprint.escalated && fingerprint.batch_id == pending.batch_id() {
-                return Some(CleanActorMutationOutcome::DurableStuck {
-                    batch_id: fingerprint.batch_id,
-                    phase: fingerprint.phase,
-                    detail: fingerprint.detail.clone(),
-                });
-            }
-        }
+        // Escalation never stops the retries: an identical detail string three
+        // times is not proof the failure is deterministic (a transient
+        // filesystem condition can repeat verbatim), so every tick still
+        // attempts recovery and escalation only changes what a persisting
+        // failure is REPORTED as — the named stuck state instead of a silent
+        // pending retry.
         let pending = self.pending.take()?;
         let state = match self.runtime.admit_clean_derived_recovery(graph) {
             Ok(mut session) => {
@@ -20746,7 +20742,12 @@ impl RuntimeActor {
             .accepted_frontier_root()
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
             .state_digest();
-        self.clean = Some(CleanRuntimeActorCore::new(runtime, false));
+        // Shared-join install IS a clean-manifest-replay recovery (set just
+        // below), and reopen's contract is that this recovery seeds a full
+        // scan: a joiner's own pre-join batch can be superseded by the
+        // reconstructed merged history, leaving its disk projection stale
+        // until a scan reconciles it (GH #351 audit finding 1).
+        self.clean = Some(CleanRuntimeActorCore::new(runtime, true));
         self.last_watcher = self
             .clean
             .as_ref()
@@ -26913,15 +26914,16 @@ mod tests {
         assert_eq!(phase, OperationalPhase::ArchiveStage);
         assert!(!detail.is_empty());
 
-        // The stuck state is a restart-to-retry contract: it keeps naming the
-        // recorded failure without re-running the coordinator, even after the
-        // external cause is repaired mid-process.
+        // Escalation names the state but never stops the retries: an identical
+        // detail string is not proof of determinism, so once the external
+        // cause is repaired the very next tick's retry must recover without a
+        // restart.
         fs::write(&manifest_path, &manifest_bytes).unwrap();
-        assert!(matches!(
-            actor.retry_pending(&graph, &receipts),
-            Some(CleanActorMutationOutcome::DurableStuck { batch_id: retained, .. })
-                if retained == batch_id
-        ));
+        let recovered = actor.retry_pending(&graph, &receipts);
+        assert!(
+            matches!(&recovered, Some(CleanActorMutationOutcome::Durable(retained)) if *retained == batch_id),
+            "a repaired cause must recover on the next retry: {recovered:?}"
+        );
         // Cold-open recovery of a continuation whose Markdown projection is
         // still pending is a separate contract with its own open defect (a
         // resources-level reopen refuses with "managed text writes are
