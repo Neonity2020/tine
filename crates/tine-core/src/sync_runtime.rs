@@ -5474,6 +5474,50 @@ impl CleanRuntimeActorCore {
         Ok(self.retain_outcome(state))
     }
 
+    /// Repair one exact graph file only when its bytes are the authenticated
+    /// retained rendering of a manifest head superseded by a concurrent merge.
+    /// The projection writer still guards the exact observed bytes, so a real
+    /// external edit races or refuses instead of being overwritten.
+    fn repair_superseded_projection(
+        &self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        path: &ManagedPath,
+    ) -> Result<bool, CleanActorMutationFailure> {
+        let observed =
+            graph
+                .read_projection_input(path)
+                .map_err(|error| CleanActorMutationFailure {
+                    phase: OperationalPhase::ProjectionDrain,
+                    detail: error.to_string(),
+                })?;
+        let Some(observed) = observed else {
+            return Ok(false);
+        };
+        let engine = self.runtime.engine();
+        let Some(page_id) = engine
+            .authorize_clean_superseded_projection_repair(path, &observed)
+            .map_err(|error| CleanActorMutationFailure {
+                phase: OperationalPhase::ProjectionDrain,
+                detail: error.to_string(),
+            })?
+        else {
+            return Ok(false);
+        };
+        crate::oplog::projection::write_projection_exact(
+            graph,
+            receipts,
+            engine,
+            page_id,
+            Some(&observed),
+        )
+        .map_err(|error| CleanActorMutationFailure {
+            phase: OperationalPhase::ProjectionDrain,
+            detail: error.to_string(),
+        })?;
+        Ok(true)
+    }
+
     fn execute_local_correlated(
         &mut self,
         graph: &Graph,
@@ -6281,8 +6325,8 @@ fn open_clean_runtime_resources_with_progress(
         match executed {
             Ok(()) => {}
             Err(crate::oplog::ProjectionError::WorkNotReady)
-                if !engine
-                    .accepted_batch_is_causally_linear(work.batch_id())
+                if engine
+                    .accepted_batch_projection_is_superseded(work.batch_id())
                     .map_err(display)? =>
             {
                 // This endpoint's recorded rendering was superseded by a
@@ -11411,6 +11455,11 @@ struct RuntimeActor {
     provider_head_generations: BTreeMap<(DeviceId, u64), (ContentDigest, Vec<BatchId>)>,
     provider_own_heads: BTreeMap<String, SharedProviderFrontierHeadV1>,
     provider_direct_manifests: VecDeque<BatchId>,
+    /// Foreign batches accepted from the provider that still owe a
+    /// conflict-resolution derivation (GH #351). Drained one batch per tick;
+    /// a batch is re-queued only after it authored a resolution, so the
+    /// queue converges once the engine reports the pair resolved.
+    pending_conflict_resolutions: VecDeque<BatchId>,
     provider_direct_queued: BTreeSet<BatchId>,
     provider_discovery_scan_complete: bool,
     provider_head_dirty: bool,
@@ -12752,6 +12801,7 @@ impl RuntimeActor {
             provider_head_generations: BTreeMap::new(),
             provider_own_heads: BTreeMap::new(),
             provider_direct_manifests: VecDeque::new(),
+            pending_conflict_resolutions: VecDeque::new(),
             provider_direct_queued: BTreeSet::new(),
             provider_discovery_scan_complete: false,
             provider_head_dirty: false,
@@ -19391,6 +19441,7 @@ impl RuntimeActor {
                     if clean.provider_change_pending_notification == Some(batch_id) =>
                 {
                     clean.provider_change_pending_notification = None;
+                    self.note_provider_batch_needs_conflict_check(batch_id);
                     return SyncRuntimeTick::ProviderMutation { batch_id };
                 }
                 CleanActorMutationOutcome::Durable(batch_id)
@@ -19432,7 +19483,11 @@ impl RuntimeActor {
             // provider projection between watcher ticks. The durable content is
             // already reader-visible, but the live UI still needs exactly one
             // aggregate change notification.
+            self.note_provider_batch_needs_conflict_check(batch_id);
             return SyncRuntimeTick::ProviderMutation { batch_id };
+        }
+        if let Some(tick) = self.resolve_pending_conflict() {
+            return tick;
         }
 
         let (paths, full_scan_epoch) = {
@@ -19577,7 +19632,8 @@ impl RuntimeActor {
             || self.provider_head_dirty
             || !self.provider_head_retirement.is_empty()
             || !self.provider_intent_retirement.is_empty()
-            || self.provider_intent_retirement_scan_active;
+            || self.provider_intent_retirement_scan_active
+            || !self.pending_conflict_resolutions.is_empty();
         has_work
     }
 
@@ -19600,6 +19656,141 @@ impl RuntimeActor {
             ));
         }
         Ok(store)
+    }
+
+    fn note_provider_batch_needs_conflict_check(&mut self, batch_id: BatchId) {
+        if !self.pending_conflict_resolutions.contains(&batch_id) {
+            self.pending_conflict_resolutions.push_back(batch_id);
+        }
+    }
+
+    /// Derive and author at most one conflict resolution per tick (GH #351).
+    ///
+    /// Intents are a deterministic function of the accepted batch set, but
+    /// authoring is restricted to the racing pair's own devices: both may
+    /// author the map-register restores (equal values converge; loro skips
+    /// same-value writes), while keep-both text authoring is claimed by the
+    /// author of the pair's minimum batch id alone, because concurrent text
+    /// insertions of even identical content would duplicate.
+    fn resolve_pending_conflict(&mut self) -> Option<SyncRuntimeTick> {
+        let batch_id = self.pending_conflict_resolutions.pop_front()?;
+        let my_device = self.binding.device_id();
+        let (transaction, reconciliation_path) = {
+            let engine = self.active_engine().ok()?;
+            let intents = match engine.conflict_resolution_intents(batch_id) {
+                Ok(intents) => intents,
+                // Dropping the derivation is safe: the counterpart device
+                // derives the same intents from the same pair.
+                Err(_) => return None,
+            };
+            let mut resolution = None;
+            for intent in intents {
+                match intent {
+                    crate::oplog::ConflictResolutionIntent::RestoreEdited {
+                        page_id,
+                        block,
+                        claim,
+                        pair,
+                    }
+                    | crate::oplog::ConflictResolutionIntent::RestoreMoved {
+                        page_id,
+                        block,
+                        claim,
+                        pair,
+                    } => {
+                        if pair.min_author_device != my_device
+                            && pair.max_author_device != my_device
+                        {
+                            continue;
+                        }
+                        let Ok(page) = engine.materialize_page(page_id) else {
+                            continue;
+                        };
+                        resolution =
+                            OperationTransaction::new(vec![SemanticOperation::RestoreSubtree {
+                                page_id,
+                                blocks: vec![crate::oplog::BlockRestore { block, claim }],
+                            }])
+                            .ok()
+                            .map(|transaction| (transaction, page.path));
+                    }
+                    crate::oplog::ConflictResolutionIntent::KeepBothTexts {
+                        page_id,
+                        block,
+                        keep_text,
+                        sibling_text,
+                        pair,
+                        ..
+                    } => {
+                        if pair.min_author_device != my_device {
+                            continue;
+                        }
+                        let Ok(page) = engine.materialize_page(page_id) else {
+                            continue;
+                        };
+                        let Some(original) = page
+                            .blocks
+                            .iter()
+                            .find(|candidate| candidate.block_id == block.block_id)
+                        else {
+                            continue;
+                        };
+                        if original.order.len() >= 511 {
+                            continue;
+                        }
+                        // "-" sorts before every digit, so this key lands
+                        // immediately after the original among its siblings.
+                        let sibling_order = format!("{}-", original.order);
+                        resolution = OperationTransaction::new(vec![
+                            SemanticOperation::EditBlockContent {
+                                block,
+                                content: keep_text,
+                            },
+                            SemanticOperation::CreateBlock {
+                                block: BlockLocation {
+                                    block_id: BlockId::new(),
+                                    home_document_id: page.home_document_id,
+                                },
+                                page_id,
+                                parent: original.parent,
+                                order: sibling_order,
+                                content: sibling_text,
+                            },
+                        ])
+                        .ok()
+                        .map(|transaction| (transaction, page.path.clone()));
+                    }
+                }
+                if resolution.is_some() {
+                    break;
+                }
+            }
+            resolution?
+        };
+        let outcome = self.submit_local_mutation(transaction);
+        // Re-derive on a later tick: the gates in the engine suppress the
+        // resolution just authored, so the queue converges.
+        self.note_provider_batch_needs_conflict_check(batch_id);
+        match outcome {
+            SyncLocalMutationOutcome::Durable { .. }
+            | SyncLocalMutationOutcome::RetryableRetainedRecovery { .. } => {
+                Some(SyncRuntimeTick::LocalMutation(outcome))
+            }
+            // Refused (e.g. local mutations are blocked until pending
+            // publications drain): yield the tick to the other lanes so the
+            // blocking condition can clear, and try again afterwards. A
+            // concurrent merge can also leave this exact path at an older
+            // authenticated manifest rendering; repair only that proven case
+            // before redrafting. Unknown/external bytes remain untouched.
+            _ => {
+                self.clean
+                    .as_ref()
+                    .expect("clean conflict resolution runs only in a clean actor")
+                    .repair_superseded_projection(&self.graph, &self.receipts, &reconciliation_path)
+                    .ok();
+                None
+            }
+        }
     }
 
     fn queue_clean_provider_publication(&mut self, batch_id: BatchId) {
@@ -20068,6 +20259,7 @@ impl RuntimeActor {
                         .provider_change_pending_notification
                         .take();
                     debug_assert_eq!(notification, Some(batch_id));
+                    self.note_provider_batch_needs_conflict_check(batch_id);
                     SyncRuntimeTick::ProviderMutation { batch_id }
                 }
                 Ok(CleanActorMutationOutcome::DurablePending { .. }) => {
@@ -38287,6 +38479,643 @@ mod tests {
         }
     }
 
+    fn visible_provider_page_text(
+        fixture: &ActivationFixture,
+        paths: &[&str],
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        paths
+            .iter()
+            .map(|path| {
+                let file = fixture.graph_root.join(path);
+                (
+                    (*path).to_owned(),
+                    file.exists().then(|| fs::read(file).unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    fn outbox_manifest_ids(fixture: &ActivationFixture) -> BTreeSet<String> {
+        let dir = fixture.request.provider_root.join("outbox/manifests");
+        match fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => BTreeSet::new(),
+        }
+    }
+
+    fn outbox_manifest_batch_id(fixture: &ActivationFixture, name: &str) -> BatchId {
+        OperationBatch::decode(
+            &fs::read(
+                fixture
+                    .request
+                    .provider_root
+                    .join("outbox/manifests")
+                    .join(name),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .batch_id()
+    }
+
+    fn deliver_offline_provider_history(
+        source: &ActivationFixture,
+        receiver: &ActivationFixture,
+        receiver_handle: &SyncRuntimeHandle,
+        batch_id: BatchId,
+    ) {
+        let delivered =
+            copy_provider_batch(source, receiver, batch_id, ProviderBatchDelivery::Complete);
+        let mut duplicate_observations = delivered.clone();
+        duplicate_observations.extend(delivered);
+        receiver_handle
+            .observe_provider_paths(duplicate_observations, false)
+            .unwrap();
+        settle_exact_provider_history(receiver_handle);
+
+        // Replay the same physical provider bytes and observation. The
+        // generated campaign deliberately duplicated both conflict histories;
+        // a clean replacement must prove that this is idempotent too.
+        let replayed =
+            copy_provider_batch(source, receiver, batch_id, ProviderBatchDelivery::Complete);
+        receiver_handle
+            .observe_provider_paths(replayed, false)
+            .unwrap();
+        settle_exact_provider_history(receiver_handle);
+    }
+
+    fn settle_exact_provider_history(handle: &SyncRuntimeHandle) {
+        for _ in 0..1_024 {
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "exact provider history did not settle: {tick:?}"
+            );
+            let status = handle.status().unwrap();
+            if status.provider_pending == 0 && !status.provider_runnable {
+                return;
+            }
+        }
+        panic!(
+            "exact provider history exceeded the bounded test turn budget: {:?}",
+            handle.status().unwrap()
+        );
+    }
+
+    fn converge_two_offline_histories(
+        first: &ActivationFixture,
+        second: &ActivationFixture,
+        first_handle: SyncRuntimeHandle,
+        second_handle: SyncRuntimeHandle,
+        first_batch: BatchId,
+        second_batch: BatchId,
+        first_history_first: bool,
+        visible_paths: &[&str],
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        if first_history_first {
+            deliver_offline_provider_history(first, second, &second_handle, first_batch);
+            deliver_offline_provider_history(second, first, &first_handle, second_batch);
+        } else {
+            deliver_offline_provider_history(second, first, &first_handle, second_batch);
+            deliver_offline_provider_history(first, second, &second_handle, first_batch);
+        }
+        assert_converged_and_reopen_stable(first, second, first_handle, second_handle, visible_paths)
+    }
+
+    /// Shared tail of the two-offline-histories scenarios: both devices show
+    /// identical visible text, shut down safely, and reopen without the text
+    /// changing.
+    fn assert_converged_and_reopen_stable(
+        first: &ActivationFixture,
+        second: &ActivationFixture,
+        first_handle: SyncRuntimeHandle,
+        second_handle: SyncRuntimeHandle,
+        visible_paths: &[&str],
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        let first_visible = visible_provider_page_text(first, visible_paths);
+        let second_visible = visible_provider_page_text(second, visible_paths);
+        assert_eq!(
+            first_visible, second_visible,
+            "opposing offline histories did not converge in visible graph text"
+        );
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+        assert!(matches!(
+            second_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+        drop(first_handle);
+        drop(second_handle);
+
+        let first_reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let second_reopened =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+        assert_eq!(
+            visible_provider_page_text(first, visible_paths),
+            first_visible,
+            "first device changed visible page text across the required reopen"
+        );
+        assert_eq!(
+            visible_provider_page_text(second, visible_paths),
+            first_visible,
+            "second device changed visible page text across the required reopen"
+        );
+        assert!(matches!(
+            first_reopened.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+        assert!(matches!(
+            second_reopened.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+        first_visible
+    }
+
+    #[test]
+    fn two_offline_same_page_text_edits_converge_in_both_delivery_orders() {
+        fn run_case(
+            label: &str,
+            seed: u128,
+            first_history_first: bool,
+        ) -> BTreeMap<String, Option<Vec<u8>>> {
+            let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+            let path = "notes/two-offline-same-page-text.md";
+            let (base_batch, _page_id, block_id, home_document_id) = submit_shared_page(
+                &first_handle,
+                seed + 0x20,
+                "Two Offline Same Page Text",
+                path,
+                "shared base text",
+            );
+            publish_shared_batch(&first_handle, &first, base_batch);
+            settle_shared_provider(&first_handle);
+            deliver_provider_to_receiver(&first, &second, &second_handle);
+
+            let first_batch = submit_durable(
+                &first_handle,
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: "first offline text".into(),
+                }],
+            );
+            let second_batch = submit_durable(
+                &second_handle,
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: "second offline text".into(),
+                }],
+            );
+            publish_shared_batch(&first_handle, &first, first_batch);
+            publish_shared_batch(&second_handle, &second, second_batch);
+            settle_shared_provider(&first_handle);
+            settle_shared_provider(&second_handle);
+
+            let first_manifest = OperationBatch::decode(
+                &fs::read(
+                    first
+                        .request
+                        .provider_root
+                        .join(format!("outbox/manifests/{first_batch}.manifest")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let second_manifest = OperationBatch::decode(
+                &fs::read(
+                    second
+                        .request
+                        .provider_root
+                        .join(format!("outbox/manifests/{second_batch}.manifest")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                first_manifest.causal_dependency_heads(),
+                second_manifest.causal_dependency_heads(),
+                "the two edits must be independently authored from the same base"
+            );
+
+            let first_known = outbox_manifest_ids(&first);
+            let second_known = outbox_manifest_ids(&second);
+            if first_history_first {
+                deliver_offline_provider_history(&first, &second, &second_handle, first_batch);
+                deliver_offline_provider_history(&second, &first, &first_handle, second_batch);
+            } else {
+                deliver_offline_provider_history(&second, &first, &first_handle, second_batch);
+                deliver_offline_provider_history(&first, &second, &second_handle, first_batch);
+            }
+
+            // Exactly one device — the author of the pair's minimum batch id —
+            // authors the keep-both resolution while settling. Exchange it so
+            // both devices show the resolved pair.
+            // A receiver relays accepted foreign manifests into its own
+            // outbox, so exclude the racing pair itself from the diff.
+            let resolutions: Vec<(bool, BatchId)> = outbox_manifest_ids(&first)
+                .difference(&first_known)
+                .map(|name| (true, outbox_manifest_batch_id(&first, name)))
+                .chain(
+                    outbox_manifest_ids(&second)
+                        .difference(&second_known)
+                        .map(|name| (false, outbox_manifest_batch_id(&second, name))),
+                )
+                .filter(|(_, batch)| *batch != first_batch && *batch != second_batch)
+                .collect();
+            assert_eq!(
+                resolutions.len(),
+                1,
+                "exactly one device authors the keep-both resolution: {resolutions:?}"
+            );
+            for (from_first, resolution_batch) in &resolutions {
+                if *from_first {
+                    deliver_offline_provider_history(
+                        &first,
+                        &second,
+                        &second_handle,
+                        *resolution_batch,
+                    );
+                } else {
+                    deliver_offline_provider_history(
+                        &second,
+                        &first,
+                        &first_handle,
+                        *resolution_batch,
+                    );
+                }
+            }
+
+            let expected: &[u8] = if first_batch <= second_batch {
+                b"- first offline text\n- second offline text\n"
+            } else {
+                b"- second offline text\n- first offline text\n"
+            };
+            let converged = assert_converged_and_reopen_stable(
+                &first,
+                &second,
+                first_handle,
+                second_handle,
+                &[path],
+            );
+            assert_eq!(
+                converged[path].as_deref(),
+                Some(expected),
+                "keep-both must show both authored versions, original first in batch-id order"
+            );
+            converged
+        }
+
+        // Each case asserts the exact keep-both bytes for its own batch-id
+        // order; sibling order follows batch ids, which are random per case,
+        // so the two cases' bytes are not comparable with each other.
+        run_case("same-page-text-first-order", 0xf600, true);
+        run_case("same-page-text-reverse-order", 0xf700, false);
+    }
+
+    #[test]
+    fn two_offline_edit_delete_histories_converge_in_both_delivery_orders() {
+        fn run_case(
+            label: &str,
+            seed: u128,
+            first_history_first: bool,
+        ) -> BTreeMap<String, Option<Vec<u8>>> {
+            let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+            let path = "notes/two-offline-edit-delete.md";
+            let (base_batch, page_id, block_id, home_document_id) = submit_shared_page(
+                &first_handle,
+                seed + 0x20,
+                "Two Offline Edit Delete",
+                path,
+                "shared edit-delete base",
+            );
+            publish_shared_batch(&first_handle, &first, base_batch);
+            settle_shared_provider(&first_handle);
+            deliver_provider_to_receiver(&first, &second, &second_handle);
+
+            let edit_batch = submit_durable(
+                &first_handle,
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: "offline edit racing deletion".into(),
+                }],
+            );
+            let delete_batch = submit_durable(
+                &second_handle,
+                vec![SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                }],
+            );
+            publish_shared_batch(&first_handle, &first, edit_batch);
+            publish_shared_batch(&second_handle, &second, delete_batch);
+            settle_shared_provider(&first_handle);
+            settle_shared_provider(&second_handle);
+
+            let converged = converge_two_offline_histories(
+                &first,
+                &second,
+                first_handle,
+                second_handle,
+                edit_batch,
+                delete_batch,
+                first_history_first,
+                &[path],
+            );
+            assert_eq!(
+                converged[path].as_deref(),
+                Some(b"- offline edit racing deletion\n".as_slice()),
+                "edit-vs-delete resolves to the edited block surviving"
+            );
+            converged
+        }
+
+        let first_order = run_case("edit-delete-first-order", 0xf800, true);
+        let reverse_order = run_case("edit-delete-reverse-order", 0xf900, false);
+        assert_eq!(
+            first_order, reverse_order,
+            "the edit/delete winner changed with provider delivery order"
+        );
+    }
+
+    #[test]
+    fn two_offline_move_delete_histories_converge_in_both_delivery_orders() {
+        fn run_case(
+            label: &str,
+            seed: u128,
+            first_history_first: bool,
+        ) -> BTreeMap<String, Option<Vec<u8>>> {
+            let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+            let source_path = "notes/two-offline-move-delete-source.md";
+            let target_path = "notes/two-offline-move-delete-target.md";
+            let (source_batch, source_page_id, block_id, home_document_id) = submit_shared_page(
+                &first_handle,
+                seed + 0x20,
+                "Two Offline Move Delete Source",
+                source_path,
+                "subtree racing a delete",
+            );
+            publish_shared_batch(&first_handle, &first, source_batch);
+            let (target_batch, target_page_id, ..) = submit_shared_page(
+                &first_handle,
+                seed + 0x40,
+                "Two Offline Move Delete Target",
+                target_path,
+                "target anchor",
+            );
+            publish_shared_batch(&first_handle, &first, target_batch);
+            settle_shared_provider(&first_handle);
+            deliver_provider_to_receiver(&first, &second, &second_handle);
+
+            let move_batch = submit_durable(
+                &first_handle,
+                vec![SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    from_page_id: source_page_id,
+                    to_page_id: target_page_id,
+                    parent: None,
+                    order: "z".into(),
+                }],
+            );
+            let delete_batch = submit_durable(
+                &second_handle,
+                vec![SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id: source_page_id,
+                }],
+            );
+            publish_shared_batch(&first_handle, &first, move_batch);
+            publish_shared_batch(&second_handle, &second, delete_batch);
+            settle_shared_provider(&first_handle);
+            settle_shared_provider(&second_handle);
+
+            let converged = converge_two_offline_histories(
+                &first,
+                &second,
+                first_handle,
+                second_handle,
+                move_batch,
+                delete_batch,
+                first_history_first,
+                &[source_path, target_path],
+            );
+            let source = converged[source_path].as_deref().unwrap_or_default();
+            let target = converged[target_path].as_deref().unwrap_or_default();
+            assert!(
+                !String::from_utf8_lossy(source).contains("subtree racing a delete"),
+                "moved-away/delete convergence left the subtree at its old owner"
+            );
+            assert!(
+                String::from_utf8_lossy(target).contains("subtree racing a delete"),
+                "move-wins: the concurrently deleted subtree survives at the move target"
+            );
+            assert!(
+                String::from_utf8_lossy(target).contains("target anchor"),
+                "the unrelated target anchor disappeared"
+            );
+            converged
+        }
+
+        let first_order = run_case("move-delete-first-order", 0xfa00, true);
+        let reverse_order = run_case("move-delete-reverse-order", 0xfb00, false);
+        assert_eq!(
+            first_order, reverse_order,
+            "the move/delete result changed with provider delivery order"
+        );
+    }
+
+    #[test]
+    fn rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders() {
+        fn run_case(
+            label: &str,
+            seed: u128,
+            first_history_first: bool,
+        ) -> BTreeMap<String, Option<Vec<u8>>> {
+            let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+            let old_target = "notes/rename-referrer-target.md";
+            let new_target = "notes/rename-referrer-target-renamed.md";
+            let referrer = "notes/rename-referrer-source.md";
+            let (target_batch, target_page_id, ..) = submit_shared_page(
+                &first_handle,
+                seed + 0x20,
+                "Rename Referrer Target",
+                old_target,
+                "rename target body",
+            );
+            publish_shared_batch(&first_handle, &first, target_batch);
+            let (referrer_batch, _referrer_page, referrer_block, referrer_document) =
+                submit_shared_page(
+                    &first_handle,
+                    seed + 0x40,
+                    "Rename Referrer Source",
+                    referrer,
+                    "referrer [[Rename Referrer Target]]",
+                );
+            publish_shared_batch(&first_handle, &first, referrer_batch);
+            settle_shared_provider(&first_handle);
+            deliver_provider_to_receiver(&first, &second, &second_handle);
+
+            let rename_batch = submit_durable(
+                &first_handle,
+                vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                    page_changes: vec![PageRename {
+                        page_id: target_page_id,
+                        new_name: LogicalPageName::parse("Rename Referrer Target Renamed").unwrap(),
+                        new_path: ManagedPath::parse(new_target).unwrap(),
+                    }],
+                    block_rewrites: vec![crate::oplog::BlockContentRewrite {
+                        block: BlockLocation {
+                            block_id: referrer_block,
+                            home_document_id: referrer_document,
+                        },
+                        new_content: "referrer [[Rename Referrer Target Renamed]]".into(),
+                    }],
+                    page_preamble_rewrites: Vec::new(),
+                }],
+            );
+            let edit_batch = submit_durable(
+                &second_handle,
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: referrer_block,
+                        home_document_id: referrer_document,
+                    },
+                    content: "ordinary referrer edit [[Rename Referrer Target]]".into(),
+                }],
+            );
+            publish_shared_batch(&first_handle, &first, rename_batch);
+            publish_shared_batch(&second_handle, &second, edit_batch);
+            settle_shared_provider(&first_handle);
+            settle_shared_provider(&second_handle);
+
+            let converged = converge_two_offline_histories(
+                &first,
+                &second,
+                first_handle,
+                second_handle,
+                rename_batch,
+                edit_batch,
+                first_history_first,
+                &[old_target, new_target, referrer],
+            );
+            assert_ne!(
+                converged[old_target].is_some(),
+                converged[new_target].is_some(),
+                "the rename must leave exactly one visible target path"
+            );
+            let referrer_text = converged[referrer]
+                .as_ref()
+                .expect("the referrer remains visible");
+            assert_eq!(
+                referrer_text.as_slice(),
+                b"- ordinary referrer edit [[Rename Referrer Target Renamed]]\n",
+                "the disjoint-region rename rewrite and prefix edit merge silently"
+            );
+            converged
+        }
+
+        let first_order = run_case("rename-referrer-first-order", 0xfc00, true);
+        let reverse_order = run_case("rename-referrer-reverse-order", 0xfd00, false);
+        assert_eq!(
+            first_order, reverse_order,
+            "the rename/referrer result changed with provider delivery order"
+        );
+    }
+
+    #[test]
+    fn two_offline_disjoint_region_edits_of_one_block_merge_silently() {
+        fn run_case(
+            label: &str,
+            seed: u128,
+            first_history_first: bool,
+        ) -> BTreeMap<String, Option<Vec<u8>>> {
+            let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+            let path = "notes/two-offline-disjoint-regions.md";
+            let (base_batch, _page_id, block_id, home_document_id) = submit_shared_page(
+                &first_handle,
+                seed + 0x20,
+                "Two Offline Disjoint Regions",
+                path,
+                "alpha beta gamma",
+            );
+            publish_shared_batch(&first_handle, &first, base_batch);
+            settle_shared_provider(&first_handle);
+            deliver_provider_to_receiver(&first, &second, &second_handle);
+
+            let first_batch = submit_durable(
+                &first_handle,
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: "ALPHA beta gamma".into(),
+                }],
+            );
+            let second_batch = submit_durable(
+                &second_handle,
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: "alpha beta GAMMA".into(),
+                }],
+            );
+            publish_shared_batch(&first_handle, &first, first_batch);
+            publish_shared_batch(&second_handle, &second, second_batch);
+            settle_shared_provider(&first_handle);
+            settle_shared_provider(&second_handle);
+
+            let converged = converge_two_offline_histories(
+                &first,
+                &second,
+                first_handle,
+                second_handle,
+                first_batch,
+                second_batch,
+                first_history_first,
+                &[path],
+            );
+            let text = converged[path]
+                .as_ref()
+                .expect("converged page remains visible");
+            assert_eq!(
+                text.as_slice(),
+                b"- ALPHA beta GAMMA\n".as_slice(),
+                "disjoint-region edits did not merge silently: {}",
+                String::from_utf8_lossy(text)
+            );
+            converged
+        }
+
+        let first_order = run_case("disjoint-regions-first-order", 0xfe00, true);
+        let reverse_order = run_case("disjoint-regions-reverse-order", 0xff00, false);
+        assert_eq!(
+            first_order, reverse_order,
+            "the disjoint-region merge changed with provider delivery order"
+        );
+    }
     fn recursive_file_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
         let mut files = BTreeMap::new();
         if !root.is_dir() {
