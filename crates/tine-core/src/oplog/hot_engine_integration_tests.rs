@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 
 use crate::oplog::{
     AuthorBatch, BatchCausalDot, BatchDisposition, BatchError, BatchId, BatchInspection,
-    BatchOrigin, BlockDelta, BlockLocation, BlockOwner, CausalPeerId, ContentDigest,
+    BatchOrigin, BlockDelta, BlockLocation, BlockOwner, BlockRestore, CausalPeerId, ContentDigest,
     CrdtPeerCounter, CrdtPeerId, DeterministicSimulator, DeviceId, DocumentCausalDigest,
     DocumentDependencies, DocumentId, EngineError, FailureCapsule, FailureIdentity, FrontierV2,
     FrozenCandidateId, ImmutableHomeClaim, ImmutableHomeConflict, ImmutableHomeEvidence,
     LineageDigest, LogseqIdentityMutation, LogseqIdentityOrigin, LogseqIdentityTrigger, LogseqUuid,
-    LogseqUuidResolution, ManagedPath, ManagedTextKind, MembershipDelta, ObjectKind, ObjectStore,
+    LogseqUuidResolution, ManagedPath, ManagedTextKind, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
     OperationBatch, OperationObject, OperationTransaction, PageDelta, PageId, PagePreambleDelta,
     PagePreambleState, PageState, PolicyGeneratedAnchorReason, PreparedBatch,
     ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore, Scenario,
@@ -7053,4 +7053,228 @@ fn an_ambiguous_logseq_claim_refuses_identically_in_both_derivations() {
         observed.refused.is_some(),
         "a duplicate accepted Logseq claim must refuse"
     );
+}
+
+#[test]
+fn restore_subtree_resurrects_a_tombstoned_block_with_the_concurrent_edit_text() {
+    let ids = Ids::new();
+    let dir = TestDir::new("restore-after-edit-delete");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "offline edit racing deletion".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(50_100, 501),
+        edited,
+        author(50_200, 502),
+        deleted,
+    );
+    let merged = apply_pair(ids, &baseline, edited.clone(), deleted.clone());
+    assert!(
+        merged.materialize_page(ids.page_a).unwrap().blocks.is_empty(),
+        "the unresolved merge tombstones the edited block"
+    );
+
+    let restore = tx(vec![SemanticOperation::RestoreSubtree {
+        page_id: ids.page_a,
+        blocks: vec![BlockRestore {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: ids.home_a,
+            },
+            claim: MembershipClaim {
+                home_document_id: ids.home_a,
+                parent: None,
+                order: "a".into(),
+            },
+        }],
+    }]);
+    let restore_prepared = {
+        let mut author_engine = ids.engine();
+        author_engine.stage_ready(baseline.clone());
+        author_engine.stage_ready(edited.clone());
+        author_engine.stage_ready(deleted.clone());
+        author_engine
+            .prepare_bootstrap_transaction(author(50_300, 503), &restore)
+            .unwrap()
+    };
+    let restore = ready(&archive, &restore_prepared);
+
+    let ab = {
+        let mut engine = apply_pair(ids, &baseline, edited.clone(), deleted.clone());
+        assert!(!matches!(
+            engine.stage_ready(restore.clone()).disposition,
+            BatchDisposition::Rejected { .. }
+        ));
+        engine
+    };
+    let ba = {
+        let mut engine = apply_pair(ids, &baseline, deleted, edited);
+        assert!(!matches!(
+            engine.stage_ready(restore).disposition,
+            BatchDisposition::Rejected { .. }
+        ));
+        engine
+    };
+    assert_eq!(
+        ab.canonical_snapshot().unwrap(),
+        ba.canonical_snapshot().unwrap()
+    );
+    let page = ab.materialize_page(ids.page_a).unwrap();
+    assert_eq!(page.blocks.len(), 1);
+    assert_eq!(page.blocks[0].content, "offline edit racing deletion");
+}
+
+#[test]
+fn independently_authored_equal_restores_converge_to_one_visible_block() {
+    let ids = Ids::new();
+    let dir = TestDir::new("restore-double-author");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let deleted = {
+        let mut author_engine = ids.engine();
+        author_engine.stage_ready(baseline.clone());
+        let prepared = author_engine
+            .prepare_bootstrap_transaction(
+                author(51_100, 511),
+                &tx(vec![SemanticOperation::DeleteSubtree {
+                    root_block_id: ids.block_a,
+                    page_id: ids.page_a,
+                }]),
+            )
+            .unwrap();
+        ready(&archive, &prepared)
+    };
+    let restore_operations = || {
+        tx(vec![SemanticOperation::RestoreSubtree {
+            page_id: ids.page_a,
+            blocks: vec![BlockRestore {
+                block: BlockLocation {
+                    block_id: ids.block_a,
+                    home_document_id: ids.home_a,
+                },
+                claim: MembershipClaim {
+                    home_document_id: ids.home_a,
+                    parent: None,
+                    order: "a".into(),
+                },
+            }],
+        }])
+    };
+    let (left, right) = concurrent_ready_from(
+        ids,
+        &archive,
+        &[baseline.clone(), deleted.clone()],
+        author(51_200, 512),
+        restore_operations(),
+        author(51_300, 513),
+        restore_operations(),
+    );
+    let ab = apply_pair_from(
+        ids,
+        &[baseline.clone(), deleted.clone()],
+        left.clone(),
+        right.clone(),
+    );
+    let ba = apply_pair_from(ids, &[baseline, deleted], right, left);
+    assert_eq!(
+        ab.canonical_snapshot().unwrap(),
+        ba.canonical_snapshot().unwrap()
+    );
+    let page = ab.materialize_page(ids.page_a).unwrap();
+    assert_eq!(page.blocks.len(), 1);
+    assert_eq!(page.blocks[0].content, "home A content");
+}
+
+#[test]
+fn restore_subtree_reasserts_a_move_over_a_concurrent_delete() {
+    let ids = Ids::new();
+    let dir = TestDir::new("restore-move-delete");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let moved = tx(vec![SemanticOperation::MoveSubtree {
+        root: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        from_page_id: ids.page_a,
+        to_page_id: ids.page_b,
+        parent: None,
+        order: "z".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (moved, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(52_100, 521),
+        moved,
+        author(52_200, 522),
+        deleted,
+    );
+    let restore = tx(vec![SemanticOperation::RestoreSubtree {
+        page_id: ids.page_b,
+        blocks: vec![BlockRestore {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: ids.home_a,
+            },
+            claim: MembershipClaim {
+                home_document_id: ids.home_a,
+                parent: None,
+                order: "z".into(),
+            },
+        }],
+    }]);
+    let restore_prepared = {
+        let mut author_engine = ids.engine();
+        author_engine.stage_ready(baseline.clone());
+        author_engine.stage_ready(moved.clone());
+        author_engine.stage_ready(deleted.clone());
+        author_engine
+            .prepare_bootstrap_transaction(author(52_300, 523), &restore)
+            .unwrap()
+    };
+    let restore = ready(&archive, &restore_prepared);
+    let ab = {
+        let mut engine = apply_pair(ids, &baseline, moved.clone(), deleted.clone());
+        let disposition = engine.stage_ready(restore.clone()).disposition;
+        assert!(
+            !matches!(disposition, BatchDisposition::Rejected { .. }),
+            "restore rejected: {disposition:?}"
+        );
+        engine
+    };
+    let ba = {
+        let mut engine = apply_pair(ids, &baseline, deleted, moved);
+        let disposition = engine.stage_ready(restore).disposition;
+        assert!(
+            !matches!(disposition, BatchDisposition::Rejected { .. }),
+            "restore rejected: {disposition:?}"
+        );
+        engine
+    };
+    assert_eq!(
+        ab.canonical_snapshot().unwrap(),
+        ba.canonical_snapshot().unwrap()
+    );
+    assert!(ab.materialize_page(ids.page_a).unwrap().blocks.is_empty());
+    let page_b = ab.materialize_page(ids.page_b).unwrap();
+    assert_eq!(page_b.blocks.len(), 1);
+    assert_eq!(page_b.blocks[0].content, "home A content");
 }

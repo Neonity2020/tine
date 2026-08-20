@@ -62,6 +62,7 @@ pub mod sqlite;
 mod sqlite_identity;
 pub mod sqlite_materialization;
 pub mod sync_layout;
+pub mod text_merge;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;
@@ -107,7 +108,7 @@ pub(crate) use hot_engine::{
 };
 pub use hot_engine::{
     decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence, AuthorBatch,
-    AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation,
+    AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation, BlockRestore,
     CapabilityCapturedProjectionInput, CapabilityCapturedProjectionState, CurrentPageAtPath,
     EngineError, EngineInstrumentation, EngineStatus, FatalEvidenceHandle, ImmutableHomeClaim,
     ImmutableHomeConflict, ImmutableHomeEvidence, LogseqIdentityMutation, LogseqIdentityTrigger,

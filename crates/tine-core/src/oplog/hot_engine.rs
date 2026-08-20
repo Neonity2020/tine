@@ -1439,6 +1439,13 @@ pub struct PagePreambleRewrite {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockRestore {
+    pub block: BlockLocation,
+    pub claim: MembershipClaim,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SemanticOperation {
     CreatePage {
@@ -1499,6 +1506,15 @@ pub enum SemanticOperation {
         page_changes: Vec<PageRename>,
         block_rewrites: Vec<BlockContentRewrite>,
         page_preamble_rewrites: Vec<PagePreambleRewrite>,
+    },
+    /// Deterministic conflict-resolution restore (GH #351): re-assert page
+    /// ownership and membership for blocks whose visibility lost a race with
+    /// a concurrent tombstone. Writes only owner/membership map registers —
+    /// never text — so independently authored restores with equal values
+    /// converge.
+    RestoreSubtree {
+        page_id: PageId,
+        blocks: Vec<BlockRestore>,
     },
     ReconcileExternalPageState {
         page_id: PageId,
@@ -1566,6 +1582,28 @@ impl OperationTransaction {
 }
 
 fn validate_operation_shape(operation: &SemanticOperation) -> Result<(), EngineError> {
+    if let SemanticOperation::RestoreSubtree { blocks, .. } = operation {
+        if blocks.is_empty() {
+            return Err(EngineError::InvalidTransaction(
+                "restore requires at least one block".into(),
+            ));
+        }
+        if blocks.len() > super::semantic::MAX_SEMANTIC_DELTA_ENTRIES {
+            return Err(EngineError::InvalidTransaction(format!(
+                "restore entry count {} exceeds the semantic bound",
+                blocks.len()
+            )));
+        }
+        if !blocks.windows(2).all(|pair| {
+            (pair[0].block.home_document_id, pair[0].block.block_id)
+                < (pair[1].block.home_document_id, pair[1].block.block_id)
+        }) {
+            return Err(EngineError::InvalidTransaction(
+                "restore blocks must be sorted and unique by home and block ID".into(),
+            ));
+        }
+        return Ok(());
+    }
     let SemanticOperation::RenamePagesAndRewriteReferrers {
         page_changes,
         block_rewrites,
@@ -30061,6 +30099,75 @@ impl ShardedHotEngine {
                     },
                 )?;
             }
+            SemanticOperation::RestoreSubtree { page_id, blocks } => {
+                let page_home =
+                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
+                // Restores re-assert values that one side of a concurrent race
+                // may already hold, and loro skips same-value map writes, so a
+                // touched document can end up with zero new operations. A
+                // zero-operation working document must not stay in the batch:
+                // its exported "update" would declare an empty start frontier
+                // and be refused by every receiver. Track which documents this
+                // operation pulled into the working set and evict the ones it
+                // did not actually change.
+                let mut touched: BTreeMap<DocumentId, (bool, VersionVector)> = BTreeMap::new();
+                for restore in blocks {
+                    if restore.claim.home_document_id != restore.block.home_document_id {
+                        return Err(EngineError::InvalidTransaction(
+                            "restore claim home must match the block home shard".into(),
+                        ));
+                    }
+                    restore.claim.validate()?;
+                    let vacant = !working.contains_key(&restore.block.home_document_id);
+                    let home = self.ensure_working_document(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        restore.block.home_document_id,
+                        peer_id,
+                    )?;
+                    touched
+                        .entry(restore.block.home_document_id)
+                        .or_insert_with(|| (vacant, home.oplog_vv()));
+                    if read_block_state(
+                        restore.block.home_document_id,
+                        home,
+                        restore.block.block_id,
+                    )?
+                    .is_none()
+                    {
+                        return Err(EngineError::BlockNotFound(restore.block.block_id));
+                    }
+                    set_owner(home, restore.block.block_id, BlockOwner::Page(*page_id))?;
+                }
+                let vacant = !working.contains_key(&page_home);
+                let destination = self.ensure_working_document(
+                    working,
+                    before_vectors,
+                    before_snapshots,
+                    page_home,
+                    peer_id,
+                )?;
+                touched
+                    .entry(page_home)
+                    .or_insert_with(|| (vacant, destination.oplog_vv()));
+                for restore in blocks {
+                    insert_membership(destination, restore.block.block_id, &restore.claim)?;
+                }
+                for (document_id, (vacant, before_vv)) in touched {
+                    if !vacant {
+                        continue;
+                    }
+                    let unchanged = working
+                        .get(&document_id)
+                        .is_some_and(|document| document.document().oplog_vv() == before_vv);
+                    if unchanged {
+                        working.remove(&document_id);
+                        before_vectors.remove(&document_id);
+                        before_snapshots.remove(&document_id);
+                    }
+                }
+            }
             SemanticOperation::CreateBlock {
                 block,
                 page_id,
@@ -30719,6 +30826,13 @@ fn explicit_bootstrap_author_documents(
                     block_rewrites
                         .iter()
                         .map(|rewrite| rewrite.block.home_document_id),
+                );
+            }
+            SemanticOperation::RestoreSubtree { blocks, .. } => {
+                documents.extend(
+                    blocks
+                        .iter()
+                        .map(|restore| restore.block.home_document_id),
                 );
             }
             SemanticOperation::SetPagePreamble { .. }

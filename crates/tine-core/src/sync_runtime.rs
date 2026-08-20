@@ -4998,6 +4998,15 @@ fn bounded_local_mutation_size(transaction: &OperationTransaction) -> SyncLocalM
             | SemanticOperation::ReorderBlock { order, .. } => {
                 charge_local_text(&mut size, order.len());
             }
+            SemanticOperation::RestoreSubtree { blocks, .. } => {
+                for restore in blocks {
+                    charge_local_row(&mut size);
+                    charge_local_text(&mut size, restore.claim.order.len());
+                    if size.rows > MAX_LOCAL_MUTATION_ROWS {
+                        break;
+                    }
+                }
+            }
             SemanticOperation::RenamePagesAndRewriteReferrers {
                 page_changes,
                 block_rewrites,
