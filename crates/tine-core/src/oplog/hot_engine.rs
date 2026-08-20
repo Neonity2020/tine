@@ -1445,6 +1445,125 @@ pub struct BlockRestore {
     pub claim: MembershipClaim,
 }
 
+/// A concurrent same-block conflict pair, ordered by batch id so every
+/// device derives the identical pair from the same two batches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictPair {
+    pub min_batch: BatchId,
+    pub min_author_device: DeviceId,
+    pub max_batch: BatchId,
+    pub max_author_device: DeviceId,
+}
+
+impl ConflictPair {
+    fn from_manifests(left: &OperationBatch, right: &OperationBatch) -> Self {
+        let (min, max) = if left.batch_id() <= right.batch_id() {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        Self {
+            min_batch: min.batch_id(),
+            min_author_device: min.author_device_id(),
+            max_batch: max.batch_id(),
+            max_author_device: max.author_device_id(),
+        }
+    }
+}
+
+/// Deterministic resolution work derived from an accepted batch that raced
+/// concurrent history on the same block (GH #351, the git-like rule). The
+/// intents are a pure function of the accepted batch set plus the merged
+/// state, so every device that observes the completed pair derives the same
+/// resolution; authoring is restricted to the pair's own author devices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConflictResolutionIntent {
+    /// edit-vs-delete: the tombstone won the owner-register race, but a
+    /// concurrent edit proves the deletion removed state its author never
+    /// saw. Re-assert the edited block; its text survives in the content
+    /// container the tombstone never touched.
+    RestoreEdited {
+        page_id: PageId,
+        block: BlockLocation,
+        claim: MembershipClaim,
+        pair: ConflictPair,
+    },
+    /// move-vs-delete: the tombstone won the owner-register race against a
+    /// concurrent move. Re-assert the move's destination ownership so the
+    /// outcome is move-wins regardless of register luck.
+    RestoreMoved {
+        page_id: PageId,
+        block: BlockLocation,
+        claim: MembershipClaim,
+        pair: ConflictPair,
+    },
+    /// Overlapping same-block text edits: the CRDT merge is an interleave
+    /// nobody typed. Keep both authored versions as adjacent sibling blocks,
+    /// original block first in batch-id order.
+    KeepBothTexts {
+        page_id: PageId,
+        block: BlockLocation,
+        keep_text: String,
+        sibling_text: String,
+        merged_text: String,
+        pair: ConflictPair,
+    },
+}
+
+fn block_delta_edit_page(delta: &BlockDelta) -> Option<PageId> {
+    match (&delta.before, &delta.after) {
+        (Some(before), Some(after)) => match (before.owner, after.owner) {
+            (BlockOwner::Page(page), BlockOwner::Page(same))
+                if page == same && before.content != after.content =>
+            {
+                Some(page)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn block_delta_is_delete(delta: &BlockDelta) -> bool {
+    matches!(
+        (&delta.before, &delta.after),
+        (Some(before), Some(after))
+            if matches!(before.owner, BlockOwner::Page(_))
+                && after.owner == BlockOwner::Tombstone
+    )
+}
+
+fn block_delta_move_target(delta: &BlockDelta) -> Option<PageId> {
+    match (&delta.before, &delta.after) {
+        (Some(before), Some(after)) => match (before.owner, after.owner) {
+            (BlockOwner::Page(source), BlockOwner::Page(target)) if source != target => {
+                Some(target)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn membership_claim_in_effect(
+    effect: &SemanticEffect,
+    page_id: PageId,
+    block_id: BlockId,
+    after: bool,
+) -> Option<MembershipClaim> {
+    effect
+        .memberships()
+        .iter()
+        .find(|delta| delta.page_id == page_id && delta.block_id == block_id)
+        .and_then(|delta| {
+            if after {
+                delta.after.clone()
+            } else {
+                delta.before.clone()
+            }
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SemanticOperation {
@@ -27217,6 +27336,257 @@ impl ShardedHotEngine {
                 .authenticated_ephemeral_exact_state(&self.ephemeral_page_names, key)
                 .map_err(|error| EngineError::Archive(error.to_string())),
         }
+    }
+
+    fn accepted_semantic_effect(
+        &self,
+        batch: &ValidatedBatch,
+    ) -> Result<SemanticEffect, EngineError> {
+        let semantic_objects = batch
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::SemanticEffect)
+            .collect::<Vec<_>>();
+        if semantic_objects.len() != 1 {
+            return Err(EngineError::Archive(
+                "accepted batch has non-unique semantic effect".into(),
+            ));
+        }
+        if SemanticEffectDigest::of(semantic_objects[0].payload())
+            != batch.manifest().semantic_effect_digest()
+        {
+            return Err(EngineError::Archive(
+                "accepted semantic effect is not manifest-bound".into(),
+            ));
+        }
+        Ok(SemanticEffect::decode(semantic_objects[0].payload())?)
+    }
+
+    /// Derive the deterministic conflict resolutions owed after accepting
+    /// `batch_id` (GH #351). Returns work only when the batch raced accepted
+    /// concurrent history on the same block: edit-vs-delete and
+    /// move-vs-delete pairs where the tombstone currently holds the owner
+    /// register, and overlapping same-block text edits whose CRDT merge is
+    /// an interleave nobody typed. Pure with respect to engine state: the
+    /// same accepted set and merged state yield the same intents on every
+    /// device.
+    pub fn conflict_resolution_intents(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<ConflictResolutionIntent>, EngineError> {
+        if self.accepted_batch_is_causally_linear(batch_id)? {
+            return Ok(Vec::new());
+        }
+        let x_batch = self.load_accepted_validated_batch(batch_id)?;
+        let x_effect = self.accepted_semantic_effect(&x_batch)?;
+        if x_effect.blocks().is_empty() {
+            return Ok(Vec::new());
+        }
+        let x_heads = declared_batch_heads(x_batch.manifest().dependency_frontier());
+        let x_ancestry = self.collect_batch_ancestry(&x_heads, false)?;
+        let accepted = self.status().accepted_batches()?.to_vec();
+        let mut intents = Vec::new();
+        for candidate in accepted {
+            let z_id = candidate.batch_id;
+            if z_id == batch_id || x_ancestry.contains_key(&z_id) {
+                continue;
+            }
+            let z_batch = self.load_accepted_validated_batch(z_id)?;
+            let z_effect = self.accepted_semantic_effect(&z_batch)?;
+            let shared: Vec<(&BlockDelta, &BlockDelta)> = x_effect
+                .blocks()
+                .iter()
+                .filter_map(|x_delta| {
+                    z_effect
+                        .blocks()
+                        .iter()
+                        .find(|z_delta| {
+                            z_delta.home_document_id == x_delta.home_document_id
+                                && z_delta.block_id == x_delta.block_id
+                        })
+                        .map(|z_delta| (x_delta, z_delta))
+                })
+                .collect();
+            if shared.is_empty() {
+                continue;
+            }
+            // Batches causally after `batch_id` (an already-accepted
+            // resolution, a later user action) are not concurrent with it.
+            let z_heads = declared_batch_heads(z_batch.manifest().dependency_frontier());
+            if self
+                .collect_batch_ancestry(&z_heads, false)?
+                .contains_key(&batch_id)
+            {
+                continue;
+            }
+            let pair = ConflictPair::from_manifests(x_batch.manifest(), z_batch.manifest());
+            for (x_delta, z_delta) in shared {
+                self.classify_block_race(
+                    x_delta,
+                    &x_effect,
+                    z_delta,
+                    &z_effect,
+                    &pair,
+                    batch_id,
+                    &mut intents,
+                )?;
+            }
+        }
+        Ok(intents)
+    }
+
+    fn classify_block_race(
+        &self,
+        x_delta: &BlockDelta,
+        x_effect: &SemanticEffect,
+        z_delta: &BlockDelta,
+        z_effect: &SemanticEffect,
+        pair: &ConflictPair,
+        x_batch_id: BatchId,
+        intents: &mut Vec<ConflictResolutionIntent>,
+    ) -> Result<(), EngineError> {
+        let home = x_delta.home_document_id;
+        let block_id = x_delta.block_id;
+        let block = BlockLocation {
+            block_id,
+            home_document_id: home,
+        };
+        let merged_doc = self.clone_validation_document(home, 1)?;
+        let Some(merged_state) = read_block_state(home, &merged_doc, block_id)? else {
+            return Ok(());
+        };
+        let restore_after_tombstone =
+            |page_id: PageId,
+             claim: Option<MembershipClaim>,
+             moved: bool,
+             intents: &mut Vec<ConflictResolutionIntent>| {
+                // Only when the tombstone actually holds the merged register
+                // is there anything to re-assert; if the surviving side won
+                // the LWW race the outcome is already the resolved one.
+                if merged_state.owner != BlockOwner::Tombstone {
+                    return;
+                }
+                let Some(mut claim) = claim else {
+                    return;
+                };
+                if let Some(parent) = claim.parent {
+                    let parent_visible = read_block_state(home, &merged_doc, parent)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|state| state.owner == BlockOwner::Page(page_id));
+                    if !parent_visible {
+                        claim.parent = None;
+                    }
+                }
+                let intent = if moved {
+                    ConflictResolutionIntent::RestoreMoved {
+                        page_id,
+                        block,
+                        claim,
+                        pair: pair.clone(),
+                    }
+                } else {
+                    ConflictResolutionIntent::RestoreEdited {
+                        page_id,
+                        block,
+                        claim,
+                        pair: pair.clone(),
+                    }
+                };
+                if !intents.contains(&intent) {
+                    intents.push(intent);
+                }
+            };
+        match (
+            block_delta_edit_page(x_delta),
+            block_delta_is_delete(x_delta),
+            block_delta_move_target(x_delta),
+            block_delta_edit_page(z_delta),
+            block_delta_is_delete(z_delta),
+            block_delta_move_target(z_delta),
+        ) {
+            // edit-vs-delete, both orders.
+            (Some(page), _, _, _, true, _) => {
+                restore_after_tombstone(
+                    page,
+                    membership_claim_in_effect(z_effect, page, block_id, false),
+                    false,
+                    intents,
+                );
+            }
+            (_, true, _, Some(page), _, _) => {
+                restore_after_tombstone(
+                    page,
+                    membership_claim_in_effect(x_effect, page, block_id, false),
+                    false,
+                    intents,
+                );
+            }
+            // move-vs-delete, both orders.
+            (_, _, Some(target), _, true, _) => {
+                restore_after_tombstone(
+                    target,
+                    membership_claim_in_effect(x_effect, target, block_id, true),
+                    true,
+                    intents,
+                );
+            }
+            (_, true, _, _, _, Some(target)) => {
+                restore_after_tombstone(
+                    target,
+                    membership_claim_in_effect(z_effect, target, block_id, true),
+                    true,
+                    intents,
+                );
+            }
+            // edit-vs-edit: classify against the ancestor and the CRDT merge.
+            (Some(page), _, _, Some(_), _, _) => {
+                let BlockOwner::Page(current_page) = merged_state.owner else {
+                    // The block lost a separate race with a tombstone; that
+                    // pair produces its own restore intent.
+                    return Ok(());
+                };
+                let _ = page;
+                let x_before = x_delta.before.as_ref().expect("edit delta has before");
+                let z_before = z_delta.before.as_ref().expect("edit delta has before");
+                let x_after = x_delta.after.as_ref().expect("edit delta has after");
+                let z_after = z_delta.after.as_ref().expect("edit delta has after");
+                let classification = if x_before.content == z_before.content {
+                    super::text_merge::classify_concurrent_edits(
+                        &x_before.content,
+                        &x_after.content,
+                        &z_after.content,
+                        &merged_state.content,
+                    )
+                } else {
+                    // Divergent ancestors (chained concurrency): there is no
+                    // single base to classify against; never ship the
+                    // interleave.
+                    super::text_merge::TextMergeClassification::Conflict
+                };
+                if classification == super::text_merge::TextMergeClassification::CleanUnion {
+                    return Ok(());
+                }
+                let (keep_text, sibling_text) = if pair.min_batch == x_batch_id {
+                    (x_after.content.clone(), z_after.content.clone())
+                } else {
+                    (z_after.content.clone(), x_after.content.clone())
+                };
+                let intent = ConflictResolutionIntent::KeepBothTexts {
+                    page_id: current_page,
+                    block,
+                    keep_text,
+                    sibling_text,
+                    merged_text: merged_state.content.clone(),
+                    pair: pair.clone(),
+                };
+                if !intents.contains(&intent) {
+                    intents.push(intent);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn load_accepted_validated_batch(

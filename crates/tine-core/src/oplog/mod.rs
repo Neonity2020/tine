@@ -109,6 +109,7 @@ pub(crate) use hot_engine::{
 pub use hot_engine::{
     decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence, AuthorBatch,
     AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation, BlockRestore,
+    ConflictPair, ConflictResolutionIntent,
     CapabilityCapturedProjectionInput, CapabilityCapturedProjectionState, CurrentPageAtPath,
     EngineError, EngineInstrumentation, EngineStatus, FatalEvidenceHandle, ImmutableHomeClaim,
     ImmutableHomeConflict, ImmutableHomeEvidence, LogseqIdentityMutation, LogseqIdentityTrigger,

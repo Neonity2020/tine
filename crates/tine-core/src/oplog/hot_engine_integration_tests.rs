@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::oplog::{
     AuthorBatch, BatchCausalDot, BatchDisposition, BatchError, BatchId, BatchInspection,
-    BatchOrigin, BlockDelta, BlockLocation, BlockOwner, BlockRestore, CausalPeerId, ContentDigest,
+    BatchOrigin, BlockDelta, BlockLocation, BlockOwner, BlockRestore, CausalPeerId,
+    ConflictResolutionIntent, ContentDigest,
     CrdtPeerCounter, CrdtPeerId, DeterministicSimulator, DeviceId, DocumentCausalDigest,
     DocumentDependencies, DocumentId, EngineError, FailureCapsule, FailureIdentity, FrontierV2,
     FrozenCandidateId, ImmutableHomeClaim, ImmutableHomeConflict, ImmutableHomeEvidence,
@@ -7277,4 +7278,222 @@ fn restore_subtree_reasserts_a_move_over_a_concurrent_delete() {
     let page_b = ab.materialize_page(ids.page_b).unwrap();
     assert_eq!(page_b.blocks.len(), 1);
     assert_eq!(page_b.blocks[0].content, "home A content");
+}
+
+#[test]
+fn conflict_intents_detect_edit_delete_and_move_delete_races() {
+    let ids = Ids::new();
+    let dir = TestDir::new("intents-delete-races");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "offline edit racing deletion".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(54_100, 541),
+        edited,
+        author(54_200, 542),
+        deleted,
+    );
+    for (first, second) in [
+        (edited.clone(), deleted.clone()),
+        (deleted.clone(), edited.clone()),
+    ] {
+        let engine = apply_pair(ids, &baseline, first, second.clone());
+        let intents = engine
+            .conflict_resolution_intents(second.manifest().batch_id())
+            .unwrap();
+        assert_eq!(intents.len(), 1, "one restore per pair: {intents:?}");
+        match &intents[0] {
+            ConflictResolutionIntent::RestoreEdited {
+                page_id,
+                block,
+                claim,
+                pair,
+            } => {
+                assert_eq!(*page_id, ids.page_a);
+                assert_eq!(block.block_id, ids.block_a);
+                assert_eq!(claim.parent, None);
+                assert_eq!(claim.order, "a");
+                assert_eq!(
+                    (pair.min_batch, pair.max_batch),
+                    (
+                        edited.manifest().batch_id().min(deleted.manifest().batch_id()),
+                        edited.manifest().batch_id().max(deleted.manifest().batch_id()),
+                    )
+                );
+            }
+            other => panic!("expected RestoreEdited, found {other:?}"),
+        }
+        // The first of the pair is linear on this device; no intents for it.
+        let engine_first_id = if second.manifest().batch_id() == edited.manifest().batch_id() {
+            deleted.manifest().batch_id()
+        } else {
+            edited.manifest().batch_id()
+        };
+        assert!(engine
+            .conflict_resolution_intents(engine_first_id)
+            .unwrap()
+            .iter()
+            .all(|intent| matches!(intent, ConflictResolutionIntent::RestoreEdited { .. })));
+    }
+
+    let moved = tx(vec![SemanticOperation::MoveSubtree {
+        root: BlockLocation {
+            block_id: ids.block_c,
+            home_document_id: ids.home_c,
+        },
+        from_page_id: ids.page_c,
+        to_page_id: ids.page_b,
+        parent: None,
+        order: "z".into(),
+    }]);
+    let subtree_deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_c,
+        page_id: ids.page_c,
+    }]);
+    let (moved, subtree_deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(54_300, 543),
+        moved,
+        author(54_400, 544),
+        subtree_deleted,
+    );
+    let engine = apply_pair(ids, &baseline, moved.clone(), subtree_deleted.clone());
+    let intents = engine
+        .conflict_resolution_intents(subtree_deleted.manifest().batch_id())
+        .unwrap();
+    let restore_moved = intents
+        .iter()
+        .find_map(|intent| match intent {
+            ConflictResolutionIntent::RestoreMoved { page_id, block, claim, .. } => {
+                Some((*page_id, block.block_id, claim.clone()))
+            }
+            _ => None,
+        });
+    if engine
+        .materialize_page(ids.page_b)
+        .unwrap()
+        .blocks
+        .is_empty()
+    {
+        // The tombstone won the register race: move-wins needs the restore.
+        let (page_id, block_id, claim) =
+            restore_moved.expect("tombstone-winning race yields a RestoreMoved intent");
+        assert_eq!(page_id, ids.page_b);
+        assert_eq!(block_id, ids.block_c);
+        assert_eq!(claim.order, "z");
+    } else {
+        // The move already won: nothing to re-assert.
+        assert!(restore_moved.is_none(), "move won yet a restore was derived");
+    }
+}
+
+#[test]
+fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
+    let ids = Ids::new();
+    let dir = TestDir::new("intents-text-races");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    // Overlap: both replace the whole content.
+    let first = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "first offline text".into(),
+    }]);
+    let second = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "second offline text".into(),
+    }]);
+    let (first, second) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(55_100, 551),
+        first,
+        author(55_200, 552),
+        second,
+    );
+    let engine = apply_pair(ids, &baseline, first.clone(), second.clone());
+    let intents = engine
+        .conflict_resolution_intents(second.manifest().batch_id())
+        .unwrap();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    match &intents[0] {
+        ConflictResolutionIntent::KeepBothTexts {
+            page_id,
+            block,
+            keep_text,
+            sibling_text,
+            merged_text,
+            pair,
+        } => {
+            assert_eq!(*page_id, ids.page_a);
+            assert_eq!(block.block_id, ids.block_a);
+            let min_is_first = first.manifest().batch_id() <= second.manifest().batch_id();
+            let (expected_keep, expected_sibling) = if min_is_first {
+                ("first offline text", "second offline text")
+            } else {
+                ("second offline text", "first offline text")
+            };
+            assert_eq!(keep_text, expected_keep);
+            assert_eq!(sibling_text, expected_sibling);
+            assert_ne!(merged_text, keep_text);
+            assert_ne!(merged_text, sibling_text);
+            assert!(pair.min_batch < pair.max_batch);
+        }
+        other => panic!("expected KeepBothTexts, found {other:?}"),
+    }
+
+    // Disjoint regions on block C: the CRDT union is faithful, no intent.
+    let prefix = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_c,
+            home_document_id: ids.home_c,
+        },
+        content: "UNRELATED content".into(),
+    }]);
+    let suffix = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_c,
+            home_document_id: ids.home_c,
+        },
+        content: "unrelated CONTENT".into(),
+    }]);
+    let (prefix, suffix) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(55_300, 553),
+        prefix,
+        author(55_400, 554),
+        suffix,
+    );
+    let engine = apply_pair(ids, &baseline, prefix, suffix.clone());
+    assert_eq!(
+        engine.materialize_page(ids.page_c).unwrap().blocks[0].content,
+        "UNRELATED CONTENT"
+    );
+    assert!(engine
+        .conflict_resolution_intents(suffix.manifest().batch_id())
+        .unwrap()
+        .is_empty());
 }
