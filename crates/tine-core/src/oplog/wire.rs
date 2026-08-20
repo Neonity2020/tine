@@ -14147,6 +14147,1312 @@ mod tests {
         }
     }
 
+    // ===== Stage 2e-ii wave 3b: orphan quarantine, journal corruption, =====
+    // ===== transaction gates, and retirement fallback on the retained  =====
+    // ===== provider path                                               =====
+    //
+    // Same design rule as wave 3a: every boundary these tests need is already
+    // reachable through an existing `#[cfg(test)]` slot beside the production
+    // code (`FAIL_PROVIDER_JOURNAL_BOUNDARY`'s orphan and retirement
+    // variants, `PROVIDER_ORPHAN_AFTER_QUARANTINE_HOOK`,
+    // `PROVIDER_PUBLICATION_SOURCE_VALIDATION_HOOK`, and the process-global
+    // `InjectedSharedProviderFlaggedRenameFailure` errno control) or through
+    // the public journal surface itself (`ProviderRetryJournal::open`,
+    // `acquire_transaction_gate`), so the installers below are RAII guards
+    // over those existing slots and NO new production consultation point is
+    // added. The retry-journal snapshot the coverage inventory named needs no
+    // hook at all: the journal is a plain directory tree, so the snapshot is
+    // read from disk.
+
+    /// One private boundary inside the orphan-blob retirement that runs at
+    /// journal open.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProviderOrphanBoundary {
+        /// Crash/power cut right after the unowned creation blob moved into
+        /// the private quarantine.
+        Quarantined,
+        /// Crash/power cut right after the authenticated-owner recheck.
+        OwnershipRechecked,
+        /// Crash/power cut right after quarantined bytes were restored to an
+        /// authenticated owner record.
+        Restored,
+        /// Crash/power cut right after the unowned quarantine copy was
+        /// deleted.
+        PrivateDeleted,
+    }
+
+    struct InstalledProviderOrphanBoundaryFault;
+
+    fn install_provider_orphan_boundary_fault_for_test(
+        boundary: ProviderOrphanBoundary,
+    ) -> InstalledProviderOrphanBoundaryFault {
+        let at = match boundary {
+            ProviderOrphanBoundary::Quarantined => ProviderJournalBoundary::OrphanQuarantined,
+            ProviderOrphanBoundary::OwnershipRechecked => {
+                ProviderJournalBoundary::OrphanOwnershipRechecked
+            }
+            ProviderOrphanBoundary::Restored => ProviderJournalBoundary::OrphanRestored,
+            ProviderOrphanBoundary::PrivateDeleted => ProviderJournalBoundary::OrphanPrivateDeleted,
+        };
+        FAIL_PROVIDER_JOURNAL_BOUNDARY.with(|hook| hook.replace(Some(at)));
+        InstalledProviderOrphanBoundaryFault
+    }
+
+    impl Drop for InstalledProviderOrphanBoundaryFault {
+        fn drop(&mut self) {
+            FAIL_PROVIDER_JOURNAL_BOUNDARY.with(|hook| hook.replace(None));
+        }
+    }
+
+    /// An action installed at the race window immediately after an orphan
+    /// blob was quarantined, before its ownership recheck.
+    struct InstalledProviderOrphanQuarantineRace;
+
+    fn install_provider_orphan_quarantine_race_for_test(
+        action: Box<dyn FnOnce()>,
+    ) -> InstalledProviderOrphanQuarantineRace {
+        PROVIDER_ORPHAN_AFTER_QUARANTINE_HOOK.with(|hook| hook.replace(Some(action)));
+        InstalledProviderOrphanQuarantineRace
+    }
+
+    impl Drop for InstalledProviderOrphanQuarantineRace {
+        fn drop(&mut self) {
+            PROVIDER_ORPHAN_AFTER_QUARANTINE_HOOK.with(|hook| hook.replace(None));
+        }
+    }
+
+    /// The complete private retry-journal state, straight from disk — the
+    /// observation surface item 15 asked for. No production hook is needed:
+    /// the journal IS a directory tree, and snapshot equality across a
+    /// refused open is exactly "failed before mutation".
+    fn provider_retry_journal_snapshot_for_test(
+        journal_root: &std::path::Path,
+    ) -> BTreeMap<String, Vec<u8>> {
+        provider_tree_bytes(journal_root)
+    }
+
+    /// Stage 2e-ii item 14: orphan-blob quarantine at journal open recovers
+    /// from a crash at every private boundary and restores the bytes when an
+    /// authenticated owner record arrives inside the race window. Replaces
+    /// the simulator scenarios
+    /// `provider_orphan_blob_retirement_is_crash_closed`,
+    /// `orphan_quarantine_restores_bytes_when_authenticated_owner_arrives_at_race_boundary`,
+    /// and `orphan_retirement_private_boundaries_are_crash_closed` on the
+    /// retained transport without the simulator.
+    #[test]
+    fn provider_orphan_quarantine_recovers_from_every_boundary() {
+        let bytes: &[u8] = b"orphan quarantine boundary bytes";
+        let object_path = format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(bytes)
+        );
+        let operation_id = generated_put_operation_id(&object_path, bytes);
+        // Seed one unowned `.creating` blob: crash/power cut right after the
+        // creation blob became durable, before any owner record existed.
+        let seed_orphan = |provider_root: &std::path::Path, journal_root: &std::path::Path| {
+            let mut transport = SharedProviderTransport::open(provider_root, journal_root).unwrap();
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                        ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::BlobDurable),
+                    ));
+                assert!(matches!(
+                    transport.publish_object_exact(ContentDigest::of(bytes), bytes),
+                    Err(ScenarioError::Io(message)) if message.contains("injected")
+                ));
+            }
+            drop(transport);
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
+            assert_eq!(
+                std::fs::read(
+                    journal_root
+                        .join("blobs")
+                        .join(ProviderRetryJournal::creating_blob_name(&operation_id)),
+                )
+                .unwrap(),
+                bytes
+            );
+        };
+
+        // (1) Crash-closed retirement. Threat: crash/power cut at each
+        // private boundary of the unowned-orphan retirement that runs at
+        // reopen. The bytes are never torn out of both private namespaces at
+        // once before their ownership was decided, the next reopen converges,
+        // and the exact retry publishes.
+        for boundary in [
+            ProviderOrphanBoundary::Quarantined,
+            ProviderOrphanBoundary::OwnershipRechecked,
+            ProviderOrphanBoundary::PrivateDeleted,
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            seed_orphan(&provider_root, &journal_root);
+            {
+                let _fault = install_provider_orphan_boundary_fault_for_test(boundary);
+                assert!(
+                    matches!(
+                        SharedProviderTransport::open(&provider_root, &journal_root),
+                        Err(ScenarioError::Io(message)) if message.contains("journal crash")
+                    ),
+                    "{boundary:?}"
+                );
+            }
+            match boundary {
+                ProviderOrphanBoundary::Quarantined
+                | ProviderOrphanBoundary::OwnershipRechecked => {
+                    assert_eq!(
+                        std::fs::read(
+                            journal_root
+                                .join("quarantine")
+                                .join(ProviderRetryJournal::creating_blob_name(&operation_id)),
+                        )
+                        .unwrap(),
+                        bytes,
+                        "{boundary:?}"
+                    );
+                    assert_eq!(
+                        retained_dir_count(&journal_root.join("blobs")),
+                        0,
+                        "{boundary:?}"
+                    );
+                }
+                ProviderOrphanBoundary::PrivateDeleted => {
+                    assert_eq!(
+                        retained_dir_count(&journal_root.join("quarantine")),
+                        0,
+                        "{boundary:?}"
+                    );
+                    assert_eq!(
+                        retained_dir_count(&journal_root.join("blobs")),
+                        0,
+                        "{boundary:?}"
+                    );
+                }
+                ProviderOrphanBoundary::Restored => unreachable!(),
+            }
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            assert_eq!(
+                retained_dir_count(&journal_root.join("quarantine")),
+                0,
+                "{boundary:?}"
+            );
+            assert_eq!(
+                retained_dir_count(&journal_root.join("blobs")),
+                0,
+                "{boundary:?}"
+            );
+            // Exact retry converges and is idempotent.
+            let destination = provider_root.join("outbox").join(&object_path);
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes, "{boundary:?}");
+            assert_eq!(
+                retained_dir_count(&journal_root.join("records")),
+                0,
+                "{boundary:?}"
+            );
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes, "{boundary:?}");
+        }
+
+        // (2) Authenticated-owner race. Threat: a crash/power cut interleaves
+        // orphan retirement with the recovery shape an exact retry leaves
+        // behind — an authenticated owner update record lands right after the
+        // blob was quarantined. Ownership is rechecked AFTER quarantining, so
+        // the bytes are restored to the owner's creation name rather than
+        // deleted, and a further crash at the restore boundary still
+        // converges to the published destination.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            seed_orphan(&provider_root, &journal_root);
+            let binding = format!("generated:{}", provider_digest(bytes));
+            let hook_journal = journal_root.clone();
+            let hook_operation_id = operation_id.clone();
+            let hook_bytes = bytes.to_vec();
+            let hook_path = object_path.clone();
+            let race = install_provider_orphan_quarantine_race_for_test(Box::new(move || {
+                let key: [u8; 32] = std::fs::read(hook_journal.join("authority.key"))
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let mut record = ProviderJournalRecord {
+                    journal_schema_version: PROVIDER_JOURNAL_SCHEMA_VERSION,
+                    operation_id: hook_operation_id.clone(),
+                    operation: ProviderJournalOperation::Put,
+                    operation_binding: binding.clone(),
+                    source_provenance: binding.clone(),
+                    tree: ProviderTree::Outbox,
+                    from_path: hook_path.clone(),
+                    to_path: None,
+                    source_identity: None,
+                    source_len: u64::try_from(hook_bytes.len()).unwrap(),
+                    source_digest: provider_digest(&hook_bytes),
+                    blob_name: Some(ProviderRetryJournal::blob_name(&hook_operation_id)),
+                    phase: ProviderJournalPhase::Prepared,
+                    staging_identity: None,
+                    destination_identity: None,
+                    staging_name: Some(ProviderRetryJournal::staging_name(&hook_operation_id, 0)),
+                    staging_generation: 0,
+                    diagnostic_path: None,
+                    authentication_tag: String::new(),
+                };
+                let unsigned = serde_json::to_vec(&record).unwrap();
+                record.authentication_tag = hmac_sha256_hex(&key, &unsigned);
+                let update = serde_json::to_vec(&record).unwrap();
+                let update_path = hook_journal
+                    .join("records")
+                    .join(format!("{hook_operation_id}.update"));
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(update_path)
+                    .unwrap();
+                file.write_all(&update).unwrap();
+                file.sync_all().unwrap();
+                std::fs::File::open(hook_journal.join("records"))
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+            }));
+            let fault =
+                install_provider_orphan_boundary_fault_for_test(ProviderOrphanBoundary::Restored);
+            assert!(matches!(
+                SharedProviderTransport::open(&provider_root, &journal_root),
+                Err(ScenarioError::Io(message)) if message.contains("journal crash")
+            ));
+            drop(race);
+            drop(fault);
+            // The crash landed AFTER the restore: the bytes are back at the
+            // owner's creation name and the quarantine window lost nothing.
+            assert_eq!(
+                std::fs::read(
+                    journal_root
+                        .join("blobs")
+                        .join(ProviderRetryJournal::creating_blob_name(&operation_id)),
+                )
+                .unwrap(),
+                bytes
+            );
+            assert_eq!(retained_dir_count(&journal_root.join("quarantine")), 0);
+            // Clean reopen converges and the exact retry publishes the bytes.
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(provider_root.join("outbox").join(&object_path)).unwrap(),
+                bytes
+            );
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
+            assert_eq!(retained_dir_count(&journal_root.join("blobs")), 0);
+        }
+    }
+
+    /// Stage 2e-ii item 15: every corruption or bound violation of the
+    /// private retry journal fails BEFORE any journal or provider mutation,
+    /// observed as snapshot equality across the refused operation. Replaces
+    /// the simulator scenarios
+    /// `every_journal_record_class_rejects_truncated_auth_invalid_unknown_and_future_bytes_on_open`,
+    /// `orphan_wrong_and_shared_blob_ownership_fail_before_reconciliation`,
+    /// `authenticated_record_load_rederives_source_provenance_length_and_digest_identity`,
+    /// `corrupt_substituted_or_multilink_local_journal_fails_closed`, and the
+    /// live half of `provider_journal_enforces_numeric_entry_and_byte_bounds`
+    /// on the retained provider machinery without the simulator.
+    #[test]
+    fn provider_retry_journal_corruption_and_bounds_fail_before_mutation() {
+        let bytes: &[u8] = b"retry journal corruption bytes";
+        let object_path = format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(bytes)
+        );
+        let sign_with_disk_key =
+            |journal_root: &std::path::Path, record: &mut ProviderJournalRecord| {
+                let key: [u8; 32] = std::fs::read(journal_root.join("authority.key"))
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                record.authentication_tag = String::new();
+                let unsigned = serde_json::to_vec(&record).unwrap();
+                record.authentication_tag = hmac_sha256_hex(&key, &unsigned);
+            };
+
+        // (A) Record classes × byte corruption at open. Threats per
+        // corruption: a torn write at power cut (truncated), disk corruption
+        // of the tag or body (auth-invalid), and an honest newer app version
+        // crashing before a downgrade (unknown field, future schema) — the
+        // old binary must fail closed instead of mis-parsing.
+        for record_class in ["pending", "update", "completed"] {
+            for corruption in ["truncated", "auth-invalid", "unknown", "future"] {
+                let case = format!("{record_class}/{corruption}");
+                let root = ScenarioRoot::new().unwrap();
+                let provider_root = root.0.join("provider");
+                let journal_root = root.0.join("private/device/journal");
+                let destination = provider_root.join("outbox").join(&object_path);
+                let mut transport =
+                    SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+                let target = match record_class {
+                    "pending" => {
+                        let _fault = install_provider_retry_boundary_fault_for_test(
+                            ProviderRetryBoundary::Put(ProviderRetryFault::AfterDurablePhase(
+                                ProviderJournalPhase::Prepared,
+                            )),
+                        );
+                        assert!(
+                            transport
+                                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                                .is_err(),
+                            "{case}"
+                        );
+                        journal_root
+                            .join("records")
+                            .join(ProviderRetryJournal::record_name(
+                                &generated_put_operation_id(&object_path, bytes),
+                            ))
+                    }
+                    "update" => {
+                        let _fault = install_provider_retry_boundary_fault_for_test(
+                            ProviderRetryBoundary::Put(ProviderRetryFault::AtJournalBoundary(
+                                ProviderJournalBoundary::UpdateDurable,
+                            )),
+                        );
+                        assert!(
+                            transport
+                                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                                .is_err(),
+                            "{case}"
+                        );
+                        journal_root.join("records").join(format!(
+                            "{}.update",
+                            generated_put_operation_id(&object_path, bytes)
+                        ))
+                    }
+                    "completed" => {
+                        transport
+                            .publish_object_exact(ContentDigest::of(bytes), bytes)
+                            .unwrap();
+                        std::fs::read_dir(journal_root.join("completed"))
+                            .unwrap()
+                            .next()
+                            .unwrap()
+                            .unwrap()
+                            .path()
+                    }
+                    _ => unreachable!(),
+                };
+                drop(transport);
+                let destination_before = destination.exists();
+                let original = std::fs::read(&target).unwrap();
+                match corruption {
+                    "truncated" => {
+                        std::fs::write(&target, &original[..original.len() / 2]).unwrap();
+                    }
+                    "auth-invalid" => {
+                        let mut value: serde_json::Value =
+                            serde_json::from_slice(&original).unwrap();
+                        value["authentication_tag"] = serde_json::json!("0".repeat(64));
+                        std::fs::write(&target, serde_json::to_vec(&value).unwrap()).unwrap();
+                    }
+                    "unknown" => {
+                        let mut value: serde_json::Value =
+                            serde_json::from_slice(&original).unwrap();
+                        value["unknown_future_field"] = serde_json::json!(true);
+                        std::fs::write(&target, serde_json::to_vec(&value).unwrap()).unwrap();
+                    }
+                    "future" => {
+                        let mut record: ProviderJournalRecord =
+                            serde_json::from_slice(&original).unwrap();
+                        record.journal_schema_version = PROVIDER_JOURNAL_SCHEMA_VERSION + 1;
+                        sign_with_disk_key(&journal_root, &mut record);
+                        std::fs::write(&target, serde_json::to_vec(&record).unwrap()).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let before = provider_retry_journal_snapshot_for_test(&journal_root);
+                assert!(
+                    matches!(
+                        ProviderRetryJournal::open(journal_root.clone()),
+                        Err(ScenarioError::UnsafeProviderJournal(_))
+                    ),
+                    "{case}"
+                );
+                assert_eq!(
+                    provider_retry_journal_snapshot_for_test(&journal_root),
+                    before,
+                    "{case}: the refused open must not mutate the journal"
+                );
+                assert_eq!(destination.exists(), destination_before, "{case}");
+                if destination_before {
+                    assert_eq!(std::fs::read(&destination).unwrap(), bytes, "{case}");
+                }
+            }
+        }
+
+        // (B) Blob ownership and link corruption at open. Threats: a crash of
+        // a different (older/newer) binary at an unjournaled boundary or
+        // disk-repair residue (bare orphan `.blob`), and fsck/lost+found
+        // style relinking (wrong name, shared hard link). Each fails closed
+        // before reconciliation can rename or delete anything.
+        for corruption in ["bare-orphan-blob", "wrong-name", "shared-link"] {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            if corruption == "bare-orphan-blob" {
+                drop(transport);
+                std::fs::write(
+                    journal_root
+                        .join("blobs")
+                        .join(format!("{}.blob", "a".repeat(64))),
+                    bytes,
+                )
+                .unwrap();
+            } else {
+                {
+                    let _fault =
+                        install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                            ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Prepared),
+                        ));
+                    assert!(
+                        transport
+                            .publish_object_exact(ContentDigest::of(bytes), bytes)
+                            .is_err(),
+                        "{corruption}"
+                    );
+                }
+                drop(transport);
+                let blob = std::fs::read_dir(journal_root.join("blobs"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let wrong = journal_root
+                    .join("blobs")
+                    .join(format!("{}.blob", "b".repeat(64)));
+                if corruption == "wrong-name" {
+                    std::fs::rename(blob, wrong).unwrap();
+                } else {
+                    std::fs::hard_link(blob, wrong).unwrap();
+                }
+            }
+            let before = provider_retry_journal_snapshot_for_test(&journal_root);
+            assert!(
+                matches!(
+                    ProviderRetryJournal::open(journal_root.clone()),
+                    Err(ScenarioError::UnsafeProviderJournal(_))
+                ),
+                "{corruption}"
+            );
+            assert_eq!(
+                provider_retry_journal_snapshot_for_test(&journal_root),
+                before,
+                "{corruption}: the refused open must not mutate the journal"
+            );
+        }
+
+        // (C) Source-identity rederivation. Threat: disk corruption or a torn
+        // partial rewrite drifts a record away from the identity its
+        // operation id was derived from; an authenticated reload rederives
+        // provenance, length, and digest and refuses the drifted record even
+        // though its tag verifies.
+        for field in ["provenance", "length", "digest"] {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Prepared),
+                    ));
+                assert!(
+                    transport
+                        .publish_object_exact(ContentDigest::of(bytes), bytes)
+                        .is_err(),
+                    "{field}"
+                );
+            }
+            drop(transport);
+            let record_path = journal_root
+                .join("records")
+                .join(ProviderRetryJournal::record_name(
+                    &generated_put_operation_id(&object_path, bytes),
+                ));
+            let mut record: ProviderJournalRecord =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            match field {
+                "provenance" => record.source_provenance.push_str(":changed"),
+                "length" => record.source_len += 1,
+                "digest" => record.source_digest = provider_digest(b"changed"),
+                _ => unreachable!(),
+            }
+            sign_with_disk_key(&journal_root, &mut record);
+            std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let before = provider_retry_journal_snapshot_for_test(&journal_root);
+            assert!(
+                matches!(
+                    ProviderRetryJournal::open(journal_root.clone()),
+                    Err(ScenarioError::UnsafeProviderJournal(_))
+                ),
+                "{field}"
+            );
+            assert_eq!(
+                provider_retry_journal_snapshot_for_test(&journal_root),
+                before,
+                "{field}: the refused open must not mutate the journal"
+            );
+        }
+
+        // (D) Retry-time corruption fails before provider mutation. Threat:
+        // disk corruption or repair residue inside the private journal while
+        // a crashed rename is pending; the exact retry must refuse before the
+        // provider tree is touched — the source survives and nothing reaches
+        // the destination.
+        for attack in [
+            "record-corrupt",
+            "record-substitute",
+            "record-link",
+            "blob-corrupt",
+            "blob-link",
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            std::fs::write(inbox.join("objects/source"), bytes).unwrap();
+            let rename = |device: &DeviceRuntime| {
+                run_provider_rename(
+                    device,
+                    7,
+                    ProviderTree::Inbox,
+                    "objects/source",
+                    "objects/destination",
+                )
+            };
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Rename(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Prepared),
+                    ));
+                assert!(rename(&device).is_err(), "{attack}");
+            }
+            let journal = root.0.join("provider-local-journal");
+            let record_path = std::fs::read_dir(journal.join("records"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let blob_path = std::fs::read_dir(journal.join("blobs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            match attack {
+                "record-corrupt" => std::fs::write(&record_path, b"{}").unwrap(),
+                "record-substitute" => {
+                    let mut record: ProviderJournalRecord =
+                        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+                    record.from_path = "objects/substituted".into();
+                    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+                }
+                "record-link" => {
+                    std::fs::hard_link(&record_path, journal.join("record-alias")).unwrap();
+                }
+                "blob-corrupt" => std::fs::write(&blob_path, b"corrupt").unwrap(),
+                "blob-link" => {
+                    std::fs::hard_link(&blob_path, journal.join("blob-alias")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let retry = rename(&device);
+            assert!(
+                matches!(retry, Err(ScenarioError::UnsafeProviderJournal(_))),
+                "{attack}: {retry:?}"
+            );
+            assert!(!inbox.join("objects/destination").exists(), "{attack}");
+            assert_eq!(
+                std::fs::read(inbox.join("objects/source")).unwrap(),
+                bytes,
+                "{attack}"
+            );
+        }
+
+        // (E) Entry-count bound. Threat: a crash-looping retry must not grow
+        // the private journal without bound (it lives on the user's disk);
+        // the refused operation fails with a limit receipt BEFORE creating a
+        // record or touching the provider tree.
+        {
+            assert_eq!(MAX_PROVIDER_JOURNAL_PENDING, 4);
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            for index in 0..=MAX_PROVIDER_JOURNAL_PENDING {
+                std::fs::write(inbox.join(format!("objects/source-{index}")), bytes).unwrap();
+            }
+            for index in 0..=MAX_PROVIDER_JOURNAL_PENDING {
+                let result = {
+                    let _fault = install_provider_retry_boundary_fault_for_test(
+                        ProviderRetryBoundary::Rename(ProviderRetryFault::AfterDurablePhase(
+                            ProviderJournalPhase::Prepared,
+                        )),
+                    );
+                    run_provider_rename(
+                        &device,
+                        100 + index as u64,
+                        ProviderTree::Inbox,
+                        &format!("objects/source-{index}"),
+                        &format!("objects/destination-{index}"),
+                    )
+                };
+                if index < MAX_PROVIDER_JOURNAL_PENDING {
+                    assert!(matches!(result, Err(ScenarioError::Io(_))), "{index}");
+                } else {
+                    assert!(
+                        matches!(result, Err(ScenarioError::ProviderJournalLimit)),
+                        "{index}: {result:?}"
+                    );
+                }
+            }
+            let journal = root.0.join("provider-local-journal");
+            assert_eq!(
+                retained_dir_count(&journal.join("records")),
+                MAX_PROVIDER_JOURNAL_PENDING
+            );
+            assert_eq!(
+                retained_dir_count(&journal.join("blobs")),
+                MAX_PROVIDER_JOURNAL_PENDING
+            );
+            let last = MAX_PROVIDER_JOURNAL_PENDING;
+            assert_eq!(
+                std::fs::read(inbox.join(format!("objects/source-{last}"))).unwrap(),
+                bytes
+            );
+            assert!(!inbox.join(format!("objects/destination-{last}")).exists());
+        }
+
+        // (F) Byte-count bounds. Threat: a torn or corrupted length must not
+        // make open read unbounded bytes into memory; an oversized record or
+        // blob is refused at open without mutation.
+        for target_kind in ["record", "blob"] {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Prepared),
+                    ));
+                assert!(
+                    transport
+                        .publish_object_exact(ContentDigest::of(bytes), bytes)
+                        .is_err(),
+                    "{target_kind}"
+                );
+            }
+            drop(transport);
+            let operation_id = generated_put_operation_id(&object_path, bytes);
+            let (target, limit) = if target_kind == "record" {
+                (
+                    journal_root
+                        .join("records")
+                        .join(ProviderRetryJournal::record_name(&operation_id)),
+                    MAX_PROVIDER_JOURNAL_RECORD_BYTES,
+                )
+            } else {
+                (
+                    journal_root
+                        .join("blobs")
+                        .join(ProviderRetryJournal::blob_name(&operation_id)),
+                    MAX_PROVIDER_JOURNAL_BLOB_BYTES,
+                )
+            };
+            let mut inflated = std::fs::read(&target).unwrap();
+            inflated.resize(limit + 1, b' ');
+            std::fs::write(&target, &inflated).unwrap();
+            let before = provider_retry_journal_snapshot_for_test(&journal_root);
+            assert!(
+                matches!(
+                    ProviderRetryJournal::open(journal_root.clone()),
+                    Err(ScenarioError::UnsafeProviderJournal(_)
+                        | ScenarioError::ProviderJournalLimit)
+                ),
+                "{target_kind}"
+            );
+            assert_eq!(
+                provider_retry_journal_snapshot_for_test(&journal_root),
+                before,
+                "{target_kind}: the refused open must not mutate the journal"
+            );
+        }
+    }
+
+    /// Stage 2e-ii item 16: the provider transaction gate is exclusive across
+    /// scopes, device lock order is canonical and deduplicated, and gate
+    /// acquisition precedes every source and retry-journal inspection.
+    /// Replaces the simulator scenarios
+    /// `provider_transaction_gate_rejects_a_second_process_scope`,
+    /// `provider_transaction_device_order_is_canonical_and_unique`,
+    /// `same_device_provider_source_uses_one_gate_and_copy_succeeds`,
+    /// `cross_device_copy_waits_for_source_gate_before_source_inspection`,
+    /// `cross_device_begin_write_waits_for_source_gate_before_source_inspection`,
+    /// and `finish_provider_write_holds_gate_before_source_or_retry_inspection`
+    /// at the retained journal and transport boundary.
+    #[test]
+    fn provider_transaction_gates_precede_source_and_retry_inspection() {
+        let bytes: &[u8] = b"transaction gate bytes";
+
+        // (A) Second-scope rejection. Threat: a concurrent honest instance
+        // opens the same private journal; while one scope holds the gate the
+        // other must be refused, and after release it must be admitted.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            let journal_root = root.0.join("provider-local-journal");
+            let gate = device
+                .provider_journal
+                .as_ref()
+                .unwrap()
+                .acquire_transaction_gate()
+                .unwrap();
+            assert!(matches!(
+                ProviderRetryJournal::open(journal_root.clone()),
+                Err(ScenarioError::UnsafeProviderJournal(message)) if message.contains("gate")
+            ));
+            drop(gate);
+            ProviderRetryJournal::open(journal_root.clone()).unwrap();
+        }
+
+        // (B) Canonical, deduplicated device lock order. Threat: two honest
+        // instances locking two devices in opposite orders would deadlock;
+        // the order must be canonical regardless of direction, and a
+        // same-device source must not acquire its gate twice.
+        {
+            let alpha_source = ProviderSource::Tree {
+                location: ProviderLocation {
+                    device: "alpha".into(),
+                    tree: ProviderTree::Outbox,
+                    path: "objects/source".into(),
+                },
+            };
+            let beta_source = ProviderSource::Tree {
+                location: ProviderLocation {
+                    device: "beta".into(),
+                    tree: ProviderTree::Outbox,
+                    path: "objects/source".into(),
+                },
+            };
+            assert_eq!(
+                provider_transaction_device_names(&alpha_source, "beta"),
+                vec!["alpha".to_owned(), "beta".to_owned()]
+            );
+            assert_eq!(
+                provider_transaction_device_names(&beta_source, "alpha"),
+                vec!["alpha".to_owned(), "beta".to_owned()]
+            );
+            assert_eq!(
+                provider_transaction_device_names(&beta_source, "beta"),
+                vec!["beta".to_owned()]
+            );
+            assert_eq!(
+                provider_transaction_device_names(
+                    &ProviderSource::Mailbox {
+                        item_id: "item".into(),
+                    },
+                    "beta",
+                ),
+                vec!["beta".to_owned()]
+            );
+        }
+
+        // (C) Gate precedes source inspection. Threat: an operation that read
+        // shared provider state before winning the gate could act on a torn
+        // concurrent view. The trap is an ABSENT source: while a competing
+        // scope holds the gate the operation reports the gate refusal — never
+        // the missing source — and creates no journal record; after release
+        // the same call reports the source condition, proving the trap was
+        // armed and inspection follows acquisition. A single-device
+        // operation then completes end to end with its one gate.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            let journal_root = root.0.join("provider-local-journal");
+            let inbox = root.0.join("provider/inbox");
+            let competing = ProviderRetryJournal::open(journal_root.clone()).unwrap();
+            let competing_gate = competing.acquire_transaction_gate().unwrap();
+            let gated = run_provider_rename(
+                &device,
+                7,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination",
+            );
+            assert!(
+                matches!(
+                    &gated,
+                    Err(ScenarioError::UnsafeProviderJournal(message)) if message.contains("gate")
+                ),
+                "{gated:?}"
+            );
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
+            drop(competing_gate);
+            assert!(matches!(
+                run_provider_rename(
+                    &device,
+                    7,
+                    ProviderTree::Inbox,
+                    "objects/source",
+                    "objects/destination",
+                ),
+                Err(ScenarioError::UnknownProviderPath(path)) if path == "objects/source"
+            ));
+            // Same-device single acquisition: one gate, full operation.
+            std::fs::write(inbox.join("objects/source"), bytes).unwrap();
+            run_provider_rename(
+                &device,
+                8,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination",
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes
+            );
+        }
+
+        // (D) Gate precedes retry-journal inspection. Threat: a second scope
+        // must not read or resume half-written retry state. With a crashed
+        // rename pending, a competing scope's gate makes the exact retry
+        // report the gate refusal and leave the journal byte-identical; after
+        // release the exact retry converges.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            let journal_root = root.0.join("provider-local-journal");
+            let inbox = root.0.join("provider/inbox");
+            std::fs::write(inbox.join("objects/source"), bytes).unwrap();
+            // The competing scope opens BEFORE the crash seeds retry state,
+            // so its own open reconciles nothing.
+            let competing = ProviderRetryJournal::open(journal_root.clone()).unwrap();
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Rename(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Prepared),
+                    ));
+                assert!(run_provider_rename(
+                    &device,
+                    7,
+                    ProviderTree::Inbox,
+                    "objects/source",
+                    "objects/destination",
+                )
+                .is_err());
+            }
+            let competing_gate = competing.acquire_transaction_gate().unwrap();
+            let before = provider_retry_journal_snapshot_for_test(&journal_root);
+            let gated = run_provider_rename(
+                &device,
+                7,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination",
+            );
+            assert!(
+                matches!(
+                    &gated,
+                    Err(ScenarioError::UnsafeProviderJournal(message)) if message.contains("gate")
+                ),
+                "{gated:?}"
+            );
+            assert_eq!(
+                provider_retry_journal_snapshot_for_test(&journal_root),
+                before,
+                "the gate refusal must not touch pending retry state"
+            );
+            drop(competing_gate);
+            run_provider_rename(
+                &device,
+                7,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination",
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes
+            );
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
+        }
+
+        // (E) The gate is held for the whole operation, not re-checked per
+        // step. Threat: a second honest scope arriving mid-operation
+        // (between source validation and publication) must be refused rather
+        // than observe partial state. Inside the put's post-validation
+        // window, a second-scope open is refused and the pending record
+        // count is unchanged; the publication then completes.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let object_path = format!(
+                "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+                ContentDigest::of(bytes)
+            );
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            let hook_journal = journal_root.clone();
+            let _race = install_provider_publication_race_for_test(
+                ProviderPublicationRace::PutAfterSourceValidation,
+                Box::new(move || {
+                    let pending_before = std::fs::read_dir(hook_journal.join("records"))
+                        .unwrap()
+                        .count();
+                    assert!(matches!(
+                        ProviderRetryJournal::open(hook_journal.clone()),
+                        Err(ScenarioError::UnsafeProviderJournal(message))
+                            if message.contains("gate")
+                    ));
+                    assert_eq!(
+                        std::fs::read_dir(hook_journal.join("records"))
+                            .unwrap()
+                            .count(),
+                        pending_before
+                    );
+                }),
+            );
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(provider_root.join("outbox").join(&object_path)).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    /// Stage 2e-ii item 17: capability absence (`renameat2` flags
+    /// unimplemented, the Android shared-storage shape) selects
+    /// byte-equivalent fallbacks for staging quarantine and retirement; a
+    /// non-capability errno still fails closed with a named receipt; the
+    /// fallback's two crash windows converge; the strict path's
+    /// placeholder-quarantine boundaries are unreachable on the fallback;
+    /// and a race at the freed source name is preserved. Replaces the
+    /// simulator scenarios
+    /// `shared_provider_publication_without_rename2_flags_matches_the_flagged_end_state`,
+    /// `a_non_capability_errno_from_a_shared_provider_rename_still_fails_closed`,
+    /// `shared_provider_retirement_without_rename2_flags_reaches_the_exchange_end_state`,
+    /// `shared_provider_retirement_fallback_crash_windows_converge`, and
+    /// `shared_provider_retirement_fallback_preserves_a_race_at_the_freed_source_name`
+    /// on the retained provider machinery without the simulator.
+    #[cfg(unix)]
+    #[test]
+    fn provider_retirement_fallback_crash_and_freed_name_races_converge() {
+        let bytes: &[u8] = b"retirement fallback bytes";
+        let object_path = format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(bytes)
+        );
+
+        // (P1) Publication staging-quarantine fallback equality. Threat: a
+        // device whose shared storage answers every `renameat2` flag with an
+        // errno (Android, CI run 32094662514) still needs the deterministic
+        // staging collision — litter from a crashed prior instance or a sync
+        // service — quarantined; the fallback must reach the flagged path's
+        // canonical tree exactly.
+        let publish_with_collision = |errno: Option<i32>| -> BTreeMap<String, Vec<u8>> {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            std::fs::write(
+                provider_root
+                    .join("outbox")
+                    .join(PROVIDER_TEMP_NAMESPACE)
+                    .join(ProviderRetryJournal::staging_name(
+                        &generated_put_operation_id(&object_path, bytes),
+                        0,
+                    )),
+                b"foreign staging occupant",
+            )
+            .unwrap();
+            let injected = errno.map(InjectedSharedProviderFlaggedRenameFailure::enter);
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            drop(injected);
+            provider_tree_bytes(&provider_root.join("outbox"))
+        };
+        let publication_control = publish_with_collision(None);
+        assert_eq!(
+            publication_control.get(&object_path).map(Vec::as_slice),
+            Some(bytes),
+            "the control publication must have published the object: {:?}",
+            publication_control.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            publication_control.iter().any(|(path, occupant)| path
+                .starts_with(PROVIDER_REMOVED_NAMESPACE)
+                && occupant == b"foreign staging occupant"),
+            "the control publication must have quarantined the occupant: {:?}",
+            publication_control.keys().collect::<Vec<_>>()
+        );
+        for errno in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert_eq!(
+                publish_with_collision(Some(errno)),
+                publication_control,
+                "the fallback must reach the flagged path's tree exactly (errno {errno})"
+            );
+        }
+
+        // (P2) A non-capability errno is not a capability answer. Threat: a
+        // real disk I/O error on the flagged rename must fail the operation
+        // closed — occupant preserved, nothing published — with a receipt
+        // naming the primitive and both names (a bare os-error string on a
+        // device receipt costs a CI round trip to localise).
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            let staging = provider_root
+                .join("outbox")
+                .join(PROVIDER_TEMP_NAMESPACE)
+                .join(ProviderRetryJournal::staging_name(
+                    &generated_put_operation_id(&object_path, bytes),
+                    0,
+                ));
+            std::fs::write(&staging, b"foreign staging occupant").unwrap();
+            let _injected = InjectedSharedProviderFlaggedRenameFailure::enter(libc::EIO);
+            let refusal = transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .expect_err("a real I/O error on the flagged rename must not be tolerated");
+            let ScenarioError::Io(detail) = &refusal else {
+                panic!("expected a filesystem refusal: {refusal:?}");
+            };
+            assert!(
+                detail.contains(PROVIDER_NOREPLACE_RENAME_PRIMITIVE)
+                    && detail.contains("quarantining abandoned shared provider staging")
+                    && detail.contains("->"),
+                "the refusal must name its operation and both names: {detail}"
+            );
+            assert_eq!(
+                std::fs::read(&staging).unwrap(),
+                b"foreign staging occupant"
+            );
+            assert!(!provider_root.join("outbox").join(&object_path).exists());
+        }
+
+        // (R1) Retirement fallback end-state equality. Threat: capability
+        // absence on the retirement exchange selects the single-rename
+        // fallback, which must leave exactly the exchange path's tree —
+        // destination published, retired original as the diagnostic copy.
+        let retire_one = |errno: Option<i32>| -> BTreeMap<String, Vec<u8>> {
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            std::fs::write(root.0.join("provider/inbox/objects/source"), bytes).unwrap();
+            let injected = errno.map(InjectedSharedProviderFlaggedRenameFailure::enter);
+            run_provider_rename(
+                &device,
+                7,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination",
+            )
+            .unwrap();
+            drop(injected);
+            provider_tree_bytes(&root.0.join("provider/inbox"))
+        };
+        let retirement_control = retire_one(None);
+        assert_eq!(
+            retirement_control
+                .get("objects/destination")
+                .map(Vec::as_slice),
+            Some(bytes),
+            "the control retirement must have published the destination: {:?}",
+            retirement_control.keys().collect::<Vec<_>>()
+        );
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP] {
+            assert_eq!(
+                retire_one(Some(errno)),
+                retirement_control,
+                "the exchange fallback must reach the exchange's tree exactly (errno {errno})"
+            );
+        }
+
+        // (R2) The fallback's two crash windows converge. Threat:
+        // crash/power cut before the single rename (placeholder durable) and
+        // after it (exchange durable); recovery from disk alone plus the
+        // exact retry reaches the converged retirement tree.
+        for boundary in [
+            ProviderJournalBoundary::RetirementPlaceholderDurable,
+            ProviderJournalBoundary::RetirementExchangeDurable,
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            std::fs::write(inbox.join("objects/source"), bytes).unwrap();
+            let injected = InjectedSharedProviderFlaggedRenameFailure::enter(libc::EINVAL);
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Rename(ProviderRetryFault::AtJournalBoundary(boundary)),
+                );
+                assert!(
+                    matches!(
+                        run_provider_rename(
+                            &device,
+                            7,
+                            ProviderTree::Inbox,
+                            "objects/source",
+                            "objects/destination",
+                        ),
+                        Err(ScenarioError::Io(message)) if message.contains("injected")
+                    ),
+                    "{boundary:?} must be reachable on the fallback path"
+                );
+            }
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            run_provider_rename(
+                &device,
+                7,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination",
+            )
+            .unwrap();
+            drop(injected);
+            assert_eq!(
+                provider_tree_bytes(&inbox),
+                retirement_control,
+                "the fallback must converge from a crash at {boundary:?}"
+            );
+        }
+
+        // (R3) The strict path's placeholder-quarantine boundaries are
+        // unreachable on the fallback — the single rename consumed the
+        // placeholder, so there is nothing to quarantine. If the fallback
+        // ever reached them this would fail here instead of silently proving
+        // nothing.
+        for boundary in [
+            ProviderJournalBoundary::RetirementPlaceholderQuarantined,
+            ProviderJournalBoundary::RetirementPlaceholderPrivateDeleted,
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            std::fs::write(inbox.join("objects/source"), bytes).unwrap();
+            let injected = InjectedSharedProviderFlaggedRenameFailure::enter(libc::EINVAL);
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Rename(ProviderRetryFault::AtJournalBoundary(boundary)),
+                );
+                run_provider_rename(
+                    &device,
+                    7,
+                    ProviderTree::Inbox,
+                    "objects/source",
+                    "objects/destination",
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{boundary:?} must be unreachable on the fallback path: {error:?}")
+                });
+            }
+            drop(injected);
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes,
+                "{boundary:?}"
+            );
+        }
+
+        // (R4) What the fallback gives up: after its single rename the source
+        // name is FREE rather than holding a known placeholder. Threat: an
+        // honest concurrent instance or a sync-service delivery re-creates
+        // the freed name across the crash window. Recovery keys on the
+        // diagnostic name holding the recorded original, treats the newcomer
+        // as a racing replacement, preserves its bytes, and refuses — it is
+        // never published and never destroyed.
+        {
+            let foreign = b"a peer delivered these bytes after the retirement";
+            let root = ScenarioRoot::new().unwrap();
+            let device = retained_provider_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            std::fs::write(inbox.join("objects/source"), bytes).unwrap();
+            let _injected = InjectedSharedProviderFlaggedRenameFailure::enter(libc::EINVAL);
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Rename(ProviderRetryFault::AtJournalBoundary(
+                        ProviderJournalBoundary::RetirementExchangeDurable,
+                    )),
+                );
+                assert!(run_provider_rename(
+                    &device,
+                    7,
+                    ProviderTree::Inbox,
+                    "objects/source",
+                    "objects/destination",
+                )
+                .is_err());
+            }
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            assert!(
+                !inbox.join("objects/source").exists(),
+                "the fallback leaves the source name free, which is exactly the exposure"
+            );
+            std::fs::write(inbox.join("objects/source"), foreign).unwrap();
+            let raced = run_provider_rename(
+                &device,
+                7,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination",
+            );
+            assert!(
+                matches!(raced, Err(ScenarioError::UnsafeProviderEntry(_))),
+                "{raced:?}"
+            );
+            assert!(!inbox.join("objects/source").exists());
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes
+            );
+            let retained: Vec<_> =
+                std::fs::read_dir(inbox.join(PROVIDER_RENAME_EVIDENCE_NAMESPACE))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+            assert_eq!(retained.len(), 1, "{retained:?}");
+            assert_eq!(std::fs::read(&retained[0]).unwrap(), foreign);
+            let removed: Vec<_> = std::fs::read_dir(inbox.join(PROVIDER_REMOVED_NAMESPACE))
+                .unwrap()
+                .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+                .collect();
+            assert_eq!(
+                removed,
+                vec![bytes.to_vec()],
+                "the retired original must still be the only diagnostic copy"
+            );
+        }
+    }
+
     #[test]
     fn provider_finish_retries_after_physical_publication_validation_error() {
         let bytes = b"retry after physical publication";
