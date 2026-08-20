@@ -38674,7 +38674,13 @@ mod tests {
             deliver_offline_provider_history(second, first, &first_handle, second_batch);
             deliver_offline_provider_history(first, second, &second_handle, first_batch);
         }
-        assert_converged_and_reopen_stable(first, second, first_handle, second_handle, visible_paths)
+        assert_converged_and_reopen_stable(
+            first,
+            second,
+            first_handle,
+            second_handle,
+            visible_paths,
+        )
     }
 
     /// Shared tail of the two-offline-histories scenarios: both devices show

@@ -3,19 +3,18 @@ use std::path::{Path, PathBuf};
 use crate::oplog::{
     AuthorBatch, BatchCausalDot, BatchDisposition, BatchError, BatchId, BatchInspection,
     BatchOrigin, BlockDelta, BlockLocation, BlockOwner, BlockRestore, CausalPeerId,
-    ConflictResolutionIntent, ContentDigest,
-    CrdtPeerCounter, CrdtPeerId, DeterministicSimulator, DeviceId, DocumentCausalDigest,
-    DocumentDependencies, DocumentId, EngineError, FailureCapsule, FailureIdentity, FrontierV2,
-    FrozenCandidateId, ImmutableHomeClaim, ImmutableHomeConflict, ImmutableHomeEvidence,
-    LineageDigest, LogseqIdentityMutation, LogseqIdentityOrigin, LogseqIdentityTrigger, LogseqUuid,
-    LogseqUuidResolution, ManagedPath, ManagedTextKind, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
-    OperationBatch, OperationObject, OperationTransaction, PageDelta, PageId, PagePreambleDelta,
-    PagePreambleState, PageState, PolicyGeneratedAnchorReason, PreparedBatch,
-    ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore, Scenario,
-    ScenarioAction, ScenarioDevice, SemanticEffect, SemanticEffectDigest, SemanticError,
-    SemanticOperation, SessionId, ShardedHotEngine, StoreError, ValidatedBatch, WorkspaceId,
-    WorkspaceStatus, MANAGED_ENTITY_SET_VERSION, OPERATION_SCHEMA_VERSION,
-    SEMANTIC_EFFECT_SCHEMA_VERSION,
+    ConflictResolutionIntent, ContentDigest, CrdtPeerCounter, CrdtPeerId, DeterministicSimulator,
+    DeviceId, DocumentCausalDigest, DocumentDependencies, DocumentId, EngineError, FailureCapsule,
+    FailureIdentity, FrontierV2, FrozenCandidateId, ImmutableHomeClaim, ImmutableHomeConflict,
+    ImmutableHomeEvidence, LineageDigest, LogseqIdentityMutation, LogseqIdentityOrigin,
+    LogseqIdentityTrigger, LogseqUuid, LogseqUuidResolution, ManagedPath, ManagedTextKind,
+    MembershipClaim, MembershipDelta, ObjectKind, ObjectStore, OperationBatch, OperationObject,
+    OperationTransaction, PageDelta, PageId, PagePreambleDelta, PagePreambleState, PageState,
+    PolicyGeneratedAnchorReason, PreparedBatch, ProjectionEndpointBinding, ProjectionEndpointId,
+    ProjectionReceiptStore, Scenario, ScenarioAction, ScenarioDevice, SemanticEffect,
+    SemanticEffectDigest, SemanticError, SemanticOperation, SessionId, ShardedHotEngine,
+    StoreError, ValidatedBatch, WorkspaceId, WorkspaceStatus, MANAGED_ENTITY_SET_VERSION,
+    OPERATION_SCHEMA_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
 };
 use crate::Graph;
 use loro::{ExportMode, LoroDoc};
@@ -7084,7 +7083,11 @@ fn restore_subtree_resurrects_a_tombstoned_block_with_the_concurrent_edit_text()
     );
     let merged = apply_pair(ids, &baseline, edited.clone(), deleted.clone());
     assert!(
-        merged.materialize_page(ids.page_a).unwrap().blocks.is_empty(),
+        merged
+            .materialize_page(ids.page_a)
+            .unwrap()
+            .blocks
+            .is_empty(),
         "the unresolved merge tombstones the edited block"
     );
 
@@ -7329,8 +7332,14 @@ fn conflict_intents_detect_edit_delete_and_move_delete_races() {
                 assert_eq!(
                     (pair.min_batch, pair.max_batch),
                     (
-                        edited.manifest().batch_id().min(deleted.manifest().batch_id()),
-                        edited.manifest().batch_id().max(deleted.manifest().batch_id()),
+                        edited
+                            .manifest()
+                            .batch_id()
+                            .min(deleted.manifest().batch_id()),
+                        edited
+                            .manifest()
+                            .batch_id()
+                            .max(deleted.manifest().batch_id()),
                     )
                 );
             }
@@ -7376,14 +7385,15 @@ fn conflict_intents_detect_edit_delete_and_move_delete_races() {
     let intents = engine
         .conflict_resolution_intents(subtree_deleted.manifest().batch_id())
         .unwrap();
-    let restore_moved = intents
-        .iter()
-        .find_map(|intent| match intent {
-            ConflictResolutionIntent::RestoreMoved { page_id, block, claim, .. } => {
-                Some((*page_id, block.block_id, claim.clone()))
-            }
-            _ => None,
-        });
+    let restore_moved = intents.iter().find_map(|intent| match intent {
+        ConflictResolutionIntent::RestoreMoved {
+            page_id,
+            block,
+            claim,
+            ..
+        } => Some((*page_id, block.block_id, claim.clone())),
+        _ => None,
+    });
     if engine
         .materialize_page(ids.page_b)
         .unwrap()
@@ -7398,7 +7408,10 @@ fn conflict_intents_detect_edit_delete_and_move_delete_races() {
         assert_eq!(claim.order, "z");
     } else {
         // The move already won: nothing to re-assert.
-        assert!(restore_moved.is_none(), "move won yet a restore was derived");
+        assert!(
+            restore_moved.is_none(),
+            "move won yet a restore was derived"
+        );
     }
 }
 
@@ -7622,7 +7635,10 @@ fn a_post_race_redelete_settles_an_edit_delete_pair_without_resurrection() {
     );
     for batch in [edited.manifest().batch_id(), deleted.manifest().batch_id()] {
         assert!(
-            engine.conflict_resolution_intents(batch).unwrap().is_empty(),
+            engine
+                .conflict_resolution_intents(batch)
+                .unwrap()
+                .is_empty(),
             "a settled pair must not derive again after reseeding"
         );
     }

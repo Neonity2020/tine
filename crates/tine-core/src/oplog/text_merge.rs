@@ -108,10 +108,11 @@ fn diff_hunks(base: &[char], target: &[char]) -> Option<Vec<Hunk>> {
     let mut hunks = Vec::new();
     let mut base_pos = 0usize;
     let mut target_pos = 0usize;
-    for (base_match, target_match) in common.iter().copied().chain(std::iter::once((
-        base.len(),
-        target.len(),
-    ))) {
+    for (base_match, target_match) in common
+        .iter()
+        .copied()
+        .chain(std::iter::once((base.len(), target.len())))
+    {
         if base_match != base_pos || target_match != target_pos {
             hunks.push(Hunk {
                 base_start: base_pos,
@@ -145,9 +146,7 @@ fn lcs_matches(base: &[char], target: &[char]) -> Option<Vec<(usize, usize)>> {
         let mut k = -(d as isize);
         while k <= d as isize {
             let index = (k + offset as isize) as usize;
-            let mut x = if k == -(d as isize)
-                || (k != d as isize && v[index - 1] < v[index + 1])
-            {
+            let mut x = if k == -(d as isize) || (k != d as isize && v[index - 1] < v[index + 1]) {
                 v[index + 1]
             } else {
                 v[index - 1] + 1
@@ -345,12 +344,7 @@ mod tests {
     #[test]
     fn multibyte_disjoint_edits_classify_clean() {
         assert_eq!(
-            classify_concurrent_edits(
-                "káva a čaj",
-                "KÁVA a čaj",
-                "káva a ČAJ",
-                "KÁVA a ČAJ",
-            ),
+            classify_concurrent_edits("káva a čaj", "KÁVA a čaj", "káva a ČAJ", "KÁVA a ČAJ",),
             TextMergeClassification::CleanUnion
         );
     }

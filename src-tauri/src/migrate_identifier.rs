@@ -129,8 +129,10 @@ fn migrate_app_data_dir(new_dir: &Path) -> bool {
             };
             let mut parked = None;
             for attempt in 0..8u32 {
-                let candidate =
-                    parent.join(format!("{}.pre-migration.{attempt}", leaf.to_string_lossy()));
+                let candidate = parent.join(format!(
+                    "{}.pre-migration.{attempt}",
+                    leaf.to_string_lossy()
+                ));
                 if candidate.exists() {
                     continue;
                 }

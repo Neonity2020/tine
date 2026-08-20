@@ -3103,14 +3103,13 @@ fn record_completed_path_with_authorization(
             // semantic component agrees. In the index-free clean runtime the
             // publication below is a no-op, so tolerate exactly that drift:
             // path, page, frontier, claims and target bytes must still match.
-            let annotations_only_drift = engine
-                .require_index_free_clean_projection_runtime()
-                .is_ok()
-                && guided.intent().path() == intent.path()
-                && guided.intent().page_id() == intent.page_id()
-                && guided.intent().frontier() == intent.frontier()
-                && guided.intent().claim_evidence() == intent.claim_evidence()
-                && guided.intent().target() == intent.target();
+            let annotations_only_drift =
+                engine.require_index_free_clean_projection_runtime().is_ok()
+                    && guided.intent().path() == intent.path()
+                    && guided.intent().page_id() == intent.page_id()
+                    && guided.intent().frontier() == intent.frontier()
+                    && guided.intent().claim_evidence() == intent.claim_evidence()
+                    && guided.intent().target() == intent.target();
             if !annotations_only_drift {
                 return Err(ProjectionError::RecoveryIntentMismatch);
             }
