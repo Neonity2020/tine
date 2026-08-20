@@ -19729,9 +19729,27 @@ impl RuntimeActor {
                         {
                             continue;
                         }
-                        let Ok(page) = engine.materialize_page(page_id) else {
-                            derivation_incomplete = true;
-                            continue;
+                        let page = match engine.materialize_page(page_id) {
+                            Ok(page) => page,
+                            // The racing deletion removed the whole page, not
+                            // just the block: a block-level restore has no live
+                            // page to land on, and the state cannot change
+                            // until a new accepted batch arrives (which
+                            // re-enqueues this check). Requeueing here would
+                            // spin the scheduler forever. Skip deliberately —
+                            // the losing text is retained in immutable local
+                            // history (audit 4 follow-up).
+                            Err(crate::oplog::EngineError::PageDeleted(_)) => {
+                                eprintln!(
+                                    "[tine] conflict resolution skipped: page {page_id} was deleted as a whole, block-level restore of {} does not apply",
+                                    block.block_id
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                derivation_incomplete = true;
+                                continue;
+                            }
                         };
                         resolution =
                             OperationTransaction::new(vec![SemanticOperation::RestoreSubtree {
@@ -19755,9 +19773,22 @@ impl RuntimeActor {
                         if pair.min_author_device != my_device {
                             continue;
                         }
-                        let Ok(page) = engine.materialize_page(page_id) else {
-                            derivation_incomplete = true;
-                            continue;
+                        let page = match engine.materialize_page(page_id) {
+                            Ok(page) => page,
+                            // Same shape as the restore arm above: a whole-page
+                            // deletion leaves nothing for keep-both to land on
+                            // and never heals on its own; requeueing would spin.
+                            Err(crate::oplog::EngineError::PageDeleted(_)) => {
+                                eprintln!(
+                                    "[tine] keep-both resolution skipped: page {page_id} was deleted as a whole for block {}",
+                                    block.block_id
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                derivation_incomplete = true;
+                                continue;
+                            }
                         };
                         let Some(original) = page
                             .blocks
