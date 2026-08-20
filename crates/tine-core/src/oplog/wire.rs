@@ -610,7 +610,69 @@ impl ProviderRuntime {
             provider_journal_after_phase_hook(ProviderJournalPhase::Staged)?;
         }
         if record.phase == ProviderJournalPhase::Staged {
-            validate_journal_staging(&temporary_dir, &record, &expected, &location.path)?;
+            match validate_journal_staging(&temporary_dir, &record, &expected, &location.path) {
+                Ok(()) => {}
+                Err(ScenarioError::UnsafeProviderEntry(_)) => {
+                    // In-scope recovery (a sync service or external editor
+                    // replaced or removed the staging file across a crash at
+                    // Staged): the private journal blob remains the byte
+                    // authority, so the intruder is quarantined with its bytes
+                    // preserved — never published — and staging is rebuilt
+                    // from the blob instead of wedging every future retry of
+                    // this operation on the same refusal.
+                    let staging_name = record.staging_name.as_deref().ok_or_else(|| {
+                        ScenarioError::UnsafeProviderJournal(record.operation_id.clone())
+                    })?;
+                    if open_provider_regular_optional(
+                        &temporary_dir,
+                        staging_name,
+                        MAX_PROVIDER_RESCAN_BYTES,
+                        staging_name,
+                    )?
+                    .is_some()
+                    {
+                        quarantine_unowned_staging(
+                            journal,
+                            gate,
+                            &temporary_dir,
+                            staging_name,
+                            self.tree(location.tree),
+                            &record.operation_id,
+                            record.staging_generation,
+                        )?;
+                    }
+                    record.staging_generation = record
+                        .staging_generation
+                        .checked_add(1)
+                        .ok_or(ScenarioError::ProviderJournalLimit)?;
+                    record.staging_name = Some(ProviderRetryJournal::staging_name(
+                        &record.operation_id,
+                        record.staging_generation,
+                    ));
+                    journal.store(gate, &record)?;
+                    let staging_name = record.staging_name.as_deref().ok_or_else(|| {
+                        ScenarioError::UnsafeProviderJournal(record.operation_id.clone())
+                    })?;
+                    let mut staged = create_provider_journal_staging(
+                        &temporary_dir,
+                        staging_name,
+                        &location.path,
+                    )?;
+                    staged
+                        .write_all(&expected)
+                        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                    staged
+                        .sync_all()
+                        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+                    validate_provider_file_bytes(&mut staged, &expected, &location.path)?;
+                    record.staging_identity = Some(provider_identity_record(
+                        provider_file_identity(&staged.file)?,
+                    ));
+                    journal.store(gate, &record)?;
+                    validate_journal_staging(&temporary_dir, &record, &expected, &location.path)?;
+                }
+                Err(error) => return Err(error),
+            }
             record.phase = ProviderJournalPhase::PublishIntent;
             journal.store(gate, &record)?;
             provider_journal_after_phase_hook(ProviderJournalPhase::PublishIntent)?;
@@ -7875,9 +7937,12 @@ mod tests {
         // (3) Staged-source replacement across a crash. Threat: crash/power
         // cut leaves the named staging file on disk and an external editor or
         // sync service replaces it before restart. The recorded staging
-        // identity refuses the replacement and nothing ever reaches the
-        // canonical destination.
-        {
+        // identity detects the replacement; the retry quarantines the foreign
+        // bytes (preserved, never published) and re-stages from the journal
+        // blob — the byte authority — so the operation recovers instead of
+        // wedging every future retry. Deletion of the staging file across the
+        // same crash recovers identically.
+        for foreign in [Some(&b"attacker staging bytes"[..]), None] {
             let (_root, provider_root, journal_root, mut transport) = open_fixture();
             {
                 let _fault =
@@ -7892,15 +7957,49 @@ mod tests {
             let staging = staging_path_of(&provider_root);
             assert_eq!(std::fs::read(&staging).unwrap(), bytes);
             std::fs::remove_file(&staging).unwrap();
-            std::fs::write(&staging, b"attacker staging bytes").unwrap();
+            if let Some(foreign_bytes) = foreign {
+                std::fs::write(&staging, foreign_bytes).unwrap();
+            }
             drop(transport);
             let mut transport =
                 SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
-            assert!(transport
+            transport
                 .publish_object_exact(ContentDigest::of(bytes), bytes)
-                .is_err());
-            assert!(!destination_of(&provider_root).exists());
-            assert_eq!(std::fs::read(&staging).unwrap(), b"attacker staging bytes");
+                .unwrap();
+            assert_eq!(
+                std::fs::read(destination_of(&provider_root)).unwrap(),
+                bytes
+            );
+            let removed_dir = provider_root
+                .join("outbox")
+                .join(PROVIDER_REMOVED_NAMESPACE);
+            let quarantined: Vec<Vec<u8>> = match std::fs::read_dir(&removed_dir) {
+                Ok(entries) => entries
+                    .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            match foreign {
+                Some(foreign_bytes) => {
+                    assert_eq!(
+                        quarantined,
+                        vec![foreign_bytes.to_vec()],
+                        "the foreign staging bytes must survive as the single quarantine diagnostic"
+                    );
+                }
+                None => assert!(
+                    quarantined.is_empty(),
+                    "recovery from a deleted staging file leaves no diagnostic residue"
+                ),
+            }
+            // The recovered operation is exactly idempotent.
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(destination_of(&provider_root)).unwrap(),
+                bytes
+            );
         }
 
         // (4) Symlink and special-file staging replacement across a crash.
