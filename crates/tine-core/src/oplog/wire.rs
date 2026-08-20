@@ -12817,6 +12817,140 @@ mod tests {
         assert_eq!(PROVIDER_SCAN_ENTRY_VISITS.with(std::cell::Cell::get), 4);
     }
 
+    /// Stage 2e-ii sentinel relocation: the legacy simulator asserted the
+    /// full-tree depth, entry, and aggregate actual-byte bounds plus
+    /// temporary-file non-authority through scheduled `ReceiverRescan` runs.
+    /// Those limits live in the retained transport
+    /// (`SharedProviderTransport::scan` / `bounded_provider_files`), which the
+    /// clean public ingress path never calls, so the sentinel moves here with
+    /// the transport instead of being dropped with the simulator.
+    #[test]
+    fn retained_transport_scan_bounds_depth_entries_and_bytes_and_skips_unfinished_temporaries() {
+        // (a) Depth refusal: one nesting level beyond the maximum fails the
+        // whole-tree scan closed.
+        let deep_root = ScenarioRoot::new().unwrap();
+        let deep_transport = SharedProviderTransport::open(
+            &deep_root.0.join("provider"),
+            &deep_root.0.join("private/device/journal"),
+        )
+        .unwrap();
+        let deep_outbox = deep_root.0.join("provider/outbox");
+        let mut deep_path = deep_outbox.join("objects");
+        for index in 0..=MAX_PROVIDER_RESCAN_DEPTH {
+            deep_path.push(format!("d{index}"));
+        }
+        std::fs::create_dir_all(&deep_path).unwrap();
+        std::fs::write(deep_path.join("object"), b"x").unwrap();
+        assert!(matches!(
+            deep_transport.scan(),
+            Err(ScenarioError::ProviderRescanLimit)
+        ));
+
+        // (b) Entry-cap boundedness at the production cap: the walk stops at
+        // exactly cap-plus-one visited entries and refuses, without visiting
+        // the rest of an adversarially large tree.
+        let cap_root = ScenarioRoot::new().unwrap();
+        let cap_transport = SharedProviderTransport::open(
+            &cap_root.0.join("provider"),
+            &cap_root.0.join("private/device/journal"),
+        )
+        .unwrap();
+        let cap_objects = cap_root.0.join("provider/outbox/objects");
+        std::fs::create_dir_all(&cap_objects).unwrap();
+        for index in 0..=MAX_PROVIDER_RESCAN_ENTRIES {
+            std::fs::write(cap_objects.join(format!("{index:05}.object")), b"").unwrap();
+        }
+        PROVIDER_SCAN_ENTRY_VISITS.with(|visits| visits.set(0));
+        assert!(matches!(
+            cap_transport.scan(),
+            Err(ScenarioError::ProviderRescanLimit)
+        ));
+        assert_eq!(
+            PROVIDER_SCAN_ENTRY_VISITS.with(std::cell::Cell::get),
+            MAX_PROVIDER_RESCAN_ENTRIES + 1,
+            "the scan visited entries beyond the refusal boundary"
+        );
+
+        // (c) Aggregate actual-byte refusal: two files that each fit the
+        // budget individually are refused once their real byte total exceeds
+        // it. The single-file control proves the refusal is the aggregate.
+        let byte_root = ScenarioRoot::new().unwrap();
+        let byte_transport = SharedProviderTransport::open(
+            &byte_root.0.join("provider"),
+            &byte_root.0.join("private/device/journal"),
+        )
+        .unwrap();
+        let byte_objects = byte_root.0.join("provider/outbox/objects");
+        std::fs::create_dir_all(&byte_objects).unwrap();
+        let over_half = vec![b'x'; MAX_PROVIDER_RESCAN_BYTES / 2 + 1];
+        std::fs::write(byte_objects.join("first.object"), &over_half).unwrap();
+        let single = byte_transport.scan().unwrap();
+        assert_eq!(single.files.len(), 1);
+        assert_eq!(single.files[0].bytes.len(), over_half.len());
+        std::fs::write(byte_objects.join("second.object"), &over_half).unwrap();
+        assert!(matches!(
+            byte_transport.scan(),
+            Err(ScenarioError::ProviderRescanLimit)
+        ));
+
+        // (d) A partially written temporary file in the provider tree stays
+        // non-authoritative: the authoritative scan neither returns it nor
+        // stops on it, and the inclusive walk marks it temporary.
+        let temp_root = ScenarioRoot::new().unwrap();
+        let mut temp_transport = SharedProviderTransport::open(
+            &temp_root.0.join("provider"),
+            &temp_root.0.join("private/device/journal"),
+        )
+        .unwrap();
+        let object_bytes = b"published canonical object bytes";
+        temp_transport
+            .publish_object(ContentDigest::of(object_bytes), object_bytes)
+            .unwrap();
+        let manifest_bytes = b"published canonical manifest bytes";
+        temp_transport
+            .publish_manifest(
+                BatchId::from_uuid(Uuid::from_u128(0x2ee2_0001)),
+                manifest_bytes,
+            )
+            .unwrap();
+        let temp_dir = temp_root
+            .0
+            .join("provider/outbox")
+            .join(PROVIDER_TEMP_NAMESPACE);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let partial = temp_dir.join("unfinished-object.part");
+        std::fs::write(&partial, b"partially written provider stag").unwrap();
+
+        let scanned = temp_transport.scan().unwrap();
+        assert_eq!(
+            scanned.files.len(),
+            2,
+            "the partial temporary stopped or polluted the scan"
+        );
+        assert!(scanned.files.iter().all(|file| {
+            !file.path.starts_with(PROVIDER_TEMP_NAMESPACE) && file.kind.is_some()
+        }));
+        assert!(
+            partial.is_file(),
+            "the scan must tolerate the unfinished temporary, not consume it"
+        );
+        let inclusive = bounded_provider_files(
+            temp_transport.runtime.tree(ProviderTree::Outbox),
+            true,
+            MAX_PROVIDER_RESCAN_ENTRIES,
+            MAX_PROVIDER_RESCAN_BYTES,
+        )
+        .unwrap();
+        let staged = inclusive
+            .iter()
+            .find(|file| file.path == format!("{PROVIDER_TEMP_NAMESPACE}/unfinished-object.part"))
+            .expect("the inclusive walk must surface the staging file for publication audits");
+        assert!(staged.temporary);
+        assert!(inclusive
+            .iter()
+            .all(|file| file.temporary == file.path.starts_with(PROVIDER_TEMP_NAMESPACE)));
+    }
+
     #[test]
     fn provider_finish_retries_after_physical_publication_validation_error() {
         let bytes = b"retry after physical publication";

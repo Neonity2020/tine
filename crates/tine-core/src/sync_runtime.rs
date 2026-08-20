@@ -38566,6 +38566,387 @@ mod tests {
         }
     }
 
+    /// Stage 2e-ii canonical-record matrix at the clean public handle.
+    ///
+    /// Frontier-head, publication-intent, and manifest-recovery records are
+    /// authored with the production encoders — and, for the record kinds the
+    /// clean actor no longer emits, published through the retained provider
+    /// transport — on the second device of a joined pair. On the receiver, a
+    /// relabel (same bytes, wrong canonical name) and a substitution (wrong
+    /// bytes, canonical name) must each fail closed with no false authority
+    /// and no mutation of retained graph bytes, across one reopen. Frontier
+    /// heads, the record kind the clean ingress accepts, must then recover
+    /// idempotently from the exact bytes at the canonical name under
+    /// duplicate delivery. The clean evidence classifier refuses the
+    /// publication-intent and manifest-recovery namespaces wholesale
+    /// ("unknown clean provider evidence retained"), so the exact-recovery
+    /// half for those kinds lives in the retained transport-level sentinels
+    /// (`shared_provider_publication_intent_is_canonical_content_addressed_and_bound`,
+    /// `shared_provider_manifest_recovery_is_exact_immutable_and_idempotent`
+    /// in `oplog::wire`); here the batch itself still converges after the
+    /// attacked namespace is cleaned, the clean actor emits no records of the
+    /// retired kinds, and the runtime ends Safe.
+    #[test]
+    fn clean_provider_records_are_canonical_bound_and_idempotent() {
+        #[derive(Clone, Copy, Debug)]
+        enum RecordKind {
+            FrontierHead,
+            PublicationIntent,
+            ManifestRecovery,
+        }
+
+        fn forged_zero_digest_name(relative: &str) -> String {
+            let (stem, extension) = relative.rsplit_once('.').unwrap();
+            let (prefix, _digest) = stem.rsplit_once('-').unwrap();
+            format!("{prefix}-{}.{extension}", "0".repeat(64))
+        }
+
+        for (index, kind) in [
+            RecordKind::FrontierHead,
+            RecordKind::PublicationIntent,
+            RecordKind::ManifestRecovery,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seed = 0xf500 + (index as u128) * 0x40;
+            let (author, receiver, author_handle, receiver_handle) =
+                joined_shared_pair(&format!("clean-provider-record-{kind:?}"), seed);
+            let target = format!("notes/clean-provider-record-{index}.md");
+            let (batch_id, ..) = submit_shared_page(
+                &author_handle,
+                seed + 0x20,
+                &format!("Clean Provider Record {index}"),
+                &target,
+                "canonical provider records bind their authority",
+            );
+            publish_shared_batch(&author_handle, &author, batch_id);
+            settle_shared_provider(&author_handle);
+
+            let author_outbox = author.request.provider_root.join("outbox");
+            let receiver_outbox = receiver.request.provider_root.join("outbox");
+            let manifest_relative = format!("manifests/{batch_id}.manifest");
+            let manifest_bytes = fs::read(author_outbox.join(&manifest_relative)).unwrap();
+            let manifest = OperationBatch::decode(&manifest_bytes).unwrap();
+            let decoy_manifest_bytes = match kind {
+                RecordKind::ManifestRecovery => {
+                    let (decoy_batch, ..) = submit_shared_page(
+                        &author_handle,
+                        seed + 0x30,
+                        &format!("Clean Provider Record Decoy {index}"),
+                        &format!("notes/clean-provider-record-decoy-{index}.md"),
+                        "valid manifest bytes with a different identity",
+                    );
+                    publish_shared_batch(&author_handle, &author, decoy_batch);
+                    settle_shared_provider(&author_handle);
+                    Some(
+                        fs::read(author_outbox.join(format!("manifests/{decoy_batch}.manifest")))
+                            .unwrap(),
+                    )
+                }
+                _ => None,
+            };
+            assert!(matches!(
+                author_handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+            drop(author_handle);
+
+            // Production record bytes plus their canonical binding, verified
+            // with the production decoders before any attack. The clean
+            // runtime publishes the clean binary enrollment descriptor.
+            let descriptor_bytes =
+                fs::read(author_outbox.join(SHARED_ENROLLMENT_DESCRIPTOR_PATH)).unwrap();
+            let descriptor = CleanSharedEnrollmentDescriptorV1::decode(&descriptor_bytes).unwrap();
+            let (relabel_relative, relabel_bytes, subst_relative, subst_bytes, exact_head): (
+                String,
+                Vec<u8>,
+                String,
+                Vec<u8>,
+                Option<(String, Vec<u8>)>,
+            ) = match kind {
+                RecordKind::FrontierHead => {
+                    let heads_dir = author_outbox.join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+                    let head_relative = fs::read_dir(&heads_dir)
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .find_map(|entry| {
+                            let relative = format!(
+                                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                                entry.file_name().to_string_lossy()
+                            );
+                            SharedProviderFrontierHeadV1::decode(
+                                &relative,
+                                &fs::read(entry.path()).unwrap(),
+                            )
+                            .ok()
+                            .filter(|head| {
+                                head.author_device_id() == author.request.identities.device_id
+                                    && head.frontier_tips().contains(&batch_id)
+                            })
+                            .map(|_| relative)
+                        })
+                        .expect("author retained no covering frontier head");
+                    let head_bytes = fs::read(author_outbox.join(&head_relative)).unwrap();
+                    let forged = forged_zero_digest_name(&head_relative);
+                    assert!(
+                        SharedProviderFrontierHeadV1::decode(&forged, &head_bytes).is_err(),
+                        "a relabeled frontier head must not decode"
+                    );
+                    let receiver_heads =
+                        receiver_outbox.join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+                    let own_head_bytes = fs::read_dir(&receiver_heads)
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .find_map(|entry| {
+                            let relative = format!(
+                                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                                entry.file_name().to_string_lossy()
+                            );
+                            let bytes = fs::read(entry.path()).unwrap();
+                            SharedProviderFrontierHeadV1::decode(&relative, &bytes)
+                                .ok()
+                                .filter(|head| {
+                                    head.author_device_id() == receiver.request.identities.device_id
+                                })
+                                .map(|_| bytes)
+                        })
+                        .expect("receiver retained no own frontier head");
+                    assert!(
+                        SharedProviderFrontierHeadV1::decode(&head_relative, &own_head_bytes)
+                            .is_err(),
+                        "substituted frontier-head bytes must not decode at the canonical name"
+                    );
+                    (
+                        forged,
+                        head_bytes.clone(),
+                        head_relative.clone(),
+                        own_head_bytes,
+                        Some((head_relative, head_bytes)),
+                    )
+                }
+                RecordKind::PublicationIntent => {
+                    let intent = SharedProviderPublicationIntentV1::new(
+                        descriptor.workspace_id(),
+                        descriptor.lineage_digest(),
+                        descriptor.digest().unwrap(),
+                        author.request.identities.device_id,
+                        manifest.author_device_id(),
+                        batch_id,
+                        ContentDigest::of(&manifest_bytes),
+                    )
+                    .unwrap();
+                    let mut provider = SharedProviderTransport::open(
+                        &author.request.provider_root,
+                        &author.request.provider_journal_root,
+                    )
+                    .unwrap();
+                    provider.publish_publication_intent(&intent).unwrap();
+                    let intent_relative = intent.path().unwrap();
+                    let intent_bytes = fs::read(author_outbox.join(&intent_relative)).unwrap();
+                    assert_eq!(intent_bytes, intent.encode().unwrap());
+                    SharedProviderPublicationIntentV1::decode(&intent_relative, &intent_bytes)
+                        .unwrap();
+                    let forged = forged_zero_digest_name(&intent_relative);
+                    assert!(
+                        SharedProviderPublicationIntentV1::decode(&forged, &intent_bytes).is_err(),
+                        "a relabeled publication intent must not decode"
+                    );
+                    let wrong_intent = SharedProviderPublicationIntentV1::new(
+                        descriptor.workspace_id(),
+                        descriptor.lineage_digest(),
+                        descriptor.digest().unwrap(),
+                        author.request.identities.device_id,
+                        manifest.author_device_id(),
+                        batch_id,
+                        ContentDigest::of(b"clean-provider-record-substitution"),
+                    )
+                    .unwrap();
+                    let wrong_bytes = wrong_intent.encode().unwrap();
+                    assert!(
+                        SharedProviderPublicationIntentV1::decode(&intent_relative, &wrong_bytes)
+                            .is_err(),
+                        "substituted intent bytes must not decode at the canonical name"
+                    );
+                    (forged, intent_bytes, intent_relative, wrong_bytes, None)
+                }
+                RecordKind::ManifestRecovery => {
+                    let link = SharedProviderManifestRecoveryLinkV1::new(
+                        descriptor.workspace_id(),
+                        descriptor.lineage_digest(),
+                        descriptor.digest().unwrap(),
+                        batch_id,
+                        manifest.author_device_id(),
+                        ContentDigest::of(&manifest_bytes),
+                    )
+                    .unwrap();
+                    let mut provider = SharedProviderTransport::open(
+                        &author.request.provider_root,
+                        &author.request.provider_journal_root,
+                    )
+                    .unwrap();
+                    provider
+                        .publish_manifest_recovery(&link, &manifest_bytes)
+                        .unwrap();
+                    let link_relative = link.path();
+                    let blob_relative = link.blob_path();
+                    let link_bytes = fs::read(author_outbox.join(&link_relative)).unwrap();
+                    let blob_bytes = fs::read(author_outbox.join(&blob_relative)).unwrap();
+                    assert_eq!(link_bytes, link.encode().unwrap());
+                    assert_eq!(blob_bytes, manifest_bytes);
+                    SharedProviderManifestRecoveryLinkV1::decode(&link_relative, &link_bytes)
+                        .unwrap();
+                    assert_eq!(
+                        blob_relative,
+                        format!(
+                            "{SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE}/{}.manifest",
+                            ContentDigest::of(&blob_bytes)
+                        )
+                    );
+                    let forged_batch = BatchId::from_uuid(Uuid::from_u128(seed + 0x3f));
+                    let forged = format!(
+                        "{SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE}/{forged_batch}.link"
+                    );
+                    assert!(
+                        SharedProviderManifestRecoveryLinkV1::decode(&forged, &link_bytes).is_err(),
+                        "a relabeled manifest-recovery link must not decode"
+                    );
+                    let decoy = decoy_manifest_bytes.clone().unwrap();
+                    assert_ne!(ContentDigest::of(&decoy), ContentDigest::of(&blob_bytes));
+                    (forged, link_bytes, blob_relative, decoy, None)
+                }
+            };
+
+            let graph_before = user_graph_bytes(&receiver.graph_root);
+
+            // Phase 1: relabel — the production bytes under a wrong canonical
+            // name fail closed and grant nothing, across a reopen.
+            let relabel_path = receiver_outbox.join(&relabel_relative);
+            fs::create_dir_all(relabel_path.parent().unwrap()).unwrap();
+            fs::write(&relabel_path, &relabel_bytes).unwrap();
+            receiver_handle
+                .observe_provider_paths(vec![relabel_relative.clone()], false)
+                .unwrap();
+            let detail =
+                wait_for_provider_recovery_block(&receiver_handle, &format!("{kind:?} relabel"));
+            assert!(!detail.is_empty());
+            assert_eq!(fs::read(&relabel_path).unwrap(), relabel_bytes);
+            assert_eq!(user_graph_bytes(&receiver.graph_root), graph_before);
+            assert!(!receiver.graph_root.join(&target).exists());
+            drop(receiver_handle);
+            let receiver_handle =
+                active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+            assert_eq!(fs::read(&relabel_path).unwrap(), relabel_bytes);
+            assert_eq!(user_graph_bytes(&receiver.graph_root), graph_before);
+            fs::remove_file(&relabel_path).unwrap();
+            receiver_handle
+                .observe_provider_paths(vec![relabel_relative.clone()], false)
+                .unwrap();
+            settle_shared_provider(&receiver_handle);
+
+            // Phase 2: substitution — wrong bytes at the canonical name fail
+            // closed and grant nothing, across a reopen.
+            let subst_path = receiver_outbox.join(&subst_relative);
+            fs::create_dir_all(subst_path.parent().unwrap()).unwrap();
+            fs::write(&subst_path, &subst_bytes).unwrap();
+            receiver_handle
+                .observe_provider_paths(vec![subst_relative.clone()], false)
+                .unwrap();
+            let detail = wait_for_provider_recovery_block(
+                &receiver_handle,
+                &format!("{kind:?} substitution"),
+            );
+            assert!(!detail.is_empty());
+            assert_eq!(fs::read(&subst_path).unwrap(), subst_bytes);
+            assert_eq!(user_graph_bytes(&receiver.graph_root), graph_before);
+            assert!(!receiver.graph_root.join(&target).exists());
+            drop(receiver_handle);
+            let receiver_handle =
+                active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+            assert_eq!(fs::read(&subst_path).unwrap(), subst_bytes);
+            assert_eq!(user_graph_bytes(&receiver.graph_root), graph_before);
+
+            // Phase 3: recovery. For frontier heads the exact bytes at the
+            // canonical name are delivered, twice, and grant authority once.
+            // For the refused record kinds the attacked namespace is cleaned
+            // and the batch itself still converges idempotently.
+            match &exact_head {
+                Some((relative, bytes)) => {
+                    let path = receiver_outbox.join(relative);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, bytes).unwrap();
+                }
+                None => fs::remove_file(&subst_path).unwrap(),
+            }
+            let mut delivered = copy_provider_batch(
+                &author,
+                &receiver,
+                batch_id,
+                ProviderBatchDelivery::Complete,
+            );
+            match &exact_head {
+                Some((relative, _)) => delivered.push(relative.clone()),
+                None => delivered.push(subst_relative.clone()),
+            }
+            let mut duplicated = delivered.clone();
+            duplicated.extend(delivered);
+            receiver_handle
+                .observe_provider_paths(duplicated, false)
+                .unwrap();
+            settle_shared_provider(&receiver_handle);
+            let mut expected_graph = graph_before.clone();
+            expected_graph.insert(
+                target.clone(),
+                b"- canonical provider records bind their authority\n".to_vec(),
+            );
+            assert_eq!(
+                user_graph_bytes(&receiver.graph_root),
+                expected_graph,
+                "{kind:?} exact canonical delivery did not converge exactly once"
+            );
+
+            let mut replayed = copy_provider_batch(
+                &author,
+                &receiver,
+                batch_id,
+                ProviderBatchDelivery::Complete,
+            );
+            if let Some((relative, bytes)) = &exact_head {
+                fs::write(receiver_outbox.join(relative), bytes).unwrap();
+                replayed.push(relative.clone());
+            }
+            receiver_handle
+                .observe_provider_paths(replayed, false)
+                .unwrap();
+            settle_shared_provider(&receiver_handle);
+            assert_eq!(
+                user_graph_bytes(&receiver.graph_root),
+                expected_graph,
+                "{kind:?} duplicate exact delivery was not idempotent"
+            );
+
+            // Architectural fact, enforced: the clean actor emits no
+            // publication-intent or manifest-recovery records of its own.
+            for namespace in [
+                SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+                SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+                SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+            ] {
+                let dir = receiver_outbox.join(namespace);
+                assert!(
+                    !dir.exists() || fs::read_dir(&dir).unwrap().count() == 0,
+                    "the clean receiver resurrected retired records under {namespace}"
+                );
+            }
+            let status = receiver_handle.status().unwrap();
+            assert_eq!(status.provider_pending, 0);
+            assert!(matches!(
+                receiver_handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+            ));
+        }
+    }
+
     fn visible_provider_page_text(
         fixture: &ActivationFixture,
         paths: &[&str],
