@@ -30,14 +30,12 @@ mod hot_engine_integration_tests;
 pub mod identity;
 pub mod import;
 pub(crate) mod lazy_genesis;
-#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_active;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_journal_drain;
 #[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod local_journal_v2_anchor;
 pub(crate) mod loro_store;
-#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod migration_backup;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
@@ -55,7 +53,6 @@ pub mod refusal;
 pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
 pub mod semantic;
-#[allow(dead_code)] // mixed live/runtime and proof/test surface
 pub(crate) mod shadow_projection;
 pub mod sqlite;
 mod sqlite_identity;
@@ -65,7 +62,6 @@ pub mod text_merge;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;
-#[allow(dead_code)] // mixed live/runtime and test instrumentation surface
 pub(crate) mod watcher_queue;
 pub(crate) mod wire;
 
