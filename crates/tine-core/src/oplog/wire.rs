@@ -12951,6 +12951,1202 @@ mod tests {
             .all(|file| file.temporary == file.path.starts_with(PROVIDER_TEMP_NAMESPACE)));
     }
 
+    // ===== Stage 2e-ii wave 3a: retained-provider retry and race controls =====
+    //
+    // The retained provider machinery (`SharedProviderTransport`,
+    // `ProviderRetryJournal`, `put_complete`, `run_provider_rename`,
+    // `run_provider_remove_with`) already consults the `#[cfg(test)]`
+    // thread-local injection slots declared beside the production code
+    // (`FAIL_PROVIDER_JOURNAL_AFTER_PHASE`, `FAIL_PROVIDER_JOURNAL_BOUNDARY`,
+    // `FAIL_PROVIDER_PUBLICATION_AFTER_PHYSICAL_WRITE`,
+    // `FAIL_PROVIDER_RENAME_AFTER_PHYSICAL_MOVE`,
+    // `PROVIDER_PUBLICATION_SOURCE_VALIDATION_HOOK`,
+    // `PROVIDER_POST_VALIDATION_HOOK`,
+    // `PROVIDER_RETIREMENT_BEFORE_PRIVATE_MOVE_HOOK`,
+    // `PROVIDER_STAGING_MODE`), so no new production consultation point is
+    // needed: the installers below are RAII guards over those existing slots,
+    // per the `InjectedSharedProviderFlaggedRenameFailure` house pattern (an
+    // armed injection slot, cleared on drop). They are thread-local rather
+    // than process-global because these tests drive the retained provider on
+    // the test thread itself; a clean-runtime actor-thread test would need
+    // the process-global variant of the pattern instead.
+
+    /// One injected fault inside a retained provider retry operation.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProviderRetryFault {
+        /// Crash/power cut immediately after the named journal phase became
+        /// durable.
+        AfterDurablePhase(ProviderJournalPhase),
+        /// Crash/power cut at the named journal file boundary.
+        AtJournalBoundary(ProviderJournalBoundary),
+        /// A validation failure reported after the destination bytes were
+        /// already physically written (the torn-write/validation-race model).
+        AfterPhysicalPublication,
+    }
+
+    /// The operation whose retry boundary the installed fault models.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProviderRetryBoundary {
+        Put(ProviderRetryFault),
+        Rename(ProviderRetryFault),
+        Remove(ProviderRetryFault),
+    }
+
+    struct InstalledProviderRetryBoundaryFault;
+
+    fn install_provider_retry_boundary_fault_for_test(
+        boundary: ProviderRetryBoundary,
+    ) -> InstalledProviderRetryBoundaryFault {
+        let fault = match boundary {
+            ProviderRetryBoundary::Put(fault)
+            | ProviderRetryBoundary::Rename(fault)
+            | ProviderRetryBoundary::Remove(fault) => fault,
+        };
+        match fault {
+            ProviderRetryFault::AfterDurablePhase(phase) => {
+                FAIL_PROVIDER_JOURNAL_AFTER_PHASE.with(|hook| hook.replace(Some(phase)));
+            }
+            ProviderRetryFault::AtJournalBoundary(at) => {
+                FAIL_PROVIDER_JOURNAL_BOUNDARY.with(|hook| hook.replace(Some(at)));
+            }
+            ProviderRetryFault::AfterPhysicalPublication => match boundary {
+                ProviderRetryBoundary::Put(_) => {
+                    FAIL_PROVIDER_PUBLICATION_AFTER_PHYSICAL_WRITE.with(|hook| hook.set(true));
+                }
+                ProviderRetryBoundary::Rename(_) => {
+                    FAIL_PROVIDER_RENAME_AFTER_PHYSICAL_MOVE.with(|hook| hook.set(true));
+                }
+                ProviderRetryBoundary::Remove(_) => {
+                    panic!("remove has no physical publication boundary")
+                }
+            },
+        }
+        InstalledProviderRetryBoundaryFault
+    }
+
+    impl Drop for InstalledProviderRetryBoundaryFault {
+        fn drop(&mut self) {
+            FAIL_PROVIDER_JOURNAL_AFTER_PHASE.with(|hook| hook.replace(None));
+            FAIL_PROVIDER_JOURNAL_BOUNDARY.with(|hook| hook.replace(None));
+            FAIL_PROVIDER_PUBLICATION_AFTER_PHYSICAL_WRITE.with(|hook| hook.set(false));
+            FAIL_PROVIDER_RENAME_AFTER_PHYSICAL_MOVE.with(|hook| hook.set(false));
+        }
+    }
+
+    /// One race window inside a retained provider operation at which an
+    /// installed action mutates the filesystem while the operation continues.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProviderPublicationRace {
+        /// Put: after the staged source is validated, before the exclusive
+        /// destination is created.
+        PutAfterSourceValidation,
+        /// Rename: right after the source file is validated into the new
+        /// journal record.
+        RenameAfterSourceValidation,
+        /// Remove: right after the source file is validated into the new
+        /// journal record.
+        RemoveAfterSourceValidation,
+        /// Rename/remove retirement: before the retired source moves into the
+        /// private diagnostic namespace.
+        RetirementBeforePrivateMove,
+    }
+
+    struct InstalledProviderPublicationRace;
+
+    fn install_provider_publication_race_for_test(
+        race: ProviderPublicationRace,
+        action: Box<dyn FnOnce()>,
+    ) -> InstalledProviderPublicationRace {
+        match race {
+            ProviderPublicationRace::PutAfterSourceValidation => {
+                PROVIDER_PUBLICATION_SOURCE_VALIDATION_HOOK.with(|hook| hook.replace(Some(action)));
+            }
+            ProviderPublicationRace::RenameAfterSourceValidation => {
+                PROVIDER_POST_VALIDATION_HOOK.with(|hook| {
+                    hook.replace(Some((ProviderPostValidationOperation::Rename, action)))
+                });
+            }
+            ProviderPublicationRace::RemoveAfterSourceValidation => {
+                PROVIDER_POST_VALIDATION_HOOK.with(|hook| {
+                    hook.replace(Some((ProviderPostValidationOperation::Remove, action)))
+                });
+            }
+            ProviderPublicationRace::RetirementBeforePrivateMove => {
+                PROVIDER_RETIREMENT_BEFORE_PRIVATE_MOVE_HOOK
+                    .with(|hook| hook.replace(Some(action)));
+            }
+        }
+        InstalledProviderPublicationRace
+    }
+
+    impl Drop for InstalledProviderPublicationRace {
+        fn drop(&mut self) {
+            PROVIDER_PUBLICATION_SOURCE_VALIDATION_HOOK.with(|hook| hook.replace(None));
+            PROVIDER_POST_VALIDATION_HOOK.with(|hook| hook.replace(None));
+            PROVIDER_RETIREMENT_BEFORE_PRIVATE_MOVE_HOOK.with(|hook| hook.replace(None));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct ForcedProviderStagingMode(ProviderStagingMode);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn force_provider_staging_mode_for_test(
+        mode: ProviderStagingMode,
+    ) -> ForcedProviderStagingMode {
+        ForcedProviderStagingMode(PROVIDER_STAGING_MODE.with(|current| current.replace(mode)))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Drop for ForcedProviderStagingMode {
+        fn drop(&mut self) {
+            PROVIDER_STAGING_MODE.with(|current| current.set(self.0));
+        }
+    }
+
+    /// A direct retained-provider device: `ProviderRuntime` plus
+    /// `ProviderRetryJournal` over a plain directory, with no simulator
+    /// scenario, scheduler, engine, or object store behind it. Dropping the
+    /// value and calling this again on the same root is the crash/power-cut
+    /// plus restart model: all process state is lost and only the on-disk
+    /// provider tree and private retry journal survive.
+    fn retained_provider_device(root: &std::path::Path) -> DeviceRuntime {
+        DeviceRuntime {
+            name: "retained".into(),
+            device_id: DeviceId::from_uuid(Uuid::from_u128(0x2ee2_3a01)),
+            root: root.to_path_buf(),
+            store: None,
+            engine: None,
+            transfers: BTreeMap::new(),
+            provider: ProviderRuntime::open(root.join("provider")).unwrap(),
+            provider_journal: Some(
+                ProviderRetryJournal::open(root.join("provider-local-journal")).unwrap(),
+            ),
+        }
+    }
+
+    fn retained_dir_count(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path).unwrap().count()
+    }
+
+    /// The deterministic operation id of a retained-transport generated put.
+    fn generated_put_operation_id(path: &str, bytes: &[u8]) -> String {
+        let binding = format!("generated:{}", provider_digest(bytes));
+        ProviderRetryJournal::operation_id(
+            ProviderJournalOperation::Put,
+            &binding,
+            &binding,
+            ProviderTree::Outbox,
+            path,
+            None,
+            u64::try_from(bytes.len()).unwrap(),
+            &provider_digest(bytes),
+        )
+    }
+
+    /// Stage 2e-ii item 10: every race boundary of the retained provider
+    /// publication path revalidates instead of trusting a name, a handle, or
+    /// an earlier validation. Replaces the simulator publication-race
+    /// scenarios (`provider_finish_uses_retained_handle_and_leaves_replacement_untouched`,
+    /// `provider_finish_never_reads_symlink_or_special_temp_replacements`,
+    /// `provider_finish_conflict_keeps_honest_temp_and_never_claims_success`,
+    /// `provider_finish_rejects_an_unrelated_identical_destination`,
+    /// `provider_copy_rejects_an_unrelated_identical_destination`,
+    /// `complete_copy_publication_rejects_a_replaced_named_staging_source`,
+    /// `provider_put_accepts_exact_bytes_after_file_sync_replaces_the_inode`,
+    /// and `anonymous_and_named_staging_produce_identical_canonical_provider_snapshots`)
+    /// at the retained `SharedProviderTransport` boundary.
+    #[test]
+    fn provider_publication_revalidates_every_race_boundary() {
+        let bytes: &[u8] = b"publication race object bytes";
+        let object_path = format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(bytes)
+        );
+        let open_fixture = || {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let transport = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            (root, provider_root, journal_root, transport)
+        };
+        let destination_of =
+            |provider_root: &std::path::Path| provider_root.join("outbox").join(&object_path);
+        let staging_path_of = |provider_root: &std::path::Path| {
+            provider_root
+                .join("outbox")
+                .join(PROVIDER_TEMP_NAMESPACE)
+                .join(ProviderRetryJournal::staging_name(
+                    &generated_put_operation_id(&object_path, bytes),
+                    0,
+                ))
+        };
+
+        // (1) Unrelated identical destination. Threat: an honest concurrent
+        // instance or a file-sync service already delivered a file carrying
+        // our canonical name. The exact object path revalidates and accepts
+        // byte-identical content without rewriting it; the plain manifest
+        // path refuses any pre-existing occupant outright and leaves it
+        // untouched.
+        {
+            let (_root, provider_root, journal_root, mut transport) = open_fixture();
+            let destination = destination_of(&provider_root);
+            std::fs::write(&destination, bytes).unwrap();
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
+
+            let manifest_id = BatchId::from_uuid(Uuid::from_u128(0x2ee2_3a10));
+            let manifest_path = provider_root
+                .join("outbox")
+                .join(PROVIDER_MANIFESTS_NAMESPACE)
+                .join(format!("{manifest_id}.manifest"));
+            std::fs::write(&manifest_path, b"occupant manifest bytes").unwrap();
+            assert!(matches!(
+                transport.publish_manifest(manifest_id, b"occupant manifest bytes"),
+                Err(ScenarioError::ProviderConflictingBytes(path))
+                    if path.ends_with(".manifest")
+            ));
+            assert_eq!(
+                std::fs::read(&manifest_path).unwrap(),
+                b"occupant manifest bytes"
+            );
+        }
+
+        // (2) Deterministic staging-name collision. Threat: a previous
+        // instance of this device crashed (power cut) or a sync service left
+        // unrelated litter at the deterministic staging name. The occupant is
+        // quarantined without byte loss and the publication converges.
+        {
+            let (_root, provider_root, journal_root, mut transport) = open_fixture();
+            let staging_dir = provider_root.join("outbox").join(PROVIDER_TEMP_NAMESPACE);
+            std::fs::write(
+                staging_dir.join(ProviderRetryJournal::staging_name(
+                    &generated_put_operation_id(&object_path, bytes),
+                    0,
+                )),
+                b"foreign staging occupant",
+            )
+            .unwrap();
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(destination_of(&provider_root)).unwrap(),
+                bytes
+            );
+            let removed = provider_root
+                .join("outbox")
+                .join(PROVIDER_REMOVED_NAMESPACE);
+            let quarantined: Vec<_> = std::fs::read_dir(&removed)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(quarantined.len(), 1);
+            assert_eq!(
+                std::fs::read(&quarantined[0]).unwrap(),
+                b"foreign staging occupant"
+            );
+            assert_eq!(retained_dir_count(&staging_dir), 0);
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
+        }
+
+        // (3) Staged-source replacement across a crash. Threat: crash/power
+        // cut leaves the named staging file on disk and an external editor or
+        // sync service replaces it before restart. The recorded staging
+        // identity refuses the replacement and nothing ever reaches the
+        // canonical destination.
+        {
+            let (_root, provider_root, journal_root, mut transport) = open_fixture();
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Staged),
+                    ));
+                assert!(matches!(
+                    transport.publish_object_exact(ContentDigest::of(bytes), bytes),
+                    Err(ScenarioError::Io(message)) if message.contains("injected")
+                ));
+            }
+            let staging = staging_path_of(&provider_root);
+            assert_eq!(std::fs::read(&staging).unwrap(), bytes);
+            std::fs::remove_file(&staging).unwrap();
+            std::fs::write(&staging, b"attacker staging bytes").unwrap();
+            drop(transport);
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            assert!(transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .is_err());
+            assert!(!destination_of(&provider_root).exists());
+            assert_eq!(std::fs::read(&staging).unwrap(), b"attacker staging bytes");
+        }
+
+        // (4) Symlink and special-file staging replacement across a crash.
+        // Threat: an external editor or hostile-shaped sync residue swaps the
+        // crashed staging name for a symlink or a FIFO; neither may ever be
+        // read or published, and the symlink target must stay untouched.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            for replacement in ["symlink", "fifo"] {
+                let (_root, provider_root, journal_root, mut transport) = open_fixture();
+                {
+                    let _fault =
+                        install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                            ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Staged),
+                        ));
+                    assert!(transport
+                        .publish_object_exact(ContentDigest::of(bytes), bytes)
+                        .is_err());
+                }
+                let staging = staging_path_of(&provider_root);
+                std::fs::remove_file(&staging).unwrap();
+                let target = provider_root
+                    .join("outbox")
+                    .join(PROVIDER_TEMP_NAMESPACE)
+                    .join("attacker-target");
+                match replacement {
+                    "symlink" => {
+                        std::fs::write(&target, b"attacker replacement").unwrap();
+                        symlink(&target, &staging).unwrap();
+                    }
+                    "fifo" => {
+                        let name = CString::new(staging.as_os_str().as_encoded_bytes()).unwrap();
+                        // SAFETY: `name` is a live NUL-terminated pathname and
+                        // mkfifo does not retain it. A filesystem without
+                        // FIFOs is an unavailable special-file case, not a
+                        // failure of this test.
+                        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+                            let error = std::io::Error::last_os_error();
+                            if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EOPNOTSUPP))
+                            {
+                                continue;
+                            }
+                            panic!("create FIFO replacement: {error}");
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                drop(transport);
+                let mut transport =
+                    SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+                assert!(
+                    transport
+                        .publish_object_exact(ContentDigest::of(bytes), bytes)
+                        .is_err(),
+                    "{replacement}"
+                );
+                assert!(!destination_of(&provider_root).exists(), "{replacement}");
+                assert!(std::fs::symlink_metadata(&staging).is_ok(), "{replacement}");
+                if replacement == "symlink" {
+                    assert_eq!(std::fs::read(&target).unwrap(), b"attacker replacement");
+                }
+            }
+        }
+
+        // (5) Post-validation staging replacement inside one publication.
+        // Threat: an external editor or a concurrent honest instance replaces
+        // the staging file in the window between staging validation and
+        // destination creation. The private journal blob stays the byte
+        // authority: the destination receives the validated bytes and the
+        // replacement is preserved as quarantine residue, never published.
+        {
+            let (_root, provider_root, _journal_root, mut transport) = open_fixture();
+            let race_staging = staging_path_of(&provider_root);
+            let _race = install_provider_publication_race_for_test(
+                ProviderPublicationRace::PutAfterSourceValidation,
+                Box::new(move || {
+                    // Delivered the way sync services install files: a
+                    // sibling temp file renamed over the target, so the
+                    // replacement is a genuinely distinct inode.
+                    let delivery = race_staging.with_file_name("attacker-delivery.tmp");
+                    std::fs::write(&delivery, b"attacker staging bytes").unwrap();
+                    std::fs::rename(&delivery, &race_staging).unwrap();
+                }),
+            );
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(destination_of(&provider_root)).unwrap(),
+                bytes
+            );
+            let removed = provider_root
+                .join("outbox")
+                .join(PROVIDER_REMOVED_NAMESPACE);
+            let quarantined: Vec<_> = std::fs::read_dir(&removed)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(quarantined.len(), 1);
+            assert_eq!(
+                std::fs::read(&quarantined[0]).unwrap(),
+                b"attacker staging bytes"
+            );
+        }
+
+        // (6) Exact-bytes destination inode replacement across a crash.
+        // Threat: file-sync services commonly reinstall even unchanged bytes
+        // through a temp-plus-rename, changing the inode while the crashed
+        // put is mid-retry. Exact bytes remain acceptable.
+        {
+            let (_root, provider_root, journal_root, mut transport) = open_fixture();
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Published),
+                    ));
+                assert!(transport
+                    .publish_object_exact(ContentDigest::of(bytes), bytes)
+                    .is_err());
+            }
+            let destination = destination_of(&provider_root);
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+            let replacement = destination.with_extension("provider-replacement");
+            std::fs::write(&replacement, bytes).unwrap();
+            std::fs::rename(&replacement, &destination).unwrap();
+            drop(transport);
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
+        }
+
+        // (7) Conflicting destination replacement across a crash. Threat: a
+        // sync service delivers DIFFERENT bytes at the canonical name while
+        // the put is mid-retry; the retry fails closed and never overwrites
+        // the delivered file.
+        {
+            let (_root, provider_root, journal_root, mut transport) = open_fixture();
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Published),
+                    ));
+                assert!(transport
+                    .publish_object_exact(ContentDigest::of(bytes), bytes)
+                    .is_err());
+            }
+            let destination = destination_of(&provider_root);
+            std::fs::remove_file(&destination).unwrap();
+            std::fs::write(&destination, b"conflicting delivered bytes").unwrap();
+            drop(transport);
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            assert!(matches!(
+                transport.publish_object_exact(ContentDigest::of(bytes), bytes),
+                Err(ScenarioError::ProviderConflictingBytes(_))
+            ));
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"conflicting delivered bytes"
+            );
+        }
+
+        // (8) Destination occupied during a pre-publication retry. Threat: an
+        // external delivery races the crashed put's destination name. The
+        // retry never claims success, never overwrites the occupant, keeps
+        // the honest staging, and converges once the occupant clears.
+        {
+            let (_root, provider_root, journal_root, mut transport) = open_fixture();
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Put(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::PublishIntent),
+                    ));
+                assert!(transport
+                    .publish_object_exact(ContentDigest::of(bytes), bytes)
+                    .is_err());
+            }
+            let destination = destination_of(&provider_root);
+            assert!(!destination.exists());
+            let staging = staging_path_of(&provider_root);
+            assert_eq!(std::fs::read(&staging).unwrap(), bytes);
+            std::fs::write(&destination, b"externally delivered occupant").unwrap();
+            drop(transport);
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            assert!(transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .is_err());
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"externally delivered occupant"
+            );
+            assert_eq!(std::fs::read(&staging).unwrap(), bytes);
+            std::fs::remove_file(&destination).unwrap();
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+            assert_eq!(retained_dir_count(&journal_root.join("records")), 0);
+        }
+
+        // (9) Anonymous versus named-fallback staging. On the retained
+        // journal-staging put path both modes must produce byte-identical
+        // canonical provider trees with no temporary residue; the forced-mode
+        // guard pins that equality against any future divergence of the two
+        // staging implementations.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let canonical_tree = |mode: ProviderStagingMode| {
+                let _mode = force_provider_staging_mode_for_test(mode);
+                let root = ScenarioRoot::new().unwrap();
+                let provider_root = root.0.join("provider");
+                let mut transport = SharedProviderTransport::open(
+                    &provider_root,
+                    &root.0.join("private/device/journal"),
+                )
+                .unwrap();
+                transport
+                    .publish_object_exact(ContentDigest::of(bytes), bytes)
+                    .unwrap();
+                provider_tree_bytes(&provider_root.join("outbox"))
+            };
+            let automatic = canonical_tree(ProviderStagingMode::Automatic);
+            let named = canonical_tree(ProviderStagingMode::NamedFallback);
+            assert_eq!(automatic, named);
+            assert!(automatic.keys().all(|path| {
+                // Directory entries end in '/'; the empty temp namespace
+                // directory itself is canonical, temp FILES are not.
+                path.ends_with('/') || !path.starts_with(PROVIDER_TEMP_NAMESPACE)
+            }));
+        }
+    }
+
+    /// Stage 2e-ii item 11: every retry boundary of the retained provider put
+    /// path recovers across a crash without overwriting foreign bytes and
+    /// converges exactly on retry. Replaces the simulator scenarios
+    /// `provider_put_recovers_from_every_journal_file_boundary`,
+    /// `provider_put_creation_crashes_reopen_without_overwrite`, and the
+    /// retry half of
+    /// `provider_finish_retries_after_physical_publication_validation_error`
+    /// at the retained `SharedProviderTransport` boundary.
+    #[test]
+    fn provider_put_recovers_from_every_retry_boundary_without_overwrite() {
+        let bytes: &[u8] = b"retry boundary put bytes";
+        let object_path = format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(bytes)
+        );
+        // Threat model per row: crash/power cut at the named durable journal
+        // boundary or phase (torn write for the physical-publication row),
+        // with a file-sync service free to race the canonical name while the
+        // device is down.
+        let faults = [
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::BeforeBlobDurable),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::BlobDurable),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::CreationRecordDurable),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::BlobInstalled),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::RecordDurable),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::UpdateDurable),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::UpdateInstalled),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::BlobRemoved),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::CompletionDurable),
+            ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::RecordRemoved),
+            ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Prepared),
+            ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Staged),
+            ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::PublishIntent),
+            ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Published),
+            ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Cleanup),
+            ProviderRetryFault::AfterPhysicalPublication,
+        ];
+        for fault in faults {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let destination = provider_root.join("outbox").join(&object_path);
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Put(fault),
+                );
+                assert!(
+                    matches!(
+                        transport.publish_object_exact(ContentDigest::of(bytes), bytes),
+                        Err(ScenarioError::Io(message)) if message.contains("injected")
+                    ),
+                    "{fault:?}"
+                );
+            }
+            // A destination either does not exist yet or already carries the
+            // exact bytes; no boundary may expose torn destination bytes.
+            let published_before_crash = destination.exists();
+            if published_before_crash {
+                assert_eq!(std::fs::read(&destination).unwrap(), bytes, "{fault:?}");
+            }
+            drop(transport);
+            let mut transport =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            if !published_before_crash {
+                // Threat: a sync service delivers an unrelated file at the
+                // canonical name while this device is crashed. The retry must
+                // refuse and must not overwrite the delivered bytes.
+                std::fs::write(&destination, b"unrelated delivered bytes").unwrap();
+                assert!(
+                    transport
+                        .publish_object_exact(ContentDigest::of(bytes), bytes)
+                        .is_err(),
+                    "{fault:?}"
+                );
+                assert_eq!(
+                    std::fs::read(&destination).unwrap(),
+                    b"unrelated delivered bytes",
+                    "{fault:?}"
+                );
+                std::fs::remove_file(&destination).unwrap();
+            }
+            // Exact convergence on retry.
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes, "{fault:?}");
+            assert_eq!(
+                retained_dir_count(&journal_root.join("records")),
+                0,
+                "{fault:?}"
+            );
+            assert_eq!(
+                retained_dir_count(&journal_root.join("blobs")),
+                0,
+                "{fault:?}"
+            );
+            assert_eq!(
+                retained_dir_count(&provider_root.join("outbox").join(PROVIDER_TEMP_NAMESPACE)),
+                0,
+                "{fault:?}"
+            );
+            // Idempotent re-publication of the converged bytes.
+            transport
+                .publish_object_exact(ContentDigest::of(bytes), bytes)
+                .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes, "{fault:?}");
+        }
+    }
+
+    /// Stage 2e-ii item 12: every retry and retirement boundary of the
+    /// retained provider rename recovers across a crash without overwriting
+    /// foreign bytes, and only the exact operation may resume its journal
+    /// record. Replaces the simulator scenarios
+    /// `provider_rename_recovers_from_every_durable_journal_phase`,
+    /// `provider_rename_creation_crashes_reopen_without_overwrite`,
+    /// `provider_rename_retry_reconciles_destination_before_source_reopen`,
+    /// `provider_rename_retry_rejects_a_conflicting_published_destination`,
+    /// `crash_restart_reconciles_rename_from_disk_after_process_state_loss`,
+    /// `retirement_race_before_public_cleanup_preserves_foreign_bytes_and_retry_converges`,
+    /// `rename_retirement_private_boundaries_are_crash_closed`, and
+    /// `provider_rename_post_validation_replacement_cannot_publish_attacker_bytes`
+    /// on the retained provider machinery without the simulator.
+    #[test]
+    fn provider_rename_recovers_from_every_retry_and_retirement_boundary_without_overwrite() {
+        let bytes: &[u8] = b"retry boundary rename bytes";
+        let rename = |device: &DeviceRuntime, event_id: u64| {
+            run_provider_rename(
+                device,
+                event_id,
+                ProviderTree::Inbox,
+                "objects/source",
+                "objects/destination",
+            )
+        };
+        let seeded_device = |root: &std::path::Path| {
+            let device = retained_provider_device(root);
+            // The source arrives the way a file-sync service delivers it: as
+            // a plain file in the provider tree.
+            std::fs::write(root.join("provider/inbox/objects/source"), bytes).unwrap();
+            device
+        };
+
+        // (A) Construction crashes: crash/power cut at each journal file
+        // boundary of the rename record's construction. The source survives,
+        // nothing reaches the destination, a foreign file delivered at the
+        // destination name while the device is down is never overwritten, and
+        // the exact retry converges with no journal or evidence residue.
+        for boundary in [
+            ProviderJournalBoundary::BeforeBlobDurable,
+            ProviderJournalBoundary::BlobDurable,
+            ProviderJournalBoundary::CreationRecordDurable,
+            ProviderJournalBoundary::BlobInstalled,
+            ProviderJournalBoundary::RecordDurable,
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Rename(ProviderRetryFault::AtJournalBoundary(boundary)),
+                );
+                assert!(
+                    matches!(
+                        rename(&device, 7),
+                        Err(ScenarioError::Io(message)) if message.contains("injected")
+                    ),
+                    "{boundary:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(inbox.join("objects/source")).unwrap(),
+                bytes,
+                "{boundary:?}"
+            );
+            assert!(!inbox.join("objects/destination").exists(), "{boundary:?}");
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            std::fs::write(inbox.join("objects/destination"), b"unrelated destination").unwrap();
+            assert!(rename(&device, 7).is_err(), "{boundary:?}");
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                b"unrelated destination",
+                "{boundary:?}"
+            );
+            assert_eq!(
+                std::fs::read(inbox.join("objects/source")).unwrap(),
+                bytes,
+                "{boundary:?}"
+            );
+            std::fs::remove_file(inbox.join("objects/destination")).unwrap();
+            rename(&device, 7).unwrap();
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes,
+                "{boundary:?}"
+            );
+            assert!(!inbox.join("objects/source").exists(), "{boundary:?}");
+            let journal = root.0.join("provider-local-journal");
+            assert_eq!(
+                retained_dir_count(&journal.join("records")),
+                0,
+                "{boundary:?}"
+            );
+            assert_eq!(
+                retained_dir_count(&journal.join("blobs")),
+                0,
+                "{boundary:?}"
+            );
+            assert_eq!(
+                retained_dir_count(&inbox.join(PROVIDER_RENAME_EVIDENCE_NAMESPACE)),
+                0,
+                "{boundary:?}"
+            );
+        }
+
+        // (B) Durable-phase crashes: crash/power cut immediately after each
+        // durable journal phase; the exact retry converges from disk alone.
+        for phase in [
+            ProviderJournalPhase::Prepared,
+            ProviderJournalPhase::Staged,
+            ProviderJournalPhase::PublishIntent,
+            ProviderJournalPhase::Published,
+            ProviderJournalPhase::RetireIntent,
+            ProviderJournalPhase::Retired,
+            ProviderJournalPhase::Cleanup,
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Rename(ProviderRetryFault::AfterDurablePhase(phase)),
+                );
+                assert!(rename(&device, 7).is_err(), "{phase:?}");
+            }
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            rename(&device, 7).unwrap();
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes,
+                "{phase:?}"
+            );
+            assert!(!inbox.join("objects/source").exists(), "{phase:?}");
+            let journal = root.0.join("provider-local-journal");
+            assert_eq!(retained_dir_count(&journal.join("records")), 0, "{phase:?}");
+            assert_eq!(retained_dir_count(&journal.join("blobs")), 0, "{phase:?}");
+        }
+
+        // (C) Publication-validation fault: a validation error reported after
+        // the destination was physically published (torn-write model). The
+        // published destination is reconciled before the source is reopened,
+        // and the retry leaves no residue.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Rename(ProviderRetryFault::AfterPhysicalPublication),
+                );
+                assert!(matches!(
+                    rename(&device, 7),
+                    Err(ScenarioError::Io(message)) if message.contains("injected provider rename")
+                ));
+            }
+            assert!(!inbox.join("objects/source").exists());
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes
+            );
+            rename(&device, 7).unwrap();
+            assert_eq!(
+                retained_dir_count(&inbox.join(PROVIDER_RENAME_EVIDENCE_NAMESPACE)),
+                0
+            );
+            assert_eq!(
+                retained_dir_count(&root.0.join("provider-local-journal/records")),
+                0
+            );
+        }
+
+        // (C2) The same fault followed by a conflicting external replacement
+        // of the published destination: the retry fails closed, quarantines
+        // the conflict into diagnostic residue, and never republishes over
+        // foreign bytes.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Rename(ProviderRetryFault::AfterPhysicalPublication),
+                );
+                assert!(rename(&device, 7).is_err());
+            }
+            std::fs::remove_file(inbox.join("objects/destination")).unwrap();
+            std::fs::write(inbox.join("objects/destination"), b"attacker conflict").unwrap();
+            assert!(matches!(
+                rename(&device, 7),
+                Err(ScenarioError::UnsafeProviderEntry(path)) if path == "objects/destination"
+            ));
+            assert!(!inbox.join("objects/destination").exists());
+            assert!(
+                std::fs::read_dir(inbox.join(PROVIDER_REMOVED_NAMESPACE))
+                    .unwrap()
+                    .any(|entry| std::fs::read(entry.unwrap().path()).unwrap()
+                        == b"attacker conflict")
+            );
+        }
+
+        // (D) Retirement private boundaries: crash/power cut at each private
+        // boundary of the placeholder-exchange retirement; the retry
+        // converges without evidence residue.
+        #[cfg(unix)]
+        for boundary in [
+            ProviderJournalBoundary::RetirementPlaceholderDurable,
+            ProviderJournalBoundary::RetirementExchangeDurable,
+            ProviderJournalBoundary::RetirementPlaceholderQuarantined,
+            ProviderJournalBoundary::RetirementPlaceholderPrivateDeleted,
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Rename(ProviderRetryFault::AtJournalBoundary(boundary)),
+                );
+                assert!(
+                    matches!(
+                        rename(&device, 7),
+                        Err(ScenarioError::Io(message)) if message.contains("injected")
+                    ),
+                    "{boundary:?}"
+                );
+            }
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            rename(&device, 7).unwrap();
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes,
+                "{boundary:?}"
+            );
+            assert!(!inbox.join("objects/source").exists(), "{boundary:?}");
+            assert_eq!(
+                retained_dir_count(&inbox.join(PROVIDER_RENAME_EVIDENCE_NAMESPACE)),
+                0,
+                "{boundary:?}"
+            );
+        }
+
+        // (E) Freed-name race at retirement: an external editor or sync
+        // service replaces the source in the retirement window. The foreign
+        // replacement is preserved as rename evidence — never destroyed, never
+        // published — and the exact retry converges while keeping it.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            let raced_source = inbox.join("objects/source");
+            let race_target = raced_source.clone();
+            let _race = install_provider_publication_race_for_test(
+                ProviderPublicationRace::RetirementBeforePrivateMove,
+                Box::new(move || {
+                    std::fs::remove_file(&race_target).unwrap();
+                    std::fs::write(&race_target, b"foreign replacement").unwrap();
+                }),
+            );
+            assert!(matches!(
+                rename(&device, 7),
+                Err(ScenarioError::UnsafeProviderEntry(_))
+            ));
+            drop(_race);
+            assert!(!raced_source.exists());
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes
+            );
+            let evidence = inbox.join(PROVIDER_RENAME_EVIDENCE_NAMESPACE);
+            let retained: Vec<_> = std::fs::read_dir(&evidence)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(std::fs::read(&retained[0]).unwrap(), b"foreign replacement");
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            rename(&device, 7).unwrap();
+            assert_eq!(std::fs::read(&retained[0]).unwrap(), b"foreign replacement");
+            assert_eq!(retained_dir_count(&evidence), 1);
+        }
+
+        // (F) Post-validation source replacement: an external editor swaps
+        // the validated source for attacker bytes right after validation. The
+        // journal blob keeps publication honest, the attacker bytes are never
+        // published and never destroyed, and the operation reports failure.
+        #[cfg(unix)]
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            let original = inbox.join("objects/source");
+            let retained_name = inbox.join("objects/validated-original");
+            let replacement = original.clone();
+            let retained_for_race = retained_name.clone();
+            let _race = install_provider_publication_race_for_test(
+                ProviderPublicationRace::RenameAfterSourceValidation,
+                Box::new(move || {
+                    std::fs::rename(&replacement, &retained_for_race).unwrap();
+                    std::fs::write(&replacement, b"attacker rename bytes").unwrap();
+                }),
+            );
+            assert!(matches!(
+                rename(&device, 7),
+                Err(ScenarioError::UnsafeProviderEntry(path)) if path == "objects/source"
+            ));
+            assert_eq!(std::fs::read(&retained_name).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes
+            );
+            assert_eq!(std::fs::read(&original).unwrap(), b"attacker rename bytes");
+        }
+
+        // (G) Exact-retry binding: after a crash at the Published phase, a
+        // DIFFERENT rename operation (another event id — the shape of a
+        // concurrent honest instance's own work) may not adopt the in-flight
+        // journal record and fails against the occupied destination without
+        // disturbing it; only the exact retry converges.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Rename(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Published),
+                    ));
+                assert!(rename(&device, 7).is_err());
+            }
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            assert!(matches!(
+                rename(&device, 8),
+                Err(ScenarioError::ProviderConflictingBytes(path))
+                    if path == "objects/destination"
+            ));
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes
+            );
+            assert_eq!(std::fs::read(inbox.join("objects/source")).unwrap(), bytes);
+            rename(&device, 7).unwrap();
+            assert_eq!(
+                std::fs::read(inbox.join("objects/destination")).unwrap(),
+                bytes
+            );
+            assert!(!inbox.join("objects/source").exists());
+        }
+    }
+
+    /// Stage 2e-ii item 13: every retry boundary of the retained provider
+    /// remove recovers across a crash, leaves the prescribed visible
+    /// evidence, and never deletes a replacement that took the freed name.
+    /// Replaces the simulator scenarios
+    /// `provider_remove_recovers_from_every_durable_journal_phase` and
+    /// `provider_remove_post_validation_replacement_cannot_delete_attacker_bytes`
+    /// on the retained provider machinery without the simulator.
+    #[test]
+    fn provider_remove_recovers_from_every_retry_boundary_without_deleting_replacements() {
+        let bytes: &[u8] = b"retry boundary remove bytes";
+        let remove = |device: &DeviceRuntime, event_id: u64| {
+            run_provider_remove(device, event_id, ProviderTree::Inbox, "objects/source")
+        };
+        let seeded_device = |root: &std::path::Path| {
+            let device = retained_provider_device(root);
+            std::fs::write(root.join("provider/inbox/objects/source"), bytes).unwrap();
+            device
+        };
+        let removed_evidence_bytes = |inbox: &std::path::Path| {
+            std::fs::read_dir(inbox.join(PROVIDER_REMOVED_NAMESPACE))
+                .unwrap()
+                .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // (A) Durable-phase crashes: crash/power cut immediately after each
+        // durable phase of the remove journal; the exact retry converges, the
+        // source is gone, the retired bytes remain as visible diagnostic
+        // evidence, and the journal is clean.
+        for phase in [
+            ProviderJournalPhase::Prepared,
+            ProviderJournalPhase::RetireIntent,
+            ProviderJournalPhase::Retired,
+            ProviderJournalPhase::Cleanup,
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Remove(ProviderRetryFault::AfterDurablePhase(phase)),
+                );
+                assert!(
+                    matches!(
+                        remove(&device, 7),
+                        Err(ScenarioError::Io(message)) if message.contains("injected")
+                    ),
+                    "{phase:?}"
+                );
+            }
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            remove(&device, 7).unwrap();
+            assert!(!inbox.join("objects/source").exists(), "{phase:?}");
+            assert_eq!(
+                removed_evidence_bytes(&inbox),
+                vec![bytes.to_vec()],
+                "{phase:?}"
+            );
+            let journal = root.0.join("provider-local-journal");
+            assert_eq!(retained_dir_count(&journal.join("records")), 0, "{phase:?}");
+        }
+
+        // (B) Retirement private boundaries: crash/power cut at each private
+        // boundary of the placeholder-exchange retirement; the retry
+        // converges without deleting anything but the authorized source.
+        #[cfg(unix)]
+        for boundary in [
+            ProviderJournalBoundary::RetirementPlaceholderDurable,
+            ProviderJournalBoundary::RetirementExchangeDurable,
+            ProviderJournalBoundary::RetirementPlaceholderQuarantined,
+            ProviderJournalBoundary::RetirementPlaceholderPrivateDeleted,
+        ] {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault = install_provider_retry_boundary_fault_for_test(
+                    ProviderRetryBoundary::Remove(ProviderRetryFault::AtJournalBoundary(boundary)),
+                );
+                assert!(
+                    matches!(
+                        remove(&device, 7),
+                        Err(ScenarioError::Io(message)) if message.contains("injected")
+                    ),
+                    "{boundary:?}"
+                );
+            }
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            remove(&device, 7).unwrap();
+            assert!(!inbox.join("objects/source").exists(), "{boundary:?}");
+            assert_eq!(
+                removed_evidence_bytes(&inbox),
+                vec![bytes.to_vec()],
+                "{boundary:?}"
+            );
+        }
+
+        // (C) Replacement survival at the freed name: after the retirement
+        // became durable but before completion, a sync service delivers a NEW
+        // file at the removed path. The exact retry completes without
+        // deleting the new owner's bytes.
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            {
+                let _fault =
+                    install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Remove(
+                        ProviderRetryFault::AfterDurablePhase(ProviderJournalPhase::Retired),
+                    ));
+                assert!(remove(&device, 7).is_err());
+            }
+            assert!(!inbox.join("objects/source").exists());
+            std::fs::write(inbox.join("objects/source"), b"new owner bytes").unwrap();
+            drop(device);
+            let device = retained_provider_device(&root.0);
+            remove(&device, 7).unwrap();
+            assert_eq!(
+                std::fs::read(inbox.join("objects/source")).unwrap(),
+                b"new owner bytes"
+            );
+            assert_eq!(removed_evidence_bytes(&inbox), vec![bytes.to_vec()]);
+            assert_eq!(
+                retained_dir_count(&root.0.join("provider-local-journal/records")),
+                0
+            );
+        }
+
+        // (D) Post-validation replacement: an external editor swaps the
+        // validated source for attacker bytes right after validation. The
+        // remove fails closed, deletes nothing, and both the attacker bytes
+        // and the original survive.
+        #[cfg(unix)]
+        {
+            let root = ScenarioRoot::new().unwrap();
+            let device = seeded_device(&root.0);
+            let inbox = root.0.join("provider/inbox");
+            let original = inbox.join("objects/source");
+            let retained_name = inbox.join("objects/validated-original");
+            let replacement = original.clone();
+            let retained_for_race = retained_name.clone();
+            let _race = install_provider_publication_race_for_test(
+                ProviderPublicationRace::RemoveAfterSourceValidation,
+                Box::new(move || {
+                    std::fs::rename(&replacement, &retained_for_race).unwrap();
+                    std::fs::write(&replacement, b"attacker remove bytes").unwrap();
+                }),
+            );
+            assert!(matches!(
+                remove(&device, 7),
+                Err(ScenarioError::UnsafeProviderEntry(path)) if path == "objects/source"
+            ));
+            assert_eq!(std::fs::read(&original).unwrap(), b"attacker remove bytes");
+            assert_eq!(std::fs::read(&retained_name).unwrap(), bytes);
+            assert_eq!(
+                retained_dir_count(&inbox.join(PROVIDER_REMOVED_NAMESPACE)),
+                0
+            );
+        }
+    }
+
     #[test]
     fn provider_finish_retries_after_physical_publication_validation_error() {
         let bytes = b"retry after physical publication";
