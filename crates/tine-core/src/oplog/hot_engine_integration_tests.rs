@@ -7403,6 +7403,56 @@ fn conflict_intents_detect_edit_delete_and_move_delete_races() {
 }
 
 #[test]
+fn projection_supersession_distinguishes_a_linear_prefix_from_a_later_concurrent_merge() {
+    let ids = Ids::new();
+    let dir = TestDir::new("projection-supersession-linearity");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "offline edit racing deletion".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(54_500, 545),
+        edited,
+        author(54_600, 546),
+        deleted,
+    );
+    let mut engine = ids.engine();
+    engine.stage_ready(baseline);
+    engine.stage_ready(edited.clone());
+    assert!(
+        !engine
+            .accepted_batch_projection_is_superseded(edited.manifest().batch_id())
+            .unwrap(),
+        "a purely linear accepted prefix must retain strict recorded-render validation"
+    );
+    engine.stage_ready(deleted.clone());
+    assert!(
+        engine
+            .accepted_batch_projection_is_superseded(edited.manifest().batch_id())
+            .unwrap(),
+        "a later concurrent merge must supersede an earlier linear render"
+    );
+    assert!(
+        engine
+            .accepted_batch_projection_is_superseded(deleted.manifest().batch_id())
+            .unwrap(),
+        "the concurrently admitted batch must classify as superseded"
+    );
+}
+
+#[test]
 fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
     let ids = Ids::new();
     let dir = TestDir::new("intents-text-races");
@@ -7462,6 +7512,49 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
         }
         other => panic!("expected KeepBothTexts, found {other:?}"),
     }
+
+    // Once a keep-both resolution rewrites the block to one authored version,
+    // re-deriving for the same pair must stay silent — otherwise every
+    // re-check would author duplicate sibling blocks forever.
+    let min_is_first = first.manifest().batch_id() <= second.manifest().batch_id();
+    let keep = if min_is_first {
+        "first offline text"
+    } else {
+        "second offline text"
+    };
+    let resolution = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: keep.into(),
+    }]);
+    let resolution = {
+        let mut author_engine = ids.engine();
+        author_engine.stage_ready(baseline.clone());
+        author_engine.stage_ready(first.clone());
+        author_engine.stage_ready(second.clone());
+        let prepared = author_engine
+            .prepare_bootstrap_transaction(author(55_500, 555), &resolution)
+            .unwrap();
+        ready(&archive, &prepared)
+    };
+    let mut engine = engine;
+    assert!(!matches!(
+        engine.stage_ready(resolution).disposition,
+        BatchDisposition::Rejected { .. }
+    ));
+    assert_eq!(
+        engine.materialize_page(ids.page_a).unwrap().blocks[0].content,
+        keep
+    );
+    assert!(
+        engine
+            .conflict_resolution_intents(second.manifest().batch_id())
+            .unwrap()
+            .is_empty(),
+        "a resolved keep-both pair must not derive again"
+    );
 
     // Disjoint regions on block C: the CRDT union is faithful, no intent.
     let prefix = tx(vec![SemanticOperation::EditBlockContent {

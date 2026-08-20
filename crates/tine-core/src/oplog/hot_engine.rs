@@ -8759,8 +8759,8 @@ impl ShardedHotEngine {
             let mut ready = None;
             for (batch_id, batch) in &pending {
                 let mut dependencies_ready = true;
-                for dependency in batch.manifest().causal_dependency_heads() {
-                    if !self.accepted_frontier_contains_batch_effects(*dependency)? {
+                for dependency in clean_replay_dependency_heads(batch)? {
+                    if !self.accepted_frontier_contains_batch_effects(dependency)? {
                         dependencies_ready = false;
                         break;
                     }
@@ -8774,8 +8774,8 @@ impl ShardedHotEngine {
                 let mut blocked = Vec::new();
                 for batch in pending.values() {
                     let mut missing = Vec::new();
-                    for dependency in batch.manifest().causal_dependency_heads() {
-                        if !self.accepted_frontier_contains_batch_effects(*dependency)? {
+                    for dependency in clean_replay_dependency_heads(batch)? {
+                        if !self.accepted_frontier_contains_batch_effects(dependency)? {
                             missing.push(dependency.to_string());
                         }
                     }
@@ -18459,10 +18459,16 @@ impl ShardedHotEngine {
             // A concurrently accepted history superseded the head batch's
             // recorded rendering: the head is then only a locator, and the
             // deterministic current rendering — `replay`, computed above from
-            // the live accepted state — is the authority (GH #351). For a
-            // linear head the divergence is a real projection defect and
-            // stays a refusal.
-            if self.accepted_batch_is_causally_linear(work.batch_id())? {
+            // the live accepted state — is the authority (GH #351). That
+            // supersession includes a LINEAR head followed by a later
+            // concurrent merge, which can change this page's rendering from
+            // another document without re-rendering it. Only a linear head
+            // with a purely linear tail holds the recorded bytes to the
+            // current rendering; that divergence is a real projection defect
+            // and stays a refusal.
+            if self.accepted_batch_is_causally_linear(work.batch_id())?
+                && !self.nonlinear_accepted_since(work.batch_id())?
+            {
                 return Err(EngineError::ProjectionManifest(format!(
                     "clean manifest predecessor for {path} is not its deterministic current rendering"
                 )));
@@ -18521,6 +18527,54 @@ impl ShardedHotEngine {
         }))
     }
 
+    /// Authorize a point repair when the graph still contains the exact
+    /// immutable rendering of a clean-manifest head that a later concurrent
+    /// merge superseded.
+    ///
+    /// This is intentionally narrower than external reconciliation: unknown
+    /// bytes, a linear head, a different current owner, and an already-current
+    /// rendering all return no authority. The caller may use the returned page
+    /// only with a guarded projection write from `observed` as its exact base.
+    pub(crate) fn authorize_clean_superseded_projection_repair(
+        &self,
+        path: &ManagedPath,
+        observed: &[u8],
+    ) -> Result<Option<PageId>, EngineError> {
+        let Some(work) = self.clean_projection_heads.get(path) else {
+            return Ok(None);
+        };
+        let ProjectionWorkTarget::Present(_) = work.target() else {
+            return Ok(None);
+        };
+        let (archive, _) = self.clean_projection_runtime_binding()?;
+        let decoded = super::projection::decode_manifested_projection_work(&archive, work)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if decoded.target_bytes() != Some(observed) {
+            return Ok(None);
+        }
+        let superseded = self.accepted_batch_projection_is_superseded(work.batch_id())?;
+        if !superseded {
+            return Ok(None);
+        }
+        let current = self.authorize_projection_write(work.page_id())?;
+        if current.state().page.page_id != work.page_id() || current.state().page.path != *path {
+            return Ok(None);
+        }
+        let replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            current.state(),
+            decoded.annotated_base().map(AnnotatedProjectionBase::bytes),
+            decoded
+                .annotated_base()
+                .map(AnnotatedProjectionBase::annotations),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if replay.target() == observed {
+            return Ok(None);
+        }
+        Ok(Some(work.page_id()))
+    }
+
     fn validate_managed_local_projection_authority(
         &self,
         path: &ManagedPath,
@@ -18577,19 +18631,33 @@ impl ShardedHotEngine {
         let decoded = super::projection::decode_manifested_projection_work(&archive, work)
             .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
         let current = self.authorize_projection_write(prior.intent.page_id())?;
+        // The catalog is shared by every page, so an unrelated page
+        // creation or rename can advance only its dependency after this
+        // page's projection was accepted. That must not invalidate the
+        // page-local predecessor. Every other document dependency remains
+        // exact, claim evidence remains exact below, and the semantic
+        // replay that follows proves that the retained bytes are still the
+        // deterministic rendering of the current page.
+        let frontier_matches = projection_frontiers_match_except_catalog(
+            &current.state().frontier,
+            work.post_frontier(),
+            self.catalog_document_id,
+        );
+        // A predecessor recorded by a concurrently merged (non-linear) batch
+        // carries the foreign author's frontier, while this device's current
+        // page frontier is the merged one — they can never be equal, and
+        // holding the page to that equality would refuse every later local
+        // mutation of a page whose last projection came from a contested
+        // batch (GH #351). A linear head is equally superseded once a later
+        // concurrent merge landed: the merge can advance this page's
+        // dependencies and rendering from another document without ever
+        // re-rendering the page. The receiver-local exact-source proof below
+        // stays fully strict and is what actually binds the captured bytes
+        // to the CURRENT semantic state.
+        let head_superseded = !self.accepted_batch_is_causally_linear(work.batch_id())?
+            || self.nonlinear_accepted_since(work.batch_id())?;
         if current.state().page.path != *path
-            // The catalog is shared by every page, so an unrelated page
-            // creation or rename can advance only its dependency after this
-            // page's projection was accepted. That must not invalidate the
-            // page-local predecessor. Every other document dependency remains
-            // exact, claim evidence remains exact below, and the semantic
-            // replay that follows proves that the retained bytes are still the
-            // deterministic rendering of the current page.
-            || !projection_frontiers_match_except_catalog(
-                &current.state().frontier,
-                work.post_frontier(),
-                self.catalog_document_id,
-            )
+            || (!frontier_matches && !head_superseded)
             || current.state().claim_evidence != prior.intent.claim_evidence()
         {
             return Err(EngineError::ProjectionManifest(
@@ -18616,7 +18684,7 @@ impl ShardedHotEngine {
             // rendering. The captured predecessor is still proven against the
             // CURRENT semantic state by the exact-source binding below, which
             // stays fully strict (GH #351).
-            if self.accepted_batch_is_causally_linear(work.batch_id())? {
+            if !head_superseded {
                 return Err(EngineError::ProjectionManifest(
                     "clean manifest predecessor authority has an invalid source projection".into(),
                 ));
@@ -18626,6 +18694,17 @@ impl ShardedHotEngine {
             && decoded
                 .receiver_local_intent()
                 .matches_replay_except_frontier(&prior.intent)
+        {
+            return Ok(());
+        }
+        // Mirror of the capture side for a superseded head: the recorded
+        // rendering was superseded by a concurrent merge, and the captured
+        // predecessor is the deterministic CURRENT rendering computed by the
+        // same planner. Prove it by recomputation rather than against the
+        // superseded record (GH #351).
+        if head_superseded
+            && source_replay.target() == prior.bytes.as_slice()
+            && source_replay.intent() == &prior.intent
         {
             return Ok(());
         }
@@ -18929,6 +19008,13 @@ impl ShardedHotEngine {
             } else {
                 None
             };
+            // `None` from the clean-manifest proof can mean that the exact
+            // graph bytes need reconciliation, not that the page still belongs
+            // to lazy genesis. Once a manifest head exists it supersedes the
+            // baseline for this path; falling through to genesis would either
+            // misbind a post-activation page or hide a real exact-byte drift.
+            let clean_manifest_head_present =
+                work_index.is_none() && self.clean_projection_heads.contains_key(path);
             let correlated_prior = if external && work_index.is_some() {
                 roles
                     .semantic_predecessor
@@ -19051,7 +19137,8 @@ impl ShardedHotEngine {
                     authority_matches = true;
                     Some(prior)
                 } else if completed.is_empty() {
-                    let lazy_genesis_prior = if bootstrap.is_none() {
+                    let lazy_genesis_prior = if bootstrap.is_none() && !clean_manifest_head_present
+                    {
                         self.lazy_genesis_projection_predecessor(path, requirement.page_id, before)?
                     } else {
                         None
@@ -21755,6 +21842,46 @@ impl ShardedHotEngine {
             .map(|(_, counter)| *counter)
             .sum();
         Ok(causal_past == evidence.acceptance_sequence())
+    }
+
+    /// True when any batch accepted after `work_batch` was causally
+    /// non-linear. A concurrent merge can change a page's deterministic
+    /// rendering without naming (or re-rendering) that page — the owner
+    /// registers it merges live in other documents — so a projection head
+    /// recorded before such a merge may legitimately disagree with the
+    /// current rendering even though the head itself was linear (GH #351).
+    fn nonlinear_accepted_since(&self, work_batch: BatchId) -> Result<bool, EngineError> {
+        let since = self
+            .accepted_batch_evidence(work_batch)?
+            .acceptance_sequence();
+        for accepted in self.status().accepted_batches()? {
+            let batch_id = accepted.batch_id;
+            if batch_id == work_batch {
+                continue;
+            }
+            let evidence = match self.accepted_batch_evidence(batch_id) {
+                Ok(evidence) => evidence,
+                Err(_) => continue,
+            };
+            if evidence.acceptance_sequence() <= since {
+                continue;
+            }
+            if !self.accepted_batch_is_causally_linear(batch_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether later accepted history has superseded state recorded by this
+    /// batch. This includes both a batch admitted against a concurrent prefix
+    /// and a linear batch followed by a later concurrent merge.
+    pub(crate) fn accepted_batch_projection_is_superseded(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<bool, EngineError> {
+        Ok(!self.accepted_batch_is_causally_linear(batch_id)?
+            || self.nonlinear_accepted_since(batch_id)?)
     }
 
     /// Rebuild the run-local terminal projection plan from accepted manifests.
@@ -27567,6 +27694,15 @@ impl ShardedHotEngine {
                 if classification == super::text_merge::TextMergeClassification::CleanUnion {
                     return Ok(());
                 }
+                if merged_state.content == x_after.content
+                    || merged_state.content == z_after.content
+                {
+                    // The visible text is exactly one authored version — never
+                    // an interleave — either because the merge landed on it or
+                    // because a keep-both resolution already rewrote the block.
+                    // Deriving again would author duplicate siblings forever.
+                    return Ok(());
+                }
                 let (keep_text, sibling_text) = if pair.min_batch == x_batch_id {
                     (x_after.content.clone(), z_after.content.clone())
                 } else {
@@ -31199,11 +31335,7 @@ fn explicit_bootstrap_author_documents(
                 );
             }
             SemanticOperation::RestoreSubtree { blocks, .. } => {
-                documents.extend(
-                    blocks
-                        .iter()
-                        .map(|restore| restore.block.home_document_id),
-                );
+                documents.extend(blocks.iter().map(|restore| restore.block.home_document_id));
             }
             SemanticOperation::SetPagePreamble { .. }
             | SemanticOperation::MoveSubtree { .. }
@@ -31827,6 +31959,29 @@ fn declared_batch_heads(frontier: &FrontierV2) -> BTreeSet<BatchId> {
         .iter()
         .flat_map(|document| document.direct_dependency_heads().iter().copied())
         .collect()
+}
+
+/// Every manifest edge that clean replay may need before admitting a batch.
+///
+/// The compact causal-head list retains no-op ancestry that cannot appear in a
+/// document frontier, while the operation and manifested projection frontiers
+/// retain the exact update ancestry later validation reconstructs. Replay must
+/// gate on their union: gating on only the operation frontier can admit an
+/// unrelated edit before a projection post-frontier dependency that validation
+/// must reconstruct (for example, a delete authored after a target page was
+/// created but touching only the source page's semantic documents).
+fn clean_replay_dependency_heads(batch: &ValidatedBatch) -> Result<BTreeSet<BatchId>, EngineError> {
+    let manifest = batch.manifest();
+    let mut heads = declared_batch_heads(manifest.dependency_frontier());
+    heads.extend(manifest.causal_dependency_heads().iter().copied());
+    let projection =
+        super::projection_manifest::validate_projection_object_set(manifest, batch.objects())
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+    for intent in projection.intents() {
+        heads.extend(declared_batch_heads(intent.post_frontier()));
+    }
+    heads.remove(&manifest.batch_id());
+    Ok(heads)
 }
 
 fn validate_maximal_document_heads(

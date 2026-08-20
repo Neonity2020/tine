@@ -1913,7 +1913,24 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
                     ProjectionWorkTarget::Present(plan.intent().target()),
                 )?;
             } else {
-                record_completed_path(receipts, engine, source.page_id(), plan.intent())?;
+                match record_completed_path(receipts, engine, source.page_id(), plan.intent()) {
+                    Ok(()) => {}
+                    Err(ProjectionError::RecoveryIntentMismatch)
+                        if engine.require_index_free_clean_projection_runtime().is_ok()
+                            && engine.accepted_batch_projection_is_superseded(
+                                source.source_batch_id(),
+                            )? =>
+                    {
+                        // The clean runtime has no completed-path index to
+                        // update. A receiver-local completion for a source
+                        // batch superseded by concurrent accepted history is
+                        // durable historical evidence, but must not be held
+                        // to the later merged rendering merely to perform that
+                        // no-op index publication. Linear mismatches still
+                        // refuse above and here.
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
@@ -3065,7 +3082,39 @@ fn record_completed_path_with_authorization(
             plan_projection(engine.workspace_id(), current.state(), base_bytes)?
         };
     if replay.intent() != intent {
-        return Err(ProjectionError::RecoveryIntentMismatch);
+        // The completion may have been captured by the annotation-guided
+        // planner (its predecessor base carried layout annotations), which the
+        // plain replay above cannot reproduce even though the bytes agree.
+        // Accept only when the guided planner reproduces the recorded intent
+        // exactly from the same current state and recorded base — byte or
+        // frontier drift still refuses through the equality below.
+        let guided = plan_projection_with_layout_annotations(
+            engine.workspace_id(),
+            current.state(),
+            base_bytes,
+            Some(intent.annotations()),
+        )?;
+        if guided.intent() != intent {
+            // Span annotations have two deterministic producer conventions:
+            // exact-source adoption shifts the predecessor's spans (each block
+            // keeps its trailing newline), while a fresh plan derives spans
+            // from the parse (newline excluded). A completion captured through
+            // the former cannot be reproduced by the latter even though every
+            // semantic component agrees. In the index-free clean runtime the
+            // publication below is a no-op, so tolerate exactly that drift:
+            // path, page, frontier, claims and target bytes must still match.
+            let annotations_only_drift = engine
+                .require_index_free_clean_projection_runtime()
+                .is_ok()
+                && guided.intent().path() == intent.path()
+                && guided.intent().page_id() == intent.page_id()
+                && guided.intent().frontier() == intent.frontier()
+                && guided.intent().claim_evidence() == intent.claim_evidence()
+                && guided.intent().target() == intent.target();
+            if !annotations_only_drift {
+                return Err(ProjectionError::RecoveryIntentMismatch);
+            }
+        }
     }
 
     record_completed_path_target(

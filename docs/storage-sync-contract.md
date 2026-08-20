@@ -623,11 +623,38 @@ published before the operation manifest. A failed episode publication cannot
 reach the manifest; after the manifest exists, cold replay plus that record
 turns a repeated request into one recovered result rather than a second edit.
 
+Cold tail replay is a causal fixed point, never manifest-directory or random
+`BatchId` order. A batch becomes runnable only after this run has reproduced
+every prerequisite named by the union of its compact causal heads, operation
+dependency frontier, and each manifested projection post-frontier (excluding
+the batch's own post-state head). This union is load-bearing: an operation can
+touch only one semantic region while its projection post-state includes an
+otherwise unrelated page creation, and projection validation reconstructs that
+larger frontier. A merely durable pre-shutdown status or an effect-equivalent
+accepted prefix cannot make an unreplayed manifest ready.
+
 An unrelated accepted batch may advance a page's causal frontier without
-changing its rendered bytes. In that case the latest clean projection manifest
-remains valid predecessor evidence only after the projection planner replays
-the current semantic page and proves equality except for that frontier. Exact
-bytes, path, page identity, claims and layout annotations must still match.
+changing its rendered bytes. A concurrent merge can also change those bytes
+without carrying a new projection row for the page. A clean projection head is
+therefore superseded when either the head batch was admitted against a
+concurrent prefix or a later accepted batch performed a concurrent merge. In
+that case the immutable row remains a locator and historical rendering proof,
+while the projection planner recomputes current bytes from current accepted
+semantics. With a wholly linear head and tail, any byte/frontier/layout mismatch
+remains a refusal.
+
+If conflict-resolution authoring finds the exact graph file still equal to the
+superseded head's immutable target, the actor may perform one guarded point
+projection from those exact bytes to the recomputed current rendering and then
+redraft the resolution. Bytes that do not exactly equal that authenticated old
+target are never repaired by this route; they remain external reconciliation or
+refusal. Once any manifest head exists for a path it also supersedes lazy
+genesis as predecessor authority, so an exact-byte mismatch cannot fall through
+to a baseline capsule (and a post-activation page can never be looked up there).
+The clean runtime has no completed-path index: a receiver-local completion that
+belongs to a superseded source batch remains durable historical receipt evidence
+but is not required to replay as the later merged point authority merely to
+perform a nonexistent index update.
 
 **An applied provider batch always owes a Markdown projection.** The same rule
 holds on the receiving side, and there it is a durability rule rather than a
