@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- The one-time app-data migration at startup no longer trusts a momentarily
+  unreadable `backups/` folder: any read error now means "assume there is user
+  data and leave everything alone", the existing folder is set aside instead of
+  deleted until the migrated data is actually in place, and an interrupted
+  fallback copy can no longer leave a half-populated app-data folder behind.
+
 ### Added
 
 - **Conflicts are now one calm queue you resolve inside the page.** Everything

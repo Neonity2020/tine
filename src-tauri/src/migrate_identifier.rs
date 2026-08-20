@@ -66,13 +66,15 @@ fn looks_like_tine_data(dir: &Path) -> bool {
 /// Counting any of those would wrongly block a backfill for exactly the user we need
 /// to rescue: someone who launched the renamed build, saw Welcome, and quit.
 fn has_real_user_data(dir: &Path) -> bool {
-    dir_has_entries(&dir.join("backups"))
-}
-
-fn dir_has_entries(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false)
+    match std::fs::read_dir(dir.join("backups")) {
+        Ok(mut rd) => rd.next().is_some(),
+        // A missing backups/ is the ordinary "no graph was ever opened under
+        // this identifier" case. Any OTHER error — EACCES, EIO, a stale
+        // mount, ENOTDIR — means we cannot PROVE the directory is disposable,
+        // and the caller's next step is to destroy it wholesale. Fail closed:
+        // claim user data and skip the migration (audit 4, D3).
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -116,20 +118,71 @@ fn migrate_app_data_dir(new_dir: &Path) -> bool {
         // (caches + an empty localStorage) that WebKitGTK pre-created — guaranteed
         // by has_real_user_data() above. Replace it WHOLESALE with the legacy dir so
         // localStorage (the graph path + session), settings and backups all carry
-        // over as one consistent unit. The discarded scaffolding is regenerated.
-        if new_dir.exists() && std::fs::remove_dir_all(new_dir).is_err() {
-            return false;
+        // over as one consistent unit. The scaffolding is renamed ASIDE, not
+        // deleted, until the replacement is actually in place — destruction
+        // before placement turned any later failure into silent loss of
+        // whatever the guard mis-assessed (audit 4, D3).
+        let mut aside: Option<std::path::PathBuf> = None;
+        if new_dir.exists() {
+            let Some(leaf) = new_dir.file_name().map(|leaf| leaf.to_owned()) else {
+                return false;
+            };
+            let mut parked = None;
+            for attempt in 0..8u32 {
+                let candidate =
+                    parent.join(format!("{}.pre-migration.{attempt}", leaf.to_string_lossy()));
+                if candidate.exists() {
+                    continue;
+                }
+                if std::fs::rename(new_dir, &candidate).is_ok() {
+                    parked = Some(candidate);
+                }
+                break;
+            }
+            let Some(parked) = parked else {
+                return false;
+            };
+            aside = Some(parked);
         }
+        let restore_aside = |aside: &Option<std::path::PathBuf>| {
+            if let Some(parked) = aside {
+                let _ = std::fs::rename(parked, new_dir);
+            }
+        };
+        let discard_aside = |aside: &Option<std::path::PathBuf>| {
+            if let Some(parked) = aside {
+                let _ = std::fs::remove_dir_all(parked);
+            }
+        };
         let _ = std::fs::create_dir_all(parent);
         // old & new share a parent => same filesystem => rename is atomic and cheap.
         match std::fs::rename(&old_dir, new_dir) {
-            Ok(()) => return true,
+            Ok(()) => {
+                discard_aside(&aside);
+                return true;
+            }
             Err(_) => {
-                // Defensive fallback (e.g. exotic mounts): copy then best-effort remove.
-                if copy_dir_all(&old_dir, new_dir).is_ok() {
+                // Defensive fallback (e.g. exotic mounts): stage the copy in a
+                // sibling temp dir and move it into place only when complete,
+                // so a partial copy (ENOSPC) can never become the destination
+                // and permanently block the migration.
+                let staging = parent.join(format!(
+                    "{}.migrating",
+                    new_dir
+                        .file_name()
+                        .map(|leaf| leaf.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "tine-app-data".into())
+                ));
+                let _ = std::fs::remove_dir_all(&staging);
+                if copy_dir_all(&old_dir, &staging).is_ok()
+                    && std::fs::rename(&staging, new_dir).is_ok()
+                {
                     let _ = std::fs::remove_dir_all(&old_dir);
+                    discard_aside(&aside);
                     return true;
                 }
+                let _ = std::fs::remove_dir_all(&staging);
+                restore_aside(&aside);
                 return false;
             }
         }
