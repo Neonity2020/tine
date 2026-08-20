@@ -57,7 +57,6 @@ pub(crate) mod scratch_store;
 pub mod semantic;
 #[allow(dead_code)] // mixed live/runtime and proof/test surface
 pub(crate) mod shadow_projection;
-pub mod simulator;
 pub mod sqlite;
 mod sqlite_identity;
 pub mod sqlite_materialization;
@@ -204,15 +203,6 @@ pub use semantic::{
     PagePreambleDelta, PagePreambleState, PageState, PolicyGeneratedAnchorReason, SemanticEffect,
     SemanticError, VisibleMembership, CATALOG_PAGE_STATE_SCHEMA_VERSION,
     MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
-};
-pub use simulator::{
-    CoordinatorAction, CoordinatorDurableBoundary, CoordinatorExpectedState,
-    CoordinatorFailureWitness, CoordinatorFault, CoordinatorHandoffState, CoordinatorObservation,
-    CoordinatorOracle, CoordinatorOracleIdentity, CoordinatorReadGate, CoordinatorRunOutcome,
-    CoordinatorSqliteMutation, DeterministicSimulator, FailureCapsule, FailureIdentity,
-    FrozenCandidateId, InvariantFailureKind, MinimizedScenario, Scenario, ScenarioAction,
-    ScenarioDevice, ScenarioError, SimulatorDeviceState, FAILURE_CAPSULE_SCHEMA_VERSION,
-    SCENARIO_SCHEMA_VERSION,
 };
 pub use sqlite::{
     AcceptedBatchEvent, ApplicationRuntimeRoot, ApplyDisposition, ForensicEvidence,

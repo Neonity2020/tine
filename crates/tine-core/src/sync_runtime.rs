@@ -165,11 +165,10 @@ use crate::oplog::wire::{
 use crate::oplog::wire::{
     inspect_cold_shared_provider_prefix, inspect_shared_provider_descriptor,
     provider_transient_path, ColdSharedProviderPrefix, SharedProviderFrontierHeadV1,
-    SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
-    SharedProviderObservationCursor, SharedProviderPublicationCursor,
-    SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
-    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE,
-    SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE, SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+    SharedProviderObservation, SharedProviderObservationCursor, SharedProviderPublicationCursor,
+    SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES, SHARED_ENROLLMENT_DESCRIPTOR_PATH,
+    SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+    SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
     SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
     SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
 };
@@ -7831,28 +7830,6 @@ fn shared_namespace_digest(workspace_id: WorkspaceId) -> ContentDigest {
     ContentDigest::from_bytes(hasher.finalize().into())
 }
 
-fn publish_manifest_recovery(
-    provider: &mut SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    manifest: &OperationBatch,
-    manifest_bytes: &[u8],
-) -> Result<(), SyncRuntimeRequestError> {
-    let link = SharedProviderManifestRecoveryLinkV1::new(
-        descriptor.workspace_id(),
-        descriptor.lineage_digest(),
-        descriptor
-            .digest()
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
-        manifest.batch_id(),
-        manifest.author_device_id(),
-        ContentDigest::of(manifest_bytes),
-    )
-    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    provider
-        .publish_manifest_recovery(&link, manifest_bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
-}
-
 fn publish_provider_object_exact(
     provider: &mut SharedProviderTransport,
     digest: ContentDigest,
@@ -7869,52 +7846,6 @@ fn publish_provider_object_exact(
     provider
         .publish_object_exact(digest, bytes)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
-}
-
-fn publish_complete_archive(
-    store: &ObjectStore,
-    provider: &mut SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    publisher_device_id: DeviceId,
-) -> Result<Vec<(String, SharedProviderPublicationIntentV1)>, SyncRuntimeRequestError> {
-    let manifests = store
-        .committed_manifests()
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    for manifest in &manifests {
-        for object in manifest.required_objects() {
-            let bytes = store
-                .read_object_bytes(object.content_digest())
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-            publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
-        }
-    }
-    let mut intents = Vec::with_capacity(manifests.len());
-    for manifest in manifests {
-        let manifest_bytes = manifest
-            .encode()
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        publish_manifest_recovery(provider, descriptor, &manifest, &manifest_bytes)?;
-        let intent = SharedProviderPublicationIntentV1::new(
-            descriptor.workspace_id(),
-            descriptor.lineage_digest(),
-            descriptor
-                .digest()
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
-            publisher_device_id,
-            manifest.author_device_id(),
-            manifest.batch_id(),
-            ContentDigest::of(&manifest_bytes),
-        )
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        let path = provider
-            .publish_publication_intent(&intent)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        provider
-            .publish_manifest(manifest.batch_id(), &manifest_bytes)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        intents.push((path, intent));
-    }
-    Ok(intents)
 }
 
 /// Publish the complete clean accepted tail without manufacturing legacy
@@ -8546,65 +8477,6 @@ fn publish_clean_archive_batch(
     publish_clean_manifest_exact(provider, batch_id, &bytes)
 }
 
-fn publish_archive_batch(
-    store: &ObjectStore,
-    provider: &mut SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    publisher_device_id: DeviceId,
-    batch_id: BatchId,
-) -> Result<(String, SharedProviderPublicationIntentV1), SyncRuntimeRequestError> {
-    let manifest = match store
-        .inspect_batch(batch_id)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-    {
-        crate::oplog::BatchInspection::Ready(batch) => batch.manifest().clone(),
-        crate::oplog::BatchInspection::Absent => {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "durable outbound batch {batch_id} is absent"
-            )));
-        }
-        crate::oplog::BatchInspection::Staged { .. } => {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "durable outbound batch {batch_id} is partial"
-            )));
-        }
-    };
-    for object in manifest.required_objects() {
-        let bytes = store
-            .read_object_bytes(object.content_digest())
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
-    }
-    let manifest_bytes = store
-        .read_manifest_bytes(batch_id)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    provider_recovery_publication_cut(descriptor.workspace_id(), "before_recovery")?;
-    publish_manifest_recovery(provider, descriptor, &manifest, &manifest_bytes)?;
-    provider_recovery_publication_cut(
-        descriptor.workspace_id(),
-        "after_recovery_before_canonical",
-    )?;
-    let intent = SharedProviderPublicationIntentV1::new(
-        descriptor.workspace_id(),
-        descriptor.lineage_digest(),
-        descriptor
-            .digest()
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
-        publisher_device_id,
-        manifest.author_device_id(),
-        batch_id,
-        ContentDigest::of(&manifest_bytes),
-    )
-    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    let path = provider
-        .publish_publication_intent(&intent)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    provider
-        .publish_manifest(batch_id, &manifest_bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    Ok((path, intent))
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProviderManifestIngress {
     Ready(OperationBatch),
@@ -8747,185 +8619,6 @@ fn canonical_generated_provider_conflict(path: &str) -> Option<String> {
     }
 }
 
-fn reconcile_generated_provider_conflict(
-    provider: &SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    path: &str,
-) -> Result<bool, SyncRuntimeRequestError> {
-    let Some(canonical) = canonical_generated_provider_conflict(path) else {
-        return Ok(false);
-    };
-    if provider
-        .read_exact(path)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-        .is_none()
-    {
-        // Exact watcher paths report removals as well as creations. An already
-        // absent conflict copy is settled work, not ambiguous evidence.
-        return Ok(true);
-    }
-    let canonical_bytes = provider
-        .read_exact(&canonical)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-        .ok_or_else(|| {
-            SyncRuntimeRequestError::ActorRefused(format!(
-                "provider conflict copy retained because canonical target is absent at {canonical}"
-            ))
-        })?;
-    let canonical_valid = if let Some(digest) = canonical
-        .strip_prefix("objects/")
-        .and_then(|name| name.strip_suffix(".object"))
-    {
-        ContentDigest::of(&canonical_bytes).to_string() == digest
-            && OperationObject::decode(&canonical_bytes).is_ok()
-    } else if let Some(batch_id) = provider_manifest_id(&canonical) {
-        OperationBatch::decode(&canonical_bytes)
-            .map(|manifest| {
-                manifest.batch_id() == batch_id
-                    && manifest.workspace_id() == descriptor.workspace_id()
-                    && manifest.lineage_digest() == descriptor.lineage_digest()
-            })
-            .unwrap_or(false)
-    } else if canonical == SHARED_ENROLLMENT_DESCRIPTOR_PATH {
-        SharedEnrollmentDescriptorV1::decode(&canonical_bytes)
-            .map(|found| found == *descriptor)
-            .unwrap_or(false)
-    } else if provider_frontier_head_path(&canonical) {
-        SharedProviderFrontierHeadV1::decode(&canonical, &canonical_bytes)
-            .map(|head| {
-                head.workspace_id() == descriptor.workspace_id()
-                    && head.lineage_digest() == descriptor.lineage_digest()
-                    && descriptor
-                        .digest()
-                        .is_ok_and(|digest| head.descriptor_digest() == digest)
-            })
-            .unwrap_or(false)
-    } else if provider_publication_intent_path(&canonical) {
-        SharedProviderPublicationIntentV1::decode(&canonical, &canonical_bytes)
-            .map(|intent| {
-                intent.workspace_id() == descriptor.workspace_id()
-                    && intent.lineage_digest() == descriptor.lineage_digest()
-                    && descriptor
-                        .digest()
-                        .is_ok_and(|digest| intent.descriptor_digest() == digest)
-            })
-            .unwrap_or(false)
-    } else if let Some(batch_id) = provider_manifest_recovery_link_id(&canonical) {
-        SharedProviderManifestRecoveryLinkV1::decode(&canonical, &canonical_bytes)
-            .map(|link| {
-                link.batch_id() == batch_id
-                    && link.workspace_id() == descriptor.workspace_id()
-                    && link.lineage_digest() == descriptor.lineage_digest()
-                    && descriptor
-                        .digest()
-                        .is_ok_and(|digest| link.descriptor_digest() == digest)
-            })
-            .unwrap_or(false)
-    } else if let Some(digest) = provider_manifest_recovery_blob_digest(&canonical) {
-        OperationBatch::decode(&canonical_bytes)
-            .map(|manifest| {
-                ContentDigest::of(&canonical_bytes).to_string() == digest
-                    && manifest.workspace_id() == descriptor.workspace_id()
-                    && manifest.lineage_digest() == descriptor.lineage_digest()
-            })
-            .unwrap_or(false)
-    } else {
-        false
-    };
-    if !canonical_valid {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "provider conflict copy retained because canonical target is invalid at {canonical}"
-        )));
-    }
-    provider
-        .remove_identical_generated_conflict(path, &canonical)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    Ok(true)
-}
-
-fn load_provider_manifest_recovery_exact(
-    provider: &SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    batch_id: BatchId,
-) -> Result<Option<(OperationBatch, Vec<u8>)>, SyncRuntimeRequestError> {
-    let link_path = format!("{SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE}/{batch_id}.link");
-    #[cfg(test)]
-    {
-        PROVIDER_TRAVERSAL_INSTRUMENTATION
-            .lock()
-            .unwrap()
-            .entry(descriptor.workspace_id())
-            .or_default()
-            .recovery_links += 1;
-    }
-    let Some(link_bytes) = provider
-        .read_exact(&link_path)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    let link = SharedProviderManifestRecoveryLinkV1::decode(&link_path, &link_bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    if link.batch_id() != batch_id
-        || link.workspace_id() != descriptor.workspace_id()
-        || link.lineage_digest() != descriptor.lineage_digest()
-        || !descriptor
-            .digest()
-            .is_ok_and(|digest| link.descriptor_digest() == digest)
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "provider manifest recovery link is outside the active namespace at {link_path}"
-        )));
-    }
-    let blob_path = link.blob_path();
-    #[cfg(test)]
-    {
-        PROVIDER_TRAVERSAL_INSTRUMENTATION
-            .lock()
-            .unwrap()
-            .entry(descriptor.workspace_id())
-            .or_default()
-            .recovery_blobs += 1;
-    }
-    let manifest_bytes = provider
-        .read_exact(&blob_path)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-        .ok_or_else(|| {
-            SyncRuntimeRequestError::ActorRefused(format!(
-                "provider manifest recovery blob is absent at {blob_path}"
-            ))
-        })?;
-    let manifest = OperationBatch::decode(&manifest_bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    if ContentDigest::of(&manifest_bytes) != link.manifest_digest()
-        || manifest.batch_id() != batch_id
-        || manifest.workspace_id() != descriptor.workspace_id()
-        || manifest.lineage_digest() != descriptor.lineage_digest()
-        || manifest.author_device_id() != link.manifest_author_device_id()
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "provider manifest recovery evidence conflicts for batch {batch_id}"
-        )));
-    }
-    Ok(Some((manifest, manifest_bytes)))
-}
-
-fn recover_provider_manifest_exact(
-    provider: &mut SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    batch_id: BatchId,
-) -> Result<bool, SyncRuntimeRequestError> {
-    let Some((_manifest, manifest_bytes)) =
-        load_provider_manifest_recovery_exact(provider, descriptor, batch_id)?
-    else {
-        return Ok(false);
-    };
-    provider
-        .publish_manifest(batch_id, &manifest_bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    Ok(true)
-}
-
 fn stage_provider_manifest_exact(
     store: &ObjectStore,
     provider: &SharedProviderTransport,
@@ -9019,34 +8712,6 @@ fn provider_manifest_present(
     {
         return Err(SyncRuntimeRequestError::ActorRefused(format!(
             "conflicting provider manifest retained at {path}"
-        )));
-    }
-    Ok(true)
-}
-
-fn provider_manifest_recovery_link_present(
-    provider: &SharedProviderTransport,
-    descriptor: &SharedEnrollmentDescriptorV1,
-    batch_id: BatchId,
-) -> Result<bool, SyncRuntimeRequestError> {
-    let path = format!("{SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE}/{batch_id}.link");
-    let Some(bytes) = provider
-        .read_exact(&path)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-    else {
-        return Ok(false);
-    };
-    let link = SharedProviderManifestRecoveryLinkV1::decode(&path, &bytes)
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    if link.batch_id() != batch_id
-        || link.workspace_id() != descriptor.workspace_id()
-        || link.lineage_digest() != descriptor.lineage_digest()
-        || !descriptor
-            .digest()
-            .is_ok_and(|digest| link.descriptor_digest() == digest)
-    {
-        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-            "provider manifest recovery link conflicts at {path}"
         )));
     }
     Ok(true)
@@ -11470,10 +11135,6 @@ struct RuntimeActor {
     provider_head_dirty: bool,
     provider_current_head: Option<String>,
     provider_head_retirement: VecDeque<String>,
-    provider_intents: BTreeMap<String, SharedProviderPublicationIntentV1>,
-    provider_intent_retirement: VecDeque<String>,
-    provider_intent_retirement_scan_active: bool,
-    provider_intent_retirement_scan_after: Option<String>,
     provider_pending: ProviderDependencyIndex,
     provider_dependency_recheck_frontier: Option<ContentDigest>,
     provider_continuation: Option<ProviderArchiveContinuation>,
@@ -12813,10 +12474,6 @@ impl RuntimeActor {
             provider_head_dirty: false,
             provider_current_head: None,
             provider_head_retirement: VecDeque::new(),
-            provider_intents: BTreeMap::new(),
-            provider_intent_retirement: VecDeque::new(),
-            provider_intent_retirement_scan_active: false,
-            provider_intent_retirement_scan_after: None,
             provider_pending: ProviderDependencyIndex::default(),
             provider_dependency_recheck_frontier: None,
             provider_continuation: None,
@@ -19648,8 +19305,6 @@ impl RuntimeActor {
             || self.provider_recovery_backfill_cursor.is_some()
             || self.provider_head_dirty
             || !self.provider_head_retirement.is_empty()
-            || !self.provider_intent_retirement.is_empty()
-            || self.provider_intent_retirement_scan_active
             || !self.pending_conflict_resolutions.is_empty();
         has_work
     }
@@ -20408,202 +20063,6 @@ impl RuntimeActor {
         Ok(())
     }
 
-    fn prove_provider_accepted_manifest_exact(
-        &mut self,
-        store: &ObjectStore,
-        descriptor: &SharedEnrollmentDescriptorV1,
-        batch_id: BatchId,
-        expected_fingerprint: ContentDigest,
-    ) -> Result<bool, SyncRuntimeRequestError> {
-        let local_manifest = match store
-            .inspect_batch(batch_id)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-        {
-            crate::oplog::BatchInspection::Ready(batch) => {
-                let bytes = store
-                    .read_manifest_bytes(batch_id)
-                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-                if ContentDigest::of(&bytes) != expected_fingerprint {
-                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                        "accepted local manifest fingerprint changed for {batch_id}"
-                    )));
-                }
-                Some((batch.manifest().clone(), bytes))
-            }
-            crate::oplog::BatchInspection::Absent
-            | crate::oplog::BatchInspection::Staged { .. } => None,
-        };
-        let provider_manifest = load_provider_manifest_with_fingerprint(
-            self.provider
-                .as_ref()
-                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-            descriptor,
-            batch_id,
-            expected_fingerprint,
-        )?;
-        let provider_manifest_present = provider_manifest.is_some();
-        let recovered_manifest = if provider_manifest_present || local_manifest.is_some() {
-            None
-        } else {
-            load_provider_manifest_recovery_exact(
-                self.provider
-                    .as_ref()
-                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                descriptor,
-                batch_id,
-            )?
-        };
-        let Some((manifest, manifest_bytes)) = provider_manifest
-            .or_else(|| local_manifest.clone())
-            .or(recovered_manifest)
-        else {
-            self.provider_accepted_archive_loss.insert(batch_id);
-            return Ok(false);
-        };
-        if ContentDigest::of(&manifest_bytes) != expected_fingerprint {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "accepted provider recovery fingerprint changed for {batch_id}"
-            )));
-        }
-
-        for object in manifest.required_objects() {
-            let digest = object.content_digest();
-            let path = format!("objects/{digest}.object");
-            match self
-                .provider
-                .as_ref()
-                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                .read_exact(&path)
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-            {
-                Some(bytes) if ContentDigest::of(&bytes) == digest => {}
-                Some(_) => {
-                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                        "accepted provider object conflicts at {path}"
-                    )));
-                }
-                None => {
-                    if !store
-                        .contains_object(digest)
-                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-                    {
-                        self.provider_accepted_archive_loss.insert(batch_id);
-                        return Ok(false);
-                    }
-                    let local_object = store.read_object_bytes(digest).map_err(|error| {
-                        SyncRuntimeRequestError::ActorRefused(error.to_string())
-                    })?;
-                    if ContentDigest::of(&local_object) != digest {
-                        return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                            "accepted local object fingerprint changed for {batch_id} at {path}"
-                        )));
-                    }
-                    provider_accepted_audit_cut(
-                        descriptor.workspace_id(),
-                        batch_id,
-                        "repair_publication",
-                    )?;
-                    publish_provider_object_exact(
-                        self.provider
-                            .as_mut()
-                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                        digest,
-                        &local_object,
-                    )?;
-                    self.provider_head_dirty = true;
-                }
-            }
-        }
-
-        if !provider_manifest_present {
-            provider_accepted_audit_cut(descriptor.workspace_id(), batch_id, "repair_publication")?;
-            publish_manifest_recovery(
-                self.provider
-                    .as_mut()
-                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                descriptor,
-                &manifest,
-                &manifest_bytes,
-            )?;
-            self.provider
-                .as_mut()
-                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                .publish_manifest(batch_id, &manifest_bytes)
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-            self.provider_head_dirty = true;
-        }
-
-        if local_manifest.is_none() {
-            let path = format!("manifests/{batch_id}.manifest");
-            let (ingress, object_arrived) = stage_provider_manifest_exact(
-                store,
-                self.provider
-                    .as_ref()
-                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                descriptor,
-                &path,
-            )?;
-            if object_arrived {
-                self.schedule_provider_incomplete_recheck_after_object_arrival();
-            }
-            match ingress {
-                ProviderManifestIngress::Ready(_) => {
-                    self.provider_incomplete.remove(&batch_id);
-                }
-                ProviderManifestIngress::Incomplete(_) | ProviderManifestIngress::Absent(_) => {
-                    self.provider_accepted_archive_loss.insert(batch_id);
-                    return Ok(false);
-                }
-            }
-        }
-        self.provider_accepted_archive_loss.remove(&batch_id);
-        Ok(true)
-    }
-
-    fn validate_provider_manifest_intents(
-        &self,
-        descriptor: &SharedEnrollmentDescriptorV1,
-        batch_id: BatchId,
-    ) -> Result<(), SyncRuntimeRequestError> {
-        let intents = self
-            .provider_intents
-            .values()
-            .filter(|intent| intent.batch_id() == batch_id)
-            .collect::<Vec<_>>();
-        if intents.is_empty() {
-            return Ok(());
-        }
-        let path = format!("manifests/{batch_id}.manifest");
-        let Some(bytes) = self
-            .provider
-            .as_ref()
-            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-            .read_exact(&path)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-        else {
-            // The intent is the retryable discovery record for this crash
-            // cut. Manifest absence is handled by the ordinary exact-path
-            // repair/incomplete state below and must not terminally poison the
-            // scan that will later observe the repaired manifest.
-            return Ok(());
-        };
-        let manifest = OperationBatch::decode(&bytes)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        if manifest.batch_id() != batch_id
-            || manifest.workspace_id() != descriptor.workspace_id()
-            || manifest.lineage_digest() != descriptor.lineage_digest()
-            || intents.iter().any(|intent| {
-                intent.manifest_author_device_id() != manifest.author_device_id()
-                    || intent.manifest_digest() != ContentDigest::of(&bytes)
-            })
-        {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "provider manifest conflicts with immutable publication intent {batch_id}"
-            )));
-        }
-        Ok(())
-    }
-
     fn submit_local_mutation(
         &mut self,
         transaction: OperationTransaction,
@@ -21206,10 +20665,7 @@ impl RuntimeActor {
                 + usize::from(self.provider_rescan_requested)
                 + usize::from(self.provider_full_scan_requested)
                 + usize::from(self.provider_head_dirty)
-                + self.provider_head_retirement.len()
-                + self.provider_intent_retirement.len()
-                + usize::from(self.provider_intent_retirement_scan_active)
-                + self.provider_intents.len(),
+                + self.provider_head_retirement.len(),
             // The scheduling half of the inventory above: exactly the predicate
             // `tick`/`tick_clean_runtime` consult before routing into the
             // provider lane. Keeping these two in one place is what lets the
@@ -26611,7 +26067,12 @@ mod tests {
 
     fn clear_provider_namespace(fixture: &ActivationFixture, namespace: &str) {
         let directory = fixture.request.provider_root.join("outbox").join(namespace);
-        for entry in fs::read_dir(directory).unwrap() {
+        // Retired namespaces are no longer part of the provider skeleton;
+        // absent already means clear.
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries {
             let entry = entry.unwrap();
             assert!(entry.file_type().unwrap().is_file());
             fs::remove_file(entry.path()).unwrap();
@@ -26770,27 +26231,24 @@ mod tests {
         })
     }
 
+    /// The publication-intent record kind is retired (0.7 blank slate): the
+    /// clean actor writes nothing under the retired namespace and the
+    /// provider skeleton no longer creates it. Counting entries (zero when
+    /// the directory is absent) keeps the architectural pin without the
+    /// deleted record decoder.
     fn provider_intent_count_for(
         fixture: &ActivationFixture,
-        publisher_device_id: DeviceId,
+        _publisher_device_id: DeviceId,
     ) -> usize {
         let intents = fixture
             .request
             .provider_root
             .join("outbox")
             .join(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE);
-        fs::read_dir(intents)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                let path = format!(
-                    "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{}",
-                    entry.file_name().to_string_lossy()
-                );
-                SharedProviderPublicationIntentV1::decode(&path, &fs::read(entry.path()).unwrap())
-                    .is_ok_and(|intent| intent.publisher_device_id() == publisher_device_id)
-            })
-            .count()
+        match fs::read_dir(intents) {
+            Ok(entries) => entries.count(),
+            Err(_) => 0,
+        }
     }
 
     /// Clean-generation stand-in for the pre-0.7 `RuntimeHostFixture` that the
@@ -30974,9 +30432,12 @@ mod tests {
         ]
         .into_iter()
         .map(|namespace| {
-            fs::read_dir(fixture.request.provider_root.join("outbox").join(namespace))
-                .unwrap()
-                .count()
+            match fs::read_dir(fixture.request.provider_root.join("outbox").join(namespace)) {
+                Ok(entries) => entries.count(),
+                // Retired namespaces are no longer part of the provider
+                // skeleton; absent means zero entries.
+                Err(_) => 0,
+            }
         })
         .sum()
     }
@@ -34137,113 +33598,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_recovery_conflicts_and_corruption_block_without_false_authority() {
-        let fixture = make_shared_fixture("provider-recovery-conflict", 0xbb42);
-        let _descriptor = activate_and_prepare_shared(&fixture);
-        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
-        settle_shared_provider(&handle);
-        let batch_id = submit_shared_page(
-            &handle,
-            0xbb44,
-            "Recovery Conflict",
-            "notes/recovery-conflict.md",
-            "immutable recovery evidence",
-        )
-        .0;
-        publish_shared_batch(&handle, &fixture, batch_id);
-        settle_shared_provider(&handle);
-        let (link, blob, link_relative, blob_relative) =
-            provider_manifest_recovery_paths(&fixture, batch_id);
-
-        let link_name = link.file_name().unwrap().to_string_lossy();
-        let (link_stem, link_extension) = link_name.rsplit_once('.').unwrap();
-        let duplicate_name =
-            format!("{link_stem}.sync-conflict-20260729-120000-ABCDEFG.{link_extension}");
-        let duplicate = link.parent().unwrap().join(&duplicate_name);
-        fs::copy(&link, &duplicate).unwrap();
-        handle
-            .observe_provider_paths(
-                vec![format!(
-                    "{SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE}/{duplicate_name}"
-                )],
-                false,
-            )
-            .unwrap();
-        settle_shared_provider(&handle);
-        assert!(
-            !duplicate.exists(),
-            "byte-identical recovery-link conflict was not retired"
-        );
-
-        let blob_name = blob.file_name().unwrap().to_string_lossy();
-        let (blob_stem, blob_extension) = blob_name.rsplit_once('.').unwrap();
-        let conflict_name =
-            format!("{blob_stem}.sync-conflict-20260729-120001-HIJKLMN.{blob_extension}");
-        let conflict = blob.parent().unwrap().join(&conflict_name);
-        fs::write(&conflict, b"differing recovery mirror").unwrap();
-        let conflict_relative =
-            format!("{SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE}/{conflict_name}");
-        handle
-            .observe_provider_paths(vec![conflict_relative.clone()], false)
-            .unwrap();
-        assert!(matches!(
-            handle.tick().unwrap(),
-            SyncRuntimeTick::RecoveryBlocked(_)
-        ));
-        assert_eq!(fs::read(&conflict).unwrap(), b"differing recovery mirror");
-        fs::remove_file(&conflict).unwrap();
-        handle
-            .observe_provider_paths(vec![conflict_relative], false)
-            .unwrap();
-        settle_shared_provider(&handle);
-
-        let canonical = fixture
-            .request
-            .provider_root
-            .join(format!("outbox/manifests/{batch_id}.manifest"));
-        let manifest_bytes = fs::read(&canonical).unwrap();
-        fs::remove_file(&canonical).unwrap();
-        fs::remove_file(&blob).unwrap();
-        handle
-            .observe_provider_paths(vec![link_relative.clone()], false)
-            .unwrap();
-        assert!(matches!(
-            handle.tick().unwrap(),
-            SyncRuntimeTick::RecoveryBlocked(_)
-        ));
-        assert!(
-            handle.clean_shutdown().is_err(),
-            "loss of canonical and recovery bytes authorized Safe"
-        );
-        fs::write(&blob, &manifest_bytes).unwrap();
-        fs::write(&canonical, &manifest_bytes).unwrap();
-        handle
-            .observe_provider_paths(
-                vec![
-                    blob_relative.clone(),
-                    format!("manifests/{batch_id}.manifest"),
-                ],
-                false,
-            )
-            .unwrap();
-        settle_shared_provider(&handle);
-
-        fs::write(&blob, b"{").unwrap();
-        handle
-            .observe_provider_paths(vec![blob_relative], false)
-            .unwrap();
-        assert!(matches!(
-            handle.tick().unwrap(),
-            SyncRuntimeTick::RecoveryBlocked(_)
-        ));
-        assert!(
-            handle.clean_shutdown().is_err(),
-            "corrupt canonical recovery evidence authorized Safe"
-        );
-        assert!(link.is_file());
-    }
-
-    #[test]
     fn reordered_remote_acceptance_cannot_reuse_stale_recovery_coverage() {
         let (author, receiver, author_handle, receiver_handle) =
             joined_shared_pair("provider-reordered-recovery-coverage", 0xbd00);
@@ -34710,9 +34064,10 @@ mod tests {
         ]
         .into_iter()
         .map(|namespace| {
-            fs::read_dir(joiner.request.provider_root.join("outbox").join(namespace))
-                .unwrap()
-                .count()
+            match fs::read_dir(joiner.request.provider_root.join("outbox").join(namespace)) {
+                Ok(entries) => entries.count(),
+                Err(_) => 0,
+            }
         })
         .sum::<usize>();
         assert!(provider_entries_per_cut > 4_096);
@@ -35223,411 +34578,6 @@ mod tests {
         );
         assert!(matches!(
             receiver_startup.clean_shutdown(),
-            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
-        ));
-    }
-
-    #[test]
-    fn normal_startup_chunks_every_foreign_intent_before_head_publication_and_safe() {
-        const TEST_HEAD_SCAN_LIMIT: usize = 4;
-        const STRANDED_BATCHES: usize = TEST_HEAD_SCAN_LIMIT + 2;
-
-        let (author, receiver, author_handle, receiver_handle) =
-            joined_shared_pair("provider-chunked-stranded-intents", 0xeb00);
-        assert!(matches!(
-            receiver_handle.clean_shutdown(),
-            Ok(SyncShutdownOutcome::Safe(_))
-        ));
-        drop(receiver_handle);
-
-        let author_heads = author
-            .request
-            .provider_root
-            .join("outbox")
-            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
-        let older_heads = fs::read_dir(&author_heads)
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (entry.file_name(), fs::read(entry.path()).unwrap())
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert!(!older_heads.is_empty());
-
-        let mut stranded = Vec::with_capacity(STRANDED_BATCHES);
-        for index in 0..STRANDED_BATCHES {
-            let path = format!("notes/chunked-stranded-intent-{index}.md");
-            let (batch_id, ..) = submit_shared_page(
-                &author_handle,
-                0xeb20 + (index as u128) * 4,
-                &format!("Chunked Stranded Intent {index}"),
-                &path,
-                "published without a newer frontier head",
-            );
-            publish_shared_batch(&author_handle, &author, batch_id);
-            stranded.push((batch_id, path));
-        }
-        let heads_at_crash = fs::read_dir(&author_heads)
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (entry.file_name(), fs::read(entry.path()).unwrap())
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            heads_at_crash, older_heads,
-            "the fixture must retain only the older valid frontier head"
-        );
-        drop(author_handle);
-
-        copy_provider_tree(
-            &author.request.provider_root,
-            &receiver.request.provider_root,
-        );
-        let intent_root = receiver
-            .request
-            .provider_root
-            .join("outbox")
-            .join(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE);
-        let intent_entries = fs::read_dir(&intent_root)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect::<Vec<_>>();
-        assert_eq!(intent_entries.len(), STRANDED_BATCHES);
-        for entry in intent_entries {
-            let relative = format!(
-                "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{}",
-                entry.file_name().to_string_lossy()
-            );
-            let intent = SharedProviderPublicationIntentV1::decode(
-                &relative,
-                &fs::read(entry.path()).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                intent.publisher_device_id(),
-                author.request.identities.device_id
-            );
-            let manifest_path = receiver
-                .request
-                .provider_root
-                .join(format!("outbox/manifests/{}.manifest", intent.batch_id()));
-            let manifest_bytes = fs::read(&manifest_path).unwrap();
-            assert_eq!(ContentDigest::of(&manifest_bytes), intent.manifest_digest());
-            let manifest = OperationBatch::decode(&manifest_bytes).unwrap();
-            assert_eq!(manifest.batch_id(), intent.batch_id());
-            for object in manifest.required_objects() {
-                assert!(
-                    receiver
-                        .request
-                        .provider_root
-                        .join(format!("outbox/objects/{}.object", object.content_digest()))
-                        .is_file(),
-                    "intent {} lacks a matching immutable object",
-                    intent.batch_id()
-                );
-            }
-        }
-
-        let receiver_heads = receiver
-            .request
-            .provider_root
-            .join("outbox")
-            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
-        let heads_before_startup = fs::read_dir(&receiver_heads)
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (entry.file_name(), fs::read(entry.path()).unwrap())
-            })
-            .collect::<BTreeMap<_, _>>();
-        PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES.lock().unwrap().insert(
-            receiver.request.identities.workspace_id,
-            TEST_HEAD_SCAN_LIMIT,
-        );
-        reset_provider_traversal_instrumentation(receiver.request.identities.workspace_id);
-        let receiver_startup =
-            active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
-
-        for _ in 0..64 {
-            let tick = receiver_startup.tick().unwrap();
-            assert!(
-                !matches!(
-                    tick,
-                    SyncRuntimeTick::RecoveryBlocked(_)
-                        | SyncRuntimeTick::Blocked(_)
-                        | SyncRuntimeTick::Terminal(_)
-                        | SyncRuntimeTick::Failed(_)
-                ),
-                "chunked normal-startup discovery failed: {tick:?}"
-            );
-            if provider_traversal_instrumentation(receiver.request.identities.workspace_id)
-                .head_scan_chunk_boundaries
-                == 1
-            {
-                break;
-            }
-        }
-
-        let first_boundary =
-            provider_traversal_instrumentation(receiver.request.identities.workspace_id);
-        assert_eq!(
-            first_boundary.head_scan_chunk_boundaries, 1,
-            "normal startup did not reach the isolated chunk boundary: {first_boundary:?}"
-        );
-        assert_eq!(
-            first_boundary.head_scan_completions, 0,
-            "a chunk boundary was mistaken for discovery EOF: {first_boundary:?}"
-        );
-        assert_eq!(
-            first_boundary.full_scan_entries, 0,
-            "a valid multi-chunk head+intent scan triggered a broad fallback"
-        );
-        let heads_at_first_boundary = fs::read_dir(&receiver_heads)
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (entry.file_name(), fs::read(entry.path()).unwrap())
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            heads_at_first_boundary, heads_before_startup,
-            "head publication outran incomplete multi-chunk discovery"
-        );
-        assert!(
-            matches!(
-                activation_fixture_handoff(&receiver),
-                EnrollmentDiscoveryHandoff::Unsafe { .. }
-            ),
-            "the first chunk boundary falsely published Safe"
-        );
-
-        settle_shared_provider(&receiver_startup);
-        PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES
-            .lock()
-            .unwrap()
-            .remove(&receiver.request.identities.workspace_id);
-        let completed =
-            provider_traversal_instrumentation(receiver.request.identities.workspace_id);
-        assert_eq!(
-            completed.intent_entries, STRANDED_BATCHES,
-            "one or more foreign intents were skipped across chunk boundaries: {completed:?}"
-        );
-        assert!(
-            completed.head_scan_chunk_boundaries >= 2 && completed.head_scan_completions >= 1,
-            "discovery did not resume through every chunk to actual EOF: {completed:?}"
-        );
-        assert_eq!(
-            completed.full_scan_entries, 0,
-            "valid multi-chunk discovery triggered a broad manifest/object scan"
-        );
-        for (batch_id, path) in &stranded {
-            assert!(
-                receiver.graph_root.join(path).is_file(),
-                "observed intent batch {batch_id} did not converge"
-            );
-        }
-        assert_eq!(receiver_startup.status().unwrap().provider_pending, 0);
-        assert_eq!(
-            fs::read_dir(&intent_root).unwrap().count(),
-            0,
-            "covering head publication did not retire every foreign intent"
-        );
-        let last_batch = stranded.last().unwrap().0;
-        assert!(
-            fs::read_dir(&receiver_heads).unwrap().any(|entry| {
-                let entry = entry.unwrap();
-                let path = format!(
-                    "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
-                    entry.file_name().to_string_lossy()
-                );
-                SharedProviderFrontierHeadV1::decode(&path, &fs::read(entry.path()).unwrap())
-                    .is_ok_and(|head| {
-                        head.author_device_id() == receiver.request.identities.device_id
-                            && head.frontier_tips().contains(&last_batch)
-                    })
-            }),
-            "receiver did not publish an authenticated head covering the final foreign batch"
-        );
-        assert!(matches!(
-            receiver_startup.clean_shutdown(),
-            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
-        ));
-        assert_eq!(
-            activation_fixture_handoff(&receiver),
-            EnrollmentDiscoveryHandoff::Safe
-        );
-    }
-
-    #[test]
-    fn peer_retired_publication_intent_settles_and_later_delivery_reaches_safe() {
-        let (author, peer, author_handle, peer_handle) =
-            joined_shared_pair("provider-peer-retired-intent", 0xed00);
-        let (first_batch, ..) = submit_shared_page(
-            &author_handle,
-            0xed20,
-            "Peer Retired Intent",
-            "notes/peer-retired-intent.md",
-            "published before the author's covering head",
-        );
-        publish_shared_batch(&author_handle, &author, first_batch);
-
-        let author_intents = author
-            .request
-            .provider_root
-            .join("outbox")
-            .join(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE);
-        let intent_entry = fs::read_dir(&author_intents)
-            .unwrap()
-            .map(Result::unwrap)
-            .next()
-            .expect("author publication intent");
-        assert_eq!(
-            fs::read_dir(&author_intents).unwrap().count(),
-            1,
-            "fixture must retain exactly the newly published intent"
-        );
-        let intent_relative = format!(
-            "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{}",
-            intent_entry.file_name().to_string_lossy()
-        );
-
-        copy_provider_tree(&author.request.provider_root, &peer.request.provider_root);
-        peer_handle
-            .observe_provider_paths(
-                vec![
-                    intent_relative.clone(),
-                    format!("manifests/{first_batch}.manifest"),
-                ],
-                false,
-            )
-            .unwrap();
-        settle_shared_provider(&peer_handle);
-        assert!(
-            !peer
-                .request
-                .provider_root
-                .join("outbox")
-                .join(&intent_relative)
-                .exists(),
-            "peer did not retire the foreign intent after publishing a covering head"
-        );
-
-        replicate_provider_file_event(
-            &peer.request.provider_root,
-            &author.request.provider_root,
-            Path::new("outbox").join(&intent_relative).as_path(),
-        );
-        assert!(
-            !author
-                .request
-                .provider_root
-                .join("outbox")
-                .join(&intent_relative)
-                .exists(),
-            "provider deletion did not replicate back to the author"
-        );
-
-        let (later_batch, ..) = submit_shared_page(
-            &peer_handle,
-            0xed40,
-            "Later Peer Delivery",
-            "notes/later-peer-delivery.md",
-            "must not starve behind converged retirement",
-        );
-        publish_shared_batch(&peer_handle, &peer, later_batch);
-        settle_shared_provider(&peer_handle);
-        copy_provider_tree(&peer.request.provider_root, &author.request.provider_root);
-        author_handle
-            .observe_provider_paths(vec![format!("manifests/{later_batch}.manifest")], false)
-            .unwrap();
-
-        let mut blocked_ticks = 0;
-        for _ in 0..512 {
-            let tick = author_handle.tick().unwrap();
-            if matches!(tick, SyncRuntimeTick::RecoveryBlocked(_)) {
-                blocked_ticks += 1;
-            }
-            if matches!(tick, SyncRuntimeTick::Idle)
-                && author_handle.status().unwrap().provider_pending == 0
-            {
-                break;
-            }
-        }
-        assert_eq!(
-            blocked_ticks, 0,
-            "an already-absent retirement target permanently blocked provider progress"
-        );
-        assert!(
-            author
-                .graph_root
-                .join("notes/later-peer-delivery.md")
-                .is_file(),
-            "later peer delivery starved behind the settled retirement"
-        );
-
-        let descriptor_bytes = fs::read(
-            author
-                .request
-                .provider_root
-                .join("outbox")
-                .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH),
-        )
-        .unwrap();
-        let descriptor = SharedEnrollmentDescriptorV1::decode(&descriptor_bytes).unwrap();
-        let manifest_bytes = fs::read(
-            author
-                .request
-                .provider_root
-                .join(format!("outbox/manifests/{later_batch}.manifest")),
-        )
-        .unwrap();
-        let manifest = OperationBatch::decode(&manifest_bytes).unwrap();
-        let replayed_intent = SharedProviderPublicationIntentV1::new(
-            descriptor.workspace_id(),
-            descriptor.lineage_digest(),
-            descriptor.digest().unwrap(),
-            peer.request.identities.device_id,
-            manifest.author_device_id(),
-            later_batch,
-            ContentDigest::of(&manifest_bytes),
-        )
-        .unwrap();
-        let replayed_intent_path = replayed_intent.path().unwrap();
-        fs::write(
-            author
-                .request
-                .provider_root
-                .join("outbox")
-                .join(&replayed_intent_path),
-            replayed_intent.encode().unwrap(),
-        )
-        .unwrap();
-        author_handle
-            .observe_provider_paths(vec![replayed_intent_path.clone()], false)
-            .unwrap();
-        assert!(matches!(
-            author_handle.tick().unwrap(),
-            SyncRuntimeTick::Recovering
-        ));
-        fs::remove_file(
-            author
-                .request
-                .provider_root
-                .join("outbox")
-                .join(&replayed_intent_path),
-        )
-        .unwrap();
-        assert!(
-            !matches!(
-                author_handle.tick().unwrap(),
-                SyncRuntimeTick::RecoveryBlocked(_)
-            ),
-            "queued replayed-intent retirement did not settle after provider deletion"
-        );
-        settle_shared_provider(&author_handle);
-        assert!(matches!(
-            author_handle.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
         ));
     }
@@ -38566,33 +37516,27 @@ mod tests {
         }
     }
 
-    /// Stage 2e-ii canonical-record matrix at the clean public handle.
+    /// Stage 2e-ii canonical-record coverage at the clean public handle.
     ///
-    /// Frontier-head, publication-intent, and manifest-recovery records are
-    /// authored with the production encoders — and, for the record kinds the
-    /// clean actor no longer emits, published through the retained provider
-    /// transport — on the second device of a joined pair. On the receiver, a
-    /// relabel (same bytes, wrong canonical name) and a substitution (wrong
-    /// bytes, canonical name) must each fail closed with no false authority
-    /// and no mutation of retained graph bytes, across one reopen. Frontier
-    /// heads, the record kind the clean ingress accepts, must then recover
-    /// idempotently from the exact bytes at the canonical name under
-    /// duplicate delivery. The clean evidence classifier refuses the
-    /// publication-intent and manifest-recovery namespaces wholesale
-    /// ("unknown clean provider evidence retained"), so the exact-recovery
-    /// half for those kinds lives in the retained transport-level sentinels
-    /// (`shared_provider_publication_intent_is_canonical_content_addressed_and_bound`,
-    /// `shared_provider_manifest_recovery_is_exact_immutable_and_idempotent`
-    /// in `oplog::wire`); here the batch itself still converges after the
-    /// attacked namespace is cleaned, the clean actor emits no records of the
-    /// retired kinds, and the runtime ends Safe.
+    /// Frontier heads — the one canonical record kind the clean ingress
+    /// accepts — are authored by the production actor on the second device of
+    /// a joined pair. On the receiver, a relabel (same bytes, wrong canonical
+    /// name) and a substitution (wrong bytes, canonical name) must each fail
+    /// closed with no false authority and no mutation of retained graph
+    /// bytes, across one reopen; the exact bytes at the canonical name must
+    /// then recover idempotently under duplicate delivery. The
+    /// publication-intent and manifest-recovery record kinds are retired
+    /// entirely (0.7 blank-slate ruling, 2026-08-20): their encoders,
+    /// transport publishers, and namespace write side no longer exist, and
+    /// this test pins the architectural fact that the clean actor leaves the
+    /// retired namespaces absent or empty. Attack coverage for unknown
+    /// namespaces is carried by
+    /// `provider_topology_attacks_fail_closed_without_following_or_mutating_targets`.
     #[test]
     fn clean_provider_records_are_canonical_bound_and_idempotent() {
         #[derive(Clone, Copy, Debug)]
         enum RecordKind {
             FrontierHead,
-            PublicationIntent,
-            ManifestRecovery,
         }
 
         fn forged_zero_digest_name(relative: &str) -> String {
@@ -38601,14 +37545,7 @@ mod tests {
             format!("{prefix}-{}.{extension}", "0".repeat(64))
         }
 
-        for (index, kind) in [
-            RecordKind::FrontierHead,
-            RecordKind::PublicationIntent,
-            RecordKind::ManifestRecovery,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (index, kind) in [RecordKind::FrontierHead].into_iter().enumerate() {
             let seed = 0xf500 + (index as u128) * 0x40;
             let (author, receiver, author_handle, receiver_handle) =
                 joined_shared_pair(&format!("clean-provider-record-{kind:?}"), seed);
@@ -38628,24 +37565,6 @@ mod tests {
             let manifest_relative = format!("manifests/{batch_id}.manifest");
             let manifest_bytes = fs::read(author_outbox.join(&manifest_relative)).unwrap();
             let manifest = OperationBatch::decode(&manifest_bytes).unwrap();
-            let decoy_manifest_bytes = match kind {
-                RecordKind::ManifestRecovery => {
-                    let (decoy_batch, ..) = submit_shared_page(
-                        &author_handle,
-                        seed + 0x30,
-                        &format!("Clean Provider Record Decoy {index}"),
-                        &format!("notes/clean-provider-record-decoy-{index}.md"),
-                        "valid manifest bytes with a different identity",
-                    );
-                    publish_shared_batch(&author_handle, &author, decoy_batch);
-                    settle_shared_provider(&author_handle);
-                    Some(
-                        fs::read(author_outbox.join(format!("manifests/{decoy_batch}.manifest")))
-                            .unwrap(),
-                    )
-                }
-                _ => None,
-            };
             assert!(matches!(
                 author_handle.clean_shutdown(),
                 Ok(SyncShutdownOutcome::Safe(_))
@@ -38724,96 +37643,6 @@ mod tests {
                         own_head_bytes,
                         Some((head_relative, head_bytes)),
                     )
-                }
-                RecordKind::PublicationIntent => {
-                    let intent = SharedProviderPublicationIntentV1::new(
-                        descriptor.workspace_id(),
-                        descriptor.lineage_digest(),
-                        descriptor.digest().unwrap(),
-                        author.request.identities.device_id,
-                        manifest.author_device_id(),
-                        batch_id,
-                        ContentDigest::of(&manifest_bytes),
-                    )
-                    .unwrap();
-                    let mut provider = SharedProviderTransport::open(
-                        &author.request.provider_root,
-                        &author.request.provider_journal_root,
-                    )
-                    .unwrap();
-                    provider.publish_publication_intent(&intent).unwrap();
-                    let intent_relative = intent.path().unwrap();
-                    let intent_bytes = fs::read(author_outbox.join(&intent_relative)).unwrap();
-                    assert_eq!(intent_bytes, intent.encode().unwrap());
-                    SharedProviderPublicationIntentV1::decode(&intent_relative, &intent_bytes)
-                        .unwrap();
-                    let forged = forged_zero_digest_name(&intent_relative);
-                    assert!(
-                        SharedProviderPublicationIntentV1::decode(&forged, &intent_bytes).is_err(),
-                        "a relabeled publication intent must not decode"
-                    );
-                    let wrong_intent = SharedProviderPublicationIntentV1::new(
-                        descriptor.workspace_id(),
-                        descriptor.lineage_digest(),
-                        descriptor.digest().unwrap(),
-                        author.request.identities.device_id,
-                        manifest.author_device_id(),
-                        batch_id,
-                        ContentDigest::of(b"clean-provider-record-substitution"),
-                    )
-                    .unwrap();
-                    let wrong_bytes = wrong_intent.encode().unwrap();
-                    assert!(
-                        SharedProviderPublicationIntentV1::decode(&intent_relative, &wrong_bytes)
-                            .is_err(),
-                        "substituted intent bytes must not decode at the canonical name"
-                    );
-                    (forged, intent_bytes, intent_relative, wrong_bytes, None)
-                }
-                RecordKind::ManifestRecovery => {
-                    let link = SharedProviderManifestRecoveryLinkV1::new(
-                        descriptor.workspace_id(),
-                        descriptor.lineage_digest(),
-                        descriptor.digest().unwrap(),
-                        batch_id,
-                        manifest.author_device_id(),
-                        ContentDigest::of(&manifest_bytes),
-                    )
-                    .unwrap();
-                    let mut provider = SharedProviderTransport::open(
-                        &author.request.provider_root,
-                        &author.request.provider_journal_root,
-                    )
-                    .unwrap();
-                    provider
-                        .publish_manifest_recovery(&link, &manifest_bytes)
-                        .unwrap();
-                    let link_relative = link.path();
-                    let blob_relative = link.blob_path();
-                    let link_bytes = fs::read(author_outbox.join(&link_relative)).unwrap();
-                    let blob_bytes = fs::read(author_outbox.join(&blob_relative)).unwrap();
-                    assert_eq!(link_bytes, link.encode().unwrap());
-                    assert_eq!(blob_bytes, manifest_bytes);
-                    SharedProviderManifestRecoveryLinkV1::decode(&link_relative, &link_bytes)
-                        .unwrap();
-                    assert_eq!(
-                        blob_relative,
-                        format!(
-                            "{SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE}/{}.manifest",
-                            ContentDigest::of(&blob_bytes)
-                        )
-                    );
-                    let forged_batch = BatchId::from_uuid(Uuid::from_u128(seed + 0x3f));
-                    let forged = format!(
-                        "{SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE}/{forged_batch}.link"
-                    );
-                    assert!(
-                        SharedProviderManifestRecoveryLinkV1::decode(&forged, &link_bytes).is_err(),
-                        "a relabeled manifest-recovery link must not decode"
-                    );
-                    let decoy = decoy_manifest_bytes.clone().unwrap();
-                    assert_ne!(ContentDigest::of(&decoy), ContentDigest::of(&blob_bytes));
-                    (forged, link_bytes, blob_relative, decoy, None)
                 }
             };
 

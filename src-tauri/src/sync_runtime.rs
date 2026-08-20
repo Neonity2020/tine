@@ -960,7 +960,7 @@ const PROVIDER_SCAFFOLD_TREES: [&str; 2] = [PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_
 /// namespaces while this check still expected ten, so a tree that had only ever
 /// been opened failed to match its own skeleton and the escape hatch warned the
 /// user their graph might be shared with another device.
-const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 11] = SHARED_PROVIDER_TREE_NAMESPACES;
+const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 8] = SHARED_PROVIDER_TREE_NAMESPACES;
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
     let mut entries = std::fs::read_dir(path)

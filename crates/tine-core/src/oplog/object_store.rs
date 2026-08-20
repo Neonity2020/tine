@@ -46,7 +46,6 @@ use super::resume_point::{
 };
 use super::scratch_store::MAX_RETAINED_SCRATCH_RUNS;
 use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
-use super::simulator::SimulatorBootstrapFixtureIngress;
 use super::sqlite::{ProjectionError, WorkspaceRuntimeProof};
 #[cfg(test)]
 use super::sync_layout::BLOCK_CLAIM_INDEX_DIR;
@@ -2132,28 +2131,6 @@ impl ObjectStore {
         self.stage_manifest_bytes_impl(bytes, true)
     }
 
-    /// Stage one canonical historical bootstrap manifest for deterministic
-    /// simulator fixture ingress.
-    ///
-    /// The unforgeable safe-code authority is owned only by the simulator
-    /// module. This is not an app-runtime, migration, provider-reconciliation,
-    /// or enrollment API. It preserves normal decoding, workspace and lineage
-    /// validation, size bounds, and immutable collision checks, and bypasses
-    /// only the public bootstrap-origin admission guard.
-    pub(super) fn stage_simulator_bootstrap_manifest_bytes(
-        &self,
-        _fixture_ingress: &SimulatorBootstrapFixtureIngress,
-        bytes: &[u8],
-    ) -> Result<BatchId, StoreError> {
-        let manifest = OperationBatch::decode(bytes)?;
-        assert_eq!(
-            manifest.origin(),
-            BatchOrigin::BootstrapImport,
-            "simulator bootstrap fixture ingress requires BootstrapImport origin"
-        );
-        self.stage_manifest_bytes_impl(&manifest.encode()?, true)
-    }
-
     fn stage_manifest_bytes_impl(
         &self,
         bytes: &[u8],
@@ -2189,16 +2166,6 @@ impl ObjectStore {
             return Err(StoreError::BootstrapBatchRequiresDirectPublication);
         }
         self.publish_prepared_impl(batch, false)
-    }
-
-    /// Seed a bootstrap-origin archive fixture through the deterministic
-    /// simulator's unforgeable ingress authority.
-    pub(super) fn publish_simulator_bootstrap_prepared(
-        &self,
-        _fixture_ingress: &SimulatorBootstrapFixtureIngress,
-        batch: &PreparedBatch,
-    ) -> Result<(), StoreError> {
-        self.publish_bootstrap_prepared_fixture(batch)
     }
 
     /// Seed a bootstrap-origin archive fixture without exposing a production
