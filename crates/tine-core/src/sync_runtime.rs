@@ -37516,6 +37516,492 @@ mod tests {
         files
     }
 
+    fn wait_for_provider_recovery_block(handle: &SyncRuntimeHandle, label: &str) -> String {
+        for _ in 0..128 {
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail) => return detail,
+                SyncRuntimeTick::Blocked(detail)
+                | SyncRuntimeTick::Terminal(detail)
+                | SyncRuntimeTick::Failed(detail) => {
+                    panic!("{label} reached the wrong provider failure: {detail}")
+                }
+                SyncRuntimeTick::Idle
+                | SyncRuntimeTick::Recovering
+                | SyncRuntimeTick::RetryFull
+                | SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::ProviderMutation { .. } => {}
+                other => panic!("{label} reached an unrelated actor turn: {other:?}"),
+            }
+        }
+        panic!(
+            "{label} did not reach a recovery refusal: {:?}",
+            handle.status().unwrap()
+        );
+    }
+
+    #[test]
+    fn objects_first_then_manifest_converges_after_duplicate_rescan_and_restart() {
+        let (author, receiver, author_handle, receiver_handle) =
+            joined_shared_pair("objects-first-provider-delivery", 0xf300);
+        let target = "notes/objects-first-provider-delivery.md";
+        let (batch_id, ..) = submit_shared_page(
+            &author_handle,
+            0xf320,
+            "Objects First Provider Delivery",
+            target,
+            "objects stay inert until their manifest arrives",
+        );
+        publish_shared_batch(&author_handle, &author, batch_id);
+        settle_shared_provider(&author_handle);
+
+        let object_paths = copy_provider_batch(
+            &author,
+            &receiver,
+            batch_id,
+            ProviderBatchDelivery::ObjectsOnly,
+        );
+        let mut duplicates = object_paths.clone();
+        duplicates.extend(object_paths.clone());
+        receiver_handle
+            .observe_provider_paths(duplicates, false)
+            .unwrap();
+        receiver_handle.observe_provider().unwrap();
+        for _ in 0..64 {
+            let tick = receiver_handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "objects-first delivery failed before its manifest: {tick:?}"
+            );
+        }
+        assert!(
+            !receiver.graph_root.join(target).exists(),
+            "objects acquired authority before a manifest was visible"
+        );
+        drop(receiver_handle);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        let replayed = copy_provider_batch(
+            &author,
+            &receiver,
+            batch_id,
+            ProviderBatchDelivery::ObjectsOnly,
+        );
+        reopened
+            .observe_provider_paths(replayed.into_iter().rev().collect(), false)
+            .unwrap();
+        reopened.observe_provider().unwrap();
+        for _ in 0..32 {
+            let _ = reopened.tick().unwrap();
+        }
+        assert!(
+            !receiver.graph_root.join(target).exists(),
+            "restart gave object-only provider residue authority"
+        );
+
+        let manifest_path = copy_provider_batch(
+            &author,
+            &receiver,
+            batch_id,
+            ProviderBatchDelivery::ManifestOnly,
+        );
+        reopened
+            .observe_provider_paths(manifest_path, false)
+            .unwrap();
+        settle_shared_provider(&reopened);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(target)).unwrap(),
+            b"- objects stay inert until their manifest arrives\n"
+        );
+        assert_eq!(reopened.status().unwrap().provider_pending, 0);
+        assert!(matches!(
+            reopened.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+    }
+
+    #[test]
+    fn canonical_provider_name_substitution_blocks_then_exact_recovery_converges() {
+        #[derive(Clone, Copy, Debug)]
+        enum Substitution {
+            Manifest,
+            Object,
+        }
+
+        for (index, substitution) in [Substitution::Manifest, Substitution::Object]
+            .into_iter()
+            .enumerate()
+        {
+            let seed = 0xf400 + (index as u128) * 0x100;
+            let (author, receiver, author_handle, receiver_handle) = joined_shared_pair(
+                &format!("canonical-provider-substitution-{substitution:?}"),
+                seed,
+            );
+            let target = format!("notes/canonical-provider-substitution-{index}.md");
+            let (batch_id, ..) = submit_shared_page(
+                &author_handle,
+                seed + 0x20,
+                &format!("Canonical Provider Substitution {index}"),
+                &target,
+                "exact canonical bytes eventually recover",
+            );
+            publish_shared_batch(&author_handle, &author, batch_id);
+            settle_shared_provider(&author_handle);
+            let (decoy_batch, ..) = submit_shared_page(
+                &author_handle,
+                seed + 0x40,
+                &format!("Canonical Provider Decoy {index}"),
+                &format!("notes/canonical-provider-decoy-{index}.md"),
+                "valid bytes bound to a different canonical name",
+            );
+            publish_shared_batch(&author_handle, &author, decoy_batch);
+            settle_shared_provider(&author_handle);
+
+            let source_outbox = author.request.provider_root.join("outbox");
+            let receiver_outbox = receiver.request.provider_root.join("outbox");
+            let target_manifest_relative = format!("manifests/{batch_id}.manifest");
+            let target_manifest_bytes =
+                fs::read(source_outbox.join(&target_manifest_relative)).unwrap();
+            let target_manifest = OperationBatch::decode(&target_manifest_bytes).unwrap();
+            let decoy_manifest_bytes =
+                fs::read(source_outbox.join(format!("manifests/{decoy_batch}.manifest"))).unwrap();
+            let decoy_manifest = OperationBatch::decode(&decoy_manifest_bytes).unwrap();
+            let mut observed = Vec::new();
+            let attacked_relative;
+            let substituted_bytes;
+
+            match substitution {
+                Substitution::Manifest => {
+                    attacked_relative = target_manifest_relative.clone();
+                    substituted_bytes = decoy_manifest_bytes;
+                    fs::write(receiver_outbox.join(&attacked_relative), &substituted_bytes)
+                        .unwrap();
+                    observed.push(attacked_relative.clone());
+                }
+                Substitution::Object => {
+                    fs::write(
+                        receiver_outbox.join(&target_manifest_relative),
+                        &target_manifest_bytes,
+                    )
+                    .unwrap();
+                    observed.push(target_manifest_relative.clone());
+                    let attacked = target_manifest
+                        .required_objects()
+                        .iter()
+                        .map(|object| format!("objects/{}.object", object.content_digest()))
+                        .find(|relative| !receiver_outbox.join(relative).exists())
+                        .expect("target batch has an object absent from the receiver");
+                    attacked_relative = attacked;
+                    let decoy_object = decoy_manifest
+                        .required_objects()
+                        .iter()
+                        .map(|object| {
+                            fs::read(
+                                source_outbox
+                                    .join(format!("objects/{}.object", object.content_digest())),
+                            )
+                            .unwrap()
+                        })
+                        .find(|bytes| {
+                            ContentDigest::of(bytes).to_string()
+                                != attacked_relative
+                                    .strip_prefix("objects/")
+                                    .unwrap()
+                                    .strip_suffix(".object")
+                                    .unwrap()
+                        })
+                        .expect("decoy batch has bytes with another object identity");
+                    substituted_bytes = decoy_object;
+                    for object in target_manifest.required_objects() {
+                        let relative = format!("objects/{}.object", object.content_digest());
+                        if relative == attacked_relative {
+                            fs::write(receiver_outbox.join(&relative), &substituted_bytes).unwrap();
+                        } else {
+                            fs::copy(
+                                source_outbox.join(&relative),
+                                receiver_outbox.join(&relative),
+                            )
+                            .unwrap();
+                        }
+                        observed.push(relative);
+                    }
+                }
+            }
+
+            let graph_before = user_graph_bytes(&receiver.graph_root);
+            receiver_handle
+                .observe_provider_paths(observed, false)
+                .unwrap();
+            let detail = wait_for_provider_recovery_block(
+                &receiver_handle,
+                &format!("{substitution:?} canonical-name substitution"),
+            );
+            assert!(
+                detail.contains("invalid")
+                    || detail.contains("digest")
+                    || detail.contains("authority"),
+                "{detail}"
+            );
+            assert_eq!(
+                fs::read(receiver_outbox.join(&attacked_relative)).unwrap(),
+                substituted_bytes
+            );
+            assert_eq!(user_graph_bytes(&receiver.graph_root), graph_before);
+            drop(receiver_handle);
+
+            let reopened =
+                active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+            assert_eq!(
+                fs::read(receiver_outbox.join(&attacked_relative)).unwrap(),
+                substituted_bytes
+            );
+            assert_eq!(user_graph_bytes(&receiver.graph_root), graph_before);
+
+            match substitution {
+                Substitution::Manifest => {
+                    fs::write(
+                        receiver_outbox.join(&target_manifest_relative),
+                        &target_manifest_bytes,
+                    )
+                    .unwrap();
+                    let mut exact = copy_provider_batch(
+                        &author,
+                        &receiver,
+                        batch_id,
+                        ProviderBatchDelivery::ObjectsOnly,
+                    );
+                    exact.push(target_manifest_relative.clone());
+                    exact.push(target_manifest_relative);
+                    reopened.observe_provider_paths(exact, false).unwrap();
+                }
+                Substitution::Object => {
+                    fs::copy(
+                        source_outbox.join(&attacked_relative),
+                        receiver_outbox.join(&attacked_relative),
+                    )
+                    .unwrap();
+                    reopened
+                        .observe_provider_paths(
+                            vec![
+                                attacked_relative.clone(),
+                                target_manifest_relative,
+                                attacked_relative,
+                            ],
+                            false,
+                        )
+                        .unwrap();
+                }
+            }
+            settle_shared_provider(&reopened);
+            assert_eq!(
+                fs::read(receiver.graph_root.join(&target)).unwrap(),
+                b"- exact canonical bytes eventually recover\n"
+            );
+            assert_eq!(reopened.status().unwrap().provider_pending, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_topology_attacks_fail_closed_without_following_or_mutating_targets() {
+        use std::os::unix::fs::symlink;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Attack {
+            IntermediateSymlink,
+            FinalSymlink,
+            Hardlink,
+            InternalNamespace,
+            UnknownNamespace,
+            Relabel,
+            TransientSibling,
+            Litter,
+        }
+
+        let attacks = [
+            Attack::IntermediateSymlink,
+            Attack::FinalSymlink,
+            Attack::Hardlink,
+            Attack::InternalNamespace,
+            Attack::UnknownNamespace,
+            Attack::Relabel,
+            Attack::TransientSibling,
+            Attack::Litter,
+        ];
+        for (index, attack) in attacks.into_iter().enumerate() {
+            let seed = 0xfe00 + (index as u128) * 0x100;
+            let (author, receiver, author_handle, receiver_handle) =
+                joined_shared_pair(&format!("provider-topology-{attack:?}"), seed);
+            let target = format!("notes/provider-topology-{index}.md");
+            let (batch_id, ..) = submit_shared_page(
+                &author_handle,
+                seed + 0x20,
+                &format!("Provider Topology {index}"),
+                &target,
+                "provider topology evidence has no false authority",
+            );
+            publish_shared_batch(&author_handle, &author, batch_id);
+            settle_shared_provider(&author_handle);
+
+            let author_outbox = author.request.provider_root.join("outbox");
+            let receiver_outbox = receiver.request.provider_root.join("outbox");
+            let manifest_relative = format!("manifests/{batch_id}.manifest");
+            let manifest_bytes = fs::read(author_outbox.join(&manifest_relative)).unwrap();
+            let manifest = OperationBatch::decode(&manifest_bytes).unwrap();
+            let object_relative = manifest
+                .required_objects()
+                .iter()
+                .map(|object| format!("objects/{}.object", object.content_digest()))
+                .find(|path| !receiver_outbox.join(path).exists())
+                .expect("new topology batch has an object absent from the receiver");
+            let object_bytes = fs::read(author_outbox.join(&object_relative)).unwrap();
+            let graph_before = user_graph_bytes(&receiver.graph_root);
+
+            match attack {
+                Attack::IntermediateSymlink => {
+                    let outside = receiver.root.join("outside-intermediate");
+                    fs::create_dir(&outside).unwrap();
+                    fs::write(outside.join("item.object"), &object_bytes).unwrap();
+                    symlink(&outside, receiver_outbox.join("objects/escape")).unwrap();
+                    let relative = "objects/escape/item.object".to_owned();
+                    receiver_handle
+                        .observe_provider_paths(vec![relative], false)
+                        .unwrap();
+                    let detail = wait_for_provider_recovery_block(
+                        &receiver_handle,
+                        "intermediate provider symlink",
+                    );
+                    assert!(!detail.is_empty());
+                    assert_eq!(fs::read(outside.join("item.object")).unwrap(), object_bytes);
+                    assert!(receiver_outbox.join("objects/escape").is_symlink());
+                    assert!(receiver_handle.clean_shutdown().is_err());
+                }
+                Attack::FinalSymlink => {
+                    let outside = receiver.root.join("outside-final-object");
+                    fs::write(&outside, &object_bytes).unwrap();
+                    symlink(&outside, receiver_outbox.join(&object_relative)).unwrap();
+                    receiver_handle
+                        .observe_provider_paths(vec![object_relative.clone()], false)
+                        .unwrap();
+                    let detail = wait_for_provider_recovery_block(
+                        &receiver_handle,
+                        "final provider symlink",
+                    );
+                    assert!(!detail.is_empty());
+                    assert_eq!(fs::read(&outside).unwrap(), object_bytes);
+                    assert!(receiver_outbox.join(&object_relative).is_symlink());
+                    assert!(receiver_handle.clean_shutdown().is_err());
+                }
+                Attack::Hardlink => {
+                    let outside = receiver.root.join("outside-hardlink-object");
+                    fs::write(&outside, &object_bytes).unwrap();
+                    fs::hard_link(&outside, receiver_outbox.join(&object_relative)).unwrap();
+                    receiver_handle
+                        .observe_provider_paths(vec![object_relative.clone()], false)
+                        .unwrap();
+                    let detail =
+                        wait_for_provider_recovery_block(&receiver_handle, "provider hardlink");
+                    assert!(!detail.is_empty());
+                    assert_eq!(fs::read(&outside).unwrap(), object_bytes);
+                    assert_eq!(
+                        fs::metadata(&outside).unwrap().len(),
+                        fs::metadata(receiver_outbox.join(&object_relative))
+                            .unwrap()
+                            .len()
+                    );
+                    assert!(receiver_handle.clean_shutdown().is_err());
+                }
+                Attack::InternalNamespace => {
+                    let relative = ".part/complete-copy.part".to_owned();
+                    fs::write(receiver_outbox.join(&relative), &object_bytes).unwrap();
+                    receiver_handle
+                        .observe_provider_paths(vec![relative.clone()], false)
+                        .unwrap();
+                    let detail = wait_for_provider_recovery_block(
+                        &receiver_handle,
+                        "internal provider namespace",
+                    );
+                    assert!(!detail.is_empty());
+                    assert_eq!(
+                        fs::read(receiver_outbox.join(relative)).unwrap(),
+                        object_bytes
+                    );
+                    assert!(receiver_handle.clean_shutdown().is_err());
+                }
+                Attack::UnknownNamespace => {
+                    let relative = "unknown/valid-manifest-bytes".to_owned();
+                    fs::create_dir(receiver_outbox.join("unknown")).unwrap();
+                    fs::write(receiver_outbox.join(&relative), &manifest_bytes).unwrap();
+                    receiver_handle
+                        .observe_provider_paths(vec![relative.clone()], false)
+                        .unwrap();
+                    let detail = wait_for_provider_recovery_block(
+                        &receiver_handle,
+                        "unknown provider namespace",
+                    );
+                    assert!(!detail.is_empty());
+                    assert_eq!(
+                        fs::read(receiver_outbox.join(relative)).unwrap(),
+                        manifest_bytes
+                    );
+                    assert!(receiver_handle.clean_shutdown().is_err());
+                }
+                Attack::Relabel => {
+                    fs::write(receiver_outbox.join(&manifest_relative), &object_bytes).unwrap();
+                    receiver_handle
+                        .observe_provider_paths(vec![manifest_relative.clone()], false)
+                        .unwrap();
+                    let detail =
+                        wait_for_provider_recovery_block(&receiver_handle, "provider relabel");
+                    assert!(!detail.is_empty());
+                    assert_eq!(
+                        fs::read(receiver_outbox.join(&manifest_relative)).unwrap(),
+                        object_bytes
+                    );
+                    assert!(receiver_handle.clean_shutdown().is_err());
+                }
+                Attack::TransientSibling => {
+                    let relative = "objects/.syncthing.complete-copy.tmp".to_owned();
+                    fs::write(receiver_outbox.join(&relative), &object_bytes).unwrap();
+                    receiver_handle
+                        .observe_provider_paths(vec![relative.clone()], false)
+                        .unwrap();
+                    settle_shared_provider(&receiver_handle);
+                    assert_eq!(
+                        fs::read(receiver_outbox.join(relative)).unwrap(),
+                        object_bytes
+                    );
+                    assert!(matches!(
+                        receiver_handle.clean_shutdown(),
+                        Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+                    ));
+                }
+                Attack::Litter => {
+                    let litter = receiver_outbox.join(".DS_Store");
+                    fs::write(&litter, b"provider-adjacent litter").unwrap();
+                    receiver_handle.observe_provider().unwrap();
+                    settle_shared_provider(&receiver_handle);
+                    assert_eq!(fs::read(&litter).unwrap(), b"provider-adjacent litter");
+                    assert!(matches!(
+                        receiver_handle.clean_shutdown(),
+                        Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+                    ));
+                }
+            }
+            assert_eq!(
+                user_graph_bytes(&receiver.graph_root),
+                graph_before,
+                "{attack:?} provider evidence changed the user graph"
+            );
+            assert!(!receiver.graph_root.join(&target).exists());
+        }
+    }
+
     fn recursive_file_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
         let mut files = BTreeMap::new();
         if !root.is_dir() {
