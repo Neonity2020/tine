@@ -15,8 +15,13 @@
 const MAX_CLASSIFIED_BYTES: usize = 256 * 1024;
 
 /// Upper bound on the Myers edit distance explored per side before giving up
-/// conservatively.
-const MAX_EDIT_DISTANCE: usize = 8 * 1024;
+/// conservatively. The backtrack trace retains one band per distance step —
+/// (d+1)^2 cells total — so this bound is also the memory bound: 1024 keeps
+/// the worst-case trace near 8 MB, where 8192 with full-width rows reached
+/// ~1 GiB for a pair of 4 KiB full replacements (audit 4). Any real pair of
+/// disjoint-region edits of one outline block sits far below this distance;
+/// larger rewrites classify `Conflict`, which keeps both authored versions.
+const MAX_EDIT_DISTANCE: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextMergeClassification {
@@ -129,10 +134,14 @@ fn lcs_matches(base: &[char], target: &[char]) -> Option<Vec<(usize, usize)>> {
     let bound = max.min(MAX_EDIT_DISTANCE);
     let offset = bound;
     let mut v = vec![0usize; 2 * bound + 1];
+    // Per-step band of `v`: step d's backtrack touches only k ∈ [-d, d], so
+    // retain exactly `v[offset-d ..= offset+d]` (2d+1 cells) instead of the
+    // full 2*bound+1 row — the full-width clone made the trace Θ(bound²·width)
+    // ≈ 1 GiB for two 4 KiB replacements (audit 4).
     let mut trace: Vec<Vec<usize>> = Vec::new();
     let mut found = None;
     'outer: for d in 0..=bound {
-        trace.push(v.clone());
+        trace.push(v[offset - d..=offset + d].to_vec());
         let mut k = -(d as isize);
         while k <= d as isize {
             let index = (k + offset as isize) as usize;
@@ -162,9 +171,11 @@ fn lcs_matches(base: &[char], target: &[char]) -> Option<Vec<(usize, usize)>> {
     let mut x = n;
     let mut y = m;
     for d in (0..=d_final).rev() {
+        // Rows are the per-step band `v[offset-d ..= offset+d]`, so diagonal
+        // k lives at row index k + d.
         let v = &trace[d];
         let k = x as isize - y as isize;
-        let index = (k + offset as isize) as usize;
+        let index = (k + d as isize) as usize;
         let (prev_k, from_down) = if d == 0 {
             (0, false)
         } else if k == -(d as isize) || (k != d as isize && v[index - 1] < v[index + 1]) {
@@ -172,7 +183,7 @@ fn lcs_matches(base: &[char], target: &[char]) -> Option<Vec<(usize, usize)>> {
         } else {
             (k - 1, false)
         };
-        let prev_index = (prev_k + offset as isize) as usize;
+        let prev_index = (prev_k + d as isize) as usize;
         let prev_x = if d == 0 { 0 } else { v[prev_index] };
         let prev_y = (prev_x as isize - prev_k) as usize;
         // The snake: diagonal matches walked after the edit step.
