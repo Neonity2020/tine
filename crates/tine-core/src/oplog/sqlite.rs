@@ -167,6 +167,16 @@ pub struct AcceptedBatchEvent {
     causal_dot: BatchCausalDot,
     retained_bytes: usize,
     prepared_identity_transition: Option<PreparedSqliteIdentityTransition>,
+    /// True when this batch's causal past is the ENTIRE accepted prefix before
+    /// it, so its effective semantic effect describes exactly the merged
+    /// post-state and per-delta materialization validation may demand
+    /// equality. A concurrently accepted batch (some earlier-accepted history
+    /// is outside its causal past) is superseded by merge: its authored
+    /// per-delta values are not statements about the merged post-state at all
+    /// (GH #351). Bootstrap authoring/replay is sequential by construction and
+    /// keeps the default `true`; the two engine-backed constructors recompute
+    /// it from the authenticated causal index in `with_effective_view`.
+    causally_linear: bool,
 }
 
 /// Move-only result of evaluating one not-yet-durable operation against the
@@ -484,10 +494,28 @@ impl AcceptedBatchEvent {
             causal_dot: manifest.causal_dot(),
             retained_bytes,
             prepared_identity_transition: None,
+            causally_linear: true,
         })
     }
 
     fn with_effective_view(mut self, engine: &ShardedHotEngine) -> Result<Self, ProjectionError> {
+        let containment = engine
+            .batch_causal_containment(
+                self.batch_id,
+                self.causal_dot,
+                &self.causal_dependency_heads,
+            )
+            .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
+        // Clocks are downward-closed and per-peer gapless, so the counter sum
+        // is |past ∪ {self}|; causal parents are always accepted before their
+        // dependents, so that set is a subset of the accepted prefix and
+        // equality of sizes is equality of sets.
+        let causal_past: u64 = containment
+            .clock()
+            .iter()
+            .map(|(_, counter)| *counter)
+            .sum();
+        self.causally_linear = causal_past == self.acceptance_sequence;
         let authored = SemanticEffect::decode(&self.semantic_effect).map_err(|error| {
             ProjectionError::InvalidAcceptedEvent(format!(
                 "accepted batch {} authored effect cannot be decoded: {error}",
@@ -531,6 +559,12 @@ impl AcceptedBatchEvent {
         &self,
     ) -> &[super::hot_engine::AuthenticatedPageLocalEffectiveTransition] {
         &self.effective_transitions
+    }
+
+    /// See the field: whether per-delta materialization validation may demand
+    /// equality with this event's effective semantic effect.
+    pub(crate) fn causally_linear(&self) -> bool {
+        self.causally_linear
     }
 
     pub const fn semantic_effect_digest(&self) -> SemanticEffectDigest {
@@ -5085,8 +5119,33 @@ impl SqliteFrontier {
             if let Some(engine) = reference_engine {
                 change = attach_parser_derived_graph_facts(engine, change)?;
             }
-            let input_digest =
-                change.validate_against_stored(stored.batch_id, &stored.semantic_effect)?;
+            // The accepted causal record is keyed by batch id alone, so an
+            // empty dependency-head slice still classifies an already-indexed
+            // batch; without a reference engine this test-only rebuild keeps
+            // the exact contract.
+            let mode = match reference_engine {
+                Some(engine) => {
+                    let containment = engine
+                        .batch_causal_containment(stored.batch_id, stored.causal_dot()?, &[])
+                        .map_err(ProjectionError::materialization_from_engine)?;
+                    let causal_past: u64 = containment
+                        .clock()
+                        .iter()
+                        .map(|(_, counter)| *counter)
+                        .sum();
+                    if causal_past == sequence {
+                        super::sqlite_materialization::EffectValidationMode::LinearExact
+                    } else {
+                        super::sqlite_materialization::EffectValidationMode::ConcurrentSuperseded
+                    }
+                }
+                None => super::sqlite_materialization::EffectValidationMode::LinearExact,
+            };
+            let input_digest = change.validate_against_stored_with_mode(
+                stored.batch_id,
+                &stored.semantic_effect,
+                mode,
+            )?;
             let prior_digest = decode_content_digest(&stored.prior_frontier_root_digest)?;
             let post_digest = decode_content_digest(&stored.post_frontier_root_digest)?;
             self.physical
@@ -5095,6 +5154,7 @@ impl SqliteFrontier {
                 &change,
                 &stored.semantic_effect,
                 Some(stored.causal_dot()?),
+                mode,
             )?;
             self.physical.apply_materialization_for_test(
                 &physical,
@@ -6162,6 +6222,7 @@ impl SqliteFrontier {
                 change,
                 event.semantic_effect(),
                 Some(event.causal_dot()),
+                super::sqlite_materialization::EffectValidationMode::for_event(event),
             )?),
             None => None,
         };

@@ -315,6 +315,25 @@ pub struct MaterializationChange {
     portable_path_identity_records: Vec<MaterializedIdentityRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectValidationMode {
+    /// Demand per-delta equality with the effective effect.
+    LinearExact,
+    /// A concurrently accepted batch: merge supersedes authored deltas; check
+    /// only structural completeness. See `validate_for_event`.
+    ConcurrentSuperseded,
+}
+
+impl EffectValidationMode {
+    pub(crate) fn for_event(event: &AcceptedBatchEvent) -> Self {
+        if event.causally_linear() {
+            Self::LinearExact
+        } else {
+            Self::ConcurrentSuperseded
+        }
+    }
+}
+
 impl MaterializationChange {
     pub fn new(
         batch_id: BatchId,
@@ -407,6 +426,17 @@ impl MaterializationChange {
         Ok(ContentDigest::of(&encoded))
     }
 
+    /// How strictly a materialization input may be compared against an
+    /// accepted event's effective semantic effect.
+    ///
+    /// `LinearExact` is the ordinary case: the batch's causal past is the
+    /// entire accepted prefix, so its effective effect IS the merged
+    /// post-state and every per-delta value must match the replacement
+    /// exactly. `ConcurrentSuperseded` covers a batch accepted concurrently
+    /// with other history (GH #351): the merge decides the post-state, the
+    /// authored per-delta values are stale by construction, and only
+    /// structural completeness — every affected page supplied exactly once —
+    /// remains checkable.
     pub(crate) fn validate_for_event(
         &self,
         event: &AcceptedBatchEvent,
@@ -419,7 +449,7 @@ impl MaterializationChange {
         }
         let effect = SemanticEffect::decode(event.semantic_effect())
             .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-        self.validate_against_effect(&effect)?;
+        self.validate_against_effect(&effect, EffectValidationMode::for_event(event))?;
         self.digest()
     }
 
@@ -429,6 +459,20 @@ impl MaterializationChange {
         batch_id: BatchId,
         semantic_effect: &[u8],
     ) -> Result<ContentDigest, MaterializationError> {
+        self.validate_against_stored_with_mode(
+            batch_id,
+            semantic_effect,
+            EffectValidationMode::LinearExact,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validate_against_stored_with_mode(
+        &self,
+        batch_id: BatchId,
+        semantic_effect: &[u8],
+        mode: EffectValidationMode,
+    ) -> Result<ContentDigest, MaterializationError> {
         if self.batch_id != batch_id {
             return Err(MaterializationError::BatchMismatch {
                 expected: batch_id,
@@ -437,7 +481,7 @@ impl MaterializationChange {
         }
         let effect = SemanticEffect::decode(semantic_effect)
             .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-        self.validate_against_effect(&effect)?;
+        self.validate_against_effect(&effect, mode)?;
         self.digest()
     }
 
@@ -575,8 +619,13 @@ impl MaterializationChange {
         Ok(())
     }
 
-    fn validate_against_effect(&self, effect: &SemanticEffect) -> Result<(), MaterializationError> {
+    fn validate_against_effect(
+        &self,
+        effect: &SemanticEffect,
+        mode: EffectValidationMode,
+    ) -> Result<(), MaterializationError> {
         self.validate_shape()?;
+        let exact = matches!(mode, EffectValidationMode::LinearExact);
         let replacements = self
             .replacements
             .iter()
@@ -610,6 +659,13 @@ impl MaterializationChange {
                     home_document_id,
                     kind,
                 }) => {
+                    if !exact {
+                        // A concurrent sibling may have deleted or reshaped
+                        // this page; the merge is the authority. The final
+                        // supplied-equals-affected check still demands the
+                        // page appear as a replacement or a deletion.
+                        continue;
+                    }
                     let page = replacements.get(&delta.page_id).ok_or_else(|| {
                         MaterializationError::Incomplete(format!(
                             "live page {} has no complete replacement",
@@ -642,6 +698,9 @@ impl MaterializationChange {
         }
         for delta in effect.page_preambles() {
             affected.insert(delta.page_id);
+            if !exact {
+                continue;
+            }
             let page = replacements.get(&delta.page_id).ok_or_else(|| {
                 MaterializationError::Incomplete(format!(
                     "preamble change for page {} has no replacement",
@@ -663,7 +722,7 @@ impl MaterializationChange {
         }
         for delta in effect.memberships() {
             affected.insert(delta.page_id);
-            if required_deletions.contains(&delta.page_id) {
+            if !exact || required_deletions.contains(&delta.page_id) {
                 continue;
             }
             let blocks = replacement_blocks.get(&delta.page_id).ok_or_else(|| {
@@ -709,7 +768,7 @@ impl MaterializationChange {
                 continue;
             };
             affected.insert(page_id);
-            if required_deletions.contains(&page_id) {
+            if !exact || required_deletions.contains(&page_id) {
                 continue;
             }
             let blocks = replacement_blocks.get(&page_id).ok_or_else(|| {
@@ -757,7 +816,7 @@ impl MaterializationChange {
                 "supplied pages {supplied:?} differ from accepted affected pages {affected:?}"
             )));
         }
-        if deletions != required_deletions {
+        if exact && deletions != required_deletions {
             return Err(MaterializationError::Contradiction(format!(
                 "supplied deletions {deletions:?} differ from accepted deletions {required_deletions:?}"
             )));
@@ -1256,7 +1315,12 @@ pub(crate) fn apply_change(
     input_digest: ContentDigest,
     post_frontier_digest: ContentDigest,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-    let physical = lower_validated_change(change, semantic_effect, None)?;
+    let physical = lower_validated_change(
+        change,
+        semantic_effect,
+        None,
+        EffectValidationMode::LinearExact,
+    )?;
     storage::apply_materialization_change_for_test(
         transaction,
         &physical,
@@ -1271,11 +1335,12 @@ pub(crate) fn lower_validated_change(
     change: &MaterializationChange,
     semantic_effect: &[u8],
     causal_dot: Option<BatchCausalDot>,
+    mode: EffectValidationMode,
 ) -> Result<storage::PhysicalMaterializationChange, MaterializationError> {
     change.validate_shape()?;
     let effect = SemanticEffect::decode(semantic_effect)
         .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    change.validate_against_effect(&effect)?;
+    change.validate_against_effect(&effect, mode)?;
 
     let pages_with_live_metadata_delta = effect
         .pages()

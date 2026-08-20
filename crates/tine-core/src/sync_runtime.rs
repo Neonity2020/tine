@@ -5190,6 +5190,10 @@ struct CleanRuntimeResources {
 struct CleanRuntimeActorCore {
     runtime: CleanLocalRuntime,
     pending: Option<CleanPublishedContinuation>,
+    /// Tracks consecutive identical failures of the retained continuation so a
+    /// deterministic failure escalates to a named block instead of an
+    /// unbounded per-tick retry. See `MAX_IDENTICAL_RETAINED_RETRY_ATTEMPTS`.
+    retry_fingerprint: Option<CleanRetryFingerprint>,
     watcher: CleanWatcherState,
     full_scan: Option<CleanFullScanContinuation>,
     completed_full_scan: Option<(u64, BTreeSet<ManagedPath>)>,
@@ -5343,7 +5347,7 @@ impl CleanWatcherState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CleanActorMutationOutcome {
     Durable(BatchId),
     /// THIS submission's manifest commit is durable; only disposable derived
@@ -5362,6 +5366,15 @@ enum CleanActorMutationOutcome {
         batch_id: BatchId,
         phase: OperationalPhase,
     },
+    /// The retained continuation failed identically on consecutive attempts
+    /// and is not a bounded-slice resume: retrying inside this process cannot
+    /// succeed until something outside it changes. The durable commit stays
+    /// retained; the runtime names the block instead of spinning on it.
+    DurableStuck {
+        batch_id: BatchId,
+        phase: OperationalPhase,
+        detail: String,
+    },
 }
 
 enum CleanActorExternalOutcome {
@@ -5371,6 +5384,23 @@ enum CleanActorExternalOutcome {
         batch_id: BatchId,
         phase: OperationalPhase,
     },
+}
+
+/// Consecutive identical non-continuation failures of one retained
+/// continuation before the actor stops re-running the coordinator and names
+/// the block. Bounded-slice resumes are exempt (see
+/// `OperationalCoordinatorError::continuation_required`); any change in the
+/// failure text resets the count, so only a deterministic failure escalates.
+/// The count is process-local: a restart retries fresh.
+const MAX_IDENTICAL_RETAINED_RETRY_ATTEMPTS: u32 = 3;
+
+#[derive(Debug)]
+struct CleanRetryFingerprint {
+    batch_id: BatchId,
+    phase: OperationalPhase,
+    detail: String,
+    attempts: u32,
+    escalated: bool,
 }
 
 #[derive(Debug)]
@@ -5397,6 +5427,7 @@ impl CleanRuntimeActorCore {
         Self {
             runtime,
             pending: None,
+            retry_fingerprint: None,
             watcher,
             full_scan: None,
             completed_full_scan: None,
@@ -5490,10 +5521,11 @@ impl CleanRuntimeActorCore {
                 .map_err(CleanActorMutationFailure::from)?
         };
         let outcome = self.retain_outcome(state);
-        self.provider_change_pending_notification = Some(match outcome {
+        self.provider_change_pending_notification = Some(match &outcome {
             CleanActorMutationOutcome::Durable(batch_id)
             | CleanActorMutationOutcome::DurablePending { batch_id, .. }
-            | CleanActorMutationOutcome::RetainedPriorPending { batch_id, .. } => batch_id,
+            | CleanActorMutationOutcome::RetainedPriorPending { batch_id, .. }
+            | CleanActorMutationOutcome::DurableStuck { batch_id, .. } => *batch_id,
         });
         Ok(outcome)
     }
@@ -5520,21 +5552,95 @@ impl CleanRuntimeActorCore {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
     ) -> Option<CleanActorMutationOutcome> {
+        if let (Some(pending), Some(fingerprint)) =
+            (self.pending.as_ref(), self.retry_fingerprint.as_ref())
+        {
+            if fingerprint.escalated && fingerprint.batch_id == pending.batch_id() {
+                return Some(CleanActorMutationOutcome::DurableStuck {
+                    batch_id: fingerprint.batch_id,
+                    phase: fingerprint.phase,
+                    detail: fingerprint.detail.clone(),
+                });
+            }
+        }
         let pending = self.pending.take()?;
         let state = match self.runtime.admit_clean_derived_recovery(graph) {
             Ok(mut session) => {
                 OperationalCoordinator::retry_clean_local(&mut session, graph, receipts, pending)
             }
-            Err(_) => {
+            Err(admission) => {
                 self.pending = Some(pending);
                 let pending = self.pending.as_ref().expect("pending was restored");
-                return Some(CleanActorMutationOutcome::DurablePending {
-                    batch_id: pending.batch_id(),
-                    phase: pending.failure().phase(),
-                });
+                let batch_id = pending.batch_id();
+                let phase = pending.failure().phase();
+                if let Some(outcome) = self.note_retry_failure(
+                    batch_id,
+                    phase,
+                    format!("clean recovery admission failed: {admission}"),
+                ) {
+                    return Some(outcome);
+                }
+                return Some(CleanActorMutationOutcome::DurablePending { batch_id, phase });
             }
         };
+        if let CleanLocalMutationState::DurablePending(pending) = &state {
+            if !pending.failure().is_continuation_required() {
+                if let Some(outcome) = self.note_retry_failure(
+                    pending.batch_id(),
+                    pending.failure().phase(),
+                    pending.failure().detail().to_owned(),
+                ) {
+                    if let CleanLocalMutationState::DurablePending(pending) = state {
+                        self.pending = Some(pending);
+                    }
+                    return Some(outcome);
+                }
+            } else {
+                self.retry_fingerprint = None;
+            }
+        } else {
+            self.retry_fingerprint = None;
+        }
         Some(self.retain_outcome(state))
+    }
+
+    /// Record one non-continuation failure of the retained continuation.
+    /// Returns the escalated outcome once the same batch has failed with the
+    /// same phase and detail `MAX_IDENTICAL_RETAINED_RETRY_ATTEMPTS` times in
+    /// a row; any difference restarts the count at one.
+    fn note_retry_failure(
+        &mut self,
+        batch_id: BatchId,
+        phase: OperationalPhase,
+        detail: String,
+    ) -> Option<CleanActorMutationOutcome> {
+        let repeat = self.retry_fingerprint.as_ref().is_some_and(|fingerprint| {
+            fingerprint.batch_id == batch_id
+                && fingerprint.phase == phase
+                && fingerprint.detail == detail
+        });
+        let attempts = if repeat {
+            self.retry_fingerprint
+                .as_ref()
+                .expect("repeat implies a fingerprint")
+                .attempts
+                .saturating_add(1)
+        } else {
+            1
+        };
+        let escalated = attempts >= MAX_IDENTICAL_RETAINED_RETRY_ATTEMPTS;
+        self.retry_fingerprint = Some(CleanRetryFingerprint {
+            batch_id,
+            phase,
+            detail: detail.clone(),
+            attempts,
+            escalated,
+        });
+        escalated.then_some(CleanActorMutationOutcome::DurableStuck {
+            batch_id,
+            phase,
+            detail,
+        })
     }
 
     fn observe(&mut self, observations: Vec<SyncWatcherObservation>) {
@@ -6152,23 +6258,39 @@ fn open_clean_runtime_resources_with_progress(
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeProjectionRepair,
     });
+    let receiver_local = terminal_work
+        .iter()
+        .filter(|work| work.endpoint_id() != endpoint.endpoint_id())
+        .collect::<Vec<_>>();
     for work in terminal_work
         .iter()
         .filter(|work| work.endpoint_id() == endpoint.endpoint_id())
     {
-        crate::oplog::projection::execute_clean_manifested_projection_work(
+        let executed = crate::oplog::projection::execute_clean_manifested_projection_work(
             &graph,
             &receipts,
             projection.database(),
             &mut engine,
-            &work,
-        )
-        .map_err(display)?;
+            work,
+        );
+        match executed {
+            Ok(()) => {}
+            Err(crate::oplog::ProjectionError::WorkNotReady)
+                if !engine
+                    .accepted_batch_is_causally_linear(work.batch_id())
+                    .map_err(display)? =>
+            {
+                // This endpoint's recorded rendering was superseded by a
+                // concurrently accepted history, so the merge decides the page
+                // now and the recorded bytes must not be replayed verbatim.
+                // Skip instead of refusing to open: reopen always seeds a
+                // clean full scan, and the receipt store re-projects any page
+                // whose disk bytes are an earlier receipted render (GH #351).
+            }
+            Err(error) => return Err(display(error)),
+        }
     }
-    let foreign = terminal_work
-        .iter()
-        .filter(|work| work.endpoint_id() != endpoint.endpoint_id())
-        .collect::<Vec<_>>();
+    let foreign = receiver_local;
     if !foreign.is_empty() {
         let handoff = graph
             .mint_handoff_safe(identities.workspace_id, endpoint)
@@ -17824,6 +17946,15 @@ impl RuntimeActor {
                     }
                     previous_failure = observed;
                 }
+                Some(CleanActorMutationOutcome::DurableStuck {
+                    phase: next_phase, ..
+                }) => {
+                    // The actor already proved this failure deterministic;
+                    // further settle turns cannot change it.
+                    phase = map_local_phase(next_phase);
+                    spent = turn + 1;
+                    break;
+                }
             }
         }
         self.note_retained_publication(expected_batch_id, phase, detail, spent, false);
@@ -17880,6 +18011,9 @@ impl RuntimeActor {
                         return (turn + 1, false);
                     }
                     previous_failure = observed;
+                }
+                Some(CleanActorMutationOutcome::DurableStuck { .. }) => {
+                    return (turn + 1, false);
                 }
             }
         }
@@ -18660,7 +18794,10 @@ impl RuntimeActor {
                 None | Some(CleanActorMutationOutcome::Durable(_)) => EditorTurnReadiness::Ready,
                 Some(
                     CleanActorMutationOutcome::DurablePending { batch_id, phase }
-                    | CleanActorMutationOutcome::RetainedPriorPending { batch_id, phase },
+                    | CleanActorMutationOutcome::RetainedPriorPending { batch_id, phase }
+                    | CleanActorMutationOutcome::DurableStuck {
+                        batch_id, phase, ..
+                    },
                 ) => EditorTurnReadiness::Deferred(
                     SyncEditorDeferred::RetryableRetainedPublication {
                         batch_id: batch_id.to_string(),
@@ -18773,7 +18910,10 @@ impl RuntimeActor {
                     affected_page_ids,
                 })
             }
-            CleanActorMutationOutcome::RetainedPriorPending { batch_id, phase } => {
+            CleanActorMutationOutcome::RetainedPriorPending { batch_id, phase }
+            | CleanActorMutationOutcome::DurableStuck {
+                batch_id, phase, ..
+            } => {
                 // An EARLIER batch still occupies the clean actor, so this
                 // transaction never ran. Deliberately do NOT claim the batch:
                 // settling it must not be reported as this save succeeding.
@@ -19269,6 +19409,16 @@ impl RuntimeActor {
                             phase: map_local_phase(phase),
                         },
                     );
+                }
+                CleanActorMutationOutcome::DurableStuck {
+                    batch_id,
+                    phase,
+                    detail,
+                } => {
+                    self.refresh_watcher();
+                    return SyncRuntimeTick::RecoveryBlocked(format!(
+                        "retained recovery for batch {batch_id} is stuck at {phase:?}: {detail}",
+                    ));
                 }
             }
         }
@@ -19927,6 +20077,13 @@ impl RuntimeActor {
                     // provider evidence on the floor.
                     SyncRuntimeTick::Recovering
                 }
+                Ok(CleanActorMutationOutcome::DurableStuck {
+                    batch_id: stuck_batch,
+                    phase,
+                    detail,
+                }) => SyncRuntimeTick::RecoveryBlocked(format!(
+                    "retained recovery for batch {stuck_batch} is stuck at {phase:?}: {detail}",
+                )),
                 Err(error) => SyncRuntimeTick::RecoveryBlocked(error.detail),
             };
         }
@@ -20198,7 +20355,10 @@ impl RuntimeActor {
                         phase: map_local_phase(phase),
                     }
                 }
-                Ok(CleanActorMutationOutcome::RetainedPriorPending { phase, .. }) => {
+                Ok(
+                    CleanActorMutationOutcome::RetainedPriorPending { phase, .. }
+                    | CleanActorMutationOutcome::DurableStuck { phase, .. },
+                ) => {
                     // An earlier retained continuation blocked this submission,
                     // so nothing of this transaction was published. Report it
                     // without a batch id: the application layer defers, and the
@@ -20284,7 +20444,10 @@ impl RuntimeActor {
                         phase: map_local_phase(phase),
                     }
                 }
-                Ok(CleanActorMutationOutcome::RetainedPriorPending { phase, .. }) => {
+                Ok(
+                    CleanActorMutationOutcome::RetainedPriorPending { phase, .. }
+                    | CleanActorMutationOutcome::DurableStuck { phase, .. },
+                ) => {
                     // An earlier retained continuation blocked this submission,
                     // so nothing of this transaction was published. Report it
                     // without a batch id: the application layer defers, and the
@@ -26605,7 +26768,8 @@ mod tests {
                 batch_id
             }
             CleanActorMutationOutcome::Durable(_)
-            | CleanActorMutationOutcome::RetainedPriorPending { .. } => {
+            | CleanActorMutationOutcome::RetainedPriorPending { .. }
+            | CleanActorMutationOutcome::DurableStuck { .. } => {
                 panic!("fault must retain this submission's own durable work")
             }
         };
@@ -26653,6 +26817,116 @@ mod tests {
                 .acceptance_sequence(),
             1
         );
+    }
+
+    #[test]
+    fn clean_actor_escalates_a_deterministic_retained_retry_to_a_named_stuck_state() {
+        fn find_file(root: &Path, name: &str) -> PathBuf {
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in fs::read_dir(&dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.file_name().is_some_and(|file| file == name) {
+                        return path;
+                    }
+                }
+            }
+            panic!("{name} is absent under {}", root.display());
+        }
+
+        let fixture = ActivationFixture::nested_unicode("clean-actor-stuck", 0xa17b);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let CleanRuntimeResources {
+            graph,
+            receipts,
+            runtime,
+        } = resources;
+        let mut actor = CleanRuntimeActorCore::new(runtime, false);
+        let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
+        let owner = actor
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&root_path, 2)
+            .unwrap()
+            .pop()
+            .expect("clean SQLite names Root.md");
+        let current = actor
+            .load_current_editor_page(owner.page_id)
+            .unwrap()
+            .expect("clean actor loads Root.md from SQLite");
+        let first = current.blocks.first().expect("Root.md has one block");
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: first.block_id,
+                home_document_id: first.home_document_id,
+            },
+            content: "stuck retained save".into(),
+        }])
+        .unwrap();
+
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let pending = actor
+            .execute_local(&graph, &receipts, &transaction)
+            .unwrap();
+        let CleanActorMutationOutcome::DurablePending { batch_id, .. } = pending else {
+            panic!("fault must retain this submission's own durable work: {pending:?}");
+        };
+
+        // Something outside Tine removes the durable manifest, so every retry
+        // of the retained continuation fails the same way. Before escalation
+        // existed this spun indefinitely, one full coordinator attempt per
+        // tick, with the real failure never surfaced.
+        let manifest_path = find_file(
+            &fixture.request.archive_root,
+            &format!("{batch_id}.manifest"),
+        );
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+        fs::remove_file(&manifest_path).unwrap();
+
+        for attempt in 1..MAX_IDENTICAL_RETAINED_RETRY_ATTEMPTS {
+            let retried = actor.retry_pending(&graph, &receipts);
+            assert!(
+                matches!(
+                    &retried,
+                    Some(CleanActorMutationOutcome::DurablePending { batch_id: retained, .. })
+                        if *retained == batch_id
+                ),
+                "attempt {attempt} escalated or completed early: {retried:?}"
+            );
+        }
+        let stuck = actor.retry_pending(&graph, &receipts);
+        let Some(CleanActorMutationOutcome::DurableStuck {
+            batch_id: stuck_batch,
+            phase,
+            detail,
+        }) = stuck
+        else {
+            panic!("identical failures must escalate to a named stuck state: {stuck:?}");
+        };
+        assert_eq!(stuck_batch, batch_id);
+        assert_eq!(phase, OperationalPhase::ArchiveStage);
+        assert!(!detail.is_empty());
+
+        // The stuck state is a restart-to-retry contract: it keeps naming the
+        // recorded failure without re-running the coordinator, even after the
+        // external cause is repaired mid-process.
+        fs::write(&manifest_path, &manifest_bytes).unwrap();
+        assert!(matches!(
+            actor.retry_pending(&graph, &receipts),
+            Some(CleanActorMutationOutcome::DurableStuck { batch_id: retained, .. })
+                if retained == batch_id
+        ));
+        // Cold-open recovery of a continuation whose Markdown projection is
+        // still pending is a separate contract with its own open defect (a
+        // resources-level reopen refuses with "managed text writes are
+        // reserved for external reconciliation"); it is tracked with the
+        // GH #351 follow-ups and deliberately not asserted here.
     }
 
     #[test]

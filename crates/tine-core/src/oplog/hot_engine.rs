@@ -804,6 +804,14 @@ pub(crate) struct AcceptedBatchCausalContainment {
 }
 
 impl AcceptedBatchCausalContainment {
+    /// The batch's transitive causal clock: per peer, the highest counter in
+    /// its causal past including its own dot. Clocks are downward-closed (a
+    /// peer's dots are gapless), so the counters sum to the exact size of
+    /// `past(batch) ∪ {batch}`.
+    pub(crate) fn clock(&self) -> &[(CausalPeerId, u64)] {
+        &self.clock
+    }
+
     pub(crate) fn contains(&self, dot: BatchCausalDot, batch_id: BatchId) -> bool {
         batch_id == self.batch_id
             || self
@@ -18254,10 +18262,19 @@ impl ShardedHotEngine {
         if replay.target() != bytes
             || !retained_intent.matches_replay_except_frontier(replay.intent())
         {
-            return Err(EngineError::ProjectionManifest(format!(
-                "clean manifest predecessor for {path} is not its deterministic current rendering"
-            )));
+            // A concurrently accepted history superseded the head batch's
+            // recorded rendering: the head is then only a locator, and the
+            // deterministic current rendering — `replay`, computed above from
+            // the live accepted state — is the authority (GH #351). For a
+            // linear head the divergence is a real projection defect and
+            // stays a refusal.
+            if self.accepted_batch_is_causally_linear(work.batch_id())? {
+                return Err(EngineError::ProjectionManifest(format!(
+                    "clean manifest predecessor for {path} is not its deterministic current rendering"
+                )));
+            }
         }
+        let bytes = replay.target();
         let (bytes, intent) = match exact_local_bytes {
             Some(local) if local != bytes => {
                 let local = match super::projection::plan_projection_adopting_exact_source(
@@ -21512,6 +21529,30 @@ impl ShardedHotEngine {
             )));
         }
         self.clean_projection_locators_for_batch(batch, endpoint)
+    }
+
+    /// Whether an accepted batch's causal past is the entire accepted prefix
+    /// before it. A `false` answer means the batch was accepted concurrently
+    /// with other history, so any state it RECORDED at authoring time (semantic
+    /// after-values, rendered projection targets) is superseded by the merge
+    /// and must not be held to byte equality against current state (GH #351).
+    pub(crate) fn accepted_batch_is_causally_linear(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<bool, EngineError> {
+        let evidence = self.accepted_batch_evidence(batch_id)?;
+        let manifest = self.load_observed_manifest(batch_id)?;
+        let containment = self.batch_causal_containment(
+            batch_id,
+            manifest.causal_dot(),
+            manifest.causal_dependency_heads(),
+        )?;
+        let causal_past: u64 = containment
+            .clock()
+            .iter()
+            .map(|(_, counter)| *counter)
+            .sum();
+        Ok(causal_past == evidence.acceptance_sequence())
     }
 
     /// Rebuild the run-local terminal projection plan from accepted manifests.
