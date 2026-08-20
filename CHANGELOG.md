@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Opening a long-lived managed graph got slower the more edit history it had,
+  independent of graph size: the startup replay re-validated every remaining
+  batch's projection objects once per admission round. Each batch's
+  dependencies are now computed exactly once, which roughly halves a
+  multi-hundred-save reopen; the remaining history-proportional cost is
+  tracked for a deeper fix.
 - The one-time app-data migration at startup no longer trusts a momentarily
   unreadable `backups/` folder: any read error now means "assume there is user
   data and leave everything alone", the existing folder is set aside instead of

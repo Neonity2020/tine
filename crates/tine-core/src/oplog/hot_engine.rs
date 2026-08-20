@@ -8768,35 +8768,62 @@ impl ShardedHotEngine {
             };
             pending.insert(manifest.batch_id(), validated);
         }
-        while !pending.is_empty() {
-            let mut ready = None;
-            for (batch_id, batch) in &pending {
-                let mut dependencies_ready = true;
-                for dependency in clean_replay_dependency_heads(batch)? {
-                    if !self.accepted_frontier_contains_batch_effects(dependency)? {
-                        dependencies_ready = false;
-                        break;
-                    }
-                }
-                if dependencies_ready {
-                    ready = Some(*batch_id);
-                    break;
+        // Dependency heads are a pure function of each validated batch, but
+        // recomputing them per readiness probe re-validates the projection
+        // object set — decoding every object of the batch, including whole
+        // rendered file blobs — and made the staging fixed point quadratic in
+        // history length (audit 4, P1). Compute them exactly once per batch.
+        let mut dependency_heads = BTreeMap::new();
+        for (batch_id, batch) in &pending {
+            dependency_heads.insert(*batch_id, clean_replay_dependency_heads(batch)?);
+        }
+        // Kahn-style ready tracking over the memoized heads. A dependency is
+        // either pending here (satisfied exactly when its own staging
+        // completes) or external — accepted effects with no committed manifest
+        // in this archive, e.g. manifestless no-op ancestry — which can flip
+        // to contained only as a side effect of staging some other batch.
+        // External deps are re-probed after every staging, so `ready` always
+        // holds precisely the batches the original per-round scan would have
+        // found, and popping the smallest keeps the original deterministic
+        // staging order.
+        let mut unmet: BTreeMap<BatchId, BTreeSet<BatchId>> = BTreeMap::new();
+        let mut waiters: BTreeMap<BatchId, Vec<BatchId>> = BTreeMap::new();
+        let mut external_unmet: BTreeMap<BatchId, Vec<BatchId>> = BTreeMap::new();
+        let mut ready: BTreeSet<BatchId> = BTreeSet::new();
+        for (batch_id, heads) in &dependency_heads {
+            let mut missing = BTreeSet::new();
+            for dependency in heads {
+                if pending.contains_key(dependency) {
+                    missing.insert(*dependency);
+                    waiters.entry(*dependency).or_default().push(*batch_id);
+                } else if !self.accepted_frontier_contains_batch_effects(*dependency)? {
+                    missing.insert(*dependency);
+                    external_unmet
+                        .entry(*dependency)
+                        .or_default()
+                        .push(*batch_id);
                 }
             }
-            let Some(batch_id) = ready else {
+            if missing.is_empty() {
+                ready.insert(*batch_id);
+            } else {
+                unmet.insert(*batch_id, missing);
+            }
+        }
+        while !pending.is_empty() {
+            let Some(batch_id) = ready.pop_first() else {
                 let mut blocked = Vec::new();
-                for batch in pending.values() {
-                    let mut missing = Vec::new();
-                    for dependency in clean_replay_dependency_heads(batch)? {
-                        if !self.accepted_frontier_contains_batch_effects(dependency)? {
-                            missing.push(dependency.to_string());
-                        }
-                    }
-                    blocked.push(format!(
-                        "{} -> [{}]",
-                        batch.manifest().batch_id(),
-                        missing.join(",")
-                    ));
+                for batch_id in pending.keys() {
+                    let missing = unmet
+                        .get(batch_id)
+                        .map(|dependencies| {
+                            dependencies
+                                .iter()
+                                .map(|dependency| dependency.to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    blocked.push(format!("{} -> [{}]", batch_id, missing.join(",")));
                 }
                 return Err(EngineError::Archive(format!(
                     "manifest-committed clean tail has no causally ready operation: {}",
@@ -8812,6 +8839,32 @@ impl ShardedHotEngine {
                     "manifest-committed clean operation {batch_id} did not validate as accepted: {:?}",
                     outcome.disposition()
                 )));
+            }
+            let mut satisfied = Vec::new();
+            if let Some(waiting) = waiters.remove(&batch_id) {
+                satisfied.push((batch_id, waiting));
+            }
+            // This staging may have accepted external no-op ancestry as a side
+            // effect; each probe is a constant-count point proof.
+            let candidates: Vec<BatchId> = external_unmet.keys().copied().collect();
+            for dependency in candidates {
+                if self.accepted_frontier_contains_batch_effects(dependency)? {
+                    let waiting = external_unmet
+                        .remove(&dependency)
+                        .expect("probed external dependency remains indexed");
+                    satisfied.push((dependency, waiting));
+                }
+            }
+            for (dependency, waiting) in satisfied {
+                for waiter in waiting {
+                    if let Some(missing) = unmet.get_mut(&waiter) {
+                        missing.remove(&dependency);
+                        if missing.is_empty() {
+                            unmet.remove(&waiter);
+                            ready.insert(waiter);
+                        }
+                    }
+                }
             }
         }
         for manifest in &manifests {
