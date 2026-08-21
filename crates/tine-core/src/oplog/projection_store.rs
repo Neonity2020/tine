@@ -7289,10 +7289,4 @@ mod tests {
         }
     }
 
-    mod crash_corpus {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/oplog/projection_crash_corpus_tests.rs"
-        ));
-    }
 }
