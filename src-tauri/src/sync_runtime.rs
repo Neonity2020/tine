@@ -140,7 +140,6 @@ impl SparseV2ActivationRecord {
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
-            migration_backup_root: private.join("migration-backup"),
             provider_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2/shared"),
             provider_journal_root: private.join("provider/device/journal"),
         })
@@ -158,7 +157,6 @@ impl SparseV2ActivationRecord {
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
-            migration_backup_root: private.join("migration-backup"),
             capture_root: private.join("capture"),
             preparation_root: private.join("preparation"),
             provider_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2/shared"),
@@ -4310,7 +4308,6 @@ mod tests {
                     receipt_root: self.private_root.join("receipts"),
                     database_path: self.private_root.join("projection/materialization.sqlite"),
                     application_runtime_root: self.private_root.join("runtime"),
-                    migration_backup_root: self.private_root.join("migration-backup"),
                     capture_root: self.private_root.join("capture"),
                     preparation_root: self.private_root.join("preparation"),
                     provider_root: self.graph_root.join(".tine-sync/v2/shared"),
@@ -5925,7 +5922,6 @@ mod tests {
             receipt_root: root.join("missing-receipts"),
             database_path: root.join("missing.sqlite"),
             application_runtime_root: root.join("missing-runtime"),
-            migration_backup_root: root.join("missing-migration-backup"),
             provider_root: root.join("missing-provider"),
             provider_journal_root: root.join("missing-provider-journal/device/journal"),
         });
@@ -6135,7 +6131,6 @@ mod tests {
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
-            migration_backup_root: private.join("migration-backup"),
             capture_root: private.join("capture"),
             preparation_root: private.join("preparation"),
             provider_root: graph_root.join(".tine-sync/v2/shared"),
@@ -6159,7 +6154,6 @@ mod tests {
             receipt_root: request.receipt_root.clone(),
             database_path: request.database_path.clone(),
             application_runtime_root: request.application_runtime_root.clone(),
-            migration_backup_root: request.migration_backup_root.clone(),
             provider_root: request.provider_root.clone(),
             provider_journal_root: request.provider_journal_root.clone(),
         };
@@ -6488,7 +6482,6 @@ mod tests {
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
-            migration_backup_root: private.join("migration-backup"),
             capture_root: private.join("capture"),
             preparation_root: private.join("preparation"),
             provider_root: graph_root.join(".tine-sync/v2/shared"),
@@ -6512,7 +6505,6 @@ mod tests {
             receipt_root: activation_request.receipt_root.clone(),
             database_path: activation_request.database_path.clone(),
             application_runtime_root: activation_request.application_runtime_root.clone(),
-            migration_backup_root: activation_request.migration_backup_root.clone(),
             provider_root: activation_request.provider_root.clone(),
             provider_journal_root: activation_request.provider_journal_root.clone(),
         };

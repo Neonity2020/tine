@@ -53,7 +53,6 @@ fn run(graph_root: PathBuf, private_root: PathBuf, write_fixture: bool) -> Strin
         receipt_root: private_root.join("receipts"),
         database_path: private_root.join("projection/materialization.sqlite"),
         application_runtime_root: private_root.join("runtime"),
-        migration_backup_root: private_root.join("migration-backup"),
         provider_root: graph_root.join(".tine-sync/v2/shared"),
         provider_journal_root: private_root.join("provider/device/journal"),
     };
@@ -64,7 +63,6 @@ fn run(graph_root: PathBuf, private_root: PathBuf, write_fixture: bool) -> Strin
         receipt_root: open_request.receipt_root.clone(),
         database_path: open_request.database_path.clone(),
         application_runtime_root: open_request.application_runtime_root.clone(),
-        migration_backup_root: open_request.migration_backup_root.clone(),
         capture_root: private_root.join("capture"),
         preparation_root: private_root.join("preparation"),
         provider_root: open_request.provider_root.clone(),

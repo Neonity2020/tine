@@ -38,7 +38,6 @@ pub(crate) mod local_journal_drain;
 #[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod local_journal_v2_anchor;
 pub(crate) mod loro_store;
-pub(crate) mod migration_backup;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
 #[allow(dead_code)] // mixed live/runtime and test-construction surface

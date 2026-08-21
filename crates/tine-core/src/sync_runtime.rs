@@ -77,8 +77,6 @@ use crate::oplog::local_journal_drain::{
     ManagedLocalDerivativeAuthority, ManagedLocalDerivativePublisher, ManagedLocalDrainCheckpoint,
     ManagedLocalDrainContinuation, ManagedLocalPublicationState,
 };
-#[cfg(test)]
-use crate::oplog::migration_backup::MigrationBackupInstrumentation;
 use crate::oplog::object_store::{
     ensure_directory_nofollow, open_dir_nofollow, ObjectStore, ObjectStoreManifestCursor,
 };
@@ -1101,7 +1099,6 @@ pub struct SyncRuntimeOpenRequest {
     pub receipt_root: PathBuf,
     pub database_path: PathBuf,
     pub application_runtime_root: PathBuf,
-    pub migration_backup_root: PathBuf,
     pub provider_root: PathBuf,
     pub provider_journal_root: PathBuf,
 }
@@ -1136,7 +1133,6 @@ pub struct SyncLocalActivationRequest {
     pub receipt_root: PathBuf,
     pub database_path: PathBuf,
     pub application_runtime_root: PathBuf,
-    pub migration_backup_root: PathBuf,
     pub capture_root: PathBuf,
     pub preparation_root: PathBuf,
     pub provider_root: PathBuf,
@@ -6125,7 +6121,6 @@ fn runtime_open_request_from_activation(
         receipt_root: request.receipt_root.clone(),
         database_path: request.database_path.clone(),
         application_runtime_root: request.application_runtime_root.clone(),
-        migration_backup_root: request.migration_backup_root.clone(),
         provider_root: request.provider_root.clone(),
         provider_journal_root: request.provider_journal_root.clone(),
     }
@@ -7152,7 +7147,6 @@ fn validate_activation_paths(
             &request.application_runtime_root,
             "application_runtime_root",
         ),
-        (&request.migration_backup_root, "migration_backup_root"),
         (&request.capture_root, "capture_root"),
         (&request.preparation_root, "preparation_root"),
         (&request.provider_journal_root, "provider_journal_root"),
@@ -7169,11 +7163,7 @@ fn validate_activation_paths(
 }
 
 fn prepare_activation_private_paths(request: &SyncLocalActivationRequest) -> Result<(), String> {
-    for path in [
-        &request.capture_root,
-        &request.preparation_root,
-        &request.migration_backup_root,
-    ] {
+    for path in [&request.capture_root, &request.preparation_root] {
         fs::create_dir_all(path)
             .map_err(|error| format!("cannot create private activation directory: {error}"))?;
         let metadata = fs::symlink_metadata(path)
@@ -20180,7 +20170,6 @@ mod tests {
                 receipt_root: root.join("receipts"),
                 database_path: root.join("projection.sqlite"),
                 application_runtime_root: root.join("application-runtime"),
-                migration_backup_root: root.join("migration-backup"),
                 provider_root: root.join("graph/.tine-sync/v2/shared"),
                 provider_journal_root: root.join("application-runtime/provider/device/journal"),
             },
@@ -22404,7 +22393,6 @@ mod tests {
                 receipt_root: private.join("receipts"),
                 database_path: private.join("projection/bootstrap.sqlite"),
                 application_runtime_root: private.join("runtime"),
-                migration_backup_root: private.join("backups"),
                 capture_root: private.join("capture"),
                 preparation_root: private.join("preparation"),
                 provider_root: graph_root.join(".tine-sync/v2/shared"),
@@ -23095,7 +23083,6 @@ mod tests {
             receipt_root: request.receipt_root.clone(),
             database_path: request.database_path.clone(),
             application_runtime_root: request.application_runtime_root.clone(),
-            migration_backup_root: request.migration_backup_root.clone(),
             provider_root: request.provider_root.clone(),
             provider_journal_root: request.provider_journal_root.clone(),
         }
@@ -24511,7 +24498,6 @@ mod tests {
             receipt_root: private_root.join("receipts"),
             database_path: private_root.join("projection/materialization.sqlite"),
             application_runtime_root: private_root.join("runtime"),
-            migration_backup_root: private_root.join("migration-backup"),
             provider_root: graph_root.join(".tine-sync/v2/shared"),
             provider_journal_root: private_root.join("provider/device/journal"),
         };
@@ -24522,7 +24508,6 @@ mod tests {
             receipt_root: open_request.receipt_root.clone(),
             database_path: open_request.database_path.clone(),
             application_runtime_root: open_request.application_runtime_root.clone(),
-            migration_backup_root: open_request.migration_backup_root.clone(),
             capture_root: private_root.join("capture"),
             preparation_root: private_root.join("preparation"),
             provider_root: open_request.provider_root.clone(),
@@ -27609,7 +27594,6 @@ mod tests {
             receipt_root: rebase(&request.receipt_root),
             database_path: rebase(&request.database_path),
             application_runtime_root: rebase(&request.application_runtime_root),
-            migration_backup_root: rebase(&request.migration_backup_root),
             capture_root: rebase(&request.capture_root),
             preparation_root: rebase(&request.preparation_root),
             provider_root: request.provider_root.clone(),
@@ -35200,7 +35184,6 @@ mod tests {
         .map(|name| format!("archive/{name}"))
         .collect::<Vec<_>>();
         for (label, root) in [
-            ("migration backup", &fixture.request.migration_backup_root),
             ("capture scratch", &fixture.request.capture_root),
             ("preparation scratch", &fixture.request.preparation_root),
         ] {
@@ -39055,7 +39038,13 @@ mod tests {
             .expect("activation must retain the runtime handle");
         assert!(fixture.request.database_path.is_file());
         assert!(
-            recursive_file_bytes(&fixture.request.migration_backup_root).is_empty(),
+            !fixture
+                .request
+                .enrollment_root
+                .parent()
+                .expect("private enrollment root has a parent")
+                .join("migration-backup")
+                .exists(),
             "clean activation must not recreate the retired migration-backup authority"
         );
         assert_eq!(
@@ -39171,180 +39160,6 @@ mod tests {
         drive_initial_feed(&reopened);
         assert_eq!(completion_count(), after_import);
         assert_eq!(fs::read(fixture.graph_root.join(PATH)).unwrap(), edited);
-        assert!(matches!(
-            reopened.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn first_local_edit_uses_bootstrap_then_ordinary_receipt_supersedes_after_restart() {
-        const PATH: &str =
-            "notes/層/\u{017e}lu\u{0165}ou\u{010d}k\u{00fd}/nested/D\u{00e9}j\u{00e0} 計画.md";
-        const FIRST_EDIT: &str = "Unicode café — edited locally";
-        const SECOND_EDIT: &str = "Unicode café — accepted after restart";
-
-        fn bootstrap_payload(root: &Path, managed_path: &str) -> PathBuf {
-            let suffix = Path::new("payload").join(managed_path);
-            let mut pending = vec![root.to_path_buf()];
-            while let Some(directory) = pending.pop() {
-                for entry in fs::read_dir(directory).unwrap().map(Result::unwrap) {
-                    if entry.file_type().unwrap().is_dir() {
-                        pending.push(entry.path());
-                    } else if entry.path().ends_with(&suffix) {
-                        return entry.path();
-                    }
-                }
-            }
-            panic!("bootstrap payload for {managed_path} was not retained");
-        }
-
-        let fixture = ActivationFixture::nested_unicode("local-bootstrap-supersession", 0xa1e0);
-        fs::write(
-            fixture.graph_root.join(PATH),
-            "- Unicode café\r\n".as_bytes(),
-        )
-        .unwrap();
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation must retain an actor");
-        drive_initial_feed(&handle);
-
-        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
-        let endpoint = ProjectionEndpointBinding {
-            endpoint_id: fixture.request.identities.endpoint_id,
-            device_id: fixture.request.identities.device_id,
-            graph_resource_id: graph.canonical_resource_id().unwrap(),
-        };
-        drop(graph);
-        let completed_paths = || {
-            ProjectionReceiptStore::open_for_endpoint(
-                &fixture.request.receipt_root,
-                fixture.request.identities.workspace_id,
-                endpoint,
-            )
-            .unwrap()
-            .validated_catalog()
-            .unwrap()
-            .into_iter()
-            .filter_map(|entry| entry.completion.map(|_| entry.intent.path().clone()))
-            .collect::<Vec<_>>()
-        };
-        assert!(
-            completed_paths().is_empty(),
-            "activation must not synthesize ordinary page completions"
-        );
-
-        let pages = handle
-            .query(SyncRuntimeQueryRequest::ListPages {
-                page_kind: Some(SyncPageKind::Page),
-                limit: 16,
-            })
-            .unwrap();
-        let SyncRuntimeQueryReply::Pages(pages) = pages else {
-            panic!("page list returned the wrong reply variant");
-        };
-        let page_id = pages
-            .into_iter()
-            .find(|page| page.path == PATH)
-            .expect("nested Unicode bootstrap page must be materialized")
-            .page_id;
-        let mut page = match handle
-            .load_editor_page(SyncEditorLoadRequest {
-                page: SyncEditorPageSelector::PageId {
-                    page_id: page_id.clone(),
-                },
-            })
-            .unwrap()
-        {
-            SyncEditorLoadOutcome::Loaded { page } => page,
-            other => panic!("bootstrap page did not load for editing: {other:?}"),
-        };
-        assert_eq!(page.blocks[0].content, "Unicode café");
-        page.blocks[0].content = FIRST_EDIT.into();
-        let saved = handle
-            .save_editor_page(SyncEditorSaveRequest {
-                target: SyncEditorSaveTarget::Existing {
-                    page_id: page.page_id,
-                    revision: page.revision,
-                },
-                preamble: page.preamble,
-                blocks: page.blocks,
-            })
-            .unwrap();
-        assert!(
-            matches!(saved, SyncEditorSaveOutcome::Durable { .. }),
-            "bootstrap-backed local edit did not publish: {saved:?}"
-        );
-        assert_eq!(
-            fs::read(fixture.graph_root.join(PATH)).unwrap(),
-            format!("- {FIRST_EDIT}\r\n").as_bytes()
-        );
-        assert!(completed_paths().is_empty());
-        drain_managed_local(&handle);
-        assert_eq!(
-            completed_paths(),
-            vec![ManagedPath::parse(PATH).unwrap()],
-            "the first real projection must complete only the edited page"
-        );
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-
-        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
-        let reopened = reopened.handle.expect("promoted runtime must reopen");
-        drive_initial_feed(&reopened);
-        let mut page = match reopened
-            .load_editor_page(SyncEditorLoadRequest {
-                page: SyncEditorPageSelector::PageId { page_id },
-            })
-            .unwrap()
-        {
-            SyncEditorLoadOutcome::Loaded { page } => page,
-            other => panic!("locally edited page did not reopen: {other:?}"),
-        };
-        assert_eq!(page.blocks[0].content, FIRST_EDIT);
-
-        fs::write(
-            bootstrap_payload(&fixture.request.migration_backup_root, PATH),
-            b"corrupt aggregate fallback",
-        )
-        .unwrap();
-        page.blocks[0].content = SECOND_EDIT.into();
-        let saved = reopened
-            .save_editor_page(SyncEditorSaveRequest {
-                target: SyncEditorSaveTarget::Existing {
-                    page_id: page.page_id,
-                    revision: page.revision,
-                },
-                preamble: page.preamble,
-                blocks: page.blocks,
-            })
-            .unwrap();
-        match saved {
-            SyncEditorSaveOutcome::Durable { .. } => {}
-            SyncEditorSaveOutcome::Deferred {
-                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
-                ..
-            } => {
-                settle_local_mutation(&reopened);
-            }
-            other => {
-                panic!(
-                    "restart did not select the ordinary receipt over aggregate fallback: {other:?}"
-                );
-            }
-        }
-        drain_managed_local(&reopened);
-        assert_eq!(
-            fs::read(fixture.graph_root.join(PATH)).unwrap(),
-            format!("- {SECOND_EDIT}\r\n").as_bytes()
-        );
-        let completed = completed_paths();
-        assert_eq!(completed.len(), 2);
-        assert!(completed.iter().all(|path| path.as_str() == PATH));
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

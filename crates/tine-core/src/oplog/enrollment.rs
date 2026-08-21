@@ -52,7 +52,6 @@ use super::import::BootstrapStreamingImportError;
 use super::legacy_enrollment_verifier::{
     self as legacy_checkpoint, LegacyAuthorityClaimV1 as EnrollmentAuthorityClaimV1,
 };
-use super::migration_backup::MigrationBackupError;
 use super::object_store::{open_dir_nofollow, publish_immutable_exact, sync_dir_required};
 use super::sqlite::{ProjectionError, WorkspaceRuntimeProof};
 use super::sync_layout::{
@@ -2978,7 +2977,6 @@ impl VerifiedLocalEvidence {
 pub(crate) enum VerifiedLocalCompositionError {
     Enrollment(EnrollmentError),
     Bootstrap(BootstrapStreamingImportError),
-    Backup(MigrationBackupError),
     Sqlite(ProjectionError),
     ProofBinding(String),
     ProofMismatch(&'static str),
@@ -2992,7 +2990,6 @@ impl fmt::Display for VerifiedLocalCompositionError {
         match self {
             Self::Enrollment(error) => error.fmt(formatter),
             Self::Bootstrap(error) => error.fmt(formatter),
-            Self::Backup(error) => error.fmt(formatter),
             Self::Sqlite(error) => error.fmt(formatter),
             Self::ProofBinding(detail) => {
                 write!(formatter, "verified-local proof binding failed: {detail}")
@@ -3023,12 +3020,6 @@ impl From<EnrollmentError> for VerifiedLocalCompositionError {
 impl From<BootstrapStreamingImportError> for VerifiedLocalCompositionError {
     fn from(error: BootstrapStreamingImportError) -> Self {
         Self::Bootstrap(error)
-    }
-}
-
-impl From<MigrationBackupError> for VerifiedLocalCompositionError {
-    fn from(error: MigrationBackupError) -> Self {
-        Self::Backup(error)
     }
 }
 

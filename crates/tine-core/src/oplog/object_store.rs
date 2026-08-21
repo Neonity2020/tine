@@ -370,14 +370,6 @@ impl ControlDirectoryIdentity {
         ContentDigest::from_bytes(hasher.finalize().into())
     }
 
-    #[cfg(test)]
-    pub(crate) fn migration_backup_root_binding_digest(self) -> ContentDigest {
-        let mut hasher = Sha256::new();
-        hasher.update(b"tine/migration-backup-root-resource/v1\0");
-        self.hash_platform_identity(&mut hasher);
-        ContentDigest::from_bytes(hasher.finalize().into())
-    }
-
     fn hash_platform_identity(self, hasher: &mut Sha256) {
         #[cfg(unix)]
         {
