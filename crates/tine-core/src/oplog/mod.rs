@@ -62,7 +62,6 @@ pub mod text_merge;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;
-pub(crate) mod watcher_queue;
 pub(crate) mod wire;
 
 /// Diagnostic trace gates, resolved once per process.

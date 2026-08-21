@@ -39,14 +39,15 @@ use uuid::Uuid;
 use super::enrollment::{EnrollmentBindingV1, ResumePointEnrollmentBinding};
 use super::hot_engine::RuntimeResumeSnapshot;
 use super::identity::{parse_digest, ARCHIVE_INSTANCE_CLAIM_FILE};
+#[cfg(test)]
+use super::resume_point::{clear_resume_points_in, ResumePointMaintenance};
 use super::resume_point::{
-    clear_resume_points_in, next_resume_sequence, prune_resume_points_below,
-    ResumeEnrollmentAdmission, ResumePointError, ResumePointMaintenance, ResumePointScan,
-    ResumePointSet, RuntimeResumePointV2, MAX_RETAINED_RESUME_POINTS, RESUME_POINT_DIR,
+    next_resume_sequence, prune_resume_points_below, ResumeEnrollmentAdmission, ResumePointError,
+    ResumePointScan, ResumePointSet, RuntimeResumePointV2, MAX_RETAINED_RESUME_POINTS,
+    RESUME_POINT_DIR,
 };
 use super::scratch_store::MAX_RETAINED_SCRATCH_RUNS;
 use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
-use super::sqlite::{ProjectionError, WorkspaceRuntimeProof};
 #[cfg(test)]
 use super::sync_layout::BLOCK_CLAIM_INDEX_DIR;
 use super::sync_layout::{
@@ -60,7 +61,6 @@ use super::sync_layout::{
     LINEAGE_CLAIM_FILE, LOGSEQ_CLAIM_INDEX_DIR, PAGE_NAME_OWNERSHIP_INDEX_DIR,
     PORTABLE_PATH_INDEX_DIR, PROJECTION_WORK_DIR, PROMOTED_RUNTIME_STATE_FILE,
 };
-use super::watcher_queue::WatcherQuiescedProof;
 use super::{
     bootstrap_import::{
         ArchiveLocalFrontierBindingV1, BootstrapAggregateCommitV1, BootstrapAggregateDigestV1,
@@ -79,7 +79,6 @@ use super::{
     DocumentId, ImportId, LineageDigest, ObjectDescriptor, OperationBatch, OperationObject,
     PreparedBatch, SessionId, ValidatedBatch, WorkspaceId, MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
 };
-use crate::model::HandoffSafe;
 
 const MAX_BOOTSTRAP_PART_PACK_BYTES: u64 =
     MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART + 4 * MAX_OPERATIONS_PER_BOOTSTRAP_PART as u64;
@@ -5210,69 +5209,6 @@ pub(crate) struct PublishedResumePoint {
     scratch_run_id: Uuid,
 }
 
-/// Sealed authority for the clear-before-Safe step.
-///
-/// This value can exist only while the exact graph reservation, watcher
-/// quiesce proof, and archive-rooted workspace lease are all borrowed. The
-/// lifecycle caller cannot construct one, and the clear operation cannot
-/// outlive any of those barriers.
-pub(crate) struct SafeTransitionCapability<'barriers, 'lease> {
-    history: &'barriers DurableEngineHistoryStore,
-    archive: &'barriers ObjectStore,
-    _graph: &'barriers HandoffSafe,
-    _watcher: &'barriers WatcherQuiescedProof,
-    workspace: &'barriers WorkspaceRuntimeProof<'lease>,
-}
-
-impl SafeTransitionCapability<'_, '_> {
-    fn revalidate_workspace(&self) -> Result<(), ProjectionError> {
-        self.workspace
-            .authorize_archive(self.archive, self.history.workspace_id)
-    }
-
-    /// Remove exactly the recognized Unsafe-bound points. Safe-bound evidence
-    /// from an older lifecycle is preserved until a successfully published
-    /// Safe successor makes it unreachable.
-    ///
-    /// The live lease proof is rerun inside this capability immediately before
-    /// deletion. The initial proof that minted the capability is intentionally
-    /// insufficient: a pathname can disappear or be replaced while the graph
-    /// and watcher barriers remain continuously held.
-    pub(crate) fn clear_unsafe_resume_points(
-        &self,
-    ) -> Result<ResumePointMaintenance, SafeTransitionError> {
-        self.revalidate_workspace()
-            .map_err(SafeTransitionError::Workspace)?;
-        self.history
-            .clear_unsafe_resume_points()
-            .map_err(SafeTransitionError::Store)
-    }
-
-    /// Revalidate the same live lease immediately before the durable
-    /// `Unsafe -> Safe` closure and keep every capability borrowed until that
-    /// closure returns.
-    pub(crate) fn commit_handoff<T, E>(
-        &self,
-        commit: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, SafeTransitionCommitError<E>> {
-        self.revalidate_workspace()
-            .map_err(SafeTransitionCommitError::Workspace)?;
-        commit().map_err(SafeTransitionCommitError::Commit)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum SafeTransitionError {
-    Workspace(ProjectionError),
-    Store(StoreError),
-}
-
-#[derive(Debug)]
-pub(crate) enum SafeTransitionCommitError<E> {
-    Workspace(ProjectionError),
-    Commit(E),
-}
-
 impl PublishedResumePoint {
     pub(crate) const fn resume_sequence(&self) -> u64 {
         self.resume_sequence
@@ -6411,51 +6347,11 @@ impl DurableEngineHistoryStore {
         })
     }
 
-    /// Mint the only capability that may clear points for a Safe transition.
-    ///
-    /// All three authorities are checked against this exact sealed endpoint.
-    /// Borrowing them into the result makes dropping either barrier before the
-    /// clear a compile error.
-    pub(crate) fn begin_safe_transition<'barriers, 'lease>(
-        &'barriers self,
-        archive: &'barriers ObjectStore,
-        workspace: &'barriers WorkspaceRuntimeProof<'lease>,
-        graph: &'barriers HandoffSafe,
-        watcher: &'barriers WatcherQuiescedProof,
-    ) -> Result<SafeTransitionCapability<'barriers, 'lease>, SafeTransitionError> {
-        workspace
-            .authorize_archive(archive, self.workspace_id)
-            .map_err(SafeTransitionError::Workspace)?;
-        let graph_binding = graph.binding();
-        if graph_binding.workspace_id() != self.workspace_id
-            || graph_binding.endpoint().endpoint_id() != self.endpoint_id
-            || graph_binding.graph_resource_id() != self.graph_resource_id
-        {
-            return Err(SafeTransitionError::Store(
-                StoreError::ResumePointBindingMismatch(
-                    "Safe transition graph reservation is bound to another endpoint",
-                ),
-            ));
-        }
-        let watcher_binding = watcher.binding();
-        if watcher_binding.endpoint != graph_binding.endpoint()
-            || watcher_binding.receipt_store_id != self.receipt_store_id
-        {
-            return Err(SafeTransitionError::Store(
-                StoreError::ResumePointBindingMismatch(
-                    "Safe transition watcher proof is bound to another endpoint",
-                ),
-            ));
-        }
-        Ok(SafeTransitionCapability {
-            history: self,
-            archive,
-            _graph: graph,
-            _watcher: watcher,
-            workspace,
-        })
-    }
-
+    /// Retained at stage 2d wave 3: the sealed Safe-transition barrier
+    /// (`begin_safe_transition` / `SafeTransitionCapability`) that was this
+    /// drain's only production caller was deleted with `watcher_queue`, so the
+    /// only surviving caller is `clear_resume_points_for_test` below.
+    #[cfg(test)]
     /// Remove every recognized Unsafe-bound resume point of this endpoint.
     ///
     /// This is the `Unsafe -> Safe` drain step: afterwards no recognized point

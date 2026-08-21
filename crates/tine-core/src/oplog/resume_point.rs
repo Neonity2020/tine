@@ -2585,6 +2585,14 @@ mod tests {
     /// activation runtime is exactly the sibling this fence exists for. It is
     /// verified green against the post-cut source, not grandfathered.
     ///
+    /// Narrowed at stage 2d wave 3: the sealed `Unsafe -> Safe` barrier
+    /// (`begin_safe_transition` and `SafeTransitionCapability::
+    /// clear_unsafe_resume_points`) was deleted together with `watcher_queue`,
+    /// whose quiesce proof it required, so the two entry-point names it used to
+    /// pin were dropped from the list below. The fence is unchanged in kind:
+    /// the raw-surface prohibitions above still cover the drain, because
+    /// `clear_resume_points_in` remains forbidden to the activation sources.
+    ///
     /// A failure here means the activation path acquired deletion or authority
     /// surface it was designed not to have — not that the test is stale.
     #[test]
@@ -2638,8 +2646,6 @@ mod tests {
             "pub(crate) fn read_resume_adoption_candidate(",
             "pub(crate) fn plan_engine_scratch_retention(",
             "pub(crate) fn reclaim_retained_runs_after_publication(",
-            "pub(crate) fn begin_safe_transition",
-            "pub(crate) fn clear_unsafe_resume_points(",
             "fn read_resume_point_set(",
         ] {
             assert!(
