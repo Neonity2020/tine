@@ -23,9 +23,6 @@ use super::bootstrap_import::{
     BootstrapImportPartEvidenceV1, BootstrapPartDescriptorV1, BootstrapPartitionProfileV1,
     BootstrapProfileDigestV1, MAX_OPERATIONS_PER_BOOTSTRAP_PART,
 };
-use super::content_patricia::{
-    PatriciaIndexReclamationError, PatriciaIndexReclamationReport, PatriciaIndexStore,
-};
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
@@ -1360,8 +1357,10 @@ pub struct FatalEvidenceHandle {
     pub(crate) canonical_digest: ContentDigest,
 }
 
+#[cfg(test)]
 const MAX_FATAL_EVIDENCE_PAGE_CONFLICTS: usize = 32;
 
+#[cfg(test)]
 /// Opaque continuation for one authenticated fatal-evidence root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FatalEvidenceCursor {
@@ -1369,6 +1368,7 @@ pub struct FatalEvidenceCursor {
     after: BlockId,
 }
 
+#[cfg(test)]
 /// A fixed-size inspection result for terminal conflict evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FatalEvidencePage {
@@ -1376,6 +1376,7 @@ pub struct FatalEvidencePage {
     next: Option<FatalEvidenceCursor>,
 }
 
+#[cfg(test)]
 impl FatalEvidencePage {
     pub fn conflicts(&self) -> &[ImmutableHomeConflict] {
         &self.conflicts
@@ -3338,6 +3339,7 @@ where
     Ok(candidate)
 }
 
+#[cfg(test)]
 pub(crate) fn replay_direct_loaded_bootstrap(
     store: &ObjectStore,
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
@@ -3382,174 +3384,6 @@ pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
         },
     )?;
     Ok((candidate, terminal_history_binding))
-}
-
-/// Reconstruct a promoted bootstrap directly into the enrolled archive's
-/// disposable scratch namespace and seal it for one immediate enrolled open.
-///
-/// This is deliberately separate from retained resume migration: a retention
-/// policy that selected `Ephemeral` has denied permission to mint another
-/// retained run. The returned capability therefore cannot be serialized,
-/// cloned, published, or revived after this process; it only lets the current
-/// open avoid replaying an already authenticated bootstrap prefix a second
-/// time.
-pub(crate) fn replay_promoted_bootstrap_into_ephemeral_predecessor(
-    store: &ObjectStore,
-    publication: &super::object_store::ValidatedBootstrapPublicationV1,
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    catalog_document_id: DocumentId,
-    storage: ProjectionStorageBinding,
-    history: &super::object_store::DurableEngineHistoryStore,
-    history_root: ContentDigest,
-    bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
-    live_history: super::object_store::EngineHistoryAuthority,
-) -> Result<Box<EphemeralBootstrapPredecessor>, EngineError> {
-    let terminal = publication
-        .aggregate()
-        .parts()
-        .last()
-        .copied()
-        .ok_or_else(|| EngineError::Archive("promoted bootstrap has no terminal part".into()))?;
-    let bytes = history
-        .lookup(history_root, terminal.batch_id())
-        .map_err(|error| EngineError::Archive(error.to_string()))?
-        .ok_or_else(|| {
-            EngineError::Archive(
-                "promoted bootstrap terminal record is absent from durable history".into(),
-            )
-        })?;
-    let record = decode_history_record(terminal.batch_id(), &bytes)?;
-    if record.generation != u64::from(bootstrap.part_count())
-        || record.bootstrap != Some(bootstrap)
-        || !matches!(record.status, ArchiveStatus::Accepted { .. })
-    {
-        return Err(EngineError::Archive(
-            "promoted bootstrap terminal record does not bind the aggregate anchor".into(),
-        ));
-    }
-    let terminal_binding = history_record_binding(&record);
-    let replay_identity = DetachedBootstrapReplayIdentity::new(
-        workspace_id,
-        lineage_digest,
-        catalog_document_id,
-        record.reference_catalog_policy,
-        storage,
-        store
-            .canonical_archive_identity()
-            .map_err(|error| EngineError::Archive(error.to_string()))?,
-    );
-    let (scratch, block_claim_index) = store
-        .start_engine_scratch()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let candidate = replay_direct_loaded_bootstrap_with(
-        store,
-        publication,
-        &replay_identity,
-        Some((scratch, Arc::new(block_claim_index))),
-        |descriptor, material| {
-            let found = history
-                .lookup(history_root, descriptor.batch_id())
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .ok_or_else(|| {
-                    EngineError::Archive(
-                        "fresh history is missing an aggregate-bound cold record".into(),
-                    )
-                })?;
-            let replayed = validate_bootstrap_history_record_against_material(
-                descriptor, &found, bootstrap, material,
-            )?;
-            if replayed != terminal_binding && descriptor == terminal {
-                return Err(EngineError::Archive(
-                    "ephemeral bootstrap replay changed the terminal history binding".into(),
-                ));
-            }
-            Ok(())
-        },
-    )?;
-    candidate.seal_ephemeral_bootstrap_predecessor(
-        live_history,
-        terminal.batch_id(),
-        &terminal_binding,
-        lineage_digest,
-        catalog_document_id,
-    )
-}
-
-/// Reconstruct a promoted bootstrap into one detached candidate, deriving the
-/// catalog policy from the authenticated terminal bootstrap record.
-///
-/// This is the restart counterpart of same-process promotion. It avoids the
-/// ordinary enrolled engine's per-part cold recovery path while preserving the
-/// same immutable-part and durable-history checks. The finished candidate is
-/// still only an accelerator; callers migrate it into a resume snapshot and
-/// the enrolled open authenticates that snapshot before replaying any records
-/// written after the bootstrap anchor.
-pub(crate) fn replay_promoted_bootstrap_validating_history(
-    store: &ObjectStore,
-    publication: &super::object_store::ValidatedBootstrapPublicationV1,
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    catalog_document_id: DocumentId,
-    storage: ProjectionStorageBinding,
-    history: &super::object_store::DurableEngineHistoryStore,
-    history_root: ContentDigest,
-    bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
-) -> Result<
-    (
-        DetachedBootstrapCandidate,
-        super::object_store::EngineHistoryBinding,
-    ),
-    EngineError,
-> {
-    let terminal = publication
-        .aggregate()
-        .parts()
-        .last()
-        .copied()
-        .ok_or_else(|| EngineError::Archive("promoted bootstrap has no terminal part".into()))?;
-    let bytes = history
-        .lookup(history_root, terminal.batch_id())
-        .map_err(|error| EngineError::Archive(error.to_string()))?
-        .ok_or_else(|| {
-            EngineError::Archive(
-                "promoted bootstrap terminal record is absent from durable history".into(),
-            )
-        })?;
-    let record = decode_history_record(terminal.batch_id(), &bytes)?;
-    if record.generation != u64::from(bootstrap.part_count())
-        || record.bootstrap != Some(bootstrap)
-        || !matches!(record.status, ArchiveStatus::Accepted { .. })
-    {
-        return Err(EngineError::Archive(
-            "promoted bootstrap terminal record does not bind the aggregate anchor".into(),
-        ));
-    }
-    let terminal_binding = history_record_binding(&record);
-    let replay_identity = DetachedBootstrapReplayIdentity::new(
-        workspace_id,
-        lineage_digest,
-        catalog_document_id,
-        record.reference_catalog_policy,
-        storage,
-        store
-            .canonical_archive_identity()
-            .map_err(|error| EngineError::Archive(error.to_string()))?,
-    );
-    let (candidate, replayed_terminal_binding) = replay_direct_loaded_bootstrap_validating_history(
-        store,
-        publication,
-        &replay_identity,
-        history,
-        history_root,
-        bootstrap,
-    )?;
-    if replayed_terminal_binding != terminal_binding {
-        return Err(EngineError::Archive(
-            "detached bootstrap replay changed the terminal history binding".into(),
-        ));
-    }
-    Ok((candidate, terminal_binding))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6467,53 +6301,6 @@ impl fmt::Display for RetainedScratchResumeFailure {
     }
 }
 
-/// The complete content-addressed Patricia inventory owned by a store-backed hot
-/// engine. Keeping this closed list beside the shared builder makes adding a
-/// fifth store impossible without updating both ordinary ownership and
-/// maintenance accounting.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContentPatriciaIndexKind {
-    LogseqUuidClaims,
-    PortablePaths,
-    PageNames,
-}
-
-impl ContentPatriciaIndexKind {
-    const ALL: [Self; 3] = [Self::LogseqUuidClaims, Self::PortablePaths, Self::PageNames];
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PackedPatriciaMaintenanceOutcome {
-    Reclaimed(PatriciaIndexReclamationReport),
-    Busy,
-    Unavailable(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PackedPatriciaIndexMaintenance {
-    pub(crate) kind: ContentPatriciaIndexKind,
-    pub(crate) outcome: PackedPatriciaMaintenanceOutcome,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PackedPatriciaMaintenanceReport {
-    pub(crate) indexes: [PackedPatriciaIndexMaintenance; 3],
-}
-
-struct ContentPatriciaIndexes<'a> {
-    stores: [Option<&'a PatriciaIndexStore>; 3],
-}
-
-impl<'a> ContentPatriciaIndexes<'a> {
-    fn iter(
-        &'a self,
-    ) -> impl Iterator<Item = (ContentPatriciaIndexKind, Option<&'a PatriciaIndexStore>)> + 'a {
-        ContentPatriciaIndexKind::ALL
-            .into_iter()
-            .zip(self.stores.iter().copied())
-    }
-}
-
 /// The exact run-local engine state one cross-process resume needs.
 ///
 /// **Derivation.** `reconstruct_run_local_state` is the same-process
@@ -8668,26 +8455,6 @@ impl ShardedHotEngine {
         )
     }
 
-    /// Construct the archive-backed engine used by the clean-baseline runtime.
-    ///
-    /// Unlike the legacy constructor, this does not open or create the native
-    /// block, external-UUID, path, page-name, or accepted-status Patricia
-    /// indexes. Those facts are respectively owned by the disposable SQLite
-    /// projection and by the accepted operation manifests themselves. Page
-    /// documents are point-loaded from the immutable baseline/tail and evicted
-    /// normally; the old persistent staging scratch is not part of this
-    /// runtime.
-    pub(crate) fn with_clean_archive_store(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-    ) -> Result<Self, EngineError> {
-        let workspace_id = store.workspace_id();
-        let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
-        engine.attach_clean_archive_store(store)?;
-        Ok(engine)
-    }
-
     /// Attach accepted operation storage to an already-open clean baseline
     /// without changing its run-local engine identity.
     ///
@@ -9343,68 +9110,6 @@ impl ShardedHotEngine {
         engine
     }
 
-    /// Build the complete maintenance inventory from the same live store
-    /// handles ordinary engine work owns. No path is reopened and no directory
-    /// is enumerated while constructing this view.
-    fn content_patricia_indexes(&self) -> ContentPatriciaIndexes<'_> {
-        ContentPatriciaIndexes {
-            stores: [
-                self.logseq_claim_index.as_deref(),
-                self.portable_path_index
-                    .as_deref()
-                    .map(PortablePathIndexStore::patricia_index),
-                self.page_name_index
-                    .as_deref()
-                    .map(PageNameOwnershipStore::patricia_index),
-            ],
-        }
-    }
-
-    /// Best-effort packed-file maintenance for every live authenticated
-    /// Patricia store. Each store authenticates its own current packed head
-    /// before scanning; a busy or malformed store never suppresses the other
-    /// independent attempts.
-    pub(crate) fn reclaim_unreachable_packed_patricia_files(
-        &self,
-    ) -> PackedPatriciaMaintenanceReport {
-        let inventory = self.content_patricia_indexes();
-        let mut indexes = inventory
-            .iter()
-            .map(|(kind, store)| PackedPatriciaIndexMaintenance {
-                kind,
-                outcome: match store {
-                    Some(store) => match store.reclaim_unreachable_packed_files() {
-                        Ok(report) => PackedPatriciaMaintenanceOutcome::Reclaimed(report),
-                        Err(PatriciaIndexReclamationError::Busy) => {
-                            PackedPatriciaMaintenanceOutcome::Busy
-                        }
-                        Err(error) => {
-                            PackedPatriciaMaintenanceOutcome::Unavailable(error.to_string())
-                        }
-                    },
-                    None => PackedPatriciaMaintenanceOutcome::Unavailable(
-                        "content-addressed Patricia store is unavailable".to_owned(),
-                    ),
-                },
-            });
-        PackedPatriciaMaintenanceReport {
-            indexes: [
-                indexes.next().expect("closed Patricia inventory entry"),
-                indexes.next().expect("closed Patricia inventory entry"),
-                indexes.next().expect("closed Patricia inventory entry"),
-            ],
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn packed_patricia_reclamation_attempts(&self) -> usize {
-        self.content_patricia_indexes()
-            .iter()
-            .filter_map(|(_, store)| store)
-            .map(PatriciaIndexStore::reclamation_attempts)
-            .sum()
-    }
-
     pub(crate) fn runtime_authority(&self) -> &EngineAuthority {
         &self.runtime_authority
     }
@@ -9486,60 +9191,6 @@ impl ShardedHotEngine {
             EngineScratchOpen::Fresh,
             false,
         )
-    }
-
-    /// Open the enrolled projection capabilities for a promoted
-    /// bootstrap-anchored runtime.
-    ///
-    /// Identical to [`Self::with_enrolled_projection`] except that the durable
-    /// history control is sealed through the promoted path, which is the only
-    /// construction that unfences a bootstrap-bound history for writes.
-    pub(crate) fn with_promoted_projection(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        promotion: &super::object_store::PromotedRuntimeStateV1,
-    ) -> Self {
-        Self::with_enrolled_projection_promoted(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            graph,
-            receipts,
-            Some(promotion),
-            EngineScratchOpen::Fresh,
-            false,
-        )
-    }
-
-    /// Open the enrolled projection capabilities and complete startup recovery
-    /// for a promoted bootstrap-anchored runtime.
-    pub(crate) fn open_promoted_projection(
-        store: ObjectStore,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        promotion: &super::object_store::PromotedRuntimeStateV1,
-        committed_manifests: &[OperationBatch],
-    ) -> Result<(Self, Vec<StageOutcome>), EngineError> {
-        let mut engine = Self::with_promoted_projection(
-            store,
-            lineage_digest,
-            catalog_document_id,
-            graph,
-            receipts,
-            promotion,
-        );
-        if engine.history_failure.is_none() {
-            if let Err(error) = engine.attach_promoted_bootstrap_parts() {
-                engine.history_failure = Some(error);
-            }
-        }
-        let outcomes = engine.complete_enrolled_projection_recovery(committed_manifests)?;
-        Ok((engine, outcomes))
     }
 
     /// Open an enrolled runtime — promoted when `promotion` is supplied — on a
@@ -9855,20 +9506,6 @@ impl ShardedHotEngine {
         );
         let outcomes = engine.complete_enrolled_projection_recovery(committed_manifests)?;
         Ok((engine, outcomes))
-    }
-
-    pub(crate) fn with_archive_store_for_endpoint(
-        open: super::object_store::EnrolledProjectionOpen,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-    ) -> Self {
-        Self::with_archive_store_for_endpoint_scratch(
-            open,
-            lineage_digest,
-            catalog_document_id,
-            EngineScratchOpen::Fresh,
-            false,
-        )
     }
 
     fn with_archive_store_for_endpoint_scratch(
@@ -11878,6 +11515,7 @@ impl ShardedHotEngine {
         self.lineage_digest
     }
 
+    #[cfg(test)]
     pub fn managed_local_work(&self) -> ManagedLocalWork {
         self.local_overlay.work.get()
     }
@@ -11986,6 +11624,7 @@ impl ShardedHotEngine {
         Ok(Some(page))
     }
 
+    #[cfg(test)]
     /// Remove the complete pending overlay only after authenticated accepted
     /// state proves the same prefix and exact resulting documents.
     pub fn collapse_managed_local_prefix(
@@ -12020,33 +11659,6 @@ impl ShardedHotEngine {
         self.local_overlay.commitment = ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0");
         self.advance_author_mutation_generation();
         Ok(removed)
-    }
-
-    /// Restore the logical cursor represented by a compacted physical journal.
-    ///
-    /// The discarded frames are never reconstructed. The caller must instead
-    /// supply the authenticated accepted-batch evidence embedded in the
-    /// generation anchor. Only a genuinely empty overlay may be seeded, and
-    /// the current accepted engine must still prove that evidence active.
-    pub(crate) fn seed_compacted_managed_local_prefix(
-        &mut self,
-        next_sequence: u64,
-        accepted_batch_id: BatchId,
-    ) -> Result<(), ManagedLocalRecordError> {
-        let prefix = self.managed_local_prefix_state();
-        if prefix.next_sequence != 0 || prefix.records_applied != 0 {
-            return Err(ManagedLocalRecordError::OutOfOrder {
-                expected: 0,
-                found: prefix.next_sequence,
-            });
-        }
-        if !self.accepted_batch_is_active(accepted_batch_id)? {
-            return Err(ManagedLocalRecordError::AcceptedFrontierMismatch);
-        }
-        self.local_overlay.next_sequence = next_sequence;
-        self.local_overlay.commitment = ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0");
-        self.advance_author_mutation_generation();
-        Ok(())
     }
 
     pub fn configure_reference_catalog_policy(
@@ -14149,12 +13761,14 @@ impl ShardedHotEngine {
         Ok(self.accepted_frontier.get(&document_id).cloned())
     }
 
+    #[cfg(test)]
     /// Legacy no-store evidence snapshot. Store-backed engines retain only an
     /// authenticated handle and must be inspected through bounded pages.
     pub fn fatal_evidence(&self) -> Option<&ImmutableHomeEvidence> {
         self.fatal_evidence.as_ref()
     }
 
+    #[cfg(test)]
     pub fn fatal_evidence_handle(&self) -> Option<FatalEvidenceHandle> {
         self.fatal_handle
     }
@@ -14630,6 +14244,7 @@ impl ShardedHotEngine {
         Ok(self.portable_path_conflicts.values().cloned().collect())
     }
 
+    #[cfg(test)]
     pub fn fatal_evidence_page(
         &self,
         cursor: Option<FatalEvidenceCursor>,
@@ -14737,6 +14352,7 @@ impl ShardedHotEngine {
         }
     }
 
+    #[cfg(test)]
     pub fn stage_from_store(
         &mut self,
         store: &ObjectStore,
@@ -15054,6 +14670,7 @@ impl ShardedHotEngine {
         }))
     }
 
+    #[cfg(test)]
     pub fn stage_ready(&mut self, batch: ValidatedBatch) -> StageOutcome {
         let batch_id = batch.manifest().batch_id();
         // A terminal workspace still admits immutable validated history into
@@ -17001,6 +16618,7 @@ impl ShardedHotEngine {
         self.apply_managed_local_record(prepared.record.clone(), prepared.journal_payload())
     }
 
+    #[cfg(test)]
     /// Replay one complete recovered record through the same transition used
     /// by live admission.
     pub fn replay_managed_local_record(
@@ -17009,134 +16627,6 @@ impl ShardedHotEngine {
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
         let record = decode_managed_local_record(frame)?;
         self.apply_managed_local_record(record, frame.payload())
-    }
-
-    /// Restore one journal-prefix position after the accepted engine base has
-    /// reopened. A derivative drain may have accepted the exact batch before a
-    /// crash without reaching its final checkpoint. In that state replaying
-    /// the CRDT update again would correctly report a stale base, but the
-    /// runtime still has to restore the journal sequence, causal predecessor,
-    /// projection predecessor, and rolling commitment before serving another
-    /// local edit.
-    ///
-    /// Exact unaccepted records continue through the ordinary replay
-    /// transition above. An already-accepted record is adopted only after its
-    /// authenticated accepted-history manifest fingerprint matches the
-    /// canonical journal manifest and the record still satisfies the strict
-    /// managed-local shape. No document or graph mutation occurs in the
-    /// accepted branch.
-    pub fn restore_managed_local_record(
-        &mut self,
-        frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    ) -> Result<(), ManagedLocalRecordError> {
-        let record = decode_managed_local_record(frame)?;
-        let batch_id = record.prepared_batch.manifest().batch_id();
-        if self.accepted_batch_is_active(batch_id)? {
-            self.adopt_accepted_managed_local_record(record, frame.payload())
-        } else {
-            self.apply_managed_local_record(record, frame.payload())?;
-            Ok(())
-        }
-    }
-
-    fn adopt_accepted_managed_local_record(
-        &mut self,
-        record: ManagedLocalRecord,
-        bytes: &[u8],
-    ) -> Result<(), ManagedLocalRecordError> {
-        let manifest = record.prepared_batch.manifest();
-        if manifest.workspace_id() != self.workspace_id {
-            return Err(EngineError::WorkspaceMismatch {
-                expected: self.workspace_id,
-                found: manifest.workspace_id(),
-            }
-            .into());
-        }
-        if manifest.lineage_digest() != self.lineage_digest {
-            return Err(EngineError::LineageMismatch {
-                expected: self.lineage_digest,
-                found: manifest.lineage_digest(),
-            }
-            .into());
-        }
-        if record.sequence != self.local_overlay.next_sequence {
-            return Err(ManagedLocalRecordError::OutOfOrder {
-                expected: self.local_overlay.next_sequence,
-                found: record.sequence,
-            });
-        }
-        if manifest.origin() != BatchOrigin::LocalMutation
-            || !record.semantic_effect.pages().is_empty()
-            || record.semantic_effect.blocks().iter().any(|delta| {
-                match (&delta.before, &delta.after) {
-                    (Some(before), Some(after)) => {
-                        before.logseq_uuid != after.logseq_uuid
-                            || before.logseq_identity_origin != after.logseq_identity_origin
-                    }
-                    (None, Some(after)) => {
-                        after.logseq_uuid.is_some() || after.logseq_identity_origin.is_some()
-                    }
-                    (Some(_), None) | (None, None) => false,
-                }
-            })
-        {
-            return Err(ManagedLocalRecordError::Unsupported(
-                "accepted journal record is not an ordinary existing-page managed-local edit"
-                    .into(),
-            ));
-        }
-        let affected = affected_projection_pages(&record.semantic_effect);
-        if affected.len() != 1 || !affected.contains(&record.projection.intent.page_id()) {
-            return Err(ManagedLocalRecordError::Unsupported(
-                "accepted journal record does not affect exactly its one projected page".into(),
-            ));
-        }
-        let evidence = self.accepted_batch_evidence(manifest.batch_id())?;
-        if evidence.manifest_fingerprint() != batch_fingerprint_from_manifest(manifest) {
-            return Err(ManagedLocalRecordError::CorruptPayload(
-                "accepted history differs from the canonical journal manifest".into(),
-            ));
-        }
-        if let Some(prior) = self.local_overlay.entries.last() {
-            let dot = manifest.causal_dot();
-            let expected_counter = prior.causal_dot.counter().checked_add(1).ok_or_else(|| {
-                ManagedLocalRecordError::CorruptPayload(
-                    "accepted journal causal counter overflow".into(),
-                )
-            })?;
-            if dot.peer_id() != prior.causal_dot.peer_id()
-                || dot.counter() != expected_counter
-                || !manifest.causal_dependency_heads().contains(&prior.batch_id)
-            {
-                return Err(ManagedLocalRecordError::CorruptPayload(
-                    "accepted journal prefix lost its exact causal predecessor".into(),
-                ));
-            }
-        }
-        let next_sequence = self
-            .local_overlay
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| ManagedLocalRecordError::CorruptPayload("sequence overflow".into()))?;
-        let payload_digest = ContentDigest::of(bytes);
-        let mut commitment = Vec::with_capacity(96);
-        commitment.extend_from_slice(b"tine/managed-local-prefix/v1\0");
-        commitment.extend_from_slice(self.local_overlay.commitment.as_bytes());
-        commitment.extend_from_slice(payload_digest.as_bytes());
-        commitment.extend_from_slice(&record.sequence.to_be_bytes());
-        self.local_overlay.commitment = ContentDigest::of(&commitment);
-        self.local_overlay.entries.push(CommittedLocalOverlayEntry {
-            sequence: record.sequence,
-            batch_id: manifest.batch_id(),
-            causal_dot: manifest.causal_dot(),
-            projection: record.projection,
-        });
-        self.local_overlay.next_sequence = next_sequence;
-        let mut work = self.local_overlay.work.get();
-        work.commits_applied = work.commits_applied.saturating_add(1);
-        self.local_overlay.work.set(work);
-        self.advance_author_mutation_generation();
-        Ok(())
     }
 
     fn validate_managed_local_candidate(
@@ -43202,6 +42692,71 @@ mod validation_tests {
         drop(engine);
         drop(writer);
         crate::test_support::remove_dir_all(root);
+    }
+
+    /// The clean write path has exactly two staging entry points.
+    ///
+    /// `stage_ready_internal` / `stage_ready_scratch` are reached from
+    /// production only through `stage_ready_with_claim_source`, and that
+    /// helper is called only by the clean replay and the clean commit. The
+    /// legacy `stage_ready` / `stage_from_store` pair is `#[cfg(test)]` and
+    /// cannot reach it at all. Widening this set widens the audited write
+    /// path, so the set is pinned here rather than asserted in a comment.
+    #[test]
+    fn stage_ready_with_claim_source_has_exactly_the_two_clean_entry_points() {
+        let source = include_str!("hot_engine.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod validation_tests")
+            .next()
+            .expect("the hot-engine production half remains identifiable");
+        let mut enclosing = "<file scope>";
+        let mut definitions = Vec::new();
+        let mut callers = Vec::new();
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| trimmed.strip_prefix("pub fn "))
+                .or_else(|| trimmed.strip_prefix("fn "))
+            {
+                enclosing = rest
+                    .split(['(', '<'])
+                    .next()
+                    .expect("a function declaration names a function");
+            }
+            if !line.contains("stage_ready_with_claim_source(") {
+                continue;
+            }
+            if trimmed.starts_with("fn ") || trimmed.starts_with("pub") {
+                definitions.push(enclosing);
+            } else {
+                callers.push(enclosing);
+            }
+        }
+        assert_eq!(
+            definitions,
+            vec!["stage_ready_with_claim_source"],
+            "the claim-source staging helper must be declared exactly once"
+        );
+        assert_eq!(
+            callers,
+            vec!["replay_clean_committed_tail", "commit_clean_prepared"],
+            "only the clean replay and the clean commit may stage with a claim source"
+        );
+        assert_eq!(
+            production.matches("stage_ready_with_claim_source").count(),
+            3,
+            "one declaration plus exactly two clean-path call sites"
+        );
+        for legacy in [
+            "#[cfg(test)]\n    pub fn stage_ready(",
+            "#[cfg(test)]\n    pub fn stage_from_store(",
+        ] {
+            assert!(
+                production.contains(legacy),
+                "the legacy staging entry point {legacy:?} must stay test-only"
+            );
+        }
     }
 
     #[test]

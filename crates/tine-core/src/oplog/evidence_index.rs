@@ -107,6 +107,7 @@ pub(crate) fn upsert_conflict(
     Ok((next, handle))
 }
 
+#[cfg(test)]
 pub(crate) fn page_conflicts(
     store: &ScratchStore,
     roots: &ScratchRoots,
@@ -383,6 +384,7 @@ fn node_max_key(node: &ConflictDirectoryNode) -> Result<BlockId, EvidenceIndexEr
     .ok_or(EvidenceIndexError::Malformed)
 }
 
+#[cfg(test)]
 fn collect_keys_after(
     store: &ScratchStore,
     node_ref: &ScratchBlobRef,
@@ -463,6 +465,7 @@ fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EvidenceIndexError {
     Scratch(String),
+    #[cfg(test)]
     InvalidPageLimit,
     Malformed,
     Misbound,
@@ -472,6 +475,7 @@ impl fmt::Display for EvidenceIndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Scratch(error) => write!(f, "conflict scratch index failed: {error}"),
+            #[cfg(test)]
             Self::InvalidPageLimit => f.write_str("fatal-evidence page limit is outside 1..=32"),
             Self::Malformed => f.write_str("malformed conflict evidence record"),
             Self::Misbound => f.write_str("misbound conflict evidence root"),
