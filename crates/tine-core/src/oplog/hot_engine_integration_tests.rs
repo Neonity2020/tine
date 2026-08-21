@@ -20,7 +20,6 @@ use loro::{ExportMode, LoroDoc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-
 struct TestDir(PathBuf);
 
 impl TestDir {

@@ -10241,6 +10241,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::oplog::import::{
+        commit_clean_activation, open_clean_activation, prepare_clean_activation,
+    };
+    use crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY;
+    use crate::oplog::local_active::CleanLocalRuntime;
+    use crate::oplog::operational_coordinator::{CleanLocalMutationState, OperationalCoordinator};
+    use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
         AuthorBatch, BatchCausalDot, BatchDisposition, BatchOrigin, BlockId, BlockLocation,
         CausalPeerId, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentDependencies, DocumentId,
@@ -10248,8 +10255,9 @@ mod tests {
         MaterializedBlockInput, MaterializedEntityId, MaterializedPageInput, MaterializedProperty,
         MaterializedReference, MaterializedReferenceKind, MaterializedReferrerRow,
         MaterializedTask, OperationBatch, OperationObject, OperationTransaction, PageId,
-        PageRename, PreparedBatch, ProjectionEndpointBinding, ProjectionEndpointId,
-        ProjectionReceiptStore, SemanticOperation, SessionId,
+        PageRename, PreparedBatch, ProjectionClaim, ProjectionEndpointBinding,
+        ProjectionEndpointId, ProjectionReceiptStore, ReferenceCatalogPolicyV1, SemanticOperation,
+        SessionId,
     };
 
     struct TestDir(PathBuf);
@@ -10563,6 +10571,223 @@ mod tests {
             );
         }
         event
+    }
+
+    struct CleanIdentityFixture {
+        _dir: TestDir,
+        graph_root: PathBuf,
+        graph: crate::Graph,
+        receipts: ProjectionReceiptStore,
+        runtime: CleanLocalRuntime,
+    }
+
+    impl CleanIdentityFixture {
+        fn new(label: &str, ids: TestIds) -> Self {
+            let dir = TestDir::new(label);
+            let graph_path = dir.path().join("graph");
+            fs::create_dir(&graph_path).unwrap();
+            fs::create_dir(graph_path.join("pages")).unwrap();
+            fs::write(graph_path.join("pages/seed.md"), b"- seed\n").unwrap();
+            let graph = crate::Graph::open(&graph_path);
+            let archive = dir.path().join("archive");
+            fs::create_dir(&archive).unwrap();
+            let enrollment = dir.path().join("enrollment");
+            let database = dir.path().join("projection.sqlite");
+            let capture_root = dir.path().join("capture");
+            fs::create_dir(&capture_root).unwrap();
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_root)
+                .unwrap();
+            let preparation = prepare_clean_activation(
+                &graph,
+                capture,
+                ids.workspace,
+                ids.lineage,
+                ids.catalog,
+                &dir.path().join("preparation"),
+                &database,
+                &ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap();
+            let committed = commit_clean_activation(
+                &graph,
+                preparation,
+                &archive.join(LAZY_GENESIS_BASELINE_DIRECTORY),
+                &enrollment,
+            )
+            .unwrap();
+            let (_, _, baseline_frontier, _) = committed.into_parts();
+            let reopened = open_clean_activation(
+                &enrollment,
+                &archive.join(LAZY_GENESIS_BASELINE_DIRECTORY),
+                &database,
+                ids.catalog,
+                ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap()
+            .expect("clean identity fixture reopens");
+            let (mut engine, projection, _) = reopened.into_parts();
+            let operations = archive.join("operations");
+            engine
+                .attach_clean_archive_store(ObjectStore::open(&operations, ids.workspace).unwrap())
+                .unwrap();
+            let store = ObjectStore::open(&operations, ids.workspace).unwrap();
+            let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+            let leased = LeasedWorkspaceProjection::adopt_clean_genesis(
+                lease,
+                &database,
+                ids.claim(),
+                &baseline_frontier,
+                &store,
+                &engine,
+                projection,
+            )
+            .map_err(|(_, error)| error)
+            .unwrap();
+            let endpoint = ProjectionEndpointBinding::enroll_graph(
+                &graph,
+                ProjectionEndpointId::from_uuid(uuid(2_000_000)),
+                DeviceId::from_uuid(uuid(2_000_001)),
+            )
+            .unwrap();
+            let receipts = ProjectionReceiptStore::open_for_endpoint(
+                &dir.path().join("receipts"),
+                ids.workspace,
+                endpoint,
+            )
+            .unwrap();
+            engine
+                .attach_clean_projection_endpoint(&graph, &receipts)
+                .unwrap();
+            let runtime = CleanLocalRuntime::from_open_parts(
+                SessionId::from_uuid(uuid(2_000_002)),
+                endpoint,
+                engine,
+                leased,
+            )
+            .unwrap();
+            Self {
+                _dir: dir,
+                graph_root: graph_path,
+                graph,
+                receipts,
+                runtime,
+            }
+        }
+
+        fn apply_and_assert_identity_shadow(
+            &mut self,
+            transaction: &OperationTransaction,
+        ) -> AcceptedBatchEvent {
+            let batch_id = {
+                let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
+                match OperationalCoordinator::execute_clean_local(
+                    &mut session,
+                    &self.graph,
+                    &self.receipts,
+                    transaction,
+                )
+                .unwrap()
+                {
+                    CleanLocalMutationState::Complete(batch_id) => batch_id,
+                    CleanLocalMutationState::DurablePending(pending) => {
+                        panic!(
+                            "clean identity mutation remained pending: {}",
+                            pending.failure()
+                        )
+                    }
+                }
+            };
+            let engine = self.runtime.engine();
+            let store = engine.archive_store().unwrap();
+            let event = AcceptedBatchEvent::from_accepted(engine, store, batch_id).unwrap();
+            let effect = SemanticEffect::decode(event.semantic_effect()).unwrap();
+            let oracle = engine
+                .accepted_identity_projection_records(event.batch_id(), &effect)
+                .unwrap();
+            let read = self.runtime.database().materialized_read().unwrap();
+            for (key_digest, record) in oracle.page_names {
+                assert_eq!(
+                    read.page_name_identity_record(key_digest).unwrap(),
+                    Some(
+                        crate::oplog::sqlite_materialization::MaterializedIdentityRecordRow {
+                            key_digest,
+                            record,
+                        },
+                    )
+                );
+            }
+            for (key_digest, record) in oracle.portable_paths {
+                assert_eq!(
+                    read.portable_path_identity_record(key_digest).unwrap(),
+                    Some(
+                        crate::oplog::sqlite_materialization::MaterializedIdentityRecordRow {
+                            key_digest,
+                            record,
+                        },
+                    )
+                );
+            }
+            event
+        }
+
+        fn reconcile_and_assert_identity_shadow(&mut self, path: &str) -> AcceptedBatchEvent {
+            let batch_id = {
+                let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
+                match OperationalCoordinator::execute_clean_external(
+                    &mut session,
+                    &self.graph,
+                    &self.receipts,
+                    &[path],
+                )
+                .unwrap()
+                {
+                    crate::oplog::operational_coordinator::CleanExternalMutationState::Complete(
+                        batch_id,
+                    ) => batch_id,
+                    crate::oplog::operational_coordinator::CleanExternalMutationState::Noop => {
+                        panic!("clean identity external mutation was unexpectedly a no-op")
+                    }
+                    crate::oplog::operational_coordinator::CleanExternalMutationState::DurablePending(
+                        pending,
+                    ) => panic!(
+                        "clean identity external mutation remained pending: {}",
+                        pending.failure()
+                    ),
+                }
+            };
+            let engine = self.runtime.engine();
+            let store = engine.archive_store().unwrap();
+            let event = AcceptedBatchEvent::from_accepted(engine, store, batch_id).unwrap();
+            let effect = SemanticEffect::decode(event.semantic_effect()).unwrap();
+            let oracle = engine
+                .accepted_identity_projection_records(event.batch_id(), &effect)
+                .unwrap();
+            let read = self.runtime.database().materialized_read().unwrap();
+            for (key_digest, record) in oracle.page_names {
+                assert_eq!(
+                    read.page_name_identity_record(key_digest).unwrap(),
+                    Some(
+                        crate::oplog::sqlite_materialization::MaterializedIdentityRecordRow {
+                            key_digest,
+                            record,
+                        },
+                    )
+                );
+            }
+            for (key_digest, record) in oracle.portable_paths {
+                assert_eq!(
+                    read.portable_path_identity_record(key_digest).unwrap(),
+                    Some(
+                        crate::oplog::sqlite_materialization::MaterializedIdentityRecordRow {
+                            key_digest,
+                            record,
+                        },
+                    )
+                );
+            }
+            event
+        }
     }
 
     fn wait_for_file(path: &Path) {
@@ -12979,32 +13204,17 @@ mod tests {
     }
 
     #[test]
-    fn enrolled_identity_shadow_matches_accepted_history_across_lifecycle() {
+    fn clean_identity_shadow_matches_accepted_history_across_lifecycle() {
         let ids = TestIds::new(2_260);
-        let dir = TestDir::new("enrolled-identity-shadow");
-        let (store, mut engine) = enrolled_test_engine(&dir, ids);
-        let mut database = open_test_projection(
-            &dir.path().join("identity-shadow.sqlite"),
-            ids.claim(),
-            RebuildSource::new(&engine, &store).unwrap(),
-        )
-        .unwrap()
-        .database;
-
-        let create = engine
-            .prepare_bootstrap_transaction(
-                author(2_270),
-                &root_transaction_named(
-                    ids,
-                    "pages/identity-alpha.md",
-                    "Identity Alpha",
-                    "identity block",
-                ),
-            )
-            .unwrap();
-        let create_event =
-            apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &create);
-        let read = database.materialized_read().unwrap();
+        let mut fixture = CleanIdentityFixture::new("clean-identity-shadow", ids);
+        let create = root_transaction_named(
+            ids,
+            "pages/identity-alpha.md",
+            "Identity Alpha",
+            "identity block",
+        );
+        let create_event = fixture.apply_and_assert_identity_shadow(&create);
+        let read = fixture.runtime.database().materialized_read().unwrap();
         let name_record = read
             .causal_page_name_identity_record(
                 crate::oplog::LogicalPageName::parse("Identity Alpha")
@@ -13028,7 +13238,9 @@ mod tests {
         );
         drop(read);
         assert_eq!(
-            database
+            fixture
+                .runtime
+                .database()
                 .materialized_read()
                 .unwrap()
                 .block_home_claims(ids.block, 2)
@@ -13044,25 +13256,16 @@ mod tests {
         );
 
         let external_uuid = LogseqUuid::from_uuid(uuid(2_280));
-        let assign = engine
-            .prepare_bootstrap_transaction(
-                author(2_271),
-                &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
-                    block: BlockLocation {
-                        block_id: ids.block,
-                        home_document_id: ids.document,
-                    },
-                    mutation: LogseqIdentityMutation::AssignExternal {
-                        logseq_uuid: external_uuid,
-                    },
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let assign_event =
-            apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &assign);
+        fs::write(
+            fixture.graph_root.join("pages/identity-alpha.md"),
+            format!("- identity block\n  id:: {external_uuid}\n"),
+        )
+        .unwrap();
+        let assign_event = fixture.reconcile_and_assert_identity_shadow("pages/identity-alpha.md");
         assert_eq!(
-            database
+            fixture
+                .runtime
+                .database()
                 .materialized_read()
                 .unwrap()
                 .logseq_uuid_introductions(external_uuid, 3)
@@ -13082,85 +13285,62 @@ mod tests {
             (2_272, "IDENTITY ALPHA", "pages/identity-alpha.md"),
             (2_273, "Identity Beta", "pages/identity-beta.md"),
         ] {
-            let rename = engine
-                .prepare_bootstrap_transaction(
-                    author(batch_seed),
-                    &OperationTransaction::new(vec![
-                        SemanticOperation::RenamePagesAndRewriteReferrers {
-                            page_changes: vec![PageRename {
-                                page_id: ids.page,
-                                new_name: crate::oplog::LogicalPageName::parse(name).unwrap(),
-                                new_path: ManagedPath::parse(path).unwrap(),
-                            }],
-                            block_rewrites: Vec::new(),
-                            page_preamble_rewrites: Vec::new(),
-                        },
-                    ])
-                    .unwrap(),
-                )
-                .unwrap();
-            apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &rename);
+            let _ = batch_seed;
+            let rename = OperationTransaction::new(vec![
+                SemanticOperation::RenamePagesAndRewriteReferrers {
+                    page_changes: vec![PageRename {
+                        page_id: ids.page,
+                        new_name: crate::oplog::LogicalPageName::parse(name).unwrap(),
+                        new_path: ManagedPath::parse(path).unwrap(),
+                    }],
+                    block_rewrites: Vec::new(),
+                    page_preamble_rewrites: Vec::new(),
+                },
+            ])
+            .unwrap();
+            fixture.apply_and_assert_identity_shadow(&rename);
         }
 
-        let delete = engine
-            .prepare_bootstrap_transaction(
-                author(2_274),
-                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
-                    page_id: ids.page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &delete);
+        let delete =
+            OperationTransaction::new(vec![SemanticOperation::DeletePage { page_id: ids.page }])
+                .unwrap();
+        fixture.apply_and_assert_identity_shadow(&delete);
 
         let replacement_page = PageId::from_uuid(uuid(2_281));
         let replacement_document = DocumentId::from_uuid(uuid(2_282));
         let replacement_block = BlockId::from_uuid(uuid(2_283));
-        let reacquire = engine
-            .prepare_bootstrap_transaction(
-                author(2_275),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::CreatePage {
-                        page_id: replacement_page,
-                        home_document_id: replacement_document,
-                        name: crate::oplog::LogicalPageName::parse("Identity Alpha").unwrap(),
-                        path: ManagedPath::parse("pages/identity-alpha.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreateBlock {
-                        block: BlockLocation {
-                            block_id: replacement_block,
-                            home_document_id: replacement_document,
-                        },
-                        page_id: replacement_page,
-                        parent: None,
-                        order: "a".into(),
-                        content: "replacement identity block".into(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &reacquire);
+        let reacquire = OperationTransaction::new(vec![
+            SemanticOperation::CreatePage {
+                page_id: replacement_page,
+                home_document_id: replacement_document,
+                name: crate::oplog::LogicalPageName::parse("Identity Alpha").unwrap(),
+                path: ManagedPath::parse("pages/identity-alpha.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            },
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: replacement_block,
+                    home_document_id: replacement_document,
+                },
+                page_id: replacement_page,
+                parent: None,
+                order: "a".into(),
+                content: "replacement identity block".into(),
+            },
+        ])
+        .unwrap();
+        fixture.apply_and_assert_identity_shadow(&reacquire);
 
-        let reintroduce = engine
-            .prepare_bootstrap_transaction(
-                author(2_276),
-                &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
-                    block: BlockLocation {
-                        block_id: replacement_block,
-                        home_document_id: replacement_document,
-                    },
-                    mutation: LogseqIdentityMutation::AssignExternal {
-                        logseq_uuid: external_uuid,
-                    },
-                }])
-                .unwrap(),
-            )
-            .unwrap();
+        fs::write(
+            fixture.graph_root.join("pages/identity-alpha.md"),
+            format!("- replacement identity block\n  id:: {external_uuid}\n"),
+        )
+        .unwrap();
         let reintroduce_event =
-            apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &reintroduce);
-        let introductions = database
+            fixture.reconcile_and_assert_identity_shadow("pages/identity-alpha.md");
+        let introductions = fixture
+            .runtime
+            .database()
             .materialized_read()
             .unwrap()
             .logseq_uuid_introductions(external_uuid, 3)
