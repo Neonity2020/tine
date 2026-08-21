@@ -10491,34 +10491,6 @@ mod tests {
         );
     }
 
-    fn enrolled_test_engine(dir: &TestDir, ids: TestIds) -> (ObjectStore, ShardedHotEngine) {
-        let graph_path = dir.path().join("graph");
-        fs::create_dir(&graph_path).unwrap();
-        let graph = crate::Graph::open(&graph_path);
-        let endpoint = ProjectionEndpointBinding::enroll_graph(
-            &graph,
-            ProjectionEndpointId::from_uuid(uuid(2_000_000)),
-            DeviceId::from_uuid(uuid(2_000_001)),
-        )
-        .unwrap();
-        let receipts = ProjectionReceiptStore::open_for_endpoint(
-            &dir.path().join("receipts"),
-            ids.workspace,
-            endpoint,
-        )
-        .unwrap();
-        let archive = dir.path().join("objects");
-        let writer = ObjectStore::open(&archive, ids.workspace).unwrap();
-        let engine = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&archive, ids.workspace).unwrap(),
-            ids.lineage,
-            ids.catalog,
-            &graph,
-            &receipts,
-        );
-        (writer, engine)
-    }
-
     fn apply_and_assert_identity_shadow(
         database: &mut SqliteFrontier,
         engine: &mut ShardedHotEngine,
