@@ -15,10 +15,10 @@ icon:: 🛟
 	- 1. Open Settings (**t s**) → **Backups & recovery** and find the snapshot from before the damage. (Tine snapshots your Markdown/Org files on every launch; **Snapshots to keep** controls how many survive.)
 	- 2. Choose **Restore** beside it and confirm.
 	- 3. What you should see: your current state is snapshotted first, backed-up graph text returns to its original paths, config and sidecars are restored, and the graph reloads — so even a mistaken restore can be undone by restoring the snapshot it just made.
-- ## Merge a sync-conflict copy
-	- 1. Open Settings → **Backups & recovery** → **Sync conflict copies** and choose **Review in page…** on the copy.
-	- 2. On the page, in the block-by-block diff, pick keep-mine, keep-theirs, or keep-both per block (the page's own properties get their own choice), then **Apply resolution**.
-	- 3. What you should see: your choices are saved to the page through the normal save path, and the conflict copy moves to the trash. If the shadowed page no longer exists, there is nothing to resolve it at — discard the copy in Settings, or restore the page in Logseq.
+- ## Resolve a sync or version-control conflict
+	- 1. Choose the **N conflicts** badge at the bottom of the sidebar, or open Settings → **Backups & recovery** and choose **Review in page…**. Tine uses the same queue for sync-provider conflict copies and files carrying unresolved git or Fossil merge markers.
+	- 2. On the page, compare the complete versions in the block-by-block review. Accept or change each suggested choice, use keep-both where both versions matter, choose the page properties separately when needed, then **Apply resolution**.
+	- 3. What you should see: the chosen page is saved through the normal guarded path. A provider conflict copy moves to the trash; a version-control page is written without conflict markers. If a conflict copy's original page no longer exists, discard the copy in Settings or restore the page in Logseq first.
 - ## Reconcile a duplicate journal day
 	- 1. Open Settings → **Backups & recovery** → **Duplicate journal days** — usually left over from a journal date-format change or a sync.
 	- 2. Choose **Open** to view a file (it saves back to itself), **Merge** to fold it into the canonical day, **Rename** to turn it into a normal page, or **Trash** (recoverable).

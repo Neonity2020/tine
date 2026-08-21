@@ -8,19 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
 ### Fixed
 
-- Opening a long-lived managed graph got slower the more edit history it had,
-  independent of graph size: the startup replay re-validated every remaining
-  batch's projection objects once per admission round. Each batch's
-  dependencies are now computed exactly once, which roughly halves a
-  multi-hundred-save reopen; the remaining history-proportional cost is
-  tracked for a deeper fix.
-- The one-time app-data migration at startup no longer trusts a momentarily
-  unreadable `backups/` folder: any read error now means "assume there is user
-  data and leave everything alone", the existing folder is set aside instead of
-  deleted until the migrated data is actually in place, and an interrupted
-  fallback copy can no longer leave a half-populated app-data folder behind.
+## [0.6.94] - 2026-08-21
 
 ### Added
 
@@ -64,6 +58,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   Nothing is merged without your confirm, exactly as before; with no
   remembered version the diff simply looks the way it always did.
   (ADR 0056; part of Concord P3, GH #337.)
+
 - **A path-free block-diff command pair (`text_block_diff` /
   `text_block_diff3`)** diffs two or three raw page texts with the same
   block-tree engine the conflict merge uses — the seam the upcoming in-page
@@ -77,27 +72,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Managed-storage activation no longer rejects a complete graph because Direct Files or the startup path catalog retained a different one-page inventory.** Readiness is now proved inside the candidate managed generation by opening its transactionally complete, exact-frontier-stamped SQLite inventory and a real page; the candidate remains unpublished until that proof succeeds.
 
+- **Files with unresolved git/Fossil merge-conflict markers are now quarantined instead of mangled.** A page whose file contains column-0 conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`, and Fossil's verbose variants) stays fully readable, but every save to it is refused with a message naming the markers — previously an edit re-indented or dropped the markers on re-save, which broke git's own conflict detection and could silently lose one side of the merge. Markers quoted inside code fences don't trigger the quarantine. Affected files are listed in Settings → Backups & recovery, and the page shows a banner explaining how to resolve.
+
 ### Changed
 
 - **Conflicts are now resolved in one place: the page.** The block-by-block merge dialog inside Settings is gone. Settings → Backups & recovery keeps the *inventory* — which conflict copies and marker-bearing files exist, **Review in page…** to go to one, **Discard copy**, and the case of a copy whose original page no longer exists — while the review itself happens next to the blocks. The two surfaces had drifted into opening with different pre-selections for the same conflict, which is exactly what Concord exists to prevent; the in-page resolver gained the dialog's one exclusive capability (choosing what happens to the page's own properties when the two sides disagree) so nothing was lost. The VCS-merge-markers panel, which previously offered no action at all, now also links to the page. (Concord P5, part of GH #337.)
 
 - **Opening a graph no longer renames journal files.** A journal file whose name is not its date (`Jun 18th, 2026.md` rather than `2026_06_18.md`) can't be matched to its day, so that day looks empty — and Tine used to fix this silently at every graph open, and after any settings change. It is a repair you didn't ask for, applied to files you own: in a graph kept in git it appeared as a batch of renames the moment Tine started. The files are now listed under Settings → Backups & recovery → **Journal files named by title** with one button to rename them, which takes a snapshot first and never overwrites a name that is already taken. (Concord P5, part of GH #337.)
-
-### Fixed
-
-- **A formatting-only external rewrite no longer wedges every later managed-storage save of that page.** A Windows peer or external editor may legitimately change CRLF/LF line endings or trailing-newline spelling without changing the outline. Tine used to recognize that reconciliation was a semantic no-op but kept comparing later saves with the old activation bytes, so every save was refused forever. Local-save capture now proves the endpoint's exact live bytes against accepted semantics and uses those bytes as the guarded predecessor. Formatting remains local to that device and out of shared history; a real semantic change still reconciles normally, and a second external write is still protected by the exact-base guard. (GH #362.)
-
-- **On Android, the Back gesture works again once you have navigated.** Tauri's own back handler was registering itself after Tine's — Android gives the gesture to whichever handler registered last — and it answered Back by stepping the WebView's history. With the mobile router pushing one history entry per page you open, that meant every Back after your first navigation quietly moved the page *behind* whatever was on screen: an open Settings modal never closed, and the drawer and the safe-close path never saw the gesture either. Tine now claims the gesture from its own Android plugin, which starts strictly later than Tauri's, so Back peels an in-progress shortcut recording, then a settings search, then the modal, then a drawer, exactly as it always intended to.
-
-- **Saving PDF highlights no longer reformats the annotation page.** The `hls__…` page was written with default formatting rather than its own, so every highlight save re-indented the whole file — including notes you had typed under an annotation — and re-terminated it, even when the highlight set was unchanged. It now reproduces the file's own indentation, line endings and blank lines, and an unchanged highlight set writes nothing at all. (Concord P5 write-shyness, part of GH #337.)
-
-- **A repository inside your graph folder no longer wakes the file watcher.** Events under `.git`, `.hg`, `.svn`, `.jj`, `.bzr`, Syncthing's `.stfolder`/`.stversions`, and `node_modules` are now discarded before they cost anything — a `git gc` or a rebase used to push thousands of events through the watcher's per-event work before each was discarded further down. Nothing that can contain notes is affected. (Concord P5, part of GH #337.)
-
-### Added
-
-- **Files with unresolved git/Fossil merge-conflict markers are now quarantined instead of mangled.** A page whose file contains column-0 conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`, and Fossil's verbose variants) stays fully readable, but every save to it is refused with a message naming the markers — previously an edit re-indented or dropped the markers on re-save, which broke git's own conflict detection and could silently lose one side of the merge. Markers quoted inside code fences don't trigger the quarantine. Affected files are listed in Settings → Backups & recovery, and the page shows a banner explaining how to resolve.
-
-### Changed
 
 - **Experimental managed-storage activation now reuses the parser facts it already produced during source capture.** Search text, tasks, properties, tags, headings, and collapse state travel through one bounded activation-only handoff and are accepted only when every terminal page and block still matches the authenticated engine state exactly; oversized or mismatched inputs fall back to the independent parser path. The 13,000-page fixture reused all 13,000 pages with no misses and cut SQLite lowering from about 8.1 s to 6.7 s, although total activation remained within run-to-run noise at 69.1 s. The same pass now reuses one authenticated catalog window while resolving block identities, avoiding a graph-sized catalog proof per UUID on pages that contain several `id::` values.
 
@@ -112,16 +93,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Block search, the `((` picker, and referenced-page autocomplete now share the same disposable SQLite fact layer in Direct Files and managed storage.** SQLite supplies only generation-coherent candidates and original-case reference spellings; Tine's existing parser still owns exact fuzzy matching, ordering, property-reference rules, and presentation. The ordinary ready path no longer scans every parsed block or maintains a second referenced-name semantic cache. Missing, stale, leased, or incompatible SQLite state still falls back to the already-parsed graph without blocking open, edit, save, or external-file observation.
 
 - **Aliases, backlinks, unlinked references, and block-reference lookup/counting now use that same disposable SQLite projection in Direct Files.** SQLite narrows only an exact current cache generation and Tine still verifies every semantic result with the parser; unsafe tokenless names and non-UUID `id::` values use the parser fallback. The former in-memory alias, reference-candidate, block-identity, and block-reference-count indices and their foreground maintenance have been removed rather than retained beside SQLite.
+
 - **Managed-storage path names now come from `tine-storage`'s certified format manifest.** Tine core retains only a definition-free compatibility import, so releases pin one complete, machine-readable layout vocabulary without changing any persisted path.
+
+- **Ordinary saves under experimental managed storage do substantially less repeated work.** The hot path now reuses parser-owned commit evidence, the exact accepted editor post-state, and the preceding projection when their identities still match; ordinary projection edits are patched instead of rebuilding the page. The proofs fail closed to the complete path whenever any prerequisite is stale or absent.
 
 ### Fixed
 
+- Opening a long-lived managed graph got slower the more edit history it had,
+  independent of graph size: the startup replay re-validated every remaining
+  batch's projection objects once per admission round. Each batch's
+  dependencies are now computed exactly once, which roughly halves a
+  multi-hundred-save reopen; the remaining history-proportional cost is
+  tracked for a deeper fix.
+
+- The one-time app-data migration at startup no longer trusts a momentarily
+  unreadable `backups/` folder: any read error now means "assume there is user
+  data and leave everything alone", the existing folder is set aside instead of
+  deleted until the migrated data is actually in place, and an interrupted
+  fallback copy can no longer leave a half-populated app-data folder behind.
+
+- **A formatting-only external rewrite no longer wedges every later managed-storage save of that page.** A Windows peer or external editor may legitimately change CRLF/LF line endings or trailing-newline spelling without changing the outline. Tine used to recognize that reconciliation was a semantic no-op but kept comparing later saves with the old activation bytes, so every save was refused forever. Local-save capture now proves the endpoint's exact live bytes against accepted semantics and uses those bytes as the guarded predecessor. Formatting remains local to that device and out of shared history; a real semantic change still reconciles normally, and a second external write is still protected by the exact-base guard. (GH #362.)
+
+- **On Android, the Back gesture works again once you have navigated.** Tauri's own back handler was registering itself after Tine's — Android gives the gesture to whichever handler registered last — and it answered Back by stepping the WebView's history. With the mobile router pushing one history entry per page you open, that meant every Back after your first navigation quietly moved the page *behind* whatever was on screen: an open Settings modal never closed, and the drawer and the safe-close path never saw the gesture either. Tine now claims the gesture from its own Android plugin, which starts strictly later than Tauri's, so Back peels an in-progress shortcut recording, then a settings search, then the modal, then a drawer, exactly as it always intended to.
+
+- **Saving PDF highlights no longer reformats the annotation page.** The `hls__…` page was written with default formatting rather than its own, so every highlight save re-indented the whole file — including notes you had typed under an annotation — and re-terminated it, even when the highlight set was unchanged. It now reproduces the file's own indentation, line endings and blank lines, and an unchanged highlight set writes nothing at all. (Concord P5 write-shyness, part of GH #337.)
+
+- **A repository inside your graph folder no longer wakes the file watcher.** Events under `.git`, `.hg`, `.svn`, `.jj`, `.bzr`, Syncthing's `.stfolder`/`.stversions`, and `node_modules` are now discarded before they cost anything — a `git gc` or a rebase used to push thousands of events through the watcher's per-event work before each was discarded further down. Nothing that can contain notes is affected. (Concord P5, part of GH #337.)
+
 - **Managed storage on Android turned itself on and then flooded the screen with the same red error, forever.** The graph had one page name written to disk twice — an ordinary thing to end up with: a backup copy, a graph synced between a Mac and a Linux box (which spell accented letters differently), or a title containing a `#` that one editor writes literally and Tine writes escaped. Turning managed storage on already handles that correctly: it keeps the first file as the page and leaves the other one exactly where it is. The trouble came immediately afterwards, because the part of Tine that watches for outside edits did not follow the same rule. It met the second file, decided it was a brand-new page, found its name already taken, and refused — not just that file, but the *entire* reconciliation, so no outside edit to any page in the graph could be imported ever again. And because that refusal repeated on every retry, and each retry passed through a step the app read as "recovered", the same message was raised as a new toast every few seconds with no way to dismiss it. Both halves are fixed. Reconciliation now makes exactly the same choice activation does: the established page keeps the name, the duplicate file is left untouched and simply carries no page, and everything else in the graph reconciles normally. Nothing is ever moved, rewritten or deleted to achieve that, and a page that already exists is never taken away from you. Separately, a condition like this now says its piece once and leaves the live detail to Storage & sync, instead of repeating itself until you close the app.
+
 - **Managed storage on Android saved a page for the first time, and then could not set up sharing.** With the save fixed, the next step of the journey failed instead: turning the graph into a shared one refused immediately with a bare `Invalid argument`. The cause was the same missing rename: Tine's sharing area lives inside the graph, on Android's shared storage, and every file Tine publishes there ends by moving its own leftover temporary entry aside with the rename flag that storage does not implement — so not a single shared file could be written. Those leftovers are throwaway diagnostic copies, so they now move through the same claim-the-name-first publication the graph files use, and sharing completes. One of the sites needed a different answer: it swaps two names at once, and there is no non-atomic stand-in for a swap. Rather than fake it with a three-step shuffle, Tine uses the fact that the destination is already occupied by a zero-length marker it created itself, and does a single ordinary rename onto that marker — atomic everywhere, with no moment where the file being retired exists under neither name. What that gives up is stated plainly and handled: the old name is left free afterwards, so anything that reappears there is preserved as evidence and the operation refuses rather than guessing. Real disk errors still fail, as before, and every refusal in this area now names the exact operation and both filenames instead of a bare error number.
+
 - **Managed storage on Android still could not save a page — the rename that publishes the file is unsupported there.** With the directory-flush refusal handled, the very next operation failed instead: to publish a page Tine moves the live file aside under a hidden name and then moves the new bytes into place, using a rename that the operating system guarantees will never overwrite an existing file. Android's shared storage does not implement that rename flag at all, so every save stalled again — the edit was durable inside Tine but never reached the graph. Tine now recognises exactly the three "this filesystem does not implement that" answers and publishes another way: it first claims the destination name with an exclusive create, which fails if anything is already there, and only then moves the file onto it. The guarantee that matters — never silently destroy a file that already exists at the destination — is unchanged, and a failed publication no longer leaves an empty file behind at a page name. Anything else the filesystem reports (a disk error, a full disk) still fails the write, and files Tine is the sole authority for keep the atomic rename on every platform. The same limitation exists on FAT/exFAT removable media and some network mounts, so the fix is not Android-only.
+
 - **Managed storage on Android could still never save a page — this time the graph write itself.** With the previous refusal fixed, every save on Android reached the point where the Markdown/Org file is written into the graph and then failed there forever: 64 retries per save, all with the same `Invalid argument` from the operating system, so the edit was durable inside Tine but never reached the user's file. Android's shared storage does not always let an app force a directory's contents to disk, which is a barrier Tine uses to make a crash safe. Tine now distinguishes the two kinds of thing it writes: state Tine is the sole authority for keeps that barrier on every platform, while the Markdown/Org file — which Tine can always rebuild from its own already-durable record — accepts that Android cannot provide it, exactly as the app-private setup path already did. A barrier the platform refuses is not a crash-safety problem there; retrying it forever was. Two related improvements: a save that genuinely cannot be finished now gives up after it sees the same failure twice instead of burning the whole retry budget, and every filesystem operation on the graph-write path now reports *which* operation and *which* page failed instead of a bare error number.
+
 - **Managed storage on Android could never save a page.** Activation worked, the page loaded, and then every single save was refused. The cause was one wrong branch: when a save's manifest commit succeeded but its disposable derived state (the SQLite cache and the Markdown projection) had to be retried, the retry was handed to the *retired* storage engine's publication machinery, which the current engine never populates — so it refused instead of retrying. Android takes that path on every save; desktop Linux never did, which is why it stayed invisible. The current engine now finishes its own retained work and reports the save, or defers it for a later retry, and never refuses. Should a retry not settle, the save now also reports *why* the retry was needed, so the underlying platform cause stays visible instead of hiding behind a successful-looking save.
+
 - **Quitting managed storage after an external rescan is no longer slow on a real-sized graph.** Reading one page from the immutable managed baseline used to re-verify the *entire* sealed pack it lives in, so any pass over the graph — including the clean shutdown drain after a rescan — cost time proportional to pages × pack size. A 1,000-page graph spent about 18 seconds draining, and on a slower machine the drain hit its 30-second ceiling and gave up. Each sealed pack is now verified once per open instead of once per page: the same drain finishes in about 2 seconds. Every page's own bytes are still checked against their sealed digest on every single read, so damaged data is still refused.
+
 - **A managed page save that fails for an internal reason now says which internal reason.** Refusals raised by the editor layer against a request the application layer built itself used to arrive as an unattributed "sync actor refused application page intent", so a failure reachable only on a device we cannot attach a debugger to (Android, or a user's machine) carried no evidence at all. Every such refusal on the managed load/save path now names its stage, and an error crossing between the editor and application surfaces keeps that stage instead of dropping it. No refusal decision changed; only what the refusal is able to tell you.
 
 - **Managed-storage recovery and sharing no longer stall or refuse clean shutdown while reconciling an unchanged large graph.** The handoff scan now compares exact accepted bytes without rebuilding semantic mutation authority for every unchanged page; only paths whose bytes actually differ enter the full parser-owned reconciliation proof. The scan still yields between bounded slices, remains visibly pending, and cannot declare a safe shutdown until its exact epoch settles, while a clean drain is no longer capped by a retry count smaller than an ordinary graph.
@@ -159,13 +170,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **A corrupt experimental managed-storage reconciliation cache no longer makes the graph permanently unopenable.** Tine preserves the exact disposable SQLite baseline files as diagnostics, rebuilds a fresh baseline, resumes safely if either the preservation or replacement was interrupted by a crash, and leaves authoritative oplog history and graph bytes unchanged. Unsupported filesystem entries are still refused without following them.
 
-## [0.6.94] - 2026-08-12
-
-### Changed
-
-- **Ordinary saves under experimental managed storage do substantially less repeated work.** The hot path now reuses parser-owned commit evidence, the exact accepted editor post-state, and the preceding projection when their identities still match; ordinary projection edits are patched instead of rebuilding the page. The proofs fail closed to the complete path whenever any prerequisite is stale or absent.
-
-### Fixed
 - **A paste can no longer delete text you typed while it was still in flight.** Pasting into an empty block on a page under experimental managed storage decided *before* its background work whether that block was empty enough to be replaced. If you kept typing while the paste ran, that decision was already stale and the block — with everything you had just typed in it — was removed. The decision is now made from the live block at the moment of insertion, on both storage paths. The same paste also re-checks the page's size limit against the page it is actually about to change, so an insertion the page has since outgrown is refused instead of stranded (GH #322).
 
 - **Experimental managed storage now stops accepting large edits as soon as its writer starts failing.** If the background writer failed repeatedly, Tine kept reporting that the graph was writable — the failure notice is only sent once, and nothing else was sent afterwards — so pastes, drops and captures were accepted onto pages nothing could save, and were lost on reload. A writer failure now withdraws that permission immediately, and only a fresh confirmation from storage itself restores it (GH #324).
@@ -239,14 +243,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **A managed-storage graph whose cold start failed can no longer trap you in it.** Malformed retained scratch left over from an interrupted run refused the open permanently instead of being recovered; the exact cold-start slot is now recovered, the recovered runtime is proven to accept saves again, and an escape back to Direct Files stays available and actionable throughout. Managed storage remains experimental and off by default.
 - **Creating a page in Direct Files no longer stalls and then refuses the save on a large graph** (part of GH #249, GH #266 and GH #267). The creation path ran the managed-storage shadow-import capture twice, retaining and parsing every graph file before it could answer whether one filename was safe. On affected graphs that ended in `precheck.limit`, stranded the new edit, and made graph transitions or close wait behind repeated failed flushes. Creation now checks one non-retaining streaming census—without applying the retained-shadow cumulative-byte ceiling—against the already parsed, generation-current Direct Files index and passes that single proof to the no-replace publisher. Creation still refuses an existing target, portable case/NFC aliases of that target (including ancestor directories), semantic owners, hard links, symlinks, and an external creator of the same file without overwriting their bytes; existing exact-target saves retain their prior path-local traversal behavior. A conflicting *different* path created by another process inside the final publication window is still not detected, which is long-standing behaviour rather than new here (GH #321).
 
-
 ## [0.6.92] - 2026-08-11
 
 ### Added
 
 - **Ctrl+O opens the page under the caret**, and Ctrl+Shift+O opens it in the sidebar — matching Logseq, so you can navigate `[[links]]` and `#tags` without the mouse (GH #274).
 - **A link to a page that doesn't exist yet is now dimmed**, with a dotted underline, so you can see before clicking that it will open a blank page. The link still works and still creates the page. `#tags` are deliberately left alone, since a tag with no page file is perfectly normal. Logseq does not make this distinction; it was added after a graph whose links all pointed at names no page had, with nothing on screen to say so.
-
 
 ### Changed
 
@@ -270,7 +272,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   5.6/14.5/26.0/42.2/84.9 s, down from 10.8/29.1/50.2/80.0/157.0 s. No safety
   guarantee changes: objects remain content-addressed and are still verified
   individually when read.
-
 
 ### Fixed
 
@@ -299,7 +300,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Tine no longer dies at launch when its data directory cannot be written.** On a machine where `~/.local/share` is owned by root — or `XDG_DATA_HOME` otherwise points somewhere unwritable — the app printed a Rust backtrace and quit, because Tauri creates the WebView's data directory during its own startup and panics on the error. Tine now checks that directory before anything resolves paths against it, moves the whole launch to the first writable fallback (`~/.tine-data`, then the runtime directory, then a temp directory), and says so in a sticky notice naming where it went. If nothing is writable it prints one actionable line instead of a backtrace (GH #303).
 - **Images and other embedded media stored in a subfolder of `assets/` now display.** Every native read path applied the top-level-only rule that belongs to asset *creation*, so a file under, say, `assets/screenshots/` stayed blank even though the link was correct. Nested paths are now read, while absolute paths, `..` traversal and symlink escapes are still refused, and newly imported assets still land directly in `assets/` (GH #300).
 - **A page changed by another program no longer becomes permanently unsaveable.** Most editors and sync clients (Syncthing, Dropbox) write a file by creating a new one and renaming it into place. Tine treated the result as a different file and refused every subsequent save with an internal message it then retried forever — even when the new content was byte-for-byte what Tine already had, and even when it was a genuine change you could have resolved. Tine now compares the content: identical content just saves, and a real difference raises the normal conflict banner. "Keep mine" is now bound to the exact disk version shown by that banner (including a deletion), so it cannot overwrite a newer unseen sync or editor change; a newer change is shown as a new conflict instead. (GH #254)
-
 
 ## [0.6.91] - 2026-08-07
 

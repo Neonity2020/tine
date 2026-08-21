@@ -15,6 +15,8 @@ icon:: 🗄️
 - ## External edits
 	- Tine notices changes made outside it — Logseq, Syncthing, or another editor. Settings (**t s**) → **Files** → **Watch for external edits**: **Live (inotify)** (default, no idle wakeups) or **Poll (3s)** for filesystems where the OS watcher misses edits (some network mounts). Saved per device.
 	- A page you are not editing updates in place automatically. A page with unsaved edits is never overwritten: Tine shows a banner and skips that page in future saves until you choose **Use disk version** (re-read the file) or **Keep mine (overwrite)** (write your version).
+	- Prefer to approve even clean external updates yourself? Turn on Settings → **Backups & recovery** → **Always ask before applying an external change**. Tine then holds the silent case and offers **Reload from disk** / **Keep mine**; changes that already conflict or arrive mid-edit keep their existing safer handling.
+	- Returning to Tine asks the watcher for a fresh pass, covering network mounts, suspended apps, and sync tools that delivered no live filesystem event. A large `git checkout`, `fossil update`, branch switch, or sync burst is grouped into one external revision and summarized once instead of interrupting once per page.
 	- Running two Tine windows on the same graph — or on a graph nested inside an open one — is refused, so that conflict cannot happen locally. For file sync between devices, run one app at a time on the graph where you can, and let conflict copies (below) catch the rest.
 - ## Snapshots — automatic backups
 	- Each time Tine opens your graph it snapshots eligible Markdown/Org files across the graph, plus `logseq/config.edn` and asset `.edn` sidecars, to a local folder **outside** the graph. Syncthing never syncs it. Binary assets are not copied.
@@ -28,8 +30,13 @@ icon:: 🗄️
 	- Settings → **Files** → **Orphan assets and trash** can find media no block links to (a deleted block keeps its files, so unused media accumulates) and trash it, and **Empty asset trash** deletes *asset* trash permanently — page, journal, and conflict recovery files are always kept.
 - ## Sync tools and conflict copies
 	- Keep Syncthing or Dropbox on your graph — Tine is built to coexist with them. Two files that resolve to the same journal day are kept, not dropped: Settings → **Backups & recovery** → **Duplicate journal days** offers **Open**, **Merge**, **Rename**, or **Trash** per file.
-	- A `*.sync-conflict-*` (or `(conflicted copy)`) file never appears as a page. It is listed under **Sync conflict copies**: **Review in page…** opens the page and resolves it there, block by block, with a per-block keep-mine / keep-theirs / keep-both choice; **Discard copy** moves it to the trash. Nothing is auto-merged or auto-deleted.
+	- A `*.sync-conflict-*` (or `(conflicted copy)`) file never appears as a page. Files carrying unresolved git or Fossil merge markers are also quarantined from ordinary saves rather than rewritten.
+	- Both kinds appear in one **N conflicts** queue at the bottom of the sidebar. Open a conflicted page to compare the complete versions block by block; choose keep-mine, keep-theirs, or keep-both for each real divergence, then **Apply resolution**. A common ancestor preselects one-sided changes when available. Nothing is auto-merged or auto-deleted, and leaving with choices unfinished never blocks you.
+	- Settings → **Backups & recovery** keeps the inventory: **Review in page…** opens a conflict and **Discard copy** moves a provider conflict copy to the trash.
 	- Tine's own operation-backed sync is a separate, opt-in **Testing only** mode — see [[Features/Managed sync]]. Ordinary provider sync needs no setup at all.
+- ## Journal files named by title
+	- Tine does not silently rename journal files when a graph opens. If an otherwise valid journal uses its display title as its filename (for example `Jun 18th, 2026.md`), the day may look empty because the filename cannot be matched to its date.
+	- Settings → **Backups & recovery** → **Journal files named by title** lists these files. Review the list and choose the explicit rename action; Tine takes a snapshot first and never overwrites an occupied destination.
 - ## Export
 	- Settings → **Graph** → **Export graph to HTML** publishes your `public:: true` pages as a standalone site with fuzzy block search.
 	- Right-click a page title → **Export to PDF…** prints one page on a light background with images inlined.

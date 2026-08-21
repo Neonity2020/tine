@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,11 +45,20 @@ function argument(name) {
   return index >= 0 ? process.argv[index + 1] : undefined;
 }
 
+function gitOutput(args) {
+  const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+  // Some restricted process supervisors report EPERM on the wrapper wait even
+  // though the child completed, returned status 0, and supplied its output.
+  // The exit status remains the authority; a real git failure is still fatal.
+  if (result.status !== 0 || result.signal || typeof result.stdout !== "string") {
+    const detail = result.stderr || result.error?.message || `status ${result.status}`;
+    throw new Error(`git ${args.join(" ")} failed: ${detail}`);
+  }
+  return result.stdout;
+}
+
 function reachableReleaseTags() {
-  const output = execFileSync("git", ["tag", "--merged", "HEAD", "--sort=-version:refname"], {
-    cwd: root,
-    encoding: "utf8",
-  });
+  const output = gitOutput(["tag", "--merged", "HEAD", "--sort=-version:refname"]);
   return output
     .split(/\r?\n/)
     .filter((tag) => /^v\d+\.\d+\.\d+$/.test(tag));
@@ -65,10 +74,7 @@ if (!expectedPrevious) {
 
   // A tagged candidate still compares with the release before itself. Manual
   // candidate runs and ordinary master builds have no candidate tag at HEAD.
-  const candidateAtHead = execFileSync("git", ["tag", "--points-at", "HEAD"], {
-    cwd: root,
-    encoding: "utf8",
-  })
+  const candidateAtHead = gitOutput(["tag", "--points-at", "HEAD"])
     .split(/\r?\n/)
     .includes(candidateTag);
   if (workflowTag === candidateTag || candidateAtHead) tags = tags.filter((tag) => tag !== candidateTag);
