@@ -817,135 +817,15 @@ pub(crate) enum ArchiveDiscoveryInspection {
 /// state, and checks the graph/archive/resource/control identities.
 pub(crate) fn inspect_existing_archive_at(
     archive_root: &Path,
-    expected_binding: Option<&EnrollmentBindingV1>,
+    _expected_binding: Option<&EnrollmentBindingV1>,
 ) -> Result<ArchiveDiscoveryInspection, StoreError> {
-    let Some(archive) = open_existing_archive_root_nofollow(archive_root)? else {
+    let Some(_archive) = open_existing_archive_root_nofollow(archive_root)? else {
         return Ok(ArchiveDiscoveryInspection::Absent);
     };
-    let Some(binding) = expected_binding else {
-        return Ok(ArchiveDiscoveryInspection::Residue);
-    };
-
-    CanonicalArchiveResourceId::open_enrolled_in_retained_directory(
-        &archive,
-        binding.archive_resource_id(),
-    )
-    .map_err(|_| {
-        StoreError::PromotedRuntimeStateMismatch(
-            "archive resource claim does not authenticate the enrollment binding",
-        )
-    })?;
-    for name in [OBJECTS_DIR, BATCHES_DIR] {
-        open_existing_dir_nofollow(&archive, name)?.ok_or(StoreError::MalformedHistoryIndex)?;
-    }
-    let lineage = read_optional_regular(&archive, LINEAGE_CLAIM_FILE, 32, Some(32))?
-        .ok_or(StoreError::MalformedHistoryIndex)?;
-    require_lineage_bytes(binding.lineage_digest(), &lineage)?;
-
-    let Some(histories) = open_existing_dir_nofollow(&archive, ENGINE_HISTORY_DIR)? else {
-        return Ok(ArchiveDiscoveryInspection::Residue);
-    };
-    let endpoint_name = binding.endpoint_id().to_string();
-    let Some(control) = open_existing_dir_nofollow(&histories, &endpoint_name)? else {
-        return Ok(ArchiveDiscoveryInspection::Residue);
-    };
-    let head = read_optional_regular(&control, ENGINE_HISTORY_HEAD_FILE, 64, None)?;
-    let claim = read_optional_regular(&control, ENGINE_HISTORY_CLAIM_FILE, 256, None)?;
-    let (head, claim) = match (head, claim) {
-        (None, None) => return Ok(ArchiveDiscoveryInspection::Residue),
-        (Some(head), Some(claim)) => (head, claim),
-        _ => return Err(StoreError::MalformedHistoryIndex),
-    };
-    validate_engine_history_claim(
-        &claim,
-        binding.workspace_id(),
-        binding.endpoint_id(),
-        binding.graph_resource_id(),
-        binding.receipt_store_id(),
-    )?;
-    open_existing_dir_nofollow(&control, ENGINE_HISTORY_NODES_DIR)?
-        .ok_or(StoreError::MalformedHistoryIndex)?;
-    let roots = open_existing_dir_nofollow(&control, ENGINE_HISTORY_ROOTS_DIR)?
-        .ok_or(StoreError::MalformedHistoryIndex)?;
-    let head_text = std::str::from_utf8(&head).map_err(|_| StoreError::MalformedHistoryIndex)?;
-    let head_digest = parse_digest(head_text)
-        .map(ContentDigest::from_bytes)
-        .map_err(|_| StoreError::MalformedHistoryIndex)?;
-    if head_digest.to_string().as_bytes() != head {
-        return Err(StoreError::MalformedHistoryIndex);
-    }
-    let root_bytes = read_optional_regular(
-        &roots,
-        &engine_history_root_filename(head_digest),
-        MAX_ENGINE_HISTORY_INDEX_BYTES,
-        None,
-    )?
-    .ok_or(StoreError::MalformedHistoryIndex)?;
-    if ContentDigest::of(&root_bytes) != head_digest {
-        return Err(StoreError::HistoryIndexPathMismatch(head_digest));
-    }
-    let root: DurableEngineHistoryRoot =
-        postcard::from_bytes(&root_bytes).map_err(|_| StoreError::MalformedHistoryIndex)?;
-    if postcard::to_allocvec(&root).map_err(|_| StoreError::MalformedHistoryIndex)? != root_bytes {
-        return Err(StoreError::MalformedHistoryIndex);
-    }
-    validate_engine_history_root(
-        &root,
-        binding.workspace_id(),
-        binding.endpoint_id(),
-        binding.graph_resource_id(),
-        binding.receipt_store_id(),
-    )?;
-
-    let Some(state_bytes) = read_optional_regular(
-        &control,
-        PROMOTED_RUNTIME_STATE_FILE,
-        MAX_PROMOTED_RUNTIME_STATE_BYTES,
-        None,
-    )?
-    else {
-        return Ok(ArchiveDiscoveryInspection::Residue);
-    };
-    let state = PromotedRuntimeStateV1::decode(&state_bytes)?;
-    let expected_binding_digest = binding
-        .binding_digest()
-        .map_err(|_| StoreError::MalformedPromotedRuntimeState)?;
-    if state.workspace_id != binding.workspace_id()
-        || state.lineage_digest != binding.lineage_digest()
-        || state.catalog_document_id != binding.catalog_document_id()
-        || state.endpoint_id != binding.endpoint_id()
-        || state.device_id != binding.device_id()
-        || state.graph_resource_id != binding.graph_resource_id()
-        || state.receipt_store_id != binding.receipt_store_id()
-        || state.archive_resource_id != binding.archive_resource_id()
-        || state.enrollment_binding_digest != expected_binding_digest
-    {
-        return Err(StoreError::PromotedRuntimeStateMismatch(
-            "promoted runtime state is bound to another enrollment",
-        ));
-    }
-    if state.archive_control_binding != control_directory_identity(&archive)?.binding_digest() {
-        return Err(StoreError::PromotedRuntimeStateMismatch(
-            "promoted runtime state is bound to another physical archive directory",
-        ));
-    }
-    if root.binding.bootstrap != Some(state.bootstrap) {
-        return Err(StoreError::PromotedRuntimeStateMismatch(
-            "durable history bootstrap binding is not the promoted lineage",
-        ));
-    }
-    Ok(ArchiveDiscoveryInspection::Present(
-        ArchiveDiscoveryEvidence {
-            bootstrap_import_id: state.bootstrap_import_id,
-            anchor_history_generation: state.anchor_history_generation,
-            anchor_history_index_root: state.anchor_history_index_root,
-            anchor_acceptance_sequence: state.anchor_acceptance_sequence,
-            anchor_accepted_frontier_state_digest: state.anchor_accepted_frontier_state_digest,
-            enrollment_verification_digest: state.enrollment_verification_digest,
-            promotion_session_id: state.promotion_session_id,
-            state_digest: state.state_digest()?,
-        },
-    ))
+    // Every archive in this namespace predates the clean 0.7 storage format.
+    // Preserve it through the caller archive-aside flow; never decode it into
+    // current runtime authority.
+    Ok(ArchiveDiscoveryInspection::Residue)
 }
 
 fn open_existing_archive_root_nofollow(root: &Path) -> Result<Option<Dir>, StoreError> {
