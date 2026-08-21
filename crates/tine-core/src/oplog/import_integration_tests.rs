@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tine_core::oplog::{
+use crate::oplog::{
     classify_conflict_copy, execute_manifested_projection_work, inventory_affected,
     inventory_initial_shadow, plan_affected_import, write_projection_exact, AuthorBatch, BatchId,
     BatchOrigin, BlobDescription, BlockId, BlockLocation, BlockMatchBasis, CrdtPeerId,
@@ -11,7 +11,7 @@ use tine_core::oplog::{
     ProjectionIntent, ProjectionReceiptStore, RawObservation, RejectedRawIdReason,
     SemanticOperation, SessionId, ShardedHotEngine, WorkspaceId,
 };
-use tine_core::Graph;
+use crate::Graph;
 use uuid::Uuid;
 
 struct TestDir(PathBuf);
@@ -155,7 +155,7 @@ impl AuthorityFixture {
             operations.push(SemanticOperation::CreatePage {
                 page_id,
                 home_document_id,
-                name: tine_core::oplog::LogicalPageName::parse(
+                name: crate::oplog::LogicalPageName::parse(
                     page.name
                         .clone()
                         .unwrap_or_else(|| format!("Imported Page {page_index}")),
@@ -395,8 +395,8 @@ fn assert_new_external_document_pair(
     assert_eq!(oracle.name, expected_name);
     assert_eq!(
         match oracle.kind {
-            tine_core::PageKind::Page => ManagedTextKind::Page,
-            tine_core::PageKind::Journal => ManagedTextKind::Journal,
+            crate::PageKind::Page => ManagedTextKind::Page,
+            crate::PageKind::Journal => ManagedTextKind::Journal,
         },
         expected_kind
     );
@@ -1238,8 +1238,8 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_supported_graph_text() {
         let entry = graph.entry_for_path(&custom.path().join(path)).unwrap();
         assert_eq!(entry.rel_path, path);
         let kind = match entry.kind {
-            tine_core::PageKind::Page => ManagedTextKind::Page,
-            tine_core::PageKind::Journal => ManagedTextKind::Journal,
+            crate::PageKind::Page => ManagedTextKind::Page,
+            crate::PageKind::Journal => ManagedTextKind::Journal,
         };
         assert_eq!(kind, expected_kind, "configured path {path}");
     }
@@ -1261,7 +1261,7 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_supported_graph_text() {
             .entry_for_path(&custom.path().join(outside))
             .unwrap()
             .kind,
-        tine_core::PageKind::Page
+        crate::PageKind::Page
     );
     // Containers OG itself skips remain unreadable evidence.
     assert!(inventory_affected(&graph, &["assets/note.md"]).is_err());
@@ -1757,7 +1757,7 @@ fn parser_owned_deep_input_is_refused_and_inventory_counts_physical_work() {
         "pages/deep.md",
         vec![BlockSpec::root("base", "a")],
     );
-    let external = (0..=tine_core::oplog::MAX_IMPORT_DEPTH)
+    let external = (0..=crate::oplog::MAX_IMPORT_DEPTH)
         .map(|depth| format!("{}- depth {depth}\n", "  ".repeat(depth)))
         .collect::<String>();
     deep.overwrite("pages/deep.md", external.as_bytes());

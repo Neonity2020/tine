@@ -29,6 +29,8 @@ pub mod hot_engine;
 mod hot_engine_integration_tests;
 pub mod identity;
 pub mod import;
+#[cfg(test)]
+mod import_integration_tests;
 pub(crate) mod lazy_genesis;
 pub(crate) mod local_active;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
@@ -43,6 +45,8 @@ pub(crate) mod operational_coordinator;
 pub(crate) mod page_name_index;
 pub(crate) mod portable_path_index;
 pub mod projection;
+#[cfg(test)]
+mod projection_integration_tests;
 pub mod projection_manifest;
 pub mod projection_store;
 pub mod projection_work_index;

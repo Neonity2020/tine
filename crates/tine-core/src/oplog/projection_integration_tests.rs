@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
-use tine_core::oplog::{
+use crate::oplog::{
     derive_receiver_local_projection, execute_manifested_projection_work, plan_projection,
     recover_incomplete_projections, write_projection_exact, AnnotatedIdentity, AuthorBatch,
     BatchDisposition, BatchId, BatchInspection, BatchOrigin, BlobDescription, BlockId,
@@ -18,7 +17,8 @@ use tine_core::oplog::{
     ProjectionStoreError, ProjectionWorkStatus, ProjectionWorkTarget, SemanticOperation, SessionId,
     ShardedHotEngine, StoreError, StructuralSpan, WorkspaceId, PORTABLE_PATH_KEY_VERSION,
 };
-use tine_core::Graph;
+use crate::Graph;
+use serde_json::Value;
 use uuid::Uuid;
 
 struct TestDir(PathBuf);
@@ -197,9 +197,9 @@ fn page(path: &str, blocks: Vec<MaterializedBlock>) -> ProjectionPageState {
     .unwrap();
     ProjectionPageState {
         page: MaterializedPage {
-            page_id: tine_core::oplog::PageId::from_uuid(uuid(500)),
+            page_id: crate::oplog::PageId::from_uuid(uuid(500)),
             home_document_id: DocumentId::from_uuid(uuid(501)),
-            name: tine_core::oplog::LogicalPageName::parse("Projection Page").unwrap(),
+            name: crate::oplog::LogicalPageName::parse("Projection Page").unwrap(),
             path: ManagedPath::parse(path).unwrap(),
             kind: ManagedTextKind::Page,
             preamble: None,
@@ -232,7 +232,7 @@ fn authorized_engine(
         SemanticOperation::CreatePage {
             page_id,
             home_document_id: home,
-            name: tine_core::oplog::LogicalPageName::parse("Projection Fixture").unwrap(),
+            name: crate::oplog::LogicalPageName::parse("Projection Fixture").unwrap(),
             path: ManagedPath::parse(relative_path).unwrap(),
             kind: ManagedTextKind::Page,
         },
@@ -355,7 +355,7 @@ fn enrolled_engine_and_store(
     (engine, page_id, store, binding)
 }
 
-fn plan(state: &ProjectionPageState, base: Option<&[u8]>) -> tine_core::oplog::ProjectionPlan {
+fn plan(state: &ProjectionPageState, base: Option<&[u8]>) -> crate::oplog::ProjectionPlan {
     plan_projection(workspace(1), state, base).unwrap()
 }
 
@@ -470,7 +470,7 @@ fn imported_markdown_structural_trivia_is_span_instrumentation_transparent() {
     ];
 
     for (case, source) in sources.into_iter().enumerate() {
-        let parsed = tine_core::doc::parse(source);
+        let parsed = crate::doc::parse(source);
         let blocks = parsed
             .roots
             .iter()
@@ -509,7 +509,7 @@ fn imported_org_structural_trivia_is_span_instrumentation_transparent() {
     ];
 
     for (case, source) in sources.into_iter().enumerate() {
-        let parsed = tine_core::org::parse_org(source);
+        let parsed = crate::org::parse_org(source);
         let blocks = parsed
             .roots
             .iter()
@@ -722,7 +722,7 @@ fn authoritative_preamble_and_structure_do_not_come_from_base() {
         text(result.target()),
         "title:: Authoritative\nfree text\n\n- root\n  body\n\t- child\n"
     );
-    let parsed = tine_core::doc::parse(text(result.target()));
+    let parsed = crate::doc::parse(text(result.target()));
     assert_eq!(
         parsed.pre_block.as_deref(),
         Some("title:: Authoritative\nfree text")
@@ -773,7 +773,7 @@ fn org_parser_distinguishes_real_mixed_case_id_from_source_and_example_blocks() 
         ],
     );
     let result = plan(&state, None);
-    let parsed = tine_core::org::parse_org(text(result.target()));
+    let parsed = crate::org::parse_org(text(result.target()));
     let existing_text = existing.to_string();
     let generated_text = generated.to_string();
     assert_eq!(
@@ -1623,8 +1623,7 @@ fn repeated_projection_replacements_and_reopen_retain_recent_recovery_sidecars()
                 SemanticOperation::CreatePage {
                     page_id,
                     home_document_id,
-                    name: tine_core::oplog::LogicalPageName::parse("Projection Recovery GC")
-                        .unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Projection Recovery GC").unwrap(),
                     path: ManagedPath::parse(path).unwrap(),
                     kind: ManagedTextKind::Page,
                 },
@@ -2566,7 +2565,7 @@ fn recovery_replays_intent_frontier_after_engine_advance() {
     writer.publish_prepared(&later).unwrap();
     assert!(matches!(
         engine.stage_archive_batch(later_batch).unwrap().disposition,
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     assert_eq!(
         engine.materialize_page(page_id).unwrap().blocks[0].content,
@@ -2737,7 +2736,7 @@ fn manifested_present_target_recovers_across_completion_and_status_publication_c
     writer.publish_prepared(&prepared).unwrap();
     assert!(matches!(
         engine.stage_archive_batch(batch_id).unwrap().disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let work = engine
         .projection_work_index()
@@ -2840,7 +2839,7 @@ fn manifested_absence_recovers_from_retained_base_across_both_publication_cuts()
     writer.publish_prepared(&prepared).unwrap();
     assert!(matches!(
         engine.stage_archive_batch(batch_id).unwrap().disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let work = engine
         .projection_work_index()
@@ -2927,7 +2926,7 @@ fn rolled_back_work_head_cannot_resurrect_deletion_after_causal_identical_path_r
             .stage_archive_batch(delete_batch)
             .unwrap()
             .disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let delete_work = engine
         .projection_work_index()
@@ -2960,7 +2959,7 @@ fn rolled_back_work_head_cannot_resurrect_deletion_after_causal_identical_path_r
                 SemanticOperation::CreatePage {
                     page_id: page_b,
                     home_document_id: home_b,
-                    name: tine_core::oplog::LogicalPageName::parse("Projection Alias").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Projection Alias").unwrap(),
                     path: path.clone(),
                     kind: ManagedTextKind::Page,
                 },
@@ -2987,7 +2986,7 @@ fn rolled_back_work_head_cannot_resurrect_deletion_after_causal_identical_path_r
             .stage_archive_batch(create_batch)
             .unwrap()
             .disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let create_work = engine
         .projection_work_index()
@@ -3053,7 +3052,7 @@ fn rolled_back_work_head_cannot_replay_stale_present_over_newer_projection() {
         writer.publish_prepared(&prepared).unwrap();
         assert!(matches!(
             engine.stage_archive_batch(batch_id).unwrap().disposition(),
-            tine_core::oplog::BatchDisposition::Accepted { .. }
+            crate::oplog::BatchDisposition::Accepted { .. }
         ));
         let work = engine
             .projection_work_index()
@@ -3207,7 +3206,7 @@ fn manifested_work_for_one_enrolled_graph_cannot_mutate_same_bytes_on_another_ro
     writer.publish_prepared(&prepared).unwrap();
     assert!(matches!(
         engine.stage_archive_batch(batch_id).unwrap().disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let work = engine
         .projection_work_index()
@@ -3289,7 +3288,7 @@ fn manifested_guarded_conflict_is_the_proof_bearing_block_path() {
     writer.publish_prepared(&prepared).unwrap();
     assert!(matches!(
         engine.stage_archive_batch(batch_id).unwrap().disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let work = engine
         .projection_work_index()
@@ -3357,7 +3356,7 @@ fn manifested_semantic_refusals_block_initial_and_reserved_restart_attempts_then
                 SemanticOperation::CreatePage {
                     page_id: initial_refusal_page,
                     home_document_id: DocumentId::from_uuid(uuid(702)),
-                    name: tine_core::oplog::LogicalPageName::parse("Initial refusal").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Initial refusal").unwrap(),
                     path: ManagedPath::parse("pages/a-initial-refusal.md").unwrap(),
                     kind: ManagedTextKind::Page,
                 },
@@ -3378,7 +3377,7 @@ fn manifested_semantic_refusals_block_initial_and_reserved_restart_attempts_then
                 SemanticOperation::CreatePage {
                     page_id: restart_refusal_page,
                     home_document_id: DocumentId::from_uuid(uuid(705)),
-                    name: tine_core::oplog::LogicalPageName::parse("Restart refusal").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Restart refusal").unwrap(),
                     path: ManagedPath::parse("pages/b-restart-refusal.md").unwrap(),
                     kind: ManagedTextKind::Page,
                 },
@@ -3467,7 +3466,7 @@ fn manifested_semantic_refusals_block_initial_and_reserved_restart_attempts_then
                 SemanticOperation::CreatePage {
                     page_id: following_page,
                     home_document_id: following_home,
-                    name: tine_core::oplog::LogicalPageName::parse("Following").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Following").unwrap(),
                     path: ManagedPath::parse("pages/z-following.md").unwrap(),
                     kind: ManagedTextKind::Page,
                 },
@@ -3776,7 +3775,7 @@ fn graph_resource_identity_survives_move_but_rejects_symlink_and_path_substituti
     writer.publish_prepared(&prepared).unwrap();
     assert!(matches!(
         engine.stage_archive_batch(batch_id).unwrap().disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let work = engine
         .projection_work_index()
@@ -3862,7 +3861,7 @@ fn fail_before_projection_crash_windows_recover_without_unauthorized_execution()
                 .stage_archive_batch(historical_batch)
                 .unwrap()
                 .disposition(),
-            tine_core::oplog::BatchDisposition::Accepted { .. }
+            crate::oplog::BatchDisposition::Accepted { .. }
         ));
         let historical_work = engine
             .projection_work_index()
@@ -3940,7 +3939,7 @@ fn fail_before_projection_crash_windows_recover_without_unauthorized_execution()
     let outcome = engine.stage_archive_batch(batch_id).unwrap();
     assert!(matches!(
         outcome.disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let accepted_head = fs::read(&work_head).unwrap();
     let accepted_history_head = fs::read(&history_head).unwrap();
@@ -4332,7 +4331,7 @@ fn manifested_rename_has_old_removal_and_new_target_using_old_render_base() {
         .unwrap();
     assert!(matches!(
         outcome.disposition(),
-        tine_core::oplog::BatchDisposition::Accepted { .. }
+        crate::oplog::BatchDisposition::Accepted { .. }
     ));
     let old_work = engine
         .projection_work_index()
