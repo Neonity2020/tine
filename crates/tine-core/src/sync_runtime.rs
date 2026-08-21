@@ -3362,18 +3362,36 @@ impl SyncRuntimeHandle {
         #[cfg(test)]
         let handle_discovery = phase_started.elapsed();
         drop(graph);
-        let advisory = match classification {
-            DiscoveryClassification::ExistingLocalActive(advisory) => advisory,
-            other => {
-                return SyncRuntimeOpenResult {
-                    status: map_discovery(other),
-                    handle: None,
-                };
+        // Blank-slate ruling (Martin, 2026-08-20): every shape of pre-0.7
+        // managed state — intact, mid-import, blocked, corrupt, mismatched,
+        // or schema-incompatible — supersedes into Direct Files; the Tauri
+        // layer archives the private root aside (never deletes) and reopens
+        // the graph fresh. This layout is written by no current version, so
+        // damage here can only be damage to an unsupported format, which is
+        // not worth a user-facing refusal. Two shapes stay loud refusals:
+        // UnsafeFilesystemKind (a symlink or special file where a regular
+        // entry belongs — misconfiguration or attack, not age; threat:
+        // hostile-shaped sync residue) and Retryable (a live I/O error —
+        // retiring on a transient mount failure could archive healthy state).
+        let status = match classification {
+            DiscoveryClassification::ExistingLocalActive(_)
+            | DiscoveryClassification::ExistingNonActive(_)
+            | DiscoveryClassification::Blocked(_)
+            | DiscoveryClassification::UnsupportedOrIncompatible(_, _)
+            | DiscoveryClassification::CorruptOrUnreadable(_, _) => {
+                SyncRuntimeOpenStatus::SupersededLegacyState
             }
+            DiscoveryClassification::AmbiguousOrForeignResidue(
+                _,
+                ManagedStorageRefusalScenario::UnsafeFilesystemKind,
+            ) => map_discovery(classification),
+            DiscoveryClassification::AmbiguousOrForeignResidue(_, _) => {
+                SyncRuntimeOpenStatus::SupersededLegacyState
+            }
+            other => map_discovery(other),
         };
-        let _ = advisory;
         SyncRuntimeOpenResult {
-            status: SyncRuntimeOpenStatus::SupersededLegacyState,
+            status,
             handle: None,
         }
     }
@@ -19929,17 +19947,86 @@ mod tests {
     fn pre_07_discovery_supersedes_instead_of_refusing_in_production_builds() {
         let source = include_str!("sync_runtime.rs");
         let arm = source
-            .find("DiscoveryClassification::ExistingLocalActive(advisory) => advisory,")
+            .find("DiscoveryClassification::ExistingLocalActive(_)")
             .expect("the discovery classification arm must exist");
-        let window = &source[arm..arm + 400];
+        let window = &source[arm..arm + 1200];
         assert!(
             window.contains("SyncRuntimeOpenStatus::SupersededLegacyState"),
             "discovered pre-0.7 state must map to SupersededLegacyState, never to a refusal"
+        );
+        // Blank-slate ruling: damaged, blocked, mid-import, and
+        // schema-incompatible pre-0.7 state supersedes exactly like intact
+        // state — the layout is written by no current version, so damage here
+        // is damage to an unsupported format.
+        for damaged_arm in [
+            "DiscoveryClassification::ExistingNonActive(_)",
+            "DiscoveryClassification::Blocked(_)",
+            "DiscoveryClassification::UnsupportedOrIncompatible(_, _)",
+            "DiscoveryClassification::CorruptOrUnreadable(_, _)",
+        ] {
+            let position = window
+                .find(damaged_arm)
+                .expect("every damaged pre-0.7 shape must be in the superseding arm");
+            assert!(
+                position
+                    < window
+                        .find("SyncRuntimeOpenStatus::SupersededLegacyState")
+                        .unwrap(),
+                "{damaged_arm} must share the superseding arm"
+            );
+        }
+        // The two deliberate refusals survive: unsafe filesystem shapes
+        // (symlink/special file — attack or misconfiguration, not age) and
+        // transient I/O (retiring on a mount failure could archive healthy
+        // state).
+        assert!(
+            window.contains("ManagedStorageRefusalScenario::UnsafeFilesystemKind"),
+            "unsafe filesystem shapes must stay loud refusals"
         );
         assert!(
             !window.contains("#[cfg(test)]"),
             "supersession is unconditional: no build may keep a pre-0.7 actor start here"
         );
+    }
+
+    /// Behavior half of the blank-slate ruling: damaged pre-0.7 residue
+    /// supersedes into Direct Files (the Tauri layer archives it aside and
+    /// reopens fresh), while an unsafe filesystem shape at the same location
+    /// stays a loud refusal — hostile-shaped sync residue or
+    /// misconfiguration, not age, and retiring it could follow a link out of
+    /// the private root.
+    #[test]
+    fn pre_07_residue_supersedes_and_unsafe_shapes_still_refuse() {
+        let fixture = ActivationFixture::empty("pre07-residue-supersedes", 0xd0b1);
+        fs::create_dir_all(&fixture.request.archive_root).unwrap();
+        let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert!(result.handle.is_none());
+        assert!(
+            matches!(result.status, SyncRuntimeOpenStatus::SupersededLegacyState),
+            "pre-0.7 archive residue must supersede, got {:?}",
+            result.status
+        );
+
+        #[cfg(unix)]
+        {
+            let fixture = ActivationFixture::empty("pre07-unsafe-refuses", 0xd0b2);
+            let target = fixture.request.archive_root.with_file_name("elsewhere");
+            fs::create_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&target, &fixture.request.archive_root).unwrap();
+            let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+            assert!(result.handle.is_none());
+            assert!(
+                matches!(
+                    result.status,
+                    SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+                        scenario: ManagedStorageRefusalScenario::UnsafeFilesystemKind,
+                        ..
+                    }
+                ),
+                "an unsafe archive-root shape must stay a refusal, got {:?}",
+                result.status
+            );
+        }
     }
 
     /// The pre-0.7 activation stack is deleted, not merely unreachable. Each
