@@ -3588,10 +3588,15 @@ mod tests {
 
     use super::*;
     use crate::model::{projection_graph_test_counters, reset_projection_graph_test_counters};
+    use crate::oplog::import::{
+        commit_clean_activation, open_clean_activation, prepare_clean_activation,
+    };
+    use crate::oplog::local_active::CleanLocalRuntime;
     use crate::oplog::object_store::{
         fail_next_engine_history_head_swap, fail_next_publish_after_objects,
     };
     use crate::oplog::projection::fail_next_formatting_adoption_after_intent_for_harness;
+    use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
         recover_incomplete_projections, write_projection_exact, AnnotatedProjectionBase,
         ApplicationRuntimeRoot, BlockId, BlockLocation, DeviceId, DocumentId, LineageDigest,
@@ -3974,6 +3979,480 @@ mod tests {
                 path,
             }
         }
+    }
+
+    /// The baseline-plus-manifest composition used by the clean coordinator
+    /// corpus. Source files are the genesis and operation manifests are the
+    /// only durable semantic history; no enrolled history, projection-work
+    /// index, scratch store, or persistent tail participates.
+    struct CleanCoordinatorFixture {
+        _root: TestRoot,
+        graph_root: PathBuf,
+        archive_root: PathBuf,
+        enrollment_root: PathBuf,
+        database_path: PathBuf,
+        graph: Graph,
+        receipts: ProjectionReceiptStore,
+        archive: ObjectStore,
+        runtime: CleanLocalRuntime,
+        lineage: LineageDigest,
+        catalog: DocumentId,
+        page_id: PageId,
+        home_document_id: DocumentId,
+        block_id: BlockId,
+        path: String,
+    }
+
+    impl CleanCoordinatorFixture {
+        fn new(label: &str) -> Self {
+            Self::new_at(
+                label,
+                "pages/deep/projects/a.md",
+                None,
+                ManagedTextKind::Page,
+            )
+        }
+
+        fn configured(label: &str) -> Self {
+            Self::new_at(
+                label,
+                "content/pages/deep/projects/a.md",
+                Some(
+                    "{:pages-directory \"content/pages\"\n\
+                      :journals-directory \"content/journals\"}\n",
+                ),
+                ManagedTextKind::Page,
+            )
+        }
+
+        fn formatting_only(label: &str) -> Self {
+            Self::new_at(
+                label,
+                "pages/Coordinator Page.md",
+                None,
+                ManagedTextKind::Page,
+            )
+        }
+
+        fn new_at(label: &str, path: &str, config: Option<&str>, _kind: ManagedTextKind) -> Self {
+            let root = TestRoot::new(&format!("{label}-clean"));
+            let graph_root = root.path().join("graph");
+            fs::create_dir_all(&graph_root).unwrap();
+            if let Some(config) = config {
+                fs::create_dir_all(graph_root.join("logseq")).unwrap();
+                fs::write(graph_root.join("logseq/config.edn"), config).unwrap();
+            }
+            let target = graph_root.join(path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, clean_coordinator_source(path, "root", "child")).unwrap();
+            let graph = Graph::open(&graph_root);
+
+            let workspace = super::super::WorkspaceId::from_uuid(Uuid::from_u128(1));
+            let lineage = LineageDigest::of(label.as_bytes());
+            let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
+            let database_path = root.path().join("clean-projection.sqlite");
+            let archive_parent = root.path().join("clean-archive");
+            let enrollment_root = root.path().join("clean-enrollment");
+            fs::create_dir(&archive_parent).unwrap();
+            let capture_root = root.path().join("clean-capture");
+            fs::create_dir(&capture_root).unwrap();
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_root)
+                .unwrap();
+            let preparation = prepare_clean_activation(
+                &graph,
+                capture,
+                workspace,
+                lineage,
+                catalog,
+                &root.path().join("clean-preparation"),
+                &database_path,
+                &super::super::ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap();
+            let page_id = preparation
+                .candidates()
+                .baseline()
+                .page_ids()
+                .find(|page_id| {
+                    preparation
+                        .candidates()
+                        .baseline()
+                        .page(*page_id)
+                        .unwrap()
+                        .is_some_and(|page| page.path.as_str() == path)
+                })
+                .unwrap_or_else(|| panic!("clean baseline has no {path}"));
+            let committed = commit_clean_activation(
+                &graph,
+                preparation,
+                &archive_parent.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+                &enrollment_root,
+            )
+            .unwrap();
+            let (baseline, physical, baseline_frontier, _) = committed.into_parts();
+            drop(physical);
+            drop(baseline);
+            let reopened = open_clean_activation(
+                &enrollment_root,
+                &archive_parent.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+                &database_path,
+                catalog,
+                super::super::ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap()
+            .expect("published clean coordinator activation reopens");
+            let (mut engine, projection, _) = reopened.into_parts();
+            let archive_root = archive_parent.join("operations");
+            engine
+                .attach_clean_archive_store(ObjectStore::open(&archive_root, workspace).unwrap())
+                .unwrap();
+            let archive = ObjectStore::open(&archive_root, workspace).unwrap();
+            let lease = WorkspaceRuntimeLease::acquire(&archive, workspace).unwrap();
+            let projection = LeasedWorkspaceProjection::adopt_clean_genesis(
+                lease,
+                &database_path,
+                ProjectionClaim::current(workspace, lineage),
+                &baseline_frontier,
+                &archive,
+                &engine,
+                projection,
+            )
+            .map_err(|(_, error)| error)
+            .unwrap();
+            let endpoint = ProjectionEndpointBinding::enroll_graph(
+                &graph,
+                ProjectionEndpointId::from_uuid(Uuid::from_u128(2)),
+                DeviceId::from_uuid(Uuid::from_u128(3)),
+            )
+            .unwrap();
+            let receipts = ProjectionReceiptStore::open_for_endpoint(
+                &root.path().join("clean-receipts"),
+                workspace,
+                endpoint,
+            )
+            .unwrap();
+            engine
+                .attach_clean_projection_endpoint(&graph, &receipts)
+                .unwrap();
+            let runtime = CleanLocalRuntime::from_open_parts(
+                SessionId::from_uuid(Uuid::from_u128(7)),
+                endpoint,
+                engine,
+                projection,
+            )
+            .unwrap();
+            let page = runtime.engine().materialize_page(page_id).unwrap();
+            let home_document_id = page.home_document_id;
+            let block_id = page.blocks[0].block_id;
+            Self {
+                _root: root,
+                graph_root,
+                archive_root,
+                enrollment_root,
+                database_path,
+                graph,
+                receipts,
+                archive,
+                runtime,
+                lineage,
+                catalog,
+                page_id,
+                home_document_id,
+                block_id,
+                path: path.into(),
+            }
+        }
+
+        fn overwrite(&self, bytes: &[u8]) {
+            fs::write(self.graph_root.join(&self.path), bytes).unwrap();
+        }
+
+        fn engine(&self) -> &ShardedHotEngine {
+            self.runtime.engine()
+        }
+
+        fn database(&self) -> &SqliteFrontier {
+            self.runtime.database()
+        }
+
+        fn local_edit_transaction(&self, content: &str) -> OperationTransaction {
+            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: self.block_id,
+                    home_document_id: self.home_document_id,
+                },
+                content: content.into(),
+            }])
+            .unwrap()
+        }
+
+        fn local_author(&self, seed: u128) -> AuthorBatch {
+            AuthorBatch {
+                batch_id: BatchId::from_uuid(Uuid::from_u128(seed)),
+                author_device_id: self.runtime.endpoint().device_id(),
+                author_session_id: SessionId::from_uuid(Uuid::from_u128(seed + 1)),
+                crdt_peer_id: CrdtPeerId::from_u64((seed as u64).saturating_add(10_001)),
+            }
+        }
+
+        fn execute_local(
+            &mut self,
+            transaction: &OperationTransaction,
+        ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
+            let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                transaction,
+            )
+        }
+
+        fn execute_local_correlated(
+            &mut self,
+            batch_id: BatchId,
+            transaction: &OperationTransaction,
+        ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
+            let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
+            OperationalCoordinator::execute_clean_local_correlated(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                batch_id,
+                transaction,
+                |_| Ok(()),
+            )
+        }
+
+        fn local_edit(
+            &mut self,
+            content: &str,
+        ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
+            let transaction = self.local_edit_transaction(content);
+            self.execute_local(&transaction)
+        }
+
+        fn execute_external(
+            &mut self,
+            paths: &[&str],
+        ) -> Result<CleanExternalMutationState, OperationalCoordinatorError> {
+            let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
+            OperationalCoordinator::execute_clean_external(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                paths,
+            )
+        }
+
+        fn retry_clean(
+            &mut self,
+            continuation: CleanPublishedContinuation,
+        ) -> CleanLocalMutationState {
+            let mut session = self
+                .runtime
+                .admit_clean_derived_recovery(&self.graph)
+                .unwrap();
+            OperationalCoordinator::retry_clean_local(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                continuation,
+            )
+        }
+
+        fn assert_clean_drained(&self) {
+            assert_eq!(
+                self.database().frontier_root().unwrap(),
+                self.engine().accepted_frontier_root().unwrap()
+            );
+            let source = RebuildSource::new(self.engine(), &self.archive).unwrap();
+            let tail = TailOverlay::from_durable(self.database(), &source).unwrap();
+            assert_eq!(tail.status().unapplied_batches, 0);
+            assert_eq!(tail.status().retained_bytes, 0);
+        }
+
+        fn restart_clean_runtime(self) -> Self {
+            let Self {
+                _root,
+                graph_root,
+                archive_root,
+                enrollment_root,
+                database_path,
+                graph,
+                receipts,
+                archive,
+                runtime,
+                lineage,
+                catalog,
+                page_id,
+                home_document_id: _,
+                block_id: _,
+                path,
+            } = self;
+            let endpoint = receipts.endpoint_binding().unwrap();
+            let workspace = runtime.engine().workspace_id();
+            drop(runtime);
+            drop(archive);
+            let archive_parent = archive_root.parent().unwrap();
+            let reopened = open_clean_activation(
+                &enrollment_root,
+                &archive_parent.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+                &database_path,
+                catalog,
+                super::super::ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap()
+            .expect("published clean coordinator activation reopens after restart");
+            let (mut engine, baseline_projection, _) = reopened.into_parts();
+            engine
+                .attach_clean_archive_store(ObjectStore::open(&archive_root, workspace).unwrap())
+                .unwrap();
+            let baseline_root = engine.accepted_frontier_root().unwrap();
+            let baseline_claim_source = super::super::sqlite::clean_genesis_materialized_read(
+                &baseline_projection,
+                &baseline_root,
+            )
+            .unwrap();
+            let replayed = engine
+                .replay_clean_committed_tail(&baseline_claim_source)
+                .unwrap();
+            drop(baseline_claim_source);
+            let archive = ObjectStore::open(&archive_root, workspace).unwrap();
+            let lease = WorkspaceRuntimeLease::acquire(&archive, workspace).unwrap();
+            let projection = if replayed == 0 {
+                let expected = engine.accepted_frontier_root().unwrap();
+                LeasedWorkspaceProjection::adopt_clean_genesis(
+                    lease,
+                    &database_path,
+                    ProjectionClaim::current(workspace, lineage),
+                    &expected,
+                    &archive,
+                    &engine,
+                    baseline_projection,
+                )
+                .map_err(|(_, error)| error)
+                .unwrap()
+            } else {
+                drop(baseline_projection);
+                let application_runtime = ApplicationRuntimeRoot::open_for_test(
+                    &_root.path().join("clean-application-runtime"),
+                )
+                .unwrap();
+                let source = RebuildSource::new(&engine, &archive).unwrap();
+                LeasedWorkspaceProjection::open_under(lease, |slot| {
+                    let opened = SqliteFrontier::open_or_rebuild_with_applier_slot(
+                        &database_path,
+                        &application_runtime,
+                        ProjectionClaim::current(workspace, lineage),
+                        source,
+                        slot,
+                    )?;
+                    Ok::<_, super::super::SqliteProjectionError>((opened, ()))
+                })
+                .map(|(projection, ())| projection)
+                .map_err(|(_, error)| error)
+                .unwrap()
+            };
+            engine
+                .attach_clean_projection_endpoint(&graph, &receipts)
+                .unwrap();
+            let runtime = CleanLocalRuntime::from_open_parts(
+                SessionId::from_uuid(Uuid::from_u128(7)),
+                endpoint,
+                engine,
+                projection,
+            )
+            .unwrap();
+            let page = runtime.engine().materialize_page(page_id).unwrap();
+            let home_document_id = page.home_document_id;
+            let block_id = page.blocks[0].block_id;
+            Self {
+                _root,
+                graph_root,
+                archive_root,
+                enrollment_root,
+                database_path,
+                graph,
+                receipts,
+                archive,
+                runtime,
+                lineage,
+                catalog,
+                page_id,
+                home_document_id,
+                block_id,
+                path,
+            }
+        }
+    }
+
+    fn clean_coordinator_source(path: &str, root: &str, child: &str) -> Vec<u8> {
+        if path.ends_with(".org") {
+            format!("* {root}\n** {child}\n").into_bytes()
+        } else {
+            format!("- {root}\n  - {child}\n").into_bytes()
+        }
+    }
+
+    fn expect_clean_local_complete(state: CleanLocalMutationState) -> BatchId {
+        match state {
+            CleanLocalMutationState::Complete(batch_id) => batch_id,
+            CleanLocalMutationState::DurablePending(pending) => {
+                panic!(
+                    "unexpected durable clean local continuation: {}",
+                    pending.failure()
+                )
+            }
+        }
+    }
+
+    fn expect_clean_local_pending(state: CleanLocalMutationState) -> CleanPublishedContinuation {
+        match state {
+            CleanLocalMutationState::DurablePending(pending) => pending,
+            CleanLocalMutationState::Complete(_) => {
+                panic!("unexpected completed clean local mutation")
+            }
+        }
+    }
+
+    fn expect_clean_external_complete(state: CleanExternalMutationState) -> BatchId {
+        match state {
+            CleanExternalMutationState::Complete(batch_id) => batch_id,
+            CleanExternalMutationState::Noop => panic!("unexpected clean external no-op"),
+            CleanExternalMutationState::DurablePending(pending) => panic!(
+                "unexpected durable clean external continuation: {}",
+                pending.failure()
+            ),
+        }
+    }
+
+    fn expect_clean_external_pending(
+        state: CleanExternalMutationState,
+    ) -> CleanPublishedContinuation {
+        match state {
+            CleanExternalMutationState::DurablePending(pending) => pending,
+            CleanExternalMutationState::Noop => panic!("unexpected clean external no-op"),
+            CleanExternalMutationState::Complete(_) => {
+                panic!("unexpected completed clean external mutation")
+            }
+        }
+    }
+
+    fn settle_clean_local(
+        fixture: &mut CleanCoordinatorFixture,
+        mut state: CleanLocalMutationState,
+    ) -> BatchId {
+        for _ in 0..8 {
+            match state {
+                CleanLocalMutationState::Complete(batch_id) => return batch_id,
+                CleanLocalMutationState::DurablePending(pending) => {
+                    state = fixture.retry_clean(pending);
+                }
+            }
+        }
+        panic!("clean local mutation did not settle within the bounded turn budget")
     }
 
     fn expect_complete(state: OperationalCoordinatorState) -> OperationalCompletion {
@@ -5667,6 +6146,1024 @@ mod tests {
             fixture.database.frontier_root().unwrap(),
             fixture.engine.accepted_frontier_root().unwrap()
         );
+    }
+
+    #[test]
+    fn fresh_nested_layout_reconcile_drains_history_sqlite_and_projection_clean() {
+        let mut fixture = CleanCoordinatorFixture::configured("nested-success");
+        let path = fixture.path.clone();
+        fixture.overwrite(b"- root edited\n  - child edited\n");
+        let batch_id = expect_clean_external_complete(fixture.execute_external(&[&path]).unwrap());
+        let batch = match fixture.archive.inspect_batch(batch_id).unwrap() {
+            BatchInspection::Ready(batch) => batch,
+            other => panic!("clean external batch did not become Ready: {other:?}"),
+        };
+        let BatchOrigin::ExternalReconciliation { import_id } = batch.manifest().origin() else {
+            panic!("clean external batch lost its external origin")
+        };
+        assert_eq!(batch_id, import_id.batch_id());
+        fixture.assert_clean_drained();
+        assert_eq!(
+            fs::read(fixture.graph_root.join(path)).unwrap(),
+            b"- root edited\n  - child edited\n"
+        );
+    }
+
+    #[test]
+    fn admitted_local_semantic_mutation_commits_history_sqlite_and_projection_once_clean() {
+        let mut fixture = CleanCoordinatorFixture::configured("local-success");
+        let path = fixture.path.clone();
+        let manifests_before = fixture.archive.committed_manifests().unwrap().len();
+        let accepted_before = fixture.engine().accepted_batch_count().unwrap();
+        let sqlite_before = fixture.database().applied_batch_count().unwrap();
+        let releases_before = fixture.graph.handoff_release_count();
+        reset_projection_graph_test_counters();
+
+        let batch_id =
+            expect_clean_local_complete(fixture.local_edit("local semantic edit").unwrap());
+
+        assert_eq!(
+            fixture.archive.committed_manifests().unwrap().len(),
+            manifests_before + 1
+        );
+        assert_eq!(
+            fixture.engine().accepted_batch_count().unwrap(),
+            accepted_before + 1
+        );
+        assert_eq!(
+            fixture.database().applied_batch_count().unwrap(),
+            sqlite_before + 1
+        );
+        assert!(fixture.database().contains_batch(batch_id).unwrap());
+        let batch = match fixture.archive.inspect_batch(batch_id).unwrap() {
+            BatchInspection::Ready(batch) => batch,
+            other => panic!("clean local batch did not become Ready: {other:?}"),
+        };
+        assert_eq!(batch.manifest().origin(), BatchOrigin::LocalMutation);
+        assert_eq!(projection_graph_test_counters().write_calls, 1);
+        assert_eq!(fixture.graph.handoff_release_count(), releases_before + 1);
+        assert_eq!(
+            fs::read(fixture.graph_root.join(path)).unwrap(),
+            clean_coordinator_source("pages/a.md", "local semantic edit", "child")
+        );
+        fixture.assert_clean_drained();
+    }
+
+    #[test]
+    fn local_exact_path_drift_requests_reconciliation_without_publication_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("local-reconcile-first");
+        let path = fixture.path.clone();
+        fixture.overwrite(b"- externally moved local base\n  - child\n");
+        let immutable_before = snapshot_immutable_publication(&fixture.archive_root);
+        let frontier_before = fixture.engine().accepted_frontier_root().unwrap();
+        let sqlite_before = fixture.database().frontier_root().unwrap();
+        reset_projection_graph_test_counters();
+
+        let error = match fixture.local_edit("must not overwrite external bytes") {
+            Err(error) => error,
+            Ok(_) => panic!("exact clean local path drift must request reconciliation"),
+        };
+        assert_eq!(error.phase(), OperationalPhase::Planning);
+        assert!(error.detail().contains("requires external reconciliation"));
+        assert_eq!(
+            snapshot_immutable_publication(&fixture.archive_root),
+            immutable_before
+        );
+        assert_eq!(
+            fixture.engine().accepted_frontier_root().unwrap(),
+            frontier_before
+        );
+        assert_eq!(fixture.database().frontier_root().unwrap(), sqlite_before);
+        assert_eq!(projection_graph_test_counters().write_calls, 0);
+        assert_eq!(
+            fs::read(fixture.graph_root.join(path)).unwrap(),
+            b"- externally moved local base\n  - child\n"
+        );
+        fixture.graph.probe_managed_text_writer().unwrap();
+    }
+
+    #[test]
+    fn stale_local_binding_is_typed_blocked_before_any_writer_side_effect_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("local-stale-binding");
+        let foreign_root = TestRoot::new("local-stale-binding-clean-foreign");
+        let foreign_graph_root = foreign_root.path().join("graph");
+        fs::create_dir_all(&foreign_graph_root).unwrap();
+        let foreign_graph = Graph::open(&foreign_graph_root);
+        let foreign_endpoint = ProjectionEndpointBinding::enroll_graph(
+            &foreign_graph,
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(44_100)),
+            DeviceId::from_uuid(Uuid::from_u128(44_101)),
+        )
+        .unwrap();
+        let foreign_receipts = ProjectionReceiptStore::open_for_endpoint(
+            &foreign_root.path().join("receipts"),
+            fixture.engine().workspace_id(),
+            foreign_endpoint,
+        )
+        .unwrap();
+        let immutable_before = snapshot_immutable_publication(&fixture.archive_root);
+        let frontier_before = fixture.engine().accepted_frontier_root().unwrap();
+        let sqlite_before = fixture.database().frontier_root().unwrap();
+        let transaction = fixture.local_edit_transaction("blocked stale binding");
+        let mut session = fixture
+            .runtime
+            .admit_clean_mutation(&fixture.graph)
+            .unwrap();
+
+        let error = match OperationalCoordinator::execute_clean_local(
+            &mut session,
+            &fixture.graph,
+            &foreign_receipts,
+            &transaction,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a stale clean local binding must be typed before publication"),
+        };
+        assert_eq!(error.phase(), OperationalPhase::Bindings);
+        assert_eq!(
+            snapshot_immutable_publication(&fixture.archive_root),
+            immutable_before
+        );
+        assert_eq!(
+            fixture.engine().accepted_frontier_root().unwrap(),
+            frontier_before
+        );
+        assert_eq!(fixture.database().frontier_root().unwrap(), sqlite_before);
+        fixture.graph.probe_managed_text_writer().unwrap();
+    }
+
+    #[test]
+    fn local_and_external_mutations_enter_the_identical_terminal_pipeline_clean() {
+        let mut local = CleanCoordinatorFixture::new("shared-terminal-local");
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let local_pending =
+            expect_clean_local_pending(local.local_edit("shared terminal local").unwrap());
+        let local_batch = local_pending.batch_id();
+        let local_manifest = match local.archive.inspect_batch(local_batch).unwrap() {
+            BatchInspection::Ready(batch) => batch,
+            other => panic!("clean local publication is not Ready: {other:?}"),
+        };
+        assert_eq!(
+            local_manifest.manifest().origin(),
+            BatchOrigin::LocalMutation
+        );
+        assert_eq!(
+            expect_clean_local_complete(local.retry_clean(local_pending)),
+            local_batch
+        );
+        local.assert_clean_drained();
+
+        let mut external = CleanCoordinatorFixture::new("shared-terminal-external");
+        let path = external.path.clone();
+        external.overwrite(b"- shared terminal external\n  - child\n");
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let external_pending =
+            expect_clean_external_pending(external.execute_external(&[&path]).unwrap());
+        let external_batch = external_pending.batch_id();
+        let external_manifest = match external.archive.inspect_batch(external_batch).unwrap() {
+            BatchInspection::Ready(batch) => batch,
+            other => panic!("clean external publication is not Ready: {other:?}"),
+        };
+        assert!(matches!(
+            external_manifest.manifest().origin(),
+            BatchOrigin::ExternalReconciliation { .. }
+        ));
+        assert_eq!(
+            expect_clean_local_complete(external.retry_clean(external_pending)),
+            external_batch
+        );
+        external.assert_clean_drained();
+    }
+
+    #[test]
+    fn local_late_failure_retries_exact_publication_without_a_second_writer_clean() {
+        for (index, point) in [
+            OperationalFaultPoint::AfterManifest,
+            OperationalFaultPoint::AfterSqliteApply,
+            OperationalFaultPoint::BeforeProjection,
+            OperationalFaultPoint::AfterProjection,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = CleanCoordinatorFixture::new(&format!("local-late-{point:?}"));
+            let path = fixture.path.clone();
+            let manifests_before = fixture.archive.committed_manifests().unwrap().len();
+            let releases_before = fixture.graph.handoff_release_count();
+            reset_projection_graph_test_counters();
+            fail_once_at(OperationalFaultPoint::AfterManifest);
+            let mut pending =
+                expect_clean_local_pending(fixture.local_edit("late local edit").unwrap());
+            let batch_id = pending.batch_id();
+            assert_eq!(
+                fixture.archive.committed_manifests().unwrap().len(),
+                manifests_before + 1
+            );
+            assert!(fixture.graph.probe_managed_text_writer().is_err());
+
+            if point != OperationalFaultPoint::AfterManifest {
+                fail_once_at(point);
+                pending = expect_clean_local_pending(fixture.retry_clean(pending));
+                assert_eq!(pending.batch_id(), batch_id);
+                assert_eq!(fixture.graph.handoff_release_count(), releases_before);
+                assert!(fixture.graph.probe_managed_text_writer().is_err());
+            }
+            let completion = expect_clean_local_complete(fixture.retry_clean(pending));
+            assert_eq!(
+                completion, batch_id,
+                "case {index} changed clean publication"
+            );
+            assert_eq!(
+                fixture.archive.committed_manifests().unwrap().len(),
+                manifests_before + 1,
+                "late clean retry republished the local mutation"
+            );
+            assert!(projection_graph_test_counters().write_calls <= 1);
+            assert_eq!(
+                fs::read(fixture.graph_root.join(&path)).unwrap(),
+                clean_coordinator_source(&path, "root", "late local edit")
+            );
+            fixture.graph.probe_managed_text_writer().unwrap();
+            fixture.assert_clean_drained();
+        }
+    }
+
+    #[test]
+    fn local_semantic_paths_accept_nested_nonstandard_utf8_markdown_and_org_clean() {
+        for (index, path) in [
+            "content/pages/研究/über topic.md",
+            "content/pages/研究/über topic.org",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = CleanCoordinatorFixture::new_at(
+                &format!("local-utf-{index}"),
+                path,
+                Some(
+                    "{:pages-directory \"content/pages\"\n\
+                      :journals-directory \"content/journals\"}\n",
+                ),
+                ManagedTextKind::Page,
+            );
+            expect_clean_local_complete(fixture.local_edit("utf local edit").unwrap());
+            let expected = if path.ends_with(".org") {
+                clean_coordinator_source(path, "utf local edit", "child")
+            } else {
+                clean_coordinator_source(path, "root", "utf local edit")
+            };
+            assert_eq!(fs::read(fixture.graph_root.join(path)).unwrap(), expected);
+            fixture.assert_clean_drained();
+        }
+    }
+
+    #[test]
+    fn in_place_catalog_derivation_publishes_the_same_markdown_and_org_source_clean() {
+        for (index, path) in [
+            "content/pages/研究/über topic.md",
+            "content/pages/研究/über topic.org",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = CleanCoordinatorFixture::new_at(
+                &format!("local-derivation-{index}"),
+                path,
+                Some(
+                    "{:pages-directory \"content/pages\"\n\
+                      :journals-directory \"content/journals\"}\n",
+                ),
+                ManagedTextKind::Page,
+            );
+
+            let edit_author = fixture.local_author(44_000 + index as u128 * 100);
+            let edit = fixture.local_edit_transaction("TODO utf derivation edit [[Other Page]]");
+            let observed = fixture.engine().assert_draft_matches_previous_derivation(
+                edit_author,
+                BatchOrigin::LocalMutation,
+                &edit,
+            );
+            assert_eq!(observed.refused, None);
+            assert_eq!(observed.optimized_catalog_copies, 0);
+            assert!(observed.oracle_catalog_copies >= 1);
+            let state = fixture.execute_local(&edit).unwrap();
+            settle_clean_local(&mut fixture, state);
+            let expected = if path.ends_with(".org") {
+                clean_coordinator_source(path, "TODO utf derivation edit [[Other Page]]", "child")
+            } else {
+                clean_coordinator_source(path, "root", "TODO utf derivation edit [[Other Page]]")
+            };
+            assert_eq!(fs::read(fixture.graph_root.join(path)).unwrap(), expected);
+            fixture.assert_clean_drained();
+
+            let insert_author = fixture.local_author(44_050 + index as u128 * 100);
+            let insert = OperationTransaction::new(vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: BlockId::from_uuid(Uuid::from_u128(44_900 + index as u128)),
+                    home_document_id: fixture.home_document_id,
+                },
+                page_id: fixture.page_id,
+                parent: None,
+                order: "b".into(),
+                content: "DONE appended tail".into(),
+            }])
+            .unwrap();
+            let observed = fixture.engine().assert_draft_matches_previous_derivation(
+                insert_author,
+                BatchOrigin::LocalMutation,
+                &insert,
+            );
+            assert_eq!(observed.refused, None);
+            assert_eq!(observed.optimized_catalog_copies, 0);
+            assert!(observed.oracle_catalog_copies >= 1);
+            let state = fixture.execute_local(&insert).unwrap();
+            settle_clean_local(&mut fixture, state);
+            fixture.assert_clean_drained();
+
+            let settle_author = fixture.local_author(44_070 + index as u128 * 100);
+            let settle = fixture.local_edit_transaction("TODO settled after deferral");
+            let observed = fixture.engine().assert_draft_matches_previous_derivation(
+                settle_author,
+                BatchOrigin::LocalMutation,
+                &settle,
+            );
+            assert_eq!(observed.refused, None);
+            assert_eq!(observed.optimized_catalog_copies, 0);
+            fail_once_at(OperationalFaultPoint::AfterManifest);
+            let pending = expect_clean_local_pending(fixture.execute_local(&settle).unwrap());
+            let batch_id = pending.batch_id();
+            fail_once_at(OperationalFaultPoint::BeforeProjection);
+            let pending = expect_clean_local_pending(fixture.retry_clean(pending));
+            assert_eq!(pending.batch_id(), batch_id);
+            assert_eq!(
+                expect_clean_local_complete(fixture.retry_clean(pending)),
+                batch_id
+            );
+            fixture.assert_clean_drained();
+
+            let restarted = fixture.restart_clean_runtime();
+            restarted.assert_clean_drained();
+            assert_eq!(
+                fs::read(restarted.graph_root.join(path)).unwrap(),
+                fs::read(restarted.graph_root.join(&restarted.path)).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn local_continuation_drop_stays_closed_and_completion_releases_once_clean() {
+        let mut dropped = CleanCoordinatorFixture::new("drop-local-published");
+        let releases = dropped.graph.handoff_release_count();
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let continuation =
+            expect_clean_local_pending(dropped.local_edit("drop local continuation").unwrap());
+        drop(continuation);
+        assert_eq!(dropped.graph.handoff_release_count(), releases);
+        assert!(dropped.graph.probe_managed_text_writer().is_err());
+
+        let mut completed = CleanCoordinatorFixture::new("complete-local-once");
+        let releases = completed.graph.handoff_release_count();
+        expect_clean_local_complete(completed.local_edit("complete local once").unwrap());
+        assert_eq!(completed.graph.handoff_release_count(), releases + 1);
+        completed.graph.probe_managed_text_writer().unwrap();
+        completed.graph.probe_managed_text_writer().unwrap();
+        assert_eq!(completed.graph.handoff_release_count(), releases + 1);
+    }
+
+    #[test]
+    fn retained_terminal_dispositions_are_blocked_while_progress_is_recovering_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("retained-clean-published");
+        let releases = fixture.graph.handoff_release_count();
+        let manifests_before = fixture.archive.committed_manifests().unwrap().len();
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let mut pending =
+            expect_clean_local_pending(fixture.local_edit("retained clean core").unwrap());
+        let batch_id = pending.batch_id();
+        let published = snapshot_immutable_publication(&fixture.archive_root);
+        fail_repeatedly_at(OperationalFaultPoint::BeforeProjection, 2);
+
+        for _ in 0..2 {
+            pending = expect_clean_local_pending(fixture.retry_clean(pending));
+            assert_eq!(pending.batch_id(), batch_id);
+            assert_eq!(pending.failure().phase(), OperationalPhase::ProjectionDrain);
+            assert_eq!(
+                snapshot_immutable_publication(&fixture.archive_root),
+                published
+            );
+            assert_eq!(fixture.graph.handoff_release_count(), releases);
+            assert!(fixture.graph.probe_managed_text_writer().is_err());
+        }
+        assert_eq!(
+            fixture.archive.committed_manifests().unwrap().len(),
+            manifests_before + 1
+        );
+        assert_eq!(
+            expect_clean_local_complete(fixture.retry_clean(pending)),
+            batch_id
+        );
+        assert_eq!(fixture.graph.handoff_release_count(), releases + 1);
+        fixture.graph.probe_managed_text_writer().unwrap();
+        fixture.assert_clean_drained();
+    }
+
+    #[test]
+    fn rejected_published_local_batch_retains_typed_blocked_evidence_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("published-rejected-blocked");
+        let sqlite_before = fixture.database().frontier_root().unwrap();
+        let releases = fixture.graph.handoff_release_count();
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let pending =
+            expect_clean_local_pending(fixture.local_edit("durable history rejection").unwrap());
+        let batch_id = pending.batch_id();
+        let manifest = fixture
+            .archive_root
+            .join(crate::oplog::sync_layout::ARCHIVE_BATCHES_DIR)
+            .join(format!("{batch_id}.manifest"));
+        let held = manifest.with_extension("manifest.held");
+        fs::rename(&manifest, &held).unwrap();
+
+        let pending = expect_clean_local_pending(fixture.retry_clean(pending));
+        assert_eq!(pending.batch_id(), batch_id);
+        assert_eq!(pending.failure().phase(), OperationalPhase::ArchiveStage);
+        assert_eq!(
+            pending.failure().retained_block_reason(),
+            Some(&RetainedBlockReason::PublishedAuthentication)
+        );
+        assert_eq!(fixture.database().frontier_root().unwrap(), sqlite_before);
+        assert_eq!(fixture.graph.handoff_release_count(), releases);
+        assert!(fixture.graph.probe_managed_text_writer().is_err());
+
+        fs::rename(held, manifest).unwrap();
+        assert_eq!(
+            expect_clean_local_complete(fixture.retry_clean(pending)),
+            batch_id
+        );
+        assert_eq!(fixture.graph.handoff_release_count(), releases + 1);
+        fixture.assert_clean_drained();
+    }
+
+    #[test]
+    fn stable_postpublication_binding_failure_retains_typed_blocked_continuation_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("local-stable-postpublication-binding");
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let pending = expect_clean_local_pending(fixture.local_edit("stable binding").unwrap());
+        let batch_id = pending.batch_id();
+        let foreign_root = TestRoot::new("local-stable-postpublication-binding-clean-foreign");
+        let foreign_graph_root = foreign_root.path().join("graph");
+        fs::create_dir_all(&foreign_graph_root).unwrap();
+        let foreign_graph = Graph::open(&foreign_graph_root);
+        let mut session = fixture
+            .runtime
+            .admit_clean_derived_recovery(&fixture.graph)
+            .unwrap();
+
+        let pending = expect_clean_local_pending(OperationalCoordinator::retry_clean_local(
+            &mut session,
+            &foreign_graph,
+            &fixture.receipts,
+            pending,
+        ));
+        assert_eq!(pending.batch_id(), batch_id);
+        assert_eq!(pending.failure().phase(), OperationalPhase::Bindings);
+        assert!(fixture.graph.probe_managed_text_writer().is_err());
+        assert_eq!(
+            expect_clean_local_complete(fixture.retry_clean(pending)),
+            batch_id
+        );
+        fixture.assert_clean_drained();
+    }
+
+    #[test]
+    fn blocked_and_noop_cancel_without_durable_or_derived_mutation_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("blocked-noop");
+        let accepted = fixture.engine().accepted_frontier_root().unwrap();
+        let sqlite = fixture.database().frontier_root().unwrap();
+        let graph = fs::read(fixture.graph_root.join(&fixture.path)).unwrap();
+        let archive = snapshot_tree(&fixture.archive_root);
+        let receipts = snapshot_tree(fixture.receipts.root_path());
+
+        let blocked = fixture.execute_external(&["../escape.md"]);
+        assert!(matches!(
+            blocked,
+            Err(OperationalCoordinatorError {
+                phase: OperationalPhase::Planning,
+                ..
+            })
+        ));
+        let path = fixture.path.clone();
+        assert!(matches!(
+            fixture.execute_external(&[&path]).unwrap(),
+            CleanExternalMutationState::Noop
+        ));
+        assert_eq!(fixture.engine().accepted_frontier_root().unwrap(), accepted);
+        assert_eq!(fixture.database().frontier_root().unwrap(), sqlite);
+        assert_eq!(
+            fs::read(fixture.graph_root.join(&fixture.path)).unwrap(),
+            graph
+        );
+        assert_eq!(snapshot_tree(&fixture.archive_root), archive);
+        assert_eq!(snapshot_tree(fixture.receipts.root_path()), receipts);
+        fixture.graph.probe_managed_text_writer().unwrap();
+    }
+
+    #[test]
+    fn every_pre_manifest_boundary_releases_and_allows_fresh_retry_clean() {
+        for (index, point) in [
+            OperationalFaultPoint::AfterHandoff,
+            OperationalFaultPoint::AfterDraft,
+            OperationalFaultPoint::AfterCapture,
+            OperationalFaultPoint::AfterFinalize,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = CleanCoordinatorFixture::new(&format!("pre-manifest-local-{index}"));
+            let accepted = fixture.engine().accepted_frontier_root().unwrap();
+            let sqlite = fixture.database().frontier_root().unwrap();
+            let archive = snapshot_immutable_publication(&fixture.archive_root);
+            fail_once_at(point);
+            assert!(
+                fixture.local_edit("changed local").is_err(),
+                "{point:?} was not reached"
+            );
+            assert_eq!(fixture.engine().accepted_frontier_root().unwrap(), accepted);
+            assert_eq!(fixture.database().frontier_root().unwrap(), sqlite);
+            assert_eq!(
+                snapshot_immutable_publication(&fixture.archive_root),
+                archive
+            );
+            fixture.graph.probe_managed_text_writer().unwrap();
+            expect_clean_local_complete(fixture.local_edit("changed local").unwrap());
+            fixture.assert_clean_drained();
+        }
+
+        for (index, point) in [
+            OperationalFaultPoint::AfterHandoff,
+            OperationalFaultPoint::AfterPlan,
+            OperationalFaultPoint::AfterDraft,
+            OperationalFaultPoint::AfterCapture,
+            OperationalFaultPoint::AfterFinalize,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture =
+                CleanCoordinatorFixture::new(&format!("pre-manifest-external-{index}"));
+            let path = fixture.path.clone();
+            fixture.overwrite(b"- changed external\n  - still nested\n");
+            let accepted = fixture.engine().accepted_frontier_root().unwrap();
+            let sqlite = fixture.database().frontier_root().unwrap();
+            let archive = snapshot_immutable_publication(&fixture.archive_root);
+            fail_once_at(point);
+            assert!(
+                fixture.execute_external(&[&path]).is_err(),
+                "{point:?} was not reached"
+            );
+            assert_eq!(fixture.engine().accepted_frontier_root().unwrap(), accepted);
+            assert_eq!(fixture.database().frontier_root().unwrap(), sqlite);
+            assert_eq!(
+                snapshot_immutable_publication(&fixture.archive_root),
+                archive
+            );
+            fixture.graph.probe_managed_text_writer().unwrap();
+            expect_clean_external_complete(fixture.execute_external(&[&path]).unwrap());
+            fixture.assert_clean_drained();
+        }
+    }
+
+    #[test]
+    fn exact_reservation_precedes_manifest_and_object_only_cut_has_no_semantic_effect_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("objects-only");
+        let sqlite = fixture.database().frontier_root().unwrap();
+        let manifests = fixture.archive.committed_manifests().unwrap();
+        let before = snapshot_tree(&fixture.archive_root);
+        fail_next_publish_after_objects();
+        let error = match fixture.local_edit("objects only") {
+            Err(error) => error,
+            Ok(_) => panic!("object-only clean publication cut unexpectedly committed"),
+        };
+        assert_eq!(error.phase(), OperationalPhase::Publication);
+        assert_eq!(fixture.database().frontier_root().unwrap(), sqlite);
+        assert_eq!(fixture.archive.committed_manifests().unwrap(), manifests);
+        assert_ne!(snapshot_tree(&fixture.archive_root), before);
+        assert!(
+            fixture.engine().materialize_page(fixture.page_id).is_err(),
+            "the speculative failed-commit engine must remain poisoned and unobservable"
+        );
+        fixture.graph.probe_managed_text_writer().unwrap();
+    }
+
+    #[test]
+    fn every_post_manifest_failure_retains_guard_and_retries_idempotently_clean() {
+        for (index, point) in [
+            OperationalFaultPoint::AfterManifest,
+            OperationalFaultPoint::AfterSqliteApply,
+            OperationalFaultPoint::BeforeProjection,
+            OperationalFaultPoint::AfterProjection,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = CleanCoordinatorFixture::new(&format!("post-manifest-{index}"));
+            let path = fixture.path.clone();
+            fixture.overwrite(b"- durable edit\n  - nested durable edit\n");
+            let releases = fixture.graph.handoff_release_count();
+            fail_once_at(OperationalFaultPoint::AfterManifest);
+            let mut pending =
+                expect_clean_external_pending(fixture.execute_external(&[&path]).unwrap());
+            let batch_id = pending.batch_id();
+            assert!(fixture.graph.probe_managed_text_writer().is_err());
+            if point != OperationalFaultPoint::AfterManifest {
+                fail_once_at(point);
+                pending = expect_clean_local_pending(fixture.retry_clean(pending));
+                assert_eq!(pending.batch_id(), batch_id);
+                assert_eq!(fixture.graph.handoff_release_count(), releases);
+                assert!(fixture.graph.probe_managed_text_writer().is_err());
+            }
+            assert_eq!(
+                expect_clean_local_complete(fixture.retry_clean(pending)),
+                batch_id
+            );
+            assert_eq!(fixture.graph.handoff_release_count(), releases + 1);
+            fixture.graph.probe_managed_text_writer().unwrap();
+            fixture.assert_clean_drained();
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                b"- durable edit\n  - nested durable edit\n"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_budget_boundary_retains_handoff_and_resumes_without_republication_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("bounded-clean-resume");
+        let releases = fixture.graph.handoff_release_count();
+        let manifests_before = fixture.archive.committed_manifests().unwrap().len();
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let mut pending =
+            expect_clean_local_pending(fixture.local_edit("immutable clean retry").unwrap());
+        let batch_id = pending.batch_id();
+        let published = snapshot_immutable_publication(&fixture.archive_root);
+        let published_count = fixture.archive.committed_manifests().unwrap().len();
+        assert_eq!(published_count, manifests_before + 1);
+        fail_repeatedly_at(OperationalFaultPoint::BeforeProjection, 3);
+
+        for _ in 0..3 {
+            assert_eq!(
+                snapshot_immutable_publication(&fixture.archive_root),
+                published
+            );
+            assert_eq!(
+                fixture.archive.committed_manifests().unwrap().len(),
+                published_count
+            );
+            assert_eq!(fixture.graph.handoff_release_count(), releases);
+            assert!(fixture.graph.probe_managed_text_writer().is_err());
+            pending = expect_clean_local_pending(fixture.retry_clean(pending));
+            assert_eq!(pending.batch_id(), batch_id);
+            assert_eq!(pending.failure().phase(), OperationalPhase::ProjectionDrain);
+        }
+
+        assert_eq!(
+            expect_clean_local_complete(fixture.retry_clean(pending)),
+            batch_id
+        );
+        assert_eq!(fixture.graph.handoff_release_count(), releases + 1);
+        assert_eq!(
+            snapshot_immutable_publication(&fixture.archive_root),
+            published
+        );
+        assert_eq!(
+            fixture.archive.committed_manifests().unwrap().len(),
+            published_count
+        );
+        fixture.graph.probe_managed_text_writer().unwrap();
+        fixture.graph.probe_managed_text_writer().unwrap();
+        assert_eq!(fixture.graph.handoff_release_count(), releases + 1);
+        fixture.assert_clean_drained();
+    }
+
+    #[test]
+    fn published_continuation_survives_same_process_engine_reconstruction_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("engine-reconstruction");
+        let path = fixture.path.clone();
+        fixture.overwrite(b"- reconstructed continuation\n  - nested\n");
+        let releases = fixture.graph.handoff_release_count();
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let pending = expect_clean_external_pending(fixture.execute_external(&[&path]).unwrap());
+        let batch_id = pending.batch_id();
+        assert!(fixture.graph.probe_managed_text_writer().is_err());
+
+        fixture = fixture.restart_clean_runtime();
+        assert_eq!(fixture.graph.handoff_release_count(), releases);
+        assert_eq!(
+            expect_clean_local_complete(fixture.retry_clean(pending)),
+            batch_id
+        );
+        assert_eq!(fixture.graph.handoff_release_count(), releases + 1);
+        fixture.graph.probe_managed_text_writer().unwrap();
+        fixture.assert_clean_drained();
+        assert_eq!(
+            fs::read(fixture.graph_root.join(path)).unwrap(),
+            b"- reconstructed continuation\n  - nested\n"
+        );
+    }
+
+    #[test]
+    fn dropping_published_continuation_stays_closed_and_completion_releases_once_clean() {
+        let mut dropped = CleanCoordinatorFixture::new("drop-published");
+        let path = dropped.path.clone();
+        dropped.overwrite(b"- durable dropped continuation\n");
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let pending = expect_clean_external_pending(dropped.execute_external(&[&path]).unwrap());
+        let releases = dropped.graph.handoff_release_count();
+        drop(pending);
+        assert_eq!(dropped.graph.handoff_release_count(), releases);
+        assert!(dropped.graph.probe_managed_text_writer().is_err());
+
+        let mut completed = CleanCoordinatorFixture::new("complete-once");
+        let path = completed.path.clone();
+        completed.overwrite(b"- successful explicit completion\n");
+        let releases = completed.graph.handoff_release_count();
+        expect_clean_external_complete(completed.execute_external(&[&path]).unwrap());
+        assert_eq!(completed.graph.handoff_release_count(), releases + 1);
+        completed.graph.probe_managed_text_writer().unwrap();
+        completed.graph.probe_managed_text_writer().unwrap();
+        assert_eq!(completed.graph.handoff_release_count(), releases + 1);
+    }
+
+    #[test]
+    fn manifested_preconditions_are_exact_fresh_external_observations_clean() {
+        let mut edit = CleanCoordinatorFixture::new("observed-precondition-edit");
+        let path = edit.path.clone();
+        let prior = fs::read(edit.graph_root.join(&path)).unwrap();
+        let observed = b"- externally changed bytes\n  - current annotation source\n".to_vec();
+        edit.overwrite(&observed);
+        let batch_id = expect_clean_external_complete(edit.execute_external(&[&path]).unwrap());
+        let batch = match edit.archive.inspect_batch(batch_id).unwrap() {
+            BatchInspection::Ready(batch) => batch,
+            other => panic!("completed batch is not immutable Ready: {other:?}"),
+        };
+        let intent = batch
+            .objects()
+            .iter()
+            .find(|object| object.kind() == ObjectKind::ProjectionIntent)
+            .map(|object| ManifestedProjectionIntent::decode(object.payload()).unwrap())
+            .expect("edit carries manifested projection intent");
+        let ManifestProjectionPrecondition::Present { base } = intent.precondition() else {
+            panic!("fresh present edit must manifest Present");
+        };
+        let manifested_base = batch
+            .objects()
+            .iter()
+            .find(|object| {
+                object.kind() == ObjectKind::AnnotatedBaseBlob
+                    && object.document_id() == base.document_id()
+            })
+            .map(|object| AnnotatedProjectionBase::decode(object.payload()).unwrap())
+            .expect("manifested observed base exists");
+        assert_eq!(manifested_base.bytes(), observed);
+        assert_ne!(manifested_base.bytes(), prior);
+
+        let mut absent = CleanCoordinatorFixture::new("observed-precondition-absent");
+        let path = absent.path.clone();
+        fs::remove_file(absent.graph_root.join(&path)).unwrap();
+        let batch_id = expect_clean_external_complete(absent.execute_external(&[&path]).unwrap());
+        let batch = match absent.archive.inspect_batch(batch_id).unwrap() {
+            BatchInspection::Ready(batch) => batch,
+            other => panic!("completed batch is not immutable Ready: {other:?}"),
+        };
+        let intent = batch
+            .objects()
+            .iter()
+            .find(|object| object.kind() == ObjectKind::ProjectionIntent)
+            .map(|object| ManifestedProjectionIntent::decode(object.payload()).unwrap())
+            .expect("delete carries manifested projection intent");
+        assert!(matches!(
+            intent.precondition(),
+            ManifestProjectionPrecondition::Absent
+        ));
+    }
+
+    #[test]
+    fn crdt_peer_probe_is_bounded_for_zero_collision_and_exhaustion_clean() {
+        let fixture = CleanCoordinatorFixture::new("peer-probe");
+        let path = fixture.path.clone();
+        fixture.overwrite(b"- peer probe edit\n");
+        let plan = plan_clean_affected_import(
+            &fixture.graph,
+            fixture.engine(),
+            fixture.database(),
+            &[&path],
+        );
+        let material = plan.into_execution_material().unwrap();
+        let endpoint = fixture.engine().projection_endpoint_binding().unwrap();
+        let claim_source = fixture.database().materialized_read().unwrap();
+        let genesis_peer = 0x5449_4e45_4745_4e31;
+        let candidates = [0, genesis_peer, genesis_peer + 1];
+        let (author, _) = draft_with_bounded_peer_candidates(
+            fixture.engine(),
+            endpoint,
+            &material,
+            Some(&claim_source),
+            |attempt| CrdtPeerId::from_u64(candidates[usize::try_from(attempt).unwrap().min(2)]),
+        )
+        .unwrap();
+        assert_eq!(author.crdt_peer_id, CrdtPeerId::from_u64(genesis_peer + 1));
+
+        let exhausted = match draft_with_bounded_peer_candidates(
+            fixture.engine(),
+            endpoint,
+            &material,
+            Some(&claim_source),
+            |_| CrdtPeerId::from_u64(genesis_peer),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("colliding bounded peer probe unexpectedly succeeded"),
+        };
+        assert_eq!(exhausted.phase(), OperationalPhase::Draft);
+        assert!(exhausted.detail().contains("bounded 8-candidate probe"));
+        fixture.graph.probe_managed_text_writer().unwrap();
+    }
+
+    #[test]
+    fn delete_and_rename_project_exact_old_removal_and_new_render_base_clean() {
+        let mut deletion = CleanCoordinatorFixture::new("delete");
+        let delete_path = deletion.path.clone();
+        fs::remove_file(deletion.graph_root.join(&delete_path)).unwrap();
+        expect_clean_external_complete(deletion.execute_external(&[&delete_path]).unwrap());
+        deletion.assert_clean_drained();
+        assert!(!deletion.graph_root.join(delete_path).exists());
+
+        let mut rename = CleanCoordinatorFixture::new("rename");
+        let old = rename.path.clone();
+        let new = "pages/elsewhere/deeper/renamed.md";
+        fs::create_dir_all(rename.graph_root.join(new).parent().unwrap()).unwrap();
+        fs::rename(rename.graph_root.join(&old), rename.graph_root.join(new)).unwrap();
+        let batch_id =
+            expect_clean_external_complete(rename.execute_external(&[&old, new]).unwrap());
+        rename.assert_clean_drained();
+        assert!(!rename.graph_root.join(&old).exists());
+        assert_eq!(
+            fs::read(rename.graph_root.join(new)).unwrap(),
+            b"- root\n  - child\n"
+        );
+        let batch = match rename.archive.inspect_batch(batch_id).unwrap() {
+            BatchInspection::Ready(batch) => batch,
+            other => panic!("completed rename batch is not Ready: {other:?}"),
+        };
+        let intents = batch
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
+            .map(|object| ManifestedProjectionIntent::decode(object.payload()).unwrap())
+            .collect::<Vec<_>>();
+        let old_intent = intents
+            .iter()
+            .find(|intent| intent.path().as_str() == old)
+            .expect("rename carries old-path removal");
+        assert!(matches!(
+            old_intent.precondition(),
+            ManifestProjectionPrecondition::Absent
+        ));
+        let new_intent = intents
+            .iter()
+            .find(|intent| intent.path().as_str() == new)
+            .expect("rename carries new-path projection");
+        let ManifestProjectionPrecondition::Present { base } = new_intent.precondition() else {
+            panic!("fresh rename destination is present");
+        };
+        let base = batch
+            .objects()
+            .iter()
+            .find(|object| {
+                object.kind() == ObjectKind::AnnotatedBaseBlob
+                    && object.document_id() == base.document_id()
+            })
+            .map(|object| AnnotatedProjectionBase::decode(object.payload()).unwrap())
+            .expect("rename destination observed base exists");
+        assert_eq!(base.bytes(), b"- root\n  - child\n");
+    }
+
+    #[test]
+    fn binding_mismatch_rejects_before_handoff_or_publication_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("binding");
+        let foreign_root = TestRoot::new("foreign-receipts-clean");
+        let foreign_graph_root = foreign_root.path().join("graph");
+        fs::create_dir_all(&foreign_graph_root).unwrap();
+        let foreign_graph = Graph::open(&foreign_graph_root);
+        let foreign_endpoint = ProjectionEndpointBinding::enroll_graph(
+            &foreign_graph,
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(900)),
+            DeviceId::from_uuid(Uuid::from_u128(901)),
+        )
+        .unwrap();
+        let foreign = ProjectionReceiptStore::open_for_endpoint(
+            &foreign_root.path().join("receipts"),
+            fixture.engine().workspace_id(),
+            foreign_endpoint,
+        )
+        .unwrap();
+        let releases = fixture.graph.handoff_release_count();
+        let transaction = fixture.local_edit_transaction("rejected binding");
+        let mut session = fixture
+            .runtime
+            .admit_clean_mutation(&fixture.graph)
+            .unwrap();
+        assert!(matches!(
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &fixture.graph,
+                &foreign,
+                &transaction,
+            ),
+            Err(OperationalCoordinatorError {
+                phase: OperationalPhase::Bindings,
+                ..
+            })
+        ));
+        assert_eq!(fixture.graph.handoff_release_count(), releases);
+        fixture.graph.probe_managed_text_writer().unwrap();
+        assert!(fixture.archive.committed_manifests().unwrap().is_empty());
+    }
+
+    #[test]
+    fn post_manifest_retry_rejects_rebound_graph_and_keeps_original_guard_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("retry-binding");
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let pending =
+            expect_clean_local_pending(fixture.local_edit("durable retry binding").unwrap());
+        let batch_id = pending.batch_id();
+
+        let foreign_root = TestRoot::new("retry-binding-clean-foreign");
+        let foreign_graph_root = foreign_root.path().join("graph");
+        fs::create_dir_all(&foreign_graph_root).unwrap();
+        let foreign_graph = Graph::open(&foreign_graph_root);
+        let mut session = fixture
+            .runtime
+            .admit_clean_derived_recovery(&fixture.graph)
+            .unwrap();
+        let pending = expect_clean_local_pending(OperationalCoordinator::retry_clean_local(
+            &mut session,
+            &foreign_graph,
+            &fixture.receipts,
+            pending,
+        ));
+        assert_eq!(pending.batch_id(), batch_id);
+        assert_eq!(pending.failure().phase(), OperationalPhase::Bindings);
+        assert!(fixture.graph.probe_managed_text_writer().is_err());
+        assert_eq!(
+            expect_clean_local_complete(fixture.retry_clean(pending)),
+            batch_id
+        );
+        fixture.graph.probe_managed_text_writer().unwrap();
+        fixture.assert_clean_drained();
+    }
+
+    #[test]
+    fn reordered_batch_ids_drain_by_authenticated_acceptance_sequence_clean() {
+        let mut fixture = CleanCoordinatorFixture::new("acceptance-sequence");
+        let first_id = BatchId::from_uuid(Uuid::from_u128(u128::MAX - 1));
+        let second_id = BatchId::from_uuid(Uuid::from_u128(20));
+        let first = fixture.local_edit_transaction("first accepted");
+        assert_eq!(
+            expect_clean_local_complete(
+                fixture.execute_local_correlated(first_id, &first).unwrap()
+            ),
+            first_id
+        );
+        let second = fixture.local_edit_transaction("second accepted");
+        assert_eq!(
+            expect_clean_local_complete(
+                fixture
+                    .execute_local_correlated(second_id, &second)
+                    .unwrap()
+            ),
+            second_id
+        );
+        assert!(first_id > second_id);
+        let first_event =
+            AcceptedBatchEvent::from_accepted(fixture.engine(), &fixture.archive, first_id)
+                .unwrap();
+        let second_event =
+            AcceptedBatchEvent::from_accepted(fixture.engine(), &fixture.archive, second_id)
+                .unwrap();
+        assert!(first_event.acceptance_sequence() < second_event.acceptance_sequence());
+        assert_eq!(
+            fixture
+                .engine()
+                .accepted_batch_id_at(first_event.acceptance_sequence())
+                .unwrap(),
+            Some(first_id)
+        );
+        assert_eq!(
+            fixture
+                .engine()
+                .accepted_batch_id_at(second_event.acceptance_sequence())
+                .unwrap(),
+            Some(second_id)
+        );
+        fixture.assert_clean_drained();
     }
 
     fn hex(bytes: &[u8]) -> String {
