@@ -2578,6 +2578,13 @@ mod tests {
     /// the raw scan, the raw reachability proof, the raw maintenance functions,
     /// or a hand-built record.
     ///
+    /// Re-anchored at stage 2d wave 2: `local_active.rs` was cut down to its
+    /// clean half (`CleanLocalRuntime`/`CleanRuntimeAdmission`/
+    /// `CleanRuntimeSession` plus the shared admission types), and the anchor
+    /// deliberately still names that file, because the surviving clean
+    /// activation runtime is exactly the sibling this fence exists for. It is
+    /// verified green against the post-cut source, not grandfathered.
+    ///
     /// A failure here means the activation path acquired deletion or authority
     /// surface it was designed not to have — not that the test is stale.
     #[test]
