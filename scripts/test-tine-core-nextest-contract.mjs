@@ -2,12 +2,9 @@
 
 import assert from "node:assert/strict";
 import {
-  CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES,
   LINUX_CORE_RELEASE_FILTERSET,
   LINUX_TINE_CORE_SHARD_COUNT,
   PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
-  SYNC_RUNTIME_CONTRACT_GUARD_TEST_NAMES,
-  SYNC_RUNTIME_RELEASE_TEST_NAMES,
   WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
   WINDOWS_CORE_EXACT_TEST_NAMES,
   WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
@@ -44,8 +41,11 @@ assert.throws(
   /selected no non-ignored tests/
 );
 
-const cleanRuntimeFixture = CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES.slice(0, 2);
-const releaseSelectedNames = ["model::tests::ordinary_semantic_contract", ...SYNC_RUNTIME_RELEASE_TEST_NAMES];
+const releaseSelectedNames = [
+  "model::tests::ordinary_semantic_contract",
+  "sync_runtime::tests::current_clean_runtime_contract",
+  "sync_runtime::tests::new_production_test_is_selected_automatically",
+];
 const coreWithLegacyOracle = listedInventory("tine-core", [
   ...releaseSelectedNames,
   ...PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
@@ -57,33 +57,14 @@ assert.deepEqual(
     coreTestCount: releaseSelectedNames.length + PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length,
     releaseTestCount: releaseSelectedNames.length,
     legacyOracleTestCount: PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length,
-    cleanRuntimeTestCount: CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES.length,
-    contractGuardTestCount: SYNC_RUNTIME_CONTRACT_GUARD_TEST_NAMES.length,
   }
 );
 assert.throws(
   () => verifyLinuxReleaseSelection(
     coreWithLegacyOracle,
-    listedInventory("tine-core", [
-      "model::tests::ordinary_semantic_contract",
-      ...cleanRuntimeFixture,
-    ])
+    listedInventory("tine-core", releaseSelectedNames.slice(0, 2))
   ),
-  /omitted required test/
-);
-
-// The exclusion contract is name-level, not module-level. A newly added healthy
-// sync-runtime test that nobody listed must fail the contract instead of being
-// silently dropped from every release shard and from the PR gate. Module
-// membership alone (the previous check) accepts it.
-const coreWithUnlistedHealthyTest = listedInventory("tine-core", [
-  ...releaseSelectedNames,
-  ...PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
-  "sync_runtime::tests::newly_added_healthy_clean_runtime_journey",
-]);
-assert.throws(
-  () => verifyLinuxReleaseSelection(coreWithUnlistedHealthyTest, releaseWithoutLegacyOracle),
-  /Linux release exclusion contract changed; missing \[none\], unexpected \[sync_runtime::tests::newly_added_healthy_clean_runtime_journey\]/
+  /Linux release exclusion contract changed.*new_production_test_is_selected_automatically/
 );
 
 // And a listed exclusion whose test no longer exists must fail too, so the list
@@ -98,41 +79,28 @@ assert.throws(
   new RegExp(`Linux release exclusion contract changed; missing \\[${staleOracleName}\\]`)
 );
 
-// The contract guards are release tests now; they must be both required and
-// listed as selected sync-runtime tests.
+// The allow-by-default filter must not permit a non-oracle omission, whether
+// the omitted test is in sync_runtime or another module.
 assert.throws(
   () => verifyLinuxReleaseSelection(
     coreWithLegacyOracle,
-    listedInventory(
-      "tine-core",
-      releaseSelectedNames.filter(
-        (name) => name !== "sync_runtime::tests::public_durable_refusal_scenarios_exactly_match_the_storage_contract"
-      )
-    )
+    listedInventory("tine-core", releaseSelectedNames.filter((name) => !name.startsWith("model::tests::")))
   ),
-  /omitted required test sync_runtime::tests::public_durable_refusal_scenarios_exactly_match_the_storage_contract/
+  /excluded non-oracle test/
 );
-assert.equal(
-  new Set([...CLEAN_SYNC_RUNTIME_RELEASE_TEST_NAMES, ...SYNC_RUNTIME_CONTRACT_GUARD_TEST_NAMES]).size,
-  SYNC_RUNTIME_RELEASE_TEST_NAMES.length
-);
-for (const name of [...SYNC_RUNTIME_RELEASE_TEST_NAMES, ...PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES]) {
+for (const name of PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES) {
   assert.match(name, /^sync_runtime::tests::/);
 }
 assert.equal(
-  new Set([...SYNC_RUNTIME_RELEASE_TEST_NAMES, ...PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES]).size,
-  SYNC_RUNTIME_RELEASE_TEST_NAMES.length + PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length
+  new Set(PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES).size,
+  PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length
 );
 
-assert.match(LINUX_CORE_RELEASE_FILTERSET, /not test\(\/sync_runtime::tests::\/\)/);
 assert.match(
   LINUX_CORE_RELEASE_FILTERSET,
-  /test\(=sync_runtime::tests::public_clean_activation_loads_saves_and_cold_reopens_an_editor_page\)/
+  /not \(test\(=sync_runtime::tests::/
 );
-assert.match(
-  LINUX_CORE_RELEASE_FILTERSET,
-  /test\(=sync_runtime::tests::managed_storage_validation_is_not_unix_uid_coupled\)/
-);
+assert.doesNotMatch(LINUX_CORE_RELEASE_FILTERSET, /not test\(\/sync_runtime::tests::\/\)/);
 assert.throws(
   () => verifyLinuxShardCoverage(fullCore, [shards[0], shards[1], shards[2], shards[2]]),
   /both selected tine-core gamma/

@@ -59,15 +59,15 @@ deterministic fixtures.
 ## Windows release scope
 
 Linux is Tine's complete behavior matrix: its nextest inventory contract proves
-every non-ignored `tine-core` test in the release selection runs exactly once
-across four isolated shards. The selection is not the whole package — the
-pre-0.7 adversarial actor oracle inside `sync_runtime::tests` is excluded — but
-the exclusion is proven BY NAME, not by module prefix:
-`PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` in
+every selected non-ignored `tine-core` test runs exactly once across four
+isolated shards. Selection is allow-by-default: every current and newly added
+test enters the release gate automatically. The only subtraction is the
+surviving pre-0.7 adversarial actor oracle, proven BY NAME rather than by module
+prefix: `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` in
 `scripts/tine-core-nextest-contract.mjs` lists every excluded test, and the
-contract fails both when a test is excluded without being listed and when a
-listed name no longer exists. The same selection and profile run on every pull
-request, so the PR gate and the release shards cannot drift apart. Those tests
+contract fails both when another test is omitted and when a listed name no
+longer exists. The same selection and profile run on every pull request, so the
+PR gate and the release shards cannot drift apart. Those tests
 exercise Tine's semantic and lifecycle integration with the
 exact certified `tine-storage` pin. The package's own complete Linux, Windows,
 Android, format, crash-cut, and API matrix runs when a storage version is cut;
