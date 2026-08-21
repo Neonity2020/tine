@@ -326,6 +326,7 @@ pub(crate) struct EnrolledProjectionOpen {
 
 /// One-shot bootstrap installer token. It seals only durable history and never
 /// opens or creates projection-work authority.
+#[cfg(test)]
 pub(crate) struct HistoryOnlyOpen {
     store: Option<ObjectStore>,
     binding: super::hot_engine::ProjectionStorageBinding,
@@ -370,6 +371,7 @@ impl ControlDirectoryIdentity {
         ContentDigest::from_bytes(hasher.finalize().into())
     }
 
+    #[cfg(test)]
     pub(crate) fn migration_backup_root_binding_digest(self) -> ContentDigest {
         let mut hasher = Sha256::new();
         hasher.update(b"tine/migration-backup-root-resource/v1\0");
@@ -585,10 +587,12 @@ impl BootstrapAggregateHistoryBindingV1 {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn publication_id(self) -> BootstrapPublicationIdV1 {
         self.publication_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn aggregate_digest(self) -> BootstrapAggregateDigestV1 {
         self.aggregate_digest
     }
@@ -1086,6 +1090,7 @@ pub(crate) struct PreparedBootstrapHistoryRecordV1<'a> {
 }
 
 impl<'a> PreparedBootstrapHistoryRecordV1<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         part: BootstrapPartDescriptorV1,
         bytes: &'a [u8],
@@ -2862,6 +2867,7 @@ impl ObjectStore {
     /// Seal the durable-history control for inactive bootstrap installation.
     /// This performs the same no-follow, absence, retained-resource, and
     /// substitution checks as enrolled open without touching projection-work.
+    #[cfg(test)]
     pub(crate) fn seal_history_only(
         self,
         binding: super::hot_engine::ProjectionStorageBinding,
@@ -4519,11 +4525,14 @@ impl EnrolledProjectionOpen {
     }
 }
 
+#[cfg(test)]
 impl HistoryOnlyOpen {
+    #[cfg(test)]
     pub(crate) const fn binding(&self) -> super::hot_engine::ProjectionStorageBinding {
         self.binding
     }
 
+    #[cfg(test)]
     pub(crate) fn into_history(
         mut self,
     ) -> Result<(ObjectStore, DurableEngineHistoryStore), (ObjectStore, StoreError)> {

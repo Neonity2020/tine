@@ -24040,26 +24040,32 @@ impl BootstrapSourceCapture {
         self.source_files
     }
 
+    #[cfg(test)]
     pub(crate) fn source_chunk_count(&self) -> u64 {
         self.source_chunks
     }
 
+    #[cfg(test)]
     pub(crate) fn graph_resource(&self) -> CanonicalGraphResourceId {
         self.binding.graph_resource
     }
 
+    #[cfg(test)]
     pub(crate) fn inventory_description(&self) -> BlobDescription {
         self.inventory
     }
 
+    #[cfg(test)]
     pub(crate) fn entries_description(&self) -> BlobDescription {
         self.entries
     }
 
+    #[cfg(test)]
     pub(crate) fn chunks_description(&self) -> BlobDescription {
         self.chunks
     }
 
+    #[cfg(test)]
     pub(crate) fn capture_identity(&self) -> io::Result<BlobDescription> {
         bootstrap_source_capture_id(self)
     }
@@ -24166,10 +24172,12 @@ impl BootstrapSourceEntry {
         self.description
     }
 
+    #[cfg(test)]
     pub(crate) fn file_resource(&self) -> ContentDigest {
         self.file_resource
     }
 
+    #[cfg(test)]
     pub(crate) fn link_count(&self) -> u64 {
         self.link_count
     }
@@ -24199,6 +24207,7 @@ impl BootstrapSourceChunk {
         self.ordinal
     }
 
+    #[cfg(test)]
     pub(crate) fn description(&self) -> BlobDescription {
         self.description
     }

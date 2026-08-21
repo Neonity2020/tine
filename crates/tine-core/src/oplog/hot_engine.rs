@@ -454,14 +454,17 @@ impl CurrentPathCatalogBinding {
         self.accepted_frontier
     }
 
+    #[cfg(test)]
     pub(crate) const fn history_generation(self) -> u64 {
         self.history_generation
     }
 
+    #[cfg(test)]
     pub(crate) const fn history_root(self) -> ContentDigest {
         self.history_root
     }
 
+    #[cfg(test)]
     pub(crate) const fn catalog_root(self) -> ContentDigest {
         self.catalog_root
     }
@@ -2766,6 +2769,7 @@ pub(crate) struct DetachedBootstrapAuthoringSession {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct DetachedBootstrapReplayIdentity {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -2775,7 +2779,9 @@ pub(crate) struct DetachedBootstrapReplayIdentity {
     archive_identity: super::object_store::ControlDirectoryIdentity,
 }
 
+#[cfg(test)]
 impl DetachedBootstrapReplayIdentity {
+    #[cfg(test)]
     pub(crate) fn new(
         workspace_id: WorkspaceId,
         lineage_digest: LineageDigest,
@@ -2794,6 +2800,7 @@ impl DetachedBootstrapReplayIdentity {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn storage(&self) -> ProjectionStorageBinding {
         self.storage
     }
@@ -3268,6 +3275,7 @@ impl DetachedBootstrapAuthoringSession {
     }
 }
 
+#[cfg(test)]
 fn replay_direct_loaded_bootstrap_with<F>(
     store: &ObjectStore,
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
@@ -3348,6 +3356,7 @@ pub(crate) fn replay_direct_loaded_bootstrap(
     replay_direct_loaded_bootstrap_with(store, publication, preparation, None, |_, _| Ok(()))
 }
 
+#[cfg(test)]
 pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
     store: &ObjectStore,
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
@@ -4925,6 +4934,7 @@ impl BootstrapBulkMaterializer<'_> {
         self.exact_document_loads.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn projection_claim_resolution_stats(
         &self,
     ) -> BootstrapProjectionClaimResolutionStats {
@@ -32543,6 +32553,7 @@ fn decode_authenticated_current_history_leaf(
     Ok(record)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_bootstrap_history_record(
     part: BootstrapPartDescriptorV1,
     bytes: &[u8],
@@ -32566,6 +32577,7 @@ pub(crate) fn validate_bootstrap_history_record(
     Ok(history_record_binding(&record))
 }
 
+#[cfg(test)]
 fn validate_bootstrap_history_record_against_material(
     part: BootstrapPartDescriptorV1,
     bytes: &[u8],
@@ -32592,6 +32604,7 @@ fn validate_bootstrap_history_record_against_material(
     Ok(record_binding)
 }
 
+#[cfg(test)]
 fn cold_history_record_difference(
     actual: &ColdHistoryRecord,
     expected: &ColdHistoryRecord,

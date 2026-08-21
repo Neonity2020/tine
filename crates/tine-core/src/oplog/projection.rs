@@ -877,10 +877,12 @@ pub fn plan_projection(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExactSourceSemanticDifference {
     UnsupportedSourceLayout(String),
+    #[cfg(test)]
     PageKind {
         accepted: &'static str,
         source: &'static str,
     },
+    #[cfg(test)]
     PageName {
         accepted: String,
         source: String,
@@ -911,12 +913,14 @@ impl fmt::Display for ExactSourceSemanticDifference {
                     "source layout is not safely importable: {detail}"
                 )
             }
+            #[cfg(test)]
             Self::PageKind { accepted, source } => {
                 write!(
                     formatter,
                     "page kind differs: accepted={accepted}, source={source}"
                 )
             }
+            #[cfg(test)]
             Self::PageName { accepted, source } => write!(
                 formatter,
                 "page name differs: accepted={accepted:?}, source={source:?}"

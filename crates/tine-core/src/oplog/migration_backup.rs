@@ -5,54 +5,73 @@
 //! fresh committed-byte readback, and a proof of the verified inventory.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-#[cfg(unix)]
+use std::fs;
+#[cfg(test)]
+use std::fs::{File, OpenOptions};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{self, Read};
+#[cfg(all(test, unix))]
 use std::os::unix::fs::OpenOptionsExt as _;
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use super::bootstrap_import::{BOOTSTRAP_FRONTIER_SCHEMA_VERSION, BOOTSTRAP_IMPORT_SCHEMA_VERSION};
-use super::import::{
-    BootstrapStreamingImportError, InactiveBootstrapPreparedPublication,
-    InactiveBootstrapVerifiedPublication,
-};
-use super::object_store::{
-    control_directory_identity, open_dir_nofollow, open_file_nofollow,
-    BootstrapAggregateHistoryBindingV1,
-};
+use super::import::BootstrapStreamingImportError;
+#[cfg(test)]
+use super::import::{InactiveBootstrapPreparedPublication, InactiveBootstrapVerifiedPublication};
+#[cfg(test)]
+use super::object_store::{control_directory_identity, BootstrapAggregateHistoryBindingV1};
+use super::object_store::{open_dir_nofollow, open_file_nofollow};
+#[cfg(test)]
 use super::sync_layout::{
     COMMIT_MARKER_FILE, COMMIT_MARKER_STAGE_FILE, MANIFEST_FILE,
     MIGRATION_BACKUP_ROOT_DIR as BACKUP_ROOT_DIRECTORY, MIGRATION_PAYLOAD_DIR as PAYLOAD_DIRECTORY,
     RESTORE_PROOF_FILE, RESTORE_PROOF_STAGE_FILE,
 };
+use super::{BlobDescription, CanonicalGraphResourceId, ContentDigest, ManagedPath, WorkspaceId};
+#[cfg(test)]
 use super::{
-    BlobDescription, CanonicalGraphResourceId, ContentDigest, ManagedPath, ManagedTextKind,
-    WorkspaceId, DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION,
+    ManagedTextKind, DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION,
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
+#[cfg(test)]
 use crate::model::{
     canonical_graph_resource_id, move_file_noreplace, BootstrapSourceCapture,
     BootstrapSourceChunkCursor, BootstrapSourceEntry, BOOTSTRAP_SOURCE_CAPTURE_SCHEMA,
     BOOTSTRAP_SOURCE_CHUNK_BYTES, BOOTSTRAP_SOURCE_MAX_DIRECTORIES,
+    BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES,
+};
+use crate::model::{
     BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH, BOOTSTRAP_SOURCE_MAX_FILES,
-    BOOTSTRAP_SOURCE_MAX_FILE_BYTES, BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES,
-    BOOTSTRAP_SOURCE_MAX_PATH_BYTES, BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES,
+    BOOTSTRAP_SOURCE_MAX_FILE_BYTES, BOOTSTRAP_SOURCE_MAX_PATH_BYTES,
+    BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES,
 };
 
+#[cfg(test)]
 const BACKUP_SCHEMA_VERSION: u32 = 1;
+#[cfg(test)]
 const RESTORE_PROOF_SCHEMA_VERSION: u32 = 1;
+#[cfg(test)]
 const COMMIT_MARKER_SCHEMA_VERSION: u32 = 1;
+#[cfg(test)]
 const MANIFEST_MAGIC: &[u8; 8] = b"TINEMB1\0";
+#[cfg(test)]
 const RESTORE_PROOF_MAGIC: &[u8; 8] = b"TINERP1\0";
+#[cfg(test)]
 const COMMIT_MARKER_MAGIC: &[u8; 8] = b"TINEMC1\0";
+#[cfg(test)]
 const IO_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 const MAX_MANIFEST_HEADER_BYTES: usize = 256 * 1024;
 const MAX_RETAINED_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const SOURCE_BACKUP_BINDING_SCHEMA_VERSION: u32 = 1;
@@ -83,6 +102,7 @@ pub(crate) enum MigrationBackupCrashCut {
     AfterCommitMarkerPublication,
 }
 
+#[cfg(test)]
 fn inject_crash_cut(cut: MigrationBackupCrashCut) -> Result<(), MigrationBackupError> {
     if take_crash_cut(cut) {
         return Err(MigrationBackupError::InjectedCrashCut(cut.label()));
@@ -90,6 +110,7 @@ fn inject_crash_cut(cut: MigrationBackupCrashCut) -> Result<(), MigrationBackupE
     Ok(())
 }
 
+#[cfg(test)]
 fn take_crash_cut(cut: MigrationBackupCrashCut) -> bool {
     #[cfg(test)]
     {
@@ -104,6 +125,7 @@ fn take_crash_cut(cut: MigrationBackupCrashCut) -> bool {
     }
 }
 
+#[cfg(test)]
 fn write_with_partial_crash_cut(
     output: &mut impl Write,
     bytes: &[u8],
@@ -120,6 +142,7 @@ fn write_with_partial_crash_cut(
 }
 
 impl MigrationBackupCrashCut {
+    #[cfg(test)]
     const fn label(self) -> &'static str {
         match self {
             Self::PartialPayloadWrite => "partial_payload_write",
@@ -144,6 +167,7 @@ impl MigrationBackupCrashCut {
 #[derive(Debug)]
 pub(crate) enum MigrationBackupError {
     Io(io::Error),
+    #[cfg(test)]
     InvalidRoot(&'static str),
     BindingMismatch(&'static str),
     CorruptOrConflicting(&'static str),
@@ -152,6 +176,7 @@ pub(crate) enum MigrationBackupError {
         observed: u64,
         limit: u64,
     },
+    #[cfg(test)]
     InjectedCrashCut(&'static str),
 }
 
@@ -159,9 +184,11 @@ impl fmt::Display for MigrationBackupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => error.fmt(formatter),
-            Self::InvalidRoot(detail)
-            | Self::BindingMismatch(detail)
-            | Self::CorruptOrConflicting(detail) => formatter.write_str(detail),
+            #[cfg(test)]
+            Self::InvalidRoot(detail) => formatter.write_str(detail),
+            Self::BindingMismatch(detail) | Self::CorruptOrConflicting(detail) => {
+                formatter.write_str(detail)
+            }
             Self::ResourceLimit {
                 resource,
                 observed,
@@ -170,6 +197,7 @@ impl fmt::Display for MigrationBackupError {
                 formatter,
                 "{resource} limit exceeded: observed {observed}, limit {limit}"
             ),
+            #[cfg(test)]
             Self::InjectedCrashCut(label) => write!(formatter, "injected crash cut: {label}"),
         }
     }
@@ -196,6 +224,7 @@ impl From<BootstrapStreamingImportError> for MigrationBackupError {
 
 /// Retained structural authority for a device-local backup root and the exact
 /// canonical graph root it is forbidden to contain.
+#[cfg(test)]
 pub(crate) struct MigrationBackupRoot {
     canonical_root: PathBuf,
     canonical_graph_root: PathBuf,
@@ -205,7 +234,9 @@ pub(crate) struct MigrationBackupRoot {
     _graph_capability: Dir,
 }
 
+#[cfg(test)]
 impl MigrationBackupRoot {
+    #[cfg(test)]
     pub(crate) fn open(
         device_local_backup_root: &Path,
         canonical_graph_root: &Path,
@@ -256,22 +287,27 @@ impl MigrationBackupRoot {
         Self::open(device_local_backup_root, canonical_graph_root)
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_root(&self) -> &Path {
         &self.canonical_root
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_graph_root(&self) -> &Path {
         &self.canonical_graph_root
     }
 
+    #[cfg(test)]
     pub(crate) const fn graph_resource(&self) -> CanonicalGraphResourceId {
         self.graph_resource
     }
 
+    #[cfg(test)]
     pub(crate) const fn root_identity(&self) -> ContentDigest {
         self.backup_root_identity
     }
 
+    #[cfg(test)]
     pub(crate) fn freshly_validate_retained_roots(&self) -> Result<(), MigrationBackupError> {
         if self.canonical_root == self.canonical_graph_root
             || self.canonical_root.starts_with(&self.canonical_graph_root)
@@ -310,6 +346,7 @@ impl MigrationBackupRoot {
 /// Private evidence that can only be constructed by the final committed
 /// readback and restore-verification path below.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct VerifiedSourceBackup {
     directory: PathBuf,
     workspace_id: WorkspaceId,
@@ -327,6 +364,7 @@ pub(crate) struct VerifiedSourceBackup {
     instrumentation: MigrationBackupInstrumentation,
 }
 
+#[cfg(test)]
 impl PartialEq for VerifiedSourceBackup {
     fn eq(&self, other: &Self) -> bool {
         self.workspace_id == other.workspace_id
@@ -344,8 +382,10 @@ impl PartialEq for VerifiedSourceBackup {
     }
 }
 
+#[cfg(test)]
 impl Eq for VerifiedSourceBackup {}
 
+#[cfg(test)]
 impl VerifiedSourceBackup {
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
@@ -568,6 +608,7 @@ pub(crate) struct SourceBackupPayloadAuthority {
 }
 
 impl SourceBackupPayloadAuthority {
+    #[cfg(test)]
     pub(crate) fn reopen(
         roots: &MigrationBackupRoot,
         binding: &SourceBackupBindingV1,
@@ -671,6 +712,7 @@ impl SourceBackupPayloadAuthority {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct MigrationBackupInstrumentation {
     pub(crate) payload_bytes_written: u64,
     pub(crate) payload_bytes_read: u64,
@@ -682,6 +724,7 @@ pub(crate) struct MigrationBackupInstrumentation {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct SourceSummary {
     file_count: u64,
     chunk_count: u64,
@@ -691,6 +734,7 @@ struct SourceSummary {
     max_depth: usize,
 }
 
+#[cfg(test)]
 struct PublicationPaths {
     publication_parent: PathBuf,
     stage: PathBuf,
@@ -700,6 +744,7 @@ struct PublicationPaths {
 /// Publish, reopen, and verify one immutable pre-activation source backup.
 /// Proof digests are always derived internally from bytes freshly read from the
 /// committed backup.
+#[cfg(test)]
 pub(crate) fn verify_migration_source_backup(
     roots: &MigrationBackupRoot,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -870,6 +915,7 @@ pub(crate) fn verify_migration_source_backup(
     })
 }
 
+#[cfg(test)]
 fn validate_bindings(
     roots: &MigrationBackupRoot,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -917,6 +963,7 @@ fn validate_bindings(
     roots.freshly_validate_retained_roots()
 }
 
+#[cfg(test)]
 fn summarize_source(
     capture: &BootstrapSourceCapture,
 ) -> Result<SourceSummary, MigrationBackupError> {
@@ -992,6 +1039,7 @@ fn summarize_source(
     })
 }
 
+#[cfg(test)]
 fn publication_paths(
     roots: &MigrationBackupRoot,
     verified: &InactiveBootstrapVerifiedPublication,
@@ -1018,6 +1066,7 @@ fn publication_paths(
     })
 }
 
+#[cfg(test)]
 fn ensure_publication_parents(
     roots: &MigrationBackupRoot,
     paths: &PublicationPaths,
@@ -1027,6 +1076,7 @@ fn ensure_publication_parents(
     ensure_real_directory_created(&paths.publication_parent)
 }
 
+#[cfg(test)]
 fn validate_entry_bounds(entry: &BootstrapSourceEntry) -> Result<(), MigrationBackupError> {
     enforce_limit(
         "managed path bytes",
@@ -1045,6 +1095,7 @@ fn validate_entry_bounds(entry: &BootstrapSourceEntry) -> Result<(), MigrationBa
     )
 }
 
+#[cfg(test)]
 fn checked_add(
     current: u64,
     growth: u64,
@@ -1059,6 +1110,7 @@ fn checked_add(
         })
 }
 
+#[cfg(test)]
 fn enforce_limit(
     resource: &'static str,
     observed: u64,
@@ -1075,6 +1127,7 @@ fn enforce_limit(
     }
 }
 
+#[cfg(test)]
 fn manifest_header(
     prepared: &InactiveBootstrapPreparedPublication,
     verified: &InactiveBootstrapVerifiedPublication,
@@ -1161,6 +1214,7 @@ fn manifest_header(
     Ok(header)
 }
 
+#[cfg(test)]
 fn emit_manifest(
     output: &mut impl Write,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -1226,6 +1280,7 @@ fn emit_manifest(
     Ok(())
 }
 
+#[cfg(test)]
 fn resume_manifest(
     path: &Path,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -1251,6 +1306,7 @@ fn resume_manifest(
     output.finish()
 }
 
+#[cfg(test)]
 fn compare_expected_manifest(
     path: &Path,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -1276,6 +1332,7 @@ fn compare_expected_manifest(
     output.finish()
 }
 
+#[cfg(test)]
 struct ResumableExactFile {
     existing: Option<File>,
     remaining_existing: u64,
@@ -1285,7 +1342,9 @@ struct ResumableExactFile {
     conflict: &'static str,
 }
 
+#[cfg(test)]
 impl ResumableExactFile {
+    #[cfg(test)]
     fn open(path: &Path, conflict: &'static str) -> Result<Self, MigrationBackupError> {
         let (existing, remaining_existing, append) = match fs::symlink_metadata(path) {
             Ok(metadata) if !metadata_is_real_file(&metadata) => {
@@ -1311,6 +1370,7 @@ impl ResumableExactFile {
         })
     }
 
+    #[cfg(test)]
     fn finish(mut self) -> Result<BlobDescription, MigrationBackupError> {
         if self.remaining_existing != 0 {
             return Err(MigrationBackupError::CorruptOrConflicting(self.conflict));
@@ -1323,6 +1383,7 @@ impl ResumableExactFile {
     }
 }
 
+#[cfg(test)]
 impl Write for ResumableExactFile {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let compare_len = usize::try_from(self.remaining_existing.min(bytes.len() as u64))
@@ -1354,6 +1415,7 @@ impl Write for ResumableExactFile {
     }
 }
 
+#[cfg(test)]
 struct ExactFileComparator {
     file: File,
     hasher: Sha256,
@@ -1361,7 +1423,9 @@ struct ExactFileComparator {
     conflict: &'static str,
 }
 
+#[cfg(test)]
 impl ExactFileComparator {
+    #[cfg(test)]
     fn open(path: &Path, conflict: &'static str) -> Result<Self, MigrationBackupError> {
         require_real_file(path, conflict)?;
         Ok(Self {
@@ -1372,6 +1436,7 @@ impl ExactFileComparator {
         })
     }
 
+    #[cfg(test)]
     fn finish(mut self) -> Result<BlobDescription, MigrationBackupError> {
         let mut trailing = [0_u8; 1];
         if self.file.read(&mut trailing)? != 0 {
@@ -1384,6 +1449,7 @@ impl ExactFileComparator {
     }
 }
 
+#[cfg(test)]
 impl Write for ExactFileComparator {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let mut actual = vec![0_u8; bytes.len()];
@@ -1406,19 +1472,23 @@ impl Write for ExactFileComparator {
     }
 }
 
+#[cfg(test)]
 fn put_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_be_bytes());
 }
 
+#[cfg(test)]
 fn put_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_be_bytes());
 }
 
+#[cfg(test)]
 fn put_description(output: &mut Vec<u8>, description: BlobDescription) {
     output.extend_from_slice(description.sha256());
     put_u64(output, description.byte_length());
 }
 
+#[cfg(test)]
 fn put_optional_16(output: &mut Vec<u8>, value: Option<[u8; 16]>) {
     match value {
         Some(value) => {
@@ -1432,6 +1502,7 @@ fn put_optional_16(output: &mut Vec<u8>, value: Option<[u8; 16]>) {
     }
 }
 
+#[cfg(test)]
 fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), MigrationBackupError> {
     let length = u32::try_from(bytes.len()).map_err(|_| MigrationBackupError::ResourceLimit {
         resource: "manifest field bytes",
@@ -1443,6 +1514,7 @@ fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), MigrationBackupEr
     Ok(())
 }
 
+#[cfg(test)]
 fn write_len_prefixed(output: &mut impl Write, bytes: &[u8]) -> Result<(), MigrationBackupError> {
     let length = u32::try_from(bytes.len()).map_err(|_| MigrationBackupError::ResourceLimit {
         resource: "manifest string bytes",
@@ -1454,6 +1526,7 @@ fn write_len_prefixed(output: &mut impl Write, bytes: &[u8]) -> Result<(), Migra
     Ok(())
 }
 
+#[cfg(test)]
 fn write_len_prefixed_with_cut(
     output: &mut impl Write,
     bytes: &[u8],
@@ -1469,6 +1542,7 @@ fn write_len_prefixed_with_cut(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_description(
     output: &mut impl Write,
     description: BlobDescription,
@@ -1478,6 +1552,7 @@ fn write_description(
     Ok(())
 }
 
+#[cfg(test)]
 fn populate_payload_from_capture(
     capture: &BootstrapSourceCapture,
     payload: &Path,
@@ -1505,6 +1580,7 @@ fn populate_payload_from_capture(
     Ok(())
 }
 
+#[cfg(test)]
 fn resume_payload_file_from_capture(
     capture: &BootstrapSourceCapture,
     entry: &BootstrapSourceEntry,
@@ -1610,21 +1686,29 @@ fn resume_payload_file_from_capture(
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 struct ManifestChunk {
+    #[cfg(test)]
     ordinal: u32,
     description: BlobDescription,
 }
 
+#[cfg(test)]
 struct ManifestEntry {
     path: ManagedPath,
+    #[cfg(test)]
     kind: ManagedTextKind,
+    #[cfg(test)]
     logical_name: String,
     description: BlobDescription,
+    #[cfg(test)]
     file_resource: ContentDigest,
+    #[cfg(test)]
     link_count: u64,
     chunks: Vec<ManifestChunk>,
 }
 
+#[cfg(test)]
 struct ManifestReader {
     file: File,
     remaining_entries: u64,
@@ -1632,7 +1716,9 @@ struct ManifestReader {
     previous_path: Option<ManagedPath>,
 }
 
+#[cfg(test)]
 impl ManifestReader {
+    #[cfg(test)]
     fn open(
         path: &Path,
         prepared: &InactiveBootstrapPreparedPublication,
@@ -1660,6 +1746,7 @@ impl ManifestReader {
         })
     }
 
+    #[cfg(test)]
     fn next(&mut self) -> Result<Option<ManifestEntry>, MigrationBackupError> {
         if self.remaining_entries == 0 {
             return Ok(None);
@@ -1765,6 +1852,7 @@ impl ManifestReader {
         }))
     }
 
+    #[cfg(test)]
     fn finish(mut self) -> Result<(), MigrationBackupError> {
         if self.remaining_entries != 0 || self.remaining_chunks != 0 {
             return Err(MigrationBackupError::CorruptOrConflicting(
@@ -1781,6 +1869,7 @@ impl ManifestReader {
     }
 }
 
+#[cfg(test)]
 fn verify_backup_directory(
     directory: &Path,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -1830,12 +1919,14 @@ enum TreeReadKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct InventoryProof {
     digest: ContentDigest,
     file_count: u64,
     total_bytes: u64,
 }
 
+#[cfg(test)]
 fn verify_tree_from_manifest(
     manifest_path: &Path,
     tree: &Path,
@@ -1892,6 +1983,7 @@ fn verify_tree_from_manifest(
     })
 }
 
+#[cfg(test)]
 fn verify_file_against_entry(
     path: &Path,
     entry: &ManifestEntry,
@@ -1967,7 +2059,7 @@ fn verify_file_against_entry(
     ))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn restore_from_manifest(
     backup: &Path,
     restore: &Path,
@@ -1995,6 +2087,7 @@ fn restore_from_manifest(
     reader.finish()
 }
 
+#[cfg(test)]
 fn resume_restored_file(
     source: &Path,
     destination: &Path,
@@ -2106,6 +2199,7 @@ fn resume_restored_file(
     Ok(())
 }
 
+#[cfg(test)]
 fn restore_proof_bytes(
     prepared: &InactiveBootstrapPreparedPublication,
     verified: &InactiveBootstrapVerifiedPublication,
@@ -2137,6 +2231,7 @@ fn restore_proof_bytes(
     bytes
 }
 
+#[cfg(test)]
 fn commit_marker_bytes(
     prepared: &InactiveBootstrapPreparedPublication,
     verified: &InactiveBootstrapVerifiedPublication,
@@ -2169,6 +2264,7 @@ fn commit_marker_bytes(
     (body, evidence_digest)
 }
 
+#[cfg(test)]
 fn publish_small_file_atomic(
     directory: &Path,
     stage_name: &str,
@@ -2207,6 +2303,7 @@ fn publish_small_file_atomic(
     Ok(description)
 }
 
+#[cfg(test)]
 fn compare_exact_small_file(
     path: &Path,
     expected: &[u8],
@@ -2220,6 +2317,7 @@ fn compare_exact_small_file(
     Ok(())
 }
 
+#[cfg(test)]
 fn hash_inventory_entry(hasher: &mut Sha256, entry: &ManifestEntry) {
     hasher.update((entry.path.as_str().len() as u64).to_be_bytes());
     hasher.update(entry.path.as_str().as_bytes());
@@ -2242,17 +2340,20 @@ fn hash_inventory_entry(hasher: &mut Sha256, entry: &ManifestEntry) {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct TreeCounts {
     files: u64,
     directories: u64,
     bytes: u64,
 }
 
+#[cfg(test)]
 struct TreeFrame {
     path: PathBuf,
     entries: fs::ReadDir,
 }
 
+#[cfg(test)]
 fn traverse_tree_bounded(
     root: &Path,
     summary: SourceSummary,
@@ -2323,10 +2424,12 @@ fn traverse_tree_bounded(
     Ok(counts)
 }
 
+#[cfg(test)]
 fn count_tree(root: &Path, summary: SourceSummary) -> Result<TreeCounts, MigrationBackupError> {
     traverse_tree_bounded(root, summary, false)
 }
 
+#[cfg(test)]
 fn validate_backup_root_entries_for_state(
     directory: &Path,
     final_directory: bool,
@@ -2386,6 +2489,7 @@ fn validate_backup_root_entries_for_state(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_final_root_entries(directory: &Path) -> Result<(), MigrationBackupError> {
     validate_backup_root_entries_for_state(directory, true)?;
     if !path_exists(&directory.join(RESTORE_PROOF_FILE))?
@@ -2400,6 +2504,7 @@ fn validate_final_root_entries(directory: &Path) -> Result<(), MigrationBackupEr
     Ok(())
 }
 
+#[cfg(test)]
 fn require_capability_description(
     directory: &Dir,
     name: &str,
@@ -2479,6 +2584,7 @@ fn validate_retained_managed_path(path: &ManagedPath) -> Result<(), MigrationBac
     Ok(())
 }
 
+#[cfg(test)]
 fn payload_path(root: &Path, path: &ManagedPath) -> Result<PathBuf, MigrationBackupError> {
     if path.as_str().len() > BOOTSTRAP_SOURCE_MAX_PATH_BYTES {
         return Err(MigrationBackupError::ResourceLimit {
@@ -2496,6 +2602,7 @@ fn payload_path(root: &Path, path: &ManagedPath) -> Result<PathBuf, MigrationBac
     Ok(joined)
 }
 
+#[cfg(test)]
 fn ensure_managed_parent_directories(
     root: &Path,
     path: &ManagedPath,
@@ -2525,6 +2632,7 @@ fn metadata_is_windows_reparse(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+#[cfg(test)]
 fn metadata_is_real_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir()
         && !metadata.file_type().is_symlink()
@@ -2537,6 +2645,7 @@ fn metadata_is_real_file(metadata: &fs::Metadata) -> bool {
         && !metadata_is_windows_reparse(metadata)
 }
 
+#[cfg(test)]
 fn require_supported_exact_filesystem() -> io::Result<()> {
     #[cfg(any(unix, windows))]
     {
@@ -2551,6 +2660,7 @@ fn require_supported_exact_filesystem() -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn configure_file_nofollow(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
@@ -2564,6 +2674,7 @@ fn configure_file_nofollow(options: &mut OpenOptions) {
     let _ = options;
 }
 
+#[cfg(test)]
 fn validate_opened_regular(file: File) -> io::Result<File> {
     if metadata_is_real_file(&file.metadata()?) {
         Ok(file)
@@ -2575,6 +2686,7 @@ fn validate_opened_regular(file: File) -> io::Result<File> {
     }
 }
 
+#[cfg(test)]
 fn open_regular_readonly_nofollow(path: &Path) -> io::Result<File> {
     require_supported_exact_filesystem()?;
     let mut options = OpenOptions::new();
@@ -2583,6 +2695,7 @@ fn open_regular_readonly_nofollow(path: &Path) -> io::Result<File> {
     validate_opened_regular(options.open(path)?)
 }
 
+#[cfg(test)]
 fn open_regular_append_nofollow(path: &Path) -> io::Result<File> {
     require_supported_exact_filesystem()?;
     let mut options = OpenOptions::new();
@@ -2591,6 +2704,7 @@ fn open_regular_append_nofollow(path: &Path) -> io::Result<File> {
     validate_opened_regular(options.open(path)?)
 }
 
+#[cfg(test)]
 fn create_new_regular_nofollow(path: &Path) -> io::Result<File> {
     require_supported_exact_filesystem()?;
     let mut options = OpenOptions::new();
@@ -2599,6 +2713,7 @@ fn create_new_regular_nofollow(path: &Path) -> io::Result<File> {
     validate_opened_regular(options.open(path)?)
 }
 
+#[cfg(test)]
 fn open_regular_for_sync(path: &Path) -> io::Result<File> {
     require_supported_exact_filesystem()?;
     let mut options = OpenOptions::new();
@@ -2609,6 +2724,7 @@ fn open_regular_for_sync(path: &Path) -> io::Result<File> {
     validate_opened_regular(options.open(path)?)
 }
 
+#[cfg(test)]
 fn open_directory_nofollow_ambient(path: &Path) -> Result<Dir, MigrationBackupError> {
     require_supported_exact_filesystem()?;
     let name = path.file_name().and_then(|name| name.to_str()).ok_or(
@@ -2623,6 +2739,7 @@ fn open_directory_nofollow_ambient(path: &Path) -> Result<Dir, MigrationBackupEr
         .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))
 }
 
+#[cfg(test)]
 fn require_real_directory(path: &Path, detail: &'static str) -> Result<(), MigrationBackupError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata_is_real_directory(&metadata) => Ok(()),
@@ -2631,6 +2748,7 @@ fn require_real_directory(path: &Path, detail: &'static str) -> Result<(), Migra
     }
 }
 
+#[cfg(test)]
 fn require_real_file(path: &Path, detail: &'static str) -> Result<(), MigrationBackupError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata_is_real_file(&metadata) => Ok(()),
@@ -2642,6 +2760,7 @@ fn require_real_file(path: &Path, detail: &'static str) -> Result<(), MigrationB
     }
 }
 
+#[cfg(test)]
 fn ensure_real_directory_created(path: &Path) -> Result<(), MigrationBackupError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata_is_real_directory(&metadata) => Ok(()),
@@ -2659,6 +2778,7 @@ fn ensure_real_directory_created(path: &Path) -> Result<(), MigrationBackupError
     }
 }
 
+#[cfg(test)]
 fn path_exists(path: &Path) -> Result<bool, MigrationBackupError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -2667,6 +2787,7 @@ fn path_exists(path: &Path) -> Result<bool, MigrationBackupError> {
     }
 }
 
+#[cfg(test)]
 fn sync_file_and_parent(path: &Path) -> Result<(), MigrationBackupError> {
     open_regular_for_sync(path)?.sync_all()?;
     sync_directory(
@@ -2675,18 +2796,21 @@ fn sync_file_and_parent(path: &Path) -> Result<(), MigrationBackupError> {
     )
 }
 
+#[cfg(test)]
 fn sync_directory(path: &Path) -> Result<(), MigrationBackupError> {
     let directory = open_directory_nofollow_ambient(path)?;
     crate::filesystem_durability::sync_reconstructible_directory(&directory)
         .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))
 }
 
+#[cfg(test)]
 fn sync_tree(path: &Path, summary: SourceSummary) -> Result<(), MigrationBackupError> {
     let _ = traverse_tree_bounded(path, summary, false)?;
     crate::filesystem_durability::sync_private_tree(path)?;
     Ok(())
 }
 
+#[cfg(test)]
 fn read_bounded_bytes(
     reader: &mut impl Read,
     limit: usize,
@@ -2707,6 +2831,7 @@ fn read_bounded_bytes(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn read_u8(reader: &mut impl Read) -> Result<u8, MigrationBackupError> {
     let mut bytes = [0_u8; 1];
     reader.read_exact(&mut bytes).map_err(|_| {
@@ -2715,6 +2840,7 @@ fn read_u8(reader: &mut impl Read) -> Result<u8, MigrationBackupError> {
     Ok(bytes[0])
 }
 
+#[cfg(test)]
 fn read_u32(reader: &mut impl Read) -> Result<u32, MigrationBackupError> {
     let mut bytes = [0_u8; 4];
     reader.read_exact(&mut bytes).map_err(|_| {
@@ -2723,6 +2849,7 @@ fn read_u32(reader: &mut impl Read) -> Result<u32, MigrationBackupError> {
     Ok(u32::from_be_bytes(bytes))
 }
 
+#[cfg(test)]
 fn read_u64(reader: &mut impl Read) -> Result<u64, MigrationBackupError> {
     let mut bytes = [0_u8; 8];
     reader.read_exact(&mut bytes).map_err(|_| {
@@ -2731,6 +2858,7 @@ fn read_u64(reader: &mut impl Read) -> Result<u64, MigrationBackupError> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+#[cfg(test)]
 fn read_array_32(reader: &mut impl Read) -> Result<[u8; 32], MigrationBackupError> {
     let mut bytes = [0_u8; 32];
     reader.read_exact(&mut bytes).map_err(|_| {
@@ -2739,12 +2867,14 @@ fn read_array_32(reader: &mut impl Read) -> Result<[u8; 32], MigrationBackupErro
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn read_description(reader: &mut impl Read) -> Result<BlobDescription, MigrationBackupError> {
     let digest = read_array_32(reader)?;
     let length = read_u64(reader)?;
     Ok(BlobDescription::from_parts(digest, length))
 }
 
+#[cfg(test)]
 fn hex(bytes: &[u8; 32]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(64);

@@ -25,14 +25,18 @@ use super::bootstrap_import::{
     BootstrapPartDescriptorV1, BootstrapPartSpanIndexV1, BootstrapPartitionProfileV1,
     FullObjectDescriptorV1, OperationDigestV1, OperationLeafV1, OperationRootV1,
     PayloadObjectDescriptorV1, PayloadObjectRootV1, SourceBlobChunkDescriptorV1,
-    SourceBlobChunkDigestV1, SourceBlobChunkRootBuilderV1, SourceBlobChunkRootV1,
-    SourceBlobIndexBuilderV1, SourceContentDigestV1, SourceInventoryIndexBuilderV1,
-    SourceInventoryRootBuilderV1, SourceInventoryRootV1, SourceLeafDigestV1, SourceLeafV1,
-    SourceSpanRootV1, SourceSpanV1, MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART, MAX_BOOTSTRAP_PARTS,
+    SourceBlobChunkRootBuilderV1, SourceBlobChunkRootV1, SourceBlobIndexBuilderV1,
+    SourceContentDigestV1, SourceInventoryIndexBuilderV1, SourceInventoryRootV1,
+    SourceLeafDigestV1, SourceLeafV1, SourceSpanRootV1, SourceSpanV1,
+    MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART, MAX_BOOTSTRAP_PARTS,
     MAX_OPERATIONS_PER_BOOTSTRAP_PART, MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART,
     MAX_PARSED_NODES_PER_SOURCE_FILE, MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART,
     MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART, MAX_SOURCE_FILE_BYTES, MAX_SOURCE_INDEX_PAGES,
-    MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART, MAX_TOTAL_SOURCE_BYTES,
+    MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART,
+};
+#[cfg(test)]
+use super::bootstrap_import::{
+    SourceBlobChunkDigestV1, SourceInventoryRootBuilderV1, MAX_TOTAL_SOURCE_BYTES,
 };
 use super::external_import::{
     ExternalImportObservationEntry, ExternalImportObservationMaterial,
@@ -41,21 +45,24 @@ use super::external_import::{
 use super::hot_engine::{
     AcceptedFrontierRoot, AuthorBatch, CleanImportProjectionPredecessor,
     DetachedBootstrapAcceptedEngineMaterial, DetachedBootstrapAuthoringSession,
-    DetachedBootstrapCandidate, DetachedBootstrapReplayIdentity, LazyGenesisCheckpointBuilder,
-    ProjectionStorageBinding, MAX_TRANSACTION_OPERATIONS,
+    DetachedBootstrapCandidate, LazyGenesisCheckpointBuilder, MAX_TRANSACTION_OPERATIONS,
 };
+#[cfg(test)]
+use super::hot_engine::{DetachedBootstrapReplayIdentity, ProjectionStorageBinding};
+#[cfg(test)]
 use super::identity::BootstrapPartId;
 use super::lazy_genesis::{
     publish_activation_marker, read_activation_marker, LazyGenesisActivationMarkerV1,
     LazyGenesisBlockInput, LazyGenesisCandidate, LazyGenesisCommitV1, LazyGenesisPackBuilder,
     LazyGenesisPageInput,
 };
+#[cfg(test)]
 use super::object_store::{
-    BootstrapAggregateHistoryBindingV1, BootstrapAuthoringCapability,
-    BootstrapPublicationInspectionV1, ControlDirectoryIdentity, DurablyStagedBootstrapPrefix,
-    EngineHistoryBinding, ObjectStore, PreparedBootstrapHistoryRecordV1, StoreError,
-    ValidatedBootstrapPublicationV1,
+    BootstrapAggregateHistoryBindingV1, BootstrapPublicationInspectionV1,
+    DurablyStagedBootstrapPrefix, EngineHistoryBinding, ObjectStore,
+    PreparedBootstrapHistoryRecordV1, ValidatedBootstrapPublicationV1,
 };
+use super::object_store::{BootstrapAuthoringCapability, ControlDirectoryIdentity, StoreError};
 use super::receipt::ImportIdDerivation;
 use super::shadow_projection::BootstrapProjectionAuthority;
 use super::{
@@ -63,12 +70,14 @@ use super::{
     BlockId, BlockLocation, ContentDigest, CrdtPeerId, CurrentPageAtPath, DeviceId, DocumentId,
     ImportId, ImportInventoryEntry, ImportInventoryState, ImportLocator, LineageDigest,
     LogicalCompletionId, LogicalPageName, LogseqIdentityMutation, LogseqUuid, ManagedPath,
-    ManagedTextKind, ObjectKind, OperationBatch, OperationObject, OperationTransaction, PageId,
-    ProjectionCompletedReceipt, ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore,
-    ProjectionStoreError, ProjectionWorkId, ProjectionWorkTarget, ReferenceCatalogPolicyV1,
-    SemanticOperation, SessionId, ShardedHotEngine, SqliteFrontier, StructuralLocator,
-    StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
+    ManagedTextKind, ObjectKind, OperationTransaction, PageId, ProjectionCompletedReceipt,
+    ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore, ProjectionStoreError,
+    ProjectionWorkId, ProjectionWorkTarget, ReferenceCatalogPolicyV1, SemanticOperation, SessionId,
+    ShardedHotEngine, SqliteFrontier, StructuralLocator, StructuralSpan, WorkspaceId,
+    DIFF_SCHEMA_VERSION,
 };
+#[cfg(test)]
+use super::{OperationBatch, OperationObject};
 use crate::model::{
     path_is_sync_conflict, resolve_external_document_identity, AcceptedExternalDocumentIdentity,
     BootstrapSourceCapture, BootstrapSourceCaptureInstrumentation, BootstrapSourceChunk,
@@ -196,12 +205,13 @@ const BOOTSTRAP_STREAM_SORT_FAN_IN: usize = 4;
 const BOOTSTRAP_STREAM_MAX_SORT_RUNS: usize = 4096;
 const BOOTSTRAP_STREAM_FRAME_BYTES: usize = 64 * 1024 * 1024 + 1024 * 1024;
 const BOOTSTRAP_STREAM_LAZY_GENESIS: &str = "lazy-genesis";
+#[cfg(test)]
+use super::sync_layout::BOOTSTRAP_STREAM_DIR as BOOTSTRAP_STREAM_DIRECTORY;
 use super::sync_layout::{
     BOOTSTRAP_STREAM_AGGREGATE_FILE as BOOTSTRAP_STREAM_AGGREGATE,
     BOOTSTRAP_STREAM_BLOB_PAGES_DIR as BOOTSTRAP_STREAM_BLOB_PAGES,
     BOOTSTRAP_STREAM_BOUNDARY_SPOOL_FILE as BOOTSTRAP_STREAM_BOUNDARY_SPOOL,
     BOOTSTRAP_STREAM_COMMIT_FILE as BOOTSTRAP_STREAM_COMMIT,
-    BOOTSTRAP_STREAM_DIR as BOOTSTRAP_STREAM_DIRECTORY,
     BOOTSTRAP_STREAM_INVENTORY_PAGES_DIR as BOOTSTRAP_STREAM_INVENTORY_PAGES,
     BOOTSTRAP_STREAM_OPERATION_SPOOL_FILE as BOOTSTRAP_STREAM_OPERATION_SPOOL,
     BOOTSTRAP_STREAM_PARTS_DIR as BOOTSTRAP_STREAM_PARTS,
@@ -561,6 +571,7 @@ impl InactiveBootstrapPreparedPublication {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct InactiveBootstrapOrchestrationInstrumentation {
     pub(crate) source_inventory_pages: u32,
     pub(crate) source_blob_pages: u32,
@@ -581,6 +592,7 @@ pub(crate) struct InactiveBootstrapOrchestrationInstrumentation {
 /// Fully reopened proof of one inactive bootstrap installation. It contains
 /// immutable identities and read-only frontier values only.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct InactiveBootstrapVerifiedPublication {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -603,6 +615,7 @@ pub(crate) struct InactiveBootstrapVerifiedPublication {
     instrumentation: InactiveBootstrapOrchestrationInstrumentation,
 }
 
+#[cfg(test)]
 impl InactiveBootstrapVerifiedPublication {
     pub(crate) const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
@@ -634,6 +647,7 @@ impl InactiveBootstrapVerifiedPublication {
         self.part_count
     }
 
+    #[cfg(test)]
     pub(crate) const fn predecessor_terminal(&self) -> Option<BootstrapPartId> {
         self.predecessor_terminal
     }
@@ -642,6 +656,7 @@ impl InactiveBootstrapVerifiedPublication {
         &self.accepted_frontier
     }
 
+    #[cfg(test)]
     pub(crate) const fn engine_binding(&self) -> &EngineHistoryBinding {
         &self.engine_binding
     }
@@ -670,20 +685,24 @@ impl InactiveBootstrapVerifiedPublication {
         self.cold_record_count
     }
 
+    #[cfg(test)]
     pub(crate) const fn instrumentation(&self) -> &InactiveBootstrapOrchestrationInstrumentation {
         &self.instrumentation
     }
 
+    #[cfg(test)]
     pub(crate) const fn catalog_document_id(&self) -> DocumentId {
         self.catalog_document_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn reference_catalog_policy(&self) -> &ReferenceCatalogPolicyV1 {
         &self.reference_catalog_policy
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct InactiveBootstrapAcceptedAuthorityBinding {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -703,6 +722,7 @@ pub(crate) struct InactiveBootstrapAcceptedAuthorityBinding {
     cold_record_count: u64,
 }
 
+#[cfg(test)]
 impl InactiveBootstrapAcceptedAuthorityBinding {
     pub(crate) const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
@@ -776,6 +796,7 @@ impl InactiveBootstrapAcceptedAuthorityBinding {
 /// All fields are private and the only constructor freshly reopens the exact
 /// archive, publication, durable history, and detached replay. Keeping the
 /// candidate alive also keeps its scratch-backed accepted indexes alive.
+#[cfg(test)]
 pub(crate) struct InactiveBootstrapAcceptedAuthority {
     store: ObjectStore,
     publication: ValidatedBootstrapPublicationV1,
@@ -789,38 +810,47 @@ pub(crate) struct InactiveBootstrapAcceptedAuthority {
 /// This handle is intentionally neither `Clone` nor serializable. It carries
 /// no writable authority and exposes no engine directly; promotion can only
 /// consume it through the durable-binding migration path.
+#[cfg(test)]
 pub(crate) struct RetainedBootstrapPromotionCandidate {
     candidate: Rc<DetachedBootstrapCandidate>,
     binding: InactiveBootstrapAcceptedAuthorityBinding,
 }
 
+#[cfg(test)]
 impl RetainedBootstrapPromotionCandidate {
     pub(crate) fn candidate(&self) -> &DetachedBootstrapCandidate {
         &self.candidate
     }
 
+    #[cfg(test)]
     pub(crate) const fn binding(&self) -> &InactiveBootstrapAcceptedAuthorityBinding {
         &self.binding
     }
 }
 
+#[cfg(test)]
 impl InactiveBootstrapAcceptedAuthority {
+    #[cfg(test)]
     pub(crate) const fn store(&self) -> &ObjectStore {
         &self.store
     }
 
+    #[cfg(test)]
     pub(crate) const fn publication(&self) -> &ValidatedBootstrapPublicationV1 {
         &self.publication
     }
 
+    #[cfg(test)]
     pub(crate) fn accepted_engine(&self) -> &ShardedHotEngine {
         self.candidate.accepted_engine()
     }
 
+    #[cfg(test)]
     pub(crate) const fn binding(&self) -> &InactiveBootstrapAcceptedAuthorityBinding {
         &self.binding
     }
 
+    #[cfg(test)]
     pub(crate) fn retain_promotion_candidate(&self) -> RetainedBootstrapPromotionCandidate {
         RetainedBootstrapPromotionCandidate {
             candidate: Rc::clone(&self.candidate),
@@ -1402,6 +1432,7 @@ impl InactiveBootstrapPreparedPartCursor {
     }
 }
 
+#[cfg(test)]
 fn invalid_bootstrap_orchestration(detail: impl Into<String>) -> BootstrapStreamingImportError {
     BootstrapStreamingImportError::InvalidOperation(detail.into())
 }
@@ -1410,6 +1441,7 @@ fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 fn validate_inactive_bootstrap_preparation(
     prepared: &InactiveBootstrapPreparedPublication,
     store: &ObjectStore,
@@ -1572,6 +1604,7 @@ fn validate_inactive_bootstrap_preparation(
     ))
 }
 
+#[cfg(test)]
 fn publish_inactive_bootstrap_prefix(
     prepared: &InactiveBootstrapPreparedPublication,
     store: &ObjectStore,
@@ -1618,6 +1651,7 @@ fn publish_inactive_bootstrap_prefix(
 /// Publish, install, freshly reopen, and verify one complete bootstrap while
 /// leaving graph, projection, enrollment, SQLite, and runtime authority
 /// untouched.
+#[cfg(test)]
 pub(crate) fn publish_install_verify_inactive_bootstrap(
     prepared: &InactiveBootstrapPreparedPublication,
     store: ObjectStore,
@@ -1841,6 +1875,7 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
 /// across publication and SQLite construction. Durable aggregate/history roots
 /// are freshly reopened here, but semantic payloads are not replayed into a
 /// second engine. A new process still uses the full replaying reopen below.
+#[cfg(test)]
 pub(crate) fn retain_inactive_bootstrap_accepted_authority(
     prepared: &InactiveBootstrapPreparedPublication,
     verified: &InactiveBootstrapVerifiedPublication,
@@ -1923,6 +1958,7 @@ pub(crate) fn retain_inactive_bootstrap_accepted_authority(
 
 /// Freshly reopen and retain the exact accepted authority described by a
 /// previously minted inactive-bootstrap publication proof.
+#[cfg(test)]
 pub(crate) fn reopen_inactive_bootstrap_accepted_authority(
     verified: &InactiveBootstrapVerifiedPublication,
     store: ObjectStore,
@@ -2571,6 +2607,7 @@ struct BootstrapSourceProtocolPreparation {
     source_count: u32,
 }
 
+#[cfg(test)]
 fn prepare_bootstrap_source_protocol(
     workspace_id: WorkspaceId,
     capture: &BootstrapSourceCapture,
@@ -3627,6 +3664,7 @@ fn capture_activation_page_records(
     activation_pages.finish()
 }
 
+#[cfg(test)]
 fn spool_bootstrap_operations(
     capture: &BootstrapSourceCapture,
     import_id: ImportId,
@@ -5164,6 +5202,7 @@ fn write_prepared_bootstrap_part(
 /// control-directory identity so installation cannot later be pointed at a
 /// different archive.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prepare_inactive_bootstrap_import(
     graph: &Graph,
     capture: BootstrapSourceCapture,
@@ -5188,6 +5227,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     graph: &Graph,
     capture: BootstrapSourceCapture,

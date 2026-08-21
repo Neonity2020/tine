@@ -67,9 +67,10 @@ use super::hot_engine::{
 pub(crate) type CleanGenesisPhysicalProjection = PhysicalSqliteDatabase;
 #[cfg(test)]
 use super::import::ActivationPageRecordStore;
+use super::import::TerminalBootstrapConstructionMaterial;
+#[cfg(test)]
 use super::import::{
     InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
-    TerminalBootstrapConstructionMaterial,
 };
 
 pub(crate) fn clean_genesis_materialized_read<'a>(
@@ -87,6 +88,7 @@ pub(crate) fn clean_genesis_materialized_read<'a>(
         .map_err(Into::into)
 }
 use super::object_store::ValidatedBootstrapPublicationV1;
+#[cfg(test)]
 use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
 use super::sync_layout::{
     SQLITE_APPLIER_LOCK_FILE as SQLITE_APPLIER_LEASE_FILE,
@@ -1033,6 +1035,7 @@ impl<'a> RebuildSource<'a> {
     /// Rebuild source for a promoted runtime, whose accepted history begins
     /// with the retained immutable bootstrap parts and continues with ordinary
     /// archived batches.
+    #[cfg(test)]
     pub(crate) fn from_promoted_runtime(
         engine: &'a ShardedHotEngine,
         store: &'a ObjectStore,
@@ -1068,6 +1071,7 @@ impl<'a> RebuildSource<'a> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_inactive_bootstrap(
         authority: &'a InactiveBootstrapAcceptedAuthority,
     ) -> Result<Self, ProjectionError> {
@@ -2654,6 +2658,7 @@ pub struct OpenProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct VerifiedBootstrapSqliteProjection {
     claim: ProjectionClaim,
     frontier_root: AcceptedFrontierRoot,
@@ -2664,6 +2669,7 @@ pub(crate) struct VerifiedBootstrapSqliteProjection {
     bootstrap_rebuild: BootstrapSqliteRebuildInstrumentation,
 }
 
+#[cfg(test)]
 impl VerifiedBootstrapSqliteProjection {
     /// This proof with its wall-clock instrumentation zeroed, for comparing two
     /// rebuilds of one authority. See
@@ -3947,6 +3953,7 @@ impl SqliteFrontier {
     /// continue that exact frontier, and be present in the authenticated batch
     /// map of the frontier it claims. The induction must terminate at both the
     /// live engine and SQLite frontier.
+    #[cfg(test)]
     pub(crate) fn authenticated_bootstrap_projection_exceptions(
         &self,
         engine: &ShardedHotEngine,
@@ -4082,6 +4089,7 @@ impl SqliteFrontier {
     /// threat model. This R-site consumes that typed proof and rechecks all
     /// cheap live authority. A crash/restart has no such process proof and
     /// continues through `freshly_verify_inactive_bootstrap` below.
+    #[cfg(test)]
     pub(crate) fn authenticate_same_process_bootstrap_reuse(
         &self,
         proof: &VerifiedBootstrapSqliteProjection,
@@ -4103,6 +4111,7 @@ impl SqliteFrontier {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn freshly_verify_inactive_bootstrap(
         &self,
         authority: &InactiveBootstrapAcceptedAuthority,
@@ -4216,6 +4225,7 @@ impl SqliteFrontier {
     // uses, and therefore the one every activation takes. The compatibility twin
     // above survives only for SQLite-level tests that open a bootstrap database
     // and never promote it.
+    #[cfg(test)]
     pub(crate) fn open_or_rebuild_inactive_bootstrap_with_applier_slot<'lease>(
         path: &Path,
         application_runtime_root: &ApplicationRuntimeRoot,
@@ -4241,6 +4251,7 @@ impl SqliteFrontier {
         Ok((LeasedOpenProjection::bind(opened, slot), proof))
     }
 
+    #[cfg(test)]
     fn open_or_rebuild_inactive_bootstrap_authorized(
         path: &Path,
         _application_runtime_root: &ApplicationRuntimeRoot,
@@ -4310,6 +4321,7 @@ impl SqliteFrontier {
         Ok((opened, proof))
     }
 
+    #[cfg(test)]
     fn rebuild_fresh_inactive_bootstrap(
         path: &Path,
         claim: ProjectionClaim,
@@ -4412,6 +4424,7 @@ impl SqliteFrontier {
     ///
     /// Missing, invalid, divergent, or forensic-interrupted state is refused.
     /// This boundary never preserves, deletes, publishes, or rebuilds files.
+    #[cfg(test)]
     pub(crate) fn open_existing_with_applier_slot<'lease>(
         path: &Path,
         _application_runtime_root: &ApplicationRuntimeRoot,
@@ -6251,6 +6264,7 @@ impl SqliteFrontier {
         self.apply_internal_with_materialization(event, fault, None)
     }
 
+    #[cfg(test)]
     fn apply_internal_with_materialization(
         &mut self,
         event: &AcceptedBatchEvent,
@@ -6743,6 +6757,7 @@ fn read_file_prefix(path: &Path, limit: usize) -> Result<Option<(u64, Vec<u8>)>,
     Ok(Some((metadata.len(), bytes)))
 }
 
+#[cfg(test)]
 fn validate_projection_checkpoint(
     path: &Path,
     claim: ProjectionClaim,

@@ -5,37 +5,53 @@
 //! and publishes only below a retained device-local root that is physically
 //! and structurally disjoint from the live graph.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
+#[cfg(test)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+#[cfg(all(test, unix))]
 use std::os::unix::fs::OpenOptionsExt as _;
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::Instant;
 
+#[cfg(test)]
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use super::bootstrap_import::{BOOTSTRAP_FRONTIER_SCHEMA_VERSION, BOOTSTRAP_IMPORT_SCHEMA_VERSION};
+use super::hot_engine::ProjectionPageState;
+#[cfg(test)]
 use super::hot_engine::{
-    CurrentPathCatalogBinding, CurrentPathCatalogRow, ProjectionPageState,
-    BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES, MAX_CURRENT_PATH_CURSOR_PAGE_ROWS,
+    CurrentPathCatalogBinding, CurrentPathCatalogRow, BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES,
+    MAX_CURRENT_PATH_CURSOR_PAGE_ROWS,
 };
+#[cfg(test)]
 use super::import::{
     bootstrap_authoritative_source_paths, InactiveBootstrapAcceptedAuthority,
     InactiveBootstrapAcceptedAuthorityBinding, InactiveBootstrapPreparedPublication,
     InactiveBootstrapVerifiedPublication,
 };
 use super::migration_backup::{
-    MigrationBackupError, MigrationBackupRoot, SourceBackupBindingV1, SourceBackupPayloadAuthority,
-    VerifiedSourceBackup,
+    MigrationBackupError, SourceBackupBindingV1, SourceBackupPayloadAuthority,
 };
-use super::object_store::{open_dir_nofollow, open_file_nofollow, sync_dir_required};
+#[cfg(test)]
+use super::migration_backup::{MigrationBackupRoot, VerifiedSourceBackup};
+use super::object_store::open_file_nofollow;
+#[cfg(test)]
+use super::object_store::{open_dir_nofollow, sync_dir_required};
 #[cfg(test)]
 use super::plan_projection;
 use super::projection::{
@@ -44,39 +60,57 @@ use super::projection::{
 };
 #[cfg(test)]
 use super::sqlite::OpenProjection;
+#[cfg(test)]
 use super::sqlite::{
     ProjectionError as SqliteProjectionError, TerminalProjectionChunkSink,
     VerifiedBootstrapSqliteProjection,
 };
+use super::sync_layout::MANIFEST_FILE;
+#[cfg(test)]
 use super::sync_layout::{
-    COMMIT_MARKER_FILE, COMMIT_MARKER_STAGE_FILE, MANIFEST_FILE, PROOF_FILE, PROOF_STAGE_FILE,
+    COMMIT_MARKER_FILE, COMMIT_MARKER_STAGE_FILE, PROOF_FILE, PROOF_STAGE_FILE,
     SHADOW_ROOT_DIR as SHADOW_ROOT_DIRECTORY,
 };
 use super::{
     BlobDescription, CanonicalGraphResourceId, ContentDigest, DeviceId, LineageDigest, ManagedPath,
     ManagedTextKind, PageId, ProjectionEndpointId, ProjectionIntent, ProjectionPrecondition,
-    ProjectionReceiptStoreId, WorkspaceId, CATALOG_PAGE_STATE_SCHEMA_VERSION, DIFF_SCHEMA_VERSION,
-    MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION,
-    OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION, PROJECTION_POLICY_VERSION,
-    PROJECTION_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
-    SQLITE_SCHEMA_VERSION,
+    ProjectionReceiptStoreId, WorkspaceId,
 };
+#[cfg(test)]
+use super::{
+    CATALOG_PAGE_STATE_SCHEMA_VERSION, DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION,
+    MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
+    OPLOG_PROTOCOL_VERSION, PROJECTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION,
+    RECEIPT_SCHEMA_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION,
+};
+#[cfg(test)]
 use crate::model::{
     move_file_noreplace, BootstrapSourceCapture, BootstrapSourceChunkCursor, BootstrapSourceEntry,
     BootstrapSourceEntryCursor, Graph, BOOTSTRAP_SOURCE_CAPTURE_SCHEMA,
     BOOTSTRAP_SOURCE_CHUNK_BYTES, BOOTSTRAP_SOURCE_MAX_DIRECTORIES,
-    BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH, BOOTSTRAP_SOURCE_MAX_FILES,
-    BOOTSTRAP_SOURCE_MAX_FILE_BYTES, BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES,
-    BOOTSTRAP_SOURCE_MAX_PATH_BYTES, BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES,
+    BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH,
+};
+use crate::model::{
+    BOOTSTRAP_SOURCE_MAX_FILES, BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
+    BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES, BOOTSTRAP_SOURCE_MAX_PATH_BYTES,
+    BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES,
 };
 
+#[cfg(test)]
 const SHADOW_PROJECTION_SCHEMA_VERSION: u32 = 2;
+#[cfg(test)]
 const SHADOW_PROOF_SCHEMA_VERSION: u32 = 1;
+#[cfg(test)]
 const SHADOW_COMMIT_MARKER_SCHEMA_VERSION: u32 = 1;
+#[cfg(test)]
 const MANIFEST_MAGIC: &[u8; 8] = b"TINESH1\0";
+#[cfg(test)]
 const PROOF_MAGIC: &[u8; 8] = b"TINESP1\0";
+#[cfg(test)]
 const COMMIT_MARKER_MAGIC: &[u8; 8] = b"TINESC1\0";
+#[cfg(test)]
 const IO_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 const CATALOG_PAGE_ROWS: usize = 128;
 const MAX_MANIFEST_ENTRY_BYTES: usize = BOOTSTRAP_SOURCE_MAX_FILE_BYTES as usize * 3;
 const MAX_MANIFEST_BYTES: u64 = BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES * 4;
@@ -161,6 +195,7 @@ pub(crate) enum ShadowProjectionCrashCut {
 }
 
 impl ShadowProjectionCrashCut {
+    #[cfg(test)]
     const fn label(self) -> &'static str {
         match self {
             Self::AfterShadowBaseCreation => "after_shadow_base_creation",
@@ -177,12 +212,14 @@ impl ShadowProjectionCrashCut {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum ShadowProjectionDurabilityBarrier {
     BackupRootAfterShadowBase,
     ShadowBaseAfterWorkspace,
     PublicationParentAfterFinal,
 }
 
+#[cfg(test)]
 fn take_crash_cut(cut: ShadowProjectionCrashCut) -> bool {
     #[cfg(test)]
     {
@@ -202,6 +239,7 @@ fn take_crash_cut(cut: ShadowProjectionCrashCut) -> bool {
     }
 }
 
+#[cfg(test)]
 fn inject_crash_cut(cut: ShadowProjectionCrashCut) -> Result<(), ShadowProjectionError> {
     if take_crash_cut(cut) {
         Err(ShadowProjectionError::InjectedCrashCut(cut.label()))
@@ -228,6 +266,7 @@ pub(crate) fn set_before_final_source_verify_hook_for_test(
 }
 
 #[cfg(not(test))]
+#[cfg(test)]
 fn before_final_source_verify_hook() -> io::Result<()> {
     Ok(())
 }
@@ -237,6 +276,7 @@ pub(crate) enum ShadowProjectionError {
     Io(io::Error),
     Backup(MigrationBackupError),
     BindingMismatch(&'static str),
+    #[cfg(test)]
     NormalSparseMismatch {
         path: String,
         source_bytes: usize,
@@ -254,13 +294,18 @@ pub(crate) enum ShadowProjectionError {
         observed: u64,
         limit: u64,
     },
+    #[cfg(test)]
     InjectedCrashCut(&'static str),
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) enum NormalSparseMismatchDetail {
+    #[cfg(test)]
     FirstDifferingByte(usize),
+    #[cfg(test)]
     CommonPrefixEnded,
+    #[cfg(test)]
     BindingChecks(Vec<&'static str>),
 }
 
@@ -272,6 +317,7 @@ impl fmt::Display for ShadowProjectionError {
             Self::BindingMismatch(detail) | Self::CorruptOrConflicting(detail) => {
                 formatter.write_str(detail)
             }
+            #[cfg(test)]
             Self::NormalSparseMismatch {
                 path,
                 source_bytes,
@@ -311,6 +357,7 @@ impl fmt::Display for ShadowProjectionError {
                 formatter,
                 "{resource} limit exceeded: observed {observed}, limit {limit}"
             ),
+            #[cfg(test)]
             Self::InjectedCrashCut(label) => write!(formatter, "injected crash cut: {label}"),
         }
     }
@@ -331,6 +378,7 @@ impl From<MigrationBackupError> for ShadowProjectionError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct ShadowProjectionSchemaBinding {
     pub(crate) shadow_projection: u32,
     pub(crate) shadow_proof: u32,
@@ -352,7 +400,9 @@ pub(crate) struct ShadowProjectionSchemaBinding {
     pub(crate) sqlite: u32,
 }
 
+#[cfg(test)]
 impl ShadowProjectionSchemaBinding {
+    #[cfg(test)]
     const CURRENT: Self = Self {
         shadow_projection: SHADOW_PROJECTION_SCHEMA_VERSION,
         shadow_proof: SHADOW_PROOF_SCHEMA_VERSION,
@@ -374,6 +424,7 @@ impl ShadowProjectionSchemaBinding {
         sqlite: SQLITE_SCHEMA_VERSION,
     };
 
+    #[cfg(test)]
     fn write(self, output: &mut Vec<u8>) {
         for value in [
             self.shadow_projection,
@@ -401,6 +452,7 @@ impl ShadowProjectionSchemaBinding {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct ShadowProjectionInstrumentation {
     pub(crate) catalog_rows: u64,
     pub(crate) source_files: u64,
@@ -475,6 +527,7 @@ pub(crate) struct PromotedBootstrapProjectionBindingV1 {
 }
 
 impl PromotedBootstrapProjectionBindingV1 {
+    #[cfg(test)]
     pub(crate) fn from_verified(
         verified: &VerifiedShadowProjection,
     ) -> Result<Self, ShadowProjectionError> {
@@ -738,6 +791,7 @@ impl PromotedBootstrapProjectionBindingV1 {
 /// a committed, device-local shadow tree. It grants no graph-write or
 /// enrollment authority.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct VerifiedShadowProjection {
     directory: PathBuf,
     workspace_id: WorkspaceId,
@@ -767,6 +821,7 @@ pub(crate) struct VerifiedShadowProjection {
     instrumentation: ShadowProjectionInstrumentation,
 }
 
+#[cfg(test)]
 impl PartialEq for VerifiedShadowProjection {
     fn eq(&self, other: &Self) -> bool {
         self.workspace_id == other.workspace_id
@@ -796,8 +851,10 @@ impl PartialEq for VerifiedShadowProjection {
     }
 }
 
+#[cfg(test)]
 impl Eq for VerifiedShadowProjection {}
 
+#[cfg(test)]
 impl VerifiedShadowProjection {
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
@@ -883,6 +940,7 @@ impl VerifiedShadowProjection {
         self.evidence_digest
     }
 
+    #[cfg(test)]
     pub(crate) const fn schema(&self) -> ShadowProjectionSchemaBinding {
         self.schema
     }
@@ -893,12 +951,14 @@ impl VerifiedShadowProjection {
         ContentDigest::of(&bytes)
     }
 
+    #[cfg(test)]
     pub(crate) const fn instrumentation(&self) -> &ShadowProjectionInstrumentation {
         &self.instrumentation
     }
 
     /// Reopen the committed per-file evidence without retaining a whole-graph
     /// snapshot. The cursor authenticates the complete manifest description.
+    #[cfg(test)]
     pub(crate) fn file_evidence_cursor(
         &self,
     ) -> Result<ShadowProjectionEvidenceCursor, ShadowProjectionError> {
@@ -968,11 +1028,14 @@ impl ShadowProjectionFileEvidence {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct ShadowProjectionEvidenceCursor {
     reader: ManifestReader,
 }
 
+#[cfg(test)]
 impl ShadowProjectionEvidenceCursor {
+    #[cfg(test)]
     fn open(
         path: &Path,
         file_count: u64,
@@ -1134,6 +1197,7 @@ impl fmt::Debug for BootstrapProjectionAuthority {
 }
 
 impl BootstrapProjectionAuthority {
+    #[cfg(test)]
     pub(crate) fn reopen(
         roots: &MigrationBackupRoot,
         binding: &PromotedBootstrapProjectionBindingV1,
@@ -1192,6 +1256,7 @@ impl BootstrapProjectionAuthority {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn binding(&self) -> &PromotedBootstrapProjectionBindingV1 {
         &self.binding
     }
@@ -1562,6 +1627,7 @@ fn read_capability_file(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct SourceSummary {
     file_count: u64,
     chunk_count: u64,
@@ -1570,12 +1636,14 @@ struct SourceSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct ValidatedCurrentPathCatalog {
     binding: CurrentPathCatalogBinding,
     rows: BTreeMap<ManagedPath, CurrentPathCatalogRow>,
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct StagedInventoryProof {
     digest: ContentDigest,
     file_count: u64,
@@ -1585,6 +1653,7 @@ struct StagedInventoryProof {
 /// Compact, process-local evidence produced from the exact terminal pages
 /// already materialized for SQLite.  It contains only canonical shadow
 /// manifest-entry bytes and their running proof, never retained page state.
+#[cfg(test)]
 pub(crate) struct AdjacentTerminalShadowEvidence {
     binding: CurrentPathCatalogBinding,
     summary: SourceSummary,
@@ -1593,6 +1662,7 @@ pub(crate) struct AdjacentTerminalShadowEvidence {
     instrumentation: ShadowProjectionInstrumentation,
 }
 
+#[cfg(test)]
 pub(crate) struct AdjacentTerminalShadowConstruction {
     capture: BootstrapSourceCapture,
     authoritative_paths: HashSet<ManagedPath>,
@@ -1607,7 +1677,9 @@ pub(crate) struct AdjacentTerminalShadowConstruction {
     instrumentation: ShadowProjectionInstrumentation,
 }
 
+#[cfg(test)]
 impl AdjacentTerminalShadowConstruction {
+    #[cfg(test)]
     pub(crate) fn new(
         prepared: &InactiveBootstrapPreparedPublication,
         authority: &InactiveBootstrapAcceptedAuthority,
@@ -1645,6 +1717,7 @@ impl AdjacentTerminalShadowConstruction {
         Ok(construction)
     }
 
+    #[cfg(test)]
     fn reset_state(&mut self) -> Result<(), ShadowProjectionError> {
         self.entries = self.capture.entries_cursor()?;
         self.chunks = self.capture.chunks_cursor()?;
@@ -1664,6 +1737,7 @@ impl AdjacentTerminalShadowConstruction {
         Ok(())
     }
 
+    #[cfg(test)]
     fn next_authoritative_source(
         &mut self,
     ) -> Result<Option<(BootstrapSourceEntry, Vec<u8>)>, ShadowProjectionError> {
@@ -1681,6 +1755,7 @@ impl AdjacentTerminalShadowConstruction {
         Ok(None)
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(
         mut self,
         authority: &InactiveBootstrapAcceptedAuthority,
@@ -1713,12 +1788,14 @@ impl AdjacentTerminalShadowConstruction {
     }
 }
 
+#[cfg(test)]
 impl TerminalProjectionChunkSink for AdjacentTerminalShadowConstruction {
     fn reset(&mut self) -> Result<(), SqliteProjectionError> {
         self.reset_state()
             .map_err(|error| SqliteProjectionError::Materialization(error.to_string()))
     }
 
+    #[cfg(test)]
     fn accept_chunk(
         &mut self,
         rows: &[CurrentPathCatalogRow],
@@ -1797,6 +1874,7 @@ impl TerminalProjectionChunkSink for AdjacentTerminalShadowConstruction {
     }
 }
 
+#[cfg(test)]
 struct PublicationPaths {
     parent: PathBuf,
     stage: PathBuf,
@@ -1808,6 +1886,7 @@ struct PublicationPaths {
 /// final live-source revalidation. Existing staged/final data is fully
 /// reverified on resume; freshly constructed data carries its adjacent proof.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     graph: &Graph,
     roots: &MigrationBackupRoot,
@@ -1830,6 +1909,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence(
     graph: &Graph,
     roots: &MigrationBackupRoot,
@@ -1854,6 +1934,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
     graph: &Graph,
     roots: &MigrationBackupRoot,
@@ -2111,6 +2192,7 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn validate_bindings(
     graph: &Graph,
     roots: &MigrationBackupRoot,
@@ -2171,6 +2253,7 @@ fn validate_bindings(
     Ok(())
 }
 
+#[cfg(test)]
 fn summarize_source(
     capture: &BootstrapSourceCapture,
     authoritative: &HashSet<ManagedPath>,
@@ -2248,6 +2331,7 @@ fn summarize_source(
     })
 }
 
+#[cfg(test)]
 fn traverse_complete_catalog(
     authority: &InactiveBootstrapAcceptedAuthority,
     authoritative_paths: &HashSet<ManagedPath>,
@@ -2319,6 +2403,7 @@ fn traverse_complete_catalog(
     })
 }
 
+#[cfg(test)]
 fn read_source_file(
     capture: &BootstrapSourceCapture,
     entry: &BootstrapSourceEntry,
@@ -2378,6 +2463,7 @@ fn read_source_file(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn plan_exact_source(
     catalog: &ValidatedCurrentPathCatalog,
     entry: &BootstrapSourceEntry,
@@ -2402,6 +2488,7 @@ fn plan_exact_source(
     Ok(Some((row.clone(), intent)))
 }
 
+#[cfg(test)]
 fn plan_exact_source_row(
     binding: CurrentPathCatalogBinding,
     row: &CurrentPathCatalogRow,
@@ -2472,10 +2559,12 @@ fn plan_exact_source_row(
     Ok(plan.intent().clone())
 }
 
+#[cfg(test)]
 fn binding_workspace(binding: CurrentPathCatalogBinding) -> WorkspaceId {
     binding.workspace_id()
 }
 
+#[cfg(test)]
 fn require_exact_source_baseline(
     target: &[u8],
     intent: &ProjectionIntent,
@@ -2520,6 +2609,7 @@ fn require_exact_source_baseline(
     })
 }
 
+#[cfg(test)]
 fn publish_manifest_from_source(
     manifest_path: &Path,
     header: &[u8],
@@ -2674,6 +2764,7 @@ fn publish_manifest_from_source(
     ))
 }
 
+#[cfg(test)]
 fn publish_manifest_from_adjacent_evidence(
     manifest_path: &Path,
     header: &[u8],
@@ -2722,6 +2813,7 @@ fn publish_manifest_from_adjacent_evidence(
     Ok((manifest, staged))
 }
 
+#[cfg(test)]
 fn session_stat_u64(value: usize, resource: &'static str) -> Result<u64, ShadowProjectionError> {
     u64::try_from(value).map_err(|_| ShadowProjectionError::ResourceLimit {
         resource,
@@ -2730,6 +2822,7 @@ fn session_stat_u64(value: usize, resource: &'static str) -> Result<u64, ShadowP
     })
 }
 
+#[cfg(test)]
 fn record_bulk_lookup_session_stats(
     instrumentation: &mut ShadowProjectionInstrumentation,
     materializer: Option<&super::hot_engine::BootstrapBulkMaterializer<'_>>,
@@ -2810,6 +2903,7 @@ fn record_bulk_lookup_session_stats(
     Ok(())
 }
 
+#[cfg(test)]
 fn emit_manifest_entry(
     output: &mut impl Write,
     entry: &BootstrapSourceEntry,
@@ -2842,6 +2936,7 @@ fn emit_manifest_entry(
 /// Recheck durable shape and the compact authenticated inventory without
 /// replaying projection semantics or rereading source bytes. The proof can
 /// only be minted by the adjacent construction/semantic-recovery pass.
+#[cfg(test)]
 fn verify_projection_directory_against_proof(
     directory: &Path,
     final_directory: bool,
@@ -2888,6 +2983,7 @@ fn verify_projection_directory_against_proof(
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_projection_directory(
     directory: &Path,
     final_directory: bool,
@@ -3027,13 +3123,16 @@ fn verify_projection_directory(
     ))
 }
 
+#[cfg(test)]
 struct ManifestReader {
     file: File,
     remaining: u64,
     previous: Option<ManagedPath>,
 }
 
+#[cfg(test)]
 impl ManifestReader {
+    #[cfg(test)]
     fn open(
         path: &Path,
         file_count: u64,
@@ -3165,6 +3264,7 @@ fn read_manifest_evidence(
     })
 }
 
+#[cfg(test)]
 fn manifest_header(
     roots: &MigrationBackupRoot,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -3205,6 +3305,7 @@ fn manifest_header(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn manifest_header_from_verified(
     verified: &VerifiedShadowProjection,
 ) -> Result<Vec<u8>, ShadowProjectionError> {
@@ -3237,6 +3338,7 @@ fn manifest_header_from_verified(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn shadow_publication_id(
     roots: &MigrationBackupRoot,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -3265,6 +3367,7 @@ fn shadow_publication_id(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn proof_bytes(
     roots: &MigrationBackupRoot,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -3298,6 +3401,7 @@ fn proof_bytes(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn commit_marker_bytes(
     roots: &MigrationBackupRoot,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -3337,6 +3441,7 @@ fn commit_marker_bytes(
     Ok((body, evidence))
 }
 
+#[cfg(test)]
 fn put_authority_binding(
     output: &mut Vec<u8>,
     binding: &InactiveBootstrapAcceptedAuthorityBinding,
@@ -3388,6 +3493,7 @@ fn put_authority_binding(
     Ok(())
 }
 
+#[cfg(test)]
 fn put_sqlite_binding(output: &mut Vec<u8>, proof: &VerifiedBootstrapSqliteProjection) {
     output.extend_from_slice(proof.claim().workspace_id().as_uuid().as_bytes());
     output.extend_from_slice(proof.claim().lineage_digest().as_bytes());
@@ -3397,6 +3503,7 @@ fn put_sqlite_binding(output: &mut Vec<u8>, proof: &VerifiedBootstrapSqliteProje
     output.extend_from_slice(proof.materialized_row_digest().as_bytes());
 }
 
+#[cfg(test)]
 fn publication_paths(
     roots: &MigrationBackupRoot,
     authority: &InactiveBootstrapAcceptedAuthorityBinding,
@@ -3424,6 +3531,7 @@ fn publication_paths(
     })
 }
 
+#[cfg(test)]
 fn ensure_publication_parent(
     roots: &MigrationBackupRoot,
     authority: &InactiveBootstrapAcceptedAuthorityBinding,
@@ -3481,6 +3589,7 @@ fn hash_file_evidence(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_source_entry(entry: &BootstrapSourceEntry) -> Result<(), ShadowProjectionError> {
     enforce_limit(
         "source path bytes",
@@ -3506,6 +3615,7 @@ fn validate_source_entry(entry: &BootstrapSourceEntry) -> Result<(), ShadowProje
     )
 }
 
+#[cfg(test)]
 fn validate_projection_root_entries(
     directory: &Path,
     final_directory: bool,
@@ -3558,6 +3668,7 @@ fn validate_projection_root_entries(
     Ok(())
 }
 
+#[cfg(test)]
 fn publish_small_file_atomic(
     directory: &Path,
     stage_name: &str,
@@ -3599,6 +3710,7 @@ fn publish_small_file_atomic(
     Ok(description)
 }
 
+#[cfg(test)]
 fn compare_exact_small_file(
     path: &Path,
     expected: &[u8],
@@ -3623,6 +3735,7 @@ fn compare_exact_small_file(
     Ok(())
 }
 
+#[cfg(test)]
 fn describe_regular_file(
     path: &Path,
     maximum_bytes: u64,
@@ -3653,6 +3766,7 @@ fn describe_regular_file(
     ))
 }
 
+#[cfg(test)]
 struct ResumableExactFile {
     existing: Option<File>,
     remaining_existing: u64,
@@ -3662,7 +3776,9 @@ struct ResumableExactFile {
     conflict: &'static str,
 }
 
+#[cfg(test)]
 impl ResumableExactFile {
+    #[cfg(test)]
     fn open(path: &Path, conflict: &'static str) -> Result<Self, ShadowProjectionError> {
         let (existing, remaining_existing, append) = match fs::symlink_metadata(path) {
             Ok(metadata) if !metadata_is_real_file(&metadata) => {
@@ -3688,12 +3804,14 @@ impl ResumableExactFile {
         })
     }
 
+    #[cfg(test)]
     fn finish(mut self) -> Result<BlobDescription, ShadowProjectionError> {
         let description = self.finish_unflushed()?;
         self.append.sync_all()?;
         Ok(description)
     }
 
+    #[cfg(test)]
     fn finish_unflushed(&mut self) -> Result<BlobDescription, ShadowProjectionError> {
         if self.remaining_existing != 0 {
             return Err(ShadowProjectionError::CorruptOrConflicting(self.conflict));
@@ -3706,6 +3824,7 @@ impl ResumableExactFile {
     }
 }
 
+#[cfg(test)]
 impl Write for ResumableExactFile {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let compare_len = usize::try_from(self.remaining_existing.min(bytes.len() as u64))
@@ -3737,6 +3856,7 @@ impl Write for ResumableExactFile {
     }
 }
 
+#[cfg(test)]
 fn write_len_prefixed(output: &mut impl Write, bytes: &[u8]) -> Result<(), ShadowProjectionError> {
     let length = u32::try_from(bytes.len()).map_err(|_| ShadowProjectionError::ResourceLimit {
         resource: "manifest field bytes",
@@ -3748,6 +3868,7 @@ fn write_len_prefixed(output: &mut impl Write, bytes: &[u8]) -> Result<(), Shado
     Ok(())
 }
 
+#[cfg(test)]
 fn write_description(
     output: &mut impl Write,
     description: BlobDescription,
@@ -3757,19 +3878,23 @@ fn write_description(
     Ok(())
 }
 
+#[cfg(test)]
 fn put_description(output: &mut Vec<u8>, description: BlobDescription) {
     output.extend_from_slice(description.sha256());
     put_u64(output, description.byte_length());
 }
 
+#[cfg(test)]
 fn put_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_be_bytes());
 }
 
+#[cfg(test)]
 fn put_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_be_bytes());
 }
 
+#[cfg(test)]
 fn put_vec(output: &mut Vec<u8>, value: &[u8]) -> Result<(), ShadowProjectionError> {
     let length = u32::try_from(value.len()).map_err(|_| ShadowProjectionError::ResourceLimit {
         resource: "proof binding bytes",
@@ -3848,6 +3973,7 @@ fn read_description(reader: &mut impl Read) -> Result<BlobDescription, ShadowPro
     ))
 }
 
+#[cfg(test)]
 fn checked_add(
     current: u64,
     growth: u64,
@@ -3890,6 +4016,7 @@ fn metadata_is_windows_reparse(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+#[cfg(test)]
 fn metadata_is_real_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir()
         && !metadata.file_type().is_symlink()
@@ -3902,6 +4029,7 @@ fn metadata_is_real_file(metadata: &fs::Metadata) -> bool {
         && !metadata_is_windows_reparse(metadata)
 }
 
+#[cfg(test)]
 fn require_supported_exact_filesystem() -> io::Result<()> {
     #[cfg(any(unix, windows))]
     {
@@ -3916,6 +4044,7 @@ fn require_supported_exact_filesystem() -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn configure_file_nofollow(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
@@ -3929,6 +4058,7 @@ fn configure_file_nofollow(options: &mut OpenOptions) {
     let _ = options;
 }
 
+#[cfg(test)]
 fn validate_opened_regular(file: File) -> io::Result<File> {
     if metadata_is_real_file(&file.metadata()?) {
         Ok(file)
@@ -3940,6 +4070,7 @@ fn validate_opened_regular(file: File) -> io::Result<File> {
     }
 }
 
+#[cfg(test)]
 fn open_regular_readonly_nofollow(path: &Path) -> io::Result<File> {
     require_supported_exact_filesystem()?;
     let mut options = OpenOptions::new();
@@ -3948,6 +4079,7 @@ fn open_regular_readonly_nofollow(path: &Path) -> io::Result<File> {
     validate_opened_regular(options.open(path)?)
 }
 
+#[cfg(test)]
 fn open_regular_append_nofollow(path: &Path) -> io::Result<File> {
     require_supported_exact_filesystem()?;
     let mut options = OpenOptions::new();
@@ -3956,6 +4088,7 @@ fn open_regular_append_nofollow(path: &Path) -> io::Result<File> {
     validate_opened_regular(options.open(path)?)
 }
 
+#[cfg(test)]
 fn create_new_regular_nofollow(path: &Path) -> io::Result<File> {
     require_supported_exact_filesystem()?;
     let mut options = OpenOptions::new();
@@ -3964,6 +4097,7 @@ fn create_new_regular_nofollow(path: &Path) -> io::Result<File> {
     validate_opened_regular(options.open(path)?)
 }
 
+#[cfg(test)]
 fn open_directory_nofollow_ambient(path: &Path) -> Result<Dir, ShadowProjectionError> {
     require_supported_exact_filesystem()?;
     let name = path.file_name().and_then(|name| name.to_str()).ok_or(
@@ -3978,6 +4112,7 @@ fn open_directory_nofollow_ambient(path: &Path) -> Result<Dir, ShadowProjectionE
         .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))
 }
 
+#[cfg(test)]
 fn require_real_directory(path: &Path, detail: &'static str) -> Result<(), ShadowProjectionError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata_is_real_directory(&metadata) => Ok(()),
@@ -3986,10 +4121,12 @@ fn require_real_directory(path: &Path, detail: &'static str) -> Result<(), Shado
     }
 }
 
+#[cfg(test)]
 fn ensure_real_directory_created(path: &Path) -> Result<(), ShadowProjectionError> {
     ensure_real_directory_created_inner(path, None)
 }
 
+#[cfg(test)]
 fn ensure_real_directory_created_before_parent_sync(
     path: &Path,
     cut: ShadowProjectionCrashCut,
@@ -3997,6 +4134,7 @@ fn ensure_real_directory_created_before_parent_sync(
     ensure_real_directory_created_inner(path, Some(cut))
 }
 
+#[cfg(test)]
 fn ensure_real_directory_created_inner(
     path: &Path,
     cut_before_parent_sync: Option<ShadowProjectionCrashCut>,
@@ -4020,6 +4158,7 @@ fn ensure_real_directory_created_inner(
     }
 }
 
+#[cfg(test)]
 fn path_exists(path: &Path) -> Result<bool, ShadowProjectionError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -4028,12 +4167,14 @@ fn path_exists(path: &Path) -> Result<bool, ShadowProjectionError> {
     }
 }
 
+#[cfg(test)]
 fn sync_directory(path: &Path) -> Result<(), ShadowProjectionError> {
     let directory = open_directory_nofollow_ambient(path)?;
     sync_dir_required(&directory)
         .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))
 }
 
+#[cfg(test)]
 fn sync_directory_barrier(
     path: &Path,
     barrier: ShadowProjectionDurabilityBarrier,
@@ -4046,6 +4187,7 @@ fn sync_directory_barrier(
     Ok(())
 }
 
+#[cfg(test)]
 fn hex(bytes: &[u8; 32]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(64);
@@ -4065,12 +4207,6 @@ mod tests {
 
     use super::*;
     use crate::oplog::bootstrap_import::MAX_OPERATIONS_PER_BOOTSTRAP_PART;
-    use crate::oplog::enrollment::{
-        compose_verified_local, compose_verified_local_at_cut_for_test,
-        enrollment_application_root_for_test, reopen_verified_local, CommitCut,
-        EnrollmentBindingV1, EnrollmentOpen, EnrollmentReader, PreparationId,
-        VerifiedLocalCompositionError, VerifiedLocalProofSet,
-    };
     use crate::oplog::hot_engine::{
         MaterializationStats, MaterializedBlock, MaterializedPage, ProjectionEndpointBinding,
         ProjectionPageState, ProjectionStorageBinding,
@@ -4121,7 +4257,6 @@ mod tests {
         sqlite: OpenProjection,
         sqlite_proof: VerifiedBootstrapSqliteProjection,
         adjacent: RefCell<Option<AdjacentTerminalShadowEvidence>>,
-        archive_resource_id: crate::oplog::CanonicalArchiveResourceId,
         original_graph: BTreeMap<String, Vec<u8>>,
     }
 
@@ -4219,10 +4354,6 @@ mod tests {
             .unwrap();
             let adjacent =
                 adjacent_construction.map(|construction| construction.finish(&authority).unwrap());
-            let archive_resource_id = authority
-                .store()
-                .provision_enrolled_archive_resource_id()
-                .unwrap();
             Self {
                 root,
                 graph_root,
@@ -4235,7 +4366,6 @@ mod tests {
                 sqlite,
                 sqlite_proof,
                 adjacent: RefCell::new(adjacent),
-                archive_resource_id,
                 original_graph,
             }
         }
@@ -4279,57 +4409,6 @@ mod tests {
 
         fn assert_graph_unchanged(&self) {
             assert_eq!(snapshot_files(&self.graph_root), self.original_graph);
-        }
-
-        fn enrollment_binding(&self) -> EnrollmentBindingV1 {
-            self.enrollment_binding_with_archive(self.archive_resource_id)
-        }
-
-        fn enrollment_binding_with_archive(
-            &self,
-            archive_resource_id: crate::oplog::CanonicalArchiveResourceId,
-        ) -> EnrollmentBindingV1 {
-            let accepted = self.authority.binding();
-            let storage = accepted.storage_binding();
-            EnrollmentBindingV1::new(
-                accepted.workspace_id(),
-                accepted.lineage_digest(),
-                self.verified.catalog_document_id(),
-                storage.endpoint.endpoint_id(),
-                storage.endpoint.device_id(),
-                accepted.graph_resource(),
-                storage.receipt_store_id,
-                archive_resource_id,
-                self.graph.graph_text_scope_binding().unwrap(),
-            )
-            .unwrap()
-        }
-
-        fn enrollment_root(
-            &self,
-            label: &str,
-        ) -> crate::oplog::enrollment::EnrollmentApplicationRoot {
-            enrollment_application_root_for_test(
-                &self
-                    .root
-                    .path()
-                    .join(format!("enrollment-{}-{label}", Uuid::new_v4())),
-            )
-            .unwrap()
-        }
-
-        fn proofs<'a>(&'a self, shadow: &'a VerifiedShadowProjection) -> VerifiedLocalProofSet<'a> {
-            VerifiedLocalProofSet {
-                graph: &self.graph,
-                roots: &self.roots,
-                prepared: &self.prepared,
-                verified_publication: &self.verified,
-                source_backup: &self.backup,
-                accepted_authority: &self.authority,
-                sqlite: &self.sqlite,
-                sqlite_projection: &self.sqlite_proof,
-                shadow_projection: shadow,
-            }
         }
     }
 
@@ -5153,619 +5232,6 @@ mod tests {
             assert!(!manifested.contains_key(&ManagedPath::parse(loser).unwrap()));
         }
         fixture.assert_graph_unchanged();
-    }
-
-    #[test]
-    fn verified_local_composes_zero_one_and_multipart_terminal_identity_exactly() {
-        let zero = Fixture::new("verified-local-zero", None, Vec::new());
-        let zero_shadow = zero.verify().unwrap();
-        let zero_root = zero.enrollment_root("zero");
-        let zero_binding = zero.enrollment_binding();
-        let zero_preparation = PreparationId::new();
-        let zero_before = snapshot_files(&zero.graph_root);
-        let zero_evidence = compose_verified_local(
-            &zero_root,
-            zero_binding.clone(),
-            zero_preparation,
-            &zero.proofs(&zero_shadow),
-        )
-        .unwrap();
-        assert_eq!(zero.verified.part_count(), 0);
-        assert_eq!(zero_evidence.bootstrap_batch_id(), None);
-        assert_eq!(snapshot_files(&zero.graph_root), zero_before);
-        let zero_repeat = compose_verified_local(
-            &zero_root,
-            zero_binding.clone(),
-            zero_preparation,
-            &zero.proofs(&zero_shadow),
-        )
-        .unwrap();
-        assert_eq!(
-            zero_repeat.enrollment_head(),
-            zero_evidence.enrollment_head()
-        );
-        assert_eq!(
-            reopen_verified_local(&zero_root, &zero_binding, &zero.proofs(&zero_shadow))
-                .unwrap()
-                .verification_digest(),
-            zero_evidence.verification_digest()
-        );
-
-        let one = Fixture::new(
-            "verified-local-one",
-            None,
-            vec![("pages/one.md".into(), b"- one\n".to_vec())],
-        );
-        let one_shadow = one.verify().unwrap();
-        let one_root = one.enrollment_root("one");
-        let one_binding = one.enrollment_binding();
-        let one_evidence = compose_verified_local(
-            &one_root,
-            one_binding,
-            PreparationId::new(),
-            &one.proofs(&one_shadow),
-        )
-        .unwrap();
-        // Partition cardinality is prepared evidence, not a fixture constant:
-        // stable internal operations may legitimately change it.
-        let one_parts = one.prepared.aggregate().parts();
-        assert!(!one_parts.is_empty());
-        assert_eq!(one.verified.part_count() as usize, one_parts.len());
-        assert_eq!(
-            one_evidence.bootstrap_batch_id(),
-            one_parts.last().map(|part| part.batch_id())
-        );
-        one.assert_graph_unchanged();
-
-        let mut multipart_bytes = Vec::new();
-        for ordinal in 0..4096 {
-            multipart_bytes.extend_from_slice(format!("- operation {ordinal:04}\n").as_bytes());
-        }
-        force_next_bootstrap_part_operation_limit(4096);
-        let multipart = Fixture::new(
-            "verified-local-4096",
-            None,
-            vec![("pages/multipart.md".into(), multipart_bytes)],
-        );
-        let multipart_shadow = multipart.verify().unwrap();
-        let multipart_parts = multipart.prepared.aggregate().parts();
-        assert_eq!(
-            multipart.verified.part_count() as usize,
-            multipart_parts.len()
-        );
-        assert_ne!(
-            multipart_parts.first().map(|part| part.batch_id()),
-            multipart_parts.last().map(|part| part.batch_id()),
-            "the multipart fixture must have a non-terminal predecessor"
-        );
-        let multipart_root = multipart.enrollment_root("multipart");
-        let multipart_evidence = compose_verified_local(
-            &multipart_root,
-            multipart.enrollment_binding(),
-            PreparationId::new(),
-            &multipart.proofs(&multipart_shadow),
-        )
-        .unwrap();
-        assert_eq!(
-            multipart_evidence.bootstrap_batch_id(),
-            multipart_parts.last().map(|part| part.batch_id())
-        );
-        multipart.assert_graph_unchanged();
-    }
-
-    fn enrollment_head(
-        root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
-        binding: &EnrollmentBindingV1,
-    ) -> ContentDigest {
-        match EnrollmentReader::open_existing(root, binding).unwrap() {
-            EnrollmentOpen::Present(reader) => reader.current().digest(),
-            EnrollmentOpen::Absent => panic!("expected enrollment head"),
-        }
-    }
-
-    fn enrollment_generation(
-        root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
-        binding: &EnrollmentBindingV1,
-    ) -> u64 {
-        match EnrollmentReader::open_existing(root, binding).unwrap() {
-            EnrollmentOpen::Present(reader) => reader.current().generation(),
-            EnrollmentOpen::Absent => panic!("expected enrollment head"),
-        }
-    }
-
-    fn enrollment_head_file(
-        root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
-        binding: &EnrollmentBindingV1,
-    ) -> PathBuf {
-        root.path()
-            .join("sparse-storage/v2/local")
-            .join(binding.graph_resource_id().to_string())
-            .join("enrollment/head")
-    }
-
-    fn enrollment_record_file(
-        root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
-        binding: &EnrollmentBindingV1,
-        digest: ContentDigest,
-    ) -> PathBuf {
-        enrollment_head_file(root, binding)
-            .parent()
-            .unwrap()
-            .join("records")
-            .join(format!("{digest}.enrollment"))
-    }
-
-    fn find_file_with_prefix(root: &Path, prefix: &str) -> PathBuf {
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(directory) = stack.pop() {
-            for entry in fs::read_dir(directory).unwrap().map(Result::unwrap) {
-                if entry.file_type().unwrap().is_dir() {
-                    stack.push(entry.path());
-                } else if entry.file_name().to_string_lossy().starts_with(prefix) {
-                    return entry.path();
-                }
-            }
-        }
-        panic!("missing file with prefix {prefix}");
-    }
-
-    #[test]
-    fn verified_local_cross_proof_mismatches_never_advance_shadow_head() {
-        let first = rich_fixture("verified-local-cross-first");
-        let first_shadow = first.verify().unwrap();
-        let second = Fixture::new(
-            "verified-local-cross-second",
-            None,
-            vec![("pages/second.md".into(), b"- second\n".to_vec())],
-        );
-        let second_shadow = second.verify().unwrap();
-        let root = first.enrollment_root("cross");
-        let binding = first.enrollment_binding();
-        let preparation = PreparationId::new();
-
-        let wrong_backup = VerifiedLocalProofSet {
-            source_backup: &second.backup,
-            ..first.proofs(&first_shadow)
-        };
-        assert!(
-            compose_verified_local(&root, binding.clone(), preparation, &wrong_backup).is_err()
-        );
-        let shadow_head = enrollment_head(&root, &binding);
-
-        for proofs in [
-            VerifiedLocalProofSet {
-                accepted_authority: &second.authority,
-                ..first.proofs(&first_shadow)
-            },
-            VerifiedLocalProofSet {
-                sqlite_projection: &second.sqlite_proof,
-                ..first.proofs(&first_shadow)
-            },
-            VerifiedLocalProofSet {
-                shadow_projection: &second_shadow,
-                ..first.proofs(&first_shadow)
-            },
-            VerifiedLocalProofSet {
-                roots: &second.roots,
-                ..first.proofs(&first_shadow)
-            },
-        ] {
-            assert!(compose_verified_local(&root, binding.clone(), preparation, &proofs).is_err());
-            assert_eq!(enrollment_head(&root, &binding), shadow_head);
-        }
-        let graph_before = snapshot_files(&first.graph_root);
-        compose_verified_local(&root, binding, preparation, &first.proofs(&first_shadow)).unwrap();
-        assert_eq!(snapshot_files(&first.graph_root), graph_before);
-        first.assert_graph_unchanged();
-        second.assert_graph_unchanged();
-    }
-
-    #[test]
-    fn verified_local_foreign_archive_resource_id_never_advances_shadow_head() {
-        // Archive A holds the genuine retained proofs and its own provisioned
-        // archive-resource claim; archive B is a second, physically distinct
-        // enrolled archive with its own genuine claim.
-        let archive_a = Fixture::new(
-            "verified-local-archive-a",
-            None,
-            vec![("pages/a.md".into(), b"- archive a\n".to_vec())],
-        );
-        let shadow_a = archive_a.verify().unwrap();
-        let archive_b = Fixture::new(
-            "verified-local-archive-b",
-            None,
-            vec![("pages/b.md".into(), b"- archive b\n".to_vec())],
-        );
-        assert_ne!(
-            archive_a.archive_resource_id, archive_b.archive_resource_id,
-            "two genuinely provisioned archives must have distinct resource ids"
-        );
-
-        // Compose archive A's valid proofs under a binding that carries archive
-        // B's valid CanonicalArchiveResourceId. The composition must fail and
-        // the enrollment head must remain exactly the initial ShadowImport.
-        let mismatched = archive_a.enrollment_binding_with_archive(archive_b.archive_resource_id);
-        let mismatch_root = archive_a.enrollment_root("foreign-archive");
-        let preparation = PreparationId::new();
-        let graph_before = snapshot_files(&archive_a.graph_root);
-
-        assert!(compose_verified_local(
-            &mismatch_root,
-            mismatched.clone(),
-            preparation,
-            &archive_a.proofs(&shadow_a),
-        )
-        .is_err());
-        let shadow_head = enrollment_head(&mismatch_root, &mismatched);
-        assert_eq!(enrollment_generation(&mismatch_root, &mismatched), 1);
-        // A retry does not launder the foreign claim into an advance either.
-        assert!(compose_verified_local(
-            &mismatch_root,
-            mismatched.clone(),
-            preparation,
-            &archive_a.proofs(&shadow_a),
-        )
-        .is_err());
-        assert_eq!(enrollment_head(&mismatch_root, &mismatched), shadow_head);
-        assert_eq!(enrollment_generation(&mismatch_root, &mismatched), 1);
-
-        // Archive A's own binding still composes and reopens cleanly.
-        let valid = archive_a.enrollment_binding();
-        assert_eq!(valid.archive_resource_id(), archive_a.archive_resource_id);
-        let valid_root = archive_a.enrollment_root("own-archive");
-        let evidence = compose_verified_local(
-            &valid_root,
-            valid.clone(),
-            PreparationId::new(),
-            &archive_a.proofs(&shadow_a),
-        )
-        .unwrap();
-        let reopened =
-            reopen_verified_local(&valid_root, &valid, &archive_a.proofs(&shadow_a)).unwrap();
-        assert_eq!(reopened.enrollment_head(), evidence.enrollment_head());
-        assert_eq!(
-            reopened.verification_digest(),
-            evidence.verification_digest()
-        );
-
-        // No path here may write a single byte into either live graph.
-        assert_eq!(snapshot_files(&archive_a.graph_root), graph_before);
-        archive_a.assert_graph_unchanged();
-        archive_b.assert_graph_unchanged();
-    }
-
-    #[test]
-    fn verified_local_all_enrollment_durability_cuts_resume_one_exact_head() {
-        let fixture = Fixture::new(
-            "verified-local-enrollment-cuts",
-            None,
-            vec![(
-                "pages/cuts.md".into(),
-                b"- enrollment durability\n".to_vec(),
-            )],
-        );
-        let shadow = fixture.verify().unwrap();
-        let binding = fixture.enrollment_binding();
-        let cuts = [
-            CommitCut::AfterRecordTempCreate,
-            CommitCut::AfterRecordWrite,
-            CommitCut::AfterRecordFileSync,
-            CommitCut::AfterRecordLink,
-            CommitCut::AfterRecordInsert,
-            CommitCut::AfterRecordsDirectorySync,
-            CommitCut::AfterHeadTempCreate,
-            CommitCut::AfterHeadWrite,
-            CommitCut::AfterHeadFileSync,
-            CommitCut::AfterHeadReplace,
-            CommitCut::AfterEnrollmentDirectorySync,
-        ];
-        for cut in cuts {
-            let root = fixture.enrollment_root("cut");
-            let preparation = PreparationId::new();
-            assert!(matches!(
-                compose_verified_local_at_cut_for_test(
-                    &root,
-                    binding.clone(),
-                    preparation,
-                    &fixture.proofs(&shadow),
-                    cut,
-                ),
-                Err(VerifiedLocalCompositionError::Enrollment(
-                    crate::oplog::enrollment::EnrollmentError::InjectedCrashCut(_)
-                ))
-            ));
-            let resumed = compose_verified_local(
-                &root,
-                binding.clone(),
-                preparation,
-                &fixture.proofs(&shadow),
-            )
-            .unwrap();
-            let repeated = compose_verified_local(
-                &root,
-                binding.clone(),
-                preparation,
-                &fixture.proofs(&shadow),
-            )
-            .unwrap();
-            assert_eq!(resumed.enrollment_head(), repeated.enrollment_head());
-            assert_eq!(
-                resumed.verification_digest(),
-                repeated.verification_digest()
-            );
-        }
-        fixture.assert_graph_unchanged();
-    }
-
-    #[test]
-    fn verified_local_partial_record_write_stays_explicitly_shadow_import() {
-        let fixture = Fixture::new(
-            "verified-local-partial-record",
-            None,
-            vec![("pages/partial.md".into(), b"- partial\n".to_vec())],
-        );
-        let shadow = fixture.verify().unwrap();
-        let root = fixture.enrollment_root("partial");
-        let binding = fixture.enrollment_binding();
-        let preparation = PreparationId::new();
-        assert!(compose_verified_local_at_cut_for_test(
-            &root,
-            binding.clone(),
-            preparation,
-            &fixture.proofs(&shadow),
-            CommitCut::AfterRecordWrite,
-        )
-        .is_err());
-        let shadow_head = enrollment_head(&root, &binding);
-        let temp = find_file_with_prefix(root.path(), ".record-tmp-");
-        let length = fs::metadata(&temp).unwrap().len();
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&temp)
-            .unwrap()
-            .set_len(length / 2)
-            .unwrap();
-        assert!(matches!(
-            compose_verified_local(
-                &root,
-                binding.clone(),
-                preparation,
-                &fixture.proofs(&shadow),
-            ),
-            Err(VerifiedLocalCompositionError::Enrollment(
-                crate::oplog::enrollment::EnrollmentError::AmbiguousRecordPublication
-            ))
-        ));
-        assert_eq!(enrollment_head(&root, &binding), shadow_head);
-
-        let head_root = fixture.enrollment_root("partial-head");
-        let head_preparation = PreparationId::new();
-        assert!(compose_verified_local_at_cut_for_test(
-            &head_root,
-            binding.clone(),
-            head_preparation,
-            &fixture.proofs(&shadow),
-            CommitCut::AfterHeadWrite,
-        )
-        .is_err());
-        let head_temp = find_file_with_prefix(head_root.path(), ".head-tmp-");
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&head_temp)
-            .unwrap()
-            .set_len(7)
-            .unwrap();
-        let resumed = compose_verified_local(
-            &head_root,
-            binding,
-            head_preparation,
-            &fixture.proofs(&shadow),
-        )
-        .unwrap();
-        assert_eq!(
-            reopen_verified_local(&head_root, resumed.binding(), &fixture.proofs(&shadow))
-                .unwrap()
-                .enrollment_head(),
-            resumed.enrollment_head()
-        );
-        fixture.assert_graph_unchanged();
-    }
-
-    #[test]
-    fn verified_local_corrupt_or_missing_proofs_fail_before_head_advance() {
-        let backup_fixture = Fixture::new(
-            "verified-local-corrupt-backup",
-            None,
-            vec![("pages/backup.md".into(), b"- backup\n".to_vec())],
-        );
-        let backup_shadow = backup_fixture.verify().unwrap();
-        let backup_root = backup_fixture.enrollment_root("backup");
-        let backup_binding = backup_fixture.enrollment_binding();
-        let backup_preparation = PreparationId::new();
-        fs::remove_file(backup_fixture.backup.directory().join("manifest.bin")).unwrap();
-        assert!(compose_verified_local(
-            &backup_root,
-            backup_binding.clone(),
-            backup_preparation,
-            &backup_fixture.proofs(&backup_shadow),
-        )
-        .is_err());
-        let backup_head = enrollment_head(&backup_root, &backup_binding);
-        assert_eq!(enrollment_head(&backup_root, &backup_binding), backup_head);
-
-        let sqlite_fixture = Fixture::new(
-            "verified-local-missing-sqlite",
-            None,
-            vec![("pages/sqlite.md".into(), b"- sqlite\n".to_vec())],
-        );
-        let sqlite_shadow = sqlite_fixture.verify().unwrap();
-        let sqlite_root = sqlite_fixture.enrollment_root("sqlite");
-        let sqlite_binding = sqlite_fixture.enrollment_binding();
-        let sqlite_preparation = PreparationId::new();
-        let database_name = sqlite_fixture
-            .sqlite
-            .database
-            .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy();
-        let sqlite_checkpoint = sqlite_fixture
-            .sqlite
-            .database
-            .path()
-            .with_file_name(format!("{database_name}-auth"));
-        fs::remove_file(&sqlite_checkpoint).unwrap();
-        assert!(compose_verified_local(
-            &sqlite_root,
-            sqlite_binding.clone(),
-            sqlite_preparation,
-            &sqlite_fixture.proofs(&sqlite_shadow),
-        )
-        .is_err());
-        let sqlite_head = enrollment_head(&sqlite_root, &sqlite_binding);
-        fs::write(&sqlite_checkpoint, b"corrupt checkpoint").unwrap();
-        assert!(compose_verified_local(
-            &sqlite_root,
-            sqlite_binding.clone(),
-            sqlite_preparation,
-            &sqlite_fixture.proofs(&sqlite_shadow),
-        )
-        .is_err());
-        assert_eq!(enrollment_head(&sqlite_root, &sqlite_binding), sqlite_head);
-
-        let shadow_fixture = Fixture::new(
-            "verified-local-corrupt-shadow",
-            None,
-            vec![("pages/shadow.md".into(), b"- shadow\n".to_vec())],
-        );
-        let shadow_proof = shadow_fixture.verify().unwrap();
-        let shadow_root = shadow_fixture.enrollment_root("shadow");
-        let shadow_binding = shadow_fixture.enrollment_binding();
-        let shadow_preparation = PreparationId::new();
-        fs::write(shadow_proof.directory().join(PROOF_FILE), b"corrupt").unwrap();
-        assert!(compose_verified_local(
-            &shadow_root,
-            shadow_binding.clone(),
-            shadow_preparation,
-            &shadow_fixture.proofs(&shadow_proof),
-        )
-        .is_err());
-        let shadow_head = enrollment_head(&shadow_root, &shadow_binding);
-        assert_eq!(enrollment_head(&shadow_root, &shadow_binding), shadow_head);
-    }
-
-    #[test]
-    fn verified_local_reopen_rejects_enrollment_record_and_head_corruption() {
-        for corrupt_head in [false, true] {
-            let fixture = Fixture::new(
-                if corrupt_head {
-                    "verified-local-head-corruption"
-                } else {
-                    "verified-local-record-corruption"
-                },
-                None,
-                vec![("pages/enrollment.md".into(), b"- enrollment\n".to_vec())],
-            );
-            let shadow = fixture.verify().unwrap();
-            let root = fixture.enrollment_root("enrollment");
-            let binding = fixture.enrollment_binding();
-            let evidence = compose_verified_local(
-                &root,
-                binding.clone(),
-                PreparationId::new(),
-                &fixture.proofs(&shadow),
-            )
-            .unwrap();
-            if corrupt_head {
-                fs::write(enrollment_head_file(&root, &binding), b"corrupt\n").unwrap();
-            } else {
-                let record = enrollment_record_file(&root, &binding, evidence.enrollment_head());
-                let mut bytes = fs::read(&record).unwrap();
-                let last = bytes.len() - 1;
-                bytes[last] ^= 1;
-                fs::write(record, bytes).unwrap();
-            }
-            assert!(reopen_verified_local(&root, &binding, &fixture.proofs(&shadow)).is_err());
-            fixture.assert_graph_unchanged();
-        }
-    }
-
-    #[test]
-    fn verified_local_source_mutation_and_blocked_lifecycle_cannot_advance() {
-        let mutation = Fixture::new(
-            "verified-local-source-mutation",
-            None,
-            vec![("pages/source.md".into(), b"- before\n".to_vec())],
-        );
-        let mutation_shadow = mutation.verify().unwrap();
-        let mutation_root = mutation.enrollment_root("mutation");
-        let mutation_binding = mutation.enrollment_binding();
-        fs::write(
-            mutation.graph_root.join("pages/source.md"),
-            b"- changed before transition\n",
-        )
-        .unwrap();
-        assert!(compose_verified_local(
-            &mutation_root,
-            mutation_binding.clone(),
-            PreparationId::new(),
-            &mutation.proofs(&mutation_shadow),
-        )
-        .is_err());
-        let mutation_head = enrollment_head(&mutation_root, &mutation_binding);
-        assert_eq!(
-            enrollment_head(&mutation_root, &mutation_binding),
-            mutation_head
-        );
-
-        let blocked = Fixture::new(
-            "verified-local-blocked",
-            None,
-            vec![("pages/blocked.md".into(), b"- blocked\n".to_vec())],
-        );
-        let blocked_shadow = blocked.verify().unwrap();
-        let blocked_root = blocked.enrollment_root("blocked");
-        let blocked_binding = blocked.enrollment_binding();
-        let preparation = PreparationId::new();
-        let evidence = compose_verified_local(
-            &blocked_root,
-            blocked_binding.clone(),
-            preparation,
-            &blocked.proofs(&blocked_shadow),
-        )
-        .unwrap();
-        let mut writer = match crate::oplog::enrollment::EnrollmentWriter::open_existing(
-            &blocked_root,
-            &blocked_binding,
-        )
-        .unwrap()
-        {
-            EnrollmentOpen::Present(writer) => writer,
-            EnrollmentOpen::Absent => unreachable!(),
-        };
-        let blocked_head = writer
-            .block_current(
-                evidence.enrollment_head(),
-                "proof.failed".into(),
-                ContentDigest::of(b"blocked evidence"),
-            )
-            .unwrap()
-            .digest();
-        drop(writer);
-        assert!(matches!(
-            compose_verified_local(
-                &blocked_root,
-                blocked_binding.clone(),
-                preparation,
-                &blocked.proofs(&blocked_shadow),
-            ),
-            Err(VerifiedLocalCompositionError::WrongLifecycle(_))
-        ));
-        assert_eq!(
-            enrollment_head(&blocked_root, &blocked_binding),
-            blocked_head
-        );
-        blocked.assert_graph_unchanged();
     }
 
     #[test]
