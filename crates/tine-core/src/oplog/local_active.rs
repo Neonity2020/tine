@@ -283,19 +283,13 @@ use std::fmt;
 #[cfg(test)]
 use std::sync::Mutex;
 
-use super::enrollment::{
-    CommittedLocalActive, LocalActiveSync, RetainedEnrollmentSession,
-    VerifiedLocalCompositionError, VerifiedLocalEvidence,
-};
+use super::enrollment::VerifiedLocalCompositionError;
 use super::hot_engine::{EngineError, LocalAuthorGeneration, ShardedHotEngine};
-use super::object_store::{EngineHistoryAuthority, PromotedRuntimeStateV1, StoreError};
-use super::shadow_projection::BootstrapProjectionAuthority;
+use super::object_store::StoreError;
 use super::sqlite::{
     LeasedWorkspaceProjection, ProjectionError, SqliteFrontier, TailOverlay, WorkspaceLeaseIdentity,
 };
-use super::{
-    ContentDigest, DeviceId, ObjectStore, ProjectionEndpointBinding, SessionId, WorkspaceId,
-};
+use super::{DeviceId, ProjectionEndpointBinding, SessionId, WorkspaceId};
 
 /// A private seal. Sibling modules can name the sealed types but can never
 /// construct one, because this module is the only place `Seal` is reachable.
@@ -377,32 +371,6 @@ fn count(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
     counter.with(|value| value.set(value.get().saturating_add(1)));
 }
 
-/// Authenticate the archive's persisted canonical resource claim and its
-/// physical control-directory identity, counted.
-///
-/// Both operations reread or re-stat the archive through an already-open
-/// immutable capability. They are stable session facts: an `ObjectStore` is a
-/// retained no-follow directory capability, so the directory it names cannot be
-/// swapped underneath it. Every open, handoff, and recovery boundary — and
-/// every observed enrollment-head change — re-proves them; an unchanged-head
-/// admission does not.
-fn authenticate_archive_identity(
-    archive: &ObjectStore,
-    state: &PromotedRuntimeStateV1,
-    control_detail: &'static str,
-) -> Result<(), RuntimePromotionError> {
-    #[cfg(test)]
-    count(&PROMOTED_ARCHIVE_IDENTITY_READS);
-    archive
-        .validate_enrolled_archive_resource_id(state.archive_resource_id)
-        .map_err(StoreError::Io)
-        .map_err(RuntimePromotionError::Store)?;
-    if archive.canonical_archive_identity()?.binding_digest() != state.archive_control_binding {
-        return Err(RuntimePromotionError::Anchor(control_detail));
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 pub(crate) enum LocalActivationError {
     Enrollment(VerifiedLocalCompositionError),
@@ -426,118 +394,6 @@ impl std::error::Error for LocalActivationError {}
 impl From<VerifiedLocalCompositionError> for LocalActivationError {
     fn from(error: VerifiedLocalCompositionError) -> Self {
         Self::Enrollment(error)
-    }
-}
-
-/// Opaque device-local write authority for one enrolled graph.
-///
-/// Deliberately not `Clone`, not `Copy`, not `Debug`-transparent, and neither
-/// serializable nor deserializable. Every field is private and every accessor
-/// returns copied evidence, never the authority itself.
-pub(crate) struct LocalActiveAuthority {
-    evidence: VerifiedLocalEvidence,
-    session_id: SessionId,
-    enrollment_head: ContentDigest,
-    verification_digest: ContentDigest,
-    endpoint: ProjectionEndpointBinding,
-    activation_acceptance_sequence: u64,
-    _seal: seal::Seal,
-}
-
-impl fmt::Debug for LocalActiveAuthority {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LocalActiveAuthority")
-            .field("enrollment_head", &self.enrollment_head)
-            .finish_non_exhaustive()
-    }
-}
-
-impl LocalActiveAuthority {
-    /// Authenticate the live graph capability alone against the committed
-    /// enrollment binding.
-    fn authenticate_graph(&self, graph: &Graph) -> Result<(), LocalActivationError> {
-        let binding = self.evidence.binding();
-        let graph_resource = graph
-            .canonical_resource_id()
-            .map_err(|error| LocalActivationError::RuntimeBinding(error.to_string()))?;
-        let scope = graph
-            .graph_text_scope_binding()
-            .map_err(|error| LocalActivationError::RuntimeBinding(error.to_string()))?;
-        if graph_resource != binding.graph_resource_id() {
-            return Err(LocalActivationError::RuntimeBinding(
-                "live graph resource identity is not the enrolled graph".into(),
-            ));
-        }
-        if scope != binding.graph_text_scope_binding() {
-            return Err(LocalActivationError::RuntimeBinding(
-                "live graph text scope is not the enrolled scope".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Authenticate the live graph and engine against the committed enrollment
-    /// binding. Nothing here reads SQLite rows or projection bytes.
-    fn authenticate_runtime(
-        &self,
-        graph: &Graph,
-        engine: &ShardedHotEngine,
-    ) -> Result<(), LocalActivationError> {
-        self.authenticate_graph(graph)?;
-        let binding = self.evidence.binding();
-        if engine.workspace_id() != binding.workspace_id()
-            || engine.lineage_digest() != binding.lineage_digest()
-            || engine.catalog_document_id() != binding.catalog_document_id()
-        {
-            return Err(LocalActivationError::RuntimeBinding(
-                "live engine workspace lineage does not match the enrolled binding".into(),
-            ));
-        }
-        match engine.projection_endpoint_binding() {
-            Some(endpoint)
-                if endpoint.endpoint_id() == binding.endpoint_id()
-                    && endpoint.device_id() == binding.device_id()
-                    && endpoint.graph_resource_id() == binding.graph_resource_id() => {}
-            _ => {
-                return Err(LocalActivationError::RuntimeBinding(
-                    "live engine projection endpoint is not the enrolled endpoint".into(),
-                ));
-            }
-        }
-        if engine.projection_receipt_store_id() != Some(binding.receipt_store_id()) {
-            return Err(LocalActivationError::RuntimeBinding(
-                "live engine receipt store is not the enrolled receipt store".into(),
-            ));
-        }
-        let accepted = engine
-            .accepted_frontier_root()
-            .map_err(|error| LocalActivationError::RuntimeBinding(error.to_string()))?;
-        if accepted.acceptance_sequence() < self.activation_acceptance_sequence {
-            return Err(LocalActivationError::RuntimeBinding(
-                "live engine accepted frontier is behind the activated frontier".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// A short-lived local mutation window derived from a live authority.
-///
-/// It borrows the authority exclusively, cannot be cloned, and carries the
-/// private seal, so no sibling module can assemble one.
-pub(crate) struct LocalMutationPermit<'a> {
-    authority: &'a LocalActiveAuthority,
-    _seal: seal::Seal,
-}
-
-impl LocalMutationPermit<'_> {
-    pub(crate) const fn session_id(&self) -> SessionId {
-        self.authority.session_id
-    }
-
-    pub(crate) const fn endpoint(&self) -> ProjectionEndpointBinding {
-        self.authority.endpoint
     }
 }
 
@@ -586,7 +442,6 @@ impl AdmittedLocalAuthorAuthority<'_> {
 }
 
 enum AdmissionProvenance<'a> {
-    Promoted(&'a PromotedRuntimeAdmission<'a>),
     Clean(&'a CleanRuntimeAdmission<'a>),
     /// Retained for the crate-private `#[cfg(test)]` fixture corpus only; see
     /// [`LocalRuntimeAdmission::unenrolled_pre_activation`].
@@ -637,26 +492,9 @@ impl LocalRuntimeAdmission<'_> {
         engine: &ShardedHotEngine,
     ) -> Result<(), RuntimePromotionError> {
         match &self.provenance {
-            AdmissionProvenance::Promoted(admission) => admission.authorize_engine(graph, engine),
             AdmissionProvenance::Clean(admission) => admission.authorize_engine(graph, engine),
             #[cfg(test)]
-            AdmissionProvenance::UnenrolledPreActivation => {
-                // A promoted engine is a real activated user graph. The
-                // pre-activation hatch exists only for fixtures whose engines
-                // were never enrolled through a bootstrap publication, so
-                // offering it a promoted runtime is always a construction
-                // error, never a fallback.
-                if engine.promoted_lineage().is_some() {
-                    return Err(RuntimePromotionError::Activation(
-                        LocalActivationError::RuntimeBinding(
-                            "the unenrolled pre-activation admission cannot authorize a promoted \
-                             runtime engine"
-                                .into(),
-                        ),
-                    ));
-                }
-                Ok(())
-            }
+            AdmissionProvenance::UnenrolledPreActivation => Ok(()),
         }
     }
 
@@ -674,11 +512,6 @@ impl LocalRuntimeAdmission<'_> {
     ) -> Result<AdmittedLocalAuthorAuthority<'a>, RuntimePromotionError> {
         self.authorize(graph, engine)?;
         let (admitted_endpoint, admitted_workspace, session_id) = match &self.provenance {
-            AdmissionProvenance::Promoted(admission) => (
-                admission.permit.endpoint(),
-                admission.state.workspace_id,
-                admission.permit.session_id(),
-            ),
             AdmissionProvenance::Clean(admission) => (
                 admission.endpoint,
                 admission.workspace_id,
@@ -736,7 +569,6 @@ impl LocalRuntimeAdmission<'_> {
         boundary: WorkspaceAuthorityBoundary,
     ) -> Result<(), WorkspaceAuthorityRefusal> {
         match &self.provenance {
-            AdmissionProvenance::Promoted(admission) => admission.reprove(boundary),
             AdmissionProvenance::Clean(admission) => admission.reprove(boundary),
             #[cfg(test)]
             AdmissionProvenance::UnenrolledPreActivation => Ok(()),
@@ -1014,310 +846,6 @@ impl RuntimeRevocationLatch {
                 revocation: Some(revocation),
             }
         }
-    }
-}
-
-/// Whether one binding proof rereads the archive's identity facts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ArchiveAuthentication {
-    /// Reread the persisted canonical resource claim and re-stat the physical
-    /// control directory.
-    Reread,
-    /// Carry the facts authenticated at this session's current binding
-    /// generation. Only reachable when the retained enrollment session reports
-    /// that generation unchanged, which means the committed enrollment head is
-    /// byte-identical to the one those facts were authenticated against.
-    Carried,
-}
-
-/// Re-prove the complete promoted binding against live durable state, and
-/// return the authenticated current accepted frontier.
-///
-/// Cost at [`ArchiveAuthentication::Reread`] is one archive-resource claim
-/// read, one archive control-identity stat, one durable head read, one
-/// shared-radix insertion-only walk bounded by the changed paths, and one
-/// engine frontier read. At [`ArchiveAuthentication::Carried`] the two archive
-/// operations are the ones already authenticated for this binding generation.
-/// The committed enrollment record is supplied by the caller's retained
-/// session, which is what removes the per-mutation journal reopen. Nothing here
-/// scans lifetime history, the enrollment chain, SQLite, or graph text.
-#[allow(clippy::too_many_arguments)]
-fn revalidate_promoted_binding(
-    state: &PromotedRuntimeStateV1,
-    anchor: EngineHistoryAuthority,
-    engine_authority: &super::hot_engine::EngineAuthority,
-    graph: &Graph,
-    engine: &ShardedHotEngine,
-    authority: &LocalActiveAuthority,
-    committed: &CommittedLocalActive,
-    archive_authentication: ArchiveAuthentication,
-) -> Result<super::hot_engine::AcceptedFrontierRoot, RuntimePromotionError> {
-    // The engine offered for work must be the exact promoted engine instance.
-    // A same-identity engine rebuilt from divergent, rolled-back, or merely
-    // higher-sequence history mints a distinct process-local authority and is
-    // refused here, before any durable or graph mutation.
-    if !engine_authority.matches(engine.runtime_authority()) {
-        return Err(RuntimePromotionError::Activation(
-            LocalActivationError::RuntimeBinding(
-                "admitted engine is not the exact promoted runtime engine".into(),
-            ),
-        ));
-    }
-    let binding = authority.evidence.binding();
-    // Enrollment identity: the authority and the durable promotion state must
-    // be the same enrollment and verification digest.
-    if authority.verification_digest != state.enrollment_verification_digest
-        || binding
-            .binding_digest()
-            .map_err(VerifiedLocalCompositionError::Enrollment)?
-            != state.enrollment_binding_digest
-    {
-        return Err(RuntimePromotionError::Anchor(
-            "live authority is not the enrollment this promoted runtime binds",
-        ));
-    }
-    // Live graph capability and enrolled engine binding.
-    authority.authenticate_runtime(graph, engine)?;
-    // Storage binding.
-    match engine.projection_endpoint_binding() {
-        Some(endpoint)
-            if endpoint.endpoint_id() == state.endpoint_id
-                && endpoint.device_id() == state.device_id
-                && endpoint.graph_resource_id() == state.graph_resource_id => {}
-        _ => {
-            return Err(RuntimePromotionError::Anchor(
-                "promoted engine endpoint is not the promoted storage binding",
-            ));
-        }
-    }
-    if engine.projection_receipt_store_id() != Some(state.receipt_store_id) {
-        return Err(RuntimePromotionError::Anchor(
-            "promoted engine receipt store is not the promoted storage binding",
-        ));
-    }
-    // Archive resource claim and physical archive control identity. These are
-    // stable session facts reread at every boundary and at every observed
-    // enrollment-head change; an unchanged-head admission carries them.
-    let archive = engine.archive_store().ok_or(RuntimePromotionError::Anchor(
-        "promoted engine retained no archive capability",
-    ))?;
-    if archive_authentication == ArchiveAuthentication::Reread {
-        authenticate_archive_identity(
-            archive,
-            state,
-            "promoted archive control directory was substituted",
-        )?;
-    }
-    // The live open must still be authorized by exactly this durable state.
-    if engine.promoted_lineage() != Some(state) {
-        return Err(RuntimePromotionError::Anchor(
-            "promoted engine no longer holds this exact promotion authorization",
-        ));
-    }
-    // Authenticated bootstrap anchor -> current history transition. Raw
-    // generation and acceptance sequence are never the proof.
-    let transition = engine.authenticate_history_descends_from(anchor)?;
-    if transition.before() != anchor || transition.after() != engine.durable_history_authority()? {
-        return Err(RuntimePromotionError::Anchor(
-            "current durable history is not an authenticated descendant of the bootstrap anchor",
-        ));
-    }
-    let accepted = engine
-        .accepted_frontier_root()
-        .map_err(RuntimePromotionError::Engine)?;
-    if accepted.acceptance_sequence() < state.anchor_acceptance_sequence {
-        return Err(RuntimePromotionError::Anchor(
-            "promoted engine accepted frontier is behind the bootstrap anchor",
-        ));
-    }
-    // Committed enrollment verification digest, session, and head, as the
-    // caller's retained session most recently revalidated them.
-    if committed.verification_digest() != state.enrollment_verification_digest
-        || committed.binding() != binding
-        || committed.sync() != LocalActiveSync::Idle
-        || committed.session_id() != Some(authority.session_id)
-        || committed.enrollment_head() != authority.enrollment_head
-    {
-        return Err(RuntimePromotionError::Enrollment(
-            VerifiedLocalCompositionError::StaleEvidence(
-                "committed LocalActive record is not this promoted session's current record",
-            ),
-        ));
-    }
-    Ok(accepted)
-}
-
-/// A short-lived promoted mutation window derived from both a live authority
-/// and the exact promoted runtime token.
-///
-/// The window splits the promoted runtime's exclusive borrow so a caller can
-/// hold the admission *and* mutate the enrolled engine, SQLite frontier, and
-/// tail at the same time, which is what every execution path needs.
-pub(crate) struct PromotedRuntimeSession<'a> {
-    admission: PromotedRuntimeAdmission<'a>,
-    engine: &'a mut ShardedHotEngine,
-    database: &'a mut SqliteFrontier,
-    tail: &'a mut TailOverlay,
-    bootstrap_projection: &'a BootstrapProjectionAuthority,
-}
-
-impl PromotedRuntimeSession<'_> {
-    // There is deliberately no `database()` or `tail()` here, in any form. The
-    // SQLite applier handle and the bounded tail are the
-    // one-applier-per-workspace write, so the only way to reach them is
-    // [`Self::parts`], which proves the archive-rooted lease immediately first.
-    // `the_promoted_window_vends_no_infallible_applier_handle` keeps it that
-    // way; a test-only escape hatch would be one `#[cfg(test)]` deletion away
-    // from being the production hole again.
-
-    /// The complete admitted runtime, borrowed disjointly.
-    ///
-    /// This is the shape both real consumers take — [`super::operational_coordinator::OperationalCoordinator::execute`]
-    /// and [`super::reconciliation_session::ReconciliationSessionDependencies`] —
-    /// so it is an authority boundary, not an accessor: handing out
-    /// `&mut SqliteFrontier` and `&mut TailOverlay` is handing out the
-    /// one-applier-per-workspace write. It therefore re-derives the lease
-    /// identity first; proven replacement latches terminal revocation, while
-    /// inability to perform the check refuses only this call.
-    ///
-    /// The returned [`LocalRuntimeAdmission`] carries the same probe forward, so
-    /// the coordinator can reprove at each of its own authority-changing
-    /// boundaries without a second capability.
-    pub(crate) fn parts(
-        &mut self,
-    ) -> Result<
-        (
-            LocalRuntimeAdmission<'_>,
-            &mut ShardedHotEngine,
-            &mut SqliteFrontier,
-            &mut TailOverlay,
-        ),
-        WorkspaceAuthorityRefusal,
-    > {
-        self.admission
-            .reprove(WorkspaceAuthorityBoundary::MutableParts)?;
-        Ok((
-            LocalRuntimeAdmission {
-                provenance: AdmissionProvenance::Promoted(&self.admission),
-            },
-            self.engine,
-            self.database,
-            self.tail,
-        ))
-    }
-
-    pub(crate) fn parts_with_bootstrap(
-        &mut self,
-    ) -> Result<
-        (
-            LocalRuntimeAdmission<'_>,
-            &mut ShardedHotEngine,
-            &mut SqliteFrontier,
-            &mut TailOverlay,
-            &BootstrapProjectionAuthority,
-        ),
-        WorkspaceAuthorityRefusal,
-    > {
-        self.admission
-            .reprove(WorkspaceAuthorityBoundary::MutableParts)?;
-        Ok((
-            LocalRuntimeAdmission {
-                provenance: AdmissionProvenance::Promoted(&self.admission),
-            },
-            self.engine,
-            self.database,
-            self.tail,
-            self.bootstrap_projection,
-        ))
-    }
-}
-
-/// The non-forgeable evidence one promoted mutation window carries.
-///
-/// It retains the durable promotion state, the bootstrap anchor, the exact
-/// promoted engine identity, and the live authority permit, so authorization
-/// re-proves the whole binding without borrowing the runtime it split.
-pub(crate) struct PromotedRuntimeAdmission<'a> {
-    permit: LocalMutationPermit<'a>,
-    state: PromotedRuntimeStateV1,
-    anchor: EngineHistoryAuthority,
-    engine_authority: super::hot_engine::EngineAuthority,
-    /// The retained session's binding generation when this window opened.
-    binding_generation: u64,
-    /// The exact retained enrollment session this window was admitted through.
-    enrollment: &'a RetainedEnrollmentSession,
-    /// The while-held identity check for the archive-rooted workspace lease
-    /// that authorized this runtime's database, borrowed disjointly from it so
-    /// every authority-changing boundary can still re-prove ownership while the
-    /// database and tail are exclusively borrowed elsewhere.
-    workspace: WorkspaceLeaseIdentity<'a>,
-    /// This runtime's terminal revocation latch, shared so a boundary that only
-    /// holds the admission can still kill the whole runtime.
-    revocation: &'a RuntimeRevocationLatch,
-    _seal: seal::Seal,
-}
-
-impl PromotedRuntimeAdmission<'_> {
-    /// Re-derive archive-rooted workspace authority immediately before one
-    /// authority-changing boundary. Proven replacement latches terminal
-    /// revocation; a check that cannot be performed remains retryable.
-    ///
-    /// One held-handle stat plus one no-follow resolution of the exact lease
-    /// pathname. It is never on the per-mutation admission path.
-    fn reprove(
-        &self,
-        boundary: WorkspaceAuthorityBoundary,
-    ) -> Result<(), WorkspaceAuthorityRefusal> {
-        self.revocation
-            .reprove_with(boundary, || self.workspace.revalidate())
-    }
-
-    fn authorize_engine(
-        &self,
-        graph: &Graph,
-        engine: &ShardedHotEngine,
-    ) -> Result<(), RuntimePromotionError> {
-        // Terminal first: a window whose runtime was revoked while it was live
-        // authorizes nothing, and in particular does not re-derive authority
-        // from the `Carried` archive facts it was minted with.
-        self.revocation
-            .guard(WorkspaceAuthorityBoundary::WindowAuthorization)?;
-        // A window is authorized only at the exact session-local binding
-        // generation it was minted at. Any full revalidation or journal
-        // mutation moves that generation, so a window that outlived a lifecycle
-        // change cannot authorize work.
-        if self.binding_generation != self.enrollment.binding_generation() {
-            return Err(RuntimePromotionError::Anchor(
-                "promoted admission is not the retained session's current binding generation",
-            ));
-        }
-        // The cheap exact head check again, now fail-closed: a window holds no
-        // authority to reauthenticate, so an enrollment head that moved while
-        // it was live refuses rather than adopting the new state.
-        if !self
-            .enrollment
-            .committed_head_is_unchanged()
-            .map_err(|error| {
-                RuntimePromotionError::Enrollment(VerifiedLocalCompositionError::Enrollment(error))
-            })?
-        {
-            return Err(RuntimePromotionError::Enrollment(
-                VerifiedLocalCompositionError::StaleEvidence(
-                    "committed LocalActive head changed while a promoted window was live",
-                ),
-            ));
-        }
-        revalidate_promoted_binding(
-            &self.state,
-            self.anchor,
-            &self.engine_authority,
-            graph,
-            engine,
-            self.permit.authority,
-            self.enrollment.committed(),
-            ArchiveAuthentication::Carried,
-        )
-        .map(|_| ())
     }
 }
 
@@ -1747,8 +1275,8 @@ mod bounded_admission {
     use crate::oplog::projection_store::ProjectionReceiptStore;
     use crate::oplog::sqlite::{ProjectionClaim, WorkspaceRuntimeLease};
     use crate::oplog::{
-        BlockLocation, DocumentId, LineageDigest, OperationTransaction, ProjectionEndpointId,
-        ReferenceCatalogPolicyV1, SemanticOperation,
+        BlockLocation, DocumentId, LineageDigest, ObjectStore, OperationTransaction,
+        ProjectionEndpointId, ReferenceCatalogPolicyV1, SemanticOperation,
     };
     use std::collections::BTreeMap;
     use std::fs;

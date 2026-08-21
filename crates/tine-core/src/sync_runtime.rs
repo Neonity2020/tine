@@ -100,8 +100,6 @@ use crate::oplog::projection::{
 use crate::oplog::projection::{render_requested_page_document, PreparedEditorProjection};
 use crate::oplog::projection_store::ProjectionReceiptStore;
 #[cfg(test)]
-use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
-#[cfg(test)]
 use crate::oplog::sqlite::{
     reset_full_digest_scan_instrumentation, reset_projection_open_test_observation,
     take_full_digest_scan_instrumentation, take_projection_open_test_observation,
@@ -233,33 +231,6 @@ const MAX_SYNC_APPLICATION_RESULT_ROWS: usize = 20_000;
 /// for a portable block reference.
 pub const SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX: &str = "sparse-v2:";
 const MAX_EDITOR_SETTLE_TURNS: usize = 64;
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-struct ActivationConstructionInstrumentation {
-    preparation: BootstrapStreamingImportInstrumentation,
-    publication: InactiveBootstrapOrchestrationInstrumentation,
-    backup: MigrationBackupInstrumentation,
-    sqlite: BootstrapSqliteRebuildInstrumentation,
-    shadow: ShadowProjectionInstrumentation,
-}
-
-#[cfg(test)]
-thread_local! {
-    static LAST_ACTIVATION_CONSTRUCTION_INSTRUMENTATION:
-        std::cell::RefCell<Option<ActivationConstructionInstrumentation>> = const {
-            std::cell::RefCell::new(None)
-        };
-}
-
-#[cfg(test)]
-fn take_activation_construction_instrumentation() -> ActivationConstructionInstrumentation {
-    LAST_ACTIVATION_CONSTRUCTION_INSTRUMENTATION.with(|slot| {
-        slot.borrow_mut()
-            .take()
-            .expect("activation construction instrumentation was recorded")
-    })
-}
 
 #[cfg(test)]
 thread_local! {
@@ -27321,20 +27292,6 @@ mod tests {
         );
     }
 
-    fn activation_fixture_handoff(fixture: &ActivationFixture) -> EnrollmentDiscoveryHandoff {
-        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
-        let classification = discover_startup(&DiscoveryRequest {
-            profile: StartupStorageProfile::ExperimentalSparse,
-            graph_resource_id: graph.canonical_resource_id().unwrap(),
-            runtime_root: &fixture.request.enrollment_root,
-            archive_root: &fixture.request.archive_root,
-        });
-        let DiscoveryClassification::ExistingLocalActive(advisory) = classification else {
-            panic!("activation fixture no longer classifies LocalActive");
-        };
-        advisory.handoff
-    }
-
     fn activate_and_prepare_shared(fixture: &ActivationFixture) -> SyncSharedEnrollmentDescriptor {
         let active = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         let handle = active.handle.expect("fixture LocalActive");
@@ -39155,66 +39112,6 @@ mod tests {
             "aggregate authority replaces the eager-receipt completion marker"
         );
         drop(handle);
-    }
-
-    #[test]
-    fn uninterrupted_activation_reuses_complete_proof_but_fresh_reopen_revalidates() {
-        use crate::oplog::shadow_projection::{
-            aggregate_reopen_calls_for_test, complete_shadow_verification_calls_for_test,
-            reset_aggregate_reopen_calls_for_test,
-            reset_complete_shadow_verification_calls_for_test,
-        };
-
-        let fixture = ActivationFixture::nested_unicode("retained-complete-proof", 0xa1b0);
-        let workspace = fixture.request.identities.workspace_id;
-        reset_complete_shadow_verification_calls_for_test(workspace);
-        reset_aggregate_reopen_calls_for_test(workspace);
-        reset_activation_actor_open_instrumentation(workspace);
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        assert_eq!(
-            complete_shadow_verification_calls_for_test(workspace),
-            1,
-            "adjacent VerifiedLocal/LocalActive/promotion transitions reran full shadow proof"
-        );
-        assert_eq!(
-            aggregate_reopen_calls_for_test(workspace),
-            1,
-            "uninterrupted activation must reopen the bootstrap aggregate only for promotion, not again for actor startup"
-        );
-        assert_eq!(
-            activation_actor_open_instrumentation(workspace),
-            ActivationActorOpenInstrumentation {
-                cold_actor_opens: 0,
-                retained_handoffs: 1,
-            },
-            "uninterrupted activation must hand the retained graph, receipts, SQLite, and engine directly to its actor"
-        );
-        let handle = activated.handle.unwrap();
-        drive_initial_feed(&handle);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-
-        reset_aggregate_reopen_calls_for_test(workspace);
-        reset_activation_actor_open_instrumentation(workspace);
-        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
-        assert_eq!(
-            aggregate_reopen_calls_for_test(workspace),
-            1,
-            "fresh-process promoted open must perform one complete aggregate publication validation"
-        );
-        assert_eq!(
-            activation_actor_open_instrumentation(workspace),
-            ActivationActorOpenInstrumentation {
-                cold_actor_opens: 1,
-                retained_handoffs: 0,
-            },
-            "a fresh reopen must retain the complete recovery boundary"
-        );
-        drop(reopened.handle);
     }
 
     #[test]

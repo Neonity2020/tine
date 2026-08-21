@@ -88,8 +88,6 @@ pub(crate) fn clean_genesis_materialized_read<'a>(
         .map_err(Into::into)
 }
 use super::object_store::ValidatedBootstrapPublicationV1;
-#[cfg(test)]
-use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
 use super::sync_layout::{
     SQLITE_APPLIER_LOCK_FILE as SQLITE_APPLIER_LEASE_FILE,
     SQLITE_RUNTIME_DIR as OBJECT_STORE_LEASE_NAMESPACE,
@@ -3697,28 +3695,6 @@ pub struct SqliteFrontier {
     _lease: Arc<HeldApplierLocks>,
 }
 
-/// Run-local proof of the pages whose accepted semantics moved after the
-/// immutable bootstrap projection. The set is rebuilt from authenticated
-/// SQLite accepted-history rows and is never persisted or trusted on its own.
-pub(crate) struct AuthenticatedBootstrapProjectionExceptions {
-    pages: BTreeMap<PageId, BatchId>,
-}
-
-impl AuthenticatedBootstrapProjectionExceptions {
-    pub(crate) fn contains(&self, page_id: PageId) -> bool {
-        self.pages.contains_key(&page_id)
-    }
-
-    pub(crate) fn latest_batch(&self, page_id: PageId) -> Option<BatchId> {
-        self.pages.get(&page_id).copied()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.pages.len()
-    }
-}
-
 /// A [`SqliteFrontier`] opened under a caller-retained
 /// [`WorkspaceRuntimeLease`], bound to the applier slot that authorized it.
 ///
@@ -4010,132 +3986,6 @@ impl SqliteFrontier {
             },
             slot,
         ))
-    }
-
-    /// Authenticate the accepted semantic suffix after a promoted bootstrap
-    /// and retain only its affected page IDs. The bootstrap state digest is
-    /// the trusted induction anchor; every later SQLite row must be canonical,
-    /// continue that exact frontier, and be present in the authenticated batch
-    /// map of the frontier it claims. The induction must terminate at both the
-    /// live engine and SQLite frontier.
-    #[cfg(test)]
-    pub(crate) fn authenticated_bootstrap_projection_exceptions(
-        &self,
-        engine: &ShardedHotEngine,
-        bootstrap: &PromotedBootstrapProjectionBindingV1,
-        maximum_pages: usize,
-        maximum_retained_bytes: u64,
-    ) -> Result<AuthenticatedBootstrapProjectionExceptions, ProjectionError> {
-        if !self.runtime_authority.matches(engine.runtime_authority())
-            || self.claim
-                != ProjectionClaim::current(bootstrap.workspace_id(), bootstrap.lineage_digest())
-            || engine.workspace_id() != bootstrap.workspace_id()
-        {
-            return Err(ProjectionError::AuthorityMismatch);
-        }
-        let current = self.frontier_root()?;
-        let engine_current = engine
-            .accepted_frontier_root()
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-        if current != engine_current || self.required_frontier_root != current {
-            return Err(ProjectionError::FrontierRegression);
-        }
-
-        let bootstrap_sequence = u64::from(bootstrap.bootstrap_part_count());
-        if bootstrap_sequence > current.acceptance_sequence() {
-            return Err(ProjectionError::FrontierRegression);
-        }
-        let mut prior = if bootstrap_sequence == 0 {
-            AcceptedFrontierRoot::empty()
-        } else {
-            let sequence = i64::try_from(bootstrap_sequence).map_err(|_| {
-                ProjectionError::Corrupt("bootstrap acceptance sequence overflowed".into())
-            })?;
-            let anchor = load_batch_at_sequence(&self.physical, sequence)?.ok_or_else(|| {
-                ProjectionError::Corrupt(
-                    "SQLite lacks the accepted bootstrap projection anchor".into(),
-                )
-            })?;
-            let post = decode_frontier_root(&anchor.post_frontier_root)?;
-            let effect = SemanticEffect::decode(&anchor.semantic_effect)
-                .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
-            if effect
-                .encode()
-                .map_err(|error| ProjectionError::Corrupt(error.to_string()))?
-                != anchor.semantic_effect
-                || SemanticEffectDigest::of(&anchor.semantic_effect)
-                    != decode_semantic_effect_digest(&anchor.semantic_effect_digest)?
-                || anchor.acceptance_sequence != sequence
-                || post.acceptance_sequence() != bootstrap_sequence
-                || post.state_digest() != bootstrap.accepted_frontier_state_digest()
-                || !self.physical.authenticate_batch(
-                    &lower_physical_frontier_root(&post)?,
-                    anchor.batch_id.as_uuid().into_bytes(),
-                    anchor.causal_record_digest()?,
-                )?
-            {
-                return Err(ProjectionError::Corrupt(
-                    "SQLite bootstrap projection anchor is unauthenticated or misbound".into(),
-                ));
-            }
-            post
-        };
-        if prior.state_digest() != bootstrap.accepted_frontier_state_digest() {
-            return Err(ProjectionError::Corrupt(
-                "bootstrap projection frontier does not bind the SQLite accepted prefix".into(),
-            ));
-        }
-
-        let mut pages = BTreeMap::new();
-        let retained_per_page = std::mem::size_of::<(PageId, BatchId)>()
-            .saturating_add(std::mem::size_of::<usize>().saturating_mul(4));
-        for sequence in bootstrap_sequence.saturating_add(1)..=current.acceptance_sequence() {
-            let sequence_i64 = i64::try_from(sequence).map_err(|_| {
-                ProjectionError::Corrupt("accepted suffix sequence overflowed".into())
-            })?;
-            let row = load_batch_at_sequence(&self.physical, sequence_i64)?.ok_or_else(|| {
-                ProjectionError::Corrupt(format!(
-                    "SQLite accepted bootstrap suffix is missing sequence {sequence}"
-                ))
-            })?;
-            let post = row.validate_canonical_transition(&prior)?;
-            if !self.physical.authenticate_batch(
-                &lower_physical_frontier_root(&post)?,
-                row.batch_id.as_uuid().into_bytes(),
-                row.causal_record_digest()?,
-            )? {
-                return Err(ProjectionError::Corrupt(format!(
-                    "SQLite accepted bootstrap suffix sequence {sequence} is unauthenticated"
-                )));
-            }
-            let effect = SemanticEffect::decode(&row.semantic_effect)
-                .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
-            if effect
-                .encode()
-                .map_err(|error| ProjectionError::Corrupt(error.to_string()))?
-                != row.semantic_effect
-            {
-                return Err(ProjectionError::Corrupt(format!(
-                    "SQLite accepted bootstrap suffix sequence {sequence} is non-canonical"
-                )));
-            }
-            for page_id in super::reference_catalog::affected_reference_sources(&effect) {
-                pages.insert(page_id, row.batch_id);
-            }
-            let retained_bytes = pages.len().saturating_mul(retained_per_page) as u64;
-            if pages.len() > maximum_pages || retained_bytes > maximum_retained_bytes {
-                return Err(ProjectionError::Materialization(
-                    "authenticated bootstrap projection exception set exceeds scan bounds".into(),
-                ));
-            }
-            prior = post;
-        }
-        if prior != current {
-            return Err(ProjectionError::Corrupt(
-                "authenticated bootstrap projection suffix does not reach the live frontier".into(),
-            ));
-        }
-        Ok(AuthenticatedBootstrapProjectionExceptions { pages })
     }
 
     /// Re-authenticate the already-verified inactive-bootstrap projection for

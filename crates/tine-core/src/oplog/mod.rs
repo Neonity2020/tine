@@ -57,7 +57,6 @@ pub mod refusal;
 pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
 pub mod semantic;
-pub(crate) mod shadow_projection;
 pub mod sqlite;
 mod sqlite_identity;
 pub mod sqlite_materialization;

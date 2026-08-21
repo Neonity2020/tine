@@ -8933,13 +8933,6 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::Archive(error.to_string()))
     }
 
-    /// The durable promoted lineage this engine's history open authorized.
-    pub(crate) fn promoted_lineage(&self) -> Option<&super::object_store::PromotedRuntimeStateV1> {
-        self.history_store
-            .as_ref()
-            .and_then(|history| history.promoted_lineage())
-    }
-
     /// The retained archive capability this engine opened, when it has one.
     pub(crate) fn archive_store(&self) -> Option<&ObjectStore> {
         self.archive_store.as_deref()
@@ -14274,12 +14267,6 @@ impl ShardedHotEngine {
         origin: BatchOrigin,
         transaction: &OperationTransaction,
     ) -> Result<AuthorTransactionDraft, EngineError> {
-        #[cfg(not(test))]
-        if self.promoted_lineage().is_some() && origin == BatchOrigin::LocalMutation {
-            return Err(EngineError::InvalidTransaction(
-                "raw local author identity is unavailable on a promoted production runtime".into(),
-            ));
-        }
         self.draft_author_transaction_with_observation(
             author,
             origin,

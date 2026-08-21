@@ -13,9 +13,7 @@ use uuid::Uuid;
 use crate::model::Graph;
 use crate::oplog::batch::ObjectKind;
 use crate::oplog::hot_engine::AcceptedFrontierRoot;
-use crate::oplog::local_active::{
-    LocalRuntimeAdmission, PromotedRuntimeSession, WorkspaceAuthorityBoundary,
-};
+use crate::oplog::local_active::{LocalRuntimeAdmission, WorkspaceAuthorityBoundary};
 use crate::oplog::object_store::{BatchInspection, StoreError};
 use crate::oplog::projection_work_index::{
     ProjectionWork, ProjectionWorkStatus, ProjectionWorkTarget,
@@ -449,63 +447,6 @@ fn checkpoint_advance(
         commitment: ContentDigest::of(&bytes),
         accepted_frontier_digest,
     })
-}
-
-/// Production facade for one promoted runtime window.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_managed_local_journal_drain(
-    session: &mut PromotedRuntimeSession<'_>,
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    checkpoint: &ManagedLocalDrainCheckpoint,
-    continuation: Option<&ManagedLocalDrainContinuation>,
-    publisher: &mut impl ManagedLocalDerivativePublisher,
-) -> ManagedLocalDrainOutcome {
-    resume_managed_local_journal_drain_with_superseding_projection(
-        session,
-        graph,
-        receipts,
-        frame,
-        None,
-        checkpoint,
-        continuation,
-        publisher,
-    )
-}
-
-/// Runtime integration seam for an older journal record whose guarded graph
-/// target has been replaced by a later committed record for the same page.
-/// The later frame is decoded and reauthenticated against the hot prefix and
-/// exact current graph bytes before the older derivative may advance.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_managed_local_journal_drain_with_superseding_projection(
-    session: &mut PromotedRuntimeSession<'_>,
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
-    checkpoint: &ManagedLocalDrainCheckpoint,
-    continuation: Option<&ManagedLocalDrainContinuation>,
-    publisher: &mut impl ManagedLocalDerivativePublisher,
-) -> ManagedLocalDrainOutcome {
-    let (admission, engine, database, tail) = match session.parts() {
-        Ok(parts) => parts,
-        Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
-    };
-    resume_managed_local_journal_drain_with_parts_and_superseding_projection(
-        &admission,
-        graph,
-        receipts,
-        engine,
-        database,
-        tail,
-        frame,
-        superseding_projection,
-        checkpoint,
-        continuation,
-        publisher,
-    )
 }
 
 /// The same boundary with explicit promoted parts, retained for deterministic
