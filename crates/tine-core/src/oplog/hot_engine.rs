@@ -61,7 +61,6 @@ use super::semantic::{
     EffectiveExplicitTitleState, LogseqIdentityOrigin, PagePreambleDelta, PagePreambleState,
     PolicyGeneratedAnchorReason,
 };
-use super::shadow_projection::BootstrapProjectionAuthority;
 use super::uuid_claim_index::{LogseqClaimIndexRoot, LogseqClaimIndexStore};
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BatchCausalDot, BatchId, BatchInspection,
@@ -15596,14 +15595,13 @@ impl ShardedHotEngine {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
-        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<LocalAuthorCapture, EngineError> {
         if draft.origin != BatchOrigin::LocalMutation || draft.external_observation.is_some() {
             return Err(EngineError::ProjectionManifest(
                 "local author capture requires an unobserved LocalMutation draft".into(),
             ));
         }
-        match self.capture_author_transaction(draft, graph, receipts, source, false, bootstrap)? {
+        match self.capture_author_transaction(draft, graph, receipts, source, false)? {
             Ok(captured) => Ok(LocalAuthorCapture::Captured(captured)),
             Err(reconciliation) => Ok(LocalAuthorCapture::ReconciliationNeeded(reconciliation)),
         }
@@ -16177,7 +16175,6 @@ impl ShardedHotEngine {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
-        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<CapturedAuthorTransaction, EngineError> {
         if !matches!(draft.origin, BatchOrigin::ExternalReconciliation { .. })
             || draft.external_observation.is_none()
@@ -16186,7 +16183,7 @@ impl ShardedHotEngine {
                 "external author capture requires a sealed reconciliation draft".into(),
             ));
         }
-        self.capture_author_transaction(draft, graph, receipts, source, true, bootstrap)?
+        self.capture_author_transaction(draft, graph, receipts, source, true)?
             .map_err(|_| {
                 EngineError::ProjectionManifest(
                     "external author capture unexpectedly requested local reconciliation".into(),
@@ -16201,7 +16198,6 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
         external: bool,
-        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<Result<CapturedAuthorTransaction, ReconciliationNeeded>, EngineError> {
         let mut draft = draft;
         self.ensure_not_blocked()?;
@@ -16484,17 +16480,11 @@ impl ShardedHotEngine {
                     authority_matches = true;
                     Some(prior)
                 } else if completed.is_empty() {
-                    let lazy_genesis_prior = if bootstrap.is_none() && !clean_manifest_head_present
-                    {
+                    let lazy_genesis_prior = if !clean_manifest_head_present {
                         self.lazy_genesis_projection_predecessor(path, requirement.page_id, before)?
                     } else {
                         None
                     };
-                    let baseline = bootstrap
-                        .map(|bootstrap| bootstrap.baseline_at(path))
-                        .transpose()
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
-                        .flatten();
                     if let Some(prior) = lazy_genesis_prior {
                         charge_preauthoring_capture_bytes(
                             &mut retained_bytes,
@@ -16503,61 +16493,7 @@ impl ShardedHotEngine {
                         )?;
                         authority_matches = true;
                         Some(prior)
-                    } else if let Some(baseline) = baseline {
-                        let before = draft.pages[&requirement.page_id]
-                            .before
-                            .as_ref()
-                            .expect("prior requirement was selected from a semantic pre-state");
-                        let owner = self
-                            .current_path_catalog_row_at_path(path)?
-                            .ok_or_else(|| {
-                                EngineError::ProjectionManifest(format!(
-                                    "aggregate bootstrap predecessor for {path} has no current owner"
-                                ))
-                            })?;
-                        if owner.page_id() != requirement.page_id
-                            || owner.path() != path
-                            || owner.kind() != baseline.kind()
-                            || baseline.intent().workspace_id() != self.workspace_id
-                            || baseline.intent().page_id() != requirement.page_id
-                            || baseline.intent().path() != path
-                            || baseline.intent().target()
-                                != super::BlobDescription::of(baseline.source_bytes())
-                        {
-                            return Err(EngineError::ProjectionManifest(format!(
-                                "aggregate bootstrap predecessor for {path} is stale or mismatched"
-                            )));
-                        } else {
-                            let replay = baseline
-                                .rebind_semantic_successor(self.workspace_id, before)
-                                .map_err(|error| {
-                                    EngineError::ProjectionManifest(format!(
-                                        "aggregate bootstrap predecessor semantic rebind for {path} failed: {error}"
-                                    ))
-                                })?;
-                            charge_preauthoring_capture_bytes(
-                                &mut retained_bytes,
-                                replay.target().len(),
-                                "aggregate bootstrap projection bytes",
-                            )?;
-                            authority_matches = true;
-                            Some(CapabilityCapturedPriorProjection {
-                                bytes: replay.target().to_vec(),
-                                intent: replay.intent().clone(),
-                                completion: None,
-                                bootstrap_owner_binding: Some(baseline.owner_binding()),
-                                managed_local_authority: None,
-                                clean_manifest_authority: None,
-                                receipt_backed_live_authority: false,
-                                correlated_authority: None,
-                            })
-                        }
                     } else {
-                        if bootstrap.is_some() {
-                            return Err(EngineError::ProjectionManifest(format!(
-                                "aggregate bootstrap predecessor for {path} is missing"
-                            )));
-                        }
                         authority_matches = false;
                         None
                     }
@@ -16703,7 +16639,7 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
     ) -> Result<PreparedBatch, EngineError> {
-        match self.capture_local_author_transaction(draft, graph, receipts, source, None)? {
+        match self.capture_local_author_transaction(draft, graph, receipts, source)? {
             LocalAuthorCapture::Captured(captured) => {
                 self.finalize_captured_author_transaction(captured, receipts)
             }

@@ -64,7 +64,6 @@ use super::object_store::{
 };
 use super::object_store::{BootstrapAuthoringCapability, ControlDirectoryIdentity, StoreError};
 use super::receipt::ImportIdDerivation;
-use super::shadow_projection::BootstrapProjectionAuthority;
 use super::{
     plan_projection, AcceptedBatchEvent, AnnotatedIdentity, BatchId, BatchOrigin, BlobDescription,
     BlockId, BlockLocation, ContentDigest, CrdtPeerId, CurrentPageAtPath, DeviceId, DocumentId,
@@ -6716,7 +6715,16 @@ pub fn plan_affected_import(
     engine: &ShardedHotEngine,
     requested_paths: &[&str],
 ) -> ImportPlan {
-    plan_affected_import_with_bootstrap(graph, receipts, engine, None, requested_paths)
+    let mut instrumentation = ImportInstrumentation {
+        requested_paths: requested_paths.len(),
+        ..ImportInstrumentation::default()
+    };
+    let paths = match parse_requested_paths(requested_paths) {
+        Ok(paths) => paths,
+        Err(error) => return blocked_inventory_error(error, instrumentation),
+    };
+    instrumentation.path_bytes = paths.iter().map(|path| path.as_str().len() as u64).sum();
+    plan_affected_import_inner(graph, receipts, engine, &paths, instrumentation)
 }
 
 /// Plan one exact external reconciliation against the clean
@@ -6847,22 +6855,13 @@ fn post_clean_import_predecessor_authority(
     clean_import_predecessor_authority(engine, database, paths)
 }
 
-pub(crate) fn plan_affected_import_with_bootstrap(
+fn plan_affected_import_inner(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
-    bootstrap: Option<&BootstrapProjectionAuthority>,
-    requested_paths: &[&str],
+    paths: &[ManagedPath],
+    mut instrumentation: ImportInstrumentation,
 ) -> ImportPlan {
-    let mut instrumentation = ImportInstrumentation {
-        requested_paths: requested_paths.len(),
-        ..ImportInstrumentation::default()
-    };
-    let paths = match parse_requested_paths(requested_paths) {
-        Ok(paths) => paths,
-        Err(error) => return blocked_inventory_error(error, instrumentation),
-    };
-    instrumentation.path_bytes = paths.iter().map(|path| path.as_str().len() as u64).sum();
     let accepted_frontier = match engine.accepted_frontier_root() {
         Ok(root) => root,
         Err(error) => {
@@ -6878,12 +6877,12 @@ pub(crate) fn plan_affected_import_with_bootstrap(
         }
     };
     let (catalog, catalog_authority) =
-        match capture_affected_catalog(receipts, engine, bootstrap, &paths, &mut instrumentation) {
+        match capture_affected_catalog(receipts, engine, paths, &mut instrumentation) {
             Ok(snapshot) => snapshot,
             Err(block) => return blocked_authority_error(None, block, instrumentation),
         };
     let (inventory, inventory_fingerprints, first_raw_bytes) =
-        match capture_inventory(graph, &paths, true, 0, &mut instrumentation) {
+        match capture_inventory(graph, paths, true, 0, &mut instrumentation) {
             Ok((Some(inventory), fingerprints, raw_bytes)) => (inventory, fingerprints, raw_bytes),
             Ok((None, _, _)) => unreachable!("retaining capture returns inventory"),
             Err(error) => return blocked_inventory_error(error, instrumentation),
@@ -6892,7 +6891,7 @@ pub(crate) fn plan_affected_import_with_bootstrap(
         graph,
         receipts,
         engine,
-        &paths,
+        paths,
         &inventory,
         catalog,
         &mut instrumentation,
@@ -6910,7 +6909,7 @@ pub(crate) fn plan_affected_import_with_bootstrap(
     };
     snapshot_revalidation_hook();
     let (_, second_fingerprints, _) =
-        match capture_inventory(graph, &paths, false, first_raw_bytes, &mut instrumentation) {
+        match capture_inventory(graph, paths, false, first_raw_bytes, &mut instrumentation) {
             Ok(capture) => capture,
             Err(error) => {
                 return blocked_authority_error(
@@ -6921,7 +6920,7 @@ pub(crate) fn plan_affected_import_with_bootstrap(
             }
         };
     let (_, post_catalog_authority) =
-        match capture_affected_catalog(receipts, engine, bootstrap, &paths, &mut instrumentation) {
+        match capture_affected_catalog(receipts, engine, paths, &mut instrumentation) {
             Ok(snapshot) => snapshot,
             Err(mut block) => {
                 block.reason = ImportBlockReason::StaleScope;
@@ -7439,7 +7438,6 @@ fn capture_clean_import_scope(
 fn capture_affected_catalog(
     receipts: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
-    bootstrap: Option<&BootstrapProjectionAuthority>,
     requested_paths: &[ManagedPath],
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<(AffectedReceiptCatalog, CatalogAuthority), ImportBlock> {
@@ -7545,124 +7543,6 @@ fn capture_affected_catalog(
             });
             captured_entries = captured_entries.saturating_add(1);
         }
-        if entries.is_empty() {
-            if let Some(bootstrap) = bootstrap {
-                let baseline = bootstrap.baseline_at(path).map_err(|error| {
-                    authority_block(
-                        ImportBlockReason::CorruptBase,
-                        Some(path),
-                        format!("aggregate bootstrap baseline lookup failed: {error}"),
-                    )
-                })?;
-                if let Some(baseline) = baseline {
-                    if captured_entries == MAX_IMPORT_CATALOG_ENTRIES {
-                        return Err(authority_block(
-                            ImportBlockReason::ResourceLimit,
-                            Some(path),
-                            "affected aggregate baseline entry budget exceeded",
-                        ));
-                    }
-                    let owner = engine
-                        .current_path_catalog_row_at_path(path)
-                        .map_err(|error| {
-                            authority_block(
-                                ImportBlockReason::AuthorityUnavailable,
-                                Some(path),
-                                format!("aggregate bootstrap current-path lookup failed: {error}"),
-                            )
-                        })?
-                        .ok_or_else(|| {
-                            authority_block(
-                                ImportBlockReason::ConflictingLocalTail,
-                                Some(path),
-                                "aggregate bootstrap path has no current accepted owner",
-                            )
-                        })?;
-                    let state = engine
-                        .materialize_page_for_projection(owner.page_id())
-                        .map_err(|error| {
-                            authority_block(
-                                ImportBlockReason::AuthorityUnavailable,
-                                Some(path),
-                                format!("aggregate bootstrap page materialization failed: {error}"),
-                            )
-                        })?;
-                    if owner.path() != path
-                        || owner.kind() != baseline.kind()
-                        || state.page.page_id != owner.page_id()
-                        || state.page.path != *path
-                        || state.page.kind != baseline.kind()
-                    {
-                        return Err(authority_block(
-                            ImportBlockReason::ConflictingLocalTail,
-                            Some(path),
-                            "aggregate bootstrap owner identity changed",
-                        ));
-                    }
-                    let rebound = baseline
-                        .rebind_semantic_successor(engine.workspace_id(), &state)
-                        .map_err(|error| {
-                            authority_block(
-                                ImportBlockReason::ConflictingLocalTail,
-                                Some(path),
-                                format!(
-                                    "aggregate bootstrap source does not match current accepted semantics: {error:?}"
-                                ),
-                            )
-                        })?;
-                    let intent = rebound.intent().clone();
-                    let base = ExactBytes::from_description(
-                        baseline.source_bytes().to_vec(),
-                        BlobDescription::of(baseline.source_bytes()),
-                    );
-                    let completion =
-                        ProjectionCompletion::for_intent(&intent, baseline.source_bytes())
-                            .map_err(|error| {
-                                authority_block(
-                                    ImportBlockReason::CorruptBase,
-                                    Some(path),
-                                    format!("aggregate bootstrap completion is invalid: {error}"),
-                                )
-                            })?;
-                    let intent_bytes = intent.encode().map_err(|error| {
-                        authority_block(
-                            ImportBlockReason::CorruptBase,
-                            Some(path),
-                            error.to_string(),
-                        )
-                    })?;
-                    let completion_bytes = completion.encode().map_err(|error| {
-                        authority_block(
-                            ImportBlockReason::CorruptBase,
-                            Some(path),
-                            error.to_string(),
-                        )
-                    })?;
-                    instrumentation.catalog_entries =
-                        instrumentation.catalog_entries.saturating_add(1);
-                    instrumentation.catalog_bytes_hashed = instrumentation
-                        .catalog_bytes_hashed
-                        .saturating_add(intent_bytes.len() as u64)
-                        .saturating_add(completion_bytes.len() as u64)
-                        .saturating_add(32);
-                    hasher.update(b"aggregate-bootstrap-baseline\0");
-                    hasher.update(baseline.owner_binding().as_bytes());
-                    hasher.update((intent_bytes.len() as u64).to_be_bytes());
-                    hasher.update(intent_bytes);
-                    hasher.update((completion_bytes.len() as u64).to_be_bytes());
-                    hasher.update(completion_bytes);
-                    entries.push(AffectedReceiptEntry {
-                        completed: None,
-                        bootstrap_base: Some(base),
-                        intent,
-                        completion,
-                        source: ReceiptBaseSource::Bootstrap,
-                    });
-                    captured_entries = captured_entries.saturating_add(1);
-                }
-            }
-        }
-
         if let Some(correlated) =
             engine
                 .correlated_projection_import_base(path)
@@ -16588,9 +16468,7 @@ mod tests {
         let source = include_str!("import.rs");
         let entry = source
             .split_once("pub(crate) fn plan_clean_affected_import(")
-            .and_then(|(_, tail)| {
-                tail.split_once("pub(crate) fn plan_affected_import_with_bootstrap(")
-            })
+            .and_then(|(_, tail)| tail.split_once("fn plan_affected_import_inner("))
             .map(|(body, _)| body)
             .expect("clean external planner must remain identifiable");
         assert!(entry.contains("database: &SqliteFrontier"));
@@ -17965,7 +17843,6 @@ mod tests {
                 &fixture.graph,
                 &fixture.receipts,
                 endpoint,
-                None,
             ),
             Err(crate::oplog::EngineError::ProjectionManifest(message))
                 if message.contains("observation") && message.contains("stale")
