@@ -23338,6 +23338,154 @@ mod tests {
         );
     }
 
+    /// A publication cut between object write and manifest commit is the
+    /// exact on-disk state a crash there leaves behind. The orphaned objects
+    /// must not make the graph unopenable, must have no semantic effect, and
+    /// a fresh session must complete the same edit.
+    #[test]
+    fn clean_object_only_publication_cut_reopens_without_semantic_effect() {
+        let fixture = ActivationFixture::nested_unicode("clean-object-cut-reopen", 0xa176);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let CleanRuntimeResources {
+            graph,
+            receipts,
+            runtime,
+        } = resources;
+        let accepted_before = runtime.engine().accepted_batch_count().unwrap();
+        let mut actor = CleanRuntimeActorCore::new(runtime, false);
+        let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
+        let owner = actor
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&root_path, 2)
+            .unwrap()
+            .pop()
+            .expect("clean SQLite names Root.md");
+        let current = actor
+            .load_current_editor_page(owner.page_id)
+            .unwrap()
+            .expect("clean actor loads Root.md from SQLite");
+        let first = current.blocks.first().expect("Root.md has one block");
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: first.block_id,
+                home_document_id: first.home_document_id,
+            },
+            content: "edit cut after objects".into(),
+        }])
+        .unwrap();
+        let before_bytes = fs::read(fixture.graph_root.join("Root.md")).unwrap();
+
+        crate::oplog::object_store::fail_next_publish_after_objects();
+        let cut = actor.execute_local(&graph, &receipts, &transaction);
+        assert!(
+            !matches!(cut, Ok(CleanActorMutationOutcome::Durable(_))),
+            "the armed object-only cut must not report a durable save: {cut:?}"
+        );
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Root.md")).unwrap(),
+            before_bytes,
+            "an unpublished batch must not project Markdown"
+        );
+        drop(actor);
+
+        let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .expect("an object-only publication cut must not make the graph unopenable");
+        let CleanRuntimeResources {
+            graph,
+            receipts,
+            runtime,
+        } = reopened;
+        assert_eq!(
+            runtime.engine().accepted_batch_count().unwrap(),
+            accepted_before,
+            "orphaned objects must not enter accepted history"
+        );
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Root.md")).unwrap(),
+            before_bytes,
+            "reopen must not project the cut batch"
+        );
+
+        let mut actor = CleanRuntimeActorCore::new(runtime, false);
+        let current = actor
+            .load_current_editor_page(owner.page_id)
+            .unwrap()
+            .expect("reopened clean actor loads Root.md");
+        let first = current.blocks.first().expect("Root.md still has one block");
+        let retry = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: first.block_id,
+                home_document_id: first.home_document_id,
+            },
+            content: "edit cut after objects".into(),
+        }])
+        .unwrap();
+        assert!(
+            matches!(
+                actor.execute_local(&graph, &receipts, &retry),
+                Ok(CleanActorMutationOutcome::Durable(_))
+            ),
+            "a fresh session must complete the same edit after the cut"
+        );
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("edit cut after objects"));
+    }
+
+    /// An external formatting-only rewrite (same semantics, different bytes)
+    /// must be adopted as the endpoint's exact baseline: the file keeps the
+    /// external spelling and the next local save still works. Refusing to
+    /// adopt wedges Direct Files -- every later save demands a reconciliation
+    /// that will forever report Noop without fixing the drift.
+    ///
+    /// The clean runtime has no adoption mechanism yet: predecessors derive
+    /// purely from shared accepted history, while formatting baselines are
+    /// endpoint-local by nature. The fix is a design decision (GH #362).
+    #[test]
+    #[ignore = "GH #362: clean formatting-only adoption is undesigned; this pins the wedge"]
+    fn clean_external_formatting_only_change_does_not_wedge_the_next_local_save() {
+        let fixture = ActivationFixture::nested_unicode("clean-formatting-only-adopt", 0xa177);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("clean activation opens actor");
+        drive_initial_feed(&handle);
+
+        let original = fs::read_to_string(fixture.graph_root.join("Root.md")).unwrap();
+        let formatted = original.replace('\n', "\r\n");
+        assert_ne!(
+            formatted, original,
+            "the fixture page must have line endings"
+        );
+        fs::write(fixture.graph_root.join("Root.md"), formatted.as_bytes()).unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        drain_until_settled(&handle);
+        assert_eq!(
+            fs::read_to_string(fixture.graph_root.join("Root.md")).unwrap(),
+            formatted,
+            "a formatting-only external change keeps the external spelling"
+        );
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(&handle, page, revision, "saved after formatting");
+        drain_managed_local(&handle);
+        assert!(
+            fs::read_to_string(fixture.graph_root.join("Root.md"))
+                .unwrap()
+                .contains("saved after formatting"),
+            "the save after a formatting-only external change must reach the file"
+        );
+    }
+
     #[test]
     fn clean_actor_escalates_a_deterministic_retained_retry_to_a_named_stuck_state() {
         fn find_file(root: &Path, name: &str) -> PathBuf {
