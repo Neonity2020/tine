@@ -15,14 +15,12 @@ use crate::oplog::batch::ObjectKind;
 use crate::oplog::hot_engine::AcceptedFrontierRoot;
 use crate::oplog::local_active::{LocalRuntimeAdmission, WorkspaceAuthorityBoundary};
 use crate::oplog::object_store::{BatchInspection, StoreError};
-use crate::oplog::projection_work_index::{
-    ProjectionWork, ProjectionWorkStatus, ProjectionWorkTarget,
-};
 use crate::oplog::{
     decode_managed_local_record, AcceptedBatchEvent, BatchDisposition, BatchId, ContentDigest,
     DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManifestObjectRef,
     ManifestProjectionTarget, ObjectStore, ProjectionEndpointBinding, ProjectionReceiptStore,
-    RebuildSource, ShardedHotEngine, SqliteFrontier, TailOverlay, WorkspaceId,
+    ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine, SqliteFrontier,
+    TailOverlay, WorkspaceId,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -819,59 +817,13 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         Ok(work) => work,
         Err(error) => return conflict(ManagedLocalDrainStage::ProjectionAdoption, error),
     };
-    let work_index = match engine.projection_work_index() {
-        Ok(index) => index,
-        Err(error) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                error.to_string(),
-            )
-        }
-    };
-    // Read the accepted point row rather than enumerating ready work. The row
-    // was prepared directly from this archived manifested intent and the
-    // executor below reauthenticates that binding against both authorities.
-    let work = match work_index.get(expected_work.work_id()) {
-        Ok(Some(work)) => work,
-        Ok(None) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                "journal projection work point row is absent",
-            )
-        }
-        Err(error) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                error.to_string(),
-            )
-        }
-    };
-    work_done.projection_work_point_reads = 1;
-    match work_index.status(work.work_id()) {
-        Ok(Some(ProjectionWorkStatus::Ready | ProjectionWorkStatus::Completed)) => {}
-        Ok(Some(ProjectionWorkStatus::Superseded { .. })) if projection_superseded => {}
-        Ok(Some(ProjectionWorkStatus::Blocked | ProjectionWorkStatus::Superseded { .. })) => {
-            return conflict(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                "journal projection work has divergent terminal state",
-            )
-        }
-        Ok(_) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                "journal projection work is absent or not accepted",
-            )
-        }
-        Err(error) => {
-            return recovery(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                error.to_string(),
-            )
-        }
-    }
     if !projection_superseded {
-        if let Err(error) = crate::oplog::projection::execute_manifested_projection_work(
-            graph, receipts, engine, &work,
+        if let Err(error) = crate::oplog::projection::execute_clean_manifested_projection_work(
+            graph,
+            receipts,
+            database,
+            engine,
+            &expected_work,
         ) {
             let current = graph.read_projection_input(intent.path());
             return if matches!(current, Ok(Some(bytes)) if bytes != exact_target) {

@@ -73,9 +73,8 @@ use super::{
     OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
     PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
     ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionIntentId,
-    ProjectionPrecondition, ProjectionReceiptStore, ProjectionWork, ProjectionWorkIndex,
-    ProjectionWorkTarget, SemanticEffect, SemanticEffectDigest, SemanticError, SessionId,
-    ValidatedBatch, WorkspaceId,
+    ProjectionPrecondition, ProjectionReceiptStore, ProjectionWork, ProjectionWorkTarget,
+    SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -108,65 +107,6 @@ const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 7;
 pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CorrelatedExternalReconciliationCapability {
-    manifest_fingerprint: ContentDigest,
-    affected_page_ids: BTreeSet<PageId>,
-}
-
-/// Opaque import-base nomination minted only through an authenticated
-/// correlated-batch capability. A Ready variant requires a durable Blocked
-/// sibling in the same exact accepted witness.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CorrelatedProjectionImportBase {
-    Blocked {
-        work: ProjectionWork,
-        observed: BlobDescription,
-        intent_id: ProjectionIntentId,
-        manifest_fingerprint: ContentDigest,
-    },
-    Ready {
-        work: ProjectionWork,
-        manifest_fingerprint: ContentDigest,
-    },
-}
-
-impl CorrelatedProjectionImportBase {
-    pub(crate) fn work(&self) -> &ProjectionWork {
-        match self {
-            Self::Blocked { work, .. } | Self::Ready { work, .. } => work,
-        }
-    }
-
-    pub(crate) const fn blocked_evidence(&self) -> Option<(BlobDescription, ProjectionIntentId)> {
-        match self {
-            Self::Blocked {
-                observed,
-                intent_id,
-                ..
-            } => Some((*observed, *intent_id)),
-            Self::Ready { .. } => None,
-        }
-    }
-
-    pub(crate) const fn manifest_fingerprint(&self) -> ContentDigest {
-        match self {
-            Self::Blocked {
-                manifest_fingerprint,
-                ..
-            }
-            | Self::Ready {
-                manifest_fingerprint,
-                ..
-            } => *manifest_fingerprint,
-        }
-    }
-
-    pub(crate) const fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready { .. })
-    }
-}
 
 /// Test-only, per-thread attribution for the ordinary trusted-local authoring
 /// path.  This is deliberately an observation receipt, not engine state: it
@@ -382,11 +322,10 @@ pub(crate) fn take_current_path_cursor_probe() -> CurrentPathCursorProbe {
 /// One exact current page path supplied by the authenticated cursor.
 ///
 /// This semantic row intentionally carries no projected blob or projection
-/// generation. Reconciliation integration must join it to one pinned
-/// `ProjectionWorkIndex` head and require the exact-path completed receipt to
-/// match this `page_id` and `path`; only that receipt's `Present` target is the
-/// projected `BlobDescription`. The joined epoch must retain the projection
-/// head generation/completed-path root beside this cursor's accepted frontier.
+/// generation. The clean runtime joins it to the frontier-matched SQLite
+/// projection and reconstructs any projection predecessor from the immutable
+/// baseline or accepted manifest tail; no persistent projection-work authority
+/// participates in current-path admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct CurrentPathCatalogRow {
@@ -682,68 +621,6 @@ pub(crate) struct AuthenticatedPageLocalEffectiveTransition {
     selected_dot: BatchCausalDot,
     selected_explicit_title: EffectiveExplicitTitleState,
     selected_intent: ManifestedProjectionIntent,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AuthenticatedEffectiveProjectionClosure {
-    transition: AuthenticatedPageLocalEffectiveTransition,
-    lifecycle_completion: ProjectionCompletedReceipt,
-}
-
-#[derive(Clone)]
-pub(crate) struct AuthenticatedEffectiveTitleProjectionCandidate {
-    seal: EffectiveTitleTransitionSeal,
-    state: ProjectionPageState,
-    source: ManifestedProjectionIntent,
-    lifecycle_completion: ProjectionCompletedReceipt,
-    accepted_frontier: AuthenticatedProjectionAcceptedFrontier,
-}
-
-impl AuthenticatedEffectiveTitleProjectionCandidate {
-    pub(crate) const fn lifecycle_completion(&self) -> &ProjectionCompletedReceipt {
-        &self.lifecycle_completion
-    }
-
-    pub(crate) const fn source(&self) -> &ManifestedProjectionIntent {
-        &self.source
-    }
-}
-
-/// Run-local proof that one materialized projection state was selected while
-/// this exact engine capability agreed with the live durable-history head and
-/// its current accepted-frontier point authority.
-///
-/// This is intentionally transient and nonconstructible outside this module.
-/// The accepted root is the bounded commitment to the whole frontier; callers
-/// never receive authority by enumerating its documents or direct heads.
-#[derive(Clone)]
-struct AuthenticatedProjectionAcceptedFrontier {
-    runtime_authority: EngineAuthority,
-    accepted_frontier_root: AcceptedFrontierRoot,
-    durable_history: super::object_store::EngineHistoryAuthority,
-}
-
-impl AuthenticatedProjectionAcceptedFrontier {
-    fn matches(&self, other: &Self) -> bool {
-        self.runtime_authority.matches(&other.runtime_authority)
-            && self.accepted_frontier_root == other.accepted_frontier_root
-            && self.durable_history == other.durable_history
-    }
-}
-
-fn same_projection_state_authority(
-    left: &ProjectionPageState,
-    right: &ProjectionPageState,
-) -> bool {
-    left.frontier == right.frontier
-        && left.claim_evidence == right.claim_evidence
-        && left.page.page_id == right.page.page_id
-        && left.page.home_document_id == right.page.home_document_id
-        && left.page.name == right.page.name
-        && left.page.path == right.page.path
-        && left.page.kind == right.page.kind
-        && left.page.preamble == right.page.preamble
-        && left.page.blocks == right.page.blocks
 }
 
 impl AuthenticatedPageLocalEffectiveTransition {
@@ -3350,12 +3227,6 @@ struct CapabilityCapturedPriorProjection {
     /// clean manifests. It is a run-local proof handle, not durable queue
     /// state; finalization re-derives and compares the current head.
     pub(crate) clean_manifest_authority: Option<ProjectionWork>,
-    /// This predecessor was reproved from the authenticated completed-path
-    /// authority and the live file, rather than from an old receipt base.
-    /// Finalization repeats the same live-layout proof, not a canonical
-    /// historical re-render that could reject harmless preserved trivia.
-    pub(crate) receipt_backed_live_authority: bool,
-    pub(crate) correlated_authority: Option<CorrelatedProjectionImportBase>,
 }
 
 /// Exact current graph-projection predecessor for the clean
@@ -3399,16 +3270,13 @@ impl CapabilityCapturedPriorProjection {
             self.bootstrap_owner_binding,
             self.managed_local_authority,
             &self.clean_manifest_authority,
-            self.receipt_backed_live_authority,
-            &self.correlated_authority,
         ) {
-            (Some(completion), None, None, None, _, None) => completion
+            (Some(completion), None, None, None) => completion
                 .validate_against(&self.intent)
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string())),
-            (None, Some(_), None, None, false, None)
-            | (None, None, Some(_), None, false, None)
-            | (None, None, None, Some(_), false, None)
-            | (None, None, None, None, false, Some(_)) => Ok(()),
+            (None, Some(_), None, None)
+            | (None, None, Some(_), None)
+            | (None, None, None, Some(_)) => Ok(()),
             _ => Err(EngineError::ProjectionManifest(
                 "captured prior projection has ambiguous authority".into(),
             )),
@@ -3479,8 +3347,6 @@ pub struct CapabilityCapturedProjectionInput {
     receipt_store_id: super::ProjectionReceiptStoreId,
     state: CapabilityCapturedProjectionState,
     material: CapabilityCapturedProjectionMaterial,
-    draft_completed_path: Option<Vec<super::ProjectionCompletedReceipt>>,
-    draft_completed_receipts: Option<Vec<(ProjectionIntent, ProjectionCompletion)>>,
 }
 
 impl CapabilityCapturedProjectionInput {
@@ -3508,8 +3374,6 @@ impl CapabilityCapturedProjectionInput {
                     bootstrap_owner_binding: None,
                     managed_local_authority: None,
                     clean_manifest_authority: None,
-                    receipt_backed_live_authority: false,
-                    correlated_authority: None,
                 }),
             },
         };
@@ -3519,8 +3383,6 @@ impl CapabilityCapturedProjectionInput {
             receipt_store_id,
             state,
             material,
-            draft_completed_path: None,
-            draft_completed_receipts: None,
         }
     }
 
@@ -3559,8 +3421,6 @@ impl CapabilityCapturedProjectionInput {
             receipt_store_id,
             state,
             material,
-            draft_completed_path: None,
-            draft_completed_receipts: None,
         }
     }
 
@@ -3692,8 +3552,6 @@ impl CaptureSealedPendingLocalPredecessor {
         if prior.completion.is_some()
             || prior.bootstrap_owner_binding.is_some()
             || prior.clean_manifest_authority.is_some()
-            || prior.receipt_backed_live_authority
-            || prior.correlated_authority.is_some()
             || before.page.page_id != requirement.page_id
             || before.page.path != requirement.path
             || current != Some(prior.bytes.as_slice())
@@ -5238,20 +5096,12 @@ impl BootstrapBulkMaterializer<'_> {
         if let Some(transition) = &effective_transition {
             transition.apply_to_materialized(&mut bulk.page)?;
         }
+        frontier_documents.insert(
+            self.engine.catalog_document_id,
+            self.engine
+                .current_hot_document_dependencies_by_id(self.engine.catalog_document_id)?,
+        );
         let frontier = FrontierV2::new(frontier_documents.into_values().collect())?;
-        let (frontier, effective_closure) = match self.engine.page_stable_projection_frontier(
-            &mut bulk.page,
-            &frontier,
-            &claim_evidence,
-            effective_selection.as_ref(),
-            effective_transition.as_ref(),
-        )? {
-            Some((stable, closure)) => (stable, closure),
-            None => (frontier, None),
-        };
-        if effective_closure.is_some() {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
         Ok(ProjectionPageState {
             page: bulk.page,
             frontier,
@@ -7671,18 +7521,11 @@ pub struct ShardedHotEngine {
     archive_store: Option<Arc<ObjectStore>>,
     projection_endpoint: Option<ProjectionEndpointBinding>,
     projection_receipt_store_id: Option<super::ProjectionReceiptStoreId>,
-    projection_work_index: Option<Arc<ProjectionWorkIndex>>,
     /// Latest source-endpoint projection row per exact path for the clean
     /// runtime. This is reconstructed from accepted immutable manifests when
     /// an endpoint attaches and advanced only after a new manifest commits;
     /// it is never persisted as a second projection-work authority.
     clean_projection_heads: BTreeMap<ManagedPath, ProjectionWork>,
-    /// Runtime-only exact Blocked batches transferred by correlated local
-    /// recovery into the existing external feed. This is repopulated from
-    /// authenticated accepted work on every cold reopen; it is not a durable
-    /// continuation or a generic blocked-work discovery surface.
-    external_reconciliation_blocked_batches:
-        BTreeMap<BatchId, CorrelatedExternalReconciliationCapability>,
     scratch: Option<Arc<ScratchStore>>,
     scratch_roots: ScratchRoots,
     ephemeral_causal_chain: RefCell<BTreeMap<CausalPeerId, (u64, BatchId)>>,
@@ -7913,9 +7756,7 @@ impl ShardedHotEngine {
             archive_store: None,
             projection_endpoint: None,
             projection_receipt_store_id: None,
-            projection_work_index: None,
             clean_projection_heads: BTreeMap::new(),
-            external_reconciliation_blocked_batches: BTreeMap::new(),
             scratch: None,
             scratch_roots: ScratchRoots::default(),
             ephemeral_causal_chain: RefCell::new(BTreeMap::new()),
@@ -8607,7 +8448,6 @@ impl ShardedHotEngine {
         if receipts.workspace_id() != self.workspace_id
             || self.projection_endpoint.is_some()
             || self.projection_receipt_store_id.is_some()
-            || self.projection_work_index.is_some()
             || graph
                 .canonical_resource_id()
                 .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
@@ -8653,7 +8493,6 @@ impl ShardedHotEngine {
         if self.lazy_genesis.is_none()
             || self.scratch.is_some()
             || self.history_store.is_some()
-            || self.projection_work_index.is_some()
             || self.projection_receipt_store_id.is_none()
         {
             return Err(EngineError::ProjectionWork(
@@ -9092,179 +8931,6 @@ impl ShardedHotEngine {
         Ok(())
     }
 
-    pub(crate) fn enrolled_projection_runtime(
-        &self,
-    ) -> Result<(Arc<ObjectStore>, Arc<ProjectionWorkIndex>), EngineError> {
-        self.ensure_not_blocked()?;
-        if self.authenticated_history_replay {
-            return Err(EngineError::ProjectionWork(
-                "projection runtime is unavailable during authenticated history replay".into(),
-            ));
-        }
-        let archive = self.archive_store.as_ref().ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection archive".into())
-        })?;
-        let index = self.projection_work_index.as_ref().ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection work index".into())
-        })?;
-        let endpoint = self.projection_endpoint.ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection endpoint".into())
-        })?;
-        if archive.workspace_id() != self.workspace_id
-            || index.workspace_id() != self.workspace_id
-            || index.endpoint_id() != endpoint.endpoint_id
-            || index.graph_resource_id() != endpoint.graph_resource_id
-            || index.receipt_store_id()
-                != self.projection_receipt_store_id.ok_or_else(|| {
-                    EngineError::ProjectionWork(
-                        "engine has no enrolled projection receipt store".into(),
-                    )
-                })?
-        {
-            return Err(EngineError::ProjectionWork(
-                "engine-owned projection runtime binding mismatch".into(),
-            ));
-        }
-        Ok((Arc::clone(archive), Arc::clone(index)))
-    }
-
-    pub fn projection_work_index(&self) -> Result<&ProjectionWorkIndex, EngineError> {
-        self.ensure_not_blocked()?;
-        self.projection_work_index.as_deref().ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection work index".into())
-        })
-    }
-
-    pub(crate) fn register_correlated_blocked_external_reconciliation(
-        &mut self,
-        batch_id: BatchId,
-        manifest_fingerprint: ContentDigest,
-        affected_page_ids: [PageId; 2],
-    ) -> Result<(), EngineError> {
-        let archive = self.archive_store.as_ref().ok_or_else(|| {
-            EngineError::ProjectionWork(
-                "correlated external reconciliation has no enrolled archive".into(),
-            )
-        })?;
-        let validated = match archive
-            .inspect_batch(batch_id)
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-        {
-            BatchInspection::Ready(validated) => validated,
-            BatchInspection::Absent | BatchInspection::Staged { .. } => {
-                return Err(EngineError::ProjectionWork(
-                    "correlated external reconciliation batch is not archive-ready".into(),
-                ));
-            }
-        };
-        if batch_fingerprint(&validated) != manifest_fingerprint {
-            return Err(EngineError::ProjectionWork(
-                "correlated external reconciliation manifest binding mismatch".into(),
-            ));
-        }
-        let affected_page_ids = BTreeSet::from(affected_page_ids);
-        if affected_page_ids.len() != 2 {
-            return Err(EngineError::ProjectionWork(
-                "correlated external reconciliation affected PageIds are not exact".into(),
-            ));
-        }
-        let rows = self
-            .projection_work_index()?
-            .accepted_batch_correlated_projections(batch_id)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        if rows.is_empty()
-            || rows
-                .iter()
-                .any(|row| !affected_page_ids.contains(&row.work().page_id()))
-        {
-            return Err(EngineError::ProjectionWork(
-                "correlated external reconciliation rows lack the exact affected/Blocked binding"
-                    .into(),
-            ));
-        }
-        self.external_reconciliation_blocked_batches.insert(
-            batch_id,
-            CorrelatedExternalReconciliationCapability {
-                manifest_fingerprint,
-                affected_page_ids,
-            },
-        );
-        Ok(())
-    }
-
-    pub(crate) fn correlated_blocked_external_expected_path(
-        &self,
-        path: &super::ManagedPath,
-    ) -> Result<Option<(ProjectionWork, super::BlobDescription)>, EngineError> {
-        let index = self.projection_work_index()?;
-        let mut matched = None;
-        for (batch_id, capability) in &self.external_reconciliation_blocked_batches {
-            for blocked in index
-                .accepted_batch_correlated_projections(*batch_id)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-            {
-                let Some((_observed, _intent_id)) = blocked.blocked_evidence() else {
-                    continue;
-                };
-                let work = blocked.work();
-                if work.path() != path || !capability.affected_page_ids.contains(&work.page_id()) {
-                    continue;
-                }
-                let ProjectionWorkTarget::Present(expected) = work.target() else {
-                    return Err(EngineError::ProjectionWork(
-                        "correlated Blocked expected path has an absent target".into(),
-                    ));
-                };
-                if matched.replace((work.clone(), expected)).is_some() {
-                    return Err(EngineError::ProjectionWork(
-                        "multiple correlated Blocked batches name one external path".into(),
-                    ));
-                }
-            }
-        }
-        Ok(matched)
-    }
-
-    /// Return one exact nonterminal import base only while its authenticated
-    /// correlated batch retains a durable Blocked sibling.
-    pub(crate) fn correlated_projection_import_base(
-        &self,
-        path: &super::ManagedPath,
-    ) -> Result<Option<CorrelatedProjectionImportBase>, EngineError> {
-        let index = self.projection_work_index()?;
-        let mut matched = None;
-        for (batch_id, capability) in &self.external_reconciliation_blocked_batches {
-            for candidate in index
-                .accepted_batch_correlated_projections(*batch_id)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-            {
-                let work = candidate.work();
-                if work.path() != path || !capability.affected_page_ids.contains(&work.page_id()) {
-                    continue;
-                }
-                let candidate = match candidate.blocked_evidence() {
-                    Some((observed, intent_id)) => CorrelatedProjectionImportBase::Blocked {
-                        work: work.clone(),
-                        observed,
-                        intent_id,
-                        manifest_fingerprint: capability.manifest_fingerprint,
-                    },
-                    None if candidate.is_ready() => CorrelatedProjectionImportBase::Ready {
-                        work: work.clone(),
-                        manifest_fingerprint: capability.manifest_fingerprint,
-                    },
-                    None => continue,
-                };
-                if matched.replace(candidate).is_some() {
-                    return Err(EngineError::ProjectionWork(
-                        "multiple correlated capabilities name one import base".into(),
-                    ));
-                }
-            }
-        }
-        Ok(matched)
-    }
-
     pub const fn projection_endpoint_binding(&self) -> Option<ProjectionEndpointBinding> {
         self.projection_endpoint
     }
@@ -9565,11 +9231,6 @@ impl ShardedHotEngine {
             .as_ref()
             .map(|store| store.stats())
             .unwrap_or_default();
-        let projection_work = self
-            .projection_work_index
-            .as_ref()
-            .map(|index| index.stats())
-            .unwrap_or_default();
         EngineInstrumentation {
             catalog_hot_state_loads: self.catalog_hot_state_loads.get(),
             prepare_transactions: work.prepare_transactions,
@@ -9641,14 +9302,14 @@ impl ShardedHotEngine {
             portable_path_index_writes: portable_paths.writes,
             portable_path_index_bytes_read: portable_paths.bytes_read,
             portable_path_index_bytes_written: portable_paths.bytes_written,
-            projection_work_node_reads: projection_work.node_reads,
-            projection_work_root_reads: projection_work.root_reads,
-            projection_work_prepared_reads: projection_work.prepared_reads,
-            projection_pending_entries_read: projection_work.pending_entries_read,
-            projection_preflight_nodes: projection_work.preflight_nodes,
-            projection_preflight_records: projection_work.preflight_records,
-            projection_preflight_roots: projection_work.preflight_roots,
-            projection_preflight_bytes: projection_work.preflight_bytes,
+            projection_work_node_reads: 0,
+            projection_work_root_reads: 0,
+            projection_work_prepared_reads: 0,
+            projection_pending_entries_read: 0,
+            projection_preflight_nodes: 0,
+            projection_preflight_records: 0,
+            projection_preflight_roots: 0,
+            projection_preflight_bytes: 0,
             block_claim_validation_nanos: work.block_claim_validation_nanos,
             block_claim_lookup_nanos: work.block_claim_lookup_nanos,
             block_claim_encode_nanos: work.block_claim_encode_nanos,
@@ -12238,11 +11899,7 @@ impl ShardedHotEngine {
         &mut self,
         batch_id: BatchId,
     ) -> Result<(), EngineError> {
-        if self.lazy_genesis.is_none()
-            || self.scratch.is_some()
-            || self.history_store.is_some()
-            || self.projection_work_index.is_some()
-        {
+        if self.lazy_genesis.is_none() || self.scratch.is_some() || self.history_store.is_some() {
             return Ok(());
         }
         let (_, endpoint) = self.clean_projection_runtime_binding()?;
@@ -12565,27 +12222,6 @@ impl ShardedHotEngine {
                 let error = EngineError::BatchCollision(batch_id);
                 return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
             }
-            if matches!(existing.status, ArchiveStatus::Accepted { .. }) {
-                if let Err(error) = self.prepare_projection_work_for_batch(
-                    &batch,
-                    self.authenticated_history_replay && is_bootstrap_generation(&existing),
-                ) {
-                    self.history_failure = Some(error.clone());
-                    return self.outcome(
-                        batch_id,
-                        BatchDisposition::Rejected { error },
-                        Vec::new(),
-                    );
-                }
-                if let Err(error) = self.activate_projection_work(batch_id, fingerprint) {
-                    self.history_failure = Some(error.clone());
-                    return self.outcome(
-                        batch_id,
-                        BatchDisposition::Rejected { error },
-                        Vec::new(),
-                    );
-                }
-            }
             let disposition = disposition_from_final_status(existing.status, true);
             return self.outcome(batch_id, disposition, Vec::new());
         }
@@ -12603,22 +12239,6 @@ impl ShardedHotEngine {
                 Some(ArchiveStatus::Rejected(error)) => BatchDisposition::Rejected { error },
                 Some(ArchiveStatus::Staged) => self.incomplete_staged_disposition(batch_id),
                 Some(ArchiveStatus::Accepted { no_op, .. }) => {
-                    if let Err(error) = self.prepare_projection_work(batch_id) {
-                        self.history_failure = Some(error.clone());
-                        return self.outcome(
-                            batch_id,
-                            BatchDisposition::Rejected { error },
-                            Vec::new(),
-                        );
-                    }
-                    if let Err(error) = self.activate_projection_work(batch_id, fingerprint) {
-                        self.history_failure = Some(error.clone());
-                        return self.outcome(
-                            batch_id,
-                            BatchDisposition::Rejected { error },
-                            Vec::new(),
-                        );
-                    }
                     BatchDisposition::DuplicateAccepted { no_op }
                 }
                 Some(ArchiveStatus::Quarantined) => BatchDisposition::Quarantined,
@@ -13215,27 +12835,6 @@ impl ShardedHotEngine {
                     Vec::new(),
                 );
             }
-            if matches!(status, ArchiveStatus::Accepted { .. }) {
-                if let Err(error) = self.prepare_projection_work_for_batch(
-                    &batch,
-                    self.authenticated_history_replay && replaying_bootstrap_generation,
-                ) {
-                    self.history_failure = Some(error.clone());
-                    return self.outcome(
-                        offered_batch_id,
-                        BatchDisposition::Rejected { error },
-                        Vec::new(),
-                    );
-                }
-                if let Err(error) = self.activate_projection_work(offered_batch_id, fingerprint) {
-                    self.history_failure = Some(error.clone());
-                    return self.outcome(
-                        offered_batch_id,
-                        BatchDisposition::Rejected { error },
-                        Vec::new(),
-                    );
-                }
-            }
         }
 
         let mut supplied = (!offered_already_final).then_some(batch);
@@ -13449,12 +13048,6 @@ impl ShardedHotEngine {
                 self.history_failure = Some(error);
                 break;
             }
-            if matches!(final_status, ArchiveStatus::Accepted { .. }) {
-                if let Err(error) = self.activate_projection_work(batch_id, ready_fingerprint) {
-                    self.history_failure = Some(error);
-                    break;
-                }
-            }
             self.statuses.remove(&batch_id);
             self.archive_fingerprints.remove(&batch_id);
             self.archive.remove(&batch_id);
@@ -13594,7 +13187,6 @@ impl ShardedHotEngine {
     ) -> Result<(bool, AcceptedBatchEvidence), EngineError> {
         debug_assert!(self.archive_store.is_none());
         debug_assert!(self.history_store.is_none());
-        debug_assert!(self.projection_work_index.is_none());
         self.begin_point_operation();
         self.advance_author_mutation_generation();
         if let Some(error) = &self.history_failure {
@@ -13713,7 +13305,6 @@ impl ShardedHotEngine {
         let admission_started = trace_enabled.then(Instant::now);
         debug_assert!(self.archive_store.is_none());
         debug_assert!(self.history_store.is_none());
-        debug_assert!(self.projection_work_index.is_none());
         self.begin_point_operation();
         self.advance_author_mutation_generation();
         if let Some(error) = &self.history_failure {
@@ -15671,8 +15262,6 @@ impl ShardedHotEngine {
             bootstrap_owner_binding: None,
             managed_local_authority: Some((entry.sequence, entry.batch_id)),
             clean_manifest_authority: None,
-            receipt_backed_live_authority: false,
-            correlated_authority: None,
         }))
     }
 
@@ -15738,8 +15327,6 @@ impl ShardedHotEngine {
             bootstrap_owner_binding: Some(genesis.root()),
             managed_local_authority: None,
             clean_manifest_authority: None,
-            receipt_backed_live_authority: false,
-            correlated_authority: None,
         }))
     }
 
@@ -15832,8 +15419,6 @@ impl ShardedHotEngine {
                             bootstrap_owner_binding: None,
                             managed_local_authority: None,
                             clean_manifest_authority: Some(work),
-                            receipt_backed_live_authority: false,
-                            correlated_authority: None,
                         }));
                     }
                     Err(super::projection::ExactSourceProjectionError::Semantic(_)) => {
@@ -15854,8 +15439,6 @@ impl ShardedHotEngine {
             bootstrap_owner_binding: None,
             managed_local_authority: None,
             clean_manifest_authority: Some(work),
-            receipt_backed_live_authority: false,
-            correlated_authority: None,
         }))
     }
 
@@ -16059,103 +15642,6 @@ impl ShardedHotEngine {
         Ok(())
     }
 
-    fn correlated_projection_predecessor(
-        &self,
-        receipts: &ProjectionReceiptStore,
-        path: &ManagedPath,
-        page_id: PageId,
-        before: &ProjectionPageState,
-    ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
-        let Some(capability) = self.correlated_projection_import_base(path)? else {
-            return Ok(None);
-        };
-        let work = capability.work();
-        if work.page_id() != page_id
-            || before.page.page_id != page_id
-            || before.page.path != *path
-            || before.frontier != *work.post_frontier()
-        {
-            return Err(EngineError::ProjectionManifest(
-                "correlated predecessor does not match the current semantic PageId/path/frontier"
-                    .into(),
-            ));
-        }
-        let archive = self.archive_store().ok_or_else(|| {
-            EngineError::ProjectionManifest(
-                "correlated predecessor has no enrolled accepted archive".into(),
-            )
-        })?;
-        let decoded = super::projection::decode_manifested_projection_work(archive, work)
-            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        let bytes = decoded.target_bytes().ok_or_else(|| {
-            EngineError::ProjectionManifest(
-                "correlated predecessor unexpectedly has an absent target".into(),
-            )
-        })?;
-        let intent = decoded.receiver_local_intent().clone();
-        if let Some((_observed, intent_id)) = capability.blocked_evidence() {
-            let durable_intent = receipts
-                .load_intent(intent_id)
-                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
-                .ok_or_else(|| {
-                    EngineError::ProjectionManifest(
-                        "correlated Blocked predecessor lacks its durable receipt intent".into(),
-                    )
-                })?;
-            let durable_base = receipts
-                .load_base(&durable_intent)
-                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-            if durable_intent != intent
-                || durable_base.as_ref().map(super::BaseBlob::bytes)
-                    != decoded.annotated_base().map(AnnotatedProjectionBase::bytes)
-            {
-                return Err(EngineError::ProjectionManifest(
-                    "correlated Blocked predecessor receipt differs from archived work".into(),
-                ));
-            }
-        }
-        let replay = super::projection::plan_projection(
-            self.workspace_id,
-            before,
-            decoded.annotated_base().map(AnnotatedProjectionBase::bytes),
-        )
-        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        if replay.intent() != &intent || replay.target() != bytes {
-            return Err(EngineError::ProjectionManifest(
-                "correlated predecessor is not the canonical current semantic projection".into(),
-            ));
-        }
-        Ok(Some(CapabilityCapturedPriorProjection {
-            bytes: bytes.to_vec(),
-            intent,
-            completion: None,
-            bootstrap_owner_binding: None,
-            managed_local_authority: None,
-            clean_manifest_authority: None,
-            receipt_backed_live_authority: false,
-            correlated_authority: Some(capability),
-        }))
-    }
-
-    fn validate_correlated_projection_authority(
-        &self,
-        path: &ManagedPath,
-        prior: &CapabilityCapturedPriorProjection,
-    ) -> Result<(), EngineError> {
-        let Some(captured) = &prior.correlated_authority else {
-            return Ok(());
-        };
-        let fresh = self.correlated_projection_import_base(path)?;
-        if fresh.as_ref() != Some(captured)
-            || captured.work().page_id() != prior.intent.page_id()
-            || captured.work().path() != prior.intent.path()
-            || captured.work().post_frontier() != prior.intent.frontier()
-        {
-            return Err(EngineError::AuthorDraftStale);
-        }
-        Ok(())
-    }
-
     pub(crate) fn capture_external_author_transaction(
         &self,
         draft: AuthorTransactionDraft,
@@ -16198,19 +15684,10 @@ impl ShardedHotEngine {
         {
             return Err(EngineError::AuthorDraftStale);
         }
-        let work_index = match self.enrolled_projection_runtime() {
-            Ok((_, work_index)) => Some(work_index),
-            Err(_) => {
-                self.clean_projection_runtime_binding()?;
-                None
-            }
-        };
+        self.clean_projection_runtime_binding()?;
         if receipts.workspace_id() != self.workspace_id
             || receipts.endpoint_binding() != Some(source)
             || Some(receipts.store_id()) != self.projection_receipt_store_id
-            || work_index
-                .as_ref()
-                .is_some_and(|index| receipts.store_id() != index.receipt_store_id())
         {
             return Err(EngineError::ProjectionManifest(
                 "draft capture is not bound to the enrolled projection runtime".into(),
@@ -16288,12 +15765,6 @@ impl ShardedHotEngine {
                     "current graph bytes",
                 )?;
             }
-            let completed = work_index
-                .as_ref()
-                .map(|index| index.completed_receipts_for_path(path))
-                .transpose()
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-                .unwrap_or_default();
             let mut authority_matches = true;
             let managed_prior = roles
                 .semantic_predecessor
@@ -16314,60 +15785,35 @@ impl ShardedHotEngine {
                 })
                 .transpose()?
                 .flatten();
-            let clean_manifest_prior = if work_index.is_none() {
-                roles
-                    .semantic_predecessor
-                    .and_then(|requirement_index| {
-                        let requirement = &draft.requirements[requirement_index];
-                        draft.pages[&requirement.page_id]
-                            .before
-                            .as_ref()
-                            .map(|before| (requirement.page_id, before))
-                    })
-                    .map(|(page_id, before)| {
-                        self.clean_manifest_projection_predecessor(
-                            path,
-                            page_id,
-                            before,
-                            current.as_deref(),
-                            external,
-                        )
-                    })
-                    .transpose()?
-                    .flatten()
-            } else {
-                None
-            };
+            let clean_manifest_prior = roles
+                .semantic_predecessor
+                .and_then(|requirement_index| {
+                    let requirement = &draft.requirements[requirement_index];
+                    draft.pages[&requirement.page_id]
+                        .before
+                        .as_ref()
+                        .map(|before| (requirement.page_id, before))
+                })
+                .map(|(page_id, before)| {
+                    self.clean_manifest_projection_predecessor(
+                        path,
+                        page_id,
+                        before,
+                        current.as_deref(),
+                        external,
+                    )
+                })
+                .transpose()?
+                .flatten();
             // `None` from the clean-manifest proof can mean that the exact
             // graph bytes need reconciliation, not that the page still belongs
             // to lazy genesis. Once a manifest head exists it supersedes the
             // baseline for this path; falling through to genesis would either
             // misbind a post-activation page or hide a real exact-byte drift.
-            let clean_manifest_head_present =
-                work_index.is_none() && self.clean_projection_heads.contains_key(path);
-            let correlated_prior = if external && work_index.is_some() {
-                roles
-                    .semantic_predecessor
-                    .and_then(|requirement_index| {
-                        let requirement = &draft.requirements[requirement_index];
-                        draft.pages[&requirement.page_id]
-                            .before
-                            .as_ref()
-                            .map(|before| (requirement.page_id, before))
-                    })
-                    .map(|(page_id, before)| {
-                        self.correlated_projection_predecessor(receipts, path, page_id, before)
-                    })
-                    .transpose()?
-                    .flatten()
-            } else {
-                None
-            };
+            let clean_manifest_head_present = self.clean_projection_heads.contains_key(path);
             let prior = if let Some(prior) = managed_prior {
-                authority_matches = true;
                 Some(prior)
             } else if let Some(prior) = clean_manifest_prior {
-                authority_matches = true;
                 Some(prior)
             } else if let Some(requirement_index) = roles.semantic_predecessor {
                 let requirement = &draft.requirements[requirement_index];
@@ -16375,124 +15821,23 @@ impl ShardedHotEngine {
                     .before
                     .as_ref()
                     .expect("prior requirement was selected from a semantic pre-state");
-                let receipt_backed_live = work_index
-                    .as_ref()
-                    .zip(current.as_deref())
-                    .map(|(work_index, live_bytes)| {
-                        super::projection::receipt_backed_live_projection_predecessor(
-                            self.workspace_id,
-                            source,
-                            receipts,
-                            work_index,
-                            before,
-                            live_bytes,
-                        )
-                    })
-                    .transpose()
-                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
-                    .flatten();
-                if let Some(live) = receipt_backed_live {
-                    charge_preauthoring_receipt_bytes(
-                        &mut retained_bytes,
-                        live.intent(),
-                        live.completion(),
-                        "live semantic predecessor receipt",
-                    )?;
-                    let bytes = current
-                        .as_ref()
-                        .expect("live receipt predecessor requires a present graph file")
-                        .clone();
-                    Some(CapabilityCapturedPriorProjection {
-                        bytes,
-                        intent: live.intent().clone(),
-                        completion: Some(live.completion().clone()),
-                        bootstrap_owner_binding: None,
-                        managed_local_authority: None,
-                        clean_manifest_authority: None,
-                        receipt_backed_live_authority: true,
-                        correlated_authority: None,
-                    })
-                } else if let Some(authority) = match completed.as_slice() {
-                    [authority]
-                        if matches!(authority.target(), ProjectionWorkTarget::Present(_)) =>
-                    {
-                        Some(authority)
-                    }
-                    _ => {
-                        authority_matches = false;
-                        None
-                    }
-                } {
-                    let (intent, completion) = receipts
-                        .load_completed_receipt(authority)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    charge_preauthoring_receipt_bytes(
-                        &mut retained_bytes,
-                        &intent,
-                        &completion,
-                        "semantic predecessor receipt",
-                    )?;
-                    let base = receipts
-                        .load_base(&intent)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    let replay = super::projection::plan_projection(
-                        self.workspace_id,
-                        before,
-                        base.as_ref().map(super::BaseBlob::bytes),
-                    )
-                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    let replay_matches = replay.intent() == &intent
-                        || (external && intent.matches_replay_except_frontier(replay.intent()));
-                    if !replay_matches {
-                        authority_matches = false;
-                        None
-                    } else {
-                        charge_preauthoring_capture_bytes(
-                            &mut retained_bytes,
-                            replay.target().len(),
-                            "authenticated prior projection bytes",
-                        )?;
-                        Some(CapabilityCapturedPriorProjection {
-                            bytes: replay.target().to_vec(),
-                            intent,
-                            completion: Some(completion),
-                            bootstrap_owner_binding: None,
-                            managed_local_authority: None,
-                            clean_manifest_authority: None,
-                            receipt_backed_live_authority: false,
-                            correlated_authority: None,
-                        })
-                    }
-                } else if let Some(prior) = correlated_prior {
-                    authority_matches = true;
-                    Some(prior)
-                } else if completed.is_empty() {
-                    let lazy_genesis_prior = if !clean_manifest_head_present {
-                        self.lazy_genesis_projection_predecessor(path, requirement.page_id, before)?
-                    } else {
-                        None
-                    };
-                    if let Some(prior) = lazy_genesis_prior {
-                        charge_preauthoring_capture_bytes(
-                            &mut retained_bytes,
-                            prior.bytes.len(),
-                            "lazy-genesis projection bytes",
-                        )?;
-                        authority_matches = true;
-                        Some(prior)
-                    } else {
-                        authority_matches = false;
-                        None
-                    }
+                let lazy_genesis_prior = if !clean_manifest_head_present {
+                    self.lazy_genesis_projection_predecessor(path, requirement.page_id, before)?
                 } else {
+                    None
+                };
+                if let Some(prior) = lazy_genesis_prior {
+                    charge_preauthoring_capture_bytes(
+                        &mut retained_bytes,
+                        prior.bytes.len(),
+                        "lazy-genesis projection bytes",
+                    )?;
+                    Some(prior)
+                } else {
+                    authority_matches = false;
                     None
                 }
             } else {
-                authority_matches = match completed.as_slice() {
-                    [] => true,
-                    [authority] => matches!(authority.target(), ProjectionWorkTarget::Absent),
-                    _ => false,
-                };
                 None
             };
 
@@ -16576,24 +15921,6 @@ impl ShardedHotEngine {
                 receipts.store_id(),
                 material,
             );
-            let captured_receipts = completed
-                .iter()
-                .map(|authority| {
-                    receipts
-                        .load_completed_receipt(authority)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            for (intent, completion) in &captured_receipts {
-                charge_preauthoring_receipt_bytes(
-                    &mut retained_bytes,
-                    intent,
-                    completion,
-                    "captured completion receipt",
-                )?;
-            }
-            input.draft_completed_path = Some(completed);
-            input.draft_completed_receipts = Some(captured_receipts);
             captured_inputs.push(input);
         }
 
@@ -16703,41 +16030,7 @@ impl ShardedHotEngine {
                 "captured author token requirement binding changed".into(),
             ));
         }
-        let work_index = match self.enrolled_projection_runtime() {
-            Ok((_, work_index)) => Some(work_index),
-            Err(_) => {
-                self.clean_projection_runtime_binding()?;
-                None
-            }
-        };
-        for input in &captured_inputs {
-            let expected = work_index
-                .as_ref()
-                .map(|index| index.completed_receipts_for_path(&input.path))
-                .transpose()
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-                .unwrap_or_default();
-            if input.draft_completed_path.as_ref() != Some(&expected) {
-                return Err(EngineError::ProjectionManifest(format!(
-                    "captured path {} no longer has its draft-owned completion authority",
-                    input.path
-                )));
-            }
-            let current_receipts = expected
-                .iter()
-                .map(|authority| {
-                    receipts
-                        .load_completed_receipt(authority)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if input.draft_completed_receipts.as_ref() != Some(&current_receipts) {
-                return Err(EngineError::ProjectionManifest(format!(
-                    "captured path {} receipt bytes changed after draft capture",
-                    input.path
-                )));
-            }
-        }
+        self.clean_projection_runtime_binding()?;
         captured_inputs.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         if !captured_inputs
             .windows(2)
@@ -16811,7 +16104,6 @@ impl ShardedHotEngine {
                 prior.validate_authority()?;
                 self.validate_managed_local_projection_authority(path, prior)?;
                 self.validate_clean_manifest_projection_authority(path, prior)?;
-                self.validate_correlated_projection_authority(path, prior)?;
                 let before = roles
                     .semantic_predecessor
                     .and_then(|index| {
@@ -16855,10 +16147,7 @@ impl ShardedHotEngine {
                         Some(prior.intent.annotations()),
                     )
                     .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    if replay.target() != prior.bytes
-                        || (prior.receipt_backed_live_authority
-                            && replay.intent().annotations() != prior.intent.annotations())
-                    {
+                    if replay.target() != prior.bytes {
                         return Err(EngineError::ProjectionManifest(format!(
                             "captured path {path} prior bytes are not the exact semantic pre-state"
                         )));
@@ -18804,29 +18093,6 @@ impl ShardedHotEngine {
         Ok(evidence)
     }
 
-    fn prepare_projection_work(&mut self, batch_id: BatchId) -> Result<(), EngineError> {
-        let reconstructible_bootstrap = self.authenticated_history_replay
-            && self
-                .recovery_bootstrap_projection_batches
-                .contains(&batch_id);
-        self.prepare_projection_work_for_batch(&self.archive[&batch_id], reconstructible_bootstrap)
-    }
-
-    fn prepare_projection_work_for_batch(
-        &self,
-        batch: &ValidatedBatch,
-        reconstructible_bootstrap: bool,
-    ) -> Result<(), EngineError> {
-        let (Some(endpoint), Some(index)) = (
-            self.projection_endpoint,
-            self.projection_work_index.as_ref(),
-        ) else {
-            return Ok(());
-        };
-        let work = self.projection_work_rows_for_batch(batch, endpoint)?;
-        self.prepare_projection_work_rows(batch, index, work, reconstructible_bootstrap)
-    }
-
     /// Derive the exact source-endpoint projection rows carried by one
     /// validated operation. The rows are a view of immutable manifest/object
     /// evidence, not durable queue state. Both the legacy queue adapter and the
@@ -18943,82 +18209,6 @@ impl ShardedHotEngine {
             ));
         }
         Ok(locators)
-    }
-
-    fn prepare_projection_work_rows(
-        &self,
-        batch: &ValidatedBatch,
-        index: &ProjectionWorkIndex,
-        work: Vec<ProjectionWork>,
-        reconstructible_bootstrap: bool,
-    ) -> Result<(), EngineError> {
-        let batch_id = batch.manifest().batch_id();
-        let mut superseded = Vec::new();
-        for row in &work {
-            if !self.authenticated_history_replay {
-                for older in index
-                    .pending_for_path(row.path())
-                    .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-                {
-                    if older.work_id() == row.work_id() {
-                        continue;
-                    }
-                    if self
-                        .projection_frontier_dominates(row.post_frontier(), older.post_frontier())?
-                    {
-                        superseded.push(older.work_id());
-                    }
-                }
-                if let ProjectionWorkTarget::Present(target) = row.target() {
-                    for blocked_batch in self.external_reconciliation_blocked_batches.keys() {
-                        for blocked in index
-                            .accepted_batch_correlated_projections(*blocked_batch)
-                            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-                        {
-                            let Some((observed, _intent_id)) = blocked.blocked_evidence() else {
-                                continue;
-                            };
-                            let older = blocked.work();
-                            let dominates = self.projection_transition_frontier_dominates(
-                                row.post_frontier(),
-                                older.post_frontier(),
-                            )?;
-                            if older.endpoint_id() == row.endpoint_id()
-                                && older.page_id() == row.page_id()
-                                && older.path() == row.path()
-                                && target == observed
-                                && dominates
-                            {
-                                superseded.push(older.work_id());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if self.authenticated_history_replay {
-            match index.require_replayed_prepared_batch(batch_id, batch_fingerprint(batch), &work) {
-                Ok(()) => return Ok(()),
-                Err(super::projection_work_index::ProjectionWorkError::MissingPreparedBatch(
-                    missing,
-                )) if reconstructible_bootstrap && missing == batch_id => {}
-                Err(error) => return Err(EngineError::ProjectionWork(error.to_string())),
-            }
-            // Bootstrap history is installed before projection-work authority
-            // exists. A full authenticated replay may therefore be the first
-            // operation able to publish its prepared row. `prepare_batch`
-            // still refuses a missing file when this index already references
-            // the batch as pending or accepted, preserving the corruption
-            // boundary for unfinished and previously witnessed work.
-            return index
-                .prepare_batch(batch_id, batch_fingerprint(batch), &work, &[])
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()));
-        }
-        superseded.sort_unstable();
-        superseded.dedup();
-        index
-            .prepare_batch(batch_id, batch_fingerprint(batch), &work, &superseded)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
     }
 
     /// Reconstruct the projection rows of one manifest-committed accepted
@@ -19283,364 +18473,6 @@ impl ShardedHotEngine {
         Ok(store)
     }
 
-    fn activate_projection_work(
-        &self,
-        batch_id: BatchId,
-        manifest_fingerprint: ContentDigest,
-    ) -> Result<(), EngineError> {
-        // Recovery may reconstruct accepted hot state, but it must not publish
-        // pending -> Ready projection authority one batch at a time. Finish
-        // first proves complete durable-history coverage and catalog
-        // readiness, then performs the bounded pending-work reconciliation.
-        if self.authenticated_history_replay {
-            return Ok(());
-        }
-        let Some(index) = self.projection_work_index.as_ref() else {
-            return Ok(());
-        };
-        let transition = self.authenticate_current_projection_history_extension(index)?;
-        index
-            .accept_batch_at_history(batch_id, manifest_fingerprint, transition)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
-    }
-
-    fn authenticate_current_projection_history_extension(
-        &self,
-        index: &ProjectionWorkIndex,
-    ) -> Result<super::object_store::AuthenticatedEngineHistoryTransition, EngineError> {
-        let before = index
-            .engine_history_authority()
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        self.history_store
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection history transition has no durable engine history".into(),
-                )
-            })?
-            .authenticate_current_history_extension(before)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
-    }
-
-    fn authenticated_projection_history_transition(
-        &self,
-    ) -> Result<Option<super::object_store::AuthenticatedEngineHistoryTransition>, EngineError>
-    {
-        let Some(index) = self.projection_work_index.as_deref() else {
-            return Ok(None);
-        };
-        self.authenticate_current_projection_history_extension(index)
-            .map(Some)
-    }
-
-    fn reconcile_pending_projection_work(
-        &mut self,
-        transition: Option<super::object_store::AuthenticatedEngineHistoryTransition>,
-    ) -> Result<(), EngineError> {
-        let Some(index) = self.projection_work_index.as_ref().map(Arc::clone) else {
-            return Ok(());
-        };
-        self.begin_point_operation();
-        let authority = self
-            .history_store
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection reconciliation has no durable engine history".into(),
-                )
-            })?
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let transition = match transition {
-            Some(transition) if transition.after() == authority => transition,
-            Some(_) => {
-                return Err(EngineError::ProjectionWork(
-                    "authenticated projection history transition is not current".into(),
-                ))
-            }
-            None => self.authenticate_current_projection_history_extension(&index)?,
-        };
-        let mut cursor = None;
-        loop {
-            let page = index
-                .pending_activation_page(cursor.as_ref(), 256)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-            for pending in page.pending() {
-                let mut work = self.history_work.get();
-                work.projection_reconciliation_history_record_reads = work
-                    .projection_reconciliation_history_record_reads
-                    .saturating_add(1);
-                self.history_work.set(work);
-                match self.durable_endpoint_history_record_at_live_head(pending.batch_id())? {
-                    Some(record) => {
-                        if record.manifest_fingerprint != pending.manifest_fingerprint() {
-                            return Err(EngineError::ProjectionWork(format!(
-                                "pending projection batch {} does not match durable engine history",
-                                pending.batch_id()
-                            )));
-                        }
-                        match record.status {
-                            ArchiveStatus::Accepted { .. } => index
-                                .accept_batch_at_history(
-                                    pending.batch_id(),
-                                    pending.manifest_fingerprint(),
-                                    transition,
-                                )
-                                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
-                            ArchiveStatus::Rejected(_)
-                            | ArchiveStatus::Quarantined
-                            | ArchiveStatus::Staged => index
-                                .retire_pending_activation_at_history(pending, transition)
-                                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
-                        }
-                    }
-                    None => index
-                        .retire_pending_activation_at_history(pending, transition)
-                        .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
-                }
-            }
-            cursor = page.next().cloned();
-            if cursor.is_none() {
-                break;
-            }
-        }
-        index
-            .bind_recovered_history_after_pending_reconciliation(transition)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        Ok(())
-    }
-
-    /// Reconcile and bind expected-path projection authority to the current
-    /// authenticated durable engine history before a filesystem
-    /// reconciliation scan consumes it.
-    pub(crate) fn reconcile_expected_path_history(&mut self) -> Result<(), EngineError> {
-        self.ensure_not_blocked()?;
-        let transition = self.authenticated_projection_history_transition()?;
-        self.reconcile_pending_projection_work(transition)
-    }
-
-    pub(crate) fn authorize_projection_work(
-        &mut self,
-        index: &ProjectionWorkIndex,
-        work: &ProjectionWork,
-    ) -> Result<(), EngineError> {
-        self.begin_point_operation();
-        self.ensure_not_blocked()?;
-        let endpoint = self.projection_endpoint.ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection endpoint".into())
-        })?;
-        if endpoint.endpoint_id != work.endpoint_id()
-            || endpoint.graph_resource_id != work.graph_resource_id()
-            || index.workspace_id() != self.workspace_id
-            || index.endpoint_id() != endpoint.endpoint_id
-            || index.graph_resource_id() != endpoint.graph_resource_id
-            || Some(index.receipt_store_id()) != self.projection_receipt_store_id
-            || work.workspace_id() != self.workspace_id
-        {
-            return Err(EngineError::ProjectionWork(
-                "projection work endpoint/workspace binding mismatch".into(),
-            ));
-        }
-        let authority = self
-            .history_store
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection authorization has no durable engine history".into(),
-                )
-            })?
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        index
-            .require_current_history_binding(authority.generation, authority.index_root)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        let record = self
-            .durable_endpoint_history_record(work.batch_id())?
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection work batch has no authenticated durable status".into(),
-                )
-            })?;
-        if !matches!(record.status, ArchiveStatus::Accepted { .. }) {
-            return Err(EngineError::ProjectionWork(
-                "projection work batch is not accepted durable state".into(),
-            ));
-        }
-        if self.visible_documents.is_empty() {
-            self.portable_path_index
-                .as_ref()
-                .ok_or_else(|| {
-                    EngineError::ProjectionWork(
-                        "projection authorization has no portable-path index".into(),
-                    )
-                })?
-                .validate_root(record.portable_path_root)
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-            self.portable_path_root = record.portable_path_root;
-        }
-        if record.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION
-            || work.portable_path_key_version() != super::PORTABLE_PATH_KEY_VERSION
-            || work.portable_path_key_digest() != work.path().portable_key().digest()
-        {
-            return Err(EngineError::ProjectionWork(
-                "projection work portable-path history binding mismatch".into(),
-            ));
-        }
-        let key = work.portable_path_key_digest();
-        let current = self.portable_path_records_many(&[key])?.remove(&key);
-        let currently_owned = current.as_ref().and_then(PortablePathRecord::occupied);
-        match work.target() {
-            ProjectionWorkTarget::Present(_)
-                if currently_owned.is_none_or(|occupied| {
-                    occupied.page_id() != work.page_id() || occupied.exact_path() != work.path()
-                }) =>
-            {
-                return Err(EngineError::ProjectionWork(
-                    "projection work path is not currently owned by its page".into(),
-                ));
-            }
-            ProjectionWorkTarget::Absent if currently_owned.is_some() => {
-                return Err(EngineError::ProjectionWork(
-                    "projection deletion path is currently owned".into(),
-                ));
-            }
-            ProjectionWorkTarget::Absent | ProjectionWorkTarget::Present(_) => {}
-        }
-        index
-            .require_accepted_ready(work, record.manifest_fingerprint)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
-    }
-
-    pub(crate) fn authorize_projected_release(
-        &self,
-        index: &ProjectionWorkIndex,
-        release: &PortablePathReleased,
-        // `None` when the released path is absent. Only the guarded-conflict
-        // route needs bytes to authenticate against; an absent completion — an
-        // ordinary deletion — is authorized without any observation.
-        observed: Option<BlobDescription>,
-    ) -> Result<ProjectedReleaseAuthority, EngineError> {
-        self.begin_point_operation();
-        self.ensure_not_blocked()?;
-        let endpoint = self.projection_endpoint.ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection endpoint".into())
-        })?;
-        let receipt_store_id = self.projection_receipt_store_id.ok_or_else(|| {
-            EngineError::ProjectionWork("engine has no enrolled projection receipt store".into())
-        })?;
-        if index.workspace_id() != self.workspace_id
-            || index.endpoint_id() != endpoint.endpoint_id
-            || index.graph_resource_id() != endpoint.graph_resource_id
-            || index.receipt_store_id() != receipt_store_id
-        {
-            return Err(EngineError::ProjectionWork(
-                "projection release runtime binding mismatch".into(),
-            ));
-        }
-        let history = self.history_store.as_ref().ok_or_else(|| {
-            EngineError::ProjectionWork(
-                "projection release authorization has no durable engine history".into(),
-            )
-        })?;
-        let (generation, history_root) = history
-            .current()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        index
-            .require_current_history_binding(generation, history_root)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        let bytes = history
-            .lookup(history_root, release.release_batch())
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection release batch has no authenticated durable status".into(),
-                )
-            })?;
-        let record = decode_history_record(release.release_batch(), &bytes)?;
-        self.validate_record_catalog_transition(&record)?;
-        if record.generation == 0
-            || record.generation > generation
-            || !matches!(record.status, ArchiveStatus::Accepted { .. })
-        {
-            return Err(EngineError::ProjectionWork(
-                "projection release batch is not accepted durable state".into(),
-            ));
-        }
-        let key = release.prior_exact_path().portable_key().digest();
-        let current = self.portable_path_records_many(&[key])?.remove(&key);
-        if current
-            .as_ref()
-            .and_then(PortablePathRecord::occupied)
-            .is_some()
-            || current
-                .as_ref()
-                .and_then(PortablePathRecord::latest_release)
-                != Some(release)
-        {
-            return Err(EngineError::ProjectionWork(
-                "projection release is not the authenticated current path fence".into(),
-            ));
-        }
-        let completed = index
-            .completed_receipts_for_path(release.prior_exact_path())
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        let mut exact = completed.into_iter().filter(|receipt| {
-            receipt.page_id() == release.prior_page_id()
-                && receipt.path() == release.prior_exact_path()
-                && receipt.target() == ProjectionWorkTarget::Absent
-        });
-        let completed = exact.next();
-        if exact.next().is_some() {
-            return Err(EngineError::ProjectionWork(
-                "projection release completion is not exact".into(),
-            ));
-        }
-        if let Some(completed) = completed {
-            if !self.projection_frontier_contains_path_acquisition(
-                completed.frontier(),
-                release.release_batch(),
-            )? {
-                return Err(EngineError::ProjectionWork(
-                    "projection release completion is not exact".into(),
-                ));
-            }
-            return Ok(ProjectedReleaseAuthority::Completed(completed));
-        }
-        let observed = observed.ok_or_else(|| {
-            EngineError::ProjectionWork(
-                "projection release has no absent completion, and no replacement bytes to \
-                 authenticate a guarded conflict against"
-                    .into(),
-            )
-        })?;
-        let blocked = index
-            .blocked_release_for_observation(
-                release.release_batch(),
-                release.prior_page_id(),
-                release.prior_exact_path(),
-                observed,
-            )
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection release has neither an absent completion nor an exact guarded conflict"
-                        .into(),
-                )
-            })?;
-        if !self.projection_frontier_contains_path_acquisition(
-            blocked.0.post_frontier(),
-            release.release_batch(),
-        )? {
-            return Err(EngineError::ProjectionWork(
-                "guarded projection conflict is not exact for the release".into(),
-            ));
-        }
-        Ok(ProjectedReleaseAuthority::GuardedConflict {
-            work: blocked.0,
-            intent_id: blocked.1,
-        })
-    }
-
     fn projection_frontier_dominates(
         &self,
         newer: &FrontierV2,
@@ -19778,18 +18610,14 @@ impl ShardedHotEngine {
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {
         self.materialize_page_inner(page_id, false, None)
-            .map(|(page, _, _, _)| page)
+            .map(|(page, _, _)| page)
     }
 
     pub fn materialize_page_for_projection(
         &self,
         page_id: PageId,
     ) -> Result<ProjectionPageState, EngineError> {
-        let (page, frontier, claim_evidence, effective_closure) =
-            self.materialize_page_inner(page_id, true, None)?;
-        if effective_closure.is_some() {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
+        let (page, frontier, claim_evidence) = self.materialize_page_inner(page_id, true, None)?;
         Ok(ProjectionPageState {
             page,
             frontier: frontier.expect("projection materialization requested a frontier"),
@@ -19802,11 +18630,8 @@ impl ShardedHotEngine {
         page_id: PageId,
         claim_source: &dyn ProjectionClaimSource,
     ) -> Result<ProjectionPageState, EngineError> {
-        let (page, frontier, claim_evidence, effective_closure) =
+        let (page, frontier, claim_evidence) =
             self.materialize_page_inner(page_id, true, Some(claim_source))?;
-        if effective_closure.is_some() {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
         Ok(ProjectionPageState {
             page,
             frontier: frontier.expect("projection materialization requested a frontier"),
@@ -19894,195 +18719,6 @@ impl ShardedHotEngine {
         Ok(ProjectionWriteAuthorization {
             state,
             claim_root: self.logseq_claim_root,
-        })
-    }
-
-    pub(crate) fn authenticate_effective_title_projection_candidate(
-        &self,
-        page_id: PageId,
-    ) -> Result<AuthenticatedEffectiveTitleProjectionCandidate, EngineError> {
-        self.begin_point_operation();
-        self.ensure_not_blocked()?;
-        let (page, frontier, claim_evidence, effective_closure) =
-            self.materialize_page_inner(page_id, true, None)?;
-        let effective_closure =
-            effective_closure.ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let source = effective_closure.transition.selected_intent.clone();
-        let state = ProjectionPageState {
-            page,
-            frontier: frontier.expect("projection materialization requested a frontier"),
-            claim_evidence,
-        };
-        let accepted_frontier = self.authenticate_projection_accepted_frontier()?;
-        Ok(AuthenticatedEffectiveTitleProjectionCandidate {
-            seal: EffectiveTitleTransitionSeal::Authenticated,
-            state,
-            source,
-            lifecycle_completion: effective_closure.lifecycle_completion,
-            accepted_frontier,
-        })
-    }
-
-    pub(crate) fn authorize_effective_title_projection_write(
-        &self,
-        candidate: &AuthenticatedEffectiveTitleProjectionCandidate,
-        source: &ManifestedProjectionIntent,
-        completed_intent: &ProjectionIntent,
-        completion: &ProjectionCompletion,
-        exact_local_base: &[u8],
-    ) -> Result<ProjectionWriteAuthorization, EngineError> {
-        let fresh = self.authenticate_effective_title_projection_candidate(source.page_id())?;
-        if candidate.seal != EffectiveTitleTransitionSeal::Authenticated
-            || candidate.source != *source
-            || fresh.seal != candidate.seal
-            || fresh.source != candidate.source
-            || fresh.lifecycle_completion != candidate.lifecycle_completion
-            || !fresh
-                .accepted_frontier
-                .matches(&candidate.accepted_frontier)
-            || !same_projection_state_authority(&fresh.state, &candidate.state)
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        completion
-            .validate_against(completed_intent)
-            .map_err(|_| EngineError::ProjectionAuthorizationUnavailable)?;
-        let completed_intent_id = completed_intent
-            .id()
-            .map_err(|_| EngineError::ProjectionAuthorizationUnavailable)?;
-        let lifecycle = &candidate.lifecycle_completion;
-        if completed_intent.workspace_id() != self.workspace_id
-            || lifecycle.page_id() != completed_intent.page_id()
-            || lifecycle.path() != completed_intent.path()
-            || lifecycle.frontier() != completed_intent.frontier()
-            || lifecycle.intent_id() != completed_intent_id
-            || lifecycle.logical_completion_id() != completion.logical_completion_id()
-            || lifecycle.target() != ProjectionWorkTarget::Present(completed_intent.target())
-            || completed_intent.page_id() != candidate.state.page.page_id
-            || completed_intent.path() != &candidate.state.page.path
-            || super::BlobDescription::of(exact_local_base) != completed_intent.target()
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let ManifestProjectionTarget::Present {
-            bytes, annotations, ..
-        } = source.target()
-        else {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        };
-        let replay = super::projection::plan_projection_with_layout_annotations(
-            self.workspace_id,
-            &candidate.state,
-            Some(exact_local_base),
-            Some(annotations),
-        )
-        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        if replay.target() != bytes || replay.intent().annotations() != annotations {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        Ok(ProjectionWriteAuthorization {
-            state: candidate.state.clone(),
-            claim_root: self.logseq_claim_root,
-        })
-    }
-
-    fn authenticate_projection_accepted_frontier(
-        &self,
-    ) -> Result<AuthenticatedProjectionAcceptedFrontier, EngineError> {
-        let mut work = self.history_work.get();
-        work.effective_title_projection_authority_calls = work
-            .effective_title_projection_authority_calls
-            .saturating_add(1);
-        self.history_work.set(work);
-
-        let accepted_frontier_root = self.accepted_frontier_root()?;
-        let accepted_documents =
-            usize::try_from(accepted_frontier_root.document_count()).unwrap_or(usize::MAX);
-        let mut work = self.history_work.get();
-        work.effective_title_projection_max_accepted_documents = work
-            .effective_title_projection_max_accepted_documents
-            .max(accepted_documents);
-        self.history_work.set(work);
-        let acceptance_sequence = accepted_frontier_root.acceptance_sequence();
-        if acceptance_sequence == 0 {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let (latest_accepted_batch, accepted_evidence) = self
-            .accepted_batch_entry_at(acceptance_sequence)?
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let accepted_evidence =
-            accepted_evidence.ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let mut work = self.history_work.get();
-        work.effective_title_projection_point_proofs = work
-            .effective_title_projection_point_proofs
-            .saturating_add(1);
-        self.history_work.set(work);
-        if accepted_evidence.batch_id() != latest_accepted_batch
-            || accepted_evidence.acceptance_sequence() != acceptance_sequence
-            || accepted_evidence.post_frontier_root() != &accepted_frontier_root
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-
-        let accepted_no_op = self
-            .accepted_frontier_batch_no_op(latest_accepted_batch)?
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let mut work = self.history_work.get();
-        work.effective_title_projection_point_proofs = work
-            .effective_title_projection_point_proofs
-            .saturating_add(1);
-        self.history_work.set(work);
-
-        let history = self
-            .history_store
-            .as_ref()
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let durable_history = history
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if durable_history.generation != self.history_generation
-            || durable_history.index_root != self.history_root
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let durable_record = self
-            .durable_endpoint_history_record_at_live_head(latest_accepted_batch)?
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        let confirmed_history = history
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let mut work = self.history_work.get();
-        work.effective_title_projection_point_proofs = work
-            .effective_title_projection_point_proofs
-            .saturating_add(1);
-        self.history_work.set(work);
-        if confirmed_history != durable_history {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let ArchiveStatus::Accepted {
-            no_op: durable_no_op,
-            evidence: durable_evidence,
-        } = &durable_record.status
-        else {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        };
-        if *durable_no_op != accepted_no_op
-            || durable_evidence.batch_id() != latest_accepted_batch
-            || durable_evidence.manifest_fingerprint() != accepted_evidence.manifest_fingerprint()
-            || durable_evidence.event_binding_digest() != accepted_evidence.event_binding_digest()
-            || durable_evidence.acceptance_sequence() != acceptance_sequence
-            || durable_evidence.affected_documents() != accepted_evidence.affected_documents()
-            || accepted_frontier_cross_run_facts(durable_evidence.prior_frontier_root())
-                != accepted_frontier_cross_run_facts(accepted_evidence.prior_frontier_root())
-            || accepted_frontier_cross_run_facts(durable_evidence.post_frontier_root())
-                != accepted_frontier_cross_run_facts(&accepted_frontier_root)
-        {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        Ok(AuthenticatedProjectionAcceptedFrontier {
-            runtime_authority: self.runtime_authority.clone(),
-            accepted_frontier_root,
-            durable_history,
         })
     }
 
@@ -21002,7 +19638,6 @@ impl ShardedHotEngine {
             MaterializedPage,
             Option<FrontierV2>,
             Vec<ProjectionClaimEvidence>,
-            Option<AuthenticatedEffectiveProjectionClosure>,
         ),
         EngineError,
     > {
@@ -21199,303 +19834,16 @@ impl ShardedHotEngine {
         if let Some(transition) = &effective_transition {
             transition.apply_to_materialized(&mut page)?;
         }
+        if include_frontier {
+            frontier_documents.insert(
+                self.catalog_document_id,
+                self.current_hot_document_dependencies_by_id(self.catalog_document_id)?,
+            );
+        }
         let frontier = include_frontier
-            .then(|| FrontierV2::new(frontier_documents.values().cloned().collect()))
+            .then(|| FrontierV2::new(frontier_documents.into_values().collect()))
             .transpose()?;
-        let (frontier, effective_closure) = match frontier {
-            Some(frontier) => match self.page_stable_projection_frontier(
-                &mut page,
-                &frontier,
-                &claim_evidence,
-                effective_selection.as_ref(),
-                effective_transition.as_ref(),
-            )? {
-                Some((stable, closure)) => (Some(stable), closure),
-                None => {
-                    frontier_documents.insert(
-                        self.catalog_document_id,
-                        self.current_hot_document_dependencies_by_id(self.catalog_document_id)?,
-                    );
-                    (
-                        Some(FrontierV2::new(frontier_documents.into_values().collect())?),
-                        None,
-                    )
-                }
-            },
-            None => (None, None),
-        };
-        Ok((page, frontier, claim_evidence, effective_closure))
-    }
-
-    fn current_catalog_dependencies_dominate(
-        &self,
-        current: Option<&DocumentDependencies>,
-        candidate: &DocumentDependencies,
-    ) -> Result<bool, EngineError> {
-        if let Some(current) = current {
-            return self.document_dependencies_dominate(current, candidate);
-        }
-        if self.retained_accepted_catalog_matches(&self.accepted_frontier_root, candidate) {
-            return Ok(true);
-        }
-        let current = self.current_hot_document_dependencies_by_id(self.catalog_document_id)?;
-        self.document_dependencies_dominate(&current, candidate)
-    }
-
-    fn page_stable_projection_frontier(
-        &self,
-        page: &mut MaterializedPage,
-        current: &FrontierV2,
-        claim_evidence: &[ProjectionClaimEvidence],
-        effective_selection: Option<&AuthenticatedPageNameExactStateV1>,
-        effective_transition: Option<&AuthenticatedPageLocalEffectiveTransition>,
-    ) -> Result<Option<(FrontierV2, Option<AuthenticatedEffectiveProjectionClosure>)>, EngineError>
-    {
-        let path_key = page.path.portable_key().digest();
-        let Some(occupied) = self
-            .portable_path_records_many(&[path_key])?
-            .remove(&path_key)
-            .and_then(|record| record.occupied().cloned())
-            .filter(|occupied| {
-                occupied.page_id() == page.page_id && occupied.exact_path() == &page.path
-            })
-        else {
-            return Ok(None);
-        };
-        let Some(index) = self.projection_work_index.as_ref() else {
-            return Ok(None);
-        };
-        let completed = index
-            .completed_receipts_for_path(&page.path)
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
-        // A remote page may not have a local completion yet; that is the
-        // first-projection case, not evidence of an external delete. Once this
-        // endpoint has completed the path, however, only the unique completion
-        // in the current acquisition lifecycle can authorize historical reuse.
-        let mut lifecycle_completion = None;
-        for completion in &completed {
-            if completion.page_id() != page.page_id || completion.path() != &page.path {
-                continue;
-            }
-            let ProjectionWorkTarget::Present(_) = completion.target() else {
-                continue;
-            };
-            if !self.projection_frontier_contains_path_acquisition(
-                completion.frontier(),
-                occupied.acquisition_batch(),
-            )? {
-                continue;
-            }
-            if lifecycle_completion.replace(completion.clone()).is_some() {
-                return Ok(None);
-            }
-        }
-        let derived_transition = if effective_transition.is_none() {
-            match (effective_selection, lifecycle_completion.as_ref()) {
-                // A same-key title revision can already supply the selected
-                // catalog name while its merged shard still has the other
-                // branch's explicit-title preamble. Reapply that authenticated
-                // revision even when its projection lifecycle is complete.
-                (Some(selection), Some(completion))
-                    if !self.projection_frontier_contains_path_acquisition(
-                        completion.frontier(),
-                        selection.exact_state_batch(),
-                    )? || selection.revises_acquired_exact_name() =>
-                {
-                    Some(self.authenticate_selected_title_transition(selection, None)?)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(transition) = &derived_transition {
-            transition.apply_to_materialized(page)?;
-        }
-        let effective_transition = effective_transition.or(derived_transition.as_ref());
-        let current_catalog = current
-            .documents()
-            .iter()
-            .find(|document| document.document_id() == self.catalog_document_id);
-        if let Some(transition) = effective_transition {
-            let intent = &transition.selected_intent;
-            if transition.seal != EffectiveTitleTransitionSeal::Authenticated
-                || transition.page_id != page.page_id
-                || transition.selected_name != page.name
-                || transition.selected_batch != intent.source_batch_id()
-                || transition.selected_dot
-                    != self
-                        .load_observed_manifest(transition.selected_batch)?
-                        .causal_dot()
-                || intent.page_id() != page.page_id
-                || intent.path() != &page.path
-                || intent.claim_evidence() != claim_evidence
-                || !matches!(intent.target(), ManifestProjectionTarget::Present { .. })
-                || !self.projection_frontier_contains_path_acquisition(
-                    intent.post_frontier(),
-                    occupied.acquisition_batch(),
-                )?
-            {
-                return Ok(None);
-            }
-            let mismatched_completion = lifecycle_completion.as_ref().filter(|completion| {
-                intent.post_frontier() != completion.frontier()
-                    || intent
-                        .target()
-                        .description()
-                        .map(ProjectionWorkTarget::Present)
-                        != Some(completion.target())
-            });
-            let Some(candidate_catalog) = intent
-                .post_frontier()
-                .documents()
-                .iter()
-                .find(|document| document.document_id() == self.catalog_document_id)
-            else {
-                return Ok(None);
-            };
-            if !self.current_catalog_dependencies_dominate(current_catalog, candidate_catalog)? {
-                return Ok(None);
-            }
-            let state = ProjectionPageState {
-                page: page.clone(),
-                frontier: intent.post_frontier().clone(),
-                claim_evidence: claim_evidence.to_vec(),
-            };
-            let target = intent.target().bytes();
-            let rendered = super::projection::plan_projection_with_layout_annotations(
-                self.workspace_id,
-                &state,
-                target,
-                Some(intent.target().annotations()),
-            )
-            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-            if rendered.target() != target.expect("Present target has bytes") {
-                return Err(EngineError::ProjectionAuthorizationUnavailable);
-            }
-            let effective_closure =
-                mismatched_completion.map(|completion| AuthenticatedEffectiveProjectionClosure {
-                    transition: transition.clone(),
-                    lifecycle_completion: completion.clone(),
-                });
-            return Ok(Some((intent.post_frontier().clone(), effective_closure)));
-        }
-
-        let mut candidate_batches = BTreeSet::new();
-        for document in current
-            .documents()
-            .iter()
-            .filter(|document| document.document_id() != self.catalog_document_id)
-        {
-            candidate_batches.extend(document.direct_dependency_heads().iter().copied());
-        }
-        let current_non_catalog = current
-            .documents()
-            .iter()
-            .filter(|document| document.document_id() != self.catalog_document_id)
-            .collect::<Vec<_>>();
-        let mut stable = None;
-        for batch_id in candidate_batches {
-            // A managed-local head is already authenticated by the durable
-            // journal prefix and is deliberately not present in accepted
-            // history yet. Use its one validated projection intent directly;
-            // admission requires one exact existing page/path and an empty
-            // page-effect set, so the record cannot change its authenticated
-            // path acquisition. Asking accepted history to reprove either the
-            // known absence or that unchanged acquisition makes foreground
-            // work proportional to unrelated history.
-            let managed_local_intent = self
-                .local_overlay
-                .entries
-                .iter()
-                .rev()
-                .find(|entry| entry.batch_id == batch_id)
-                .map(|entry| entry.projection.intent.clone());
-            let (intents, managed_local) = match managed_local_intent {
-                Some(intent) => (vec![intent], true),
-                None => (self.load_accepted_projection_intents(batch_id)?, false),
-            };
-            for intent in intents {
-                // The portable-path acquisition is the lifecycle identity.
-                // A prior A projection after A -> B -> A cannot authorize the
-                // next A acquisition because its causal frontier cannot contain
-                // that later acquisition batch.
-                if intent.page_id() != page.page_id
-                    || intent.path() != &page.path
-                    || intent.claim_evidence() != claim_evidence
-                    || !matches!(intent.target(), ManifestProjectionTarget::Present { .. })
-                    || (!managed_local
-                        && !self.projection_frontier_contains_path_acquisition(
-                            intent.post_frontier(),
-                            occupied.acquisition_batch(),
-                        )?)
-                {
-                    continue;
-                }
-                // An accepted intent still needs the endpoint completion to
-                // select its exact historical projection. A managed-local
-                // intent instead comes from the exact committed journal entry
-                // named by the current hot frontier; its completion normally
-                // predates that undrained prefix and cannot supersede the
-                // journal authority.
-                if !managed_local
-                    && lifecycle_completion.as_ref().is_some_and(|completion| {
-                        intent.post_frontier() != completion.frontier()
-                            || intent
-                                .target()
-                                .description()
-                                .map(ProjectionWorkTarget::Present)
-                                != Some(completion.target())
-                    })
-                {
-                    continue;
-                }
-                let candidate_non_catalog = intent
-                    .post_frontier()
-                    .documents()
-                    .iter()
-                    .filter(|document| document.document_id() != self.catalog_document_id)
-                    .collect::<Vec<_>>();
-                if candidate_non_catalog != current_non_catalog {
-                    continue;
-                }
-                let Some(candidate_catalog) = intent
-                    .post_frontier()
-                    .documents()
-                    .iter()
-                    .find(|document| document.document_id() == self.catalog_document_id)
-                else {
-                    continue;
-                };
-                if !self
-                    .current_catalog_dependencies_dominate(current_catalog, candidate_catalog)?
-                {
-                    continue;
-                }
-                let state = ProjectionPageState {
-                    page: page.clone(),
-                    frontier: intent.post_frontier().clone(),
-                    claim_evidence: claim_evidence.to_vec(),
-                };
-                let target = intent.target().bytes();
-                let rendered = super::projection::plan_projection_with_layout_annotations(
-                    self.workspace_id,
-                    &state,
-                    target,
-                    Some(intent.target().annotations()),
-                )
-                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                if rendered.target() != target.expect("Present target has bytes") {
-                    continue;
-                }
-                match &stable {
-                    Some(existing) if existing != intent.post_frontier() => return Ok(None),
-                    Some(_) => {}
-                    None => stable = Some(intent.post_frontier().clone()),
-                }
-            }
-        }
-        Ok(stable.map(|frontier| (frontier, None)))
+        Ok((page, frontier, claim_evidence))
     }
 
     fn projection_frontier_contains_path_acquisition(
@@ -21810,18 +20158,11 @@ impl ShardedHotEngine {
                 }
                 match self.validate_and_apply(batch_id, true, None, None, claim_source) {
                     Ok(BatchApplication::Accepted { no_op, evidence }) => {
-                        let manifest_fingerprint = self.archive_fingerprints[&batch_id];
                         self.set_final_status(
                             batch_id,
                             ArchiveStatus::Accepted { no_op, evidence },
                         );
                         if self.history_failure.is_some() {
-                            break 'drain;
-                        }
-                        if let Err(error) =
-                            self.activate_projection_work(batch_id, manifest_fingerprint)
-                        {
-                            self.history_failure = Some(error);
                             break 'drain;
                         }
                         accepted.push(AcceptedBatch { batch_id, no_op });
@@ -24098,7 +22439,6 @@ impl ShardedHotEngine {
         self.record_replay_timing_elapsed(durable_history_started, |timing, elapsed| {
             timing.durable_history_nanos = timing.durable_history_nanos.saturating_add(elapsed);
         });
-        let projection_preparation_error = self.prepare_projection_work(batch_id).err();
         self.commit_identity_publication(identity);
         self.commit_logseq_claim_updates(
             logseq_claim_candidate.expect("visible batch prepared Logseq claim updates"),
@@ -24172,9 +22512,6 @@ impl ShardedHotEngine {
                         .retain(|current| *current != document_id);
                 }
             }
-        }
-        if let Some(error) = projection_preparation_error {
-            self.history_failure = Some(error);
         }
         self.remember_effective_semantic_view(
             batch_id,
@@ -26204,7 +24541,6 @@ impl ShardedHotEngine {
             self.precommit_history_publication_failure = Some(error.clone());
             return Err(error);
         }
-        let projection_preparation_error = self.prepare_projection_work(batch_id).err();
         self.commit_identity_publication(identity);
         self.commit_logseq_claim_updates(logseq_claim_candidate);
         self.commit_portable_path_updates(portable_paths);
@@ -26255,9 +24591,6 @@ impl ShardedHotEngine {
                     .borrow_mut()
                     .insert(document_id, before);
             }
-        }
-        if let Some(error) = projection_preparation_error {
-            self.history_failure = Some(error);
         }
         self.remember_effective_semantic_view(batch_id, &effective_view);
         Ok(Some(BatchApplication::Accepted {
@@ -32545,7 +30878,6 @@ mod validation_tests {
         ExternalImportObservationEntry, ExternalImportObservationState,
     };
     use crate::oplog::lazy_genesis::LazyGenesisBlockInput;
-    use crate::oplog::projection_work_index::ProjectionExpectedPathReadBudget;
     use crate::oplog::{BlobDescription, ImportId, ProjectionReceiptStoreId};
 
     fn validated_transition(
@@ -32859,7 +31191,6 @@ mod validation_tests {
         assert!(engine.detached_accepted_manifests.is_empty());
         assert!(engine.archive_store.is_none());
         assert!(engine.history_store.is_none());
-        assert!(engine.projection_work_index.is_none());
     }
 
     #[test]
@@ -34025,7 +32356,6 @@ mod validation_tests {
             );
             assert!(replayed.engine.archive_store.is_none());
             assert!(replayed.engine.history_store.is_none());
-            assert!(replayed.engine.projection_work_index.is_none());
             drop(replayed);
             drop(expected);
             drop(store);
@@ -34263,7 +32593,6 @@ mod validation_tests {
         assert!(engine.archive.is_empty());
         assert!(engine.archive_store.is_none());
         assert!(engine.history_store.is_none());
-        assert!(engine.projection_work_index.is_none());
         assert!(engine.projection_endpoint.is_none());
         let scratch_root = completed
             .scratch_root
@@ -34328,7 +32657,6 @@ mod validation_tests {
         accepted_frontier_root: AcceptedFrontierRoot,
         accepted_sequence: BTreeMap<u64, BatchId>,
         next_acceptance_sequence: u64,
-        projection_pending: Vec<u8>,
     }
 
     fn document_updates(
@@ -34350,23 +32678,6 @@ mod validation_tests {
             .history_store
             .as_ref()
             .map(|store| postcard::to_allocvec(&store.current_with_binding().unwrap()).unwrap());
-        let projection_pending = engine
-            .projection_work_index
-            .as_ref()
-            .map(|index| {
-                let mut pending = Vec::new();
-                let mut cursor = None;
-                loop {
-                    let page = index.pending_activation_page(cursor.as_ref(), 64).unwrap();
-                    pending.extend_from_slice(page.pending());
-                    cursor = page.next().cloned();
-                    if cursor.is_none() {
-                        break;
-                    }
-                }
-                postcard::to_allocvec(&pending).unwrap()
-            })
-            .unwrap_or_default();
         ObservableEngineState {
             durable_history,
             history_generation: engine.history_generation,
@@ -34403,7 +32714,6 @@ mod validation_tests {
             accepted_frontier_root: engine.accepted_frontier_root.clone(),
             accepted_sequence: engine.accepted_sequence.clone(),
             next_acceptance_sequence: engine.next_acceptance_sequence,
-            projection_pending,
         }
     }
 
@@ -34726,7 +33036,6 @@ mod validation_tests {
         let r2 = engine.accepted_frontier_root().unwrap();
         assert_ne!(r1, r2);
         assert!(engine.archive_store.is_some());
-        assert!(engine.history_store.is_some());
 
         let (fallback_resolution, fallback_evidence, fallback_homes) =
             engine.resolve_logseq_uuid_current(stale_uuid).unwrap();

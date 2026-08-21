@@ -278,10 +278,11 @@ multi-record enrollment tree and reservation, `reconciliation/`, runtime
 scratch, `managed-local-journal-v1/`, `local-authorship-v1/`,
 `inactive-bootstrap-publication-v1/`, `inactive-shadow-projections-v1/`,
 `migration-source-backups-v1/`, and `bootstrap-source-capture-v1/`. Production
-open never treats any of them as authority. Their decoders/construction paths
-remain only in the test oracle while the source is physically separated; a
-real graph containing only this state is refused and can Return to Direct
-Files for a fresh clean activation.
+open never treats any of them as authority. Their production construction and
+recovery routes are physically removed; negative contract tests and the frozen
+pre-0.7 failure corpus may still name the formats. A real graph containing only
+this state is refused and can Return to Direct Files for a fresh clean
+activation.
 
 Temporary prefixes (`.tmp-`, `.head-tmp-`, `.record-tmp-`,
 `.authority-tmp-`) and `.staging` files have no authority until their named
@@ -354,7 +355,7 @@ replaces and deletes each old route.
 | joiner | its own local archive/enrollment after validating the exact shared descriptor and provider cut | rewriting the descriptor or adopting incomplete provider bytes |
 | provider transport | durable copy/rename/retirement of exact files | semantic acceptance; directory presence is not enrollment |
 | immutable oplog/archive | managed page/journal semantic truth | assets, PDF sidecars, config/settings |
-| SQLite, scratch, projection work/receipts | acceleration, reconstruction, diagnostics | semantic truth or permission to overwrite Markdown |
+| SQLite, scratch, projection receipts | acceleration, reconstruction, diagnostics | semantic truth or permission to overwrite Markdown |
 
 Authority is transferred only by a validated, durably published record while
 the current owner retains the relevant lease/capability. A path name, a newer
@@ -784,11 +785,13 @@ ambiguous baseline claims remain unresolved after reconstruction.
    IDs, names/paths, references, and properties. Markdown is a projection when
    managed mode is active. Assets, PDF sidecars, `config.edn`, and app settings
    retain their separate authorities.
-3. SQLite, reconciliation databases, scratch, Patricia lookup indexes,
-   projection-work indexes, and transient receipts are disposable. Deleting or
-   version-mismatching one may cause exactly one bounded rebuild, never a second
-   rebuild on the following open. A complete rebuild must be linear in graph
-   size and finish within 10 seconds on the release corpus.
+3. SQLite, runtime scratch, and transient projection receipts are disposable.
+   Deleting or version-mismatching one may cause exactly one bounded rebuild,
+   never a second rebuild on the following open. A complete rebuild must be
+   linear in graph size and finish within 10 seconds on the release corpus.
+   Reconciliation databases, Patricia lookup indexes, and persistent
+   projection-work indexes are retired formats: production neither opens nor
+   rebuilds them.
 4. Authoritative bytes are append-only or atomically replaced under an exact
    observed-generation/lease check. A cache cannot authorize oplog mutation or
    Markdown overwrite.
@@ -1245,10 +1248,10 @@ require the two paths to publish identical durable shadow bytes.
 The ordinary release suite tests the clean baseline-plus-manifest runtime,
 including activation, cold reopen, editor/application saves, external
 reconciliation, cross-page moves, graph/PDF/guide reads, sharing, late join,
-restart, and clean shutdown. The interleaved pre-0.7 actor scenarios remain a
-differential oracle while their source is physically extracted, but they are
-not allowed to redefine the production contract or make a release depend on
-retired enrollment, Patricia, projection-work, scratch, or shadow mechanics.
+restart, and clean shutdown. The frozen pre-0.7 actor failure corpus remains a
+regression oracle for the retirement campaign, but retired enrollment,
+Patricia, persistent projection-work, and promoted-runtime mechanics are not
+compiled production alternatives and cannot redefine the release contract.
 The exact clean-runtime selection is pinned by
 `scripts/tine-core-nextest-contract.mjs`; every other `tine-core` module remains
 fully selected. The architectural guards that bind this document to the code —

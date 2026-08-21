@@ -2638,9 +2638,11 @@ mod tests {
             }
         }
 
-        // And the sealed entry points still exist under the names this contract
-        // points activation at, so a rename cannot make the test vacuous.
-        for sealed in [
+        // The promoted-runtime resume entry points were retired with that
+        // architecture. Keep this source contract non-vacuous by proving that
+        // none of those former activation capabilities survived as callable
+        // object-store surface.
+        for retired in [
             "pub(crate) fn mint_resume_point(",
             "pub(crate) fn publish_resume_point(",
             "pub(crate) fn read_resume_adoption_candidate(",
@@ -2649,8 +2651,8 @@ mod tests {
             "fn read_resume_point_set(",
         ] {
             assert!(
-                OBJECT_STORE_SOURCE.contains(sealed),
-                "the sealed entry point {sealed} is gone"
+                !OBJECT_STORE_SOURCE.contains(retired),
+                "retired promoted-runtime resume entry point survived: {retired}"
             );
         }
         // The strict proof must stay module-private in `object_store`: a

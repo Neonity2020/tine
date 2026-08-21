@@ -47,9 +47,8 @@ use super::sync_layout::{
 use super::{
     BaseBlob, BlobDescription, CapabilityCapturedProjectionInput,
     CapabilityCapturedProjectionState, ContentDigest, ManagedPath, ProjectionCompletedReceipt,
-    ProjectionCompletion, ProjectionDirectCompletionAuthority, ProjectionEndpointBinding,
-    ProjectionIntent, ProjectionIntentId, ProjectionPrecondition, ProjectionReceiptStoreId,
-    ProjectionWork, ProjectionWorkCompletionAuthority, ProjectionWorkTarget, ReceiptError,
+    ProjectionCompletion, ProjectionEndpointBinding, ProjectionIntent, ProjectionIntentId,
+    ProjectionPrecondition, ProjectionReceiptStoreId, ProjectionWorkTarget, ReceiptError,
     WorkspaceId,
 };
 #[cfg(test)]
@@ -1853,79 +1852,6 @@ impl ProjectionReceiptStore {
             ));
         }
         Ok((intent, completion))
-    }
-
-    pub(crate) fn completed_direct_authority(
-        &self,
-        intent: &ProjectionIntent,
-        target: ProjectionWorkTarget,
-        engine_history_generation: u64,
-        engine_history_root: super::ContentDigest,
-    ) -> Result<ProjectionDirectCompletionAuthority, ProjectionStoreError> {
-        let endpoint = self
-            .endpoint
-            .ok_or(ProjectionStoreError::EndpointBindingMismatch)?;
-        self.require_endpoint(endpoint)?;
-        self.require_workspace(intent)?;
-        let completion = self
-            .load_completion(intent)?
-            .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
-        completion.validate_against(intent)?;
-        let target_matches = match target {
-            ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
-            ProjectionWorkTarget::Present(description) => intent.target() == description,
-        };
-        if !target_matches {
-            return Err(ProjectionStoreError::EndpointBindingMismatch);
-        }
-        Ok(
-            ProjectionDirectCompletionAuthority::from_durable_completion(
-                endpoint.endpoint_id,
-                endpoint.graph_resource_id,
-                self.store_id,
-                engine_history_generation,
-                engine_history_root,
-                target,
-                intent,
-                &completion,
-            ),
-        )
-    }
-
-    pub(crate) fn completed_work_authority(
-        &self,
-        work: &ProjectionWork,
-        intent: &ProjectionIntent,
-    ) -> Result<ProjectionWorkCompletionAuthority, ProjectionStoreError> {
-        let endpoint = self
-            .endpoint
-            .ok_or(ProjectionStoreError::EndpointBindingMismatch)?;
-        self.require_endpoint(endpoint)?;
-        let target_matches = match work.target() {
-            ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
-            ProjectionWorkTarget::Present(target) => intent.target() == target,
-        };
-        if work.workspace_id() != self.workspace_id
-            || work.endpoint_id() != endpoint.endpoint_id
-            || work.graph_resource_id() != endpoint.graph_resource_id
-            || intent.workspace_id() != work.workspace_id()
-            || intent.page_id() != work.page_id()
-            || intent.path() != work.path()
-            || intent.frontier() != work.post_frontier()
-            || !target_matches
-        {
-            return Err(ProjectionStoreError::EndpointBindingMismatch);
-        }
-        let completion = self
-            .load_completion(intent)?
-            .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
-        completion.validate_against(intent)?;
-        Ok(ProjectionWorkCompletionAuthority::from_durable_completion(
-            work,
-            self.store_id,
-            completion.intent_id(),
-            completion.logical_completion_id(),
-        ))
     }
 
     pub fn local_forensic_evidence(

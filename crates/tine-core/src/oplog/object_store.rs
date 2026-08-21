@@ -1,14 +1,3 @@
-//! Projection work namespaces cannot be opened by external callers from a
-//! caller-constructed endpoint binding:
-//!
-//! ```compile_fail
-//! use tine_core::oplog::{ObjectStore, ProjectionEndpointBinding};
-//!
-//! fn preclaim(store: &ObjectStore, binding: ProjectionEndpointBinding) {
-//!     let _ = store.open_projection_work_index(binding);
-//! }
-//! ```
-
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
 use std::cmp::Reverse;
@@ -311,16 +300,6 @@ pub struct ObjectStore {
     workspace_id: WorkspaceId,
     capability: Dir,
     counters: Arc<StoreCounters>,
-}
-
-/// One-shot enrolled-engine open token. Existing controls are exact retained
-/// capabilities with authenticated heads pinned by the comprehensive
-/// preflight; absent controls are rechecked before any layout is created.
-pub(crate) struct EnrolledProjectionOpen {
-    store: Option<ObjectStore>,
-    binding: super::hot_engine::ProjectionStorageBinding,
-    history: Option<SealedControl<DurableEngineHistoryStore>>,
-    work: Option<SealedControl<super::ProjectionWorkIndex>>,
 }
 
 /// One-shot bootstrap installer token. It seals only durable history and never
@@ -2400,51 +2379,6 @@ impl ObjectStore {
         self.counters.snapshot()
     }
 
-    pub(crate) fn seal_enrolled_projection(
-        self,
-        binding: super::hot_engine::ProjectionStorageBinding,
-    ) -> Result<EnrolledProjectionOpen, (Self, StoreError)> {
-        let history = match self.seal_existing_engine_history(binding) {
-            Ok(history) => history,
-            Err(error) => return Err((self, error)),
-        };
-        if let SealedControl::Existing(history) = &history {
-            match history.current_bootstrap_binding() {
-                Ok(Some(_)) => return Err((self, StoreError::InactiveBootstrapHistory)),
-                Ok(None) => {}
-                Err(error) => return Err((self, error)),
-            }
-        }
-        self.finish_sealing_projection(binding, history)
-    }
-
-    fn finish_sealing_projection(
-        self,
-        binding: super::hot_engine::ProjectionStorageBinding,
-        mut history: SealedControl<DurableEngineHistoryStore>,
-    ) -> Result<EnrolledProjectionOpen, (Self, StoreError)> {
-        let mut work = match self.seal_existing_projection_work(binding) {
-            Ok(work) => work,
-            Err(error) => return Err((self, error)),
-        };
-        let history_parent_created = match history.bind_absent_parent(&self.capability) {
-            Ok(created) => created,
-            Err(error) => return Err((self, error)),
-        };
-        if let Err(error) = work.bind_absent_parent(&self.capability) {
-            if history_parent_created {
-                history.release_empty_parent(&self.capability);
-            }
-            return Err((self, error));
-        }
-        Ok(EnrolledProjectionOpen {
-            store: Some(self),
-            binding,
-            history: Some(history),
-            work: Some(work),
-        })
-    }
-
     /// Seal the durable-history control for inactive bootstrap installation.
     /// This performs the same no-follow, absence, retained-resource, and
     /// substitution checks as enrolled open without touching projection-work.
@@ -2510,44 +2444,6 @@ impl ObjectStore {
                 Arc::clone(&self.counters),
             )
             .map(SealedControl::Existing),
-            _ => Err(StoreError::MalformedHistoryIndex),
-        }
-    }
-
-    fn seal_existing_projection_work(
-        &self,
-        binding: super::hot_engine::ProjectionStorageBinding,
-    ) -> Result<SealedControl<super::ProjectionWorkIndex>, StoreError> {
-        let Some(root) = open_existing_dir_nofollow(&self.capability, PROJECTION_WORK_DIR)? else {
-            return Ok(SealedControl::Absent(AbsentControlName {
-                namespace_name: PROJECTION_WORK_DIR,
-                namespace: None,
-                namespace_identity: None,
-                endpoint_name: binding.endpoint.endpoint_id.to_string(),
-            }));
-        };
-        let endpoint_name = binding.endpoint.endpoint_id.to_string();
-        let Some(control) = open_existing_dir_nofollow(&root, &endpoint_name)? else {
-            return Ok(SealedControl::Absent(AbsentControlName {
-                namespace_name: PROJECTION_WORK_DIR,
-                namespace_identity: Some(control_directory_identity(&root)?),
-                namespace: Some(root),
-                endpoint_name,
-            }));
-        };
-        let head = read_optional_regular(&control, "projection-work.head", 64, None)?;
-        let claim = read_optional_regular(&control, "projection-work.claim", 256, None)?;
-        match (head, claim) {
-            (None, None) => Err(StoreError::MalformedHistoryIndex),
-            (Some(_), Some(_)) => super::ProjectionWorkIndex::open_sealed_existing(
-                control,
-                self.workspace_id,
-                binding.endpoint.endpoint_id,
-                binding.endpoint.graph_resource_id,
-                binding.receipt_store_id,
-            )
-            .map(SealedControl::Existing)
-            .map_err(|error| StoreError::Scratch(error.to_string())),
             _ => Err(StoreError::MalformedHistoryIndex),
         }
     }
@@ -2898,57 +2794,6 @@ impl ObjectStore {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_projection_work_index(
-        &self,
-        binding: super::hot_engine::ProjectionStorageBinding,
-    ) -> Result<super::ProjectionWorkIndex, StoreError> {
-        self.preflight_projection_work_index(binding)?;
-        let endpoint = binding.endpoint;
-        ensure_directory_nofollow(&self.capability, PROJECTION_WORK_DIR)?;
-        let root = open_dir_nofollow(&self.capability, PROJECTION_WORK_DIR)?;
-        let endpoint_name = endpoint.endpoint_id.to_string();
-        ensure_directory_nofollow(&root, &endpoint_name)?;
-        let endpoint_dir = open_dir_nofollow(&root, &endpoint_name)?;
-        for name in ["nodes", "roots", "prepared"] {
-            ensure_directory_nofollow(&endpoint_dir, name)?;
-        }
-        super::ProjectionWorkIndex::new(
-            self.workspace_id,
-            endpoint.endpoint_id,
-            endpoint.graph_resource_id,
-            binding.receipt_store_id,
-            endpoint_dir.try_clone()?,
-            open_dir_nofollow(&endpoint_dir, "nodes")?,
-            open_dir_nofollow(&endpoint_dir, "roots")?,
-            open_dir_nofollow(&endpoint_dir, "prepared")?,
-        )
-        .map_err(|error| StoreError::Scratch(error.to_string()))
-    }
-
-    fn open_absent_projection_work_index(
-        &self,
-        absence: AbsentControlName,
-        binding: super::hot_engine::ProjectionStorageBinding,
-    ) -> Result<super::ProjectionWorkIndex, StoreError> {
-        let endpoint_dir = absence.claim(&self.capability)?;
-        for name in ["nodes", "roots", "prepared"] {
-            endpoint_dir.create_dir(name)?;
-        }
-        sync_dir_required(&endpoint_dir)?;
-        super::ProjectionWorkIndex::new(
-            self.workspace_id,
-            binding.endpoint.endpoint_id,
-            binding.endpoint.graph_resource_id,
-            binding.receipt_store_id,
-            endpoint_dir.try_clone()?,
-            open_dir_nofollow(&endpoint_dir, "nodes")?,
-            open_dir_nofollow(&endpoint_dir, "roots")?,
-            open_dir_nofollow(&endpoint_dir, "prepared")?,
-        )
-        .map_err(|error| StoreError::Scratch(error.to_string()))
-    }
-
     fn preflight_engine_history(
         &self,
         binding: super::hot_engine::ProjectionStorageBinding,
@@ -3012,43 +2857,6 @@ impl ObjectStore {
             }
             _ => Err(StoreError::MalformedHistoryIndex),
         }
-    }
-
-    #[cfg(test)]
-    fn preflight_projection_work_index(
-        &self,
-        binding: super::hot_engine::ProjectionStorageBinding,
-    ) -> Result<(), StoreError> {
-        let Some(root) = open_existing_dir_nofollow(&self.capability, PROJECTION_WORK_DIR)? else {
-            return Ok(());
-        };
-        let endpoint_name = binding.endpoint.endpoint_id.to_string();
-        let Some(control) = open_existing_dir_nofollow(&root, &endpoint_name)? else {
-            return Ok(());
-        };
-        let head = read_optional_regular(&control, "projection-work.head", 64, None)?;
-        let claim = read_optional_regular(&control, "projection-work.claim", 256, None)?;
-        match (head, claim) {
-            (None, None) => Ok(()),
-            (Some(_), Some(_)) => super::ProjectionWorkIndex::preflight_existing(
-                &control,
-                self.workspace_id,
-                binding.endpoint.endpoint_id,
-                binding.endpoint.graph_resource_id,
-                binding.receipt_store_id,
-            )
-            .map_err(|error| StoreError::Scratch(error.to_string())),
-            _ => Err(StoreError::MalformedHistoryIndex),
-        }
-    }
-
-    #[cfg(test)]
-    fn preflight_enrolled_projection(
-        &self,
-        binding: super::hot_engine::ProjectionStorageBinding,
-    ) -> Result<(), StoreError> {
-        self.preflight_engine_history(binding)?;
-        self.preflight_projection_work_index(binding)
     }
 
     /// Enumerate all manifest commit markers in deterministic BatchId order.
@@ -4018,91 +3826,6 @@ impl BootstrapBlobCursor {
             ))?
             .finish()?;
         Ok(())
-    }
-}
-
-impl EnrolledProjectionOpen {
-    pub(crate) const fn binding(&self) -> super::hot_engine::ProjectionStorageBinding {
-        self.binding
-    }
-
-    pub(crate) fn into_runtime(
-        mut self,
-    ) -> Result<
-        (
-            ObjectStore,
-            DurableEngineHistoryStore,
-            super::ProjectionWorkIndex,
-        ),
-        (ObjectStore, StoreError),
-    > {
-        enrolled_open_use_hook();
-        let validation = (|| {
-            match self
-                .history
-                .as_ref()
-                .expect("sealed history control is present")
-            {
-                SealedControl::Existing(history) => history.validate_sealed_open()?,
-                SealedControl::Absent(_) => {}
-            }
-            match self.work.as_ref().expect("sealed work control is present") {
-                SealedControl::Existing(work) => work
-                    .validate_sealed_open()
-                    .map_err(|error| StoreError::Scratch(error.to_string())),
-                SealedControl::Absent(_) => Ok(()),
-            }
-        })();
-        if let Err(error) = validation {
-            return Err((self.store.take().expect("sealed store is present"), error));
-        }
-        enrolled_open_act_hook();
-
-        let store = self.store.take().expect("sealed store is present");
-        let post_hook_validation = (|| {
-            match self
-                .history
-                .as_ref()
-                .expect("sealed history control is present")
-            {
-                SealedControl::Existing(history) => history.validate_sealed_open()?,
-                SealedControl::Absent(absence) => {
-                    absence.validate_still_absent(&store.capability)?
-                }
-            }
-            match self.work.as_ref().expect("sealed work control is present") {
-                SealedControl::Existing(work) => work
-                    .validate_sealed_open()
-                    .map_err(|error| StoreError::Scratch(error.to_string())),
-                SealedControl::Absent(absence) => absence.validate_still_absent(&store.capability),
-            }
-        })();
-        if let Err(error) = post_hook_validation {
-            return Err((store, error));
-        }
-        let history = match self
-            .history
-            .take()
-            .expect("sealed history control is present")
-        {
-            SealedControl::Existing(history) => history,
-            SealedControl::Absent(absence) => {
-                match store.open_absent_engine_history(absence, self.binding) {
-                    Ok(history) => history,
-                    Err(error) => return Err((store, error)),
-                }
-            }
-        };
-        let work = match self.work.take().expect("sealed work control is present") {
-            SealedControl::Existing(work) => work,
-            SealedControl::Absent(absence) => {
-                match store.open_absent_projection_work_index(absence, self.binding) {
-                    Ok(work) => work,
-                    Err(error) => return Err((store, error)),
-                }
-            }
-        };
-        Ok((store, history, work))
     }
 }
 
@@ -7700,140 +7423,6 @@ mod history_index_tests {
     }
 
     #[test]
-    fn absent_enrolled_controls_are_not_adopted_after_last_validation() {
-        #[derive(Clone, Copy)]
-        enum Attack {
-            Create,
-            Substitute,
-        }
-
-        for (label, control_name, attack) in [
-            ("history-create", ENGINE_HISTORY_DIR, Attack::Create),
-            ("work-create", PROJECTION_WORK_DIR, Attack::Create),
-            ("history-substitute", ENGINE_HISTORY_DIR, Attack::Substitute),
-            ("work-substitute", PROJECTION_WORK_DIR, Attack::Substitute),
-        ] {
-            let root = test_root(&format!("absent-enrolled-{label}"));
-            let archive = root.join("archive");
-            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(100));
-            let binding = enrolled_binding(110);
-            let store = ObjectStore::open(&archive, workspace).unwrap();
-            let open = store.seal_enrolled_projection(binding).unwrap();
-            let control = archive
-                .join(control_name)
-                .join(binding.endpoint.endpoint_id.to_string());
-            let snapshot = Arc::new(Mutex::new(None));
-            let snapshot_hook = Arc::clone(&snapshot);
-            let archive_hook = archive.clone();
-            set_enrolled_open_act_hook(move || {
-                match attack {
-                    Attack::Create => std::fs::create_dir_all(&control).unwrap(),
-                    Attack::Substitute => {
-                        std::fs::create_dir_all(control.parent().unwrap()).unwrap();
-                        let foreign = archive_hook.join(format!("foreign-{label}"));
-                        std::fs::create_dir(&foreign).unwrap();
-                        std::fs::rename(foreign, &control).unwrap();
-                    }
-                }
-                std::fs::write(control.join("foreign-owner"), b"foreign archive").unwrap();
-                *snapshot_hook.lock().unwrap() = Some(snapshot_tree_with_identity(&archive_hook));
-            });
-
-            assert!(
-                open.into_runtime().is_err(),
-                "formerly absent {label} control was adopted"
-            );
-            assert_eq!(
-                snapshot_tree_with_identity(&archive),
-                snapshot.lock().unwrap().clone().expect("attack hook ran"),
-                "rejection mutated the foreign {label} archive"
-            );
-            crate::test_support::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn absent_endpoint_rejects_sealed_parent_namespace_substitution() {
-        for (label, namespace_name) in [
-            ("history-parent", ENGINE_HISTORY_DIR),
-            ("work-parent", PROJECTION_WORK_DIR),
-        ] {
-            let root = test_root(&format!("absent-parent-{label}"));
-            let archive = root.join("archive");
-            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(105));
-            let binding = enrolled_binding(115);
-            let store = ObjectStore::open(&archive, workspace).unwrap();
-            let namespace = archive.join(namespace_name);
-            std::fs::create_dir(&namespace).unwrap();
-            std::fs::create_dir(namespace.join("unrelated-endpoint")).unwrap();
-            let open = store.seal_enrolled_projection(binding).unwrap();
-            let moved = archive.join(format!("{namespace_name}-moved"));
-            let endpoint = namespace.join(binding.endpoint.endpoint_id.to_string());
-            let snapshot = Arc::new(Mutex::new(None));
-            let snapshot_hook = Arc::clone(&snapshot);
-            let archive_hook = archive.clone();
-            set_enrolled_open_act_hook(move || {
-                std::fs::rename(&namespace, &moved).unwrap();
-                std::fs::create_dir(&namespace).unwrap();
-                std::fs::create_dir(&endpoint).unwrap();
-                std::fs::write(endpoint.join("foreign-owner"), b"foreign archive").unwrap();
-                *snapshot_hook.lock().unwrap() = Some(snapshot_tree_with_identity(&archive_hook));
-            });
-
-            assert!(open.into_runtime().is_err());
-            assert_eq!(
-                snapshot_tree_with_identity(&archive),
-                snapshot.lock().unwrap().clone().expect("attack hook ran")
-            );
-            crate::test_support::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn enrolled_history_head_rollback_after_validation_is_rejected() {
-        let root = test_root("enrolled-head-rollback-at-act");
-        let archive = root.join("archive");
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(120));
-        let binding = enrolled_binding(130);
-        let store = ObjectStore::open(&archive, workspace).unwrap();
-        let history = store.open_engine_history(binding).unwrap();
-        let control = archive
-            .join(ENGINE_HISTORY_DIR)
-            .join(binding.endpoint.endpoint_id.to_string());
-        let original = std::fs::read(control.join(ENGINE_HISTORY_HEAD_FILE)).unwrap();
-        history
-            .publish(
-                BatchId::from_uuid(Uuid::from_u128(140)),
-                b"accepted history",
-                EngineHistoryBinding::empty(),
-            )
-            .unwrap();
-        drop(history);
-        drop(store.open_projection_work_index(binding).unwrap());
-        drop(store);
-
-        let open = ObjectStore::open(&archive, workspace)
-            .unwrap()
-            .seal_enrolled_projection(binding)
-            .unwrap();
-        let attacked = Arc::new(Mutex::new(None));
-        let attacked_hook = Arc::clone(&attacked);
-        let archive_hook = archive.clone();
-        set_enrolled_open_act_hook(move || {
-            std::fs::write(control.join(ENGINE_HISTORY_HEAD_FILE), original).unwrap();
-            *attacked_hook.lock().unwrap() = Some(snapshot_tree_with_identity(&archive_hook));
-        });
-
-        assert!(open.into_runtime().is_err());
-        assert_eq!(
-            snapshot_tree_with_identity(&archive),
-            attacked.lock().unwrap().clone().expect("attack hook ran"),
-            "rollback rejection mutated the archive"
-        );
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
     fn sealed_history_baseline_survives_reads_until_an_anchored_transition() {
         let root = test_root("enrolled-head-rollback-subsequent-read");
         let archive = root.join("archive");
@@ -7854,14 +7443,13 @@ mod history_index_tests {
             .unwrap();
         let accepted = std::fs::read(control.join(ENGINE_HISTORY_HEAD_FILE)).unwrap();
         drop(history);
-        drop(store.open_projection_work_index(binding).unwrap());
         drop(store);
 
-        let (_, history, _) = ObjectStore::open(&archive, workspace)
+        let (_, history) = ObjectStore::open(&archive, workspace)
             .unwrap()
-            .seal_enrolled_projection(binding)
+            .seal_history_only(binding)
             .unwrap()
-            .into_runtime()
+            .into_history()
             .unwrap();
         assert_eq!(history.current().unwrap().0, 1);
         std::fs::write(control.join(ENGINE_HISTORY_HEAD_FILE), &original).unwrap();
@@ -9346,7 +8934,7 @@ mod history_index_tests {
             std::fs::write(control.join(ENGINE_HISTORY_HEAD_FILE), digest.to_string()).unwrap();
             let before = snapshot_tree(&archive_path);
 
-            let error = store.preflight_enrolled_projection(binding).unwrap_err();
+            let error = store.preflight_engine_history(binding).unwrap_err();
             if version < ENGINE_HISTORY_ROOT_SCHEMA_VERSION {
                 assert!(matches!(
                     error,
@@ -9369,7 +8957,6 @@ mod history_index_tests {
             assert!(!archive_path
                 .join(super::super::scratch_store::SCRATCH_DIR)
                 .exists());
-            assert!(!archive_path.join(PROJECTION_WORK_DIR).exists());
         }
 
         drop(store);
@@ -10831,42 +10418,6 @@ mod bootstrap_store_tests {
             .unwrap(),
             b"foreign history"
         );
-        assert!(fixture
-            .archive
-            .join(PROJECTION_WORK_DIR)
-            .symlink_metadata()
-            .is_err());
-    }
-
-    #[test]
-    fn inactive_bootstrap_history_blocks_ordinary_enrolled_open_before_projection_creation() {
-        let fixture = EmptyBootstrapFixture::new("ordinary-open-refusal");
-        let store = fixture.store();
-        store
-            .publish_bootstrap_aggregate_prefix(&fixture.aggregate)
-            .unwrap();
-        let publication_id = store
-            .commit_bootstrap_aggregate(&fixture.aggregate)
-            .unwrap();
-        let publication = store.load_bootstrap_publication(publication_id).unwrap();
-        let storage = fixture.history_binding(0x7c50);
-        let (_, history) = store
-            .seal_history_only(storage)
-            .unwrap()
-            .into_history()
-            .unwrap();
-        history
-            .publish_many_exact(&[], &publication, EngineHistoryBinding::empty())
-            .unwrap();
-        drop(history);
-
-        let error = fixture
-            .store()
-            .seal_enrolled_projection(storage)
-            .err()
-            .expect("inactive authority must fail enrolled open")
-            .1;
-        assert!(matches!(error, StoreError::InactiveBootstrapHistory));
         assert!(fixture
             .archive
             .join(PROJECTION_WORK_DIR)

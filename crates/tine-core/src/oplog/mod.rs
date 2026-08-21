@@ -48,7 +48,7 @@ pub mod projection;
 mod projection_integration_tests;
 pub mod projection_manifest;
 pub mod projection_store;
-pub mod projection_work_index;
+pub mod projection_work;
 pub mod receipt;
 pub mod reference_catalog;
 pub mod refusal;
@@ -125,13 +125,12 @@ pub use identity::{
     SessionId, WorkspaceId,
 };
 pub use import::{
-    classify_conflict_copy, inventory_affected, inventory_initial_shadow, plan_affected_import,
-    BlockImportMatch, BlockMatchBasis, ConflictClassificationError, ConflictCopyClass, ExactBytes,
-    ImportBlock, ImportBlockReason, ImportInstrumentation, ImportMatches, ImportPlan,
-    ImportPlanStatus, InventoryError, PageImportMatch, PageMatchBasis, RawInventory,
-    RawObservation, RejectedRawId, RejectedRawIdReason, MAX_IMPORT_CATALOG_ENTRIES,
-    MAX_IMPORT_DEPTH, MAX_IMPORT_FILES, MAX_IMPORT_LOCATOR_COMPONENTS, MAX_IMPORT_PARSED_NODES,
-    MAX_IMPORT_RAW_BYTES,
+    classify_conflict_copy, inventory_affected, inventory_initial_shadow, BlockImportMatch,
+    BlockMatchBasis, ConflictClassificationError, ConflictCopyClass, ExactBytes, ImportBlock,
+    ImportBlockReason, ImportInstrumentation, ImportMatches, ImportPlan, ImportPlanStatus,
+    InventoryError, PageImportMatch, PageMatchBasis, RawInventory, RawObservation, RejectedRawId,
+    RejectedRawIdReason, MAX_IMPORT_CATALOG_ENTRIES, MAX_IMPORT_DEPTH, MAX_IMPORT_FILES,
+    MAX_IMPORT_LOCATOR_COMPONENTS, MAX_IMPORT_PARSED_NODES, MAX_IMPORT_RAW_BYTES,
 };
 pub(crate) use local_journal_v2_anchor::{
     classify_managed_local_anchor, managed_local_v2_anchor_name,
@@ -151,9 +150,9 @@ pub use portable_path_index::{
     PortablePathIndexRoot, PortablePathOccupied, PortablePathRecord, PortablePathReleased,
 };
 pub use projection::{
-    derive_receiver_local_projection, execute_manifested_projection_work, plan_projection,
-    recover_incomplete_projections, write_projection_exact, PolicyGeneratedAnchor, ProjectionError,
-    ProjectionPlan, ProjectionWrite,
+    derive_receiver_local_projection, plan_projection, recover_incomplete_projections,
+    write_projection_exact, PolicyGeneratedAnchor, ProjectionError, ProjectionPlan,
+    ProjectionWrite,
 };
 pub use projection_manifest::{
     annotated_base_document_id, projection_intent_document_id, AnnotatedProjectionBase,
@@ -166,15 +165,8 @@ pub use projection_store::{
     LocalProjectionEvidenceRecord, ProjectionAttemptReservation, ProjectionReceiptStore,
     ProjectionStoreError,
 };
-pub(crate) use projection_work_index::{
-    ProjectionCompletedReceipt, ProjectionDirectCompletionAuthority, ProjectionWorkBlockAuthority,
-    ProjectionWorkCompletionAuthority,
-};
-pub use projection_work_index::{
-    ProjectionPendingActivation, ProjectionPendingCursor, ProjectionPendingPage, ProjectionWork,
-    ProjectionWorkCursor, ProjectionWorkError, ProjectionWorkId, ProjectionWorkIndex,
-    ProjectionWorkIndexStats, ProjectionWorkPage, ProjectionWorkStatus, ProjectionWorkTarget,
-};
+pub(crate) use projection_work::ProjectionCompletedReceipt;
+pub use projection_work::{ProjectionWork, ProjectionWorkId, ProjectionWorkTarget};
 pub(crate) use receipt::managed_component_is_portable;
 pub use receipt::{
     AnnotatedIdentity, BaseBlob, BlobDescription, CrdtPeerCounter, DocumentCausalDigest,

@@ -27,8 +27,7 @@ use super::{
     ObjectKind, ObjectStore, PageId, ProjectionCompletedReceipt, ProjectionCompletion,
     ProjectionEndpointBinding, ProjectionEndpointId, ProjectionIntent, ProjectionPageState,
     ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError,
-    ProjectionTombstoneAuthorization, ProjectionWork, ProjectionWorkBlockAuthority,
-    ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget, ReceiptError,
+    ProjectionTombstoneAuthorization, ProjectionWork, ProjectionWorkTarget, ReceiptError,
     ShardedHotEngine, SqliteFrontier, StructuralLocator, StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
@@ -1001,93 +1000,6 @@ pub(crate) fn plan_projection_with_layout_annotations(
     projection_plan_from_rendered(workspace_id, state, expected_base, rendered)
 }
 
-/// One current completed-path receipt whose immutable completion and the live
-/// graph bytes together prove the exact semantic predecessor for a new local
-/// projection. This is deliberately a *live* proof: an old receipt base is
-/// not reconstructed and compared with a newer serializer. The completed-path
-/// row authenticates which receipt is current, while the live target digest and
-/// layout-aware replay prove that those bytes still describe the accepted page.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReceiptBackedLiveProjectionPredecessor {
-    completed: ProjectionCompletedReceipt,
-    intent: ProjectionIntent,
-    completion: ProjectionCompletion,
-}
-
-impl ReceiptBackedLiveProjectionPredecessor {
-    pub(crate) const fn completed(&self) -> &ProjectionCompletedReceipt {
-        &self.completed
-    }
-
-    pub(crate) const fn intent(&self) -> &ProjectionIntent {
-        &self.intent
-    }
-
-    pub(crate) const fn completion(&self) -> &ProjectionCompletion {
-        &self.completion
-    }
-}
-
-/// Prove that `live_bytes` remain the current projection of `state` through
-/// the enrolled completed-path authority. `None` is an ordinary stale or
-/// externally-divergent observation and must enter reconciliation; an error
-/// denotes malformed or foreign durable authority.
-pub(crate) fn receipt_backed_live_projection_predecessor(
-    workspace_id: WorkspaceId,
-    endpoint: ProjectionEndpointBinding,
-    receipts: &ProjectionReceiptStore,
-    work_index: &ProjectionWorkIndex,
-    state: &ProjectionPageState,
-    live_bytes: &[u8],
-) -> Result<Option<ReceiptBackedLiveProjectionPredecessor>, ProjectionError> {
-    if receipts.workspace_id() != workspace_id
-        || receipts.endpoint_binding() != Some(endpoint)
-        || work_index.workspace_id() != workspace_id
-        || work_index.endpoint_id() != endpoint.endpoint_id()
-        || work_index.graph_resource_id() != endpoint.graph_resource_id()
-        || work_index.receipt_store_id() != receipts.store_id()
-    {
-        return Err(ProjectionError::EndpointBindingMismatch);
-    }
-
-    let completed = work_index
-        .completed_receipts_for_path(&state.page.path)
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    let [completed] = completed.as_slice() else {
-        return Ok(None);
-    };
-    if !matches!(completed.target(), ProjectionWorkTarget::Present(_)) {
-        return Ok(None);
-    }
-
-    let (intent, completion) = receipts.load_completed_receipt(completed)?;
-    if intent.workspace_id() != workspace_id
-        || intent.page_id() != state.page.page_id
-        || intent.path() != &state.page.path
-        || intent.frontier() != &state.frontier
-        || intent.claim_evidence() != state.claim_evidence
-        || intent.target() != super::BlobDescription::of(live_bytes)
-    {
-        return Ok(None);
-    }
-
-    let replay = plan_projection_with_layout_annotations(
-        workspace_id,
-        state,
-        Some(live_bytes),
-        Some(intent.annotations()),
-    )?;
-    if replay.target() != live_bytes || replay.intent().annotations() != intent.annotations() {
-        return Ok(None);
-    }
-
-    Ok(Some(ReceiptBackedLiveProjectionPredecessor {
-        completed: completed.clone(),
-        intent,
-        completion,
-    }))
-}
-
 fn projection_plan_from_rendered(
     workspace_id: WorkspaceId,
     state: &ProjectionPageState,
@@ -1660,44 +1572,20 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         return Err(ProjectionError::ReceiverEndpointIsSource);
     }
     let source_absent = matches!(source.target(), ManifestProjectionTarget::Absent);
-    let mut effective_candidate = None;
     // The accepted current state of this page, retained when the source intent
     // is no longer the live authority but this receiver still owes the page a
     // Markdown projection. See the supersession note below.
     let mut superseded_current = None;
     let tombstone_authorization = if source_absent {
-        // The engine names the regime, not the caller: only an index-free clean
-        // runtime may take the clean authorization, and a clean runtime may not
-        // silently fall back to the pre-0.7 one it can never satisfy.
-        let clean_runtime = engine.require_index_free_clean_projection_runtime().is_ok();
-        match clean_runtime.then_some(clean_projection).flatten() {
-            Some(projection) => {
-                match engine.authorize_clean_projection_tombstone(projection, source)? {
-                    CleanTombstoneAuthorization::Authorized(authorization) => Some(*authorization),
-                    // A live page owns this exact path in current accepted
-                    // state, so the delivered release is historical evidence
-                    // and its owner projects the path. Finishing here is the
-                    // convergent answer, not a dropped deletion.
-                    CleanTombstoneAuthorization::Superseded(_) => return Ok(Some(false)),
-                    // Nothing is wrong; this device cannot answer yet. Retain a
-                    // continuation so the batch stays DurablePending and
-                    // clean_shutdown keeps refusing Safe.
-                    CleanTombstoneAuthorization::Deferred(_) => return Ok(None),
-                }
-            }
-            // A clean runtime that reached here without its disposable
-            // projection cannot prove a path release at all; refuse by name
-            // rather than fall through to an authorization it cannot satisfy.
-            None if clean_runtime => {
-                return Err(ProjectionError::Engine(EngineError::ProjectionWork(
-                    "clean receiver-local deletion has no disposable SQLite projection".into(),
-                )))
-            }
-            None => match engine.authorize_projection_tombstone(source) {
-                Ok(authorization) => Some(authorization),
-                Err(EngineError::ProjectionAuthorizationUnavailable) => return Ok(Some(false)),
-                Err(error) => return Err(error.into()),
-            },
+        let projection = clean_projection.ok_or_else(|| {
+            ProjectionError::Engine(EngineError::ProjectionWork(
+                "clean receiver-local deletion has no disposable SQLite projection".into(),
+            ))
+        })?;
+        match engine.authorize_clean_projection_tombstone(projection, source)? {
+            CleanTombstoneAuthorization::Authorized(authorization) => Some(*authorization),
+            CleanTombstoneAuthorization::Superseded(_) => return Ok(Some(false)),
+            CleanTombstoneAuthorization::Deferred(_) => return Ok(None),
         }
     } else {
         let current = match engine.authorize_projection_write(source.page_id()) {
@@ -1711,86 +1599,29 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
                 && current.state().claim_evidence == source.claim_evidence()
         });
         if !current_matches_source {
-            // Most superseded immutable intents are historical evidence only.
-            // One exception is an exact-title event selected by the current
-            // merged frontier: its original source intent remains the
-            // authenticated authority for the winning UTF-8 spelling and for
-            // whether that title was explicit or filename-derived.
-            match engine.authenticate_effective_title_projection_candidate(source.page_id()) {
-                Ok(candidate) => effective_candidate = Some(candidate),
-                Err(EngineError::ProjectionAuthorizationUnavailable) => {
-                    // "Superseded" is a claim about the WHOLE merged frontier,
-                    // not about this page. An ordinary local external admission
-                    // on the receiving device commits its own batch, which
-                    // advances the shared page-catalog document; the delivered
-                    // page itself is untouched, yet its intent's post-frontier
-                    // stops matching. Dropping the intent here used to leave the
-                    // batch applied in SQLite with its Markdown file never
-                    // written, surviving Safe shutdown and reopen — durable
-                    // data-visibility loss, because Markdown is the interchange
-                    // truth. Nothing else owns this path, so project the
-                    // accepted CURRENT state instead. That is idempotent: a page
-                    // genuinely superseded by newer accepted work renders to the
-                    // bytes that already sit on disk.
-                    let Some(current) = current else {
-                        // Neither the delivered intent nor the current accepted
-                        // state can be authorized. The obligation is real and
-                        // unmet, so retain it rather than report completion.
-                        return Ok(None);
-                    };
-                    superseded_current = Some(current);
-                }
-                Err(error) => return Err(error.into()),
-            }
+            let Some(current) = current else {
+                return Ok(None);
+            };
+            superseded_current = Some(current);
         }
         None
     };
-    let projection_source = effective_candidate
-        .as_ref()
-        .map(|candidate| candidate.source())
-        .unwrap_or(source);
     // A page renamed after this intent was authored is projected at the path
     // the accepted state names, never at the intent's stale one.
-    let projection_path = superseded_current.as_ref().map_or_else(
-        || projection_source.path(),
-        |current| &current.state().page.path,
-    );
+    let projection_path = superseded_current
+        .as_ref()
+        .map_or_else(|| source.path(), |current| &current.state().page.path);
     let local_base = graph.read_projection_input(projection_path)?;
     let source_layout_base = if source_absent {
         None
     } else {
-        authenticated_source_layout_base(engine, projection_source)?
+        authenticated_source_layout_base(engine, source)?
     };
-    let mut effective_prior_completion = None;
     let plan = if source_absent {
         let authorization = tombstone_authorization
             .as_ref()
             .expect("Absent source has tombstone authorization");
-        if engine.require_index_free_clean_projection_runtime().is_ok() {
-            receiver_clean_tombstone_plan(engine, authorization, local_base.as_deref())?
-        } else {
-            receiver_tombstone_plan(receipts, engine, authorization, local_base.as_deref())?
-        }
-    } else if let Some(candidate) = effective_candidate.as_ref() {
-        let (completed_intent, completion) =
-            receipts.load_completed_receipt(candidate.lifecycle_completion())?;
-        let local_base = local_base
-            .as_deref()
-            .ok_or(ProjectionError::ReceiverBaseMismatch)?;
-        let authorization = engine.authorize_effective_title_projection_write(
-            candidate,
-            projection_source,
-            &completed_intent,
-            &completion,
-            local_base,
-        )?;
-        let plan = plan_projection(
-            engine.workspace_id(),
-            authorization.state(),
-            Some(local_base),
-        )?;
-        effective_prior_completion = Some((completed_intent, completion));
-        plan
+        receiver_clean_tombstone_plan(engine, authorization, local_base.as_deref())?
     } else if let Some(current) = superseded_current.as_ref() {
         plan_projection_with_layout_annotations(
             engine.workspace_id(),
@@ -1887,54 +1718,22 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             record_completed_tombstone_path(receipts, engine, plan.intent(), authorization)?
         }
         None => {
-            if let Some((completed_intent, completion)) = effective_prior_completion.as_ref() {
-                let candidate = effective_candidate
-                    .as_ref()
-                    .expect("effective prior completion has a candidate");
-                let exact_local_base = local_base
-                    .as_deref()
-                    .ok_or(ProjectionError::ReceiverBaseMismatch)?;
-                let authorization = engine.authorize_effective_title_projection_write(
-                    candidate,
-                    projection_source,
-                    completed_intent,
-                    completion,
-                    exact_local_base,
-                )?;
-                let replay = plan_projection(
-                    engine.workspace_id(),
-                    authorization.state(),
-                    Some(exact_local_base),
-                )?;
-                if replay.intent() != plan.intent() {
-                    return Err(ProjectionError::RecoveryIntentMismatch);
+            match record_completed_path(receipts, engine, source.page_id(), plan.intent()) {
+                Ok(()) => {}
+                Err(ProjectionError::RecoveryIntentMismatch)
+                    if engine.require_index_free_clean_projection_runtime().is_ok()
+                        && engine.accepted_batch_projection_is_superseded(
+                            source.source_batch_id(),
+                        )? =>
+                {
+                    // A receiver-local completion for a source batch
+                    // superseded by concurrent accepted history is durable
+                    // historical evidence, but must not be held
+                    // to the later merged rendering merely to perform that
+                    // no-op index publication. Linear mismatches still
+                    // refuse above and here.
                 }
-                record_completed_path_target(
-                    receipts,
-                    engine,
-                    source.page_id(),
-                    plan.intent(),
-                    ProjectionWorkTarget::Present(plan.intent().target()),
-                )?;
-            } else {
-                match record_completed_path(receipts, engine, source.page_id(), plan.intent()) {
-                    Ok(()) => {}
-                    Err(ProjectionError::RecoveryIntentMismatch)
-                        if engine.require_index_free_clean_projection_runtime().is_ok()
-                            && engine.accepted_batch_projection_is_superseded(
-                                source.source_batch_id(),
-                            )? =>
-                    {
-                        // The clean runtime has no completed-path index to
-                        // update. A receiver-local completion for a source
-                        // batch superseded by concurrent accepted history is
-                        // durable historical evidence, but must not be held
-                        // to the later merged rendering merely to perform that
-                        // no-op index publication. Linear mismatches still
-                        // refuse above and here.
-                    }
-                    Err(error) => return Err(error),
-                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1985,157 +1784,6 @@ fn receiver_clean_tombstone_plan(
     })
 }
 
-fn receiver_tombstone_plan(
-    store: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    authorization: &ProjectionTombstoneAuthorization,
-    local_base: Option<&[u8]>,
-) -> Result<ProjectionPlan, ProjectionError> {
-    let (_, work_index) = engine.enrolled_projection_runtime()?;
-    let completed = work_index
-        .completed_receipts_for_path(authorization.path())
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    let mut deletion = completed.iter().filter(|receipt| {
-        receipt.page_id() == authorization.page_id()
-            && receipt.path() == authorization.path()
-            && receipt.frontier() == authorization.frontier()
-            && receipt.target() == ProjectionWorkTarget::Absent
-    });
-    if let Some(receipt) = deletion.next() {
-        if deletion.next().is_some() {
-            return Err(ProjectionError::ReceiverBaseMismatch);
-        }
-        let (intent, _) = store.load_completed_receipt(receipt)?;
-        let base = store.load_base(&intent)?;
-        return Ok(ProjectionPlan {
-            intent,
-            base,
-            target: Vec::new(),
-            guarded_layout: GuardedProjectionLayout::empty(),
-            generated_anchors: Vec::new(),
-        });
-    }
-
-    let prior_description = match authorization.prior_frontier() {
-        Some(prior_frontier) => {
-            let mut prior = completed.iter().filter_map(|receipt| {
-                (receipt.page_id() == authorization.page_id()
-                    && receipt.path() == authorization.path()
-                    && receipt.frontier() == prior_frontier)
-                    .then(|| match receipt.target() {
-                        ProjectionWorkTarget::Present(description) => Some((receipt, description)),
-                        ProjectionWorkTarget::Absent => None,
-                    })
-                    .flatten()
-            });
-            match prior.next() {
-                Some((receipt, description)) => {
-                    if prior.next().is_some() {
-                        return Err(ProjectionError::ReceiverBaseMismatch);
-                    }
-                    store.load_completed_receipt(receipt)?;
-                    Some(description)
-                }
-                None if local_base.is_some() => {
-                    return Err(ProjectionError::ReceiverBaseMismatch);
-                }
-                None => None,
-            }
-        }
-        None => None,
-    };
-    let make_intent = |precondition| {
-        ProjectionIntent::new(
-            engine.workspace_id(),
-            authorization.page_id(),
-            authorization.path().clone(),
-            authorization.frontier().clone(),
-            Vec::new(),
-            precondition,
-            super::BlobDescription::of(&[]),
-            Vec::new(),
-        )
-    };
-    let (intent, base) = match (prior_description, local_base) {
-        (Some(description), Some(bytes)) => {
-            if super::BlobDescription::of(bytes) != description {
-                return Err(ProjectionError::ReceiverBaseMismatch);
-            }
-            (
-                make_intent(ProjectionPrecondition::Base(description))?,
-                Some(BaseBlob::new(bytes.to_vec())),
-            )
-        }
-        (Some(description), None) => {
-            let base_intent = make_intent(ProjectionPrecondition::Base(description))?;
-            match store.load_intent(base_intent.id()?)? {
-                Some(intent) if intent == base_intent => {
-                    let base = store
-                        .load_base(&intent)?
-                        .ok_or(ProjectionError::ReceiverBaseMismatch)?;
-                    (intent, Some(base))
-                }
-                Some(_) => return Err(ProjectionError::ReceiverBaseMismatch),
-                None => (make_intent(ProjectionPrecondition::Absent)?, None),
-            }
-        }
-        (None, None) => (make_intent(ProjectionPrecondition::Absent)?, None),
-        (None, Some(_)) => return Err(ProjectionError::ReceiverBaseMismatch),
-    };
-    Ok(ProjectionPlan {
-        intent,
-        base,
-        target: Vec::new(),
-        guarded_layout: GuardedProjectionLayout::empty(),
-        generated_anchors: Vec::new(),
-    })
-}
-
-/// Execute one source-endpoint manifested work row. Recovery reloads immutable
-/// target/base objects through the batch locator; no local intent or target
-/// copy is published. Device-local attempt reservations remain forensic, while
-/// stable completion is recorded against the immutable work/object reference.
-pub fn execute_manifested_projection_work(
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    engine: &mut ShardedHotEngine,
-    work: &ProjectionWork,
-) -> Result<(), ProjectionError> {
-    let (archive, work_index) = engine.enrolled_projection_runtime()?;
-    execute_manifested_projection_work_with_runtime(
-        graph,
-        receipts,
-        engine,
-        ManifestedProjectionRuntime::Legacy {
-            archive: &archive,
-            work_index: &work_index,
-        },
-        work,
-        None,
-    )
-}
-
-pub(crate) fn execute_manifested_projection_work_under_handoff(
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    engine: &mut ShardedHotEngine,
-    work: &ProjectionWork,
-    handoff: &crate::model::PublishedHandoffLatch,
-) -> Result<(), ProjectionError> {
-    let (archive, work_index) = engine.enrolled_projection_runtime()?;
-    execute_manifested_projection_work_with_runtime(
-        graph,
-        receipts,
-        engine,
-        ManifestedProjectionRuntime::Legacy {
-            archive: &archive,
-            work_index: &work_index,
-        },
-        work,
-        Some(handoff),
-    )
-}
-
 /// Execute one clean-runtime work row derived from an accepted immutable
 /// manifest. SQLite supplies only current path ownership/current-frontier
 /// evidence; it is disposable and never becomes a second work-status store.
@@ -2146,14 +1794,7 @@ pub(crate) fn execute_clean_manifested_projection_work(
     engine: &mut ShardedHotEngine,
     work: &ProjectionWork,
 ) -> Result<(), ProjectionError> {
-    execute_manifested_projection_work_with_runtime(
-        graph,
-        receipts,
-        engine,
-        ManifestedProjectionRuntime::Clean { projection },
-        work,
-        None,
-    )
+    execute_manifested_projection_work_with_runtime(graph, receipts, engine, projection, work, None)
 }
 
 pub(crate) fn execute_clean_manifested_projection_work_under_handoff(
@@ -2168,52 +1809,10 @@ pub(crate) fn execute_clean_manifested_projection_work_under_handoff(
         graph,
         receipts,
         engine,
-        ManifestedProjectionRuntime::Clean { projection },
+        projection,
         work,
         Some(handoff),
     )
-}
-
-#[derive(Clone, Copy)]
-enum ManifestedProjectionRuntime<'a> {
-    Legacy {
-        archive: &'a ObjectStore,
-        work_index: &'a ProjectionWorkIndex,
-    },
-    Clean {
-        projection: &'a SqliteFrontier,
-    },
-}
-
-impl<'a> ManifestedProjectionRuntime<'a> {
-    const fn work_index(self) -> Option<&'a ProjectionWorkIndex> {
-        match self {
-            Self::Legacy { work_index, .. } => Some(work_index),
-            Self::Clean { .. } => None,
-        }
-    }
-}
-
-fn block_manifested_projection_work(
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    work_index: &ProjectionWorkIndex,
-    work: &ProjectionWork,
-    intent_id: super::ProjectionIntentId,
-) -> Result<(), ProjectionError> {
-    let observed = graph
-        .read_projection_input(work.path())
-        .map_err(ProjectionError::Io)?
-        .as_deref()
-        .map(super::BlobDescription::of);
-    work_index
-        .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict_for_intent(
-            work,
-            receipts.store_id(),
-            observed,
-            intent_id,
-        ))
-        .map_err(|error| ProjectionError::Work(error.to_string()))
 }
 
 /// Read-only, content-addressed decoding of one exact accepted projection work
@@ -2367,12 +1966,12 @@ fn execute_manifested_projection_work_with_runtime(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
-    runtime: ManifestedProjectionRuntime<'_>,
+    projection: &SqliteFrontier,
     work: &ProjectionWork,
     handoff: Option<&crate::model::PublishedHandoffLatch>,
 ) -> Result<(), ProjectionError> {
     let path = work.path().as_str().to_owned();
-    execute_manifested_projection_work_located(graph, receipts, engine, runtime, work, handoff)
+    execute_manifested_projection_work_located(graph, receipts, engine, projection, work, handoff)
         .map_err(|error| locate_projection_failure(&path, error))
 }
 
@@ -2380,7 +1979,7 @@ fn execute_manifested_projection_work_located(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
-    runtime: ManifestedProjectionRuntime<'_>,
+    projection: &SqliteFrontier,
     work: &ProjectionWork,
     handoff: Option<&crate::model::PublishedHandoffLatch>,
 ) -> Result<(), ProjectionError> {
@@ -2390,11 +1989,7 @@ fn execute_manifested_projection_work_located(
     let receipt_store_id = engine
         .projection_receipt_store_id()
         .ok_or(ProjectionError::EndpointBindingMismatch)?;
-    if receipts.store_id() != receipt_store_id
-        || runtime
-            .work_index()
-            .is_some_and(|index| index.receipt_store_id() != receipt_store_id)
-    {
+    if receipts.store_id() != receipt_store_id {
         return Err(ProjectionError::EndpointBindingMismatch);
     }
     receipts.require_endpoint(endpoint)?;
@@ -2402,58 +1997,30 @@ fn execute_manifested_projection_work_located(
         return Err(ProjectionError::EndpointBindingMismatch);
     }
     retire_pending_projection_recovery(graph, receipts)?;
-    let clean_archive = match runtime {
-        ManifestedProjectionRuntime::Legacy { work_index, .. } => {
-            engine
-                .authorize_projection_work(work_index, work)
-                .map_err(ProjectionError::Engine)?;
-            // A journal drain has no affine process-memory continuation after a
-            // restart. Re-entering with the exact already-completed work must
-            // authenticate the same archive/intent/receipt authority below.
-            if !matches!(
-                work_index
-                    .status(work.work_id())
-                    .map_err(|error| ProjectionError::Work(error.to_string()))?,
-                Some(ProjectionWorkStatus::Ready | ProjectionWorkStatus::Completed)
-            ) {
-                return Err(ProjectionError::WorkNotReady);
-            }
-            None
-        }
-        ManifestedProjectionRuntime::Clean { projection } => engine
-            .authorize_clean_projection_work(projection, work)
-            .map_err(ProjectionError::Engine)?
-            .into(),
-    };
-    let archive = match runtime {
-        ManifestedProjectionRuntime::Legacy { archive, .. } => archive,
-        ManifestedProjectionRuntime::Clean { .. } => clean_archive
-            .as_deref()
-            .expect("clean projection authorization returns its archive"),
-    };
-    let decoded = decode_manifested_projection_work(archive, work)?;
+    let archive = engine
+        .authorize_clean_projection_work(projection, work)
+        .map_err(ProjectionError::Engine)?;
+    let decoded = decode_manifested_projection_work(&archive, work)?;
     let manifested = decoded.manifested();
     let target = decoded.target_bytes();
     let expected_base = decoded.annotated_base();
     let guarded_layout = decoded.guarded_layout();
     let local_attempt_intent = decoded.receiver_local_intent().clone();
-    if matches!(runtime, ManifestedProjectionRuntime::Clean { .. }) {
-        if let Some(target) = target {
-            let current = engine
-                .authorize_projection_write(work.page_id())
-                .map_err(ProjectionError::Engine)?;
-            let replay = plan_projection_with_layout_annotations(
-                engine.workspace_id(),
-                current.state(),
-                expected_base.map(AnnotatedProjectionBase::bytes),
-                expected_base.map(AnnotatedProjectionBase::annotations),
-            )?;
-            if replay.target() != target
-                || replay.guarded_layout() != guarded_layout
-                || !local_attempt_intent.matches_replay_except_frontier(replay.intent())
-            {
-                return Err(ProjectionError::WorkNotReady);
-            }
+    if let Some(target) = target {
+        let current = engine
+            .authorize_projection_write(work.page_id())
+            .map_err(ProjectionError::Engine)?;
+        let replay = plan_projection_with_layout_annotations(
+            engine.workspace_id(),
+            current.state(),
+            expected_base.map(AnnotatedProjectionBase::bytes),
+            expected_base.map(AnnotatedProjectionBase::annotations),
+        )?;
+        if replay.target() != target
+            || replay.guarded_layout() != guarded_layout
+            || !local_attempt_intent.matches_replay_except_frontier(replay.intent())
+        {
+            return Err(ProjectionError::WorkNotReady);
         }
     }
     // Projecting one document costs ~95ms uniformly (F46), which is far too slow
@@ -2473,12 +2040,6 @@ fn execute_manifested_projection_work_located(
     }
     if receipts.load_completion(&local_attempt_intent)?.is_some() {
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
-        if let Some(work_index) = runtime.work_index() {
-            let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
-            work_index
-                .mark_completed(authority)
-                .map_err(|error| ProjectionError::Work(error.to_string()))?;
-        }
         return Ok(());
     }
     let attempts = receipts.load_attempt_reservations(&local_attempt_intent)?;
@@ -2539,15 +2100,6 @@ fn execute_manifested_projection_work_located(
             None
         }
         Some((Err(error), _)) if crate::model::is_projection_semantic_refusal(&error) => {
-            if let Some(work_index) = runtime.work_index() {
-                block_manifested_projection_work(
-                    graph,
-                    receipts,
-                    work_index,
-                    work,
-                    local_attempt_intent.id()?,
-                )?;
-            }
             return Err(ProjectionError::GuardedConflict(error));
         }
         Some((Err(error), _)) => return Err(error.into()),
@@ -2659,15 +2211,6 @@ fn execute_manifested_projection_work_located(
                         io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
                     ) || crate::model::is_projection_semantic_refusal(&error) =>
                 {
-                    if let Some(work_index) = runtime.work_index() {
-                        block_manifested_projection_work(
-                            graph,
-                            receipts,
-                            work_index,
-                            work,
-                            local_attempt_intent.id()?,
-                        )?;
-                    }
                     return Err(ProjectionError::GuardedConflict(error));
                 }
                 Err(error) => return Err(error.into()),
@@ -2676,12 +2219,6 @@ fn execute_manifested_projection_work_located(
     };
     receipts.publish_completion(authority, &local_attempt_intent, &proof)?;
     retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
-    if let Some(work_index) = runtime.work_index() {
-        let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
-        work_index
-            .mark_completed(authority)
-            .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    }
     Ok(())
 }
 
@@ -2985,50 +2522,7 @@ fn record_adopted_formatting_path(
     page_id: PageId,
     intent: &ProjectionIntent,
 ) -> Result<(), ProjectionError> {
-    let current = engine.authorize_projection_write(page_id)?;
-    if current.state().page.path != *intent.path()
-        || current.state().frontier != *intent.frontier()
-        || current.state().claim_evidence != intent.claim_evidence()
-    {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    }
-    let base = store.load_base(intent)?;
-    let Some(base) = base.as_ref() else {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    };
-    if base.description() != intent.target() {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    }
-    let replay = plan_projection_with_layout_annotations(
-        engine.workspace_id(),
-        current.state(),
-        Some(base.bytes()),
-        Some(intent.annotations()),
-    )?;
-    if replay.intent() != intent {
-        return Err(ProjectionError::RecoveryIntentMismatch);
-    }
-    let (_, work_index) = engine.enrolled_projection_runtime()?;
-    let prior = work_index
-        .completed_receipts_for_path(intent.path())
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    let [prior] = prior.as_slice() else {
-        return Err(ProjectionError::Work(
-            "formatting adoption requires one exact prior completed-path authority".into(),
-        ));
-    };
-    let (engine_history_generation, engine_history_root) =
-        engine.projection_completion_history_authority()?;
-    let authority = store.completed_direct_authority(
-        intent,
-        ProjectionWorkTarget::Present(intent.target()),
-        engine_history_generation,
-        engine_history_root,
-    )?;
-    work_index
-        .mark_formatting_adopted(authority, prior)
-        .map_err(|error| ProjectionError::Work(error.to_string()))?;
-    Ok(())
+    record_completed_path_with_authorization(store, engine, page_id, intent)
 }
 
 fn record_completed_tombstone_path(
@@ -3046,13 +2540,7 @@ fn record_completed_tombstone_path(
     {
         return Err(ProjectionError::RecoveryIntentMismatch);
     }
-    record_completed_path_target(
-        store,
-        engine,
-        intent.page_id(),
-        intent,
-        ProjectionWorkTarget::Absent,
-    )
+    Ok(())
 }
 
 fn record_completed_path_with_authorization(
@@ -3120,60 +2608,6 @@ fn record_completed_path_with_authorization(
         }
     }
 
-    record_completed_path_target(
-        store,
-        engine,
-        page_id,
-        intent,
-        ProjectionWorkTarget::Present(intent.target()),
-    )
-}
-
-fn record_completed_path_target(
-    store: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    page_id: PageId,
-    intent: &ProjectionIntent,
-    target: ProjectionWorkTarget,
-) -> Result<(), ProjectionError> {
-    // The compatibility writer still produces a normal enrolled completion.
-    // Mirror it into the authenticated completed-path tree when its accepted
-    // work row is present, so sparse import never has to fall back to receipt
-    // directory enumeration for this path.
-    if let Ok((_, work_index)) = engine.enrolled_projection_runtime() {
-        let mut exact = work_index
-            .pending_for_path(intent.path())
-            .map_err(|error| ProjectionError::Work(error.to_string()))?
-            .into_iter()
-            .filter(|work| {
-                work.page_id() == page_id
-                    && work.post_frontier() == intent.frontier()
-                    && work.target() == target
-            });
-        if let Some(work) = exact.next() {
-            if exact.next().is_some() {
-                return Err(ProjectionError::Work(
-                    "multiple ready work rows match one direct projection completion".into(),
-                ));
-            }
-            let authority = store.completed_work_authority(&work, intent)?;
-            work_index
-                .mark_completed(authority)
-                .map_err(|error| ProjectionError::Work(error.to_string()))?;
-        } else {
-            let (engine_history_generation, engine_history_root) =
-                engine.projection_completion_history_authority()?;
-            let authority = store.completed_direct_authority(
-                intent,
-                target,
-                engine_history_generation,
-                engine_history_root,
-            )?;
-            work_index
-                .mark_direct_completed(authority)
-                .map_err(|error| ProjectionError::Work(error.to_string()))?;
-        }
-    }
     Ok(())
 }
 

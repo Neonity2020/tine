@@ -87,8 +87,7 @@ use crate::oplog::operational_coordinator::{
 };
 use crate::oplog::operational_coordinator::{
     CleanExternalMutationState, CleanLocalMutationState, CleanPublishedContinuation,
-    LocalPublishedContinuation, OperationalCoordinator, OperationalCoordinatorError,
-    OperationalPhase, ProviderArchiveContinuation,
+    OperationalCoordinator, OperationalCoordinatorError, OperationalPhase,
 };
 #[cfg(test)]
 use crate::oplog::projection::{
@@ -8679,7 +8678,6 @@ enum PendingLocalMutation {
         correlated_batch_id: Option<BatchId>,
         application_move_episode: Option<ApplicationMoveEpisodeDraft>,
     },
-    Published(LocalPublishedContinuation),
 }
 
 enum PendingManagedLocalCommit {
@@ -9888,7 +9886,6 @@ struct RuntimeActor {
     provider_head_retirement: VecDeque<String>,
     provider_pending: ProviderDependencyIndex,
     provider_dependency_recheck_frontier: Option<ContentDigest>,
-    provider_continuation: Option<ProviderArchiveContinuation>,
     provider_incomplete: BTreeSet<BatchId>,
     provider_incomplete_recheck: VecDeque<BatchId>,
     provider_accepted_archive_loss: BTreeSet<BatchId>,
@@ -10139,7 +10136,6 @@ impl RuntimeActor {
             provider_head_retirement: VecDeque::new(),
             provider_pending: ProviderDependencyIndex::default(),
             provider_dependency_recheck_frontier: None,
-            provider_continuation: None,
             provider_incomplete: BTreeSet::new(),
             provider_incomplete_recheck: VecDeque::new(),
             provider_accepted_archive_loss: BTreeSet::new(),
@@ -16098,13 +16094,13 @@ impl RuntimeActor {
     /// ordinary save path remains the sole owner of those transitions.
     fn read_only_editor_turn_readiness(&self) -> EditorTurnReadiness {
         if self.terminal.is_some() {
-            let (batch_id, phase) = self
-                .local_mutation
-                .as_ref()
-                .map(pending_local_identity)
-                .unwrap_or((None, SyncLocalMutationPhase::Bindings));
+            let phase = if self.local_mutation.is_some() {
+                SyncLocalMutationPhase::Capture
+            } else {
+                SyncLocalMutationPhase::Bindings
+            };
             return EditorTurnReadiness::Deferred(SyncEditorDeferred::Revoked {
-                batch_id: batch_id.map(|id| id.to_string()),
+                batch_id: None,
                 phase,
             });
         }
@@ -16127,13 +16123,13 @@ impl RuntimeActor {
 
     fn prepare_editor_turn(&mut self) -> EditorTurnReadiness {
         if self.terminal.is_some() {
-            let (batch_id, phase) = self
-                .local_mutation
-                .as_ref()
-                .map(pending_local_identity)
-                .unwrap_or((None, SyncLocalMutationPhase::Bindings));
+            let phase = if self.local_mutation.is_some() {
+                SyncLocalMutationPhase::Capture
+            } else {
+                SyncLocalMutationPhase::Bindings
+            };
             return EditorTurnReadiness::Deferred(SyncEditorDeferred::Revoked {
-                batch_id: batch_id.map(|id| id.to_string()),
+                batch_id: None,
                 phase,
             });
         }
@@ -16499,7 +16495,6 @@ impl RuntimeActor {
             || self.provider_observation_cursor.is_some()
             || !self.provider_direct_manifests.is_empty()
             || !self.provider_pending.is_empty()
-            || self.provider_continuation.is_some()
             || !self.provider_incomplete_recheck.is_empty()
             || !self.provider_accepted_archive_loss.is_empty()
             || self.provider_accepted_manifest_audit.is_some()
@@ -17246,11 +17241,11 @@ impl RuntimeActor {
         // A claim is valid only for the request that made it.
         self.clean_request_retained_batch = None;
         if self.terminal.is_some() {
-            let (batch_id, phase) = self
-                .local_mutation
-                .as_ref()
-                .map(pending_local_identity)
-                .unwrap_or((None, SyncLocalMutationPhase::Bindings));
+            let (batch_id, phase) = if self.local_mutation.is_some() {
+                (None, SyncLocalMutationPhase::Capture)
+            } else {
+                (None, SyncLocalMutationPhase::Bindings)
+            };
             return SyncLocalMutationOutcome::Revoked { batch_id, phase };
         }
         if self.clean.is_some() {
@@ -17813,7 +17808,6 @@ impl RuntimeActor {
                 + usize::from(
                     self.provider_objects_changed && !self.provider_incomplete.is_empty(),
                 )
-                + usize::from(self.provider_continuation.is_some())
                 + usize::from(self.provider_publication_probe)
                 + usize::from(self.provider_publication_cursor.is_some())
                 + self.provider_publication_forced.len()
@@ -19846,18 +19840,6 @@ fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {
         OperationalPhase::TailAdmission => SyncLocalMutationPhase::TailAdmission,
         OperationalPhase::SqliteDrain => SyncLocalMutationPhase::SqliteDrain,
         OperationalPhase::ProjectionDrain => SyncLocalMutationPhase::ProjectionDrain,
-    }
-}
-
-fn pending_local_identity(
-    pending: &PendingLocalMutation,
-) -> (Option<BatchId>, SyncLocalMutationPhase) {
-    match pending {
-        PendingLocalMutation::Reconciliation { .. } => (None, SyncLocalMutationPhase::Capture),
-        PendingLocalMutation::Published(continuation) => (
-            Some(continuation.batch_id()),
-            map_local_phase(continuation.phase()),
-        ),
     }
 }
 

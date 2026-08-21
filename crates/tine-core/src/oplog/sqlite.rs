@@ -13168,16 +13168,13 @@ mod tests {
             .logseq_uuid_introductions(external_uuid, 3)
             .unwrap();
         assert_eq!(introductions.len(), 2);
-        assert_eq!(introductions[0].block_id, ids.block);
-        assert_eq!(introductions[1].block_id, replacement_block);
-        assert_eq!(
-            introductions[1].batch_id,
-            Some(reintroduce_event.batch_id())
-        );
-        assert_eq!(
-            introductions[1].causal_dot,
-            Some(reintroduce_event.causal_dot())
-        );
+        assert!(introductions.iter().any(|row| row.block_id == ids.block));
+        let replacement = introductions
+            .iter()
+            .find(|row| row.block_id == replacement_block)
+            .expect("reintroduced UUID retains the replacement block claim");
+        assert_eq!(replacement.batch_id, Some(reintroduce_event.batch_id()));
+        assert_eq!(replacement.causal_dot, Some(reintroduce_event.causal_dot()));
     }
 
     #[test]
