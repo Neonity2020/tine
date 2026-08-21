@@ -1700,7 +1700,9 @@ impl OperationalCoordinator {
             .map_err(|error| {
                 OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
             })?;
+        fault(OperationalFaultPoint::AfterHandoff)?;
         let plan = plan_clean_affected_import(graph, engine, database, requested_paths);
+        fault(OperationalFaultPoint::AfterPlan)?;
         match plan.status() {
             ImportPlanStatus::Noop => {
                 handoff.cancel();
@@ -1746,11 +1748,13 @@ impl OperationalCoordinator {
             },
         )?;
         drop(claim_source);
+        fault(OperationalFaultPoint::AfterDraft)?;
         let captured = engine
             .capture_external_author_transaction(draft, graph, receipts, endpoint, None)
             .map_err(|error| {
                 OperationalCoordinatorError::new(OperationalPhase::Capture, error.to_string())
             })?;
+        fault(OperationalFaultPoint::AfterCapture)?;
         let prepared = engine
             .finalize_captured_author_transaction(captured, receipts)
             .map_err(|error| {
@@ -1764,6 +1768,7 @@ impl OperationalCoordinator {
                 "clean external batch lost its import identity",
             ));
         }
+        fault(OperationalFaultPoint::AfterFinalize)?;
         let identity = database
             .preflight_prepared_identity_transition(engine, &prepared)
             .map_err(|error| {
@@ -2935,6 +2940,7 @@ fn resume_clean_published(
             .map_err(|error| {
                 OperationalCoordinatorError::new(OperationalPhase::SqliteDrain, error.to_string())
             })?;
+        fault(OperationalFaultPoint::AfterSqliteApply)?;
     } else if !applied.same_accepted_authority(event.post_frontier_root()) {
         return Err(OperationalCoordinatorError::new(
             OperationalPhase::SqliteDrain,
@@ -2957,6 +2963,7 @@ fn resume_clean_published(
             WorkspaceAuthorityBoundary::ProjectionDrain,
             OperationalPhase::ProjectionDrain,
         )?;
+        fault(OperationalFaultPoint::BeforeProjection)?;
         super::projection::execute_clean_manifested_projection_work_under_handoff(
             graph,
             receipts,
@@ -2968,6 +2975,7 @@ fn resume_clean_published(
         .map_err(|error| {
             OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
         })?;
+        fault(OperationalFaultPoint::AfterProjection)?;
     }
 
     // Projection intents authored by another endpoint describe accepted
