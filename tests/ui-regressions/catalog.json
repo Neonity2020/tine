@@ -100,8 +100,7 @@
       "status": "reported",
       "coverage": {
         "tests": [
-          "crates/tine-core/src/oplog/local_active/tests.rs",
-          "crates/tine-core/src/sync_runtime.rs",
+          "crates/tine-core/src/sync_runtime.rs::android_instrumentation_save_journey_shape_succeeds_on_a_host_graph",
           "src-tauri/src/lib.rs",
           "src/startupReveal.test.ts"
         ],
