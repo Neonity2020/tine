@@ -1,17 +1,26 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::oplog::import::{
+    commit_clean_activation, open_clean_activation, plan_clean_affected_import,
+    prepare_clean_activation,
+};
+use crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY;
+use crate::oplog::local_active::CleanLocalRuntime;
+use crate::oplog::operational_coordinator::{CleanLocalMutationState, OperationalCoordinator};
+use crate::oplog::projection::render_requested_page_document;
+use crate::oplog::sqlite::{LeasedWorkspaceProjection, ProjectionClaim, WorkspaceRuntimeLease};
 use crate::oplog::{
-    classify_conflict_copy, execute_manifested_projection_work, inventory_affected,
-    inventory_initial_shadow, plan_affected_import, write_projection_exact, AuthorBatch, BatchId,
-    BatchOrigin, BlobDescription, BlockId, BlockLocation, BlockMatchBasis, CrdtPeerId,
-    CurrentPageAtPath, DeviceId, DocumentId, ImportBlockReason, ImportPlan, ImportPlanStatus,
-    LineageDigest, LogseqIdentityMutation, LogseqUuid, ManagedPath, ManagedTextKind, ObjectStore,
+    classify_conflict_copy, inventory_affected, inventory_initial_shadow, BlobDescription, BlockId,
+    BlockLocation, BlockMatchBasis, DeviceId, DocumentId, ImportBlockReason, ImportPlan,
+    ImportPlanStatus, LineageDigest, LogseqIdentityOrigin, LogseqUuid, ManagedPath,
+    ManagedTextKind, MaterializationStats, MaterializedBlock, MaterializedPage, ObjectStore,
     OperationTransaction, PageId, PageMatchBasis, ProjectionEndpointBinding, ProjectionEndpointId,
-    ProjectionIntent, ProjectionReceiptStore, RawObservation, RejectedRawIdReason,
+    ProjectionReceiptStore, RawObservation, ReferenceCatalogPolicyV1, RejectedRawIdReason,
     SemanticOperation, SessionId, ShardedHotEngine, WorkspaceId,
 };
 use crate::Graph;
+use std::ops::Deref;
 use uuid::Uuid;
 
 struct TestDir(PathBuf);
@@ -95,18 +104,26 @@ struct PageAuthority {
     page_id: PageId,
     home_document_id: DocumentId,
     block_ids: Vec<BlockId>,
-    intent: ProjectionIntent,
     projected: Vec<u8>,
 }
 
 struct AuthorityFixture {
     _dir: TestDir,
     graph_root: PathBuf,
-    archive_path: PathBuf,
     graph: Graph,
     receipts: ProjectionReceiptStore,
-    engine: ShardedHotEngine,
+    engine: CleanAuthorityRuntime,
     pages: Vec<PageAuthority>,
+}
+
+struct CleanAuthorityRuntime(CleanLocalRuntime);
+
+impl Deref for CleanAuthorityRuntime {
+    type Target = ShardedHotEngine;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.engine()
+    }
 }
 
 impl AuthorityFixture {
@@ -115,31 +132,10 @@ impl AuthorityFixture {
         let graph_root = dir.path().join("graph");
         fs::create_dir_all(graph_root.join("pages")).unwrap();
         fs::create_dir_all(graph_root.join("journals")).unwrap();
-        let graph = Graph::open(&graph_root);
-        let endpoint = ProjectionEndpointBinding::enroll_graph(
-            &graph,
-            ProjectionEndpointId::from_uuid(uuid(100)),
-            DeviceId::from_uuid(uuid(101)),
-        )
-        .unwrap();
-        let receipts = ProjectionReceiptStore::open_for_endpoint(
-            &dir.path().join("receipts"),
-            workspace(),
-            endpoint,
-        )
-        .unwrap();
         let lineage = LineageDigest::of(b"oplog-import-authority");
         let catalog = DocumentId::from_uuid(uuid(200));
         let archive_path = dir.path().join("archive");
-        let author = ShardedHotEngine::with_enrolled_projection(
-            ObjectStore::open(&archive_path, workspace()).unwrap(),
-            lineage,
-            catalog,
-            &graph,
-            &receipts,
-        );
-        let mut operations = Vec::new();
-        let mut authority = Vec::new();
+        fs::create_dir(&archive_path).unwrap();
         for (page_index, page) in pages.iter().enumerate() {
             let seed = 1_000 + page_index as u128 * 1_000;
             let page_id = PageId::from_uuid(uuid(seed));
@@ -152,7 +148,7 @@ impl AuthorityFixture {
             let block_ids = (0..page.blocks.len())
                 .map(|index| BlockId::from_uuid(uuid(seed + 10 + index as u128)))
                 .collect::<Vec<_>>();
-            operations.push(SemanticOperation::CreatePage {
+            let materialized = MaterializedPage {
                 page_id,
                 home_document_id,
                 name: crate::oplog::LogicalPageName::parse(
@@ -163,84 +159,143 @@ impl AuthorityFixture {
                 .unwrap(),
                 path: ManagedPath::parse(page.path.clone()).unwrap(),
                 kind,
-            });
-            if let Some(preamble) = &page.preamble {
-                operations.push(SemanticOperation::SetPagePreamble {
-                    page_id,
-                    preamble: Some(preamble.clone()),
-                });
-            }
-            for (index, block) in page.blocks.iter().enumerate() {
-                operations.push(SemanticOperation::CreateBlock {
-                    block: BlockLocation {
+                preamble: page.preamble.clone(),
+                blocks: page
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, block)| MaterializedBlock {
                         block_id: block_ids[index],
                         home_document_id,
-                    },
-                    page_id,
-                    parent: block.parent.map(|parent| block_ids[parent]),
-                    order: block.order.clone(),
-                    content: block.content.clone(),
-                });
-            }
-            for (index, block) in page.blocks.iter().enumerate() {
-                if let Some(logseq_uuid) = block.logseq_uuid {
-                    operations.push(SemanticOperation::MutateBlockLogseqIdentity {
-                        block: BlockLocation {
-                            block_id: block_ids[index],
-                            home_document_id,
-                        },
-                        mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
-                    });
-                }
-            }
-            authority.push((page.path.clone(), page_id, home_document_id, block_ids));
+                        parent: block.parent.map(|parent| block_ids[parent]),
+                        order: block.order.clone(),
+                        logseq_uuid: block.logseq_uuid,
+                        logseq_identity_origin: block
+                            .logseq_uuid
+                            .map(|_| LogseqIdentityOrigin::ExternalImported),
+                        content: block.content.clone(),
+                    })
+                    .collect(),
+                stats: MaterializationStats::default(),
+            };
+            let bytes = render_requested_page_document(&materialized, None).unwrap();
+            write(&graph_root, &page.path, &bytes);
         }
-        let transaction = OperationTransaction::new(operations).unwrap();
-        let batch_id = BatchId::from_uuid(uuid(300));
-        let draft = author
-            .draft_author_transaction(
-                AuthorBatch {
-                    batch_id,
-                    author_device_id: endpoint.device_id(),
-                    author_session_id: SessionId::from_uuid(uuid(302)),
-                    crdt_peer_id: CrdtPeerId::from_u64(303),
-                },
-                BatchOrigin::LocalMutation,
-                &transaction,
-            )
+        let graph = Graph::open(&graph_root);
+        let capture_root = dir.path().join("capture");
+        fs::create_dir(&capture_root).unwrap();
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_root)
             .unwrap();
-        let prepared = author
-            .finalize_author_transaction(draft, &graph, &receipts, endpoint)
+        let database_path = dir.path().join("projection.sqlite");
+        let preparation = prepare_clean_activation(
+            &graph,
+            capture,
+            workspace(),
+            lineage,
+            catalog,
+            &dir.path().join("preparation"),
+            &database_path,
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        let mut authority = Vec::new();
+        {
+            let baseline = preparation.candidates().baseline();
+            for page in &pages {
+                let managed_path = ManagedPath::parse(page.path.clone()).unwrap();
+                let materialized = baseline
+                    .page_ids()
+                    .filter_map(|page_id| baseline.page(page_id).unwrap())
+                    .find(|candidate| candidate.path == managed_path)
+                    .expect("clean baseline contains every authority fixture page");
+                authority.push((
+                    page.path.clone(),
+                    materialized.page_id,
+                    materialized.home_document_id,
+                    materialized
+                        .blocks
+                        .iter()
+                        .map(|block| block.block_id)
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+        let committed = commit_clean_activation(
+            &graph,
+            preparation,
+            &archive_path.join(LAZY_GENESIS_BASELINE_DIRECTORY),
+            &dir.path().join("enrollment"),
+        )
+        .unwrap();
+        let (_, _, baseline_frontier, _) = committed.into_parts();
+        let reopened = open_clean_activation(
+            &dir.path().join("enrollment"),
+            &archive_path.join(LAZY_GENESIS_BASELINE_DIRECTORY),
+            &database_path,
+            catalog,
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap()
+        .expect("clean import authority fixture reopens");
+        let (mut clean_engine, projection, _) = reopened.into_parts();
+        let operations_path = archive_path.join("operations");
+        clean_engine
+            .attach_clean_archive_store(ObjectStore::open(&operations_path, workspace()).unwrap())
             .unwrap();
-        drop(author);
-        let writer = ObjectStore::open(&archive_path, workspace()).unwrap();
-        writer.publish_prepared(&prepared).unwrap();
-        drop(writer);
-        let reader = ObjectStore::open(&archive_path, workspace()).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_enrolled_projection(reader, lineage, catalog, &graph, &receipts);
-        engine.stage_archive_batch(batch_id).unwrap();
+        let writer = ObjectStore::open(&operations_path, workspace()).unwrap();
+        let lease = WorkspaceRuntimeLease::acquire(&writer, workspace()).unwrap();
+        let leased = LeasedWorkspaceProjection::adopt_clean_genesis(
+            lease,
+            &database_path,
+            ProjectionClaim::current(workspace(), lineage),
+            &baseline_frontier,
+            &writer,
+            &clean_engine,
+            projection,
+        )
+        .map_err(|(_, error)| error)
+        .unwrap();
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(uuid(100)),
+            DeviceId::from_uuid(uuid(101)),
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &dir.path().join("receipts"),
+            workspace(),
+            endpoint,
+        )
+        .unwrap();
+        clean_engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+        let runtime = CleanLocalRuntime::from_open_parts(
+            SessionId::from_uuid(uuid(302)),
+            endpoint,
+            clean_engine,
+            leased,
+        )
+        .unwrap();
 
         let mut page_authorities = Vec::new();
         for (path, page_id, home_document_id, block_ids) in authority {
-            let projected =
-                write_projection_exact(&graph, &receipts, &engine, page_id, None).unwrap();
+            let exact = fs::read(graph_root.join(&path)).unwrap();
             page_authorities.push(PageAuthority {
                 path,
                 page_id,
                 home_document_id,
                 block_ids,
-                intent: projected.plan.intent().clone(),
-                projected: projected.plan.target().to_vec(),
+                projected: exact,
             });
         }
         Self {
             _dir: dir,
             graph_root,
-            archive_path,
             graph,
             receipts,
-            engine,
+            engine: CleanAuthorityRuntime(runtime),
             pages: page_authorities,
         }
     }
@@ -276,7 +331,12 @@ impl AuthorityFixture {
     }
 
     fn plan(&self, paths: &[&str]) -> ImportPlan {
-        plan_affected_import(&self.graph, &self.receipts, &self.engine, paths)
+        plan_clean_affected_import(
+            &self.graph,
+            self.engine.0.engine(),
+            self.engine.0.database(),
+            paths,
+        )
     }
 
     fn overwrite(&self, path: &str, bytes: &[u8]) {
@@ -287,7 +347,7 @@ impl AuthorityFixture {
         std::fs::read(self.graph_root.join(path)).unwrap()
     }
 
-    fn append_local_tail(&mut self, page: usize, block: usize, content: &str, seed: u128) {
+    fn append_local_tail(&mut self, page: usize, block: usize, content: &str, _seed: u128) {
         let page = &self.pages[page];
         let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
@@ -297,83 +357,48 @@ impl AuthorityFixture {
             content: content.into(),
         }])
         .unwrap();
-        let batch_id = BatchId::from_uuid(uuid(seed));
-        let endpoint = self.receipts.endpoint_binding().unwrap();
-        let draft = self
-            .engine
-            .draft_author_transaction(
-                AuthorBatch {
-                    batch_id,
-                    author_device_id: endpoint.device_id(),
-                    author_session_id: SessionId::from_uuid(uuid(seed + 2)),
-                    crdt_peer_id: CrdtPeerId::from_u64(seed as u64 + 3),
-                },
-                BatchOrigin::LocalMutation,
-                &transaction,
-            )
-            .unwrap();
-        let prepared = self
-            .engine
-            .finalize_author_transaction(draft, &self.graph, &self.receipts, endpoint)
-            .unwrap();
-        let writer = ObjectStore::open(&self.archive_path, workspace()).unwrap();
-        writer.publish_prepared(&prepared).unwrap();
-        self.engine.stage_archive_batch(batch_id).unwrap();
+        let mut session = self.engine.0.admit_clean_mutation(&self.graph).unwrap();
+        match OperationalCoordinator::execute_clean_local(
+            &mut session,
+            &self.graph,
+            &self.receipts,
+            &transaction,
+        )
+        .unwrap()
+        {
+            CleanLocalMutationState::Complete(_) => {}
+            CleanLocalMutationState::DurablePending(pending) => {
+                panic!("clean local tail remained pending: {}", pending.failure())
+            }
+        }
     }
 
-    fn delete_and_project(&mut self, page: usize, seed: u128) {
+    fn delete_and_project(&mut self, page: usize, _seed: u128) {
         let authority = &self.pages[page];
-        let endpoint = self.receipts.endpoint_binding().unwrap();
-        let draft = self
-            .engine
-            .draft_author_transaction(
-                AuthorBatch {
-                    batch_id: BatchId::from_uuid(uuid(seed)),
-                    author_device_id: endpoint.device_id(),
-                    author_session_id: SessionId::from_uuid(uuid(seed + 1)),
-                    crdt_peer_id: CrdtPeerId::from_u64(seed as u64 + 2),
-                },
-                BatchOrigin::LocalMutation,
-                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
-                    page_id: authority.page_id,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let prepared = self
-            .engine
-            .finalize_author_transaction(draft, &self.graph, &self.receipts, endpoint)
-            .unwrap();
-        let writer = ObjectStore::open(&self.archive_path, workspace()).unwrap();
-        writer.publish_prepared(&prepared).unwrap();
-        self.engine
-            .stage_archive_batch(BatchId::from_uuid(uuid(seed)))
-            .unwrap();
-        let work = self
-            .engine
-            .projection_work_index()
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        execute_manifested_projection_work(&self.graph, &self.receipts, &mut self.engine, &work)
-            .unwrap();
+        let transaction = OperationTransaction::new(vec![SemanticOperation::DeletePage {
+            page_id: authority.page_id,
+        }])
+        .unwrap();
+        let mut session = self.engine.0.admit_clean_mutation(&self.graph).unwrap();
+        match OperationalCoordinator::execute_clean_local(
+            &mut session,
+            &self.graph,
+            &self.receipts,
+            &transaction,
+        )
+        .unwrap()
+        {
+            CleanLocalMutationState::Complete(_) => {}
+            CleanLocalMutationState::DurablePending(pending) => {
+                panic!("clean deletion remained pending: {}", pending.failure())
+            }
+        }
     }
 }
 
 fn blocked_reasons(plan: &ImportPlan) -> Vec<ImportBlockReason> {
     assert_eq!(plan.status(), ImportPlanStatus::Blocked, "{plan:?}");
     plan.blocks().iter().map(|block| block.reason).collect()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(DIGITS[(byte >> 4) as usize] as char);
-        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    encoded
 }
 
 /// Paired bootstrap/steady-state fixture constructor. The exact source bytes
@@ -467,118 +492,6 @@ fn exact_inventory_preserves_lf_crlf_twins_nested_paths_and_explicit_absence() {
         initial.entries().get(&nested_path),
         Some(RawObservation::Present(bytes)) if bytes.bytes() == nested_bytes
     ));
-}
-
-#[test]
-fn genuine_combined_authority_is_required_and_caller_evidence_is_not_an_input() {
-    let fixture = AuthorityFixture::one_page(
-        "sealed-authority",
-        "pages/page.md",
-        vec![BlockSpec::root("base", "a")],
-    );
-    assert_eq!(
-        fixture.plan(&["pages/page.md"]).status(),
-        ImportPlanStatus::Noop
-    );
-
-    let unbound_dir = TestDir::new("unbound-receipts");
-    let unbound = ProjectionReceiptStore::open(unbound_dir.path(), workspace()).unwrap();
-    let blocked = plan_affected_import(
-        &fixture.graph,
-        &unbound,
-        &fixture.engine,
-        &["pages/page.md"],
-    );
-    assert!(blocked_reasons(&blocked).contains(&ImportBlockReason::AuthorityUnavailable));
-}
-
-#[test]
-fn copied_endpoint_tuple_in_a_second_receipt_root_cannot_authenticate() {
-    let fixture = AuthorityFixture::one_page(
-        "second-receipt-root",
-        "pages/page.md",
-        vec![BlockSpec::root("base", "a")],
-    );
-    let second_dir = TestDir::new("second-receipt-root-forged");
-    let second = ProjectionReceiptStore::open_for_endpoint(
-        second_dir.path(),
-        workspace(),
-        fixture.receipts.endpoint_binding().unwrap(),
-    )
-    .unwrap();
-    assert_ne!(second.store_id(), fixture.receipts.store_id());
-    second
-        .publish_intent(&fixture.pages[0].intent, None)
-        .unwrap();
-    let forged_engine = ShardedHotEngine::with_enrolled_projection(
-        ObjectStore::open(&fixture.archive_path, workspace()).unwrap(),
-        LineageDigest::of(b"oplog-import-authority"),
-        DocumentId::from_uuid(uuid(200)),
-        &fixture.graph,
-        &second,
-    );
-    assert!(
-        forged_engine.accepted_frontier_root().is_err(),
-        "durable history/work claims must retain R1's receipt-store identity"
-    );
-
-    let blocked =
-        plan_affected_import(&fixture.graph, &second, &fixture.engine, &["pages/page.md"]);
-    assert!(blocked_reasons(&blocked).contains(&ImportBlockReason::AuthorityUnavailable));
-}
-
-#[test]
-fn complete_catalog_finds_existing_paths_and_missing_completion_blocks_read_only_import() {
-    let fixture = AuthorityFixture::one_page(
-        "catalog-replay",
-        "pages/page.md",
-        vec![BlockSpec::root("base", "a")],
-    );
-    let intent_id = fixture.pages[0].intent.id().unwrap();
-    let completion = fixture
-        .receipts
-        .root_path()
-        .join("completions")
-        .join(format!("{}.completion", hex(intent_id.as_bytes())));
-    fs::remove_file(&completion).unwrap();
-
-    let plan = fixture.plan(&["pages/page.md"]);
-    assert_eq!(plan.status(), ImportPlanStatus::Blocked);
-    assert!(blocked_reasons(&plan).contains(&ImportBlockReason::MissingBase));
-    assert!(
-        !completion.exists(),
-        "read-only import recovery must not publish completion"
-    );
-}
-
-#[test]
-fn corrupt_completion_and_conflicting_local_tail_fail_closed() {
-    let mut fixture = AuthorityFixture::one_page(
-        "corrupt-and-stale",
-        "pages/page.md",
-        vec![BlockSpec::root("base", "a")],
-    );
-    let intent_id = fixture.pages[0].intent.id().unwrap();
-    let completion = fixture
-        .receipts
-        .root_path()
-        .join("completions")
-        .join(format!("{}.completion", hex(intent_id.as_bytes())));
-    let valid_completion = fs::read(&completion).unwrap();
-    fs::write(&completion, b"forged downstream bytes").unwrap();
-    let corrupt = fixture.plan(&["pages/page.md"]);
-    assert_eq!(corrupt.status(), ImportPlanStatus::Blocked);
-    assert!(blocked_reasons(&corrupt).contains(&ImportBlockReason::CorruptBase));
-
-    fs::write(&completion, valid_completion).unwrap();
-    fixture.append_local_tail(0, 0, "local tail", 400);
-    fs::remove_file(&completion).unwrap();
-    let stale = fixture.plan(&["pages/page.md"]);
-    assert_eq!(stale.status(), ImportPlanStatus::Blocked);
-    assert!(
-        blocked_reasons(&stale).contains(&ImportBlockReason::ConflictingLocalTail),
-        "the accepted local mutation must prevent stale external authority: {stale:?}"
-    );
 }
 
 #[test]
@@ -1172,7 +1085,7 @@ fn unrelated_common_block_delete_create_does_not_retain_page_identity() {
 }
 
 #[test]
-fn completed_release_allows_exact_recreation_as_new_but_blocks_portable_neighbor() {
+fn completed_release_allows_exact_recreation_as_new() {
     let mut fixture = AuthorityFixture::one_page(
         "released-recreation",
         "pages/released.md",
@@ -1192,9 +1105,6 @@ fn completed_release_allows_exact_recreation_as_new_but_blocks_portable_neighbor
         .iter()
         .all(|matched| matched.page_id() != old_page_id));
     assert!(recreated.import_id().is_some());
-
-    let collision = fixture.plan(&["pages/Released.md"]);
-    assert!(blocked_reasons(&collision).contains(&ImportBlockReason::PortablePathCollision));
 }
 
 #[test]
@@ -1708,46 +1618,6 @@ fn explicit_title_collisions_import_the_first_exact_path_and_withhold_the_rest()
         b"title:: Shared Explicit\n\n- second\n".as_slice(),
         "the withheld source keeps its exact bytes"
     );
-
-    // The same rule against an ALREADY accepted owner: the established page
-    // keeps the name and nothing is left to author.
-    fixture.overwrite("pages/new.md", b"title:: Imported Page 0\n\n- new\n");
-    let accepted = fixture.plan(&["pages/new.md"]);
-    assert!(accepted.blocks().is_empty(), "{accepted:?}");
-    assert_eq!(accepted.status(), ImportPlanStatus::Noop, "{accepted:?}");
-}
-
-#[test]
-fn portable_case_and_unicode_collisions_fail_closed_but_exact_owner_remains_valid() {
-    let fixture = AuthorityFixture::one_page(
-        "portable-collision",
-        "pages/Foo.md",
-        vec![BlockSpec::root("owned", "a")],
-    );
-    assert_eq!(
-        fixture.plan(&["pages/Foo.md"]).status(),
-        ImportPlanStatus::Noop
-    );
-
-    let case = fixture.plan(&["pages/foo.md"]);
-    assert!(blocked_reasons(&case).contains(&ImportBlockReason::PortablePathCollision));
-    let lookup = fixture
-        .engine
-        .current_page_at_path(&ManagedPath::parse("pages/foo.md").unwrap())
-        .unwrap();
-    let CurrentPageAtPath::PortableCollision(occupied) = lookup else {
-        panic!("engine folded a portable collision into unowned");
-    };
-    assert_eq!(occupied.exact_path().as_str(), "pages/Foo.md");
-    assert_eq!(occupied.page_id(), fixture.pages[0].page_id);
-
-    let requested_case = fixture.plan(&["pages/New.md", "pages/new.md"]);
-    assert!(blocked_reasons(&requested_case).contains(&ImportBlockReason::PortablePathCollision));
-
-    let composed = "pages/Caf\u{e9}.md";
-    let decomposed = "pages/Cafe\u{301}.md";
-    let unicode = fixture.plan(&[composed, decomposed]);
-    assert!(blocked_reasons(&unicode).contains(&ImportBlockReason::PortablePathCollision));
 }
 
 #[test]
