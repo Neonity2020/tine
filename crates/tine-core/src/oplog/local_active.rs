@@ -276,15 +276,12 @@
 //! derived from *both* a live [`LocalActiveAuthority`] and the exact
 //! [`PromotedLocalRuntime`].
 
+use crate::model::Graph;
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(test)]
 use std::sync::Mutex;
-#[cfg(test)]
-use std::time::Duration;
-
-use crate::model::Graph;
 
 use super::enrollment::{
     CommittedLocalActive, LocalActiveSync, RetainedEnrollmentSession,
@@ -345,67 +342,6 @@ pub(crate) struct PromotedRuntimeInstrumentation {
     /// plus one no-follow resolution of the exact lease pathname each. It is a
     /// boundary fact, so an unchanged-head admission must perform none.
     pub(crate) workspace_lease_identity_revalidations: usize,
-}
-
-/// Test-only phase receipt for the promoted-runtime portion of an existing
-/// managed open. It is keyed by workspace because the actor thread emits it
-/// and the benchmark caller consumes it after the thread joins.
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct PromotedRuntimeOpenInstrumentation {
-    pub(crate) total: Duration,
-    pub(crate) bootstrap_anchor: Duration,
-    pub(crate) enrollment_session: Duration,
-    pub(crate) promotion_state: Duration,
-    pub(crate) mint: Duration,
-    pub(crate) handoff_and_final_proof: Duration,
-    pub(crate) bootstrap_projection: Duration,
-    pub(crate) bootstrap_runtime_authority: Duration,
-    pub(crate) resume_candidate: Duration,
-    pub(crate) reconstructed_bootstrap_resume: bool,
-    pub(crate) reconstructed_ephemeral_bootstrap: bool,
-    pub(crate) engine_open: Duration,
-    pub(crate) sqlite_open: Duration,
-    pub(crate) tail_construction: Duration,
-    /// Which branch the disposable SQLite projection actually took at open, and
-    /// what the rebuild did if it rebuilt. `sqlite_open` alone cannot distinguish
-    /// "reopened a valid projection slowly" from "threw it away and rebuilt the
-    /// whole graph", and those have opposite fixes.
-    pub(crate) projection_recovery: &'static str,
-    pub(crate) projection_rebuild_reason: String,
-    pub(crate) projection_applied_batches: usize,
-    pub(crate) projection_bulk_pages_materialized: usize,
-    pub(crate) projection_ancestry_full_scans: usize,
-    /// The rebuild's own counters, carried whole rather than field by field.
-    /// Which term carries a superlinear rebuild is not known in advance, so
-    /// copying three of them forces a source change every time the search moves.
-    pub(crate) projection_rebuild_counters: super::sqlite::RebuildInstrumentation,
-    pub(crate) engine: super::hot_engine::EnrolledProjectionOpenInstrumentation,
-    pub(crate) engine_stages: super::hot_engine::EngineOpenStageBreakdown,
-}
-
-#[cfg(test)]
-static PROMOTED_RUNTIME_OPEN_INSTRUMENTATION: Mutex<
-    BTreeMap<WorkspaceId, PromotedRuntimeOpenInstrumentation>,
-> = Mutex::new(BTreeMap::new());
-
-#[cfg(test)]
-pub(crate) fn reset_promoted_runtime_open_instrumentation(workspace: WorkspaceId) {
-    PROMOTED_RUNTIME_OPEN_INSTRUMENTATION
-        .lock()
-        .unwrap()
-        .remove(&workspace);
-}
-
-#[cfg(test)]
-pub(crate) fn take_promoted_runtime_open_instrumentation(
-    workspace: WorkspaceId,
-) -> PromotedRuntimeOpenInstrumentation {
-    PROMOTED_RUNTIME_OPEN_INSTRUMENTATION
-        .lock()
-        .unwrap()
-        .remove(&workspace)
-        .expect("promoted runtime timing was recorded")
 }
 
 #[cfg(test)]

@@ -57,7 +57,8 @@ use crate::oplog::enrollment::{
 use crate::oplog::hot_engine::ProjectionEndpointBinding;
 use crate::oplog::hot_engine::{AcceptedFrontierRoot, ShardedHotEngine};
 use crate::oplog::import::{
-    commit_clean_activation, open_clean_activation, prepare_clean_activation,
+    commit_clean_activation, open_clean_activation_authority,
+    open_or_rebuild_clean_genesis_projection, prepare_clean_activation,
     BootstrapPreparationProgress, BootstrapPreparationSubphase, BootstrapPreparationSummary,
 };
 #[cfg(test)]
@@ -72,12 +73,6 @@ use crate::oplog::lazy_genesis::{
     LazyGenesisProviderIndexV1, LAZY_GENESIS_PROVIDER_CHUNK_BYTES,
 };
 use crate::oplog::local_active::CleanLocalRuntime;
-#[cfg(test)]
-use crate::oplog::local_active::{
-    act_once_at_resume_lifecycle_cut_for_workspace_for_test,
-    reset_promoted_runtime_open_instrumentation, take_promoted_runtime_open_instrumentation,
-    PromotedRuntimeOpenInstrumentation, ResumeLifecycleCut,
-};
 use crate::oplog::local_journal_drain::{
     ManagedLocalDerivativeAuthority, ManagedLocalDerivativePublisher, ManagedLocalDrainCheckpoint,
     ManagedLocalDrainContinuation, ManagedLocalPublicationState,
@@ -108,8 +103,10 @@ use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
 #[cfg(test)]
 use crate::oplog::sqlite::{
-    reset_full_digest_scan_instrumentation, take_full_digest_scan_instrumentation,
+    reset_full_digest_scan_instrumentation, reset_projection_open_test_observation,
+    take_full_digest_scan_instrumentation, take_projection_open_test_observation,
     BootstrapSqliteRebuildInstrumentation, FullDigestScanInstrumentation,
+    ProjectionOpenTestObservation,
 };
 use crate::oplog::sqlite::{
     ApplicationRuntimeRoot, LeasedWorkspaceProjection, WorkspaceRuntimeLease,
@@ -5893,10 +5890,9 @@ fn open_clean_runtime_resources_with_progress(
             phase: SyncLocalActivationPhase::RetainedRuntimeOpen,
         });
     }
-    let Some(opened) = open_clean_activation(
+    let Some(opened) = open_clean_activation_authority(
         &request.enrollment_root,
         &clean_baseline_directory(&request.archive_root),
-        &request.database_path,
         identities.catalog_document_id,
         ReferenceCatalogPolicyV1::default(),
     )
@@ -5922,22 +5918,22 @@ fn open_clean_runtime_resources_with_progress(
     {
         return Err("clean activation marker differs from persisted local identities".into());
     }
-    let (mut engine, baseline_projection, _) = opened.into_parts();
+    let (mut engine, baseline, _) = opened.into_parts();
     let operation_archive_path = clean_operation_archive_directory(&request.archive_root);
     engine
         .attach_clean_archive_store(
             ObjectStore::open(&operation_archive_path, identities.workspace_id).map_err(display)?,
         )
         .map_err(display)?;
-    let baseline_root = engine.accepted_frontier_root().map_err(display)?;
-    let baseline_claim_source =
-        crate::oplog::sqlite::clean_genesis_materialized_read(&baseline_projection, &baseline_root)
-            .map_err(display)?;
+    let baseline_claim_source = engine
+        .clean_transient_projection_claim_snapshot()
+        .map_err(display)?
+        .ok_or_else(|| "clean runtime has no immutable baseline claim snapshot".to_owned())?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeTailReplay,
     });
     let replayed = engine
-        .replay_clean_committed_tail(&baseline_claim_source)
+        .replay_clean_committed_tail(baseline_claim_source.as_ref())
         .map_err(display)?;
     drop(baseline_claim_source);
     let store =
@@ -5945,6 +5941,13 @@ fn open_clean_runtime_resources_with_progress(
     let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id).map_err(display)?;
     let projection = if replayed == 0 {
         let expected = engine.accepted_frontier_root().map_err(display)?;
+        let baseline_projection = open_or_rebuild_clean_genesis_projection(
+            &request.database_path,
+            ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
+            &baseline,
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .map_err(display)?;
         LeasedWorkspaceProjection::adopt_clean_genesis(
             lease,
             &request.database_path,
@@ -5956,7 +5959,6 @@ fn open_clean_runtime_resources_with_progress(
         )
         .map_err(|(_, error)| display(error))?
     } else {
-        drop(baseline_projection);
         let application_runtime =
             ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
                 .map_err(display)?;
@@ -19903,8 +19905,6 @@ mod tests {
     use super::*;
     use crate::model::Format;
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
-    use crate::oplog::resume_point::RuntimeResumePointV2;
-    use crate::oplog::shadow_projection::set_before_final_source_verify_hook_for_test;
     use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
     use std::collections::BTreeMap;
     use std::fs;
@@ -35133,89 +35133,6 @@ mod tests {
             .collect()
     }
 
-    fn immutable_engine_history_bytes(archive_root: &Path) -> BTreeMap<String, Vec<u8>> {
-        recursive_file_bytes(&archive_root.join("engine-history"))
-            .into_iter()
-            .filter(|(path, _)| {
-                !path.contains("/resume-points/")
-                    && !path.ends_with("/engine-history.head")
-                    && !path.ends_with("/engine-history.transition.lock")
-            })
-            .collect()
-    }
-
-    fn immutable_projection_receipt_bytes(receipt_root: &Path) -> BTreeMap<String, Vec<u8>> {
-        recursive_file_bytes(receipt_root)
-            .into_iter()
-            .filter(|(path, _)| {
-                path == "projection-receipts.claim"
-                    || path == "projection-receipts.init"
-                    || ["bases/", "intents/", "completions/"]
-                        .iter()
-                        .any(|prefix| path.starts_with(prefix))
-            })
-            .collect()
-    }
-
-    fn assert_byte_map_is_strict_extension(
-        before: &BTreeMap<String, Vec<u8>>,
-        after: &BTreeMap<String, Vec<u8>>,
-        label: &str,
-    ) {
-        for (path, bytes) in before {
-            assert_eq!(
-                after.get(path),
-                Some(bytes),
-                "{label} rewrote or removed accepted bytes at {path}"
-            );
-        }
-        assert!(
-            after.len() > before.len(),
-            "{label} did not append durable evidence for the accepted save"
-        );
-    }
-
-    /// Resolve the run named by the newest concrete resume-point record, rather
-    /// than choosing an arbitrary retained directory.  The runtime itself
-    /// makes the same record selection before it tries to adopt the run.
-    fn selected_retained_scratch_run_for_test(archive_root: &Path) -> (Uuid, PathBuf) {
-        let history_root = archive_root.join("engine-history");
-        let mut endpoints = fs::read_dir(&history_root)
-            .unwrap_or_else(|error| panic!("promoted archive has engine history: {error}"))
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_dir())
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        endpoints.sort();
-        assert_eq!(
-            endpoints.len(),
-            1,
-            "fixture has exactly one durable history endpoint"
-        );
-        let mut points = fs::read_dir(endpoints.pop().unwrap().join("resume-points"))
-            .unwrap_or_else(|error| panic!("safe handoff published a resume point: {error}"))
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_file())
-            .map(|entry| {
-                RuntimeResumePointV2::decode(
-                    &fs::read(entry.path())
-                        .unwrap_or_else(|error| panic!("resume point is readable: {error}")),
-                )
-                .unwrap_or_else(|error| panic!("resume point is canonical: {error}"))
-            })
-            .collect::<Vec<_>>();
-        let point = points
-            .drain(..)
-            .max_by_key(RuntimeResumePointV2::resume_sequence)
-            .expect("safe handoff leaves a resume point to select the retained run");
-        let run_id = point.scratch_run_id();
-        let run = archive_root
-            .join("engine-scratch-v2")
-            .join(format!("run-{run_id}"));
-        assert!(run.is_dir(), "selected retained scratch run exists");
-        (run_id, run)
-    }
-
     #[derive(Debug)]
     struct ActivationScaleReceipt {
         source_files: usize,
@@ -35789,7 +35706,6 @@ mod tests {
         named_page: StartupBenchmarkNamedPage,
         graph_state: StartupBenchmarkGraphState,
         open: RuntimeOpenInstrumentation,
-        promoted: PromotedRuntimeOpenInstrumentation,
         resume: crate::oplog::hot_engine::RuntimeResumeObservation,
     }
 
@@ -36953,43 +36869,11 @@ mod tests {
         )
     }
 
-    fn startup_promoted_open_phase_receipt(
-        promoted: &PromotedRuntimeOpenInstrumentation,
-    ) -> String {
-        let engine = &promoted.engine;
+    fn startup_projection_open_test_receipt(observation: &ProjectionOpenTestObservation) -> String {
         format!(
-            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} reconstructed_bootstrap_resume={} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={} engine_prepare_replay_ms={:.3} engine_predecessor_restore_ms={:.3} engine_bootstrap_replay_ms={:.3} engine_archived_tail_replay_ms={:.3} engine_finish_replay_ms={:.3} engine_archived_manifests_offered={} engine_archived_manifests_replayed={} projection_recovery={} projection_rebuild_reason={:?} projection_applied_batches={} projection_bulk_pages_materialized={} projection_ancestry_full_scans={}",
-            startup_ms(promoted.total),
-            startup_ms(promoted.bootstrap_anchor),
-            startup_ms(promoted.enrollment_session),
-            startup_ms(promoted.promotion_state),
-            startup_ms(promoted.mint),
-            startup_ms(promoted.handoff_and_final_proof),
-            startup_ms(promoted.bootstrap_projection),
-            startup_ms(promoted.bootstrap_runtime_authority),
-            startup_ms(promoted.resume_candidate),
-            promoted.reconstructed_bootstrap_resume,
-            startup_ms(promoted.engine_open),
-            startup_ms(promoted.sqlite_open),
-            startup_ms(promoted.tail_construction),
-            startup_ms(engine.total),
-            startup_ms(engine.engine_construction),
-            startup_ms(engine.resume_restore),
-            startup_ms(engine.bootstrap_part_recovery),
-            engine.bootstrap_parts_examined,
-            startup_ms(promoted.engine_stages.prepare_replay),
-            startup_ms(promoted.engine_stages.predecessor_restore),
-            startup_ms(promoted.engine_stages.bootstrap_part_replay),
-            startup_ms(promoted.engine_stages.archived_tail_replay),
-            startup_ms(promoted.engine_stages.finish_replay),
-            promoted.engine_stages.archived_manifests_offered,
-            promoted.engine_stages.archived_manifests_replayed,
-            promoted.projection_recovery,
-            promoted.projection_rebuild_reason,
-            promoted.projection_applied_batches,
-            promoted.projection_bulk_pages_materialized,
-            promoted.projection_ancestry_full_scans,
-        ) + &startup_projection_rebuild_receipt(&promoted.projection_rebuild_counters)
+            "projection_recovery={} projection_rebuild_reason={:?}",
+            observation.recovery, observation.reason,
+        ) + &startup_projection_rebuild_receipt(&observation.rebuild)
     }
 
     #[test]
@@ -37079,27 +36963,6 @@ mod tests {
         );
     }
 
-    fn remove_resume_points(root: &Path) -> usize {
-        let mut removed = 0;
-        let mut directories = vec![root.to_path_buf()];
-        while let Some(directory) = directories.pop() {
-            for entry in fs::read_dir(directory).unwrap() {
-                let entry = entry.unwrap();
-                if entry.file_type().unwrap().is_dir() {
-                    directories.push(entry.path());
-                } else if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "resume-point")
-                {
-                    fs::remove_file(entry.path()).unwrap();
-                    removed += 1;
-                }
-            }
-        }
-        removed
-    }
-
     /// Age a graph, shut it down cleanly, then damage only the disposable
     /// SQLite projection. The oplog is untouched and authoritative, so the
     /// graph must still open.
@@ -37110,10 +36973,10 @@ mod tests {
         name: &str,
         seed: u128,
         damage: impl FnOnce(&Path),
-        expected_recovery: &str,
+        expect_replaced_file: bool,
+        expected_forensic_bytes: Option<&[u8]>,
     ) {
         let fixture = ActivationFixture::nested_unicode(name, seed);
-        let workspace_id = fixture.request.identities.workspace_id;
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
         let handle = activated.handle.expect("synthetic graph activates");
@@ -37138,21 +37001,80 @@ mod tests {
         );
         drop(handle);
 
-        damage(&fixture.request.database_path);
+        let database_path = &fixture.request.database_path;
+        let forensic_prefix = format!(
+            "{}.forensic-",
+            database_path.file_name().unwrap().to_string_lossy()
+        );
+        let forensic_directories = || {
+            fs::read_dir(database_path.parent().unwrap())
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| {
+                    entry.file_type().unwrap().is_dir()
+                        && entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(&forensic_prefix)
+                })
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            forensic_directories().is_empty(),
+            "the fixture starts without projection forensic evidence"
+        );
 
-        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let original_link = database_path.with_extension("pre-damage.sqlite");
+        if expect_replaced_file {
+            fs::hard_link(database_path, &original_link)
+                .expect("the negative-control link retains the original projection inode");
+        }
+
+        damage(database_path);
+
         let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         assert_eq!(
             reopened.status,
             SyncRuntimeOpenStatus::Active,
             "a damaged disposable projection must not make an authoritative oplog unopenable"
         );
-        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
-        assert_eq!(
-            promoted.projection_recovery, expected_recovery,
-            "recovery took the wrong branch (reason: {})",
-            promoted.projection_rebuild_reason
-        );
+        let forensics = forensic_directories();
+        if expect_replaced_file {
+            assert!(
+                !same_file::is_same_file(&original_link, database_path).unwrap(),
+                "the missing projection path was not replaced; this oracle must fail when deletion is skipped"
+            );
+            fs::remove_file(&original_link).unwrap();
+        }
+        match expected_forensic_bytes {
+            None => {
+                assert!(
+                    database_path.is_file(),
+                    "the projection database was recreated"
+                );
+                assert!(
+                    forensics.is_empty(),
+                    "a missing disposable projection has no damaged bytes to preserve"
+                );
+            }
+            Some(expected) => {
+                assert_eq!(
+                    forensics.len(),
+                    1,
+                    "one damaged projection file set is preserved"
+                );
+                let forensic = &forensics[0];
+                assert!(forensic.join("EVIDENCE_COMPLETE").is_file());
+                assert!(forensic.join("REBUILD_COMPLETE").is_file());
+                assert!(
+                    recursive_file_bytes(forensic)
+                        .values()
+                        .any(|bytes| bytes.as_slice() == expected),
+                    "the exact damaged projection bytes survive in forensic evidence"
+                );
+            }
+        }
 
         // Opening is not the whole claim: the rebuilt projection must actually
         // answer for the graph, including the edit made before the damage.
@@ -37186,7 +37108,8 @@ mod tests {
                     .remove()
                     .expect("the projection file set is removable");
             },
-            "rebuilt-missing",
+            true,
+            None,
         );
     }
 
@@ -37202,14 +37125,19 @@ mod tests {
                 fs::write(database_path, b"this is not a SQLite database")
                     .expect("the projection file is writable");
             },
-            "rebuilt-preserving-evidence",
+            false,
+            Some(b"this is not a SQLite database"),
         );
     }
 
+    /// Clean composition has no separate reconciliation database. The
+    /// accepted operation archive plus disposable SQLite projection replace
+    /// that legacy authority; reintroducing a second baseline would recreate
+    /// two independently recoverable views of the same graph.
     #[test]
-    fn managed_safe_reopen_rebuilds_a_corrupt_reconciliation_baseline() {
+    fn clean_runtime_does_not_publish_a_legacy_reconciliation_baseline() {
         let fixture = ActivationFixture::nested_unicode(
-            "managed-safe-reopen-corrupt-reconciliation-baseline",
+            "clean-runtime-no-legacy-reconciliation-baseline",
             0xa0ec,
         );
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
@@ -37231,26 +37159,23 @@ mod tests {
         ));
         drop(handle);
 
-        let baseline_path = fixture
+        let legacy_baseline_root = fixture
             .request
             .application_runtime_root
             .join(crate::oplog::sync_layout::RECONCILIATION_DIR)
             .join(fixture.request.identities.workspace_id.to_string())
-            .join(fixture.request.identities.endpoint_id.to_string())
-            .join(crate::oplog::sync_layout::RECONCILIATION_DATABASE_FILE);
-        assert!(baseline_path.is_file());
-        let connection = rusqlite::Connection::open(&baseline_path).unwrap();
-        connection
-            .execute("UPDATE binding SET endpoint = zeroblob(16)", [])
-            .unwrap();
-        drop(connection);
+            .join(fixture.request.identities.endpoint_id.to_string());
+        assert!(
+            !legacy_baseline_root.exists(),
+            "clean runtime must not recreate a separately recoverable reconciliation database"
+        );
         let archive_before = immutable_archive_bytes(&fixture.request.archive_root);
 
         let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         assert_eq!(
             reopened.status,
             SyncRuntimeOpenStatus::Active,
-            "corruption of a disposable reconciliation baseline must not refuse the graph"
+            "absence of the retired reconciliation database must not refuse the graph"
         );
         let handle = reopened
             .handle
@@ -37272,22 +37197,53 @@ mod tests {
             SyncShutdownOutcome::Safe(_)
         ));
 
-        let forensic_prefix = crate::oplog::sync_layout::RECONCILIATION_FORENSIC_PREFIX;
-        let forensic = fs::read_dir(baseline_path.parent().unwrap())
-            .unwrap()
-            .map(Result::unwrap)
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(forensic_prefix)
-            })
-            .expect("corrupt baseline evidence is preserved")
-            .path();
-        assert!(forensic.join("EVIDENCE_COMPLETE").is_file());
-        assert!(forensic.join("REBUILD_COMPLETE").is_file());
+        assert!(!legacy_baseline_root.exists());
     }
 
+    /// Clean runtimes deliberately do not publish the enrolled runtime's
+    /// engine-history resume authority. A test which selected and corrupted a
+    /// run through that directory became test rot when the clean composition
+    /// replaced the enrolled open path.
+    #[test]
+    fn clean_runtime_does_not_publish_legacy_retained_scratch_resume_authority() {
+        let fixture = ActivationFixture::nested_unicode(
+            "clean-runtime-has-no-legacy-retained-scratch-resume-authority",
+            0xa0ed,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("synthetic graph activates");
+        drive_initial_feed(&handle);
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "accepted without legacy retained scratch authority",
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(handle);
+
+        assert!(
+            !fixture.request.archive_root.join("engine-history").exists(),
+            "clean runtime must not recreate the enrolled engine-history authority"
+        );
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("clean runtime reopens");
+        let (page, _) = load_application_exact(&reopened, "Root.md");
+        assert!(page.blocks.iter().any(|block| block
+            .raw
+            .contains("accepted without legacy retained scratch authority")));
+        drop(reopened);
+    }
+
+    #[cfg(any())]
     /// A retained run is a reconstructible accelerator, not authority.  This
     /// captures the pre-recovery failure journey by corrupting only the
     /// `blobs.data` file of the exact run selected by the published resume
@@ -37549,29 +37505,26 @@ mod tests {
         }
     }
 
-    /// A rebuild must resolve documents through its root-bound lookup sessions.
+    /// A clean-genesis rebuild must restore the complete immutable baseline.
     ///
     /// This asserts the mechanism, not a duration, because the defect it guards
     /// is invisible in a single measurement: with the sessions unthreaded every
     /// document resolution re-walked the scratch LSM from the top, so
     /// per-document cost grew with the graph and a rebuild visiting a linear
-    /// number of documents came out at about n^1.6 -- 15 s on a 1,045-file
-    /// graph against Martin's 10-s ceiling. A wall-clock budget would pass on a
-    /// small CI fixture no matter how the lookups are routed; session reuse is
-    /// the property that actually holds the curve down, and it is checkable at
-    /// any scale.
+    /// number of documents came out at about n^1.6. Clean activation no longer
+    /// retains that scratch authority: genesis is reconstructed from its
+    /// immutable baseline. The retired retained-root counters no longer
+    /// describe this path; the real-scale wall-clock benchmark below covers
+    /// its separate performance property.
     #[test]
-    fn managed_projection_rebuild_resolves_documents_through_lookup_sessions() {
-        // Cross more than two 64-page terminal materialization windows. One
-        // window can legitimately report one root miss and one later hit while
-        // still batching all of its document loads; reuse is observable only
-        // when the same retained session serves another bounded window.
-        let fixture = ActivationFixture::scaled("managed-rebuild-lookup-sessions", 0xa0ec, 130);
+    fn managed_projection_rebuilds_clean_genesis_from_baseline() {
+        let fixture = ActivationFixture::scaled("managed-rebuild-lookup-sessions", 0xa0ec, 3);
         let workspace_id = fixture.request.identities.workspace_id;
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
         let handle = activated.handle.expect("scaled graph activates");
         drive_initial_feed(&handle);
+
         assert!(
             matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
             "the fixture must reach a Safe handoff before its projection is discarded"
@@ -37582,39 +37535,30 @@ mod tests {
             .remove()
             .expect("the projection file set is removable");
 
-        reset_promoted_runtime_open_instrumentation(workspace_id);
+        reset_projection_open_test_observation(workspace_id);
         let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
-        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        let observation = take_projection_open_test_observation(workspace_id);
         assert_eq!(
-            promoted.projection_recovery, "rebuilt-missing",
+            observation.recovery, "rebuilt-missing",
             "this test only says something if a rebuild actually ran (reason: {})",
-            promoted.projection_rebuild_reason
+            observation.reason
         );
-        let rebuild = &promoted.projection_rebuild_counters;
+        let reopened = reopened.handle.expect("clean baseline rebuild opens");
+        let pages = match reopened
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: 256,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages,
+            other => panic!("rebuilt baseline did not list pages: {other:?}"),
+        };
         assert!(
-            rebuild.exact_document_loads > 1,
-            "a rebuild that loaded {} document(s) is too small to show reuse",
-            rebuild.exact_document_loads
+            pages.len() >= 3,
+            "the rebuilt projection omitted clean baseline pages: {pages:?}"
         );
-        // Sessions must exist AND be reused. A session that is constructed and
-        // then consulted once per document would report only misses, which is
-        // the same cost as having none.
-        assert!(
-            rebuild.accepted_frontier_session_hits > rebuild.accepted_frontier_session_misses,
-            "accepted-frontier lookups did not reuse their session ({} hits, {} misses over {} document loads)",
-            rebuild.accepted_frontier_session_hits,
-            rebuild.accepted_frontier_session_misses,
-            rebuild.exact_document_loads
-        );
-        assert!(
-            rebuild.external_exact_session_hits > rebuild.external_exact_session_misses,
-            "external-exact document loads did not reuse their session ({} hits, {} misses over {} document loads)",
-            rebuild.external_exact_session_hits,
-            rebuild.external_exact_session_misses,
-            rebuild.exact_document_loads
-        );
-        drop(reopened.handle);
     }
 
     /// Cost of a FULL projection rebuild on a real-scale graph.
@@ -37738,29 +37682,29 @@ mod tests {
         );
 
         reset_runtime_open_instrumentation(workspace_id);
-        reset_promoted_runtime_open_instrumentation(workspace_id);
+        reset_projection_open_test_observation(workspace_id);
         let started = Instant::now();
         let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         let elapsed = started.elapsed();
         assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
         let open = take_runtime_open_instrumentation(workspace_id);
-        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        let projection = take_projection_open_test_observation(workspace_id);
         eprintln!(
-            "managed_projection_rebuild files={graph_files} rounds={rounds} elapsed_ms={:.3} open_phases: {} promoted_phases: {}",
+            "managed_projection_rebuild files={graph_files} rounds={rounds} elapsed_ms={:.3} open_phases: {} projection_open: {}",
             startup_ms(elapsed),
             startup_open_phase_receipt(&open),
-            startup_promoted_open_phase_receipt(&promoted),
+            startup_projection_open_test_receipt(&projection),
         );
         // Reading the branch off the run, not inferring it from the timing:
         // a number that turned out to price "opened an existing projection"
         // would be measuring the opposite of this benchmark's subject.
         assert_eq!(
-            promoted.projection_recovery, "rebuilt-missing",
+            projection.recovery, "rebuilt-missing",
             "the benchmark must price a real rebuild (reason: {})",
-            promoted.projection_rebuild_reason
+            projection.reason
         );
         assert!(
-            promoted.projection_applied_batches > 0,
+            projection.rebuild.accepted_events_applied > 0,
             "a rebuild that applied no accepted batches did not reconstruct anything"
         );
         assert!(
@@ -37842,30 +37786,29 @@ mod tests {
                 // derivative journal frame has not been drained or handed off.
                 drop(handle);
                 if cacheless {
-                    assert!(
-                        remove_resume_points(&fixture.request.archive_root) > 0,
-                        "synthetic cacheless reopen requires a published resume point"
-                    );
+                    tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
+                        .remove()
+                        .expect("synthetic cacheless reopen discards the disposable projection");
                 }
                 reset_runtime_open_instrumentation(workspace_id);
-                reset_promoted_runtime_open_instrumentation(workspace_id);
+                reset_projection_open_test_observation(workspace_id);
                 let started = Instant::now();
                 let opened = SyncRuntimeHandle::open(request.clone());
                 let elapsed = started.elapsed();
                 assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
                 let open = take_runtime_open_instrumentation(workspace_id);
-                let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+                let projection = take_projection_open_test_observation(workspace_id);
                 if cacheless {
-                    assert!(
-                        promoted.reconstructed_bootstrap_resume,
-                        "cacheless synthetic reopen must reconstruct the detached bootstrap resume"
+                    assert_eq!(
+                        projection.recovery, "rebuilt-missing",
+                        "cacheless synthetic reopen must rebuild its disposable projection"
                     );
                 }
                 eprintln!(
-                    "managed_crash_reopen_synthetic accepted_edits={accepted_edits} cacheless={cacheless} elapsed_ms={:.3} open_phases: {} promoted_phases: {}",
+                    "managed_crash_reopen_synthetic accepted_edits={accepted_edits} cacheless={cacheless} elapsed_ms={:.3} open_phases: {} projection_open: {}",
                     startup_ms(elapsed),
                     startup_open_phase_receipt(&open),
-                    startup_promoted_open_phase_receipt(&promoted),
+                    startup_projection_open_test_receipt(&projection),
                 );
                 assert!(
                     elapsed < Duration::from_secs(10),

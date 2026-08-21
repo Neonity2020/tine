@@ -4309,6 +4309,76 @@ pub(crate) struct OpenedCleanActivation {
     marker: LazyGenesisActivationMarkerV1,
 }
 
+/// Cold-opened clean authority before choosing how to reconstruct its
+/// disposable SQLite projection.  Keeping this boundary projection-free is
+/// load bearing: a runtime with an accepted operation tail must rebuild SQLite
+/// once at the final frontier, not first rebuild sequence zero and immediately
+/// replace that temporary database with a second full rebuild.
+pub(crate) struct OpenedCleanActivationAuthority {
+    engine: ShardedHotEngine,
+    baseline: std::sync::Arc<LazyGenesisCandidate>,
+    marker: LazyGenesisActivationMarkerV1,
+}
+
+impl OpenedCleanActivationAuthority {
+    pub(crate) const fn marker(&self) -> LazyGenesisActivationMarkerV1 {
+        self.marker
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ShardedHotEngine,
+        std::sync::Arc<LazyGenesisCandidate>,
+        LazyGenesisActivationMarkerV1,
+    ) {
+        (self.engine, self.baseline, self.marker)
+    }
+}
+
+/// Authenticate and open only the immutable clean authority. SQLite is a
+/// disposable projection and is deliberately left unopened until the caller
+/// has replayed the committed tail and knows the exact frontier it needs.
+pub(crate) fn open_clean_activation_authority(
+    enrollment_root: &Path,
+    baseline_directory: &Path,
+    catalog_document_id: DocumentId,
+    policy: ReferenceCatalogPolicyV1,
+) -> Result<Option<OpenedCleanActivationAuthority>, BootstrapStreamingImportError> {
+    let Some(marker) = read_activation_marker(enrollment_root)? else {
+        return Ok(None);
+    };
+    let baseline = std::sync::Arc::new(LazyGenesisCandidate::open_sealed_for_marker(
+        baseline_directory,
+        marker,
+    )?);
+    if baseline.catalog_document_id() != catalog_document_id {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "clean activation marker names a different catalog document".into(),
+        ));
+    }
+    let mut engine = ShardedHotEngine::new(
+        marker.workspace_id(),
+        marker.lineage_digest(),
+        catalog_document_id,
+    );
+    engine.configure_reference_catalog_policy(policy)?;
+    engine.install_lazy_genesis_baseline(std::sync::Arc::clone(&baseline))?;
+    let accepted_frontier = engine.accepted_frontier_root()?;
+    if super::sqlite::canonical_frontier_root_digest(&accepted_frontier)?
+        != marker.accepted_frontier_digest()
+    {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "clean activation marker accepted frontier differs from its baseline".into(),
+        ));
+    }
+    Ok(Some(OpenedCleanActivationAuthority {
+        engine,
+        baseline,
+        marker,
+    }))
+}
+
 impl OpenedCleanActivation {
     pub(crate) const fn engine(&self) -> &ShardedHotEngine {
         &self.engine
@@ -4336,48 +4406,59 @@ pub(crate) fn open_clean_activation(
     catalog_document_id: DocumentId,
     policy: ReferenceCatalogPolicyV1,
 ) -> Result<Option<OpenedCleanActivation>, BootstrapStreamingImportError> {
-    let Some(marker) = read_activation_marker(enrollment_root)? else {
+    let Some(opened) = open_clean_activation_authority(
+        enrollment_root,
+        baseline_directory,
+        catalog_document_id,
+        policy.clone(),
+    )?
+    else {
         return Ok(None);
     };
-    let baseline = LazyGenesisCandidate::open_sealed_for_marker(baseline_directory, marker)?;
-    if baseline.catalog_document_id() != catalog_document_id {
-        return Err(BootstrapStreamingImportError::InvalidSource(
-            "clean activation marker names a different catalog document".into(),
-        ));
-    }
-    let projection = match super::sqlite::open_clean_genesis_projection(
+    let (engine, baseline, marker) = opened.into_parts();
+    let projection = open_or_rebuild_clean_genesis_projection(
         database_path,
         super::ProjectionClaim::current(marker.workspace_id(), marker.lineage_digest()),
-        &super::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline)?,
-    ) {
-        Ok(projection) => projection,
-        Err(_) => rebuild_clean_genesis_projection(
-            database_path,
-            super::ProjectionClaim::current(marker.workspace_id(), marker.lineage_digest()),
-            &baseline,
-            policy.clone(),
-        )?,
-    };
-    let mut engine = ShardedHotEngine::new(
-        marker.workspace_id(),
-        marker.lineage_digest(),
-        catalog_document_id,
-    );
-    engine.configure_reference_catalog_policy(policy)?;
-    engine.install_lazy_genesis_baseline(std::sync::Arc::new(baseline))?;
-    let accepted_frontier = engine.accepted_frontier_root()?;
-    if super::sqlite::canonical_frontier_root_digest(&accepted_frontier)?
-        != marker.accepted_frontier_digest()
-    {
-        return Err(BootstrapStreamingImportError::InvalidSource(
-            "clean activation marker accepted frontier differs from its baseline".into(),
-        ));
-    }
+        &baseline,
+        policy,
+    )?;
     Ok(Some(OpenedCleanActivation {
         engine,
         projection,
         marker,
     }))
+}
+
+pub(crate) fn open_or_rebuild_clean_genesis_projection(
+    database_path: &Path,
+    claim: super::ProjectionClaim,
+    baseline: &LazyGenesisCandidate,
+    policy: ReferenceCatalogPolicyV1,
+) -> Result<super::sqlite::CleanGenesisPhysicalProjection, BootstrapStreamingImportError> {
+    let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(baseline)?;
+    match super::sqlite::open_clean_genesis_projection(database_path, claim, &accepted_frontier) {
+        Ok(projection) => {
+            super::sqlite::record_projection_open_test_observation(
+                claim.workspace_id(),
+                "opened-existing",
+                "",
+                super::sqlite::RebuildInstrumentation::default(),
+            );
+            Ok(projection)
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let projection =
+                rebuild_clean_genesis_projection(database_path, claim, baseline, policy)?;
+            super::sqlite::record_projection_open_test_observation(
+                claim.workspace_id(),
+                "rebuilt-missing",
+                &reason,
+                super::sqlite::RebuildInstrumentation::default(),
+            );
+            Ok(projection)
+        }
+    }
 }
 
 fn materialize_lazy_genesis_page(

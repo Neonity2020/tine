@@ -2625,6 +2625,71 @@ pub(crate) fn take_full_digest_scan_instrumentation(
         .unwrap_or_default()
 }
 
+/// Clean-path projection-open evidence recorded on the actor thread and
+/// consumed by journey tests on their caller thread. This is deliberately
+/// scoped to SQLite's disposable projection boundary rather than reviving the
+/// removed promoted-runtime timing aggregate.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectionOpenTestObservation {
+    pub(crate) recovery: &'static str,
+    pub(crate) reason: String,
+    pub(crate) rebuild: RebuildInstrumentation,
+}
+
+#[cfg(test)]
+static PROJECTION_OPEN_TEST_OBSERVATIONS: Mutex<
+    BTreeMap<WorkspaceId, ProjectionOpenTestObservation>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn reset_projection_open_test_observation(workspace: WorkspaceId) {
+    PROJECTION_OPEN_TEST_OBSERVATIONS
+        .lock()
+        .expect("projection-open test observation lock")
+        .remove(&workspace);
+}
+
+#[cfg(test)]
+pub(crate) fn take_projection_open_test_observation(
+    workspace: WorkspaceId,
+) -> ProjectionOpenTestObservation {
+    PROJECTION_OPEN_TEST_OBSERVATIONS
+        .lock()
+        .expect("projection-open test observation lock")
+        .remove(&workspace)
+        .expect("projection open recorded a clean SQLite observation")
+}
+
+#[cfg(test)]
+pub(crate) fn record_projection_open_test_observation(
+    workspace: WorkspaceId,
+    recovery: &'static str,
+    reason: &str,
+    rebuild: RebuildInstrumentation,
+) {
+    PROJECTION_OPEN_TEST_OBSERVATIONS
+        .lock()
+        .expect("projection-open test observation lock")
+        .insert(
+            workspace,
+            ProjectionOpenTestObservation {
+                recovery,
+                reason: reason.to_owned(),
+                rebuild,
+            },
+        );
+}
+
+#[cfg(not(test))]
+pub(crate) fn record_projection_open_test_observation(
+    _workspace: WorkspaceId,
+    _recovery: &'static str,
+    _reason: &str,
+    _rebuild: RebuildInstrumentation,
+) {
+}
+
 fn reset_projection_open_breakdown() {
     PROJECTION_OPEN_BREAKDOWN.with(|slot| *slot.borrow_mut() = ProjectionOpenBreakdown::default());
 }
@@ -4499,6 +4564,12 @@ impl SqliteFrontier {
                         &path, claim, lease, &source, None, None,
                     )?;
                     record_projection_rebuild("rebuilt-behind", &reason, stage.elapsed(), &rebuild);
+                    record_projection_open_test_observation(
+                        claim.workspace_id,
+                        "rebuilt-behind",
+                        &reason,
+                        rebuild,
+                    );
                     mark_rebuild_complete(&pending_forensics)?;
                     return Ok(OpenProjection {
                         database,
@@ -4514,6 +4585,12 @@ impl SqliteFrontier {
                     if !pending_forensics.directories.is_empty() {
                         mark_rebuild_complete(&pending_forensics)?;
                         let physical = PhysicalSqliteDatabase::open_writable(&path)?;
+                        record_projection_open_test_observation(
+                            claim.workspace_id,
+                            "rebuilt-preserving-evidence",
+                            "recovered a committed rebuild after process termination",
+                            RebuildInstrumentation::default(),
+                        );
                         return Ok(OpenProjection {
                             database: Self {
                                 path,
@@ -4538,6 +4615,12 @@ impl SqliteFrontier {
                         });
                     }
                     let physical = PhysicalSqliteDatabase::open_writable(&path)?;
+                    record_projection_open_test_observation(
+                        claim.workspace_id,
+                        "opened-existing",
+                        "",
+                        RebuildInstrumentation::default(),
+                    );
                     return Ok(OpenProjection {
                         database: Self {
                             path,
@@ -4575,6 +4658,12 @@ impl SqliteFrontier {
                         stage.elapsed(),
                         &rebuild,
                     );
+                    record_projection_open_test_observation(
+                        claim.workspace_id,
+                        "rebuilt-preserving-evidence",
+                        &reason,
+                        rebuild,
+                    );
                     mark_rebuild_complete(&pending_forensics)?;
                     return Ok(OpenProjection {
                         database,
@@ -4592,17 +4681,25 @@ impl SqliteFrontier {
         let (database, rebuild, _) =
             Self::build_candidate_and_publish(&path, claim, lease, &source, None, None)?;
         if !pending_forensics.directories.is_empty() {
+            let reason = "resumed interrupted forensic preservation and rebuild";
+            record_projection_open_test_observation(
+                claim.workspace_id,
+                "rebuilt-preserving-evidence",
+                reason,
+                rebuild,
+            );
             mark_rebuild_complete(&pending_forensics)?;
             return Ok(OpenProjection {
                 database,
                 recovery: ProjectionRecovery::RebuiltPreservingEvidence {
-                    reason: "resumed interrupted forensic preservation and rebuild".into(),
+                    reason: reason.into(),
                     evidence: pending_forensics.evidence,
                     applied_batches: rebuild.accepted_events_applied,
                 },
                 rebuild,
             });
         }
+        record_projection_open_test_observation(claim.workspace_id, "rebuilt-missing", "", rebuild);
         Ok(OpenProjection {
             database,
             recovery: ProjectionRecovery::RebuiltMissing {
