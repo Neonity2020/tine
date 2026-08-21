@@ -2086,6 +2086,31 @@
       "notes": "Fail-before: the independent verifier used a fixture whose logical name, kind, and path already agreed and changed only round-tripping CRLF/blank-line formatting. Reconciliation produced zero semantic operations, then OperationTransaction's correct non-empty invariant converted that no-op into UnsafeInput. The no-op now has a separate sealed formatting material lane: it publishes endpoint-local intent/base/completion authority, replaces the bounded completed-path baseline only after authenticating the prior receipt and unchanged semantic frontier, and never publishes an operation batch. Crash after intent is recovered after a full Graph/receipt/archive-engine/SQLite/tail restart; exact bytes survive, and a subsequent real semantic edit renders from the adopted formatting baseline."
     },
     {
+      "id": "REG-SYNC-CLEAN-LOCAL-FORMATTING-ADOPTION-001",
+      "title": "Endpoint-local formatting drift cannot wedge later managed-storage saves",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [
+          362
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::clean_external_formatting_only_change_does_not_wedge_the_next_local_save",
+          "crates/tine-core/src/sync_runtime.rs::public_clean_runtime_reconciles_an_exact_external_edit_and_reopens_it"
+        ],
+        "scenario": "sync.clean-endpoint-local-formatting-adoption",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: after a CRLF-only external rewrite, reconciliation correctly returned Noop but the next local save was refused at trusted_local.preparation.planning forever because lazy-genesis capture still required activation bytes byte-for-byte. Capture now parses and proves the exact live endpoint bytes against the accepted semantic page, then uses those bytes and their annotations as the guarded predecessor without writing formatting into shared history or restoring a persistent formatting index. The regression crosses cold reopen both before the page's first manifest and after a manifest head exists, retains CRLF and LF respectively, and completes the next edit. A semantic mismatch still follows ordinary external reconciliation, while publication continues to guard the exact predecessor against a later race."
+    },
+    {
       "id": "REG-SYNC-EDITOR-TITLE-SEMANTIC-DIVERGENCE-001",
       "title": "Editor title changes remain one atomic logical rename across Graph, oplog, SQLite, projection, and restart",
       "family": "sync-data-safety",

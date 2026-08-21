@@ -23384,11 +23384,10 @@ mod tests {
     /// adopt wedges Direct Files -- every later save demands a reconciliation
     /// that will forever report Noop without fixing the drift.
     ///
-    /// The clean runtime has no adoption mechanism yet: predecessors derive
-    /// purely from shared accepted history, while formatting baselines are
-    /// endpoint-local by nature. The fix is a design decision (GH #362).
+    /// The clean runtime re-proves the exact endpoint-local bytes against the
+    /// accepted semantic state at capture time. This keeps formatting out of
+    /// shared history while preserving the exact base-revision guard.
     #[test]
-    #[ignore = "GH #362: clean formatting-only adoption is undesigned; this pins the wedge"]
     fn clean_external_formatting_only_change_does_not_wedge_the_next_local_save() {
         let fixture = ActivationFixture::nested_unicode("clean-formatting-only-adopt", 0xa177);
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
@@ -23415,15 +23414,62 @@ mod tests {
             "a formatting-only external change keeps the external spelling"
         );
 
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(handle);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened
+            .handle
+            .expect("formatting-only lazy-genesis state reopens");
+
         let (page, revision) = load_application_exact(&handle, "Root.md");
         let _ = save_application_block_text(&handle, page, revision, "saved after formatting");
         drain_managed_local(&handle);
+        let first_saved = fs::read(fixture.graph_root.join("Root.md")).unwrap();
+        assert!(first_saved.windows(2).any(|window| window == b"\r\n"));
         assert!(
-            fs::read_to_string(fixture.graph_root.join("Root.md"))
+            String::from_utf8(first_saved.clone())
                 .unwrap()
                 .contains("saved after formatting"),
             "the save after a formatting-only external change must reach the file"
         );
+
+        // Repeat after the page has a manifest head, and cross a cold reopen:
+        // neither predecessor source may confuse endpoint-local formatting
+        // with a shared semantic mutation.
+        let lf = String::from_utf8(first_saved)
+            .unwrap()
+            .replace("\r\n", "\n");
+        fs::write(fixture.graph_root.join("Root.md"), lf.as_bytes()).unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        drain_until_settled(&handle);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(handle);
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened
+            .handle
+            .expect("formatting-only manifest state reopens");
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ =
+            save_application_block_text(&handle, page, revision, "saved after second formatting");
+        drain_managed_local(&handle);
+        let second_saved = fs::read(fixture.graph_root.join("Root.md")).unwrap();
+        assert!(!second_saved.windows(2).any(|window| window == b"\r\n"));
+        assert!(String::from_utf8(second_saved)
+            .unwrap()
+            .contains("saved after second formatting"));
     }
 
     #[test]

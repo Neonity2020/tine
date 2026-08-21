@@ -687,6 +687,17 @@ by canonical rendering or bypassed by trusting live bytes alone. This proof is
 reconstructed from the manifest plus live file on reopen and therefore does
 not require another persistent page/layout index.
 
+The same endpoint-local rule applies before a page has its first manifest head.
+The immutable activation capsule remains semantic authority, but it is not an
+assertion that an external editor has preserved the capsule's byte spelling.
+Local-save capture may use live bytes as the lazy-genesis predecessor only
+after the exact-source parser proves that they express the capsule's accepted
+page state. The resulting annotations and bytes are scoped to that capture;
+they do not author a formatting batch, mutate shared history, or require a
+persistent formatting overlay. A semantic mismatch instead enters external
+reconciliation (or refuses stale local authoring), and publication still guards
+the exact live predecessor, so a second external write cannot be overwritten.
+
 For a valid clean marker, the immutable baseline plus committed ordinary
 manifests is the complete semantic authority. The runtime reconstructs any
 current projection-head map in process memory from those manifests; it neither

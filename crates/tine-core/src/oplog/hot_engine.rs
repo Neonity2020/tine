@@ -8538,7 +8538,13 @@ impl ShardedHotEngine {
                     (prior, false)
                 } else {
                     let prior = self
-                        .lazy_genesis_projection_predecessor(path, page_id, current.state())?
+                        .lazy_genesis_projection_predecessor(
+                            path,
+                            page_id,
+                            current.state(),
+                            None,
+                            false,
+                        )?
                         .ok_or_else(|| {
                             EngineError::ProjectionManifest(format!(
                                 "clean import has no baseline or manifest predecessor for {path}"
@@ -15276,6 +15282,8 @@ impl ShardedHotEngine {
         path: &ManagedPath,
         page_id: PageId,
         before: &ProjectionPageState,
+        exact_local_bytes: Option<&[u8]>,
+        external_reconciliation: bool,
     ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
         let Some(genesis) = &self.lazy_genesis else {
             return Ok(None);
@@ -15297,7 +15305,7 @@ impl ShardedHotEngine {
                 "lazy-genesis predecessor for {path} is stale or mismatched"
             )));
         }
-        let replay = super::projection::plan_projection_adopting_exact_source(
+        let baseline = super::projection::plan_projection_adopting_exact_source(
             self.workspace_id,
             before,
             &page.exact_source_bytes,
@@ -15307,20 +15315,56 @@ impl ShardedHotEngine {
                 "lazy-genesis predecessor semantic proof for {path} failed: {error:?}"
             ))
         })?;
-        if replay.target() != page.exact_source_bytes
-            || replay.intent().workspace_id() != self.workspace_id
-            || replay.intent().page_id() != page_id
-            || replay.intent().path() != path
-            || replay.intent().frontier() != &before.frontier
-            || replay.intent().claim_evidence() != before.claim_evidence
+        if baseline.target() != page.exact_source_bytes
+            || baseline.intent().workspace_id() != self.workspace_id
+            || baseline.intent().page_id() != page_id
+            || baseline.intent().path() != path
+            || baseline.intent().frontier() != &before.frontier
+            || baseline.intent().claim_evidence() != before.claim_evidence
         {
             return Err(EngineError::ProjectionManifest(format!(
                 "lazy-genesis predecessor for {path} did not bind its current semantic state"
             )));
         }
+        let (bytes, intent) = match exact_local_bytes {
+            Some(local) if local != page.exact_source_bytes => {
+                let local = match super::projection::plan_projection_adopting_exact_source(
+                    self.workspace_id,
+                    before,
+                    local,
+                ) {
+                    Ok(local) => local,
+                    Err(super::projection::ExactSourceProjectionError::Semantic(_))
+                        if external_reconciliation =>
+                    {
+                        // The external bytes are the desired successor rather
+                        // than this accepted page's predecessor. Reconciliation
+                        // still starts from the immutable activation baseline;
+                        // local authoring takes the `None` path below and must
+                        // not overwrite unseen semantic changes.
+                        return Ok(Some(CapabilityCapturedPriorProjection {
+                            bytes: page.exact_source_bytes,
+                            intent: baseline.intent().clone(),
+                            completion: None,
+                            bootstrap_owner_binding: Some(genesis.root()),
+                            managed_local_authority: None,
+                            clean_manifest_authority: None,
+                        }));
+                    }
+                    Err(super::projection::ExactSourceProjectionError::Semantic(_)) => {
+                        return Ok(None);
+                    }
+                    Err(super::projection::ExactSourceProjectionError::Projection(error)) => {
+                        return Err(EngineError::ProjectionManifest(error.to_string()));
+                    }
+                };
+                (local.target().to_vec(), local.intent().clone())
+            }
+            _ => (page.exact_source_bytes, baseline.intent().clone()),
+        };
         Ok(Some(CapabilityCapturedPriorProjection {
-            bytes: page.exact_source_bytes,
-            intent: replay.intent().clone(),
+            bytes,
+            intent,
             completion: None,
             // The baseline root transitively authenticates this page capsule;
             // the intent above supplies the exact page/path/byte binding.
@@ -15822,7 +15866,13 @@ impl ShardedHotEngine {
                     .as_ref()
                     .expect("prior requirement was selected from a semantic pre-state");
                 let lazy_genesis_prior = if !clean_manifest_head_present {
-                    self.lazy_genesis_projection_predecessor(path, requirement.page_id, before)?
+                    self.lazy_genesis_projection_predecessor(
+                        path,
+                        requirement.page_id,
+                        before,
+                        current.as_deref(),
+                        external,
+                    )?
                 } else {
                     None
                 };
