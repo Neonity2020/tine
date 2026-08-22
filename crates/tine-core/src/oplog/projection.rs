@@ -21,14 +21,15 @@ use std::fmt;
 use std::io;
 
 use super::{
-    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlockId, CleanTombstoneAuthorization,
-    EngineError, LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition,
-    ManifestProjectionTarget, ManifestedProjectionIntent, MaterializedBlock, MaterializedPage,
-    ObjectKind, ObjectStore, PageId, ProjectionCompletedReceipt, ProjectionCompletion,
-    ProjectionEndpointBinding, ProjectionEndpointId, ProjectionIntent, ProjectionPageState,
-    ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError,
-    ProjectionTombstoneAuthorization, ProjectionWork, ProjectionWorkTarget, ReceiptError,
-    ShardedHotEngine, SqliteFrontier, StructuralLocator, StructuralSpan, WorkspaceId,
+    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlobDescription, BlockId,
+    CleanTombstoneAuthorization, EngineError, LogseqIdentityOrigin, LogseqUuid,
+    ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
+    MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore, PageId,
+    ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
+    ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
+    ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionWork,
+    ProjectionWorkTarget, ReceiptError, ShardedHotEngine, SqliteFrontier, StructuralLocator,
+    StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
@@ -2016,10 +2017,24 @@ fn execute_manifested_projection_work_located(
             expected_base.map(AnnotatedProjectionBase::bytes),
             expected_base.map(AnnotatedProjectionBase::annotations),
         )?;
-        if replay.target() != target
-            || replay.guarded_layout() != guarded_layout
-            || !local_attempt_intent.matches_replay_except_frontier(replay.intent())
-        {
+        let target_matches = replay.target() == target;
+        let layout_matches = replay.guarded_layout() == guarded_layout;
+        let intent_matches = local_attempt_intent.matches_replay_except_frontier(replay.intent());
+        if !target_matches || !layout_matches || !intent_matches {
+            if super::phase_trace_enabled() {
+                eprintln!(
+                    "PHASE DETAIL Projection.work_not_ready path={} batch={} target_matches={} layout_matches={} intent_matches={} target={:?} replay={:?} target_text={:?} replay_text={:?}",
+                    work.path(),
+                    work.batch_id(),
+                    target_matches,
+                    layout_matches,
+                    intent_matches,
+                    BlobDescription::of(target),
+                    BlobDescription::of(replay.target()),
+                    String::from_utf8_lossy(target),
+                    String::from_utf8_lossy(replay.target()),
+                );
+            }
             return Err(ProjectionError::WorkNotReady);
         }
     }

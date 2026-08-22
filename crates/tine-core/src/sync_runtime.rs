@@ -8905,8 +8905,13 @@ fn persist_application_move_episode(
         Some(existing) if existing == bytes => {}
         Some(_) => return Err("move episode immutable record collision".into()),
         None => {
+            // Move episodes live below this process's private application
+            // runtime root and are published only by its single actor.  On
+            // Android the shared-archive hard-link protocol is unavailable;
+            // use the same proven-absent, same-directory atomic publication
+            // contract as the other private runtime journals.
             publication
-                .publish_new_exact(&name, &bytes)
+                .publish_new_exact_single_writer(&name, &bytes)
                 .map_err(|error| format!("move episode record publication failed: {error}"))?;
             if fail_after_record_write_for_test {
                 // Model an error returned after the new directory entry became
@@ -8922,7 +8927,7 @@ fn persist_application_move_episode(
         .completion_bytes()
         .map_err(|error| error.to_string())?;
     publication
-        .publish_new_exact(&completion_name, &completion_bytes)
+        .publish_new_exact_single_writer(&completion_name, &completion_bytes)
         .map_err(|error| format!("move episode completion publication failed: {error}"))?;
     let retained = read_optional_regular(
         directory,
@@ -9253,11 +9258,15 @@ fn persist_clean_foreground_checkpoint(
         Some(_) => Err(format!(
             "clean foreground checkpoint {filename} collides with different durable evidence"
         )),
+        // This checkpoint directory is private to one local runtime actor.
+        // Shared/provider namespaces must retain strict no-replace
+        // publication, but this sole-writer namespace may use the Android-safe
+        // proven-absent atomic-rename fallback.
         None => DurableDirectoryPublication::open(directory)
             .map_err(|error| {
                 format!("clean foreground checkpoint publication is unavailable: {error}")
             })?
-            .publish_new_exact(&filename, &bytes)
+            .publish_new_exact_single_writer(&filename, &bytes)
             .map_err(|error| {
                 format!("cannot publish clean foreground checkpoint {filename}: {error}")
             }),
@@ -17405,44 +17414,84 @@ impl RuntimeActor {
         };
         match outcome {
             ManagedLocalDrainOutcome::Complete(completion) => {
-                let managed = self
-                    .managed_local
-                    .as_mut()
-                    .expect("clean foreground journal remains installed");
-                if let Err(error) =
-                    persist_clean_foreground_checkpoint(&managed.directory, &completion.checkpoint)
-                {
-                    managed.last_failure = Some(error.clone());
-                    return Some(SyncRuntimeTick::RecoveryBlocked(error));
-                }
-                if managed.frames.front().map(LocalJournalFrame::sequence)
-                    != Some(completion.sequence)
-                {
-                    return Some(SyncRuntimeTick::Terminal(
-                        "clean foreground completion does not name the queue front".into(),
-                    ));
-                }
-                managed.checkpoint = completion.checkpoint;
-                managed.checkpoint_batch_id = Some(completion.batch_id);
-                managed.frames.pop_front();
-                if managed
-                    .latest_projection_frames
-                    .get(record.projection().intent().path().as_str())
-                    .is_some_and(|latest| latest.sequence() == completion.sequence)
-                {
-                    managed
+                let settled = {
+                    let managed = self
+                        .managed_local
+                        .as_mut()
+                        .expect("clean foreground journal remains installed");
+                    if let Err(error) = persist_clean_foreground_checkpoint(
+                        &managed.directory,
+                        &completion.checkpoint,
+                    ) {
+                        managed.last_failure = Some(error.clone());
+                        return Some(SyncRuntimeTick::RecoveryBlocked(error));
+                    }
+                    if managed.frames.front().map(LocalJournalFrame::sequence)
+                        != Some(completion.sequence)
+                    {
+                        return Some(SyncRuntimeTick::Terminal(
+                            "clean foreground completion does not name the queue front".into(),
+                        ));
+                    }
+                    managed.checkpoint = completion.checkpoint;
+                    managed.checkpoint_batch_id = Some(completion.batch_id);
+                    managed.frames.pop_front();
+                    if managed
                         .latest_projection_frames
-                        .remove(record.projection().intent().path().as_str());
-                    managed.retire_latest_task_query_overlay(
-                        record.projection().intent().path(),
-                        completion.sequence,
-                    );
-                }
-                managed.continuation = None;
-                managed.last_failure = None;
-                if let Err(error) = managed.compact_clean_foreground_journal_if_needed() {
-                    managed.last_failure = Some(error.clone());
-                    return Some(SyncRuntimeTick::RecoveryBlocked(error));
+                        .get(record.projection().intent().path().as_str())
+                        .is_some_and(|latest| latest.sequence() == completion.sequence)
+                    {
+                        managed
+                            .latest_projection_frames
+                            .remove(record.projection().intent().path().as_str());
+                        managed.retire_latest_task_query_overlay(
+                            record.projection().intent().path(),
+                            completion.sequence,
+                        );
+                    }
+                    managed.continuation = None;
+                    managed.last_failure = None;
+                    if let Err(error) = managed.compact_clean_foreground_journal_if_needed() {
+                        managed.last_failure = Some(error.clone());
+                        return Some(SyncRuntimeTick::RecoveryBlocked(error));
+                    }
+                    managed.frames.is_empty() && managed.pending_commit.is_none()
+                };
+                if settled {
+                    // The journal prefix is now completely checkpointed in
+                    // canonical accepted history.  Keeping the identical hot
+                    // overlay would let it shadow the next external import and
+                    // make projection work contradict the accepted state.
+                    // Collapse only after the engine itself proves every
+                    // overlay record and document equal that accepted prefix.
+                    let collapsed = self
+                        .clean
+                        .as_mut()
+                        .ok_or_else(|| "clean foreground derivative has no runtime".to_owned())
+                        .and_then(|clean| {
+                            let mut session = clean
+                                .runtime
+                                .admit_clean_mutation(&self.graph)
+                                .map_err(|error| {
+                                    format!("cannot authorize settled overlay collapse: {error}")
+                                })?;
+                            let (_, engine, _) = session.parts().map_err(|error| {
+                                format!("cannot retain settled overlay engine: {error}")
+                            })?;
+                            let accepted = engine
+                                .accepted_frontier_root()
+                                .map_err(|error| error.to_string())?;
+                            engine
+                                .collapse_managed_local_prefix(&accepted)
+                                .map_err(|error| error.to_string())?;
+                            Ok(())
+                        });
+                    if let Err(error) = collapsed {
+                        if let Some(managed) = self.managed_local.as_mut() {
+                            managed.last_failure = Some(error.clone());
+                        }
+                        return Some(SyncRuntimeTick::RecoveryBlocked(error));
+                    }
                 }
                 self.queue_clean_provider_publication(completion.batch_id);
                 Some(SyncRuntimeTick::Recovering)

@@ -134,12 +134,11 @@ export const WINDOWS_CORE_EXACT_TEST_NAMES = Object.freeze([
 ]);
 
 export const WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES = Object.freeze([
-  "oplog::local_active::tests::a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write",
+  "oplog::local_active::tests::clean_admissions_are_bounded_at_one_one_thousand_and_ten_thousand",
   "model::tests::bootstrap_source_regular_file_sync_uses_supported_handle_access",
   "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts",
   "oplog::import::tests::inactive_streaming_bootstrap_preseal_crash_retries_exactly",
   "oplog::import::tests::inactive_streaming_bootstrap_repeated_run_reuses_exact_seal",
-  "oplog::local_active::tests::authoritative_snapshot_prunes_lock_namespaces_before_reading_files",
   "oplog::enrollment::tests::a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
   "oplog::sqlite::tests::separate_process_workspace_lease_contends_and_crash_releases",
 ]);

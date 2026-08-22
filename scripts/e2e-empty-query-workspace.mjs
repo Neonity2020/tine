@@ -391,10 +391,22 @@ await withApp(1, async (browser) => {
 
   // (10) A valid workspace still executes under the existing bounded result path.
   await setSource(browser, origin, "fixture");
-  await browser.waitUntil(async () => {
-    const state = await paneState(browser, origin);
-    return state.status !== "Enter a search to begin." && /result/.test(state.status ?? "");
-  }, { timeout: 10_000, timeoutMsg: "valid source did not reach the bounded live query path" });
+  let finalState;
+  try {
+    await browser.waitUntil(async () => {
+      finalState = await paneState(browser, origin);
+      return finalState.status !== "Enter a search to begin." && /result/.test(finalState.status ?? "");
+    }, {
+      // This is a semantic route/execution proof, not a latency budget. A loaded
+      // release run once crossed the old ten-second wall even though an immediate
+      // exact-scenario rerun completed correctly. Performance has its own gates;
+      // retain a bounded wait here and report the last semantic state on failure.
+      timeout: 30_000,
+      timeoutMsg: "valid source did not reach the bounded live query path",
+    });
+  } catch (error) {
+    throw new Error(`${error.message}; lastState=${JSON.stringify(finalState)}`);
+  }
   sameDigest(postInitializationGraph, "valid virtual query execution");
 });
 

@@ -103,7 +103,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("cancel_sparse_v2_cold", NoGraphSlot),
     ("capture_frontend_ready", NoGraphSlot),
     ("capture_graph_binding", NoGraphSlot),
-    ("capture_live_save_conflict", LegacyOnly),
+    ("capture_live_save_conflict", Filesystem),
     ("capture_quick_switch", NoGraphSlot),
     ("capture_target", NoGraphSlot),
     ("clipboard_files", NoGraphSlot),
@@ -117,7 +117,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("default_graph_parent", NoGraphSlot),
     ("delete_page", ManagedRouted),
     ("detect_media_editor", NoGraphSlot),
-    ("durable_live_save_conflict_diff", LegacyOnly),
+    ("durable_live_save_conflict_diff", Filesystem),
     ("edit_asset_external", Filesystem),
     ("empty_asset_trash", TrashWrite),
     ("existing_page_names", ManagedRouted),
@@ -156,7 +156,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("list_sync_conflicts", Filesystem),
     ("list_templates", ManagedRouted),
     ("list_vcs_marker_conflicts", Filesystem),
-    ("live_save_conflict_diff", LegacyOnly),
+    ("live_save_conflict_diff", Filesystem),
     ("load_graph", NoGraphSlot),
     ("load_plugin_registry_cache", NoGraphSlot),
     ("load_session", NoGraphSlot),
@@ -277,6 +277,14 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "present_conflict_override",
         "managed conflicts use actor-issued observations, not Direct Files editor activations",
+    ),
+    (
+        "resolve_durable_live_save_conflict",
+        "durable live-save conflicts are retained Direct Files editor state, not managed actor state",
+    ),
+    (
+        "resolve_live_save_conflict",
+        "live-save conflicts consume a Direct Files observation epoch that managed editors do not issue",
     ),
     (
         "resolve_vcs_marker_conflict",

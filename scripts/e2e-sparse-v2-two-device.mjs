@@ -469,6 +469,7 @@ async function clickSettingsButtonMatchingAndConfirm(patternSource, label) {
   }, patternSource);
   if (!clicked) throw new Error(`${label}: the join action disappeared before it could be clicked`);
   await acceptNativeConfirmation(label, before);
+  return before;
 }
 
 // Vocabulary reserved for a genuinely hostile provider entry (a symlink, a file
@@ -567,6 +568,15 @@ async function acceptNativeConfirmation(label, before) {
     `${label} did not open the native confirmation dialog`);
   execFileSync(XDOTOOL, ["windowactivate", "--sync", dialogId], { env });
   execFileSync(XDOTOOL, ["key", "--clearmodifiers", "alt+y"], { env });
+  await waitFor(() => !windowIds(".*").includes(dialogId), 12_000,
+    `${label} confirmation did not close`);
+}
+
+async function declineNativeConfirmation(label, before) {
+  const dialogId = await waitFor(() => windowIds(".*").find((id) => !before.has(id)), 15_000,
+    `${label} did not open the native confirmation dialog`);
+  execFileSync(XDOTOOL, ["windowactivate", "--sync", dialogId], { env });
+  execFileSync(XDOTOOL, ["key", "--clearmodifiers", "alt+n"], { env });
   await waitFor(() => !windowIds(".*").includes(dialogId), 12_000,
     `${label} confirmation did not close`);
 }
@@ -907,7 +917,7 @@ try {
   // managed-storage/provider probe. The explicit Join action performs cold
   // discovery and then transitions this installation to SharedActive. The same
   // action is offered from either storage mode, so it is selected by role.
-  await clickSettingsButtonMatchingAndConfirm(JOIN_BUTTON_PATTERN, "device-b-join");
+  const joinWindows = await clickSettingsButtonMatchingAndConfirm(JOIN_BUTTON_PATTERN, "device-b-join");
   if (JOIN_FROM_MANAGED) {
     // What happens to device B's OWN pre-join managed history is quoted from
     // the backend, not inferred. `join_shared_clean`
@@ -919,6 +929,13 @@ try {
     // retired, archived or merged: the assertion is therefore that device B
     // keeps exactly what it had, including the edit it made after its own
     // activation, and that the user is told why the join did not happen.
+    // The product now turns this otherwise-correct refusal into an actionable
+    // second prompt: adopt the other device's history, archiving this one's.
+    // This leg proves the conservative choice. Decline that prompt through the
+    // real native dialog, then require the refusal explanation and byte-exact
+    // retention below. Leaving the prompt open made WebKitWebDriver appear to
+    // hang and tested neither outcome.
+    await declineNativeConfirmation("device-b-decline-adoption", joinWindows);
     const { notice, settled } = await joinNoticeAfter("device B joining from its own managed storage");
     if (settled.includes(JOIN_SUCCESS_NOTICE)) {
       throw new Error("device B reported a completed join while holding its own managed history");

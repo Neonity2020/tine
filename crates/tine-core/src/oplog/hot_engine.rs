@@ -9183,10 +9183,9 @@ impl ShardedHotEngine {
         Ok(Some(page))
     }
 
-    #[cfg(test)]
     /// Remove the complete pending overlay only after authenticated accepted
     /// state proves the same prefix and exact resulting documents.
-    pub fn collapse_managed_local_prefix(
+    pub(crate) fn collapse_managed_local_prefix(
         &mut self,
         expected_accepted_frontier: &AcceptedFrontierRoot,
     ) -> Result<usize, ManagedLocalRecordError> {
@@ -15338,7 +15337,6 @@ impl ShardedHotEngine {
         if intent.workspace_id() != self.workspace_id
             || intent.page_id() != before.page.page_id
             || intent.path() != path
-            || intent.post_frontier() != &before.frontier
             || intent.claim_evidence() != before.claim_evidence
         {
             return Err(EngineError::ProjectionManifest(
@@ -15364,6 +15362,12 @@ impl ShardedHotEngine {
             )
             .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
         } else {
+            // An unrelated accepted page may advance the graph-wide frontier
+            // after this page's latest managed-local projection.  Frontier
+            // equality would then reject a perfectly valid predecessor.  The
+            // replay below is the authority: it re-renders this exact page
+            // from the current semantic state and must reproduce the retained
+            // bytes and annotations before they are admitted.
             let replay = super::projection::plan_projection_with_layout_annotations(
                 self.workspace_id,
                 before,
@@ -15675,7 +15679,6 @@ impl ShardedHotEngine {
         let target = intent.target();
         if intent.path() != path
             || intent.page_id() != prior.intent.page_id()
-            || intent.post_frontier() != prior.intent.frontier()
             || target.bytes() != Some(prior.bytes.as_slice())
             || target.description() != Some(prior.intent.target())
             || target.annotations() != prior.intent.annotations()
@@ -15685,6 +15688,12 @@ impl ShardedHotEngine {
                     .into(),
             ));
         }
+        // The entry's graph-wide frontier may be older because an unrelated
+        // page was accepted afterwards, or because this journal-durable edit
+        // has not drained into accepted history yet. The caller immediately
+        // below binds `prior.intent` to the draft's exact current semantic
+        // pre-state (frontier and claim evidence included), while the checks
+        // above bind its bytes and annotations to this retained journal entry.
         Ok(())
     }
 
