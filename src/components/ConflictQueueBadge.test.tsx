@@ -129,6 +129,15 @@ describe("the queue after an external change", () => {
 
     await refreshSyncConflicts("new");
     expect(toasts()).toHaveLength(1);
+
+    __setBackendForTest({
+      listSyncConflicts: async () => [],
+      listVcsMarkerConflicts: async () => [],
+      conflictQueue: async () => [],
+    } as unknown as Backend);
+    await refreshSyncConflicts();
+    expect(conflictQueue()).toEqual([]);
+    expect(toasts()).toEqual([]);
   });
 
   it("re-derives only when the change touched something queued", async () => {

@@ -27,7 +27,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   merge, installs the exact page returned by the native commit, and only then
   releases editing. This prevents the old open copy from immediately creating a
   second conflict or appearing to undo the chosen merge. Newly delivered copies
-  also raise one actionable notice, and Android now defaults to its native
+  also raise one actionable notice which retires with the resolved conflict;
+  resolving today's journal updates it in place without dropping it from the
+  live Journals feed. Android now defaults to its native
   inotify-backed watcher; polling remains available and uses the same
   reconciliation semantics. (GH #337.)
 

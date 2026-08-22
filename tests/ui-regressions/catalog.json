@@ -3,7 +3,7 @@
   "entries": [
     {
       "id": "UI-CONCORD-SYNC-COPY-HANDOFF-337",
-      "title": "Applying a sync conflict copy installs the exact committed merge and cannot immediately resurrect the stale open editor",
+      "title": "Applying a sync conflict copy installs the exact committed merge, preserves a live Journals feed, and retires resolved notices",
       "family": "external-change-conflict-resolution",
       "sources": {
         "issues": [337],
@@ -25,7 +25,7 @@
         "scenario": "concord.sync-copy-exact-editor-handoff",
         "failBefore": "proven"
       },
-      "notes": "Martin's 2026-08-22 Direct Files test: a delivered conflict copy was invisible until he opened the page; Apply reported success but left the old editor content visible, then a second resolver appeared and could restore that stale version. The native resolver committed the selected merge and trashed the copy but returned void, while the frontend refreshed only the queue and never replaced the open page. The retained pre-merge editor could therefore autosave or conflict against the just-committed merge. The correction contract requires event-independent reconciliation, discoverable arrival, a quiescent editor handoff, and installation of the exact PageDto returned by the guarded native commit under both inotify and polling."
+      "notes": "Martin's 2026-08-22 Direct Files tests exposed three phases of the same incomplete handoff: the pre-merge editor remained installed and could manufacture another conflict; resolving today's journal could let a watcher feed restart omit that mutation-held day until app restart; and sticky conflict-arrival notices outlived the derived conflict they described. The correction contract requires event-independent discovery, a quiescent exact-DTO handoff, journal-feed deferral across explicit mutation ownership, and notification retirement under both inotify and polling."
     },
     {
       "id": "UI-BLOCK-SELECTION-ACTION-OWNERSHIP-240",

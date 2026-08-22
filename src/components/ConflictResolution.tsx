@@ -28,6 +28,7 @@ import {
   conflictQueue,
   pushToast,
   refreshSyncConflicts,
+  settleArtifactConflict,
   updateLiveSaveConflictDiskRev,
 } from "../ui";
 import {
@@ -170,6 +171,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     // remove that owner immediately, so keep only plain snapshots across IPC
     // and reactive mutations. Reading `c` afterwards is a stale-owner access.
     const source = c.source;
+    const conflictId = c.id;
     const pageName = c.page_name;
     const pagePath = c.page_path;
     const sides = [...c.sides];
@@ -276,9 +278,14 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         if (refusal) {
           throw new Error("the resolved file was committed, but its exact page could not replace the old editor; reopen the page");
         }
+        settleArtifactConflict(conflictId);
         pushToast(`Merged into “${pageName}”`, "success");
       }
-      await refreshSyncConflicts();
+      // A successful sync-copy commit has already retired its exact object
+      // locally. Reconcile unrelated artifacts without keeping Apply blocked on
+      // graph-wide directory walks (noticeable on Android document trees).
+      if (source === "sync-copy") void refreshSyncConflicts();
+      else await refreshSyncConflicts();
     } catch (e) {
       if (String(e).includes("conflict")) {
         pushToast("The file changed on disk — re-reading it, please redo your choices.", "error");

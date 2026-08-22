@@ -14,6 +14,7 @@ import {
   setDoc,
   extendFeedForScroll,
   flushPage,
+  holdPageMutationUi,
   isDirty,
   pageToDto,
   setBlockMoving,
@@ -412,7 +413,7 @@ describe("Journals feed generation lifecycle", () => {
     await expect(extendFeedForScroll()).resolves.toBe(false);
   });
 
-  it.each(["active edit", "dirty", "saving", "conflict", "moving"] as const)("defers a %s feed gate then retries on its real release", async (gate) => {
+  it.each(["active edit", "dirty", "saving", "conflict", "moving", "explicit mutation"] as const)("defers a %s feed gate then retries on its real release", async (gate) => {
     const api = vi.spyOn(backend(), "journalFeedPage").mockResolvedValue(feedResponse([journalDto("initial")]))
     const mounted = mount(() => <PageView />);
     await flushMicrotasks();
@@ -428,6 +429,7 @@ describe("Journals feed generation lifecycle", () => {
     if (gate === "dirty" || gate === "saving") setRaw("feed", "dirty");
     if (gate === "conflict") markConflict(today);
     if (gate === "moving") setBlockMoving(true, today);
+    const releaseMutation = gate === "explicit mutation" ? holdPageMutationUi([today]) : null;
     let saved: Promise<boolean> | null = null;
     let releaseSave: (() => void) | null = null;
     if (gate === "saving") {
@@ -456,6 +458,7 @@ describe("Journals feed generation lifecycle", () => {
       }
       if (gate === "conflict") clearConflict(today);
       if (gate === "moving") setBlockMoving(false);
+      releaseMutation?.();
       await flushMicrotasks();
       await flushMicrotasks();
       expect(api).toHaveBeenCalledTimes(1);

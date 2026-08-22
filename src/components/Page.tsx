@@ -56,7 +56,17 @@ function feedHasActiveEdit(): boolean {
   // feed page is unsafe here.
   if (edited && doc.byId[edited] && doc.feed.includes(doc.byId[edited].page)) return true;
   return doc.feed.some((name) =>
-    isDirty(name) || isSaving(name) || isConflicted(name) || isBlockMoving(name)
+    isDirty(name)
+    || isSaving(name)
+    || isConflicted(name)
+    || isBlockMoving(name)
+    // An explicit native mutation (Concord resolution, managed move, etc.)
+    // owns the exact live page until its committed DTO is installed. A watcher
+    // restart that enters loadFeed during that window cannot install this day,
+    // and loadFeed correctly publishes only successful installations — which
+    // used to drop today's journal from the feed until restart. Treat the
+    // ownership hold like every other feed safety gate and replay on release.
+    || pageMutationBusy(name)
   );
 }
 

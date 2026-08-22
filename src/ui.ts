@@ -506,6 +506,52 @@ export function conflictObjectFor(
 // Where the badge left off, so repeated clicks WALK the queue instead of parking
 // on its first item. Transient session state: the queue itself is derived.
 let conflictCursor = 0;
+let syncConflictInventoryToast: number | undefined;
+let vcsConflictInventoryToast: number | undefined;
+const artifactArrivalToasts = new Map<number, Set<string>>();
+
+function retireToast(id: number | undefined): void {
+  if (id !== undefined) dismissToast(id);
+}
+
+/** Sticky conflict notices describe live derived objects, not history. Retire
+ * them when the objects disappear so a successful resolution cannot leave a
+ * blue "needs review" notice contradicting the green success confirmation. */
+function retireSettledArtifactArrivalToasts(queue: ConflictObject[]): void {
+  const live = new Set(queue.map((conflict) => conflict.id));
+  for (const [toastId, ids] of [...artifactArrivalToasts]) {
+    if ([...ids].some((id) => live.has(id))) continue;
+    artifactArrivalToasts.delete(toastId);
+    dismissToast(toastId);
+  }
+}
+
+/** Apply the exact local consequence of a successful guarded artifact resolve.
+ * The native commit proves this one derived object is gone, so the UI need not
+ * block on another graph-wide inventory walk before closing the resolver. A
+ * best-effort refresh still follows in the background to catch unrelated
+ * arrivals/removals. */
+export function settleArtifactConflict(id: string): void {
+  const settled = artifactConflictQueue.find((conflict) => conflict.id === id);
+  if (!settled) return;
+  replaceArtifactConflictQueue(artifactConflictQueue.filter((conflict) => conflict.id !== id));
+  resetConflictCursor();
+  if (settled.source === "sync-copy") {
+    const copy = settled.sides.find((side) => side.role === "theirs")?.path;
+    if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
+    if (!syncConflicts().length) {
+      retireToast(syncConflictInventoryToast);
+      syncConflictInventoryToast = undefined;
+    }
+  } else if (settled.source === "vcs-markers") {
+    setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
+    if (!vcsMarkerConflicts().length) {
+      retireToast(vcsConflictInventoryToast);
+      vcsConflictInventoryToast = undefined;
+    }
+  }
+  retireSettledArtifactArrivalToasts(artifactConflictQueue);
+}
 /** The next conflict to visit, cycling. `undefined` when the queue is empty. */
 export function advanceConflictCursor(): ConflictObject | undefined {
   const queue = conflictQueue();
@@ -543,12 +589,22 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
   try {
     const c = await backend().listSyncConflicts();
     setSyncConflicts(c);
-    if (notify && c.length) {
-      pushToast(
+    if (!c.length) {
+      retireToast(syncConflictInventoryToast);
+      syncConflictInventoryToast = undefined;
+    } else if (notify === true && syncConflictInventoryToast === undefined) {
+      const id = pushToast(
         `${c.length} sync-conflict file${c.length === 1 ? "" : "s"} in your graph — review + merge them in Settings → Backups & recovery`,
         "info",
-        { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
+        {
+          sticky: true,
+          action: { label: "Open", run: () => openSettings("backups") },
+          onDismiss: () => {
+            if (syncConflictInventoryToast === id) syncConflictInventoryToast = undefined;
+          },
+        }
       );
+      syncConflictInventoryToast = id;
     }
   } catch {
     /* best-effort */
@@ -556,12 +612,22 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
   try {
     const m = await backend().listVcsMarkerConflicts();
     setVcsMarkerConflicts(m);
-    if (notify && m.length) {
-      pushToast(
+    if (!m.length) {
+      retireToast(vcsConflictInventoryToast);
+      vcsConflictInventoryToast = undefined;
+    } else if (notify === true && vcsConflictInventoryToast === undefined) {
+      const id = pushToast(
         `${m.length} file${m.length === 1 ? " contains" : "s contain"} unresolved VCS merge markers — Tine won't overwrite them; open the page to resolve the merge block by block`,
         "info",
-        { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
+        {
+          sticky: true,
+          action: { label: "Open", run: () => openSettings("backups") },
+          onDismiss: () => {
+            if (vcsConflictInventoryToast === id) vcsConflictInventoryToast = undefined;
+          },
+        }
       );
+      vcsConflictInventoryToast = id;
     }
   } catch {
     /* best-effort */
@@ -571,6 +637,7 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
     const before = conflictQueue().map((c) => c.id).join("\u0000");
     const queue = await backend().conflictQueue();
     replaceArtifactConflictQueue(queue);
+    retireSettledArtifactArrivalToasts(queue);
     if (queue.map((c) => c.id).join("\u0000") !== before) resetConflictCursor();
     if (notify === "new") {
       const arrived = queue.filter((conflict) =>
@@ -578,7 +645,7 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
       );
       if (arrived.length) {
         const first = arrived[0];
-        pushToast(
+        const toastId = pushToast(
           `${arrived.length} new sync conflict${arrived.length === 1 ? " needs" : "s need"} review`,
           "info",
           {
@@ -591,8 +658,10 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
                 path: first.page_path,
               }),
             },
+            onDismiss: () => artifactArrivalToasts.delete(toastId),
           },
         );
+        artifactArrivalToasts.set(toastId, new Set(arrived.map((conflict) => conflict.id)));
       }
     }
   } catch {

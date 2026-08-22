@@ -20,20 +20,31 @@ await ensureDisplay();
 const mode = process.env.TINE_E2E_WATCH_MODE === "poll" ? "poll" : "inotify";
 const suffix = mode === "poll" ? "poll" : "native";
 const G = `/tmp/tgraph-concord-sync-copy-${suffix}`;
+const corpus = process.env.TINE_E2E_CONCORD_CORPUS;
+const target = process.env.TINE_E2E_CONCORD_TARGET === "note" ? "note" : "journal";
 const APP = process.env.TINE_APP || `${process.env.HOME}/research/tine`;
 const TD = process.env.TAURI_DRIVER
   || (process.env.CARGO_HOME ? `${process.env.CARGO_HOME}/bin/tauri-driver` : "tauri-driver");
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4510);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4511);
-const pageFile = `${G}/pages/Note.md`;
-const conflictFile = `${G}/pages/Note.sync-conflict-20260822-120000-PHONE.md`;
+const now = new Date();
+const journalStem = [
+  now.getFullYear(),
+  String(now.getMonth() + 1).padStart(2, "0"),
+  String(now.getDate()).padStart(2, "0"),
+].join("_");
+const pageFile = target === "journal" ? `${G}/journals/${journalStem}.md` : `${G}/pages/Note.md`;
+const conflictFile = target === "journal"
+  ? `${G}/journals/${journalStem}.sync-conflict-20260822-120000-PHONE.md`
+  : `${G}/pages/Note.sync-conflict-20260822-120000-PHONE.md`;
 
 fs.rmSync(G, { recursive: true, force: true });
+if (corpus) fs.cpSync(corpus, G, { recursive: true });
 fs.mkdirSync(`${G}/pages`, { recursive: true });
 fs.mkdirSync(`${G}/journals`, { recursive: true });
 fs.mkdirSync(`${G}/logseq`, { recursive: true });
 fs.writeFileSync(pageFile, "- desktop version\n");
-fs.writeFileSync(`${G}/journals/2026_08_22.md`, "- open [[Note]]\n");
+if (target === "note") fs.writeFileSync(`${G}/journals/${journalStem}.md`, "- open [[Note]]\n");
 
 const xdg = `/tmp/txdg-concord-sync-copy-${suffix}`;
 fs.rmSync(xdg, { recursive: true, force: true });
@@ -79,8 +90,14 @@ async function newSession() {
   });
 }
 
-async function openNote(browser) {
+async function openTarget(browser) {
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
+  if (target === "journal") {
+    await browser.waitUntil(async () =>
+      (await browser.$(".page-blocks").getText()).includes("desktop version"),
+    { timeout: 20_000, timeoutMsg: "current journal did not open" });
+    return;
+  }
   const title = await browser.$("h1.page-title");
   if (!(await title.isExisting()) || (await title.getText()) !== "Note") {
     const ref = await browser.$(".page-ref");
@@ -103,7 +120,7 @@ let browser;
 let failure;
 try {
   browser = await newSession();
-  await openNote(browser);
+  await openTarget(browser);
 
   fs.writeFileSync(conflictFile, "- phone version\n");
   const resolver = await browser.$(".page-conflict");
@@ -121,6 +138,7 @@ try {
     }
   });
   await browser.$('[data-concord-keep-both="true"]').click();
+  const applyStarted = performance.now();
   await browser.$('[data-concord-apply="true"]').click();
 
   await waitForFileText(
@@ -128,6 +146,7 @@ try {
     (text) => text.includes("desktop version") && text.includes("phone version"),
     `${mode} conflict-copy merge`,
   );
+  const durableMs = performance.now() - applyStarted;
   await browser.waitUntil(async () => !fs.existsSync(conflictFile), {
     timeout: 10_000,
     timeoutMsg: "resolved conflict copy remained in the graph",
@@ -137,6 +156,12 @@ try {
     timeoutMsg: "resolved conflict reopened immediately",
   });
   await assertMergedUi(browser, "after apply");
+  const visibleMs = performance.now() - applyStarted;
+  await browser.waitUntil(async () => browser.execute(() =>
+    ![...document.querySelectorAll(".toast")]
+      .some((notice) => notice.textContent?.includes("sync conflict"))
+  ), { timeout: 10_000, timeoutMsg: "resolved conflict left a stale review notification" });
+  const settledMs = performance.now() - applyStarted;
 
   const committed = fs.readFileSync(pageFile, "utf8");
   await sleep(2500); // beyond the ordinary save debounce
@@ -151,11 +176,12 @@ try {
   browser = undefined;
   await sleep(1200);
   browser = await newSession();
-  await openNote(browser);
+  await openTarget(browser);
   await assertMergedUi(browser, "after restart");
   if ((await browser.$$(".page-conflict")).length !== 0) {
     throw new Error("resolved conflict returned after restart");
   }
+  console.log(`TIMING: ${mode}/${target}${corpus ? "/corpus" : ""} apply durable=${durableMs.toFixed(1)}ms visible=${visibleMs.toFixed(1)}ms settled=${settledMs.toFixed(1)}ms`);
   console.log(`PASS: ${mode} conflict-copy discovery and exact editor handoff`);
 } catch (error) {
   failure = error;
