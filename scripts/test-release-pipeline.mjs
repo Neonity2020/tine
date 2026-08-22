@@ -657,8 +657,13 @@ assert.match(
 );
 assert.match(
   e2eRunner,
-  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device-managed-join", "scripts\/e2e-sparse-v2-two-device\.mjs", \{\s*TINE_E2E_JOIN_ORDERING: "join-from-managed",\s*\}\]/,
+  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device-managed-join", "scripts\/e2e-sparse-v2-two-device\.mjs", \{[\s\S]*?TINE_E2E_JOIN_ORDERING: "join-from-managed",[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "240000",[\s\S]*?\}\]/,
   "the mandatory Linux release catalog does not prove joining from a device that already runs Tine-managed storage"
+);
+assert.match(
+  e2eRunner,
+  /const scenarioTimeoutMs = Number\(env\.E2E_SCENARIO_TIMEOUT_MS \|\| timeoutMs\);[\s\S]*?setTimeout\([\s\S]*?scenarioTimeoutMs\);/,
+  "per-scenario E2E timeout budgets are declared but not applied to the spawned scenario"
 );
 assert.match(
   e2eRunner,

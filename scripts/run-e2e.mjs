@@ -95,6 +95,11 @@ const suites = {
     ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
     ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
       TINE_E2E_JOIN_ORDERING: "join-from-managed",
+      // This leg deliberately exercises three partial provider deliveries,
+      // declines adoption, and proves the original managed history again after
+      // a clean reopen. It takes ~177s locally, so the ordinary 180s scenario
+      // ceiling is not a meaningful product gate on slower hosted runners.
+      E2E_SCENARIO_TIMEOUT_MS: "240000",
     }],
   ],
   // Release-only local proof on a copied private corpus. This suite is kept
@@ -145,6 +150,7 @@ const suites = {
     ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
     ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
       TINE_E2E_JOIN_ORDERING: "join-from-managed",
+      E2E_SCENARIO_TIMEOUT_MS: "240000",
     }],
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: process.env.E2E_WINDOW_MANAGER || "openbox" }],
     ["native-titlebar", "scripts/e2e-native-titlebar.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
@@ -500,13 +506,14 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       : [path.join(root, script)];
     const child = spawn(command, args, { cwd: root, env, detached: process.platform !== "win32", stdio: ["ignore", stdout, stderr] });
     let timedOut = false;
+    const scenarioTimeoutMs = Number(env.E2E_SCENARIO_TIMEOUT_MS || timeoutMs);
     const timer = setTimeout(() => {
       timedOut = true;
       try {
         if (process.platform === "win32") child.kill("SIGKILL");
         else process.kill(-child.pid, "SIGKILL");
       } catch {}
-    }, timeoutMs);
+    }, scenarioTimeoutMs);
     const result = await new Promise((resolve) => {
       child.once("error", (error) => resolve({ code: 1, error: String(error) }));
       child.once("exit", (code, signal) => resolve({ code: code ?? 1, signal }));
