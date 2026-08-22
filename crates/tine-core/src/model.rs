@@ -6485,9 +6485,6 @@ impl Graph {
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         let paths = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
-        if uncertain || !paths.is_empty() {
-            self.note_graph_text_external_observation();
-        }
         if uncertain {
             self.revoke_all_conflict_authority();
             self.invalidate_guarded_graph_text_identity("external watcher generation is uncertain");

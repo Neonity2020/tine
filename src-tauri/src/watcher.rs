@@ -111,6 +111,11 @@ struct SparseV2ErrorEvent {
 struct Pending {
     paths: HashSet<PathBuf>,
     full_paths: HashSet<PathBuf>,
+    /// Highest raw-callback frontier admitted into this pending batch for each
+    /// Direct graph root. The callback records this while holding the same
+    /// mutex used to add its notify event, so a drained batch can never
+    /// acknowledge an event that is still waiting to enter the queue.
+    legacy_observation_epochs: HashMap<PathBuf, u64>,
     need_full: bool,
     notify_error: bool,
     /// When the FIRST notify callback of the batch currently accumulating
@@ -162,6 +167,19 @@ impl Pending {
         self.note_event_arrival();
         self.need_full = true;
         self.notify_error = true;
+    }
+
+    fn add_legacy_observations(&mut self, observations: Vec<(PathBuf, u64)>) {
+        for (root, epoch) in observations {
+            self.legacy_observation_epochs
+                .entry(root)
+                .and_modify(|current| *current = (*current).max(epoch))
+                .or_insert(epoch);
+        }
+    }
+
+    fn take_legacy_observation_epochs(&mut self) -> HashMap<PathBuf, u64> {
+        std::mem::take(&mut self.legacy_observation_epochs)
     }
 }
 
@@ -1169,6 +1187,7 @@ fn observe_legacy_graph_text_event(
     // identity index; exact events remain eligible for one exact-path update by
     // the debounced reconciler.
     if observation.uncertain {
+        graph.note_graph_text_external_observation();
         let _ = graph.observe_graph_text_external_paths(std::iter::empty::<&Path>(), true);
     } else if !observation.exact_paths.is_empty() {
         graph.note_graph_text_external_observation();
@@ -1182,18 +1201,25 @@ fn observe_legacy_graph_text_event(
 /// when the event is ambiguous) under the same resource-scoped mutation
 /// authority that `Graph::save_page` uses. Debounced reconciliation captures
 /// each final path once.
-fn observe_legacy_graph_text_callback(app: &tauri::AppHandle, event: Option<&notify::Event>) {
+fn observe_legacy_graph_text_callback(
+    app: &tauri::AppHandle,
+    event: Option<&notify::Event>,
+) -> Vec<(PathBuf, u64)> {
     let state = app.state::<AppState>();
     let entries = match state.graphs.read() {
         Ok(graphs) => graphs.entries(),
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
+    let mut observations = Vec::new();
     for (_, slot) in entries {
         let Ok((graph, root)) = direct_watch_paths(&slot) else {
             continue;
         };
-        observe_legacy_graph_text_event(&graph, &root, event);
+        if observe_legacy_graph_text_event(&graph, &root, event) {
+            observations.push((root, graph.graph_text_external_observation_epoch()));
+        }
     }
+    observations
 }
 
 fn sparse_observations(
@@ -1435,6 +1461,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             baseline: bool,
             last_reconcile_error: Option<String>,
             retry: RetrySchedule,
+            /// Frontier already drained from `Pending` but not yet reconciled
+            /// successfully. It survives retry cycles and is acknowledged only
+            /// after the matching graph batch succeeds.
+            pending_observation_epoch: Option<u64>,
         }
 
         struct WatchedSparse {
@@ -1522,6 +1552,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 baseline: false,
                                 last_reconcile_error: None,
                                 retry: RetrySchedule::default(),
+                                pending_observation_epoch: None,
                             },
                         );
                     }
@@ -1567,11 +1598,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                     return;
                                 }
                             }
-                            match &res {
-                                Ok(event) => observe_legacy_graph_text_callback(&appc, Some(event)),
-                                Err(_) => observe_legacy_graph_text_callback(&appc, None),
-                            }
                             if let Ok(mut p) = pendingc.lock() {
+                                let observations = match &res {
+                                    Ok(event) => {
+                                        observe_legacy_graph_text_callback(&appc, Some(event))
+                                    }
+                                    Err(_) => observe_legacy_graph_text_callback(&appc, None),
+                                };
+                                p.add_legacy_observations(observations);
                                 match res {
                                     Ok(event) => p.add_event(event),
                                     Err(_) => p.add_notify_error(),
@@ -1624,27 +1658,63 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             watch_failures.retain(|dir, _| desired.contains(dir));
 
             // --- reconcile (identical in both modes) ---
-            let (paths, full_paths, event_need_full, notify_error, first_event_at) = if inotify {
+            let (
+                paths,
+                full_paths,
+                drained_observation_epochs,
+                event_need_full,
+                notify_error,
+                first_event_at,
+            ) = if inotify {
                 if let Ok(mut p) = pending.lock() {
                     let paths = std::mem::take(&mut p.paths);
                     let full_paths = std::mem::take(&mut p.full_paths);
+                    let observation_epochs = p.take_legacy_observation_epochs();
                     let need_full = p.need_full;
                     let notify_error = p.notify_error;
                     let first_event_at = p.first_event_at.take();
                     p.need_full = false;
                     p.notify_error = false;
-                    (paths, full_paths, need_full, notify_error, first_event_at)
+                    (
+                        paths,
+                        full_paths,
+                        observation_epochs,
+                        need_full,
+                        notify_error,
+                        first_event_at,
+                    )
                 } else {
-                    (HashSet::new(), HashSet::new(), true, true, None)
+                    (
+                        HashSet::new(),
+                        HashSet::new(),
+                        HashMap::new(),
+                        true,
+                        true,
+                        None,
+                    )
                 }
             } else {
-                (HashSet::new(), HashSet::new(), false, false, None)
+                (
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashMap::new(),
+                    false,
+                    false,
+                    None,
+                )
             };
             // A focus-driven rescan demands the same full stat diff a kernel
             // rescan does, for the Direct lane and the managed lane alike.
             let explicit_rescan = pending_full_rescan();
             let event_need_full = event_need_full || explicit_rescan.is_some();
             for (label, graph) in graphs.iter_mut() {
+                if let Some(epoch) = drained_observation_epochs.get(&graph.root).copied() {
+                    graph.pending_observation_epoch = Some(
+                        graph
+                            .pending_observation_epoch
+                            .map_or(epoch, |pending| pending.max(epoch)),
+                    );
+                }
                 let initial_cycle = !graph.baseline;
                 if initial_cycle {
                     // No baseline yet, so nothing about the graph's text identity
@@ -1659,8 +1729,6 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let owned = pending_for_graph(&paths, &graph.legacy_graph);
                 let full_owned = full_scan_owner_for_graph(&full_paths, &graph.legacy_graph);
                 let need_full = event_need_full || !inotify || !full_owned.is_empty() || retry_due;
-                let drained_observation_epoch =
-                    graph.legacy_graph.graph_text_external_observation_epoch();
                 let mut cycle_failed = false;
                 let mut attempted = false;
                 if need_full || !owned.is_empty() {
@@ -1724,9 +1792,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 } else if attempted {
                     graph.retry.succeeded();
                     graph.last_reconcile_error = None;
-                    graph
-                        .legacy_graph
-                        .acknowledge_graph_text_external_observations(drained_observation_epoch);
+                    if let Some(epoch) = graph.pending_observation_epoch.take() {
+                        graph
+                            .legacy_graph
+                            .acknowledge_graph_text_external_observations(epoch);
+                    }
                 }
             }
             for (label, graph) in sparse_graphs.iter_mut() {
@@ -3379,6 +3449,60 @@ mod tests {
             graph.acknowledge_graph_text_external_observations(rename_epoch);
             assert_new_page_refused(&graph, &format!("New {extension}"));
         }
+    }
+
+    /// A callback arriving after batch A was drained belongs to batch B. Batch
+    /// A must acknowledge only its captured frontier, never the graph's newer
+    /// global epoch, or creation could race B before B is reconciled.
+    #[test]
+    fn drained_batch_cannot_acknowledge_a_callback_in_the_next_batch() {
+        use notify::event::{CreateKind, EventKind};
+
+        let graph_dir = TempGraph::new("watcher-drain-frontier-race");
+        graph_dir.write("pages/Anchor.md", "- anchor\n");
+        let graph = Graph::open(&graph_dir.root);
+        warm_direct_graph(&graph);
+        let mut pending = Pending::default();
+
+        graph_dir.write("pages/External A.md", "- external A\n");
+        let path_a = graph_dir.path("pages/External A.md");
+        assert!(observe_legacy_graph_text_event(
+            &graph,
+            &graph_dir.root,
+            Some(&event(
+                EventKind::Create(CreateKind::File),
+                vec![path_a.clone()],
+            )),
+        ));
+        pending.add_legacy_observations(vec![(
+            graph_dir.root.clone(),
+            graph.graph_text_external_observation_epoch(),
+        )]);
+        let batch_a = pending.take_legacy_observation_epochs();
+
+        graph_dir.write("pages/External B.md", "- external B\n");
+        let path_b = graph_dir.path("pages/External B.md");
+        assert!(observe_legacy_graph_text_event(
+            &graph,
+            &graph_dir.root,
+            Some(&event(
+                EventKind::Create(CreateKind::File),
+                vec![path_b.clone()],
+            )),
+        ));
+        pending.add_legacy_observations(vec![(
+            graph_dir.root.clone(),
+            graph.graph_text_external_observation_epoch(),
+        )]);
+
+        graph.sync_file_checked(&path_a).unwrap();
+        graph.acknowledge_graph_text_external_observations(batch_a[&graph_dir.root]);
+        assert_new_page_waits_for_reconciliation(&graph, "Still Blocked By B");
+
+        let batch_b = pending.take_legacy_observation_epochs();
+        graph.sync_file_checked(&path_b).unwrap();
+        graph.acknowledge_graph_text_external_observations(batch_b[&graph_dir.root]);
+        graph.save_page(&new_page("Now Reconciled"), None).unwrap();
     }
 
     #[test]
