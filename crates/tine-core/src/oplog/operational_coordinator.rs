@@ -348,6 +348,55 @@ fn classify_authorization_failure(error: RuntimePromotionError) -> OperationalCo
 
 pub(crate) struct OperationalCoordinator;
 
+impl OperationalCoordinator {
+    /// Prepare one ordinary existing-page edit for the clean runtime's durable
+    /// foreground journal boundary.
+    ///
+    /// This is the preparation half of the same coordinator path used by a
+    /// synchronous clean manifest commit.  It deliberately stops before
+    /// SQLite identity preflight and archive publication: the trusted-local
+    /// coordinator makes the canonical prepared batch durable in the local
+    /// journal first, while archive/SQLite expansion remains later actor work.
+    pub(crate) fn prepare_clean_trusted_local(
+        session: &mut CleanRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        transaction: &OperationTransaction,
+        prepared_editor_projection: super::projection::PreparedEditorProjection,
+    ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
+        #[cfg(test)]
+        {
+            reset_trusted_local_preparation_stage_timings();
+            super::hot_engine::reset_local_mutation_detail_timings();
+        }
+        #[cfg(test)]
+        let parts_started = Instant::now();
+        let (admission, engine, database) = session.parts().map_err(|refusal| {
+            OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+        })?;
+        #[cfg(test)]
+        note_trusted_local_preparation_stage(|timings| {
+            timings.session_parts = parts_started.elapsed();
+        });
+        let claim_source = database.materialized_read().map_err(|error| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Draft,
+                format!("clean SQLite identity candidates are unavailable: {error}"),
+            )
+        })?;
+        prepare_local_inner(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            LocalDraftSource::Promoted { batch_id: None },
+            transaction,
+            Some(prepared_editor_projection),
+            Some(&claim_source),
+        )
+    }
+}
+
 /// Result after the clean runtime's only irreversible boundary. A pending
 /// continuation means the manifest is already the durable operation commit;
 /// only disposable SQLite and/or exact Markdown projection remains.

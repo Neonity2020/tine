@@ -468,13 +468,50 @@ pub(crate) fn resume_managed_local_journal_drain_with_parts(
         receipts,
         engine,
         database,
-        tail,
+        ManagedLocalSqliteMode::Tail(tail),
         frame,
         None,
         checkpoint,
         continuation,
         publisher,
     )
+}
+
+/// Resume one foreground-journal record through the clean runtime's direct
+/// SQLite frontier. The journal is the durable foreground boundary; this
+/// continuation performs only rebuildable archive, SQLite, Markdown receipt,
+/// and publication derivatives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resume_clean_managed_local_journal_drain(
+    admission: &LocalRuntimeAdmission<'_>,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    database: &mut SqliteFrontier,
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    checkpoint: &ManagedLocalDrainCheckpoint,
+    continuation: Option<&ManagedLocalDrainContinuation>,
+    publisher: &mut impl ManagedLocalDerivativePublisher,
+) -> ManagedLocalDrainOutcome {
+    resume_managed_local_journal_drain_with_parts_and_superseding_projection(
+        admission,
+        graph,
+        receipts,
+        engine,
+        database,
+        ManagedLocalSqliteMode::Direct,
+        frame,
+        superseding_projection,
+        checkpoint,
+        continuation,
+        publisher,
+    )
+}
+
+enum ManagedLocalSqliteMode<'a> {
+    Tail(&'a mut TailOverlay),
+    Direct,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -484,7 +521,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
-    tail: &mut TailOverlay,
+    sqlite_mode: ManagedLocalSqliteMode<'_>,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     checkpoint: &ManagedLocalDrainCheckpoint,
@@ -647,6 +684,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error),
     };
 
+    let direct_clean_runtime = matches!(&sqlite_mode, ManagedLocalSqliteMode::Direct);
     match exact_archive_batch(&record, &archive) {
         Ok(true) => {}
         Ok(false) => {
@@ -698,17 +736,39 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         {
             return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string());
         }
-        let staged = match engine.stage_archive_batch_bounded_below_managed_local_overlay(
-            batch_id,
-            ENGINE_STAGE_WORK_PER_RESUME,
-        ) {
-            Ok(staged) => staged,
-            Err(error) => {
-                return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+        let (disposition, has_more, stage_work) = if direct_clean_runtime {
+            let claim_source = match database.materialized_read() {
+                Ok(source) => source,
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+                }
+            };
+            match engine.accept_clean_prepared_below_managed_local_overlay(
+                record.prepared_batch(),
+                &claim_source,
+            ) {
+                Ok(staged) => (staged.disposition().clone(), false, 1),
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+                }
+            }
+        } else {
+            match engine.stage_archive_batch_bounded_below_managed_local_overlay(
+                batch_id,
+                ENGINE_STAGE_WORK_PER_RESUME,
+            ) {
+                Ok(staged) => (
+                    staged.outcome().disposition().clone(),
+                    staged.has_more(),
+                    staged.work(),
+                ),
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+                }
             }
         };
-        work_done.engine_stage_work = staged.work();
-        match staged.outcome().disposition() {
+        work_done.engine_stage_work = stage_work;
+        match disposition {
             BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. } => {}
             BatchDisposition::IncompleteStaged {
                 missing_dependencies,
@@ -733,7 +793,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                 )
             }
         }
-        if staged.has_more() {
+        if has_more {
             return pending(ManagedLocalDrainStage::EngineAcceptance, frame, &record);
         }
         if drain_fault!(AfterEngineAcceptance) {
@@ -754,41 +814,82 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),
     };
     work_done.accepted_events = 1;
-    if let Err(error) = tail.try_enqueue(database, engine, &event) {
-        return pending_with_detail(
-            ManagedLocalDrainStage::TailAndSqlite,
-            frame,
-            &record,
-            error.to_string(),
-        );
-    }
-    if drain_fault!(AfterTailAdmission) {
-        return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
-    }
-    if let Err(error) =
-        admission.reprove_workspace_authority(WorkspaceAuthorityBoundary::SqliteDrain)
-    {
-        return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
-    }
-    let source = match RebuildSource::new(engine, &archive) {
-        Ok(source) => source,
-        Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),
-    };
-    if drain_fault!(BeforeSqliteCommit) {
-        return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
-    }
-    work_done.sqlite_batches = match tail.drain_ready(database, &source, SQLITE_BATCHES_PER_RESUME)
-    {
-        Ok(applied) => applied,
-        Err(error) => {
-            return pending_with_detail(
-                ManagedLocalDrainStage::TailAndSqlite,
-                frame,
-                &record,
-                error.to_string(),
-            )
+    match sqlite_mode {
+        ManagedLocalSqliteMode::Tail(tail) => {
+            if let Err(error) = tail.try_enqueue(database, engine, &event) {
+                return pending_with_detail(
+                    ManagedLocalDrainStage::TailAndSqlite,
+                    frame,
+                    &record,
+                    error.to_string(),
+                );
+            }
+            if drain_fault!(AfterTailAdmission) {
+                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
+            }
+            if let Err(error) =
+                admission.reprove_workspace_authority(WorkspaceAuthorityBoundary::SqliteDrain)
+            {
+                return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
+            }
+            let source = match RebuildSource::new(engine, &archive) {
+                Ok(source) => source,
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string())
+                }
+            };
+            if drain_fault!(BeforeSqliteCommit) {
+                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
+            }
+            work_done.sqlite_batches =
+                match tail.drain_ready(database, &source, SQLITE_BATCHES_PER_RESUME) {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        return pending_with_detail(
+                            ManagedLocalDrainStage::TailAndSqlite,
+                            frame,
+                            &record,
+                            error.to_string(),
+                        )
+                    }
+                };
         }
-    };
+        ManagedLocalSqliteMode::Direct => {
+            if drain_fault!(AfterTailAdmission) {
+                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
+            }
+            if let Err(error) =
+                admission.reprove_workspace_authority(WorkspaceAuthorityBoundary::SqliteDrain)
+            {
+                return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
+            }
+            if drain_fault!(BeforeSqliteCommit) {
+                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
+            }
+            let applied = match database.frontier_root() {
+                Ok(frontier) => frontier,
+                Err(error) => {
+                    return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string())
+                }
+            };
+            if applied.same_accepted_authority(event.prior_frontier_root()) {
+                if let Err(error) = database.apply_engine_owned_accepted(&event, engine) {
+                    return pending_with_detail(
+                        ManagedLocalDrainStage::TailAndSqlite,
+                        frame,
+                        &record,
+                        error.to_string(),
+                    );
+                }
+                work_done.sqlite_batches = 1;
+            } else if !applied.same_accepted_authority(event.post_frontier_root()) {
+                return recovery(
+                    ManagedLocalDrainStage::TailAndSqlite,
+                    "clean SQLite frontier is neither before nor after the journal batch",
+                );
+            }
+        }
+    }
     let accepted_frontier = match engine.accepted_frontier_root() {
         Ok(frontier) => frontier,
         Err(error) => return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string()),

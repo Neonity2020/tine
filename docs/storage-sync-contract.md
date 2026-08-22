@@ -873,6 +873,31 @@ refusal that could have come from any of 131 unnamed sites.
 
 ### 3.2 Clean-runtime save settlement
 
+An eligible ordinary application-page save has a foreground acceptance lane.
+After the semantic transaction and exact projection have been prepared, Tine
+commits the exact graph bytes together with one append to the device-private
+foreground journal, installs that journal record in the hot semantic overlay,
+and may then report the new page and revision. Immutable archive publication,
+SQLite materialization, provider publication, and journal checkpoint/compaction
+are derivative work advanced after the foreground response. Reads combine the
+accepted SQLite baseline with the exact pending journal suffix; they must never
+answer from either one alone when the other may change the result.
+
+The append result is a commit boundary. A definitely-not-appended failure may
+refuse the save normally. If the filesystem reports an uncertain outcome after
+the append may already have become durable, that actor becomes terminal and
+accepts no further edits. Restart replays the authenticated journal and either
+recovers the one accepted operation or refuses recovery; retrying the edit in
+the same process could otherwise duplicate it. Replayed task-query overlays
+begin as incomplete and force the complete evaluator until their bounded sparse
+facts have been reconstructed, so stale SQLite can never hide a journaled edit.
+
+Foreground-journal compaction publishes a complete successor generation before
+retiring its predecessor. Failure to retire the predecessor is retryable
+cleanup, not permission to forget it: reopen selects the greatest authenticated
+generation and retries removal of every older tuple before advancing derivative
+work.
+
 The clean baseline-plus-manifest runtime and the retired legacy coordinator are
 two **distinct** retained-publication state machines, and a request may never be
 routed from one into the other.

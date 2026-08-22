@@ -98,6 +98,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Ordinary saves under experimental managed storage do substantially less repeated work.** The hot path now reuses parser-owned commit evidence, the exact accepted editor post-state, and the preceding projection when their identities still match; ordinary projection edits are patched instead of rebuilding the page. The proofs fail closed to the complete path whenever any prerequisite is stale or absent.
 
+- **Managed-storage saves now return from one bounded foreground commit instead of rebuilding or publishing graph-wide derived state.** The exact Markdown/Org update and one private journal append establish the accepted edit; the hot overlay serves it immediately while immutable archive, SQLite, provider, checkpoint, and journal-compaction work drain afterwards. Consecutive saves use the SQLite baseline plus the exact journal suffix to prove their predecessor without reconstructing the whole page. The release gate measures a 511-block page at under 50 ms p95, and fails if the old full-page predecessor reconstruction returns. Crash replay marks pending task-query facts incomplete and safely uses the complete evaluator until rebuilt; an append whose outcome is genuinely unknowable stops further edits until restart replay, rather than risking a duplicate operation.
+
 ### Fixed
 
 - Opening a long-lived managed graph got slower the more edit history it had,

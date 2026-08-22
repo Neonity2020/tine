@@ -5309,6 +5309,14 @@ pub(crate) trait ProjectionClaimSource {
         &self,
         logseq_uuid: LogseqUuid,
     ) -> Result<Vec<ProjectionClaimParticipant>, EngineError>;
+
+    /// Return the exact baseline owner for one path, when this source carries
+    /// path facts. A clean suffix remains authoritative for any occupied,
+    /// released, or colliding key; this bounded baseline lookup is consulted
+    /// only when the suffix has no event for the key at all.
+    fn exact_page_owner(&self, _path: &ManagedPath) -> Result<Option<PageId>, EngineError> {
+        Ok(None)
+    }
 }
 
 /// Rebuild-local copy of the sequence-zero external-UUID candidate rows.
@@ -5392,6 +5400,18 @@ impl ProjectionClaimSource for super::SqliteMaterializedRead<'_> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect())
+    }
+
+    fn exact_page_owner(&self, path: &ManagedPath) -> Result<Option<PageId>, EngineError> {
+        let rows = self.pages_by_path(path, 2).map_err(|error| {
+            EngineError::ProjectionManifest(format!(
+                "clean SQLite exact-path owner lookup failed: {error}"
+            ))
+        })?;
+        Ok(match rows.as_slice() {
+            [page] if page.path == *path => Some(page.page_id),
+            [] | [_, ..] => None,
+        })
     }
 }
 
@@ -8428,6 +8448,68 @@ impl ShardedHotEngine {
             self.clean_projection_heads
                 .insert(work.path().clone(), work);
         }
+        Ok(outcome)
+    }
+
+    /// Accept an already journal-durable, exactly archived local batch beneath
+    /// the foreground overlay that made its Markdown target immediately
+    /// visible. This is the background half of the clean foreground commit:
+    /// no manifest is published here, and no scratch/Patricia runtime is
+    /// required.
+    pub(crate) fn accept_clean_prepared_below_managed_local_overlay(
+        &mut self,
+        prepared: &PreparedBatch,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<StageOutcome, EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.scratch.is_some()
+            || self.history_store.is_some()
+            || self.has_native_semantic_index_stores()
+            || !matches!(prepared.manifest().origin(), BatchOrigin::LocalMutation)
+        {
+            return Err(EngineError::Archive(
+                "clean foreground acceptance requires an index-free baseline runtime and an ordinary local mutation"
+                    .into(),
+            ));
+        }
+        let store =
+            self.archive_store.as_ref().cloned().ok_or_else(|| {
+                EngineError::Archive("clean runtime has no operation archive".into())
+            })?;
+        let retained = store
+            .read_manifest(prepared.manifest().batch_id())
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "clean foreground batch {} is not manifest-committed",
+                    prepared.manifest().batch_id()
+                ))
+            })?;
+        if retained != *prepared.manifest() {
+            return Err(EngineError::Archive(format!(
+                "clean foreground batch {} differs from its retained manifest",
+                prepared.manifest().batch_id()
+            )));
+        }
+
+        let overlay = std::mem::take(&mut self.local_overlay);
+        let outcome =
+            self.stage_ready_with_claim_source(ValidatedBatch::new(prepared.clone()), claim_source);
+        self.local_overlay = overlay;
+        let accepted_exactly_once =
+            matches!(outcome.disposition(), BatchDisposition::Accepted { .. })
+                && outcome.newly_accepted().len() == 1
+                && outcome.newly_accepted()[0].batch_id == prepared.manifest().batch_id();
+        if !accepted_exactly_once {
+            return match outcome.disposition() {
+                BatchDisposition::Rejected { error } => Err(error.clone()),
+                other => Err(EngineError::Archive(format!(
+                    "clean foreground batch {} did not validate as one accepted operation: {other:?}",
+                    prepared.manifest().batch_id()
+                ))),
+            };
+        }
+        self.refresh_clean_projection_head_for_batch(prepared.manifest().batch_id())?;
         Ok(outcome)
     }
 
@@ -13986,10 +14068,9 @@ impl ShardedHotEngine {
         self.apply_managed_local_record(prepared.record.clone(), prepared.journal_payload())
     }
 
-    #[cfg(test)]
     /// Replay one complete recovered record through the same transition used
     /// by live admission.
-    pub fn replay_managed_local_record(
+    pub(crate) fn replay_managed_local_record(
         &mut self,
         frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
@@ -14960,6 +15041,7 @@ impl ShardedHotEngine {
                     exact_base_matches,
                     &accepted_target,
                     &accepted_annotations,
+                    claim_source,
                 )? {
                     #[cfg(test)]
                     note_local_mutation_detail(|detail| {
@@ -15008,6 +15090,7 @@ impl ShardedHotEngine {
         exact_base_matches: bool,
         accepted_target: &[u8],
         accepted_annotations: &[AnnotatedIdentity],
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
         if page.page_id != page_id
             || !page.path.as_str().ends_with(".md")
@@ -15101,10 +15184,17 @@ impl ShardedHotEngine {
         {
             return Ok(None);
         }
-        let CurrentPageAtPath::ExactOwner(owner) = self.current_page_at_path(&page.path)? else {
-            return Ok(None);
+        let exact_path_owner = match self.current_page_at_path(&page.path)? {
+            CurrentPageAtPath::ExactOwner(owner) => Some(owner.page_id()),
+            CurrentPageAtPath::Unowned => match claim_source {
+                Some(source) => source.exact_page_owner(&page.path)?,
+                None => None,
+            },
+            CurrentPageAtPath::Released(_)
+            | CurrentPageAtPath::PortableCollision(_)
+            | CurrentPageAtPath::ReleasedPortableCollision(_) => None,
         };
-        if owner.page_id() != page_id {
+        if exact_path_owner != Some(page_id) {
             return Ok(None);
         }
 
@@ -18660,6 +18750,19 @@ impl ShardedHotEngine {
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {
         self.materialize_page_inner(page_id, false, None)
+            .map(|(page, _, _)| page)
+    }
+
+    /// Materialize one page from the accepted clean suffix while consulting
+    /// the disposable SQLite baseline for claims the suffix does not repeat.
+    /// Clean runtimes deliberately do not copy the full baseline into the hot
+    /// engine, so pending foreground reads must use this combined view.
+    pub(crate) fn materialize_page_with_claim_source(
+        &self,
+        page_id: PageId,
+        claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<MaterializedPage, EngineError> {
+        self.materialize_page_inner(page_id, false, Some(claim_source))
             .map(|(page, _, _)| page)
     }
 
