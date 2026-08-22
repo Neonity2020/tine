@@ -4380,6 +4380,29 @@
         ]
       },
       "notes": "Internal report, 2026-08-17: Full CI run 32071490984 shard 3/4 went red because clean_shutdown_drains_a_full_scan_larger_than_the_generic_retry_limit took 34.5 s on the runner and exceeded the production CLEAN_FULL_SCAN_SHUTDOWN_BUDGET (30 s), so clean_shutdown returned ActorRefused instead of Safe; a red full CI run blocks release.yml preflight. Root cause was not the watcher scan, which is already a bounded continuation: LazyGenesisCandidate::page called describe_file on the whole sealed segment pack to re-prove its manifest digest on EVERY page read. Measured with a temporary probe on the 1032-page fixture: 1035 whole-pack proofs of 721,648 bytes at ~15.4 ms each = 15.9 s of the 16.4 s spent inside the scan (clean_observed_projection 16.30 s, SQLite owner lookups 0.075 s, materialized_read 0.023 s). The cost is O(pages x segment bytes), and segments target 32 MiB, so Martin's real 1,045-file graph re-hashes its whole pack per page - the shape behind the reported ~15-second quit/recovery. Fix: prove each sealed segment at most once per opened candidate (SegmentSealMemo), reset on relocate_after_parent_move. The seal check is retained, not deleted, and the per-capsule descriptor-digest check still runs on every read, so damage to the bytes a caller receives is still rejected. Necessity: the guard COUNTS whole-pack proofs rather than timing anything - it reads 64 pages from a one-segment pack and requires exactly 1 proof - and fails (64 proofs) against the pre-fix shape. Drain wall clock 18.375/18.308/18.306 s before, 2.066/1.924/1.914 s after, on the same box, with no budget widened and no fixture shrunk."
+    },
+    {
+      "id": "REG-ANDROID-MANAGED-PRIVATE-JOURNAL-PUBLICATION-20260822",
+      "title": "Android managed storage prepares and reopens its private foreground journal without requiring hard-link support",
+      "family": "managed-storage-platform-durability",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "tine-core-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "tine-storage::local_journal_v2 private single-writer preparation",
+          "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/ManagedStorageSmokeTest.kt"
+        ],
+        "scenario": "android.managed-private-journal-activation-edit-crash-reopen",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: GitHub Actions run 32579788092 reached the real Android app-UID managed runtime and failed during retained-runtime actor open because LocalJournalSegmentV2::prepare used hard-link-based strict no-replace publication for an app-private sole-writer journal; Android returned Permission denied (os error 13). The required fix applies the existing absence-check and same-directory atomic-rename fallback to the complete private journal segment/frontier/anchor family while retaining strict publication for shared/provider namespaces."
     }
   ]
 }

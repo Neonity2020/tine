@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.6.94] - 2026-08-22
+
+### Added
+
 - **Live Direct Files save conflicts now use Concord's in-page, block-level
   resolver.** If another device changes a file underneath a retained Tine draft,
   both versions appear above that page with three-way suggestions and per-block
@@ -17,48 +25,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   recovery state, survives a Tine restart, and is removed only after a
   revision-guarded resolution commits. The old global *Keep mine / Use current*
   bar is no longer used for Direct Files conflicts.
-
-### Changed
-
-### Fixed
-
-- **Direct Files no longer repeats whole-graph work on ordinary foreground
-  paths.** Opening Journals before background warm now inventories filenames
-  without reading and parsing every ordinary page. Creating one page uses the
-  warm semantic-identity generation plus target-local no-replace publication,
-  instead of hashing the graph twice, and advances the cached page inventory
-  incrementally. Raw filesystem callbacks now publish an O(1) creation barrier;
-  the debounced watcher owns the single final read/parse, so event bursts do not
-  parse intermediate versions before coalescing.
-
-- **Applying a sync conflict no longer leaves the pre-merge editor behind.**
-  Concord now drains the page's pending save, blocks mutations for the guarded
-  merge, installs the exact page returned by the native commit, and only then
-  releases editing. This prevents the old open copy from immediately creating a
-  second conflict or appearing to undo the chosen merge. Newly delivered copies
-  also raise one actionable notice which retires with the resolved conflict;
-  resolving today's journal updates it in place without dropping it from the
-  live Journals feed. Deferred winner-file events are replayed as soon as the
-  guarded mutation releases, and an older inventory scan cannot resurrect the
-  resolved conflict when ordinary editing resumes. Same-content resolutions now
-  keep the returned disk revision, an in-flight Journals refresh cannot publish
-  a partial feed without today, and Apply refuses to discard edits made after a
-  live-conflict comparison was shown. After restart, a recovered unsaved draft
-  remains the reviewed side instead of being overwritten by the disk-loaded
-  editor. Android now defaults to its native
-  inotify-backed watcher; polling remains available and uses the same
-  reconciliation semantics. (GH #337.)
-
-- **Returning to Tine can no longer open an editor over a stale page.** A
-  focus-driven disk scan now has an explicit native completion receipt, waits
-  for frontend page application, and finally verifies only the visible/edited
-  working set against the current backend cache before admitting input. Clean
-  external changes appear first; dirty pages become Concord conflicts instead
-  of being replaced. The check stays bounded by active pages, not graph size.
-
-## [0.6.94] - 2026-08-21
-
-### Added
 
 - **Conflicts are now one calm queue you resolve inside the page.** Everything
   that needs your judgement — a Syncthing/Dropbox/Seafile conflict copy, or a
@@ -143,6 +109,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Managed-storage saves now return from one bounded foreground commit instead of rebuilding or publishing graph-wide derived state.** The exact Markdown/Org update and one private journal append establish the accepted edit; the hot overlay serves it immediately while immutable archive, SQLite, provider, checkpoint, and journal-compaction work drain afterwards. Consecutive saves use the SQLite baseline plus the exact journal suffix to prove their predecessor without reconstructing the whole page. The release gate measures a 511-block page at under 50 ms p95, and fails if the old full-page predecessor reconstruction returns. Crash replay marks pending task-query facts incomplete and safely uses the complete evaluator until rebuilt; an append whose outcome is genuinely unknowable stops further edits until restart replay, rather than risking a duplicate operation.
 
 ### Fixed
+
+- **Managed storage now creates its private foreground journal on Android
+  without requiring hard-link support.** Segment, frontier, and selector
+  publication use the app-private sole-writer atomic-rename fallback while
+  shared/provider publication remains strict, so the real app-UID activation,
+  edit, crash-reopen, share-setup, shutdown, and reopen journey no longer fails
+  with `Permission denied (os error 13)`.
+
+- **Direct Files no longer repeats whole-graph work on ordinary foreground
+  paths.** Opening Journals before background warm now inventories filenames
+  without reading and parsing every ordinary page. Creating one page uses the
+  warm semantic-identity generation plus target-local no-replace publication,
+  instead of hashing the graph twice, and advances the cached page inventory
+  incrementally. Raw filesystem callbacks now publish an O(1) creation barrier;
+  the debounced watcher owns the single final read/parse, so event bursts do not
+  parse intermediate versions before coalescing.
+
+- **Applying a sync conflict no longer leaves the pre-merge editor behind.**
+  Concord now drains the page's pending save, blocks mutations for the guarded
+  merge, installs the exact page returned by the native commit, and only then
+  releases editing. This prevents the old open copy from immediately creating a
+  second conflict or appearing to undo the chosen merge. Newly delivered copies
+  also raise one actionable notice which retires with the resolved conflict;
+  resolving today's journal updates it in place without dropping it from the
+  live Journals feed. Deferred winner-file events are replayed as soon as the
+  guarded mutation releases, and an older inventory scan cannot resurrect the
+  resolved conflict when ordinary editing resumes. Same-content resolutions now
+  keep the returned disk revision, an in-flight Journals refresh cannot publish
+  a partial feed without today, and Apply refuses to discard edits made after a
+  live-conflict comparison was shown. After restart, a recovered unsaved draft
+  remains the reviewed side instead of being overwritten by the disk-loaded
+  editor. Android now defaults to its native
+  inotify-backed watcher; polling remains available and uses the same
+  reconciliation semantics. (GH #337.)
+
+- **Returning to Tine can no longer open an editor over a stale page.** A
+  focus-driven disk scan now has an explicit native completion receipt, waits
+  for frontend page application, and finally verifies only the visible/edited
+  working set against the current backend cache before admitting input. Clean
+  external changes appear first; dirty pages become Concord conflicts instead
+  of being replaced. The check stays bounded by active pages, not graph size.
 
 - Opening a long-lived managed graph got slower the more edit history it had,
   independent of graph size: the startup replay re-validated every remaining

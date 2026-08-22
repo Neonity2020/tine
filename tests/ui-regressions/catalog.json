@@ -2,6 +2,30 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-CONCORD-LIVE-DIRECT-SAVE-337",
+      "title": "A Direct Files save conflict enters Concord with both exact versions, survives restart, and resolves without the retired global conflict bar",
+      "family": "external-change-conflict-resolution",
+      "sources": {
+        "issues": [337],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::tests::concord live save conflict cases",
+          "src/components/ConflictResolution.test.tsx",
+          "scripts/e2e-concord-live-save.mjs"
+        ],
+        "scenario": "concord.live-direct-save-exact-restart-handoff",
+        "failBefore": "proven"
+      },
+      "notes": "A guarded Direct Files save refusal retains the exact disk winner and the editor draft in app-private recovery state. The conflict is reviewed through the page-level Concord resolver, survives a real process restart, applies under the shown revision guard, and returns to ordinary editable Markdown. The blocking E2E contract also proves that the retired Keep mine / Use current global bar never reappears."
+    },
+    {
       "id": "UI-CONCORD-SYNC-COPY-HANDOFF-337",
       "title": "Applying a sync conflict copy installs the exact committed merge and returns the journal to ordinary conflict-free editing",
       "family": "external-change-conflict-resolution",

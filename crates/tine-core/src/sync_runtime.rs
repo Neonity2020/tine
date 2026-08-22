@@ -9307,8 +9307,11 @@ fn prepare_clean_foreground_journal(
     let anchor_bytes = anchor
         .encode()
         .map_err(|error| format!("cannot encode clean foreground journal anchor: {error}"))?;
-    LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(directory, anchor.selection())
-        .map_err(|error| format!("cannot prepare clean foreground journal segment: {error}"))?;
+    LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare_single_writer(
+        directory,
+        anchor.selection(),
+    )
+    .map_err(|error| format!("cannot prepare clean foreground journal segment: {error}"))?;
     let (journal, recovery) =
         LocalJournalSegmentV2::open_selected(directory, anchor.selection())
             .map_err(|error| format!("cannot open clean foreground journal segment: {error}"))?;
@@ -9319,7 +9322,7 @@ fn prepare_clean_foreground_journal(
         return Err("fresh clean foreground journal is not empty".into());
     }
     publication
-        .publish_new_exact(&anchor_name, &anchor_bytes)
+        .publish_new_exact_single_writer(&anchor_name, &anchor_bytes)
         .map_err(|error| {
             format!("cannot publish clean foreground journal anchor {anchor_name}: {error}")
         })?;
