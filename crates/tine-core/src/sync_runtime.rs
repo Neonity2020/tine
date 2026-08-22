@@ -255,39 +255,6 @@ fn take_clean_activation_instrumentation() -> CleanActivationInstrumentation {
     })
 }
 
-/// Timing receipt for the existing-active startup path. This is test-only on
-/// purpose: reopening must not pay for clocks or synchronization in production.
-/// The fields are sequential startup phases; `accounted` therefore represents
-/// the same wall-time interval as `total` apart from the named coordination
-/// remainder.
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-struct RuntimeOpenInstrumentation {
-    total: Duration,
-    handle_graph_open: Duration,
-    handle_graph_resource_identity: Duration,
-    handle_discovery: Duration,
-    actor_thread_overhead: Duration,
-    actor_graph_open: Duration,
-    actor_graph_resource_identity: Duration,
-    actor_discovery_revalidation: Duration,
-    actor_enrollment_root_open: Duration,
-    actor_receipt_store_open: Duration,
-    actor_application_runtime_open: Duration,
-    actor_baseline_binding: Duration,
-    actor_baseline_open: Duration,
-    actor_promoted_runtime_reopen: Duration,
-    actor_exact_feed_open: Duration,
-    actor_shared_descriptor_inspection: Duration,
-    actor_shared_phase_inspection: Duration,
-    actor_accepted_frontier_open: Duration,
-    actor_provider_transport_open: Duration,
-    actor_provider_descriptor_probe: Duration,
-    actor_assembly: Duration,
-    actor_total: Duration,
-    coordination_remainder: Duration,
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct ManagedApplicationSaveInstrumentation {
@@ -727,37 +694,6 @@ fn checked_editor_request_remainder(timings: &ManagedApplicationSaveStageTimings
         ))
 }
 
-#[cfg(test)]
-impl RuntimeOpenInstrumentation {
-    fn accounted(&self) -> Duration {
-        [
-            self.handle_graph_open,
-            self.handle_graph_resource_identity,
-            self.handle_discovery,
-            self.actor_thread_overhead,
-            self.actor_graph_open,
-            self.actor_graph_resource_identity,
-            self.actor_discovery_revalidation,
-            self.actor_enrollment_root_open,
-            self.actor_receipt_store_open,
-            self.actor_application_runtime_open,
-            self.actor_baseline_binding,
-            self.actor_baseline_open,
-            self.actor_promoted_runtime_reopen,
-            self.actor_exact_feed_open,
-            self.actor_shared_descriptor_inspection,
-            self.actor_shared_phase_inspection,
-            self.actor_accepted_frontier_open,
-            self.actor_provider_transport_open,
-            self.actor_provider_descriptor_probe,
-            self.actor_assembly,
-            self.coordination_remainder,
-        ]
-        .into_iter()
-        .sum()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderRecoveryCoverageRoot {
     acceptance_sequence: u64,
@@ -789,12 +725,6 @@ static ACTOR_THREADS_FINISHED: std::sync::atomic::AtomicUsize =
 static ACTIVATION_ACTOR_OPEN_INSTRUMENTATION: Mutex<
     BTreeMap<WorkspaceId, ActivationActorOpenInstrumentation>,
 > = Mutex::new(BTreeMap::new());
-/// Cross-thread test receipt for `SyncRuntimeHandle::open`. Actor construction
-/// happens on its dedicated thread, so the caller and actor contribute their
-/// sequential phases to one workspace-keyed record.
-#[cfg(test)]
-static RUNTIME_OPEN_INSTRUMENTATION: Mutex<BTreeMap<WorkspaceId, RuntimeOpenInstrumentation>> =
-    Mutex::new(BTreeMap::new());
 #[cfg(test)]
 static PREPARE_SHARED_TEST_CUT: Mutex<Option<WorkspaceId>> = Mutex::new(None);
 #[cfg(test)]
@@ -865,73 +795,6 @@ fn activation_actor_open_instrumentation(
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-fn record_runtime_actor_open(workspace: WorkspaceId, timing: RuntimeOpenInstrumentation) {
-    let mut records = RUNTIME_OPEN_INSTRUMENTATION.lock().unwrap();
-    let record = records.entry(workspace).or_default();
-    record.actor_graph_open = timing.actor_graph_open;
-    record.actor_graph_resource_identity = timing.actor_graph_resource_identity;
-    record.actor_discovery_revalidation = timing.actor_discovery_revalidation;
-    record.actor_enrollment_root_open = timing.actor_enrollment_root_open;
-    record.actor_receipt_store_open = timing.actor_receipt_store_open;
-    record.actor_application_runtime_open = timing.actor_application_runtime_open;
-    record.actor_baseline_binding = timing.actor_baseline_binding;
-    record.actor_baseline_open = timing.actor_baseline_open;
-    record.actor_promoted_runtime_reopen = timing.actor_promoted_runtime_reopen;
-    record.actor_total = timing.actor_total;
-}
-
-#[cfg(test)]
-fn record_runtime_proven_resources_open(
-    workspace: WorkspaceId,
-    timing: RuntimeOpenInstrumentation,
-) {
-    let mut records = RUNTIME_OPEN_INSTRUMENTATION.lock().unwrap();
-    let record = records.entry(workspace).or_default();
-    record.actor_exact_feed_open = timing.actor_exact_feed_open;
-    record.actor_shared_descriptor_inspection = timing.actor_shared_descriptor_inspection;
-    record.actor_shared_phase_inspection = timing.actor_shared_phase_inspection;
-    record.actor_accepted_frontier_open = timing.actor_accepted_frontier_open;
-    record.actor_provider_transport_open = timing.actor_provider_transport_open;
-    record.actor_provider_descriptor_probe = timing.actor_provider_descriptor_probe;
-    record.actor_assembly = timing.actor_assembly;
-}
-
-#[cfg(test)]
-fn record_runtime_handle_open(
-    workspace: WorkspaceId,
-    total: Duration,
-    handle_graph_open: Duration,
-    handle_graph_resource_identity: Duration,
-    handle_discovery: Duration,
-    actor_thread_elapsed: Duration,
-) {
-    let mut records = RUNTIME_OPEN_INSTRUMENTATION.lock().unwrap();
-    let record = records.entry(workspace).or_default();
-    record.total = total;
-    record.handle_graph_open = handle_graph_open;
-    record.handle_graph_resource_identity = handle_graph_resource_identity;
-    record.handle_discovery = handle_discovery;
-    record.actor_thread_overhead = actor_thread_elapsed.saturating_sub(record.actor_total);
-    record.coordination_remainder = total.saturating_sub(record.accounted());
-}
-
-#[cfg(test)]
-fn reset_runtime_open_instrumentation(workspace: WorkspaceId) {
-    RUNTIME_OPEN_INSTRUMENTATION
-        .lock()
-        .unwrap()
-        .remove(&workspace);
-}
-
-#[cfg(test)]
-fn take_runtime_open_instrumentation(workspace: WorkspaceId) -> RuntimeOpenInstrumentation {
-    RUNTIME_OPEN_INSTRUMENTATION
-        .lock()
-        .unwrap()
-        .remove(&workspace)
-        .expect("existing-active runtime open instrumentation was recorded")
-}
 #[cfg(test)]
 static PROVIDER_RECOVERY_PUBLICATION_TEST_CUTS: Mutex<
     BTreeMap<WorkspaceId, ProviderRecoveryPublicationTestCut>,
@@ -37271,16 +37134,6 @@ mod tests {
         graph_state: StartupBenchmarkGraphState,
     }
 
-    #[derive(Clone, Debug)]
-    struct ManagedStartupBenchmarkReceipt {
-        milestones: StartupBenchmarkMilestones,
-        deferred_catch_up_and_shutdown: Duration,
-        named_page: StartupBenchmarkNamedPage,
-        graph_state: StartupBenchmarkGraphState,
-        open: RuntimeOpenInstrumentation,
-        resume: crate::oplog::hot_engine::RuntimeResumeObservation,
-    }
-
     fn startup_page_semantics(page: &PageDto) -> StartupBenchmarkNamedPage {
         StartupBenchmarkNamedPage {
             name: page.name.clone(),
@@ -38741,34 +38594,6 @@ mod tests {
         page_local_reads
     }
 
-    fn startup_open_phase_receipt(open: &RuntimeOpenInstrumentation) -> String {
-        format!(
-            "total_ms={:.3} handle_graph_open_ms={:.3} handle_identity_ms={:.3} handle_discovery_ms={:.3} actor_thread_overhead_ms={:.3} actor_graph_open_ms={:.3} actor_identity_ms={:.3} actor_discovery_revalidation_ms={:.3} enrollment_open_ms={:.3} receipt_store_open_ms={:.3} application_runtime_open_ms={:.3} baseline_binding_ms={:.3} baseline_open_ms={:.3} promoted_runtime_reopen_ms={:.3} exact_feed_open_ms={:.3} shared_descriptor_ms={:.3} shared_phase_ms={:.3} accepted_frontier_ms={:.3} provider_transport_ms={:.3} provider_descriptor_probe_ms={:.3} actor_assembly_ms={:.3} coordination_remainder_ms={:.3}",
-            startup_ms(open.total),
-            startup_ms(open.handle_graph_open),
-            startup_ms(open.handle_graph_resource_identity),
-            startup_ms(open.handle_discovery),
-            startup_ms(open.actor_thread_overhead),
-            startup_ms(open.actor_graph_open),
-            startup_ms(open.actor_graph_resource_identity),
-            startup_ms(open.actor_discovery_revalidation),
-            startup_ms(open.actor_enrollment_root_open),
-            startup_ms(open.actor_receipt_store_open),
-            startup_ms(open.actor_application_runtime_open),
-            startup_ms(open.actor_baseline_binding),
-            startup_ms(open.actor_baseline_open),
-            startup_ms(open.actor_promoted_runtime_reopen),
-            startup_ms(open.actor_exact_feed_open),
-            startup_ms(open.actor_shared_descriptor_inspection),
-            startup_ms(open.actor_shared_phase_inspection),
-            startup_ms(open.actor_accepted_frontier_open),
-            startup_ms(open.actor_provider_transport_open),
-            startup_ms(open.actor_provider_descriptor_probe),
-            startup_ms(open.actor_assembly),
-            startup_ms(open.coordination_remainder),
-        )
-    }
-
     /// The rebuild's own work counters. A rebuild that is superlinear in graph
     /// size is superlinear in one of these, and elapsed time alone cannot say
     /// which -- so the receipt names the quantities rather than the duration.
@@ -39616,18 +39441,15 @@ mod tests {
             "the benchmark must actually discard the projection it means to price"
         );
 
-        reset_runtime_open_instrumentation(workspace_id);
         reset_projection_open_test_observation(workspace_id);
         let started = Instant::now();
         let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         let elapsed = started.elapsed();
         assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
-        let open = take_runtime_open_instrumentation(workspace_id);
         let projection = take_projection_open_test_observation(workspace_id);
         eprintln!(
-            "managed_projection_rebuild files={graph_files} rounds={rounds} elapsed_ms={:.3} open_phases: {} projection_open: {}",
+            "managed_projection_rebuild files={graph_files} rounds={rounds} elapsed_ms={:.3} projection_open: {}",
             startup_ms(elapsed),
-            startup_open_phase_receipt(&open),
             startup_projection_open_test_receipt(&projection),
         );
         // Reading the branch off the run, not inferring it from the timing:
@@ -39725,13 +39547,11 @@ mod tests {
                         .remove()
                         .expect("synthetic cacheless reopen discards the disposable projection");
                 }
-                reset_runtime_open_instrumentation(workspace_id);
                 reset_projection_open_test_observation(workspace_id);
                 let started = Instant::now();
                 let opened = SyncRuntimeHandle::open(request.clone());
                 let elapsed = started.elapsed();
                 assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
-                let open = take_runtime_open_instrumentation(workspace_id);
                 let projection = take_projection_open_test_observation(workspace_id);
                 if cacheless {
                     assert_eq!(
@@ -39740,9 +39560,8 @@ mod tests {
                     );
                 }
                 eprintln!(
-                    "managed_crash_reopen_synthetic accepted_edits={accepted_edits} cacheless={cacheless} elapsed_ms={:.3} open_phases: {} projection_open: {}",
+                    "managed_crash_reopen_synthetic accepted_edits={accepted_edits} cacheless={cacheless} elapsed_ms={:.3} projection_open: {}",
                     startup_ms(elapsed),
-                    startup_open_phase_receipt(&open),
                     startup_projection_open_test_receipt(&projection),
                 );
                 assert!(
@@ -39755,7 +39574,8 @@ mod tests {
                 let recovered_status = reopened.status().unwrap();
                 assert_eq!(
                     recovered_status.recovery,
-                    Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+                    Some(SyncRuntimeRecovery::CleanManifestReplay),
+                    "the current clean-manifest recovery path must replay the accepted undrained tail without falling back to legacy unsafe takeover"
                 );
                 assert_eq!(recovered_status.managed_local_pending, 0);
                 assert_eq!(
