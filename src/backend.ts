@@ -33,6 +33,7 @@ import type {
   SyncConflictDiff,
   VcsMarkerConflict,
   ConflictObject,
+  LiveSaveConflictCapture,
   MarkerConflictDiff,
   MergeDecision,
   ManagedPageMutationPreflightResult,
@@ -412,10 +413,10 @@ export interface Backend {
   /** Journal days that resolve to >1 file (date-stem + title-named, or md/org
    *  twin) — for the user to reconcile. */
   listJournalConflicts(): Promise<JournalConflict[]>;
-  /** Ask the backend watcher for one full stat-diff pass now (Concord L0's
-   *  reload-on-focus fallback). Findings arrive as ordinary graph-changed
-   *  events; this never applies anything itself. */
-  rescanGraphNow(): Promise<void>;
+  /** Request one watcher full pass. The returned sequence is completed by a
+   *  later `graph-rescan-complete` event, after ordinary change events emit. */
+  rescanGraphNow(): Promise<number>;
+  onGraphRescanComplete(cb: (sequence: number) => void): Promise<() => void>;
   /** Journal files whose names don't round-trip to a date, with the names they
    *  would get. Proposed only — see `applyJournalFilenameMigrations`. */
   listJournalFilenameMigrations(): Promise<JournalFilenameMigration[]>;
@@ -480,6 +481,30 @@ export interface Backend {
     theirs: string,
     format?: "md" | "org"
   ): Promise<SyncConflictDiff>;
+  liveSaveConflictDiff(
+    page: PageDto,
+    baseRev: string | null,
+    conflictEpoch: number,
+  ): Promise<SyncConflictDiff>;
+  captureLiveSaveConflict(
+    page: PageDto,
+    baseRev: string | null,
+    conflictEpoch: number,
+  ): Promise<LiveSaveConflictCapture>;
+  durableLiveSaveConflictDiff(page: PageDto, baseText: string | null): Promise<SyncConflictDiff>;
+  resolveDurableLiveSaveConflict(
+    page: PageDto,
+    expectedDiskRev: string,
+    decisions: Record<string, MergeDecision>,
+    preChoice?: "mine" | "theirs" | "union",
+  ): Promise<PageDto>;
+  resolveLiveSaveConflict(
+    page: PageDto,
+    baseRev: string | null,
+    conflictEpoch: number,
+    decisions: Record<string, MergeDecision>,
+    preChoice?: "mine" | "theirs" | "union",
+  ): Promise<PageDto>;
   /** The Concord conflict queue (L3): one derived inventory of every page that
    *  needs the user's judgement, from BOTH artifact sources (conflict copies and
    *  VCS-marker pages). Derived from disk on every call — nothing is stored, so
@@ -1201,7 +1226,11 @@ class TauriBackend implements Backend {
     return this.call<JournalConflict[]>("list_journal_conflicts");
   }
   rescanGraphNow() {
-    return this.call<void>("rescan_graph_now");
+    return this.call<number>("rescan_graph_now");
+  }
+  async onGraphRescanComplete(cb: (sequence: number) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<{ sequence: number }>("graph-rescan-complete", (event) => cb(event.payload.sequence));
   }
   listJournalFilenameMigrations() {
     return this.call<JournalFilenameMigration[]>("list_journal_filename_migrations");
@@ -1292,6 +1321,51 @@ class TauriBackend implements Backend {
   }
   textBlockDiff3(base: string, mine: string, theirs: string, format?: "md" | "org") {
     return this.call<SyncConflictDiff>("text_block_diff3", { base, mine, theirs, format });
+  }
+  liveSaveConflictDiff(page: PageDto, baseRev: string | null, conflictEpoch: number) {
+    return this.call<SyncConflictDiff>("live_save_conflict_diff", {
+      page,
+      baseRev,
+      conflictEpoch,
+    });
+  }
+  captureLiveSaveConflict(page: PageDto, baseRev: string | null, conflictEpoch: number) {
+    return this.call<LiveSaveConflictCapture>("capture_live_save_conflict", {
+      page,
+      baseRev,
+      conflictEpoch,
+    });
+  }
+  durableLiveSaveConflictDiff(page: PageDto, baseText: string | null) {
+    return this.call<SyncConflictDiff>("durable_live_save_conflict_diff", { page, baseText });
+  }
+  resolveDurableLiveSaveConflict(
+    page: PageDto,
+    expectedDiskRev: string,
+    decisions: Record<string, MergeDecision>,
+    preChoice: "mine" | "theirs" | "union" = "union",
+  ) {
+    return this.call<PageDto>("resolve_durable_live_save_conflict", {
+      page,
+      expectedDiskRev,
+      decisions,
+      preChoice,
+    });
+  }
+  resolveLiveSaveConflict(
+    page: PageDto,
+    baseRev: string | null,
+    conflictEpoch: number,
+    decisions: Record<string, MergeDecision>,
+    preChoice: "mine" | "theirs" | "union" = "union",
+  ) {
+    return this.call<PageDto>("resolve_live_save_conflict", {
+      page,
+      baseRev,
+      conflictEpoch,
+      decisions,
+      preChoice,
+    });
   }
   resolveSyncConflict(
     winner: string,

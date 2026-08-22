@@ -1019,6 +1019,56 @@
    "stability": "stable",
    "notes": "Added 2026-08-09 after a generated graph linked 29 papers by filename while every file declared a different title::; every link opened a blank page with nothing on screen to explain it. Logseq does NOT dim unresolved links (components/block.cljs:548 dims only untitled-page?, meaning a page existing under a uuid name), so the dimming is a deliberate, Martin-approved divergence and this journey is its contract."
   },
+  "scripts/e2e-concord-focus-freshness.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Concord live-focus contract: focus freshness is established before a stale editor can acquire input authority.",
+     "userOutcome": "After another device atomically replaces a page while Tine is backgrounded, returning and clicking immediately opens the editor on the external winner; the subsequent local edit preserves both changes.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "The ordinary clean-page journey does not surface the retired Direct Files Keep mine / Use current conflict bar.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The watcher may notice the external replacement before the explicit focus rescan, provided the editor still opens on the external winner.",
+    "A perceptible refresh may show a small progress status before the editor activates."
+   ],
+   "nonRequirements": [
+    "Exact refresh-indicator styling, duration, DOM nesting, or watcher event count.",
+    "Exact pixel geometry or animation."
+   ],
+   "stability": "stable",
+   "notes": "Added for the suspended-laptop/Syncthing Concord redesign. It asserts rendered editor content and durable file bytes, not timing or DOM trivia."
+  },
+  "scripts/e2e-concord-live-save.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Concord live-save contract: a guarded save refusal retains both the editor draft and the exact disk winner across a process restart.",
+     "userOutcome": "A local draft racing an atomic external replacement appears in the page-level Concord resolver, survives restarting Tine, and can resolve with both sides into ordinary Markdown.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Direct Files conflicts use the in-page resolver and queue, never the retired global Keep mine / Use current bar.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Three-way suggestions may select one side where the common base proves it changed alone; the user can still choose either side or both.",
+    "Labels and explanatory wording may evolve while both texts remain visible and the guarded apply remains explicit."
+   ],
+   "nonRequirements": [
+    "Exact conflict colors, row geometry, button ordering, DOM nesting, or animation.",
+    "Exact generated block identities or save debounce duration."
+   ],
+   "stability": "stable",
+   "notes": "Added for the Concord live Direct Files redesign. It drives an actual guarded save conflict, full app restart, no-loss resolution, visible post-resolution state, and final file bytes."
+  },
   "scripts/e2e-dirty-editor-replacement.mjs": {
    "contracts": [
     {

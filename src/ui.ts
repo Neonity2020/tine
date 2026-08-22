@@ -8,6 +8,7 @@ import type {
   SyncConflict,
   VcsMarkerConflict,
   PageKind,
+  PageDto,
 } from "./types";
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
@@ -355,14 +356,150 @@ export const [vcsMarkerConflicts, setVcsMarkerConflicts] = createSignal<VcsMarke
 export function vcsMarkerConflictFor(path: string | undefined): VcsMarkerConflict | undefined {
   return path ? vcsMarkerConflicts().find((c) => c.path === path) : undefined;
 }
-// --- Concord L3: the conflict queue. ONE derived inventory over both artifact
-// sources (conflict copies + VCS-marker pages), recomputed from disk — nothing
-// is stored, so it survives restarts for free. It drives a calm badge (never a
-// modal, never blocking) and the in-page resolver. ---
-export const [conflictQueue, setConflictQueue] = createSignal<ConflictObject[]>([]);
+// --- Concord L3: one conflict queue. Disk artifacts (conflict copies and
+// VCS-marker pages) are derived afresh; live save conflicts are app-private
+// capsules because their retained draft does not exist on disk. Neither source
+// writes metadata into the graph. The combined queue drives one calm badge and
+// the in-page resolver. ---
+const [conflictQueue, setConflictQueueSignal] = createSignal<ConflictObject[]>([]);
+export { conflictQueue };
+let artifactConflictQueue: ConflictObject[] = [];
+const liveSaveConflicts = new Map<string, ConflictObject>();
+const LIVE_CONFLICT_STORE_KEY = "tine.concord.live-conflicts.v1";
+
+type StoredLiveConflict = { root: string; conflict: ConflictObject };
+
+function readStoredLiveConflicts(): StoredLiveConflict[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LIVE_CONFLICT_STORE_KEY) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is StoredLiveConflict =>
+      typeof item?.root === "string"
+      && item?.conflict?.source === "live-save"
+      && !!item.conflict.live?.page,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistLiveSaveConflicts(): boolean {
+  const root = graphMeta()?.root;
+  if (!root) return false;
+  try {
+    const otherGraphs = readStoredLiveConflicts().filter((item) => item.root !== root);
+    const current = [...liveSaveConflicts.values()].map((conflict) => ({ root, conflict }));
+    localStorage.setItem(LIVE_CONFLICT_STORE_KEY, JSON.stringify([...otherGraphs, ...current]));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Rehydrate unresolved live drafts after a process restart. The capsule stays
+ * app-private; no marker or metadata is written into the graph. */
+export function restoreLiveSaveConflicts(root: string): void {
+  liveSaveConflicts.clear();
+  for (const item of readStoredLiveConflicts()) {
+    if (item.root === root) liveSaveConflicts.set(item.conflict.page_name, item.conflict);
+  }
+  publishConflictQueue();
+}
+
+function publishConflictQueue(): void {
+  setConflictQueueSignal([...artifactConflictQueue, ...liveSaveConflicts.values()]);
+}
+
+/** Test/setup replacement of the complete queue. Production artifact refreshes
+ * use `replaceArtifactConflictQueue` so they cannot erase retained live drafts. */
+export function setConflictQueue(queue: ConflictObject[]): void {
+  artifactConflictQueue = queue.filter((item) => item.source !== "live-save");
+  liveSaveConflicts.clear();
+  for (const item of queue) {
+    if (item.source === "live-save") liveSaveConflicts.set(item.page_name, item);
+  }
+  publishConflictQueue();
+}
+
+function replaceArtifactConflictQueue(queue: ConflictObject[]): void {
+  artifactConflictQueue = queue;
+  publishConflictQueue();
+}
+
+export function registerLiveSaveConflict(
+  page: PageDto,
+  baseRev: string | null,
+  conflictEpoch: number,
+  recovery?: { base_text: string | null; disk_rev: string },
+): void {
+  const previous = liveSaveConflicts.get(page.name)?.live?.draft_version ?? 0;
+  liveSaveConflicts.set(page.name, {
+    id: `live:${page.path || page.name}`,
+    source: "live-save",
+    page_name: page.name,
+    page_path: page.path ?? page.name,
+    kind: page.kind,
+    sides: [
+      { role: "mine", label: "Your retained draft" },
+      { role: "theirs", label: "Current file on disk", path: page.path },
+      { role: "base", label: "Last version this editor loaded" },
+    ],
+    live: {
+      page,
+      base_rev: baseRev,
+      conflict_epoch: conflictEpoch,
+      draft_version: previous + 1,
+      base_text: recovery?.base_text,
+      disk_rev: recovery?.disk_rev,
+    },
+  });
+  publishConflictQueue();
+  if (recovery && !persistLiveSaveConflicts()) {
+    pushToast(
+      `“${page.name}” is still recoverable in this window, but Tine could not preserve the conflict for an app restart.`,
+      "error",
+      { sticky: true },
+    );
+  }
+}
+
+export function refreshLiveSaveConflictDraft(page: PageDto): void {
+  const current = liveSaveConflicts.get(page.name);
+  if (!current?.live) return;
+  liveSaveConflicts.set(page.name, {
+    ...current,
+    live: { ...current.live, page, draft_version: current.live.draft_version + 1 },
+  });
+  publishConflictQueue();
+  persistLiveSaveConflicts();
+}
+
+export function updateLiveSaveConflictDiskRev(name: string, diskRev: string): void {
+  const current = liveSaveConflicts.get(name);
+  if (!current?.live || current.live.disk_rev === diskRev) return;
+  liveSaveConflicts.set(name, {
+    ...current,
+    live: { ...current.live, disk_rev: diskRev },
+  });
+  publishConflictQueue();
+  persistLiveSaveConflicts();
+}
+
+export function clearLiveSaveConflict(name: string): void {
+  if (liveSaveConflicts.delete(name)) {
+    publishConflictQueue();
+    persistLiveSaveConflicts();
+  }
+}
 /** The queue entry for the page loaded from `path`, if it has one. */
-export function conflictObjectFor(path: string | undefined): ConflictObject | undefined {
-  return path ? conflictQueue().find((c) => c.page_path === path) : undefined;
+export function conflictObjectFor(
+  path: string | undefined,
+  name?: string,
+): ConflictObject | undefined {
+  return conflictQueue().find((conflict) =>
+    (path && conflict.page_path === path)
+    || (conflict.source === "live-save" && name !== undefined && conflict.page_name === name)
+  );
 }
 // Where the badge left off, so repeated clicks WALK the queue instead of parking
 // on its first item. Transient session state: the queue itself is derived.
@@ -430,12 +567,12 @@ export async function refreshSyncConflicts(notify = false): Promise<void> {
   try {
     const before = conflictQueue().map((c) => c.id).join("\u0000");
     const queue = await backend().conflictQueue();
-    setConflictQueue(queue);
+    replaceArtifactConflictQueue(queue);
     if (queue.map((c) => c.id).join("\u0000") !== before) resetConflictCursor();
   } catch {
     // Best-effort like the two listings above: a missing queue means no badge,
     // never a broken app. The Settings fallback surface still works.
-    setConflictQueue([]);
+    replaceArtifactConflictQueue([]);
   }
 }
 
@@ -1108,6 +1245,7 @@ export function markConflict(name: string) {
 }
 export function clearConflict(name: string) {
   setConflicts(conflicts().filter((n) => n !== name));
+  clearLiveSaveConflict(name);
 }
 export function isConflicted(name: string): boolean {
   return conflicts().includes(name);

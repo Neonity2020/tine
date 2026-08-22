@@ -2,6 +2,7 @@ import { batch, createSignal } from "solid-js";
 import { renderedBlocks } from "./lazyObserve";
 import { clearSelection, sweepReplaceable } from "./store";
 import { notifyEditingStarted } from "./modeHooks";
+import { deferEditorStartUntilFresh } from "./freshnessBarrier";
 
 // Where to put the caret when a block starts editing. Either a concrete offset
 // (clicks, splits, most callers) OR a column descriptor for cross-block Up/Down
@@ -184,6 +185,9 @@ export function startEditing(
   surface: string | null = null,
   preserveHistoryRestore = false,
 ) {
+  if (deferEditorStartUntilFresh(() =>
+    startEditing(id, offset, owner, surface, preserveHistoryRestore)
+  )) return;
   if (!preserveHistoryRestore) setPendingHistoryEditorRestore(null);
   notifyEditingStarted(id, owner);
   // Latch the block so that when editing ends its body renders eagerly (no

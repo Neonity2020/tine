@@ -2,8 +2,20 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { PageConflictResolution } from "./ConflictResolution";
 import { __setBackendForTest, type Backend } from "../backend";
-import { conflictQueue, setConflictQueue } from "../ui";
-import type { ConflictObject, MarkerConflictDiff, SyncConflictDiff } from "../types";
+import {
+  conflictQueue,
+  registerLiveSaveConflict,
+  restoreLiveSaveConflicts,
+  setConflictQueue,
+  setGraphMeta,
+} from "../ui";
+import type {
+  ConflictObject,
+  MarkerConflictDiff,
+  MergeDecision,
+  PageDto,
+  SyncConflictDiff,
+} from "../types";
 
 // Concord P4 (L4 + L5). Fail-before: nothing in Tine could resolve a
 // VCS-marker conflict at all — a marker-bearing page showed a banner telling the
@@ -19,6 +31,8 @@ afterEach(() => {
   document.body.innerHTML = "";
   __setBackendForTest(null);
   setConflictQueue([]);
+  setGraphMeta(null);
+  localStorage.clear();
 });
 
 const view = (text: string) => ({ uuid: "", text, child_count: 0 });
@@ -93,6 +107,15 @@ function stubBackend(overrides: Partial<Backend>): void {
     listSyncConflicts: async () => [],
     listVcsMarkerConflicts: async () => [],
     conflictQueue: async () => [],
+    liveSaveConflictDiff: async () => markerDiff.diff,
+    captureLiveSaveConflict: async () => ({
+      diff: markerDiff.diff,
+      base_text: "- base\n",
+      disk_rev: "disk-rev",
+    }),
+    durableLiveSaveConflictDiff: async () => markerDiff.diff,
+    resolveDurableLiveSaveConflict: async (page: PageDto) => ({ ...page, rev: "resolved-rev" }),
+    resolveLiveSaveConflict: async (page: PageDto) => ({ ...page, rev: "resolved-rev" }),
     ...overrides,
   } as unknown as Backend);
 }
@@ -234,6 +257,120 @@ describe("in-page conflict resolution", () => {
       expect(copy).toBe("pages/Note.sync-conflict-20260817-101010-ABCDEFG.md");
       expect(baseRev).toBe("winner-rev");
       expect(conflictRev).toBe("copy-rev");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("routes an in-memory save conflict through Concord's guarded live resolution", async () => {
+    const draft: PageDto = {
+      name: "Note",
+      kind: "page",
+      title: "Note",
+      pre_block: null,
+      path: "pages/Note.md",
+      rev: "editor-base-rev",
+      activation: 7,
+      blocks: [{ id: "1", raw: "my edit", collapsed: false, children: [] }],
+    };
+    const liveDiff: SyncConflictDiff = {
+      ...markerDiff.diff,
+      base_rev: "editor-base-rev",
+      conflict_rev: "42",
+    };
+    const resolve = vi.fn(async (
+      _page: PageDto,
+      _baseRev: string | null,
+      _epoch: number,
+      _decisions: Record<string, MergeDecision>,
+      _preChoice?: "mine" | "theirs" | "union",
+    ) => ({ ...draft, rev: "resolved-rev" }));
+    stubBackend({
+      liveSaveConflictDiff: (async () => liveDiff) as Backend["liveSaveConflictDiff"],
+      resolveLiveSaveConflict: resolve as Backend["resolveLiveSaveConflict"],
+      getPageByPath: async () => null,
+    });
+    const liveObject: ConflictObject = {
+      id: "live:pages/Note.md",
+      source: "live-save",
+      page_name: "Note",
+      page_path: "pages/Note.md",
+      kind: "page",
+      sides: [
+        { role: "mine", label: "Your retained draft" },
+        { role: "theirs", label: "Current file on disk" },
+        { role: "base", label: "Last version this editor loaded" },
+      ],
+      live: { page: draft, base_rev: "editor-base-rev", conflict_epoch: 42, draft_version: 1 },
+    };
+    const { host, dispose } = mount(liveObject);
+    try {
+      await flush();
+      await flush();
+      expect(host.querySelector(".page-conflict-title")!.textContent).toContain(
+        "Your draft and the current file both changed",
+      );
+      [...host.querySelectorAll("button")]
+        .find((button) => button.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      await flush();
+      expect(resolve).toHaveBeenCalledTimes(1);
+      const [page, baseRev, epoch, decisions] = resolve.mock.calls[0];
+      expect(page).toEqual(draft);
+      expect(baseRev).toBe("editor-base-rev");
+      expect(epoch).toBe(42);
+      expect(decisions).toEqual({ "1": "mine", "2": "theirs", "3": "both" });
+    } finally {
+      dispose();
+    }
+  });
+
+  it("rehydrates a durable live conflict after restart and uses its revision guard", async () => {
+    const draft: PageDto = {
+      name: "Durable",
+      kind: "page",
+      title: "Durable",
+      pre_block: null,
+      path: "pages/Durable.md",
+      rev: "base-rev",
+      blocks: [{ id: "1", raw: "draft", collapsed: false, children: [] }],
+    };
+    setGraphMeta({ root: "/graph", preferred_format: "md" } as never);
+    registerLiveSaveConflict(draft, "base-rev", 5, {
+      base_text: "- base\n",
+      disk_rev: "disk-rev",
+    });
+    setConflictQueue([]); // process memory is gone; app-private capsule remains
+    restoreLiveSaveConflicts("/graph");
+    const restored = conflictQueue()[0];
+    expect(restored.live?.page.blocks[0].raw).toBe("draft");
+
+    const resolve = vi.fn(async (
+      _page: PageDto,
+      _diskRev: string,
+      _decisions: Record<string, MergeDecision>,
+      _preChoice?: "mine" | "theirs" | "union",
+    ) => ({ ...draft, rev: "resolved-rev" }));
+    stubBackend({
+      durableLiveSaveConflictDiff: async () => ({
+        ...markerDiff.diff,
+        conflict_rev: "disk-rev",
+      }),
+      resolveDurableLiveSaveConflict: resolve,
+      getPageByPath: async () => null,
+    });
+    const { host, dispose } = mount(restored);
+    try {
+      await flush();
+      await flush();
+      [...host.querySelectorAll("button")]
+        .find((button) => button.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      await flush();
+      expect(resolve).toHaveBeenCalledTimes(1);
+      expect(resolve.mock.calls[0][1]).toBe("disk-rev");
     } finally {
       dispose();
     }

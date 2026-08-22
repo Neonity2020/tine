@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { backend } from "./backend";
 import {
   FOCUS_RESCAN_THROTTLE_MS,
+  installFocusFreshnessVerifier,
   installReloadOnFocus,
   refreshOnReturnToWindow,
   resetFocusRescanThrottle,
@@ -20,50 +21,68 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  installFocusFreshnessVerifier(async () => {});
   vi.restoreAllMocks();
   resetStore();
 });
 
 describe("reload on focus", () => {
-  it("asks the backend for one rescan and replays what P1 deferred", () => {
-    const rescan = vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(undefined);
+  it("asks the backend for one rescan and replays what P1 deferred", async () => {
+    const rescan = vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(1);
     const replayed: string[] = [];
     // A page the store already considers replaceable: exactly the record P1's
     // `deferExternalReload` leaves behind while a block is being edited.
     onPageBecameReplaceable("Externally Edited", (name) => replayed.push(name));
 
-    refreshOnReturnToWindow(100_000);
+    await refreshOnReturnToWindow(100_000);
 
     expect(rescan).toHaveBeenCalledTimes(1);
-    expect(replayed).toEqual(["Externally Edited"]);
+    expect(replayed).toEqual(["Externally Edited", "Externally Edited"]);
   });
 
-  it("throttles the rescan but never the replay", () => {
-    const rescan = vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(undefined);
+  it("throttles the rescan but never the replay", async () => {
+    const rescan = vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(1);
     const replayed: string[] = [];
     onPageBecameReplaceable("Externally Edited", (name) => replayed.push(name));
 
-    refreshOnReturnToWindow(100_000);
-    refreshOnReturnToWindow(100_000 + FOCUS_RESCAN_THROTTLE_MS - 1);
+    await refreshOnReturnToWindow(100_000);
+    await refreshOnReturnToWindow(100_000 + FOCUS_RESCAN_THROTTLE_MS - 1);
     expect(rescan).toHaveBeenCalledTimes(1);
-    expect(replayed.length).toBe(2); // alt-tabbing never costs a stale page
+    expect(replayed.length).toBe(3); // full refresh sweeps before and after; throttled refresh still sweeps
 
-    refreshOnReturnToWindow(100_000 + FOCUS_RESCAN_THROTTLE_MS);
+    await refreshOnReturnToWindow(100_000 + FOCUS_RESCAN_THROTTLE_MS);
     expect(rescan).toHaveBeenCalledTimes(2);
   });
 
   it("survives a backend that refuses the rescan", async () => {
     vi.spyOn(backend(), "rescanGraphNow").mockRejectedValue(new Error("no watcher"));
-    expect(() => refreshOnReturnToWindow(100_000)).not.toThrow();
-    await Promise.resolve();
+    await expect(refreshOnReturnToWindow(100_000)).resolves.toBeUndefined();
   });
 
-  it("fires on window focus and on becoming visible, never while hidden", () => {
-    const rescan = vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(undefined);
+  it("awaits the bounded visible-page verifier before completing", async () => {
+    vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(1);
+    let release = () => {};
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const verifier = vi.fn(() => pending);
+    installFocusFreshnessVerifier(verifier);
+
+    let completed = false;
+    const refresh = refreshOnReturnToWindow(100_000).then(() => { completed = true; });
+    await vi.waitFor(() => expect(verifier).toHaveBeenCalledTimes(1));
+    expect(completed).toBe(false);
+
+    release();
+    await refresh;
+    expect(completed).toBe(true);
+  });
+
+  it("fires on window focus and on becoming visible, never while hidden", async () => {
+    const rescan = vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(1);
     installReloadOnFocus();
 
     window.dispatchEvent(new Event("focus"));
-    expect(rescan).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(rescan).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
 
     resetFocusRescanThrottle();
     const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
@@ -72,15 +91,15 @@ describe("reload on focus", () => {
 
     hidden.mockReturnValue(false);
     document.dispatchEvent(new Event("visibilitychange"));
-    expect(rescan).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(rescan).toHaveBeenCalledTimes(2));
   });
 
-  it("installs exactly once", () => {
-    const rescan = vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(undefined);
+  it("installs exactly once", async () => {
+    const rescan = vi.spyOn(backend(), "rescanGraphNow").mockResolvedValue(1);
     installReloadOnFocus();
     installReloadOnFocus();
     window.dispatchEvent(new Event("focus"));
-    expect(rescan).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(rescan).toHaveBeenCalledTimes(1));
   });
 
   it("does not replace the store's own sweep", () => {

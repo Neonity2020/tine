@@ -167,6 +167,8 @@ const suites = {
     ["publish-security", "scripts/e2e-publish-security.mjs", {}],
     ["page-identity-links", "scripts/e2e-page-identity-links.mjs", {}],
     ["external-graph-wide-changes", "scripts/e2e-external-graph-wide-changes.mjs", {}],
+    ["concord-focus-freshness", "scripts/e2e-concord-focus-freshness.mjs", {}],
+    ["concord-live-save", "scripts/e2e-concord-live-save.mjs", {}],
     ["rendered-delete-verify", "scripts/e2e-rendered-delete-verify.mjs", {}],
     ["delete-selection-timing", "scripts/e2e-delete-selection-timing.mjs", {}],
     ["selection-actions", "scripts/e2e-selection-actions.mjs", {}],

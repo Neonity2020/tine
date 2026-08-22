@@ -1668,8 +1668,12 @@ export function mockBackend(): Backend {
         },
       ];
     },
-    async rescanGraphNow(): Promise<void> {
+    async rescanGraphNow(): Promise<number> {
       // no backend watcher in the browser mock
+      return 1;
+    },
+    async onGraphRescanComplete(_cb: (sequence: number) => void): Promise<() => void> {
+      return () => {};
     },
     async listJournalFilenameMigrations() {
       // Same demo gate as the duplicate-day list: only under `?conflicts`.
@@ -1824,6 +1828,33 @@ export function mockBackend(): Backend {
         blocks_identical: same,
         three_way: true,
       };
+    },
+    async liveSaveConflictDiff(page: PageDto) {
+      const v = (text: string) => ({ uuid: "", text, child_count: 0 });
+      const mine = page.blocks[0]?.raw ?? "";
+      return {
+        base_rev: "mock-live-disk",
+        conflict_rev: "mock-live-draft",
+        rows: [{ id: "0", kind: "modified" as const, mine: v(mine), theirs: v("Changed on disk"), children: [] }],
+        mine_pre: page.pre_block,
+        theirs_pre: page.pre_block,
+        pre_differs: false,
+        blocks_identical: false,
+        three_way: true,
+      };
+    },
+    async captureLiveSaveConflict(page: PageDto) {
+      const diff = await this.liveSaveConflictDiff(page, null, 1);
+      return { diff, base_text: null, disk_rev: diff.conflict_rev };
+    },
+    async durableLiveSaveConflictDiff(page: PageDto) {
+      return this.liveSaveConflictDiff(page, null, 1);
+    },
+    async resolveDurableLiveSaveConflict(page) {
+      return { ...page, rev: "mock-live-resolved" };
+    },
+    async resolveLiveSaveConflict(page) {
+      return { ...page, rev: "mock-live-resolved" };
     },
     async conflictQueue() {
       // Same `?conflicts` demo flag as the two listings above; the queue is

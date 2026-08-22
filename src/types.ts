@@ -734,7 +734,24 @@ export interface SyncConflictDiff {
 export type MergeDecision = "mine" | "theirs" | "both";
 
 /** Where a conflict object came from (Concord L3). */
-export type ConflictSource = "sync-copy" | "vcs-markers";
+export type ConflictSource = "sync-copy" | "vcs-markers" | "live-save";
+
+export interface LiveSaveConflictSnapshot {
+  page: PageDto;
+  base_rev: string | null;
+  conflict_epoch: number;
+  draft_version: number;
+  /** Exact editor base captured before watcher admission could advance caches. */
+  base_text?: string | null;
+  /** Exact disk revision the current review is aligned against. */
+  disk_rev?: string;
+}
+
+export interface LiveSaveConflictCapture {
+  diff: SyncConflictDiff;
+  base_text: string | null;
+  disk_rev: string;
+}
 
 /** Which version of the page a side is. Three roles, not two — a diff3/Fossil
  *  marker block and a ledger-backed conflict copy both supply a base. */
@@ -764,6 +781,9 @@ export interface ConflictObject {
   block_conflicts?: number | null;
   /** Marker tokens present, for a `vcs-markers` object. */
   markers?: string[];
+  /** Present only for an in-memory editor draft whose guarded Direct Files save
+   * was refused. It carries the exact unconsumed authority presentation. */
+  live?: LiveSaveConflictSnapshot;
 }
 
 /** A marker-bearing page's own conflict, parsed out of its `<<<<<<<` sections

@@ -2523,6 +2523,22 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.focus-freshness-barrier {
+  position: fixed;
+  left: 50%;
+  bottom: 1rem;
+  z-index: 10020;
+  transform: translateX(-50%);
+  padding: 0.42rem 0.72rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 24%);
+  font-size: 0.78rem;
+  pointer-events: none;
+}
+
 /* Concord P5: an external change held for review ("always ask"). A calm bar
    above the page, in the same family as the VCS-marker banner — never a modal. */
 .external-change-bar {

@@ -22,7 +22,17 @@ import {
 } from "./store";
 import { backend } from "./backend";
 import { onGraphRebound } from "./modeHooks";
-import { markConflict, clearConflict, isConflicted, conflicts, bumpDataRev, bumpPageInventoryRev, pushToast } from "./ui";
+import {
+  markConflict,
+  clearConflict,
+  isConflicted,
+  conflicts,
+  bumpDataRev,
+  bumpPageInventoryRev,
+  pushToast,
+  registerLiveSaveConflict,
+  refreshLiveSaveConflictDraft,
+} from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
 import { recordClipboardAcceptedSaveForTest } from "./clipboardWorkProbe";
@@ -889,7 +899,11 @@ async function doSave(
   // already conflicted: those are exactly the states a banner leaves behind, and
   // only a fresh refusal can mint the authority the visible banner needs.
   if (intent.kind === "ordinary" && !dirty.has(name)) return true; // saved by a prior link
-  if (intent.kind === "ordinary" && isConflicted(name)) return false;
+  if (intent.kind === "ordinary" && isConflicted(name)) {
+    const draft = pageToDto(name);
+    if (draft) refreshLiveSaveConflictDraft(draft);
+    return false;
+  }
   // A cross-page move source: hold its save until the destination is durable (C#1).
   // Stays dirty, so it writes the moment `releaseSourcesFor(dest)` frees it.
   if (heldSources.has(name)) {
@@ -1029,6 +1043,19 @@ async function doSave(
       clearTransientRetry(name);
       if (observed >= 0) {
         conflictObservation.set(name, { kind: "direct", epoch: observed });
+        try {
+          const capture = await backend().captureLiveSaveConflict(dto, baseline, observed);
+          registerLiveSaveConflict(dto, baseline, observed, capture);
+        } catch (captureError) {
+          // The draft remains live and close protection stays armed. Surface the
+          // missing restart capsule instead of pretending crash recovery exists.
+          registerLiveSaveConflict(dto, baseline, observed);
+          pushToast(
+            `Couldn't preserve “${name}” for restart recovery. Keep Tine open while resolving it. (${String(captureError)})`,
+            "error",
+            { sticky: true },
+          );
+        }
       } else {
         conflictObservation.set(name, { kind: "direct", epoch: null });
       }

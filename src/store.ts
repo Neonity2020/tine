@@ -1022,6 +1022,14 @@ function pinnedPages(): Set<string> {
   return pin;
 }
 
+/** Pages whose current bytes matter before the focus freshness barrier can
+ * release input. This deliberately exposes only the bounded working-set pins,
+ * never the graph inventory: focus verification must stay O(visible/active
+ * pages), not O(graph). */
+export function focusFreshnessPageNames(): string[] {
+  return [...pinnedPages()];
+}
+
 /** Replace a page in the working set from a fresh DTO (e.g. resolving a conflict
  *  with the disk version, or a watcher reload). Updates the main view and any
  *  satellite that shows it, since they share `byId`. */

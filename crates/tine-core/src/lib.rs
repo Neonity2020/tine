@@ -48,6 +48,6 @@ pub use graph_text_scope::{
 };
 pub use model::{
     ActivationIntent, BlockDto, BlockPreview, ConflictOverride, ConflictPresentation,
-    EditorActivation, EditorActivationHandle, Graph, GraphMeta, PageDto, PageEntry, PageKind,
-    RefGroup, ReferencedPageNames,
+    EditorActivation, EditorActivationHandle, Graph, GraphMeta, LiveSaveConflictCapture, PageDto,
+    PageEntry, PageKind, RefGroup, ReferencedPageNames,
 };

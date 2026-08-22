@@ -2333,6 +2333,11 @@ struct ActivationRecord {
     /// a prospective target that does not exist yet; the target is re-resolved and
     /// compared at first save.
     prospective: bool,
+    /// Exact source text this editor instance last loaded or successfully
+    /// wrote. Unlike the graph cache or Concord ledger, an external watcher
+    /// admission does not advance it; this is the true three-way base for a
+    /// live save conflict.
+    baseline: Option<String>,
 }
 
 #[derive(Default)]
@@ -2379,6 +2384,17 @@ struct ConflictEditorEpisode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConflictOverride {
     pub observation_epoch: u64,
+}
+
+/// App-private recovery material for a live Direct Files conflict. The caller
+/// persists this outside the graph so an unresolved draft survives navigation,
+/// a clean shutdown, or a process crash. `disk_rev` is the exact revision the
+/// review was computed against; resolution rechecks it under the page lock.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LiveSaveConflictCapture {
+    pub diff: crate::sync_diff::SyncConflictDiff,
+    pub base_text: Option<String>,
+    pub disk_rev: String,
 }
 
 #[derive(Clone, Debug)]
@@ -11696,6 +11712,221 @@ impl Graph {
         result.map(|_| ())
     }
 
+    /// Capture an exact, still-live save-conflict presentation without
+    /// consuming its one-shot write authority.
+    fn live_save_conflict_parts(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        presented: ConflictOverride,
+    ) -> io::Result<(PathBuf, Option<String>, Option<String>)> {
+        let write = self.admit_managed_text_writer()?;
+        let (path, _) = self.save_target(&write, page)?;
+        let activation = page.activation.map(EditorActivation::from_u64);
+        let episode = ConflictEditorEpisode {
+            loaded_revision: base_rev.map(str::to_owned),
+            activation,
+        };
+        let authority = {
+            let state = self.conflict_authority.lock().unwrap();
+            let authority = state.tokens.get(&path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "live conflict authority is missing or already consumed",
+                )
+            })?;
+            if authority.observation_epoch != presented.observation_epoch
+                || authority.editor_episode != episode
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "live conflict authority no longer describes this editor",
+                ));
+            }
+            authority.clone()
+        };
+        let base = activation
+            .and_then(|activation| self.editor_activation_baseline(&path, activation, base_rev));
+        Ok((path, authority.bytes, base))
+    }
+
+    /// Block-level three-way presentation for a retained editor draft whose
+    /// ordinary Direct Files save was refused. The disk side comes from the
+    /// exact unconsumed authority token; the base comes from the matching live
+    /// editor activation and is not advanced by watcher/cache admission.
+    pub fn live_save_conflict_diff(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        presented: ConflictOverride,
+    ) -> io::Result<crate::sync_diff::SyncConflictDiff> {
+        let (path, theirs_text, base_text) =
+            self.live_save_conflict_parts(page, base_rev, presented)?;
+        let mine = page_dto_document(page)?;
+        let theirs = theirs_text
+            .as_deref()
+            .map(|text| parse_doc(&path, text))
+            .unwrap_or(Document {
+                pre_block: None,
+                roots: Vec::new(),
+            });
+        Ok(match base_text {
+            Some(base) => crate::sync_diff::diff3_docs(&parse_doc(&path, &base), &mine, &theirs),
+            None => crate::sync_diff::diff_docs(&mine, &theirs),
+        })
+    }
+
+    /// Capture the complete restart-recoverable presentation while the original
+    /// one-shot editor authority is still live. This inspects but does not
+    /// consume that authority.
+    pub fn capture_live_save_conflict(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        presented: ConflictOverride,
+    ) -> io::Result<LiveSaveConflictCapture> {
+        let (path, theirs_text, base_text) =
+            self.live_save_conflict_parts(page, base_rev, presented)?;
+        let theirs_text = theirs_text.unwrap_or_default();
+        let mine = page_dto_document(page)?;
+        let theirs = parse_doc(&path, &theirs_text);
+        let mut diff = match base_text.as_deref() {
+            Some(base) => crate::sync_diff::diff3_docs(&parse_doc(&path, base), &mine, &theirs),
+            None => crate::sync_diff::diff_docs(&mine, &theirs),
+        };
+        diff.base_rev = base_rev.unwrap_or_default().to_owned();
+        diff.conflict_rev = content_rev(&theirs_text);
+        Ok(LiveSaveConflictCapture {
+            disk_rev: diff.conflict_rev.clone(),
+            diff,
+            base_text,
+        })
+    }
+
+    /// Recompute a durable live-conflict review against the disk as it exists
+    /// now. This is read-only and deliberately needs no process-local editor
+    /// activation: the draft and its exact base came from a prior capture.
+    pub fn durable_live_save_conflict_diff(
+        &self,
+        page: &PageDto,
+        base_text: Option<&str>,
+    ) -> io::Result<crate::sync_diff::SyncConflictDiff> {
+        let write = self.admit_managed_text_writer()?;
+        let (path, _) = self.save_target(&write, page)?;
+        let theirs_text = self.managed_read_to_string(&write, &path)?;
+        let mine = page_dto_document(page)?;
+        let theirs = parse_doc(&path, &theirs_text);
+        let mut diff = match base_text {
+            Some(base) => crate::sync_diff::diff3_docs(&parse_doc(&path, base), &mine, &theirs),
+            None => crate::sync_diff::diff_docs(&mine, &theirs),
+        };
+        diff.base_rev = page.rev.clone().unwrap_or_default();
+        diff.conflict_rev = content_rev(&theirs_text);
+        Ok(diff)
+    }
+
+    /// Resolve an app-private live-conflict capsule. The expected disk revision
+    /// is durable authority: it is checked under the same page lock immediately
+    /// before the normal Direct Files writer commits. A later external write
+    /// therefore refuses and forces a fresh review.
+    pub fn resolve_durable_live_save_conflict(
+        &self,
+        page: &PageDto,
+        expected_disk_rev: &str,
+        decisions: &std::collections::HashMap<String, String>,
+        pre_choice: &str,
+    ) -> io::Result<PageDto> {
+        let write = self.admit_managed_text_writer()?;
+        let (path, _) = self.save_target(&write, page)?;
+        let lock = self.page_lock(&path);
+        let _guard = lock.lock().unwrap();
+        let theirs_text = self.managed_read_to_string(&write, &path)?;
+        if content_rev(&theirs_text) != expected_disk_rev {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "live conflict changed on disk",
+            ));
+        }
+        if Format::from_path(&path) == Format::Org && !crate::org::org_editable(&theirs_text) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the org file does not round-trip; not merging",
+            ));
+        }
+        let mine = page_dto_document(page)?;
+        let theirs = parse_doc(&path, &theirs_text);
+        let pre_block = match pre_choice {
+            "theirs" => theirs.pre_block.clone(),
+            "mine" => mine.pre_block.clone(),
+            _ if page.format == Format::Md => {
+                union_pre(mine.pre_block.as_deref(), theirs.pre_block.as_deref())
+            }
+            _ => mine.pre_block.clone(),
+        };
+        let mut resolved = existing_document_page_dto(
+            page,
+            Document {
+                pre_block,
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+            },
+        )?;
+        let cacheable = self.managed_path_is_cacheable(&write, &path)?;
+        let rev = self.write_page(
+            &write,
+            &resolved,
+            &path,
+            Some(&theirs_text),
+            true,
+            None,
+            None,
+            None,
+            cacheable,
+        )?;
+        resolved.rev = Some(rev);
+        Ok(resolved)
+    }
+
+    /// Apply block decisions for a live Direct Files save conflict through the
+    /// same one-shot authority consumed by `Keep mine`. No second overwrite
+    /// protocol is invented: this only builds a resolved DTO, then delegates to
+    /// the existing exact guarded force-save path.
+    pub fn resolve_live_save_conflict(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        presented: ConflictOverride,
+        decisions: &std::collections::HashMap<String, String>,
+        pre_choice: &str,
+    ) -> io::Result<PageDto> {
+        let (path, theirs_text, _) = self.live_save_conflict_parts(page, base_rev, presented)?;
+        let mine = page_dto_document(page)?;
+        let theirs = theirs_text
+            .as_deref()
+            .map(|text| parse_doc(&path, text))
+            .unwrap_or(Document {
+                pre_block: None,
+                roots: Vec::new(),
+            });
+        let pre_block = match pre_choice {
+            "theirs" => theirs.pre_block.clone(),
+            "mine" => mine.pre_block.clone(),
+            _ if page.format == Format::Md => {
+                union_pre(mine.pre_block.as_deref(), theirs.pre_block.as_deref())
+            }
+            _ => mine.pre_block.clone(),
+        };
+        let mut resolved = existing_document_page_dto(
+            page,
+            Document {
+                pre_block,
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+            },
+        )?;
+        let rev = self.force_save_page_at_revision(&resolved, base_rev, presented)?;
+        resolved.rev = Some(rev);
+        Ok(resolved)
+    }
+
     /// Structural block-level diff of a conflict copy against its winner (both
     /// graph-root-relative paths). Loads each file directly by path — the conflict
     /// copy is deliberately not in the page cache — and aligns the two block trees
@@ -18056,6 +18287,9 @@ impl Graph {
         })();
         match result {
             Ok(published) => {
+                if let Some(activation) = editor_episode.and_then(|episode| episode.activation) {
+                    self.update_editor_activation_baseline(path, activation, content);
+                }
                 // Concord ledger (ADR 0056): these exact bytes are now on disk,
                 // so they are the last text Tine and the disk agree on. Off the
                 // save critical path — one channel send, work happens on the
@@ -18609,10 +18843,10 @@ impl Graph {
         // identifies the mounted editor only; the ordinary save's base-revision
         // guard still decides whether bytes may land and mints any conflict under
         // this activation. Absent editors use `activate_absent_editor` instead.
-        if let Some(expected_revision) = expected_revision {
+        let matched_baseline = if let Some(expected_revision) = expected_revision {
             let permit = self.admit_retained_managed_text_writer()?;
             match self.managed_read_optional_text(&permit, &abs)? {
-                Some(content) if content_rev(&content) == expected_revision => {}
+                Some(content) if content_rev(&content) == expected_revision => Some(content),
                 Some(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -18626,7 +18860,9 @@ impl Graph {
                     ));
                 }
             }
-        }
+        } else {
+            None
+        };
         // A successfully matched expected revision proves presence even if a
         // concurrently cold/stale inventory has not indexed the file yet.
         let prospective = expected_revision.is_none() && self.entry_for_path(&abs).is_none();
@@ -18645,6 +18881,7 @@ impl Graph {
         state.live.entry(abs).or_default().push(ActivationRecord {
             activation,
             prospective,
+            baseline: matched_baseline,
         });
         Ok(EditorActivationHandle {
             activation,
@@ -18680,12 +18917,54 @@ impl Graph {
         state.live.entry(abs).or_default().push(ActivationRecord {
             activation,
             prospective: true,
+            baseline: None,
         });
         Ok(EditorActivationHandle {
             activation,
             target: rel,
             prospective: true,
         })
+    }
+
+    fn editor_activation_baseline(
+        &self,
+        path: &Path,
+        activation: EditorActivation,
+        expected_revision: Option<&str>,
+    ) -> Option<String> {
+        self.editor_activations
+            .lock()
+            .unwrap()
+            .live
+            .get(path)?
+            .iter()
+            .find(|record| record.activation == activation)?
+            .baseline
+            .clone()
+            .filter(|content| expected_revision.is_none_or(|rev| content_rev(content) == rev))
+    }
+
+    fn update_editor_activation_baseline(
+        &self,
+        path: &Path,
+        activation: EditorActivation,
+        content: &str,
+    ) {
+        if let Some(record) = self
+            .editor_activations
+            .lock()
+            .unwrap()
+            .live
+            .get_mut(path)
+            .and_then(|records| {
+                records
+                    .iter_mut()
+                    .find(|record| record.activation == activation)
+            })
+        {
+            record.baseline = Some(content.to_owned());
+            record.prospective = false;
+        }
     }
 
     /// Present a conflict observation WITHOUT writing anything.
@@ -47169,6 +47448,148 @@ mod tests {
         page.activation = Some(handle.activation.as_u64());
         page.blocks[0].raw = "mine".into();
         (root, path, graph, page)
+    }
+
+    #[test]
+    fn concord_live_save_conflict_uses_editor_base_and_guarded_resolution() {
+        let root = scratch("concord-live-save-conflict");
+        let path = root.join("pages/Note.md");
+        fs::write(&path, "- one\n- two\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        let activation = graph
+            .activate_editor(
+                "pages/Note.md",
+                ActivationIntent::Replace,
+                page.rev.as_deref(),
+            )
+            .unwrap();
+        page.activation = Some(activation.activation.as_u64());
+        page.blocks[0].raw = "mine one".into();
+        fs::write(&path, "- one\n- disk two\n").unwrap();
+
+        let refusal = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let shown = gh254_shown(&refusal);
+        let diff = graph
+            .live_save_conflict_diff(&page, page.rev.as_deref(), shown)
+            .unwrap();
+        assert!(
+            diff.three_way,
+            "the live editor activation must retain a real base"
+        );
+
+        fn accept_suggestions(
+            rows: &[crate::sync_diff::DiffRow],
+            out: &mut std::collections::HashMap<String, String>,
+        ) {
+            for row in rows {
+                if row.kind != crate::sync_diff::RowKind::Unchanged {
+                    out.insert(
+                        row.id.clone(),
+                        row.suggestion.clone().unwrap_or_else(|| "both".to_owned()),
+                    );
+                }
+                accept_suggestions(&row.children, out);
+            }
+        }
+        let mut decisions = std::collections::HashMap::new();
+        accept_suggestions(&diff.rows, &mut decisions);
+        graph
+            .resolve_live_save_conflict(&page, page.rev.as_deref(), shown, &decisions, "union")
+            .unwrap();
+        let resolved = fs::read_to_string(&path).unwrap();
+        assert!(
+            resolved.contains("mine one"),
+            "mine-only edit must survive: {resolved}"
+        );
+        assert!(
+            resolved.contains("disk two"),
+            "theirs-only edit must survive: {resolved}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk() {
+        let root = scratch("concord-live-save-restart");
+        let path = root.join("pages/Note.md");
+        fs::write(&path, "- one\n- two\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        let activation = graph
+            .activate_editor(
+                "pages/Note.md",
+                ActivationIntent::Replace,
+                page.rev.as_deref(),
+            )
+            .unwrap();
+        page.activation = Some(activation.activation.as_u64());
+        page.blocks[0].raw = "mine one".into();
+        fs::write(&path, "- one\n- disk two\n").unwrap();
+        let shown = gh254_shown(&graph.save_page(&page, page.rev.as_deref()).unwrap_err());
+        let capture = graph
+            .capture_live_save_conflict(&page, page.rev.as_deref(), shown)
+            .unwrap();
+        assert!(capture.diff.three_way);
+        drop(graph);
+
+        // A later process has no activation registry or one-shot token. The
+        // app-private capsule is sufficient to reconstruct the same review.
+        let reopened = Graph::open(&root);
+        reopened.warm_cache();
+        let diff = reopened
+            .durable_live_save_conflict_diff(&page, capture.base_text.as_deref())
+            .unwrap();
+        assert!(diff.three_way);
+        assert_eq!(diff.conflict_rev, capture.disk_rev);
+
+        let decisions = diff
+            .rows
+            .iter()
+            .filter(|row| row.kind != crate::sync_diff::RowKind::Unchanged)
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    row.suggestion.clone().unwrap_or_else(|| "both".to_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        // An unseen external write invalidates the durable authority rather than
+        // being overwritten by choices computed for the prior disk revision.
+        fs::write(&path, "- one\n- newer disk two\n").unwrap();
+        assert!(reopened
+            .resolve_durable_live_save_conflict(&page, &capture.disk_rev, &decisions, "union",)
+            .is_err());
+
+        let refreshed = reopened
+            .durable_live_save_conflict_diff(&page, capture.base_text.as_deref())
+            .unwrap();
+        let refreshed_decisions = refreshed
+            .rows
+            .iter()
+            .filter(|row| row.kind != crate::sync_diff::RowKind::Unchanged)
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    row.suggestion.clone().unwrap_or_else(|| "both".to_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        reopened
+            .resolve_durable_live_save_conflict(
+                &page,
+                &refreshed.conflict_rev,
+                &refreshed_decisions,
+                "union",
+            )
+            .unwrap();
+        let resolved = fs::read_to_string(&path).unwrap();
+        assert!(resolved.contains("mine one"));
+        assert!(resolved.contains("newer disk two"));
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Make `dto` an EDITOR's DTO, the way the frontend does.

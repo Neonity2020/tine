@@ -740,7 +740,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
       {/* Concord P5: with "always ask" on, an external change waits here. */}
       <ExternalChangeBar name={props.page.name} />
       {/* Concord L4: the conflict is resolved AT the page, block by block. */}
-      <Show when={conflictObjectFor(props.page.path)}>
+      <Show when={conflictObjectFor(props.page.path, props.page.name)}>
         {(conflict) => <PageConflictResolution conflict={conflict()} />}
       </Show>
       <Show when={props.page.kind === "page"}>

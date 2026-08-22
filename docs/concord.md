@@ -24,8 +24,8 @@ not bounce back as external changes.
 
 A page with **unsaved edits** is never clobbered by a disk change. Tine proves
 per page that the file really diverged from what your editor started from; a
-real divergence surfaces the conflict banner where you choose which side wins,
-and both sides remain recoverable.
+real divergence becomes an in-page Concord review where you choose per block
+which side wins (or keep both), and both sides remain recoverable.
 
 ### While you are editing: deferred, not dropped
 
@@ -47,7 +47,10 @@ come back to the window**: returning to Tine replays any reload that was deferre
 while you were editing, and asks the watcher for one full pass over the graph's
 text files. Anything that changed is then handled exactly as a live change would
 be, with the same protections — a page you are editing is still deferred, never
-yanked. The check is throttled, so alt-tabbing repeatedly costs nothing.
+yanked. Before new input is admitted, Tine waits for the native scan receipt,
+its frontend applications, and a bounded final check of pages that are visible,
+edited, dirty, or otherwise active. This never scans the graph a second time.
+The check is throttled, so alt-tabbing repeatedly costs nothing.
 
 ### Being asked instead of shown
 
@@ -61,7 +64,7 @@ The switch only affects the case that was silent. A page with unsaved edits, or
 one you are actively editing, behaves identically whether the switch is on or
 off: it is proven, deferred or refused exactly as described above. Choosing
 *Keep mine* writes nothing; the next time you save that page, Tine notices the
-file moved on and raises the ordinary conflict banner.
+file moved on and opens the in-page Concord review.
 
 ### Your version-control tool's own churn is ignored
 
@@ -122,8 +125,8 @@ revision* instead of hundreds of independent edits:
   diverged. No dialogs, nothing to click through.
 
 Pages with unsaved edits keep every guarantee from the Freshness section:
-divergence is proven per page, the conflict banner appears only on the
-backend's own refusal, and both sides stay recoverable.
+divergence is proven per page, the in-page review appears only after the
+backend's own guarded refusal, and both sides stay recoverable.
 
 ## Transport artifacts and VCS markers
 
@@ -209,15 +212,17 @@ lone `=======` divider line never triggers the quarantine on its own.
 
 ### The conflict queue
 
-Everything that needs your judgement — a sync tool's conflict copy, a page
-carrying VCS merge markers — appears in **one queue**, shown as a quiet
-`N conflicts` badge at the bottom of the sidebar. Clicking it walks you to the
-next conflicted page.
+Everything that needs your judgement — a retained live draft whose file changed,
+a sync tool's conflict copy, or a page carrying VCS merge markers — appears in
+**one queue**, shown as a quiet `N conflicts` badge at the bottom of the sidebar.
+Clicking it walks you to the next conflicted page.
 
-The queue is **derived**, not stored: Tine recomputes it from what is on disk.
-Nothing about a conflict is written into your graph, so the queue costs nothing,
-never goes stale, and survives restarts by simply being recalculated. Deleting
-Tine's app data does not lose it either.
+Disk artifacts are derived afresh on every scan. A live draft has no disk
+artifact to derive from, so Tine preserves its exact draft, base, and reviewed
+disk revision in app-private recovery state until resolution. Neither kind writes
+markers or metadata into your graph. Deleting Tine's app data cannot lose a
+conflict-copy or VCS-marker artifact, but it can discard an unresolved live draft;
+resolve those before clearing app data.
 
 It is deliberately calm. A conflict is a thing waiting for you, not an
 interruption: no modal opens, nothing is blocked, and leaving a page with
@@ -259,6 +264,11 @@ Nothing is applied until you click **Apply resolution**.
   lifts by itself, because there is no longer anything to quarantine. This is
   the only circumstance in which Tine ever rewrites a file carrying merge
   markers, and only as the direct result of the resolution you just confirmed.
+- For a **retained live draft**: the merged result is revision-guarded against
+  the exact disk version shown in the review and written through the ordinary
+  Direct Files writer. A newer unseen disk edit refuses the apply and refreshes
+  the review. After success, Tine installs the exact page it wrote and removes
+  the app-private capsule.
 
 Both paths run through the same guarded write Tine uses everywhere: the page is
 locked, the file must still be byte-for-byte what you reviewed (if your VCS or
@@ -268,11 +278,12 @@ and the losing side stays recoverable.
 
 ### Where each surface lives
 
-Resolution happens **only on the page**. **Settings → Backups & recovery** is
-the *inventory*: it lists the conflict copies and marker-bearing files in your
-graph, offers **Review in page…** to take you to the one you pick, and keeps the
-two actions the page cannot offer — **Discard copy**, and the case of a copy
-whose original page no longer exists at all.
+Resolution happens **only on the page**. Live draft conflicts appear there
+automatically and in the sidebar queue. **Settings → Backups & recovery** is the
+*inventory* for disk artifacts: it lists the conflict copies and marker-bearing
+files in your graph, offers **Review in page…** to take you to the one you pick,
+and keeps the two actions the page cannot offer — **Discard copy**, and the case
+of a copy whose original page no longer exists at all.
 
 (Earlier versions also had a block-by-block merge dialog inside Settings. It is
 gone: two surfaces over the same conflict opened with different pre-selections,
@@ -341,4 +352,3 @@ Practical notes:
   (no suggestions) until the ledger repopulates through normal editing.
 - It fills in as you work: pages saved or reloaded since the feature arrived
   have a remembered version; untouched pages simply have none yet.
-

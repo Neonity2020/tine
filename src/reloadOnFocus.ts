@@ -20,8 +20,14 @@
 // Throttled, because window focus is a gesture a user makes constantly, and a
 // rescan is one stat per graph-text file.
 
-import { backend } from "./backend";
+import { backend, isTauri } from "./backend";
+import {
+  beginFreshnessBarrier,
+  endFreshnessBarrier,
+  installFreshnessInputGate,
+} from "./freshnessBarrier";
 import { sweepReplaceable } from "./store";
+import { pushToast } from "./ui";
 
 /** Minimum spacing between focus-driven rescans. Below this, returning to the
  *  window is answered by the sweep alone (which is pure in-memory work). */
@@ -29,16 +35,91 @@ export const FOCUS_RESCAN_THROTTLE_MS = 1500;
 
 let installed = false;
 let lastRescan = 0;
+let activeRefresh: Promise<void> | null = null;
+let completedSequence = 0;
+let completionListener: Promise<void> | null = null;
+const completionWaiters = new Map<number, () => void>();
+const graphApplications = new Set<Promise<unknown>>();
+let verifyPinnedPages: () => Promise<void> = async () => {};
+
+/** App-level final verifier. Native completion proves the backend cache is
+ * current, but Tauri does not promise that earlier event callbacks have
+ * finished applying to Solid before the completion callback runs. */
+export function installFocusFreshnessVerifier(verifier: () => Promise<void>): void {
+  verifyPinnedPages = verifier;
+}
+
+function ensureCompletionListener(): Promise<void> {
+  if (!isTauri()) return Promise.resolve();
+  if (!completionListener) {
+    completionListener = backend().onGraphRescanComplete((sequence) => {
+      completedSequence = Math.max(completedSequence, sequence);
+      for (const [target, resolve] of completionWaiters) {
+        if (target <= completedSequence) {
+          completionWaiters.delete(target);
+          resolve();
+        }
+      }
+    }).then(() => undefined);
+  }
+  return completionListener;
+}
+
+function waitForCompletion(sequence: number): Promise<void> {
+  if (!isTauri() || sequence <= completedSequence) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    completionWaiters.set(sequence, resolve);
+    window.setTimeout(() => {
+      if (!completionWaiters.delete(sequence)) return;
+      reject(new Error(`watcher rescan ${sequence} did not complete`));
+    }, 30_000);
+  });
+}
+
+async function drainGraphApplications(): Promise<void> {
+  while (graphApplications.size) {
+    await Promise.allSettled([...graphApplications]);
+  }
+}
+
+/** Track the async application started by one native graph-change event. The
+ * rescan completion marker is emitted after those events, but their handlers
+ * may still be awaiting page reads; the focus barrier drains them all. */
+export function trackGraphChangeApplication(work: Promise<unknown>): void {
+  graphApplications.add(work);
+  void work.finally(() => graphApplications.delete(work));
+}
 
 /** Exported for tests; `installReloadOnFocus` wires it to focus/visibility. */
-export function refreshOnReturnToWindow(now = Date.now()): void {
+export function refreshOnReturnToWindow(now = Date.now()): Promise<void> {
   // Always cheap: replay anything already deferred that has become replaceable.
   sweepReplaceable();
-  if (now - lastRescan < FOCUS_RESCAN_THROTTLE_MS) return;
+  if (activeRefresh) return activeRefresh;
+  if (now - lastRescan < FOCUS_RESCAN_THROTTLE_MS) return Promise.resolve();
   lastRescan = now;
-  void backend().rescanGraphNow().catch(() => {
-    /* best-effort: the watcher is still the primary path */
-  });
+  beginFreshnessBarrier();
+  activeRefresh = (async () => {
+    try {
+      await ensureCompletionListener();
+      const sequence = await backend().rescanGraphNow();
+      await waitForCompletion(sequence);
+      await drainGraphApplications();
+      await verifyPinnedPages();
+      await drainGraphApplications();
+      sweepReplaceable();
+    } catch (error) {
+      // The watcher remains the primary path. Most importantly, a failed
+      // fallback must release the input gate rather than strand the editor.
+      pushToast(
+        `Tine couldn't finish checking for external changes. Editing is available, but reopen the page before relying on it being current. (${String(error)})`,
+        "error",
+      );
+    } finally {
+      endFreshnessBarrier();
+      activeRefresh = null;
+    }
+  })();
+  return activeRefresh;
 }
 
 /** Reset the throttle (tests, and a graph switch — a fresh graph deserves one). */
@@ -49,8 +130,9 @@ export function resetFocusRescanThrottle(): void {
 export function installReloadOnFocus(): void {
   if (installed || typeof window === "undefined") return;
   installed = true;
-  window.addEventListener("focus", () => refreshOnReturnToWindow());
+  installFreshnessInputGate();
+  window.addEventListener("focus", () => void refreshOnReturnToWindow());
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshOnReturnToWindow();
+    if (!document.hidden) void refreshOnReturnToWindow();
   });
 }

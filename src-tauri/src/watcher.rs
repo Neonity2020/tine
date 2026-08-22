@@ -221,12 +221,33 @@ pub(crate) struct WatcherLatencyReceipt {
 /// ordinary `graph-changed` / `graph-changed-bulk` events, so a page being
 /// edited is deferred by the P1 replay machinery exactly as for a live event,
 /// and a caret is never stolen.
-static FORCE_FULL_RESCAN: AtomicBool = AtomicBool::new(false);
+static FULL_RESCAN_REQUESTED: AtomicU64 = AtomicU64::new(0);
+static FULL_RESCAN_COMPLETED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+struct GraphRescanComplete {
+    sequence: u64,
+}
 
 /// Request that one full rescan. Pair with `state::poke_watcher` — this only
 /// arms the flag; the poke is what wakes the loop to read it.
-pub(crate) fn request_full_rescan() {
-    FORCE_FULL_RESCAN.store(true, Ordering::SeqCst);
+pub(crate) fn request_full_rescan() -> u64 {
+    FULL_RESCAN_REQUESTED.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Snapshot the newest explicit request not yet completed. Several focus and
+/// visibility notifications may arrive before one watcher turn; one full pass
+/// satisfies all of them and publishes the newest sequence.
+fn pending_full_rescan() -> Option<u64> {
+    let requested = FULL_RESCAN_REQUESTED.load(Ordering::SeqCst);
+    (requested > FULL_RESCAN_COMPLETED.load(Ordering::SeqCst)).then_some(requested)
+}
+
+fn complete_full_rescan(app: &tauri::AppHandle, sequence: u64) {
+    FULL_RESCAN_COMPLETED.fetch_max(sequence, Ordering::SeqCst);
+    // Broadcast rather than target one graph window: a request can race a graph
+    // rebind, and every frontend matches the exact sequence it requested.
+    let _ = app.emit("graph-rescan-complete", GraphRescanComplete { sequence });
 }
 
 const LATENCY_RECEIPT_CAP: usize = 64;
@@ -1613,8 +1634,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             };
             // A focus-driven rescan demands the same full stat diff a kernel
             // rescan does, for the Direct lane and the managed lane alike.
-            let event_need_full =
-                event_need_full || FORCE_FULL_RESCAN.swap(false, Ordering::SeqCst);
+            let explicit_rescan = pending_full_rescan();
+            let event_need_full = event_need_full || explicit_rescan.is_some();
             for (label, graph) in graphs.iter_mut() {
                 let initial_cycle = !graph.baseline;
                 if initial_cycle {
@@ -1889,6 +1910,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         }
                     }
                 }
+            }
+
+            // This is the focus-freshness boundary: every graph lane has
+            // finished the requested full pass and all ordinary change events
+            // were emitted before this completion marker. The frontend still
+            // waits for its asynchronous handlers before admitting edits.
+            if let Some(sequence) = explicit_rescan {
+                complete_full_rescan(&app, sequence);
             }
 
             // --- wait for the next cycle ---

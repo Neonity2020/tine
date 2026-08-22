@@ -73,6 +73,7 @@ import {
   bumpPageInventoryRev,
   installPaneTracker,
   isConflicted,
+  conflicts,
   pushToast,
   refreshSyncConflicts,
   refreshConflictQueueIfTouched,
@@ -94,11 +95,19 @@ import {
   deferExternalReload,
   installExternalReloadReplayHandler,
   pageByName,
+  focusFreshnessPageNames,
   reloadDisposition,
   reloadPageIfStillSafe,
   restoreTodayJournalInFeed,
 } from "./store";
-import { applyDivergenceVerdict, graphBinding, isSaving, reconcileExternalChange } from "./persistence";
+import {
+  applyDivergenceVerdict,
+  conflictObservationKindFor,
+  graphBinding,
+  isSaving,
+  reconcileExternalChange,
+  saveBaselineFor,
+} from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
 import { backend, isTauri, type GraphChange, type GraphChangedBulk } from "./backend";
 import { parserFailed } from "./render/parse";
@@ -138,7 +147,12 @@ import { paneSel, samePaneTarget } from "./paneSelect";
 import { SurfaceContext } from "./components/Block";
 import { endEdit } from "./editorController";
 import { installBackgroundFlush } from "./backgroundFlush";
-import { installReloadOnFocus } from "./reloadOnFocus";
+import {
+  installFocusFreshnessVerifier,
+  installReloadOnFocus,
+  trackGraphChangeApplication,
+} from "./reloadOnFocus";
+import { freshnessVisible } from "./freshnessBarrier";
 import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
@@ -233,6 +247,42 @@ function requestJournalFeedWatcherRestart(
 // state holds at that moment (it may have become "conflict", which then takes
 // the divergence path exactly like a live event).
 installExternalReloadReplayHandler((change) => void handleGraphChange(change));
+
+// Native rescan completion means the backend cache is current, but event
+// callbacks cross the Tauri bridge independently. Verify the bounded set of
+// pages the user can immediately interact with against that cache before the
+// focus input barrier opens. This is intentionally O(active pages), not
+// O(graph), and reuses the ordinary external-change policy below.
+installFocusFreshnessVerifier(async () => {
+  const binding = graphBinding();
+  const changes: GraphChange[] = [];
+  for (const name of focusFreshnessPageNames()) {
+    const loaded = pageByName(name);
+    if (!loaded) continue;
+    const current = loaded.path
+      ? await backend().getPageByPath(loaded.path)
+      : await backend().getPage(loaded.name, loaded.kind);
+    if (binding !== graphBinding()) return;
+    const baseline = saveBaselineFor(name);
+    const currentRev = current?.rev ?? null;
+    if (currentRev === baseline) continue;
+    changes.push({
+      name,
+      kind: loaded.kind,
+      created: baseline === null && current !== null,
+      removed: current === null,
+    });
+  }
+  if (!changes.length || binding !== graphBinding()) return;
+  bumpDataRev();
+  if (changes.some((change) => change.created || change.removed)) {
+    bumpPageInventoryRev();
+  }
+  for (const change of changes) {
+    if (binding !== graphBinding()) return;
+    await applyExternalChange(change, binding);
+  }
+});
 
 // Concord L0's reload-on-focus fallback. Returning to the window replays
 // anything already deferred and asks the backend watcher for one full stat diff,
@@ -944,7 +994,7 @@ export function App(): JSX.Element {
   onMount(() => {
     let unsub = () => {};
     void backend()
-      .onGraphChanged((c) => void handleGraphChange(c))
+      .onGraphChanged((c) => trackGraphChangeApplication(handleGraphChange(c)))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
@@ -953,7 +1003,7 @@ export function App(): JSX.Element {
   onMount(() => {
     let unsub = () => {};
     void backend()
-      .onGraphChangedBulk((bulk) => void handleGraphChangedBulk(bulk))
+      .onGraphChangedBulk((bulk) => trackGraphChangeApplication(handleGraphChangedBulk(bulk)))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
@@ -1487,7 +1537,12 @@ export function App(): JSX.Element {
             </Show>
           </div>
         </header>
-        <ConflictBar />
+        {/* Direct Files conflicts are Concord objects rendered in-page. The old
+            global two-button surface remains only for actor-owned managed
+            conflicts until that protocol adopts the multi-side queue. */}
+        <Show when={conflicts().some((name) => conflictObservationKindFor(name) === "managed")}>
+          <ConflictBar />
+        </Show>
         <InPageFind />
         </DrawerBackground>
         {/* Everything below the topbar lives in this row, so the topbar (and its
@@ -1567,6 +1622,11 @@ export function App(): JSX.Element {
         onClose={closeWelcome}
       />
       <StartupRecoveryLayer controller={startupRecovery} />
+      <Show when={freshnessVisible()}>
+        <div class="focus-freshness-barrier" role="status" aria-live="polite">
+          Refreshing changes from disk…
+        </div>
+      </Show>
       <DrawerBackground class="drawer-floating-background" blockedBy="any">
         <Toasts />
       </DrawerBackground>

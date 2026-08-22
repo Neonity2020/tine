@@ -10,9 +10,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Live Direct Files save conflicts now use Concord's in-page, block-level
+  resolver.** If another device changes a file underneath a retained Tine draft,
+  both versions appear above that page with three-way suggestions and per-block
+  keep-this / keep-that / keep-both choices. The draft is kept in app-private
+  recovery state, survives a Tine restart, and is removed only after a
+  revision-guarded resolution commits. The old global *Keep mine / Use current*
+  bar is no longer used for Direct Files conflicts.
+
 ### Changed
 
 ### Fixed
+
+- **Returning to Tine can no longer open an editor over a stale page.** A
+  focus-driven disk scan now has an explicit native completion receipt, waits
+  for frontend page application, and finally verifies only the visible/edited
+  working set against the current backend cache before admitting input. Clean
+  external changes appear first; dirty pages become Concord conflicts instead
+  of being replaced. The check stays bounded by active pages, not graph size.
 
 ## [0.6.94] - 2026-08-21
 

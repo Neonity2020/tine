@@ -24,10 +24,14 @@ import {
 } from "solid-js";
 import { backend } from "../backend";
 import {
+  clearConflict,
   conflictQueue,
   pushToast,
   refreshSyncConflicts,
+  updateLiveSaveConflictDiskRev,
 } from "../ui";
+import { dropObservation, reobserve } from "../persistence";
+import { reloadPage } from "../store";
 import { DiffRowView, collectRows, seedSuggestedOrNoLoss } from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, SyncConflictDiff } from "../types";
 
@@ -52,6 +56,12 @@ function sideLabels(conflict: ConflictObject): { mine: string; theirs: string; b
 /** The in-page conflict resolver for the page currently being viewed. */
 export function PageConflictResolution(props: { conflict: ConflictObject }): JSX.Element {
   const conflict = () => props.conflict;
+  // These survive removal of the surrounding `<Show>`. Cleanup runs precisely
+  // while that owner is being disposed, when reading `props.conflict` again is
+  // a stale reactive access.
+  const cleanupConflictId = props.conflict.id;
+  const cleanupPageName = props.conflict.page_name;
+  let mounted = true;
   const labels = createMemo(() => sideLabels(conflict()));
   const [decisions, setDecisions] = createSignal<Record<string, MergeDecision>>({});
   // The page-header (pre-block) properties are one decision for the whole page,
@@ -67,9 +77,22 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   // Load the diff from whichever source this object came from. Both return the
   // same `SyncConflictDiff`, so everything downstream is source-agnostic.
   const [diff, { refetch }] = createResource<SyncConflictDiff | null, string>(
-    () => conflict().id,
+    () => `${conflict().id}:${conflict().live?.draft_version ?? 0}`,
     async () => {
       const c = conflict();
+      if (c.source === "live-save") {
+        const live = c.live;
+        if (!live) return null;
+        const result = live.disk_rev !== undefined
+          ? await backend().durableLiveSaveConflictDiff(live.page, live.base_text ?? null)
+          : await backend().liveSaveConflictDiff(
+              live.page,
+              live.base_rev,
+              live.conflict_epoch,
+            );
+        updateLiveSaveConflictDiskRev(c.page_name, result.conflict_rev);
+        return result;
+      }
       if (c.source === "vcs-markers") {
         const parsed = await backend().vcsMarkerConflictDiff(c.page_path);
         return parsed?.diff ?? null;
@@ -128,49 +151,88 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     const current = diff();
     if (!current || diff.loading || busy()) return;
     const c = conflict();
+    // `c` belongs to the surrounding Solid <Show>. Resolving or refreshing can
+    // remove that owner immediately, so keep only plain snapshots across IPC
+    // and reactive mutations. Reading `c` afterwards is a stale-owner access.
+    const source = c.source;
+    const pageName = c.page_name;
+    const pagePath = c.page_path;
+    const sides = [...c.sides];
+    const live = c.live;
     setBusy(true);
     try {
-      if (c.source === "vcs-markers") {
+      if (source === "live-save") {
+        if (!live) return;
+        const resolved = live.disk_rev !== undefined
+          ? await backend().resolveDurableLiveSaveConflict(
+            live.page,
+            live.disk_rev,
+            decisions(),
+            preChoice(),
+          )
+          : await backend().resolveLiveSaveConflict(
+            live.page,
+            live.base_rev,
+            live.conflict_epoch,
+            decisions(),
+            preChoice(),
+          );
+        // The guarded native command is the durable resolution boundary. Clear
+        // the capsule there, before editor replacement waits to retire the old
+        // activation: retirement can be slow, but it must not keep presenting a
+        // conflict whose merged bytes are already committed. The returned DTO
+        // is the exact page written, so installing it cannot invent another
+        // version even if that retirement finishes later.
+        dropObservation(pageName);
+        clearConflict(pageName);
+        await reloadPage(resolved);
+        pushToast(`Resolved the live conflict in “${pageName}”`, "success");
+      } else if (source === "vcs-markers") {
         await backend().resolveVcsMarkerConflict(
-          c.page_path,
+          pagePath,
           decisions(),
           current.base_rev,
           preChoice()
         );
-        pushToast(`Resolved the merge in “${c.page_name}”`, "success");
+        pushToast(`Resolved the merge in “${pageName}”`, "success");
       } else {
-        const copy = c.sides.find((s) => s.role === "theirs")?.path;
+        const copy = sides.find((s) => s.role === "theirs")?.path;
         if (!copy) return;
         await backend().resolveSyncConflict(
-          c.page_path,
+          pagePath,
           copy,
           decisions(),
           current.base_rev,
           current.conflict_rev,
           preChoice()
         );
-        pushToast(`Merged into “${c.page_name}”`, "success");
+        pushToast(`Merged into “${pageName}”`, "success");
       }
       await refreshSyncConflicts();
     } catch (e) {
       if (String(e).includes("conflict")) {
         pushToast("The file changed on disk — re-reading it, please redo your choices.", "error");
         alignment = undefined;
-        void refetch();
+        if (source === "live-save") {
+          dropObservation(pageName);
+          await reobserve(pageName);
+        } else {
+          void refetch();
+        }
       } else {
         pushToast(`Couldn’t resolve it: ${String(e)}`, "error");
       }
     } finally {
-      setBusy(false);
+      if (mounted) setBusy(false);
     }
   };
 
   // Leaving the page with work outstanding gets a quiet note, never a dialog
   // that blocks navigation (L3: a conflict is a calm object, not a modal).
   onCleanup(() => {
-    const c = props.conflict;
-    if (conflictQueue().some((q) => q.id === c.id)) {
-      pushToast(`“${c.page_name}” still has unresolved conflicts`, "info");
+    mounted = false;
+    if (conflictQueue().some((q) => q.id === cleanupConflictId)) {
+      pushToast(`“${cleanupPageName}” still has unresolved conflicts`, "info");
     }
   });
 
@@ -180,6 +242,8 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         <span class="page-conflict-title">
           {conflict().source === "vcs-markers"
             ? "Unresolved merge from your version-control tool"
+            : conflict().source === "live-save"
+              ? "Your draft and the current file both changed"
             : "Two versions of this page arrived"}
         </span>
         <span class="page-conflict-nav">
@@ -302,7 +366,11 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
               <span class="settings-hint">
                 <Show
                   when={conflict().source === "vcs-markers"}
-                  fallback={<>The copy moves to the recoverable trash once this is applied.</>}
+                  fallback={
+                    conflict().source === "live-save"
+                      ? <>The resolved page is saved through the same guarded Direct Files path.</>
+                      : <>The copy moves to the recoverable trash once this is applied.</>
+                  }
                 >
                   Applying writes the merged page without any markers — the file becomes ordinary
                   Markdown again and saves are no longer refused.

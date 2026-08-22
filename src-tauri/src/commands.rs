@@ -3780,9 +3780,10 @@ pub(crate) fn list_journal_conflicts(
 /// Deliberately graph-slot-free: it arms a process-wide flag on the single
 /// watcher thread, which already covers every bound graph in both regimes.
 #[tauri::command]
-pub(crate) fn rescan_graph_now(state: tauri::State<'_, AppState>) {
-    crate::watcher::request_full_rescan();
+pub(crate) fn rescan_graph_now(state: tauri::State<'_, AppState>) -> u64 {
+    let sequence = crate::watcher::request_full_rescan();
     crate::state::poke_watcher(&state);
+    sequence
 }
 
 /// Journal files whose names don't round-trip to a date, and the names they
@@ -3939,6 +3940,119 @@ pub(crate) fn text_block_diff3(
     format: Option<String>,
 ) -> tine_core::sync_diff::SyncConflictDiff {
     tine_core::sync_diff::diff3_texts(&base, &mine, &theirs, format.as_deref() == Some("org"))
+}
+
+/// Diff a retained live Direct Files draft against the exact disk observation
+/// that refused its save. The authority is inspected, never consumed.
+#[tauri::command]
+pub(crate) fn live_save_conflict_diff(
+    page: PageDto,
+    base_rev: Option<String>,
+    conflict_epoch: u64,
+    state: GraphContext<'_>,
+) -> Result<tine_core::sync_diff::SyncConflictDiff, String> {
+    with_filesystem_graph(&state, |graph| {
+        graph
+            .live_save_conflict_diff(
+                &page,
+                base_rev.as_deref(),
+                tine_core::ConflictOverride {
+                    observation_epoch: conflict_epoch,
+                },
+            )
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn capture_live_save_conflict(
+    page: PageDto,
+    base_rev: Option<String>,
+    conflict_epoch: u64,
+    state: GraphContext<'_>,
+) -> Result<tine_core::LiveSaveConflictCapture, String> {
+    with_filesystem_graph(&state, |graph| {
+        graph
+            .capture_live_save_conflict(
+                &page,
+                base_rev.as_deref(),
+                tine_core::ConflictOverride {
+                    observation_epoch: conflict_epoch,
+                },
+            )
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+pub(crate) fn durable_live_save_conflict_diff(
+    page: PageDto,
+    base_text: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<tine_core::sync_diff::SyncConflictDiff, String> {
+    with_filesystem_graph(&state, |graph| {
+        graph
+            .durable_live_save_conflict_diff(&page, base_text.as_deref())
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn resolve_durable_live_save_conflict(
+    page: PageDto,
+    expected_disk_rev: String,
+    decisions: std::collections::HashMap<String, String>,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<PageDto, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let graph = slot.legacy_graph()?;
+        graph
+            .resolve_durable_live_save_conflict(
+                &page,
+                &expected_disk_rev,
+                &decisions,
+                pre_choice.as_deref().unwrap_or("union"),
+            )
+            .map_err(direct_save_error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Resolve a live Direct Files save conflict block-by-block, consuming the same
+/// exact one-shot authority as the former Keep-mine action.
+#[tauri::command]
+pub(crate) async fn resolve_live_save_conflict(
+    page: PageDto,
+    base_rev: Option<String>,
+    conflict_epoch: u64,
+    decisions: std::collections::HashMap<String, String>,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<PageDto, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let graph = slot.legacy_graph()?;
+        graph
+            .resolve_live_save_conflict(
+                &page,
+                base_rev.as_deref(),
+                tine_core::ConflictOverride {
+                    observation_epoch: conflict_epoch,
+                },
+                &decisions,
+                pre_choice.as_deref().unwrap_or("both"),
+            )
+            .map_err(direct_save_error_message)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Resolve a sync-conflict copy: merge it into its winner per the user's per-row
