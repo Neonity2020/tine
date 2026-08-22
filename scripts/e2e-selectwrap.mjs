@@ -25,11 +25,18 @@ const check = (name, got, want) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}: ${JSON.stringify(got)}${ok ? "" : ` (want ${JSON.stringify(want)})`}`);
 };
 
+async function ensureEditor(page) {
+  const editor = page.locator("textarea.block-editor");
+  if (!(await editor.isVisible().catch(() => false))) {
+    await page.locator(".ls-block .block-content").first().click();
+  }
+  await editor.waitFor({ state: "visible", timeout: 3000 });
+}
+
 // Enter the first block's editor, replace its text with `content`, then select
 // [selStart,selEnd) and press each key in `keys`. Returns {value, acOpen}.
 async function gesture(page, content, selStart, selEnd, keys) {
-  await page.locator(".ls-block .block-content").first().click();
-  await page.waitForSelector("textarea.block-editor", { timeout: 3000 });
+  await ensureEditor(page);
   // Replace the field's contents directly rather than via Ctrl+A. This scenario
   // is about selection WRAPPING; Ctrl+A is only being used here to clear the
   // field. Since GH #262 it is also the block-selection ladder, and its first
@@ -55,8 +62,7 @@ async function gesture(page, content, selStart, selEnd, keys) {
 // Exercise the configured semantic command path rather than literal delimiter
 // auto-wrapping. `direction=backward` matches Ctrl+Shift+Left's live selection.
 async function formatGesture(page, content, selStart, selEnd, key, direction = "backward") {
-  await page.locator(".ls-block .block-content").first().click();
-  await page.waitForSelector("textarea.block-editor", { timeout: 3000 });
+  await ensureEditor(page);
   // Replace the field's contents directly rather than via Ctrl+A. This scenario
   // is about selection WRAPPING; Ctrl+A is only being used here to clear the
   // field. Since GH #262 it is also the block-selection ladder, and its first

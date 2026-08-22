@@ -275,14 +275,17 @@ async function dragSelectionFromAToAfterE() {
       root.querySelector(":scope > .block-main > .block-content-wrapper > .block-content")?.textContent?.trim() === label,
     );
     const aBullet = rootFor("A")?.querySelector(":scope > .block-main .bullet-container");
-    const eMain = rootFor("E")?.querySelector(":scope > .block-main");
-    if (!(aBullet instanceof HTMLElement) || !(eMain instanceof HTMLElement)) return null;
+    const eRoot = rootFor("E");
+    const eMain = eRoot?.querySelector(":scope > .block-main");
+    if (!(aBullet instanceof HTMLElement) || !(eRoot instanceof HTMLElement) || !(eMain instanceof HTMLElement)) return null;
     const start = aBullet.getBoundingClientRect();
+    const targetRoot = eRoot.getBoundingClientRect();
     const target = eMain.getBoundingClientRect();
     return {
       start: { x: start.left + start.width / 2, y: start.top + start.height / 2 },
-      // Lower interior of E's live row requests the semantic "after E" side.
-      end: { x: target.left + target.width * 0.65, y: target.top + target.height * 0.75 },
+      // Stay in OG's shallow (<=50 px) sibling strip; moving deeper into the
+      // row explicitly requests child insertion.
+      end: { x: targetRoot.left + 35, y: target.top + target.height * 0.75 },
     };
   });
   assert(points && Number.isFinite(points.start.x) && Number.isFinite(points.end.y), "live A bullet/E row drag coordinates were unavailable", points);

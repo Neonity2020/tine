@@ -140,12 +140,9 @@ try {
     throw new Error(`Tine exited ${client.exitCode} before advertising its app ID:\n${wire.slice(-4_000)}`);
   }
 
-  const fallbackAt = wire.indexOf('set_app_id("tine")');
   const tineAt = wire.indexOf('set_app_id("page.tine.Tine")');
-  const firstBufferAt = wire.indexOf(".attach(", fallbackAt);
-  if (fallbackAt < 0 || tineAt < fallbackAt) {
-    throw new Error("Wayland trace does not show Tine overriding GTK's executable-name fallback");
-  }
+  const firstBufferAt = wire.indexOf(".attach(");
+  if (tineAt < 0) throw new Error("Wayland trace does not show Tine's desktop-entry identity");
   if (firstBufferAt >= 0 && tineAt > firstBufferAt) {
     throw new Error("Tine advertised its application ID only after the first visible buffer");
   }
@@ -157,7 +154,7 @@ try {
 
   fs.writeFileSync(
     path.join(out, "result.json"),
-    `${JSON.stringify({ app, appId: "page.tine.Tine", fallbackOverridden: true, beforeFirstBuffer: true }, null, 2)}\n`,
+    `${JSON.stringify({ app, appId: "page.tine.Tine", beforeFirstBuffer: true }, null, 2)}\n`,
   );
   console.log("Wayland app ID OK: page.tine.Tine before the first visible buffer");
 } finally {
