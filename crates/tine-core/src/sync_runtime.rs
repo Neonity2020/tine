@@ -17107,10 +17107,18 @@ impl RuntimeActor {
                 })
             }
             TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => {
-                self.managed_local
+                let detail = format!(
+                    "journal-committed foreground projection remains pending: {}",
+                    pending.last_error()
+                );
+                #[cfg(target_os = "android")]
+                eprintln!("[tine] {detail}");
+                let managed = self
+                    .managed_local
                     .as_mut()
-                    .expect("clean foreground journal remains installed")
-                    .pending_commit = Some(PendingManagedLocalCommit::Projection(pending));
+                    .expect("clean foreground journal remains installed");
+                managed.last_failure = Some(detail);
+                managed.pending_commit = Some(PendingManagedLocalCommit::Projection(pending));
                 Ok(SyncEditorSaveOutcome::Deferred {
                     state: SyncEditorDeferred::BlockedRecovery {
                         batch_id: Some(batch_id.to_string()),
@@ -17233,6 +17241,10 @@ impl RuntimeActor {
                                 .expect("clean foreground journal remains installed")
                                 .install_latest_task_query_overlay(committed.sequence(), overlay);
                         }
+                        self.managed_local
+                            .as_mut()
+                            .expect("clean foreground journal remains installed")
+                            .last_failure = None;
                         Ok(true)
                     }
                     Err(_) => {
@@ -17245,10 +17257,18 @@ impl RuntimeActor {
                 }
             }
             TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => {
-                self.managed_local
+                let detail = format!(
+                    "journal-committed foreground projection remains pending: {}",
+                    pending.last_error()
+                );
+                #[cfg(target_os = "android")]
+                eprintln!("[tine] {detail}");
+                let managed = self
+                    .managed_local
                     .as_mut()
-                    .expect("clean foreground journal remains installed")
-                    .pending_commit = Some(PendingManagedLocalCommit::Projection(pending));
+                    .expect("clean foreground journal remains installed");
+                managed.last_failure = Some(detail);
+                managed.pending_commit = Some(PendingManagedLocalCommit::Projection(pending));
                 Ok(false)
             }
             TrustedLocalCommitOutcome::CommittedRecoveryRequired(recovery) => {
@@ -19087,7 +19107,11 @@ impl RuntimeActor {
             recovery: Some(self.recovery),
             watcher: self.last_watcher,
             last_tick: self.last_tick.clone(),
-            detail: self.terminal.clone(),
+            detail: self.terminal.clone().or_else(|| {
+                self.managed_local
+                    .as_ref()
+                    .and_then(|managed| managed.last_failure.clone())
+            }),
             shared_role: self.shared_role,
             shared_phase: self.shared_phase,
             provider_pending: self.provider_pending.len()
