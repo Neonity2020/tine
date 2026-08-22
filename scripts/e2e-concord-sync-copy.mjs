@@ -108,11 +108,10 @@ try {
   fs.writeFileSync(conflictFile, "- phone version\n");
   const resolver = await browser.$(".page-conflict");
   await resolver.waitForExist({ timeout: mode === "poll" ? 15_000 : 10_000 });
-  await browser.waitUntil(async () => {
-    const notices = await browser.$$(".toast");
-    return (await Promise.all(notices.map((notice) => notice.getText())))
-      .some((text) => text.includes("new sync conflict"));
-  }, { timeout: 10_000, timeoutMsg: "new conflict arrived without an actionable notice" });
+  await browser.waitUntil(async () => browser.execute(() =>
+    [...document.querySelectorAll(".toast")]
+      .some((notice) => notice.textContent?.includes("new sync conflict"))
+  ), { timeout: 10_000, timeoutMsg: "new conflict arrived without an actionable notice" });
 
   await browser.execute(() => {
     for (const button of document.querySelectorAll(".page-conflict button")) {
