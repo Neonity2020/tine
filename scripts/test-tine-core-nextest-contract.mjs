@@ -123,7 +123,7 @@ const coreWindowsTests = [
 assert.deepEqual(WINDOWS_CORE_EXACT_TEST_NAMES, coreWindowsTests);
 
 const coreLifecycleWitnesses = [
-  "oplog::local_active::tests::clean_admissions_are_bounded_at_one_one_thousand_and_ten_thousand",
+  "oplog::local_active::bounded_admission::clean_admissions_are_bounded_at_one_one_thousand_and_ten_thousand",
   "model::tests::bootstrap_source_regular_file_sync_uses_supported_handle_access",
   "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts",
   "oplog::import::tests::inactive_streaming_bootstrap_preseal_crash_retries_exactly",

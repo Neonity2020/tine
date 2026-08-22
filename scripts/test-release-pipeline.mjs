@@ -456,6 +456,11 @@ assert.ok(
   androidManagedRuntimeScript.includes("grep -Eq 'OK \\([0-9]+ tests?\\)'"),
   "Android instrumentation must require the runner's explicit passing summary"
 );
+assert.match(
+  androidManagedRuntimeScript,
+  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest[\s\S]*run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest/,
+  "independent Android native/activity contracts must use separate instrumentation lifetimes"
+);
 assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
 assert.equal(
   yamlScalar(androidTestApk, "if", 4),

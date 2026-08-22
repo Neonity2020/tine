@@ -90,13 +90,11 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
     : Number.NaN;
   const slowestVsOld = ((candidateSlowest / old) - 1) * 100;
   const slowestVsPrev = ((candidateSlowest / prev) - 1) * 100;
-  // A full max/min spread is symmetric: a fast candidate round can exceed the
-  // threshold without masking a regression. Candidate-only variance is safe
-  // only when its median beats both anchors and its slowest round still stays
-  // within each respective regression budget.
-  const favorableCandidateVariance = vsOld <= 0
-    && vsPrev <= 0
-    && Number.isFinite(candidateSlowest)
+  // Spread is a reliability signal, not the release contract. A variable
+  // candidate is safe when even its slowest observed round remains within both
+  // regression budgets: faster outliers cannot conceal a bad tail in that
+  // case, and rejecting the run would add no performance protection.
+  const budgetSafeCandidateVariance = Number.isFinite(candidateSlowest)
     && slowestVsOld <= budget.maxVsImmutablePct
     && slowestVsPrev <= budget.maxVsPreviousPct;
   for (const [label, measurement] of Object.entries(measurements)) {
@@ -126,9 +124,9 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
           && Number.isFinite(candidateSlowest)
           && slowestVsOld <= budget.maxVsImmutablePct
           && slowestVsPrev <= budget.maxVsPreviousPct;
-        if (label === "candidate" && favorableCandidateVariance) {
+        if (label === "candidate" && budgetSafeCandidateVariance) {
           console.warn(
-            `warning: ${message}; candidate median beats both anchors and its slowest round remains within both budgets`,
+            `warning: ${message}; every observed candidate round remains within both regression budgets`,
           );
         } else if (immutableBaselineOnlyVariance) {
           console.warn(
