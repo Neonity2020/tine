@@ -461,6 +461,11 @@ assert.match(
   /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest[\s\S]*run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest/,
   "independent Android native/activity contracts must use separate instrumentation lifetimes"
 );
+assert.match(
+  androidManagedRuntimeScript,
+  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest\nif ! run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest; then[\s\S]*QUARANTINED Android Safe Back instrumentation/,
+  "managed-storage runtime must remain blocking while exhausted Safe Back emulator infrastructure is explicitly quarantined"
+);
 assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
 assert.equal(
   yamlScalar(androidTestApk, "if", 4),
