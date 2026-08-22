@@ -110,12 +110,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
-- **Managed storage now creates its private foreground journal on Android
-  without requiring hard-link support.** Segment, frontier, and selector
-  publication use the app-private sole-writer atomic-rename fallback while
-  shared/provider publication remains strict, so the real app-UID activation,
-  edit, crash-reopen, share-setup, shutdown, and reopen journey no longer fails
-  with `Permission denied (os error 13)`.
+- **Managed storage now activates and saves on Android shared storage without
+  requiring hard-link or flagged-rename support.** Private segment, frontier,
+  and selector publication use the app-private sole-writer atomic-rename
+  fallback. The reconstructible Markdown/Org projection also falls back from
+  Android shared storage's `EACCES` answer for flagged `renameat2` to the
+  existing reserve-and-ordinary-rename protocol; a real permission denial still
+  fails that ordinary rename, and shared/provider authority remains strict. The
+  real app-UID activation, edit, crash-reopen, share-setup, shutdown, and reopen
+  journey therefore no longer stalls after a durable edit with `Permission
+  denied (os error 13)`.
+
+- **A pending managed-storage edit no longer makes unrelated pages disappear
+  until the derived projection drains.** Exact-path loads now combine the
+  exact-frontier SQLite baseline with only that path's journal-durable overlay,
+  instead of globally abandoning the baseline whenever any page has pending
+  derived work. Untouched pages therefore remain readable after a crash reopen
+  while another page's Markdown/SQLite publication catches up.
 
 - **Direct Files no longer repeats whole-graph work on ordinary foreground
   paths.** Opening Journals before background warm now inventories filenames

@@ -34,11 +34,11 @@ use std::{
 
 use crate::graph_name_folding::{graph_name_folding, GraphNameFolding};
 use crate::sync_runtime::{
-    SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
-    SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
-    SyncLocalActivationRequest, SyncLocalActivationStatus, SyncRuntimeHandle,
-    SyncRuntimeOpenRequest, SyncRuntimeOpenStatus, SyncRuntimeTick, SyncShutdownOutcome,
-    SyncWatcherObservation,
+    SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
+    SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
+    SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncLocalActivationRequest,
+    SyncLocalActivationStatus, SyncRuntimeHandle, SyncRuntimeOpenRequest, SyncRuntimeOpenStatus,
+    SyncRuntimeTick, SyncShutdownOutcome, SyncWatcherObservation,
 };
 
 /// The page the journey edits through the application save path.
@@ -789,11 +789,33 @@ pub fn run_managed_storage_journey(
     }) {
         Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. }) if page.blocks.len() == 1 => {}
         outcome => {
+            let inventory = match handle.application_page_inventory() {
+                Ok(SyncApplicationPageInventoryOutcome::Loaded { pages }) => {
+                    let nearby = pages
+                        .iter()
+                        .filter(|page| page.rel_path.contains("Denn") || page.name.contains("Denn"))
+                        .map(|page| {
+                            format!(
+                                "{}=>{} path_bytes={:?}",
+                                page.rel_path,
+                                page.name,
+                                page.rel_path.as_bytes()
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    format!(
+                        "count={} requested_bytes={:?} nearby={nearby:?}",
+                        pages.len(),
+                        JOURNEY_EXTERNAL_EDIT_PAGE.as_bytes()
+                    )
+                }
+                other => format!("unavailable:{other:?}"),
+            };
             return format!(
                 "journey precondition failed: {JOURNEY_EXTERNAL_EDIT_PAGE} must already be an \
                  owned single-block page before the external edit — drive the journey against \
-                 `write_journey_graph_fixture`: {outcome:?}"
-            )
+                 `write_journey_graph_fixture`: {outcome:?}; inventory={inventory}"
+            );
         }
     }
     let reconciliation_started = Instant::now();

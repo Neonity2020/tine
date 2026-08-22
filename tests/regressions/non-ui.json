@@ -4403,6 +4403,52 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before: GitHub Actions run 32579788092 reached the real Android app-UID managed runtime and failed during retained-runtime actor open because LocalJournalSegmentV2::prepare used hard-link-based strict no-replace publication for an app-private sole-writer journal; Android returned Permission denied (os error 13). The required fix applies the existing absence-check and same-directory atomic-rename fallback to the complete private journal segment/frontier/anchor family while retaining strict publication for shared/provider namespaces."
+    },
+    {
+      "id": "REG-ANDROID-MANAGED-SHARED-PROJECTION-RENAME-20260822",
+      "title": "Android managed saves publish their reconstructible Markdown projection when shared storage rejects flagged rename",
+      "family": "managed-storage-platform-durability",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "tine-core-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::tests::android_shared_storage_permission_refusal_is_only_a_flagged_rename_capability_answer",
+          "crates/tine-core/src/model.rs::tests::only_the_reconstructible_projection_rename_falls_back_when_the_flag_is_unsupported",
+          "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/ManagedStorageSmokeTest.kt"
+        ],
+        "scenario": "android.managed-activation-edit-crash-reopen-share-shutdown",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: exact-candidate GitHub Actions run 32584809938 activated managed storage as Tine's real Android app UID, durably appended the first edit, and then left it permanently Deferred at ProjectionDrain. The shared-storage flagged rename returned EACCES even though the same test had created and written the graph normally. Android now treats EACCES only as a capability answer for the reconstructible projection's flagged syscall and tries the existing destination reservation plus ordinary same-directory rename. A true permission failure still fails that ordinary rename; sole-authority and provider publication remain strict."
+    },
+    {
+      "id": "REG-MANAGED-PENDING-EDIT-UNRELATED-EXACT-LOAD-20260822",
+      "title": "A pending managed edit does not hide unrelated pages from exact-path loads",
+      "family": "managed-storage-recovery",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "tine-core-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph"
+        ],
+        "scenario": "managed.activate-save-crash-reopen-load-unrelated-page",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before was reproduced at current master 042054c1 and the frozen release candidate 475b6e72: after the journey saved pages/Smoke.md and crash-reopened with that durable frame still pending, SQLite inventory contained pages/Denní poznámky.md but exact-path loading reported Missing. Any pending managed frame globally disabled SQLite and fell back to a lazy hot engine that did not contain untouched pages. Exact-path reads now apply a path-local journal overlay over the exact-frontier SQLite baseline; unrelated pending work cannot hide the requested page."
     }
   ]
 }

@@ -29647,9 +29647,13 @@ fn rename_reconstructible_projection_noreplace(dir: &Dir, from: &str, to: &str) 
 ///
 /// `renameat2` reports an unsupported flag as `EINVAL` on most filesystems, as
 /// `ENOSYS` when the syscall itself is absent, and as `EOPNOTSUPP`/`ENOTSUP` on
-/// some stacked filesystems. Those three, and only those three, are capability
-/// answers. Every other errno — `EIO`, `ENOSPC`, `EACCES`, `EXDEV`, `EEXIST`,
-/// `ENOENT` — describes the operation, not the flag, and stays fatal.
+/// some stacked filesystems. Android shared storage additionally reports
+/// `EACCES` for this flagged syscall while permitting an ordinary same-directory
+/// rename. That platform-only answer is classified by
+/// [`noreplace_or_reserve_for_platform`], where the fallback must still perform
+/// the ordinary rename; a real permission denial therefore remains a failure.
+/// Everywhere else `EIO`, `ENOSPC`, `EACCES`, `EXDEV`, `EEXIST`, and `ENOENT`
+/// describe the operation rather than the flag and stay fatal.
 #[cfg(unix)]
 fn is_flagged_rename_capability_refusal(error: &io::Error) -> bool {
     // Written as comparisons rather than a `match`: on Linux `ENOTSUP` and
@@ -29851,6 +29855,26 @@ fn noreplace_or_reserve(
     reconstructible: bool,
     platform: &dyn Fn() -> io::Result<()>,
 ) -> (FlaggedRenameStep, io::Result<()>) {
+    noreplace_or_reserve_for_platform(
+        source_dir,
+        from,
+        destination_dir,
+        to,
+        reconstructible,
+        cfg!(target_os = "android"),
+        platform,
+    )
+}
+
+fn noreplace_or_reserve_for_platform(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+    reconstructible: bool,
+    android: bool,
+    platform: &dyn Fn() -> io::Result<()>,
+) -> (FlaggedRenameStep, io::Result<()>) {
     if reconstructible && flagged_rename_known_unsupported(destination_dir) {
         return (
             FlaggedRenameStep::Reservation,
@@ -29859,7 +29883,10 @@ fn noreplace_or_reserve(
     }
     match platform() {
         Ok(()) => (FlaggedRenameStep::Platform, Ok(())),
-        Err(error) if reconstructible && is_flagged_rename_capability_refusal(&error) => {
+        Err(error)
+            if reconstructible
+                && reconstructible_flagged_rename_capability_refusal(&error, android) =>
+        {
             remember_flagged_rename_unsupported(destination_dir);
             (
                 FlaggedRenameStep::Reservation,
@@ -29868,6 +29895,11 @@ fn noreplace_or_reserve(
         }
         Err(error) => (FlaggedRenameStep::Platform, Err(error)),
     }
+}
+
+fn reconstructible_flagged_rename_capability_refusal(error: &io::Error, android: bool) -> bool {
+    is_flagged_rename_capability_refusal(error)
+        || (android && error.kind() == io::ErrorKind::PermissionDenied)
 }
 
 /// The same policy for a `SharedReconstructibleProjection` artifact of the
@@ -32706,6 +32738,26 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_shared_storage_permission_refusal_is_only_a_flagged_rename_capability_answer() {
+        let permission = io::Error::from_raw_os_error(libc::EACCES);
+        assert!(reconstructible_flagged_rename_capability_refusal(
+            &permission,
+            true
+        ));
+        assert!(
+            !reconstructible_flagged_rename_capability_refusal(&permission, false),
+            "desktop EACCES remains a real permission failure"
+        );
+
+        let io_failure = io::Error::from_raw_os_error(libc::EIO);
+        assert!(
+            !reconstructible_flagged_rename_capability_refusal(&io_failure, true),
+            "Android may degrade only the shared-filesystem capability refusal"
+        );
     }
 
     /// The guarantee the flag was there to provide, kept by the fallback: an

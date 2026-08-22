@@ -13609,44 +13609,36 @@ impl RuntimeActor {
         if let Some(current) = self.load_clean_foreground_pending_exact_ready(&path)? {
             return Ok(current);
         }
-        if self.exact_projection_read_available() {
-            let engine = self
-                .active_engine()
-                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-            let database = self
-                .active_database()
-                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-            let read = database.materialized_read().map_err(|_| {
+        let read = self.application_materialized_read_ready()?;
+        if let [page] = read
+            .pages_by_path(&path, 2)
+            .map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt(
-                    "application_load_exact_materialized_read",
+                    "application_load_exact_pages_by_path",
                 )
-            })?;
-            ensure_editor_frontier_parts(engine, database, read.acceptance_sequence())
-                .map_err(map_editor_application_error)?;
-            let projected = match read
-                .pages_by_path(&path, 2)
-                .map_err(|_| {
-                    SyncApplicationPageRequestError::ActorRefusedAt(
-                        "application_load_exact_pages_by_path",
-                    )
-                })?
-                .as_slice()
-            {
-                [page] if page.path == path => Some(
-                    self.load_application_page_id_untracked_ready(page.page_id)
-                        .map(ApplicationExactLoad::Loaded),
-                ),
-                [] => None,
-                // Duplicate or malformed projected rows are exceptional. Keep
-                // the established authenticated catalog route for them rather
-                // than making SQLite decide their exact-path semantics.
-                _ => None,
-            };
-            if let Some(projected) = projected {
-                return projected
-                    .map(|current| self.finish_managed_application_query_exact_load(current));
+            })?
+            .as_slice()
+        {
+            if page.path == path {
+                if let Ok(Some(current)) = load_projected_source_rebased_application_page_from_parts(
+                    self.active_engine()
+                        .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?,
+                    self.active_database()
+                        .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?,
+                    &self.graph,
+                    page.page_id,
+                ) {
+                    if current.editor.page.path == path {
+                        return Ok(self.finish_managed_application_query_exact_load(
+                            ApplicationExactLoad::Loaded(current),
+                        ));
+                    }
+                }
             }
         }
+        // Missing, duplicate, and structurally malformed projected rows are
+        // exceptional. Authenticate those bounded cases through the retained
+        // engine state instead of allowing SQLite alone to decide them.
         self.load_hot_application_exact_untracked_ready(&path)
             .map(|current| self.finish_managed_application_query_exact_load(current))
     }
