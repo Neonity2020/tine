@@ -2,6 +2,32 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-CONCORD-SYNC-COPY-HANDOFF-337",
+      "title": "Applying a sync conflict copy installs the exact committed merge and cannot immediately resurrect the stale open editor",
+      "family": "external-change-conflict-resolution",
+      "sources": {
+        "issues": [337],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/graph.rs::resolve_sync_conflict_merges_and_trashes",
+          "src-tauri/src/watcher.rs::unset_watch_mode_prefers_native_events_on_every_platform",
+          "src/components/ConflictResolution.test.tsx",
+          "src/components/ConflictQueueBadge.test.tsx",
+          "scripts/e2e-concord-sync-copy.mjs"
+        ],
+        "scenario": "concord.sync-copy-exact-editor-handoff",
+        "failBefore": "proven"
+      },
+      "notes": "Martin's 2026-08-22 Direct Files test: a delivered conflict copy was invisible until he opened the page; Apply reported success but left the old editor content visible, then a second resolver appeared and could restore that stale version. The native resolver committed the selected merge and trashed the copy but returned void, while the frontend refreshed only the queue and never replaced the open page. The retained pre-merge editor could therefore autosave or conflict against the just-committed merge. The correction contract requires event-independent reconciliation, discoverable arrival, a quiescent editor handoff, and installation of the exact PageDto returned by the guarded native commit under both inotify and polling."
+    },
+    {
       "id": "UI-BLOCK-SELECTION-ACTION-OWNERSHIP-240",
       "title": "An active block selection owns heading commands and bullet drag even when the pointer is on another block",
       "family": "block-selection",

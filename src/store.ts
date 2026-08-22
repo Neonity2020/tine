@@ -333,6 +333,19 @@ export function pageMutationBusy(name: string): boolean {
   return managedMoveBusyPages().has(name);
 }
 
+/** Keep the named page editors inert across one explicit native mutation.
+ * This is UI ownership only; callers drain then separately hold persistence. */
+export function holdPageMutationUi(pages: readonly string[]): () => void {
+  const held = [...new Set(pages)];
+  setManagedMoveBusy(held, true);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    setManagedMoveBusy(held, false);
+  };
+}
+
 function setManagedMoveBusy(pages: readonly string[], busy: boolean): void {
   const next = new Set(managedMoveBusyPages());
   for (const page of pages) busy ? next.add(page) : next.delete(page);
@@ -1440,7 +1453,9 @@ export function clearAllEditorLeases(): void {
  * uncommitted rename during that await. (GH #254 increment 3.)
  */
 export function mayReplaceInstance(name: string): boolean {
-  return reloadDisposition(name) === "reload" && !hasEditorLease(name);
+  return reloadDisposition(name) === "reload"
+    && !hasEditorLease(name)
+    && !pageMutationBusy(name);
 }
 
 /** Why a replacement was refused, for the surface that asked for it. */

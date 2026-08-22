@@ -1019,6 +1019,31 @@
    "stability": "stable",
    "notes": "Added 2026-08-09 after a generated graph linked 29 papers by filename while every file declared a different title::; every link opened a blank page with nothing on screen to explain it. Logseq does NOT dim unresolved links (components/block.cljs:548 dims only untitled-page?, meaning a page existing under a uuid name), so the dimming is a deliberate, Martin-approved divergence and this journey is its contract."
   },
+  "scripts/e2e-concord-sync-copy.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Concord sync-copy handoff contract approved by Martin on 2026-08-22.",
+     "userOutcome": "A delivered conflict copy is discovered in native-event and polling modes; applying keep-both installs and durably retains the exact committed merge without a second conflict after autosave or restart.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A newly delivered sync conflict becomes discoverable without first navigating to its page, while resolution remains explicit and non-modal.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The native event or focus fallback may discover the conflict before the other, provided the same derived queue and resolver result.",
+    "Notice wording and resolver labels may evolve while the conflict is actionable and both page versions are preserved."
+   ],
+   "nonRequirements": [
+    "Exact watcher event count, delivery latency within the generous wait, toast geometry, colors, or DOM nesting.",
+    "Generated block identities and conflict-trash filename."
+   ],
+      "stability": "burn-in",
+   "notes": "Added after the field sequence where Apply wrote the merge but the pre-merge editor remained installed, then manufactured a second conflict and appeared to restore the local version. The journey asserts the file, visible editor, save-debounce settlement, copy retirement, and process restart in both watcher modes."
+  },
   "scripts/e2e-concord-focus-freshness.mjs": {
    "contracts": [
     {

@@ -12090,7 +12090,7 @@ impl Graph {
         base_rev: &str,
         conflict_rev: &str,
         pre_choice: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<PageDto> {
         let write = self.admit_managed_text_writer()?;
         let win = self
             .resolve_managed_rel(&write, winner_rel)?
@@ -12150,7 +12150,8 @@ impl Graph {
             roots: merged_roots,
         };
         assign_doc_runtime_ids(&mut merged.roots, &win_entry.rel_path);
-        let dto = page_dto_checked(&win_entry, &merged)?;
+        let mut dto = page_dto_checked(&win_entry, &merged)?;
+        dto.path = win_entry.rel_path.clone();
         let win_cacheable = self.managed_path_is_cacheable(&write, &win)?;
         // Stage-before-commit (L5): move the conflict copy out first, then write the
         // merged winner; roll the move back if the write fails.
@@ -12166,7 +12167,7 @@ impl Graph {
                 "conflict copy changed during merge",
             ));
         }
-        if let Err(e) = self.write_page(
+        let rev = match self.write_page(
             &write,
             &dto,
             &win,
@@ -12177,16 +12178,20 @@ impl Graph {
             None,
             win_cacheable,
         ) {
-            let _ = managed_write_during_rollback_hook();
-            let _ = self.managed_move_noreplace(&write, &staged, &conf);
-            return Err(e);
-        }
+            Ok(rev) => rev,
+            Err(error) => {
+                let _ = managed_write_during_rollback_hook();
+                let _ = self.managed_move_noreplace(&write, &staged, &conf);
+                return Err(error);
+            }
+        };
         // The conflict copy is resolved and trashed — its pinned base (if any)
         // has served its purpose; let the ledger forget it (best-effort).
         if let Some(ledger) = self.concord_ledger.get() {
             ledger.drop_pin(conflict_rel);
         }
-        Ok(())
+        dto.rev = Some(rev);
+        Ok(dto)
     }
 
     /// Move a sync-conflict copy to the recoverable trash WITHOUT merging (the

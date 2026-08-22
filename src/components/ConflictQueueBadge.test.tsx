@@ -9,6 +9,8 @@ import {
   refreshSyncConflicts,
   resetConflictCursor,
   setConflictQueue,
+  setToasts,
+  toasts,
 } from "../ui";
 import type { ConflictObject } from "../types";
 
@@ -23,6 +25,7 @@ afterEach(() => {
   __setBackendForTest(null);
   setConflictQueue([]);
   resetConflictCursor();
+  setToasts([]);
 });
 
 const object = (id: string, name: string): ConflictObject => ({
@@ -99,6 +102,35 @@ describe("the conflict queue badge", () => {
 });
 
 describe("the queue after an external change", () => {
+  it("surfaces a newly arrived sync copy once without auto-navigating", async () => {
+    const arrived: ConflictObject = {
+      id: "copy:pages/Alpha.sync-conflict-20260822-120000-PHONE.md",
+      source: "sync-copy",
+      page_name: "Alpha",
+      page_path: "pages/Alpha.md",
+      kind: "page",
+      sides: [
+        { role: "mine", label: "This device", path: "pages/Alpha.md" },
+        { role: "theirs", label: "Phone", path: "pages/Alpha.sync-conflict-20260822-120000-PHONE.md" },
+      ],
+      block_conflicts: 1,
+    };
+    __setBackendForTest({
+      listSyncConflicts: async () => [],
+      listVcsMarkerConflicts: async () => [],
+      conflictQueue: async () => [arrived],
+    } as unknown as Backend);
+
+    await refreshSyncConflicts("new");
+    expect(conflictQueue().map((conflict) => conflict.id)).toEqual([arrived.id]);
+    expect(toasts()).toHaveLength(1);
+    expect(toasts()[0].message).toContain("new sync conflict");
+    expect(toasts()[0].sticky).toBe(true);
+
+    await refreshSyncConflicts("new");
+    expect(toasts()).toHaveLength(1);
+  });
+
   it("re-derives only when the change touched something queued", async () => {
     const conflictQueueFn = vi.fn(async () => [] as ConflictObject[]);
     __setBackendForTest({

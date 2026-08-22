@@ -1926,8 +1926,16 @@ export function mockBackend(): Backend {
     async resolveVcsMarkerConflict(): Promise<void> {
       // no-op in the browser mock
     },
-    async resolveSyncConflict(): Promise<void> {
-      // no-op in the browser mock
+    async resolveSyncConflict(winner: string): Promise<PageDto> {
+      return {
+        name: winner.split("/").pop()?.replace(/\.(md|org)$/i, "") ?? "Resolved",
+        kind: "page",
+        title: "Resolved",
+        pre_block: null,
+        path: winner,
+        rev: "mock-resolved-rev",
+        blocks: [],
+      };
     },
     async trashSyncConflict(): Promise<void> {
       // no-op in the browser mock

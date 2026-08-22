@@ -985,7 +985,7 @@ export function App(): JSX.Element {
   onMount(() => {
     let unsub = () => {};
     void backend()
-      .onConflictsChanged(() => void refreshSyncConflicts())
+      .onConflictsChanged(() => trackGraphChangeApplication(refreshSyncConflicts("new")))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });

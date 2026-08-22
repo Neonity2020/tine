@@ -2960,15 +2960,16 @@ fn resolve_sync_conflict_merges_and_trashes() {
     ]);
     let base = tine_core::model::content_rev(winner);
     let conflict_rev = tine_core::model::content_rev(conflict);
-    g.resolve_sync_conflict(
-        win_rel,
-        &conf_rel,
-        &decisions,
-        &base,
-        &conflict_rev,
-        "union",
-    )
-    .unwrap();
+    let resolved = g
+        .resolve_sync_conflict(
+            win_rel,
+            &conf_rel,
+            &decisions,
+            &base,
+            &conflict_rev,
+            "union",
+        )
+        .unwrap();
 
     let merged = std::fs::read_to_string(pages.join("Foo.md")).unwrap();
     assert!(merged.contains("beta line there"), "merged: {merged:?}");
@@ -2979,6 +2980,17 @@ fn resolve_sync_conflict_merges_and_trashes() {
     assert!(
         merged.contains("extra from other device"),
         "removed block not pulled in: {merged:?}"
+    );
+    assert_eq!(resolved.path, win_rel);
+    let merged_rev = tine_core::model::content_rev(&merged);
+    assert_eq!(resolved.rev.as_deref(), Some(merged_rev.as_str()));
+    assert!(
+        resolved
+            .blocks
+            .iter()
+            .any(|block| block.raw.contains("beta line there")),
+        "returned DTO is not the committed merge: {:?}",
+        resolved.blocks
     );
 
     // Conflict copy is gone from pages/ and from the conflicts list, and lives in trash.

@@ -30,8 +30,23 @@ import {
   refreshSyncConflicts,
   updateLiveSaveConflictDiskRev,
 } from "../ui";
-import { dropObservation, reobserve } from "../persistence";
-import { reloadPage } from "../store";
+import {
+  dropObservation,
+  flushPageToQuiescence,
+  forgetSaveState,
+  holdManagedMovePages,
+  isDirty,
+  isSaving,
+  reobserve,
+} from "../persistence";
+import {
+  editGeneration,
+  editorTransactionGeneration,
+  hasEditorLease,
+  holdPageMutationUi,
+  pageInstanceGeneration,
+  reloadPage,
+} from "../store";
 import { DiffRowView, collectRows, seedSuggestedOrNoLoss } from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, SyncConflictDiff } from "../types";
 
@@ -160,6 +175,8 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     const sides = [...c.sides];
     const live = c.live;
     setBusy(true);
+    let releasePageUi = () => {};
+    let releasePageSaves = () => {};
     try {
       if (source === "live-save") {
         if (!live) return;
@@ -198,7 +215,46 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       } else {
         const copy = sides.find((s) => s.role === "theirs")?.path;
         if (!copy) return;
-        await backend().resolveSyncConflict(
+        // The resolver writes the winning file. It must therefore own the exact
+        // open editor from the user's click until the committed DTO is installed;
+        // otherwise the pre-merge editor can autosave over that merge and create
+        // the confusing second conflict this surface is meant to eliminate.
+        if (hasEditorLease(pageName)) {
+          pushToast("Finish the current edit, then apply this resolution.", "info");
+          return;
+        }
+        const instance = pageInstanceGeneration(pageName);
+        const edit = editGeneration(pageName);
+        const transaction = editorTransactionGeneration(pageName);
+        const hadPendingSave = isDirty(pageName) || isSaving(pageName);
+        if (instance === null) {
+          pushToast("This page is no longer open. Open it again before applying the resolution.", "error");
+          return;
+        }
+        releasePageUi = holdPageMutationUi([pageName]);
+        if (!(await flushPageToQuiescence(pageName))) {
+          pushToast("Your current draft needs attention first. Resolve or finish saving it, then review this conflict copy.", "error");
+          return;
+        }
+        if (
+          pageInstanceGeneration(pageName) !== instance
+          || editGeneration(pageName) !== edit
+          || editorTransactionGeneration(pageName) !== transaction
+          || hasEditorLease(pageName)
+        ) {
+          alignment = undefined;
+          void refetch();
+          pushToast("The open page changed while Tine prepared the merge. Review the refreshed comparison.", "info");
+          return;
+        }
+        if (hadPendingSave) {
+          alignment = undefined;
+          await refetch();
+          pushToast("Your latest edit was saved. Review the updated comparison, then apply it again.", "info");
+          return;
+        }
+        releasePageSaves = holdManagedMovePages([pageName]);
+        const resolved = await backend().resolveSyncConflict(
           pagePath,
           copy,
           decisions(),
@@ -206,6 +262,20 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           current.conflict_rev,
           preChoice()
         );
+        if (
+          pageInstanceGeneration(pageName) !== instance
+          || editGeneration(pageName) !== edit
+          || editorTransactionGeneration(pageName) !== transaction
+        ) {
+          throw new Error("the resolved file was committed, but the open editor changed; reopen the page to load the exact result");
+        }
+        dropObservation(pageName);
+        forgetSaveState(pageName);
+        clearConflict(pageName);
+        const refusal = await reloadPage(resolved);
+        if (refusal) {
+          throw new Error("the resolved file was committed, but its exact page could not replace the old editor; reopen the page");
+        }
         pushToast(`Merged into “${pageName}”`, "success");
       }
       await refreshSyncConflicts();
@@ -223,6 +293,8 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         pushToast(`Couldn’t resolve it: ${String(e)}`, "error");
       }
     } finally {
+      releasePageSaves();
+      releasePageUi();
       if (mounted) setBusy(false);
     }
   };

@@ -107,6 +107,7 @@ async function loadHarness(
     pushToast,
     refreshJournalConflicts: vi.fn(async () => {}),
     refreshSyncConflicts: vi.fn(async () => {}),
+    restoreLiveSaveConflicts: vi.fn(),
     clearRecent: vi.fn(),
     resetLeftSidebarSections: vi.fn(),
     graphTransitioning: () => false,

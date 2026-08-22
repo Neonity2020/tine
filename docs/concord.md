@@ -16,8 +16,9 @@ this document describes what is implemented today and grows with each phase.
 
 When a file changes on disk and its page has no unsaved edits in Tine, the
 loaded page is replaced with the disk version silently — no dialog, no page
-flicker, no action needed. The file watcher notices the change (default:
-a real OS watcher; a 3-second polling scan on filesystems where that is
+flicker, no action needed. The file watcher notices the change (default on
+desktop and Android: the platform's native inotify-backed watcher; a 3-second
+polling scan remains available for filesystems where native events are
 unreliable — see the `watch_mode` setting), re-reads just the changed files,
 and refreshes any pane that shows them. Tine's own saves are recognized and do
 not bounce back as external changes.
@@ -225,7 +226,9 @@ conflict-copy or VCS-marker artifact, but it can discard an unresolved live draf
 resolve those before clearing app data.
 
 It is deliberately calm. A conflict is a thing waiting for you, not an
-interruption: no modal opens, nothing is blocked, and leaving a page with
+interruption: no modal opens and nothing is blocked. A newly delivered sync
+copy raises one persistent, actionable notice and joins the badge; if its page
+is already open, the in-page resolver appears there. Leaving a page with
 conflicts outstanding gets a one-line note, never a dialog you must answer.
 
 ### Resolving on the page
@@ -257,8 +260,12 @@ Nothing is applied until you click **Apply resolution**.
 
 ### What resolving does
 
-- For a **conflict copy**: the merged result is written to the page and the copy
-  moves to the recoverable trash (Settings → Backups & recovery).
+- For a **conflict copy**: the merged result is written to the page, the copy
+  moves to the recoverable trash (Settings → Backups & recovery), and the exact
+  committed page replaces the reviewed editor before typing is admitted again.
+  If that editor still has an edit or save in flight, Tine first lands it and
+  refreshes the comparison; it never applies decisions made against the older
+  winner or lets the stale editor save over the merge.
 - For a **marker-bearing page**: the merged result is written *without any
   markers* — the file becomes ordinary Markdown again and the save quarantine
   lifts by itself, because there is no longer anything to quarantine. This is

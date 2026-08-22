@@ -4068,22 +4068,34 @@ pub(crate) async fn resolve_sync_conflict(
     conflict_rev: String,
     pre_choice: Option<String>,
     state: GraphContext<'_>,
-) -> Result<(), String> {
+) -> Result<PageDto, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
         match sparse_application_handle(&slot)? {
-            Some(handle) => map_managed_sync_conflict_resolution(handle.mutate_application_graph(
-                SyncApplicationGraphMutationRequest::ResolveSyncConflict {
-                    winner_path: winner,
-                    conflict_path: conflict,
-                    decisions,
-                    base_revision: base_rev,
-                    conflict_revision: conflict_rev,
-                    pre_choice: pre_choice.unwrap_or_else(|| "union".into()),
-                },
-            )),
+            Some(handle) => {
+                let winner_path = winner.clone();
+                map_managed_sync_conflict_resolution(handle.mutate_application_graph(
+                    SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+                        winner_path: winner,
+                        conflict_path: conflict,
+                        decisions,
+                        base_revision: base_rev,
+                        conflict_revision: conflict_rev,
+                        pre_choice: pre_choice.unwrap_or_else(|| "union".into()),
+                    },
+                ))?;
+                load_sparse_page(
+                    handle,
+                    SyncApplicationPageSelector::ExactPath {
+                        path: winner_path.clone(),
+                    },
+                )?
+                .ok_or_else(|| {
+                    format!("resolved page disappeared after managed conflict merge: {winner_path}")
+                })
+            }
             None => slot
                 .legacy_graph()?
                 .resolve_sync_conflict(

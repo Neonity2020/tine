@@ -3,6 +3,13 @@ import { render } from "solid-js/web";
 import { PageConflictResolution } from "./ConflictResolution";
 import { __setBackendForTest, type Backend } from "../backend";
 import {
+  doc,
+  pageByName,
+  resetStore,
+  setDoc,
+  takeEditorLease,
+} from "../store";
+import {
   conflictQueue,
   registerLiveSaveConflict,
   restoreLiveSaveConflicts,
@@ -33,6 +40,7 @@ afterEach(() => {
   setConflictQueue([]);
   setGraphMeta(null);
   localStorage.clear();
+  resetStore();
 });
 
 const view = (text: string) => ({ uuid: "", text, child_count: 0 });
@@ -217,7 +225,15 @@ describe("in-page conflict resolution", () => {
       pre_differs: false,
       blocks_identical: false,
     };
-    const resolveCopy = vi.fn(async () => {});
+    const resolveCopy = vi.fn(async (): Promise<PageDto> => ({
+      name: "Note",
+      kind: "page",
+      title: "Note",
+      pre_block: null,
+      path: "pages/Note.md",
+      rev: "merged-rev",
+      blocks: [{ id: "note", raw: "mine", collapsed: false, children: [] }],
+    }));
     const resolveMarkers = vi.fn(async () => {});
     stubBackend({
       syncConflictDiff: (async () => copyDiff) as unknown as Backend["syncConflictDiff"],
@@ -240,6 +256,24 @@ describe("in-page conflict resolution", () => {
       ],
       block_conflicts: 1,
     };
+    setDoc({
+      byId: {
+        note: { id: "note", raw: "mine", collapsed: false, parent: null, page: "Note", children: [] },
+      },
+      pages: [{
+        name: "Note",
+        kind: "page",
+        title: "Note",
+        preBlock: null,
+        roots: ["note"],
+        format: "md",
+        readOnly: false,
+        guide: false,
+        path: "pages/Note.md",
+      }],
+      feed: ["Note"],
+      loaded: true,
+    });
     const { host, dispose } = mount(copyObject);
     try {
       await flush();
@@ -258,6 +292,143 @@ describe("in-page conflict resolution", () => {
       expect(baseRev).toBe("winner-rev");
       expect(conflictRev).toBe("copy-rev");
     } finally {
+      dispose();
+    }
+  });
+
+  it("replaces the open editor with the exact page committed by a conflict-copy resolution", async () => {
+    const copyDiff: SyncConflictDiff = {
+      base_rev: "winner-rev",
+      conflict_rev: "copy-rev",
+      rows: [{ id: "0", kind: "modified", mine: view("desktop"), theirs: view("phone"), children: [] }],
+      mine_pre: null,
+      theirs_pre: null,
+      pre_differs: false,
+      blocks_identical: false,
+    };
+    const resolved: PageDto = {
+      name: "Note",
+      kind: "page",
+      title: "Note",
+      pre_block: null,
+      path: "pages/Note.md",
+      rev: "merged-rev",
+      blocks: [{ id: "merged", raw: "desktop and phone", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: {
+        old: { id: "old", raw: "desktop", collapsed: false, parent: null, page: "Note", children: [] },
+      },
+      pages: [{
+        name: "Note",
+        kind: "page",
+        title: "Note",
+        preBlock: null,
+        roots: ["old"],
+        format: "md",
+        readOnly: false,
+        guide: false,
+        path: "pages/Note.md",
+      }],
+      feed: ["Note"],
+      loaded: true,
+    });
+    const resolveCopy = vi.fn(async () => resolved);
+    stubBackend({
+      syncConflictDiff: async () => copyDiff,
+      resolveSyncConflict: resolveCopy as unknown as Backend["resolveSyncConflict"],
+      activateEditor: async (path) => ({ activation: 17, target: path, prospective: false }),
+    });
+    const copyObject: ConflictObject = {
+      id: "copy:pages/Note.sync-conflict-20260817-101010-ABCDEFG.md",
+      source: "sync-copy",
+      page_name: "Note",
+      page_path: "pages/Note.md",
+      kind: "page",
+      sides: [
+        { role: "mine", label: "This device", path: "pages/Note.md" },
+        { role: "theirs", label: "Phone", path: "pages/Note.sync-conflict-20260817-101010-ABCDEFG.md" },
+      ],
+      block_conflicts: 1,
+    };
+    const { host, dispose } = mount(copyObject);
+    try {
+      await flush();
+      await flush();
+      [...host.querySelectorAll("button")]
+        .find((button) => button.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      await flush();
+      await flush();
+      const installed = pageByName("Note")!;
+      expect(installed.roots).toHaveLength(1);
+      expect(doc.byId[installed.roots[0]].raw).toBe("desktop and phone");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("does not commit a conflict-copy resolution over component-local uncommitted input", async () => {
+    const copyDiff: SyncConflictDiff = {
+      base_rev: "winner-rev",
+      conflict_rev: "copy-rev",
+      rows: [{ id: "0", kind: "modified", mine: view("desktop"), theirs: view("phone"), children: [] }],
+      mine_pre: null,
+      theirs_pre: null,
+      pre_differs: false,
+      blocks_identical: false,
+    };
+    setDoc({
+      byId: {
+        note: { id: "note", raw: "desktop", collapsed: false, parent: null, page: "Note", children: [] },
+      },
+      pages: [{
+        name: "Note",
+        kind: "page",
+        title: "Note",
+        preBlock: null,
+        roots: ["note"],
+        format: "md",
+        readOnly: false,
+        guide: false,
+        path: "pages/Note.md",
+      }],
+      feed: ["Note"],
+      loaded: true,
+    });
+    const resolveCopy = vi.fn(async () => {
+      throw new Error("must not be called");
+    });
+    stubBackend({
+      syncConflictDiff: async () => copyDiff,
+      resolveSyncConflict: resolveCopy as unknown as Backend["resolveSyncConflict"],
+    });
+    const releaseLease = takeEditorLease("Note");
+    const copyObject: ConflictObject = {
+      id: "copy:pages/Note.sync-conflict-20260822-120000-PHONE.md",
+      source: "sync-copy",
+      page_name: "Note",
+      page_path: "pages/Note.md",
+      kind: "page",
+      sides: [
+        { role: "mine", label: "This device", path: "pages/Note.md" },
+        { role: "theirs", label: "Phone", path: "pages/Note.sync-conflict-20260822-120000-PHONE.md" },
+      ],
+      block_conflicts: 1,
+    };
+    const { host, dispose } = mount(copyObject);
+    try {
+      await flush();
+      await flush();
+      [...host.querySelectorAll("button")]
+        .find((button) => button.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      expect(resolveCopy).not.toHaveBeenCalled();
+      expect(doc.byId.note.raw).toBe("desktop");
+    } finally {
+      releaseLease();
       dispose();
     }
   });

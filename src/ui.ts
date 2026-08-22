@@ -13,7 +13,7 @@ import type {
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
-import { route, focusBlock, scheduleSessionSave, type PageTarget } from "./router";
+import { route, focusBlock, openPageTarget, scheduleSessionSave, type PageTarget } from "./router";
 import { PaneContext } from "./paneContext";
 import { exitPaneSelect } from "./paneSelect";
 import { setJournalTitleFormat, isJournalTitle } from "./journal";
@@ -407,7 +407,9 @@ export function restoreLiveSaveConflicts(root: string): void {
 }
 
 function publishConflictQueue(): void {
-  setConflictQueueSignal([...artifactConflictQueue, ...liveSaveConflicts.values()]);
+  // A retained draft is the page's unsaved work and must be resolved before a
+  // disk artifact for that same page can safely replace its editor.
+  setConflictQueueSignal([...liveSaveConflicts.values(), ...artifactConflictQueue]);
 }
 
 /** Test/setup replacement of the complete queue. Production artifact refreshes
@@ -537,7 +539,7 @@ export async function refreshConflictQueueIfTouched(
 }
 
 /** Re-fetch the sync-conflict + VCS-marker lists; with `notify`, toast if any exist. */
-export async function refreshSyncConflicts(notify = false): Promise<void> {
+export async function refreshSyncConflicts(notify: boolean | "new" = false): Promise<void> {
   try {
     const c = await backend().listSyncConflicts();
     setSyncConflicts(c);
@@ -565,10 +567,34 @@ export async function refreshSyncConflicts(notify = false): Promise<void> {
     /* best-effort */
   }
   try {
+    const previousIds = new Set(artifactConflictQueue.map((conflict) => conflict.id));
     const before = conflictQueue().map((c) => c.id).join("\u0000");
     const queue = await backend().conflictQueue();
     replaceArtifactConflictQueue(queue);
     if (queue.map((c) => c.id).join("\u0000") !== before) resetConflictCursor();
+    if (notify === "new") {
+      const arrived = queue.filter((conflict) =>
+        conflict.source === "sync-copy" && !previousIds.has(conflict.id)
+      );
+      if (arrived.length) {
+        const first = arrived[0];
+        pushToast(
+          `${arrived.length} new sync conflict${arrived.length === 1 ? " needs" : "s need"} review`,
+          "info",
+          {
+            sticky: true,
+            action: {
+              label: "Review",
+              run: () => openPageTarget({
+                name: first.page_name,
+                pageKind: first.kind,
+                path: first.page_path,
+              }),
+            },
+          },
+        );
+      }
+    }
   } catch {
     // Best-effort like the two listings above: a missing queue means no badge,
     // never a broken app. The Settings fallback surface still works.

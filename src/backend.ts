@@ -535,7 +535,7 @@ export interface Backend {
     baseRev: string,
     conflictRev: string,
     preChoice?: "mine" | "theirs" | "union"
-  ): Promise<void>;
+  ): Promise<PageDto>;
   /** Discard a conflict copy without merging (move it to the recoverable trash). */
   trashSyncConflict(conflict: string): Promise<void>;
   /** Subscribe to the watcher's `conflicts-changed` event (a conflict copy
@@ -1375,7 +1375,7 @@ class TauriBackend implements Backend {
     conflictRev: string,
     preChoice?: "mine" | "theirs" | "union"
   ) {
-    return this.call<void>("resolve_sync_conflict", {
+    return this.call<PageDto>("resolve_sync_conflict", {
       winner,
       conflict,
       decisions,

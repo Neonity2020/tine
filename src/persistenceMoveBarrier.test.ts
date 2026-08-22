@@ -75,6 +75,7 @@ vi.mock("./ui", () => ({
   bumpDataRev: () => {},
   bumpPageInventoryRev: () => {},
   pushToast: () => {},
+  registerLiveSaveConflict: () => {},
 }));
 
 const { forceSave, holdSourcesForDest, markDirty, flushPage, reconcileExternalChange, resetSaveState } = await import("./persistence");

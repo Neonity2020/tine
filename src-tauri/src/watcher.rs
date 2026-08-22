@@ -1966,9 +1966,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
 }
 
 /// How the file-watcher detects external changes (device-local, in
-/// tine-settings.json): "inotify" (default on desktop) → a real OS watcher, no
-/// idle wakeups; "poll" (default on Android) → a 3s mtime scan for filesystems
-/// where inotify is flaky (some NFS, Android shared storage). See `start_watcher`.
+/// tine-settings.json): "inotify" (the default) → a real OS watcher, no idle
+/// wakeups; "poll" → a 3s mtime scan for filesystems where native events are
+/// unavailable or unreliable. Both feed the same full-diff reconciliation.
 fn watch_mode(app: &tauri::AppHandle) -> String {
     settings_path(app)
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -1978,13 +1978,11 @@ fn watch_mode(app: &tauri::AppHandle) -> String {
                 .and_then(|x| x.as_str().map(String::from))
         })
         .filter(|m| m == "poll" || m == "inotify")
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "android") {
-                "poll".to_string()
-            } else {
-                "inotify".to_string()
-            }
-        })
+        .unwrap_or_else(|| default_watch_mode().to_string())
+}
+
+fn default_watch_mode() -> &'static str {
+    "inotify"
 }
 
 #[tauri::command]
@@ -2013,6 +2011,11 @@ pub(crate) fn set_watch_mode(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn unset_watch_mode_prefers_native_events_on_every_platform() {
+        assert_eq!(default_watch_mode(), "inotify");
+    }
     use tine_core::model::{BlockDto, Format, PageDto};
     use tine_core::sync_runtime::SyncRuntimeLifecycle;
 

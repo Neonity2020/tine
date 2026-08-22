@@ -22,6 +22,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Applying a sync conflict no longer leaves the pre-merge editor behind.**
+  Concord now drains the page's pending save, blocks mutations for the guarded
+  merge, installs the exact page returned by the native commit, and only then
+  releases editing. This prevents the old open copy from immediately creating a
+  second conflict or appearing to undo the chosen merge. Newly delivered copies
+  also raise one actionable notice, and Android now defaults to its native
+  inotify-backed watcher; polling remains available and uses the same
+  reconciliation semantics. (GH #337.)
+
 - **Returning to Tine can no longer open an editor over a stale page.** A
   focus-driven disk scan now has an explicit native completion receipt, waits
   for frontend page application, and finally verifies only the visible/edited
