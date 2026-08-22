@@ -3,7 +3,7 @@
   "entries": [
     {
       "id": "UI-CONCORD-SYNC-COPY-HANDOFF-337",
-      "title": "Applying a sync conflict copy installs the exact committed merge, preserves a live Journals feed, and retires resolved notices",
+      "title": "Applying a sync conflict copy installs the exact committed merge and returns the journal to ordinary conflict-free editing",
       "family": "external-change-conflict-resolution",
       "sources": {
         "issues": [337],
@@ -25,7 +25,7 @@
         "scenario": "concord.sync-copy-exact-editor-handoff",
         "failBefore": "proven"
       },
-      "notes": "Martin's 2026-08-22 Direct Files tests exposed three phases of the same incomplete handoff: the pre-merge editor remained installed and could manufacture another conflict; resolving today's journal could let a watcher feed restart omit that mutation-held day until app restart; and sticky conflict-arrival notices outlived the derived conflict they described. The correction contract requires event-independent discovery, a quiescent exact-DTO handoff, journal-feed deferral across explicit mutation ownership, and notification retirement under both inotify and polling."
+      "notes": "Martin's 2026-08-22 Direct Files tests exposed a continuing incomplete handoff: the pre-merge editor could remain installed; resolving today's journal could omit that mutation-held day; sticky notices could outlive the object; a winner-file watcher event declined during mutation ownership remained parked until the next edit and then looked divergent; an older inventory refresh could republish an already-resolved conflict; and a same-content resolution could lose its disk baseline so the next edit reopened Concord. The correction contract requires event-independent discovery, a quiescent exact-DTO handoff, atomic journal-feed publication, immediate replay when explicit ownership releases, newest-generation inventory publication, notification retirement, and a successful ordinary post-resolution edit after both changed-content and same-content handoffs."
     },
     {
       "id": "UI-BLOCK-SELECTION-ACTION-OWNERSHIP-240",

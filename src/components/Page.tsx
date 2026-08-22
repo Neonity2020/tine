@@ -104,14 +104,27 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
       if (generation === feedGeneration && ownerIsLive(owner)) pendingFeedRestart = true;
       return;
     }
+    // The page can become owned while the backend request is in flight. Never
+    // begin installing a feed response that is already known to be unsafe.
+    if (feedHasActiveEdit()) {
+      pendingFeedRestart = true;
+      return;
+    }
     // Clear the deferred flag before loadFeed synchronously updates doc.feed;
     // otherwise the intentionally reactive pending-retry effect observes the
     // old true value during that store write and starts a duplicate restart.
     pendingFeedRestart = false;
-    await loadFeed(withToday(response.pages), {
+    const installed = await loadFeed(withToday(response.pages), {
       endEdit: false,
       expectedGraphBinding: owner.graphBinding,
     });
+    // Installation rechecks every page at its final replacement boundary. A
+    // mutation may begin after the post-request check above; in that case keep
+    // the old feed atomically and replay after ownership releases.
+    if (!installed) {
+      pendingFeedRestart = true;
+      return;
+    }
     journalAsOfDay = response.as_of_day;
     nextBeforeDay = response.next_before_day;
     feedDone = response.done;

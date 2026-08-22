@@ -4,8 +4,10 @@ import { PageConflictResolution } from "./ConflictResolution";
 import { __setBackendForTest, type Backend } from "../backend";
 import {
   doc,
+  loadSingle,
   pageByName,
   resetStore,
+  setRaw,
   setDoc,
   takeEditorLease,
 } from "../store";
@@ -474,6 +476,7 @@ describe("in-page conflict resolution", () => {
       ],
       live: { page: draft, base_rev: "editor-base-rev", conflict_epoch: 42, draft_version: 1 },
     };
+    loadSingle(draft);
     const { host, dispose } = mount(liveObject);
     try {
       await flush();
@@ -488,10 +491,56 @@ describe("in-page conflict resolution", () => {
       await flush();
       expect(resolve).toHaveBeenCalledTimes(1);
       const [page, baseRev, epoch, decisions] = resolve.mock.calls[0];
-      expect(page).toEqual(draft);
+      expect(page).toMatchObject({
+        name: draft.name,
+        path: draft.path,
+        blocks: draft.blocks,
+      });
       expect(baseRev).toBe("editor-base-rev");
       expect(epoch).toBe(42);
       expect(decisions).toEqual({ "1": "mine", "2": "theirs", "3": "both" });
+    } finally {
+      dispose();
+    }
+  });
+
+  it("requires a fresh review instead of discarding a draft changed after the live diff appeared", async () => {
+    const draft: PageDto = {
+      name: "Note",
+      kind: "page",
+      title: "Note",
+      pre_block: null,
+      path: "pages/Note.md",
+      blocks: [{ id: "1", raw: "reviewed draft", collapsed: false, children: [] }],
+    };
+    loadSingle(draft);
+    const resolve = vi.fn(async (page: PageDto) => ({ ...page, rev: "resolved-rev" }));
+    stubBackend({ resolveLiveSaveConflict: resolve as Backend["resolveLiveSaveConflict"] });
+    const liveObject: ConflictObject = {
+      id: "live:pages/Note.md",
+      source: "live-save",
+      page_name: "Note",
+      page_path: "pages/Note.md",
+      kind: "page",
+      sides: [
+        { role: "mine", label: "Your retained draft" },
+        { role: "theirs", label: "Current file on disk" },
+        { role: "base", label: "Last version this editor loaded" },
+      ],
+      live: { page: draft, base_rev: "base", conflict_epoch: 9, draft_version: 1 },
+    };
+    const { host, dispose } = mount(liveObject);
+    try {
+      await flush();
+      await flush();
+      setRaw("1", "reviewed draft plus a newer edit");
+      [...host.querySelectorAll("button")]
+        .find((button) => button.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      await flush();
+      expect(resolve).not.toHaveBeenCalled();
+      expect(doc.byId["1"].raw).toBe("reviewed draft plus a newer edit");
     } finally {
       dispose();
     }
@@ -516,6 +565,11 @@ describe("in-page conflict resolution", () => {
     restoreLiveSaveConflicts("/graph");
     const restored = conflictQueue()[0];
     expect(restored.live?.page.blocks[0].raw).toBe("draft");
+    loadSingle({
+      ...draft,
+      rev: "disk-rev",
+      blocks: [{ id: "disk", raw: "disk from phone", collapsed: false, children: [] }],
+    });
 
     const resolve = vi.fn(async (
       _page: PageDto,
@@ -541,6 +595,7 @@ describe("in-page conflict resolution", () => {
       await flush();
       await flush();
       expect(resolve).toHaveBeenCalledTimes(1);
+      expect(resolve.mock.calls[0][0].blocks[0].raw).toBe("draft");
       expect(resolve.mock.calls[0][1]).toBe("disk-rev");
     } finally {
       dispose();

@@ -34,6 +34,7 @@ import {
   setCollapsedDescendants,
   visibleOrder,
   setRaw,
+  setEditorActivation,
   undo,
   redo,
   selectBlock,
@@ -83,6 +84,7 @@ import {
   appendToTodayJournal,
   captureToPage,
 } from "./store";
+import { saveBaselineFor, setBaseRev } from "./persistence";
 import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
 import { splitProps, joinProps, isBuiltinHidden, hideAll } from "./editor/properties";
@@ -361,6 +363,19 @@ beforeEach(() => {
   setRightSidebar([]);
   setCopyIncludeSubtree(false); // copy prefs default OFF; reset so tests don't leak
   setCopyStripCollapsed(false);
+});
+
+describe("same-content revision adoption", () => {
+  it("adopts the exact returned revision even when Concord hydration keeps the existing instance", async () => {
+    const dto = load([blk("winner content")]);
+    setEditorActivation("Test", 77);
+    setBaseRev("Test", null);
+
+    await expect(ensurePageLoaded({ ...dto, rev: "resolved-winner-rev" })).resolves.toBeNull();
+
+    expect(saveBaselineFor("Test")).toBe("resolved-winner-rev");
+    expect(pageToDto("Test")?.blocks[0].raw).toBe("winner content");
+  });
 });
 
 describe("managed quick-capture admission", () => {

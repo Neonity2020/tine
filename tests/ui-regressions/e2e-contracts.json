@@ -1024,7 +1024,7 @@
     {
      "class": "exact-safety-interoperability",
      "authority": "Concord sync-copy handoff contract approved by Martin on 2026-08-22.",
-     "userOutcome": "A delivered conflict copy on today's journal is discovered in native-event and polling modes; applying keep-both installs and durably retains the exact committed merge, keeps today in the Journals feed, retires its notice, and does not create a second conflict after autosave or restart.",
+     "userOutcome": "A delivered conflict copy on today's journal is discovered in native-event and polling modes; applying keep-both or a same-content keep-mine result installs and durably retains the exact committed page, keeps today in the Journals feed, retires its notice, and ordinary post-resolution editing saves without reopening Concord before or after restart.",
      "blocking": true
     },
     {
@@ -1042,7 +1042,7 @@
     "Generated block identities and conflict-trash filename."
    ],
       "stability": "burn-in",
-   "notes": "Added after field sequences where Apply wrote the merge but the pre-merge editor remained installed, then expanded when a current-journal resolution disappeared from the live feed and its sticky notice survived. The journey asserts the file, visible current journal, notice retirement, save-debounce settlement, copy retirement, and process restart in both watcher modes."
+   "notes": "Added after field sequences where Apply wrote the merge but the pre-merge editor remained installed, then expanded when a current-journal resolution disappeared from the live feed and its sticky notice survived. The journey asserts the file, visible current journal, notice retirement, save-debounce settlement, copy retirement, and process restart in both watcher modes; TINE_E2E_CONCORD_DECISION=mine additionally proves that same-content handoff adopts the returned revision before ordinary editing resumes."
   },
   "scripts/e2e-concord-focus-freshness.mjs": {
    "contracts": [

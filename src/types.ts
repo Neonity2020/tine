@@ -745,6 +745,9 @@ export interface LiveSaveConflictSnapshot {
   base_text?: string | null;
   /** Exact disk revision the current review is aligned against. */
   disk_rev?: string;
+  /** This retained draft was rehydrated after process restart. The ordinary
+   * disk-loaded editor is not its replacement authority. */
+  restored?: boolean;
 }
 
 export interface LiveSaveConflictCapture {

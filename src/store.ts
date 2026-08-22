@@ -343,6 +343,14 @@ export function holdPageMutationUi(pages: readonly string[]): () => void {
     if (released) return;
     released = true;
     setManagedMoveBusy(held, false);
+    // Releasing explicit ownership is a real replacement-gate transition, just
+    // like ending an edit or draining a save. A winner-file watcher event can
+    // arrive while Concord owns the page and be deferred by
+    // reloadPageIfStillSafe; leaving that event parked until the user's next
+    // keystroke makes the fresh edit look divergent and opens Concord again.
+    // Sweep only after every held page is released; each watcher re-checks the
+    // full gate synchronously before it is notified.
+    sweepReplaceable();
   };
 }
 
@@ -765,7 +773,13 @@ export async function ensurePageLoaded(
   }
 
   // Already active exact-instance hydration is the idempotent fast path.
-  if (sameInstanceHydration && editorActivationFor(dto.name) !== undefined) return null;
+  if (sameInstanceHydration && editorActivationFor(dto.name) !== undefined) {
+    // Exact same-content hydration still carries new disk authority. Skipping
+    // this adoption after Concord Apply left the winner open with no baseline,
+    // so the next ordinary edit correctly looked like a brand-new conflict.
+    setBaseRev(dto.name, dto.rev ?? null);
+    return null;
+  }
 
   let handle: EditorActivationHandle | null = null;
   const editable = !dto.read_only && !dto.guide;
@@ -830,6 +844,7 @@ export async function ensurePageLoaded(
   }
 
   if (sameInstanceHydration) {
+    setBaseRev(dto.name, dto.rev ?? null);
     if (handle) recordEditorActivation(dto.name, handle);
     return null;
   }
@@ -1484,7 +1499,7 @@ export function loadSingle(dto: PageDto, opts: { endEdit?: boolean } = {}) {
 export async function loadFeed(
   dtos: PageDto[],
   opts: { endEdit?: boolean; expectedGraphBinding?: number } = {},
-) {
+): Promise<boolean> {
   // Publication FOLLOWS installation. When the DTO is declined the name used to
   // be published into the feed anyway, so the feed rendered a dirty path-pinned
   // stray as though it were the requested canonical journal — no refusal, no
@@ -1499,13 +1514,15 @@ export async function loadFeed(
   const binding = opts.expectedGraphBinding ?? graphBinding();
   const installed: string[] = [];
   for (const dto of dtos) {
-    if (await upsertUnlessDirty(dto, binding)) installed.push(dto.name);
+    if (!(await upsertUnlessDirty(dto, binding))) return false;
+    installed.push(dto.name);
   }
-  if (binding !== graphBinding()) return;
+  if (binding !== graphBinding()) return false;
   setDoc("feed", installed);
   setDoc("loaded", true);
   if (opts.endEdit !== false) endEdit("page-navigation");
   evictIfNeeded();
+  return true;
 }
 
 /** Append more pages to the journals feed (infinite scroll). */

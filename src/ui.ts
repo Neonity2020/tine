@@ -401,7 +401,12 @@ function persistLiveSaveConflicts(): boolean {
 export function restoreLiveSaveConflicts(root: string): void {
   liveSaveConflicts.clear();
   for (const item of readStoredLiveConflicts()) {
-    if (item.root === root) liveSaveConflicts.set(item.conflict.page_name, item.conflict);
+    if (item.root === root && item.conflict.live) {
+      liveSaveConflicts.set(item.conflict.page_name, {
+        ...item.conflict,
+        live: { ...item.conflict.live, restored: true },
+      });
+    }
   }
   publishConflictQueue();
 }
@@ -509,6 +514,11 @@ let conflictCursor = 0;
 let syncConflictInventoryToast: number | undefined;
 let vcsConflictInventoryToast: number | undefined;
 const artifactArrivalToasts = new Map<number, Set<string>>();
+// Inventory calls include several awaited filesystem walks. Only the newest
+// refresh episode may publish: a conflicts-changed scan begun before Apply can
+// otherwise finish after the guarded native resolution and resurrect the exact
+// conflict object the user just settled.
+let artifactConflictRefreshGeneration = 0;
 
 function retireToast(id: number | undefined): void {
   if (id !== undefined) dismissToast(id);
@@ -534,6 +544,7 @@ function retireSettledArtifactArrivalToasts(queue: ConflictObject[]): void {
 export function settleArtifactConflict(id: string): void {
   const settled = artifactConflictQueue.find((conflict) => conflict.id === id);
   if (!settled) return;
+  ++artifactConflictRefreshGeneration;
   replaceArtifactConflictQueue(artifactConflictQueue.filter((conflict) => conflict.id !== id));
   resetConflictCursor();
   if (settled.source === "sync-copy") {
@@ -586,8 +597,10 @@ export async function refreshConflictQueueIfTouched(
 
 /** Re-fetch the sync-conflict + VCS-marker lists; with `notify`, toast if any exist. */
 export async function refreshSyncConflicts(notify: boolean | "new" = false): Promise<void> {
+  const generation = ++artifactConflictRefreshGeneration;
   try {
     const c = await backend().listSyncConflicts();
+    if (generation !== artifactConflictRefreshGeneration) return;
     setSyncConflicts(c);
     if (!c.length) {
       retireToast(syncConflictInventoryToast);
@@ -611,6 +624,7 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
   }
   try {
     const m = await backend().listVcsMarkerConflicts();
+    if (generation !== artifactConflictRefreshGeneration) return;
     setVcsMarkerConflicts(m);
     if (!m.length) {
       retireToast(vcsConflictInventoryToast);
@@ -636,6 +650,7 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
     const previousIds = new Set(artifactConflictQueue.map((conflict) => conflict.id));
     const before = conflictQueue().map((c) => c.id).join("\u0000");
     const queue = await backend().conflictQueue();
+    if (generation !== artifactConflictRefreshGeneration) return;
     replaceArtifactConflictQueue(queue);
     retireSettledArtifactArrivalToasts(queue);
     if (queue.map((c) => c.id).join("\u0000") !== before) resetConflictCursor();
@@ -667,7 +682,7 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
   } catch {
     // Best-effort like the two listings above: a missing queue means no badge,
     // never a broken app. The Settings fallback surface still works.
-    replaceArtifactConflictQueue([]);
+    if (generation === artifactConflictRefreshGeneration) replaceArtifactConflictQueue([]);
   }
 }
 

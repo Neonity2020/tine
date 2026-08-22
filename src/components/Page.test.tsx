@@ -468,6 +468,47 @@ describe("Journals feed generation lifecycle", () => {
     }
   });
 
+  it("keeps today visible when Concord acquires it while a journal refresh is in flight", async () => {
+    const today = journalTitle(new Date());
+    const older = "August 21st, 2026";
+    setDoc({
+      byId: {
+        today: node("today", "visible today", today),
+        older: node("older", "visible older", older),
+      },
+      pages: [page(today, "journal", ["today"]), page(older, "journal", ["older"])],
+      feed: [today, older],
+      loaded: true,
+    });
+    let land!: (response: JournalFeedPage) => void;
+    const api = vi.spyOn(backend(), "journalFeedPage")
+      .mockImplementationOnce(() => new Promise((resolve) => { land = resolve; }))
+      .mockResolvedValue(feedResponse([
+        journalDto(today, "fresh today"),
+        journalDto(older, "fresh older"),
+      ]));
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      expect(api).toHaveBeenCalledTimes(1);
+      const release = holdPageMutationUi([today]);
+      land(feedResponse([
+        journalDto(today, "response today"),
+        journalDto(older, "response older"),
+      ]));
+      await flushMicrotasks();
+      expect(doc.feed).toEqual([today, older]);
+      expect(pageByName(today)?.roots.map((id) => doc.byId[id].raw)).toEqual(["visible today"]);
+
+      release();
+      await vi.waitFor(() => expect(api).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(pageByName(today)?.roots.map((id) => doc.byId[id].raw)).toEqual(["fresh today"]));
+      expect(doc.feed).toEqual([today, older]);
+    } finally {
+      mounted.dispose();
+    }
+  });
+
   it("retains the old feed after a current-generation error and retries it", async () => {
     const today = journalTitle(new Date());
     setDoc({

@@ -27,6 +27,7 @@ import {
   clearConflict,
   conflictQueue,
   pushToast,
+  refreshLiveSaveConflictDraft,
   refreshSyncConflicts,
   settleArtifactConflict,
   updateLiveSaveConflictDiskRev,
@@ -34,7 +35,6 @@ import {
 import {
   dropObservation,
   flushPageToQuiescence,
-  forgetSaveState,
   holdManagedMovePages,
   isDirty,
   isSaving,
@@ -45,11 +45,12 @@ import {
   editorTransactionGeneration,
   hasEditorLease,
   holdPageMutationUi,
+  pageToDto,
   pageInstanceGeneration,
   reloadPage,
 } from "../store";
 import { DiffRowView, collectRows, seedSuggestedOrNoLoss } from "./DiffRows";
-import type { ConflictObject, DiffRow, MergeDecision, SyncConflictDiff } from "../types";
+import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
 
 /** The side labels the artifact itself supplied, shortened for a row segment. */
 function segLabel(text: string, fallback: string): string {
@@ -182,20 +183,93 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     try {
       if (source === "live-save") {
         if (!live) return;
+        // The diff is an exact review of `live.page`, not a standing grant to
+        // write whatever happened to be in the editor when Apply was clicked.
+        // Freeze this page, then prove the current draft is still the reviewed
+        // one before crossing the native write boundary. This closes the normal
+        // debounce window where post-conflict typing had not yet refreshed the
+        // stored capsule and was silently replaced by the resolved DTO.
+        if (hasEditorLease(pageName)) {
+          pushToast("Finish the current edit, then apply this resolution.", "info");
+          return;
+        }
+        releasePageUi = holdPageMutationUi([pageName]);
+        const instance = pageInstanceGeneration(pageName);
+        const edit = editGeneration(pageName);
+        const transaction = editorTransactionGeneration(pageName);
+        const reviewedDraft = pageToDto(pageName);
+        if (!reviewedDraft || instance === null) {
+          pushToast("This page is no longer open. Open it again before applying the resolution.", "error");
+          return;
+        }
+        if (
+          pageInstanceGeneration(pageName) !== instance
+          || editGeneration(pageName) !== edit
+          || editorTransactionGeneration(pageName) !== transaction
+          || hasEditorLease(pageName)
+        ) {
+          alignment = undefined;
+          void refetch();
+          pushToast("The open page changed while Tine prepared the merge. Review the refreshed comparison.", "info");
+          return;
+        }
+        // Both snapshots came from pageToDto. Ignore only backend-populated
+        // revision metadata; every editable semantic/identity field must match.
+        const snapshot = (page: PageDto) => JSON.stringify({
+          name: page.name,
+          kind: page.kind,
+          title: page.title,
+          pre_block: page.pre_block,
+          blocks: page.blocks,
+          format: page.format ?? "md",
+          path: page.path ?? "",
+          guide: page.guide ?? false,
+          read_only: page.read_only ?? false,
+        });
+        // After restart, the editor is deliberately loaded from the current
+        // disk winner while `live.page` is the only retained copy of the user's
+        // unsaved draft. The disk-loaded editor must never overwrite that
+        // capsule merely because their contents differ. If the user has since
+        // edited the reopened disk page, preserve both and require a deliberate
+        // follow-up policy; otherwise Apply resolves the exact retained draft
+        // whose comparison is on screen.
+        if (live.restored && isDirty(pageName)) {
+          pushToast(
+            "This reopened page also has new edits. Finish or preserve them before resolving the recovered draft.",
+            "info",
+          );
+          return;
+        }
+        if (!live.restored && snapshot(reviewedDraft) !== snapshot(live.page)) {
+          refreshLiveSaveConflictDraft(reviewedDraft);
+          alignment = undefined;
+          void refetch();
+          pushToast("Your draft changed. Review the updated comparison, then apply it again.", "info");
+          return;
+        }
+        const draftToResolve = live.restored ? live.page : reviewedDraft;
+        releasePageSaves = holdManagedMovePages([pageName]);
         const resolved = live.disk_rev !== undefined
           ? await backend().resolveDurableLiveSaveConflict(
-            live.page,
+            draftToResolve,
             live.disk_rev,
             decisions(),
             preChoice(),
           )
           : await backend().resolveLiveSaveConflict(
-            live.page,
+            draftToResolve,
             live.base_rev,
             live.conflict_epoch,
             decisions(),
             preChoice(),
           );
+        if (
+          pageInstanceGeneration(pageName) !== instance
+          || editGeneration(pageName) !== edit
+          || editorTransactionGeneration(pageName) !== transaction
+        ) {
+          throw new Error("the resolved file was committed, but the open editor changed; reopen the page to load the exact result");
+        }
         // The guarded native command is the durable resolution boundary. Clear
         // the capsule there, before editor replacement waits to retire the old
         // activation: retirement can be slow, but it must not keep presenting a
@@ -272,7 +346,6 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           throw new Error("the resolved file was committed, but the open editor changed; reopen the page to load the exact result");
         }
         dropObservation(pageName);
-        forgetSaveState(pageName);
         clearConflict(pageName);
         const refusal = await reloadPage(resolved);
         if (refusal) {

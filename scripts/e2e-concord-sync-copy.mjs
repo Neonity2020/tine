@@ -2,8 +2,9 @@
 //
 // A recognized Syncthing conflict copy arrives while its winner is open. Both
 // native-event and polling modes must derive the same queue, surface the review,
-// commit keep-both, install that exact page, and stay settled past autosave and
-// a process restart.
+// commit the requested decision (keep-both by default, or same-content
+// keep-mine), install that exact page, and stay settled past autosave and a
+// process restart.
 //
 // Usage:
 //   TINE_APP=/path/to/tine TINE_E2E_WATCH_MODE=inotify node scripts/e2e-concord-sync-copy.mjs
@@ -22,6 +23,7 @@ const suffix = mode === "poll" ? "poll" : "native";
 const G = `/tmp/tgraph-concord-sync-copy-${suffix}`;
 const corpus = process.env.TINE_E2E_CONCORD_CORPUS;
 const target = process.env.TINE_E2E_CONCORD_TARGET === "note" ? "note" : "journal";
+const decision = process.env.TINE_E2E_CONCORD_DECISION === "mine" ? "mine" : "both";
 const APP = process.env.TINE_APP || `${process.env.HOME}/research/tine`;
 const TD = process.env.TAURI_DRIVER
   || (process.env.CARGO_HOME ? `${process.env.CARGO_HOME}/bin/tauri-driver` : "tauri-driver");
@@ -112,7 +114,8 @@ async function openTarget(browser) {
 async function assertMergedUi(browser, phase) {
   await browser.waitUntil(async () => {
     const text = await browser.$(".page-blocks").getText();
-    return text.includes("desktop version") && text.includes("phone version");
+    return text.includes("desktop version")
+      && (decision === "both" ? text.includes("phone version") : !text.includes("phone version"));
   }, { timeout: 15_000, timeoutMsg: `${phase}: exact merged page was not installed` });
 }
 
@@ -134,16 +137,20 @@ try {
     for (const button of document.querySelectorAll(".page-conflict button")) {
       const text = button.textContent?.trim();
       if (text === "Keep both everywhere") button.setAttribute("data-concord-keep-both", "true");
+      if (text === "Keep This device") button.setAttribute("data-concord-keep-mine", "true");
       if (text === "Apply resolution") button.setAttribute("data-concord-apply", "true");
     }
   });
-  await browser.$('[data-concord-keep-both="true"]').click();
+  await browser.$(decision === "both"
+    ? '[data-concord-keep-both="true"]'
+    : '[data-concord-keep-mine="true"]').click();
   const applyStarted = performance.now();
   await browser.$('[data-concord-apply="true"]').click();
 
   await waitForFileText(
     pageFile,
-    (text) => text.includes("desktop version") && text.includes("phone version"),
+    (text) => text.includes("desktop version")
+      && (decision === "both" ? text.includes("phone version") : !text.includes("phone version")),
     `${mode} conflict-copy merge`,
   );
   const durableMs = performance.now() - applyStarted;
@@ -172,6 +179,37 @@ try {
     throw new Error("a second conflict appeared after the save debounce");
   }
 
+  // The resolution episode is not complete until ordinary editing resumes.
+  // Android exposed a parked winner-write replay here: the first new block woke
+  // the stale watcher event, which re-opened Concord and could also drop today
+  // from the Journals feed. Exercise the literal user continuation rather than
+  // treating an inert resolved screen as sufficient proof.
+  const resolvedSection = await browser.$(".page-section");
+  const resolvedTitle = await resolvedSection.$("h1.page-title").getText();
+  const trailing = await resolvedSection.$(".page-trailing-block-target");
+  await trailing.waitForDisplayed({ timeout: 10_000 });
+  await trailing.click();
+  const editor = await browser.$("textarea.block-editor");
+  await editor.waitForDisplayed({ timeout: 10_000 });
+  await editor.addValue("post resolution edit");
+  await browser.$("h1.page-title").click();
+  await waitForFileText(
+    pageFile,
+    (text) => text.includes("post resolution edit"),
+    `${mode} post-resolution edit`,
+  );
+  await sleep(2500);
+  if ((await browser.$$(".page-conflict")).length !== 0) {
+    throw new Error("ordinary editing after resolution reopened Concord");
+  }
+  await browser.waitUntil(async () => {
+    const sections = await browser.$$(".page-section");
+    for (const section of sections) {
+      if (await section.$(`h1.page-title=${resolvedTitle}`).isExisting()) return true;
+    }
+    return false;
+  }, { timeout: 10_000, timeoutMsg: "resolved current journal disappeared after ordinary editing resumed" });
+
   await browser.deleteSession();
   browser = undefined;
   await sleep(1200);
@@ -181,8 +219,8 @@ try {
   if ((await browser.$$(".page-conflict")).length !== 0) {
     throw new Error("resolved conflict returned after restart");
   }
-  console.log(`TIMING: ${mode}/${target}${corpus ? "/corpus" : ""} apply durable=${durableMs.toFixed(1)}ms visible=${visibleMs.toFixed(1)}ms settled=${settledMs.toFixed(1)}ms`);
-  console.log(`PASS: ${mode} conflict-copy discovery and exact editor handoff`);
+  console.log(`TIMING: ${mode}/${target}/${decision}${corpus ? "/corpus" : ""} apply durable=${durableMs.toFixed(1)}ms visible=${visibleMs.toFixed(1)}ms settled=${settledMs.toFixed(1)}ms`);
+  console.log(`PASS: ${mode} ${decision} conflict-copy discovery and exact editor handoff`);
 } catch (error) {
   failure = error;
   console.error("FAIL:", error?.message ?? error);

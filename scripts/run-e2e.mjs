@@ -171,6 +171,8 @@ const suites = {
     ["concord-live-save", "scripts/e2e-concord-live-save.mjs", {}],
     ["concord-sync-copy-native", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "inotify" }],
     ["concord-sync-copy-poll", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "poll" }],
+    ["concord-sync-copy-native-same-content", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "inotify", TINE_E2E_CONCORD_DECISION: "mine" }],
+    ["concord-sync-copy-poll-same-content", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "poll", TINE_E2E_CONCORD_DECISION: "mine" }],
     ["rendered-delete-verify", "scripts/e2e-rendered-delete-verify.mjs", {}],
     ["delete-selection-timing", "scripts/e2e-delete-selection-timing.mjs", {}],
     ["selection-actions", "scripts/e2e-selection-actions.mjs", {}],

@@ -9,6 +9,7 @@ import {
   refreshSyncConflicts,
   resetConflictCursor,
   setConflictQueue,
+  settleArtifactConflict,
   setToasts,
   toasts,
 } from "../ui";
@@ -138,6 +139,43 @@ describe("the queue after an external change", () => {
     await refreshSyncConflicts();
     expect(conflictQueue()).toEqual([]);
     expect(toasts()).toEqual([]);
+  });
+
+  it("does not resurrect a resolved conflict from an older inventory refresh", async () => {
+    const arrived: ConflictObject = {
+      id: "copy:pages/Alpha.sync-conflict-20260822-120000-PHONE.md",
+      source: "sync-copy",
+      page_name: "Alpha",
+      page_path: "pages/Alpha.md",
+      kind: "page",
+      sides: [
+        { role: "mine", label: "This device", path: "pages/Alpha.md" },
+        { role: "theirs", label: "Phone", path: "pages/Alpha.sync-conflict-20260822-120000-PHONE.md" },
+      ],
+      block_conflicts: 1,
+    };
+    setConflictQueue([arrived]);
+    let publishOlder!: (queue: ConflictObject[]) => void;
+    const older = new Promise<ConflictObject[]>((resolve) => { publishOlder = resolve; });
+    __setBackendForTest({
+      listSyncConflicts: async () => [],
+      listVcsMarkerConflicts: async () => [],
+      conflictQueue: async () => older,
+      // Full-suite graph setup may finish its independent warm-cache probe while
+      // this deliberately delayed inventory is active. Keep that unrelated
+      // callback inside the backend contract instead of leaking an unhandled
+      // missing-method rejection from this race fixture.
+      warmDone: async () => false,
+    } as unknown as Backend);
+
+    const refresh = refreshSyncConflicts();
+    await flush();
+    settleArtifactConflict(arrived.id);
+    expect(conflictQueue()).toEqual([]);
+    publishOlder([arrived]);
+    await refresh;
+
+    expect(conflictQueue()).toEqual([]);
   });
 
   it("re-derives only when the change touched something queued", async () => {

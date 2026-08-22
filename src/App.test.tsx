@@ -14,6 +14,7 @@ import {
   resetStore,
   setBlockMoving,
   setDoc,
+  holdPageMutationUi,
   takeEditorLease,
   type FeedPage,
   type Node as StoreNode,
@@ -720,6 +721,24 @@ describe("deferred replay of externally changed pages skipped mid-edit", () => {
 
     release();
 
+    await vi.waitFor(() => expect(visibleRaws()).toEqual(["fresh from disk"]));
+  });
+
+  it("replays the winner self-write declined during an explicit Concord mutation as soon as ownership releases", async () => {
+    loadedStalePage();
+    const release = holdPageMutationUi([name]);
+    const getPage = vi.spyOn(backend(), "getPage").mockResolvedValue(diskPage());
+
+    // The winner write can arrive while Concord owns the exact page. It is
+    // correctly deferred, but it must not remain parked until the user's next
+    // keystroke turns that stale event into a false dirty-page conflict.
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+    expect(getPage).toHaveBeenCalledTimes(1);
+    expect(visibleRaws()).toEqual(["loaded elsewhere"]);
+
+    release();
+
+    await vi.waitFor(() => expect(getPage).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(visibleRaws()).toEqual(["fresh from disk"]));
   });
 });

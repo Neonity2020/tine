@@ -29,7 +29,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   second conflict or appearing to undo the chosen merge. Newly delivered copies
   also raise one actionable notice which retires with the resolved conflict;
   resolving today's journal updates it in place without dropping it from the
-  live Journals feed. Android now defaults to its native
+  live Journals feed. Deferred winner-file events are replayed as soon as the
+  guarded mutation releases, and an older inventory scan cannot resurrect the
+  resolved conflict when ordinary editing resumes. Same-content resolutions now
+  keep the returned disk revision, an in-flight Journals refresh cannot publish
+  a partial feed without today, and Apply refuses to discard edits made after a
+  live-conflict comparison was shown. After restart, a recovered unsaved draft
+  remains the reviewed side instead of being overwritten by the disk-loaded
+  editor. Android now defaults to its native
   inotify-backed watcher; polling remains available and uses the same
   reconciliation semantics. (GH #337.)
 
