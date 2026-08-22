@@ -2414,6 +2414,10 @@ export function Editor(props: { id: string }): JSX.Element {
   });
 
   let acTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => {
+    clearTimeout(acTimer);
+    acTimer = undefined;
+  });
   const refreshAutocompleteAfterInput = () => {
     // Close the popup synchronously when the trigger ends (instant), but debounce
     // the page/template IPC fetch so holding down a key doesn't fire a backend
@@ -2443,7 +2447,9 @@ export function Editor(props: { id: string }): JSX.Element {
       setAcItems([]);
     }
     clearTimeout(acTimer);
-    acTimer = setTimeout(() => void updateAutocomplete(), 90);
+    acTimer = setTimeout(() => {
+      if (editorMounted && node()) void updateAutocomplete();
+    }, 90);
   };
   const applyFullWidthRefReplace = () => {
     const paired = fullWidthRefReplace(ref.value, ref.selectionStart);

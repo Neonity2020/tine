@@ -16,7 +16,8 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "crates/tine-core/src/model.rs::tests::concord live save conflict cases",
+          "crates/tine-core/src/model.rs::tests::concord_live_save_conflict_uses_editor_base_and_guarded_resolution",
+          "crates/tine-core/src/model.rs::tests::concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk",
           "src/components/ConflictResolution.test.tsx",
           "scripts/e2e-concord-live-save.mjs"
         ],

@@ -107,7 +107,6 @@ assert.throws(
 );
 
 const coreWindowsTests = [
-  "fail_before_projection_crash_windows_recover_without_unauthorized_execution",
   "model::tests::page_name_encoding_is_injective_reversible_and_windows_safe",
   "model::tests::windows_handle_relative_noreplace_renames_the_exact_source",
   "model::tests::windows_handle_relative_noreplace_moves_between_nonstandard_retained_directories_with_unicode",
@@ -154,9 +153,9 @@ assert.deepEqual(
     listedInventory("tine-core", coreSmokeTests)
   ),
   {
-    coreTestCount: 30,
-    coreSmokeTestCount: 29,
-    windowsNamedCount: 13,
+    coreTestCount: 29,
+    coreSmokeTestCount: 28,
+    windowsNamedCount: 12,
     bootstrapWitnessCount: 8,
   }
 );

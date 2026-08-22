@@ -939,11 +939,12 @@ Two further rules keep the settlement honest:
   report on both the success and the failure path so that cause stays visible.
 
 The structural claim — a clean runtime never reaches the legacy publication
-settlement — is enforced by tests
-(`clean_runtime_application_save_settles_its_own_retained_publication`,
-`clean_runtime_application_save_defers_when_retained_publication_cannot_settle`),
-which assert the actor's legacy-settlement counter stays at zero, not by this
-paragraph.
+settlement — is enforced by
+`clean_runtime_application_save_never_enters_legacy_publication_settlement`,
+which asserts the actor's legacy-settlement counter stays at zero, not by this
+paragraph. Durable foreground saves now enter the journal continuation directly;
+the pre-journal retained-publication settlement described by older revisions of
+this section is retired.
 
 The settlement budget is an upper bound, not a target. A retry that reproduces
 the **same phase and the same failure detail** as the previous turn has made no
@@ -989,7 +990,7 @@ The class split is enforced by tests, not by this table:
 and `model::tests::only_the_reconstructible_projection_barrier_degrades_on_android`
 at the primitive, and
 `sync_runtime::tests::clean_runtime_save_survives_an_android_projection_directory_barrier_refusal`
-plus `…::a_projection_directory_barrier_refusal_still_fails_closed_off_android`
+plus `…::a_projection_directory_barrier_refusal_stays_pending_off_android`
 at the save boundary.
 
 ### 2.10b No-clobber publication when the filesystem has no rename flags
@@ -1061,18 +1062,19 @@ recovery name, publishing the staged bytes onto the live name, withdrawing an
 unsafe publication, restoring a displaced target, retiring a recovery artifact
 into quarantine, and preserving a changed recovery artifact as a projection
 conflict. The graph-tree write paths that are *not* on that leg —
-`managed_atomic_create_with_proof`, `managed_atomic_write_with_conflict`,
-`managed_atomic_replace_bound`, `managed_move_noreplace` — keep the strict
-class, because in Direct Files the graph tree is the sole authority for those
-bytes.
+`managed_atomic_create_with_proof`, `managed_atomic_write_with_conflict`, and
+`managed_move_noreplace` — keep the strict class, because in Direct Files the
+graph tree is the sole authority for those bytes. `managed_atomic_replace_bound`
+is explicitly classified by its caller: Direct Files remains strict, while an
+already-journaled managed projection uses the reconstructible fallback for all
+three replacement transitions and their directory barriers.
 
 Enforced by `model::tests::only_the_reconstructible_projection_rename_falls_back_when_the_flag_is_unsupported`,
 `…::the_projection_rename_fallback_refuses_an_occupied_destination_rather_than_clobbering_it`,
 `…::a_projection_rename_fallback_that_cannot_complete_leaves_no_empty_destination`,
 and at the save boundary by
 `sync_runtime::tests::clean_runtime_save_survives_a_projection_rename_capability_refusal`
-(which also compares the displacement artifacts against an uninjected control
-save) plus `…::a_non_capability_errno_from_the_projection_rename_still_fails_closed`.
+plus `…::a_non_capability_errno_from_the_projection_rename_stays_pending`.
 
 ### 2.10c The shared-provider tree without rename flags, including the exchange
 

@@ -480,6 +480,39 @@ enum ProjectionParentCapture {
     Present(ProjectionParent),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorPublicationAuthority {
+    /// The Markdown/Org file is the sole durable authority (Direct Files).
+    DirectFile,
+    /// The file is a rebuildable managed-storage projection whose durable
+    /// authority is the accepted journal/manifest.
+    ReconstructibleManagedProjection,
+}
+
+fn preflight_editor_publication_chain(
+    authority: EditorPublicationAuthority,
+    chain: &[Dir],
+) -> io::Result<()> {
+    match authority {
+        EditorPublicationAuthority::DirectFile => preflight_projection_chain(chain),
+        EditorPublicationAuthority::ReconstructibleManagedProjection => {
+            preflight_reconstructible_projection_chain(chain)
+        }
+    }
+}
+
+fn sync_editor_publication_chain(
+    authority: EditorPublicationAuthority,
+    chain: &[Dir],
+) -> io::Result<()> {
+    match authority {
+        EditorPublicationAuthority::DirectFile => sync_projection_chain_required(chain),
+        EditorPublicationAuthority::ReconstructibleManagedProjection => {
+            sync_reconstructible_projection_chain(chain)
+        }
+    }
+}
+
 fn validate_projection_attempt(
     target: &ProjectionTarget,
     attempt: &ProjectionAttemptReservation,
@@ -8773,6 +8806,7 @@ impl Graph {
         expected_identity: ContentDigest,
         expected_bytes: Option<&[u8]>,
         editor_episode: Option<&ConflictEditorEpisode>,
+        publication_authority: EditorPublicationAuthority,
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -8805,7 +8839,7 @@ impl Graph {
             }
             return Err(error);
         }
-        preflight_projection_chain(&target.chain)?;
+        preflight_editor_publication_chain(publication_authority, &target.chain)?;
         let temp = create_editor_staged_recovery(target.parent(), &target.filename, bytes)?;
         let staged_identity = match (|| {
             let staged_file = open_projection_file_nofollow(target.parent(), &temp)?;
@@ -8856,7 +8890,15 @@ impl Graph {
                 }
                 return Err(error);
             }
-            rename_projection_noreplace(target.parent(), &target.filename, &recovery)?;
+            let rename_noreplace = |from: &str, to: &str| match publication_authority {
+                EditorPublicationAuthority::DirectFile => {
+                    rename_projection_noreplace(target.parent(), from, to)
+                }
+                EditorPublicationAuthority::ReconstructibleManagedProjection => {
+                    rename_reconstructible_projection_noreplace(target.parent(), from, to)
+                }
+            };
+            rename_noreplace(&target.filename, &recovery)?;
             retired = true;
 
             let (retired_file, retired_bytes) =
@@ -8864,7 +8906,7 @@ impl Graph {
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
             validate_graph_text_single_link(&retired_file, managed_path.as_str())?;
             drop(retired_file);
-            sync_projection_chain_required(&target.chain)?;
+            sync_editor_publication_chain(publication_authority, &target.chain)?;
             if retired_identity != expected_identity
                 || expected_bytes.is_some_and(|expected| retired_bytes != expected)
             {
@@ -8887,9 +8929,7 @@ impl Graph {
             validate_graph_text_single_link(&staged_file, managed_path.as_str())?;
             drop(staged_file);
 
-            if let Err(error) =
-                rename_projection_noreplace(target.parent(), &temp, &target.filename)
-            {
+            if let Err(error) = rename_noreplace(&temp, &target.filename) {
                 if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
                     conflict_site = Some(EditorConflictSite::ReplacePublicationCollision);
                 }
@@ -8897,7 +8937,7 @@ impl Graph {
             }
             published = true;
             journal_projection_after_publish_hook()?;
-            sync_projection_chain_required(&target.chain)?;
+            sync_editor_publication_chain(publication_authority, &target.chain)?;
             if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
                 &managed_path,
@@ -8915,7 +8955,7 @@ impl Graph {
             }
             target.parent().remove_file(&recovery)?;
             retired = false;
-            sync_projection_chain_required(&target.chain)
+            sync_editor_publication_chain(publication_authority, &target.chain)
         })();
 
         let outcome = match result {
@@ -8937,12 +8977,27 @@ impl Graph {
                             ));
                         }
                         validate_graph_text_single_link(&recovery_file, managed_path.as_str())?;
-                        rename_projection_noreplace(target.parent(), &recovery, &target.filename)
+                        match publication_authority {
+                            EditorPublicationAuthority::DirectFile => rename_projection_noreplace(
+                                target.parent(),
+                                &recovery,
+                                &target.filename,
+                            ),
+                            EditorPublicationAuthority::ReconstructibleManagedProjection => {
+                                rename_reconstructible_projection_noreplace(
+                                    target.parent(),
+                                    &recovery,
+                                    &target.filename,
+                                )
+                            }
+                        }
                     });
                     match restore {
                         Ok(()) => {
                             retired = false;
-                            if let Err(sync_error) = sync_projection_chain_required(&target.chain) {
+                            if let Err(sync_error) =
+                                sync_editor_publication_chain(publication_authority, &target.chain)
+                            {
                                 Err(io::Error::new(
                                     primary.kind(),
                                     format!(
@@ -15688,8 +15743,17 @@ impl Graph {
                 format,
             );
             let content = serialize_pdf_hls_page(&page_path, &page_doc, None)?;
-            let page_rev = self
-                .commit_editor_write(&write, &page_path, &content, None, true, None, None, None)?;
+            let page_rev = self.commit_editor_write(
+                &write,
+                &page_path,
+                &content,
+                None,
+                true,
+                None,
+                None,
+                None,
+                EditorPublicationAuthority::DirectFile,
+            )?;
             let name = crate::pdf::hls_page_name(&key);
             let entry = PageEntry {
                 name,
@@ -16158,6 +16222,7 @@ impl Graph {
                 None,
                 None,
                 None,
+                EditorPublicationAuthority::DirectFile,
             ) {
                 Ok(rev) => rev,
                 Err(page_error) => {
@@ -18340,6 +18405,7 @@ impl Graph {
         expected_identity: Option<ContentDigest>,
         editor_episode: Option<&ConflictEditorEpisode>,
         creation_proof: Option<DirectCreationProof>,
+        publication_authority: EditorPublicationAuthority,
     ) -> io::Result<String> {
         let create_parent = creation_proof.is_none();
         let (rev, ()) = self.commit_write(
@@ -18358,6 +18424,7 @@ impl Graph {
                     identity,
                     recheck.then_some(baseline).flatten().map(str::as_bytes),
                     editor_episode,
+                    publication_authority,
                 ),
                 (None, Some(creation_proof)) if baseline.is_none() => self
                     .managed_atomic_create_with_proof(
@@ -19956,6 +20023,7 @@ impl Graph {
                 Some(plan.expected_identity),
                 None,
                 None,
+                EditorPublicationAuthority::ReconstructibleManagedProjection,
             )?;
         }
 
@@ -20420,6 +20488,7 @@ impl Graph {
                 expected_identity,
                 editor_episode,
                 creation_proof,
+                EditorPublicationAuthority::DirectFile,
             )?
         } else {
             content_rev(&content)
@@ -32740,6 +32809,99 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The artifact classification must cover the whole guarded replacement,
+    /// not only standalone projection publication. Android refused the first
+    /// target-retirement rename in this transaction before the staged bytes
+    /// could be published.
+    #[cfg(unix)]
+    #[test]
+    fn managed_projection_replacement_falls_back_but_direct_files_stays_strict() {
+        use crate::filesystem_durability::DurabilityArtifactClass;
+
+        let dir = scratch("managed-replacement-artifact-class");
+        let path = dir.join("pages/Target.md");
+        fs::write(&path, b"- original\n").unwrap();
+        let graph = Graph::open(&dir);
+        let write = graph.admit_managed_text_writer().unwrap();
+        let identity =
+            canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
+
+        {
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EINVAL,
+                &dir.join("pages"),
+            )
+            .unwrap();
+            graph
+                .managed_atomic_replace_bound(
+                    &write,
+                    &path,
+                    b"- managed replacement\n",
+                    identity,
+                    Some(b"- original\n"),
+                    None,
+                    EditorPublicationAuthority::ReconstructibleManagedProjection,
+                )
+                .expect("a reconstructible managed projection must use the capability fallback");
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"- managed replacement\n");
+
+        let managed_identity =
+            canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
+        {
+            let _refusal = InjectedProjectionDirectoryBarrierFailure::enter(
+                DurabilityArtifactClass::SharedReconstructibleProjection,
+                libc::EINVAL,
+                true,
+                &dir.join("pages"),
+            )
+            .unwrap();
+            graph
+                .managed_atomic_replace_bound(
+                    &write,
+                    &path,
+                    b"- managed barrier replacement\n",
+                    managed_identity,
+                    Some(b"- managed replacement\n"),
+                    None,
+                    EditorPublicationAuthority::ReconstructibleManagedProjection,
+                )
+                .expect("a reconstructible managed projection may degrade an Android barrier");
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"- managed barrier replacement\n");
+
+        let managed_identity =
+            canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap();
+        {
+            let _refusal = InjectedProjectionNoreplaceRenameFailure::enter(
+                DurabilityArtifactClass::PrivateDurableAuthority,
+                libc::EINVAL,
+                &dir.join("pages"),
+            )
+            .unwrap();
+            let error = graph
+                .managed_atomic_replace_bound(
+                    &write,
+                    &path,
+                    b"- direct replacement\n",
+                    managed_identity,
+                    Some(b"- managed barrier replacement\n"),
+                    None,
+                    EditorPublicationAuthority::DirectFile,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"- managed barrier replacement\n",
+            "Direct Files must not weaken the sole-authority publication contract"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn android_shared_storage_permission_refusal_is_only_a_flagged_rename_capability_answer() {
@@ -41128,12 +41290,24 @@ mod tests {
         .unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
+        graph.list_pages();
 
         let mut existing = graph.load_by_path("pages/Existing.md").unwrap().unwrap();
         existing.blocks[0].raw = "after".into();
         graph
             .save_page(&existing, existing.rev.as_deref())
             .expect("identity-preserving existing save");
+        let (inventory_generation, inventory_entries) = graph
+            .page_list_cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("content-only save must retain the warm page inventory");
+        assert_eq!(inventory_generation, graph.cache_generation());
+        assert!(inventory_entries
+            .iter()
+            .any(|entry| entry.rel_path == "pages/Existing.md"));
         let installed = graph
             .effective_identity_index
             .read()

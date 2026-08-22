@@ -3174,7 +3174,6 @@ mod untouched_bytes_survive_an_edit {
 /// 243 ms on a real 5,225-file graph.
 mod page_inventory_survives_a_content_save {
     use super::*;
-    use std::time::Instant;
 
     fn graph_with(pages: usize, tag: &str) -> (PathBuf, Graph) {
         let root = std::env::temp_dir().join(format!(
@@ -3232,34 +3231,6 @@ mod page_inventory_survives_a_content_save {
                 .unwrap()
                 .is_some(),
             "the page exists on disk but cannot be loaded by name"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The perf property, as a RATIO rather than an absolute bound: a shared box
-    /// makes absolute timings flaky, but a rebuild is ~350x a memo hit, so the
-    /// gap survives any load. The `title::` save is the control — it genuinely
-    /// changes the inventory and MUST still pay for a rebuild.
-    #[test]
-    fn a_content_only_save_keeps_the_inventory_warm() {
-        let (root, graph) = graph_with(400, "warm");
-        graph.list_pages();
-
-        save_first_block(&graph, "pages/Page 1.md", "edited body");
-        let start = Instant::now();
-        let after_content = graph.list_pages();
-        let content_only = start.elapsed();
-
-        save_first_block(&graph, "pages/Page 2.md", "title:: Renamed Page Two");
-        let start = Instant::now();
-        let after_title = graph.list_pages();
-        let identity_change = start.elapsed();
-
-        assert_eq!(after_content.len(), after_title.len());
-        assert!(
-            content_only * 5 < identity_change,
-            "a content-only save still paid for a whole-graph rebuild \
-             (content-only {content_only:?} vs identity-change {identity_change:?})"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

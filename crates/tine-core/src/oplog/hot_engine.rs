@@ -9059,6 +9059,34 @@ impl ShardedHotEngine {
         }
     }
 
+    /// Restore the journal cursor represented by an authenticated drain
+    /// checkpoint. Checkpointed records already live in canonical accepted
+    /// history, so replaying them into the hot overlay would apply them twice;
+    /// nevertheless the next foreground append must continue after that
+    /// durable prefix rather than starting again at sequence zero.
+    pub(crate) fn resume_checkpointed_managed_local_prefix(
+        &mut self,
+        next_sequence: u64,
+    ) -> Result<(), ManagedLocalRecordError> {
+        if self.local_overlay.next_sequence == next_sequence {
+            return Ok(());
+        }
+        if self.local_overlay.next_sequence != 0
+            || !self.local_overlay.entries.is_empty()
+            || !self.local_overlay.documents.is_empty()
+            || !self.local_overlay.document_heads.is_empty()
+            || !self.local_overlay.block_claims.is_empty()
+        {
+            return Err(ManagedLocalRecordError::OutOfOrder {
+                expected: self.local_overlay.next_sequence,
+                found: next_sequence,
+            });
+        }
+        self.local_overlay.next_sequence = next_sequence;
+        self.advance_author_mutation_generation();
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn rewrite_managed_local_authority_endpoint_for_test(
         &mut self,
@@ -36770,16 +36798,17 @@ mod validation_tests {
         crate::test_support::remove_dir_all(root);
     }
 
-    /// The clean write path has exactly two staging entry points.
+    /// The clean write path has exactly three staging entry points.
     ///
     /// `stage_ready_internal` / `stage_ready_scratch` are reached from
     /// production only through `stage_ready_with_claim_source`, and that
-    /// helper is called only by the clean replay and the clean commit. The
+    /// helper is called only by clean replay, clean commit, and the bounded
+    /// acceptance of a clean prepared batch below the managed-local overlay. The
     /// legacy `stage_ready` / `stage_from_store` pair is `#[cfg(test)]` and
     /// cannot reach it at all. Widening this set widens the audited write
     /// path, so the set is pinned here rather than asserted in a comment.
     #[test]
-    fn stage_ready_with_claim_source_has_exactly_the_two_clean_entry_points() {
+    fn stage_ready_with_claim_source_has_exactly_the_three_clean_entry_points() {
         let source = include_str!("hot_engine.rs");
         let production = source
             .split("#[cfg(test)]\nmod validation_tests")
@@ -36816,13 +36845,17 @@ mod validation_tests {
         );
         assert_eq!(
             callers,
-            vec!["replay_clean_committed_tail", "commit_clean_prepared"],
-            "only the clean replay and the clean commit may stage with a claim source"
+            vec![
+                "replay_clean_committed_tail",
+                "commit_clean_prepared",
+                "accept_clean_prepared_below_managed_local_overlay",
+            ],
+            "only the three audited clean paths may stage with a claim source"
         );
         assert_eq!(
             production.matches("stage_ready_with_claim_source").count(),
-            3,
-            "one declaration plus exactly two clean-path call sites"
+            4,
+            "one declaration plus exactly three clean-path call sites"
         );
         for legacy in [
             "#[cfg(test)]\n    pub fn stage_ready(",

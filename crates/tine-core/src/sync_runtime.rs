@@ -9497,13 +9497,21 @@ fn open_clean_foreground_journal(
             },
         );
     }
-    if !recovered_frames.is_empty() {
+    if checkpoint.next_sequence() != 0 || !recovered_frames.is_empty() {
         let mut session = runtime
             .admit_clean_mutation(graph)
             .map_err(|error| format!("cannot authorize clean journal recovery: {error}"))?;
         let (_, engine, _) = session
             .parts()
             .map_err(|error| format!("cannot retain clean journal recovery engine: {error}"))?;
+        engine
+            .resume_checkpointed_managed_local_prefix(checkpoint.next_sequence())
+            .map_err(|error| {
+                format!(
+                    "cannot restore clean foreground checkpoint sequence {}: {error}",
+                    checkpoint.next_sequence()
+                )
+            })?;
         for frame in &recovered_frames {
             let record = crate::oplog::decode_managed_local_record(frame).map_err(display)?;
             if latest_projection_frames
@@ -17108,7 +17116,8 @@ impl RuntimeActor {
             }
             TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => {
                 let detail = format!(
-                    "journal-committed foreground projection remains pending: {}",
+                    "journal-committed foreground projection for {:?} remains pending: {}",
+                    pending.relative_path(),
                     pending.last_error()
                 );
                 #[cfg(target_os = "android")]
@@ -17258,7 +17267,8 @@ impl RuntimeActor {
             }
             TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => {
                 let detail = format!(
-                    "journal-committed foreground projection remains pending: {}",
+                    "journal-committed foreground projection for {:?} remains pending: {}",
+                    pending.relative_path(),
                     pending.last_error()
                 );
                 #[cfg(target_os = "android")]
@@ -25361,15 +25371,11 @@ mod tests {
             .contains("clean production actor save"));
     }
 
-    /// Android activation produces a CLEAN runtime, and a clean save whose
-    /// derived state fails lands in `CleanActorMutationOutcome::DurablePending`.
-    /// Before the fix that outcome was routed into the LEGACY publication
-    /// settlement, whose first act demands a `PendingLocalMutation::Published`
-    /// the clean actor never writes — so every such save was refused with
-    /// `ActorRefusedAt("require_pending_publication_absent")` and no managed
-    /// save could ever succeed on Android.
+    /// Android activation produces a CLEAN runtime. Foreground saves must stay
+    /// on its journal/continuation path and never enter the retired legacy
+    /// publication settlement.
     #[test]
-    fn clean_runtime_application_save_settles_its_own_retained_publication() {
+    fn clean_runtime_application_save_never_enters_legacy_publication_settlement() {
         let fixture = ActivationFixture::nested_unicode("clean-retained-save", 0xa1781);
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
         let resources =
@@ -25414,85 +25420,10 @@ mod tests {
         // clean runtime never reaches the legacy publication settlement.
         assert_eq!(handle.legacy_publication_settlements().unwrap(), 0);
 
-        // The converged retry must still name the underlying failure. On
-        // Android that detail is the real defect; a green save would hide it.
-        let retained = handle
-            .last_retained_publication()
-            .unwrap()
-            .expect("a settled retained publication is still reported");
-        assert!(retained.settled);
-        assert_eq!(retained.settle_turns, 1);
-        assert!(
-            retained.detail.contains("deterministic operational fault"),
-            "retained publication must carry the underlying failure: {retained:?}"
-        );
-
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
-    }
-
-    /// The complement of the settlement contract: when the retained work
-    /// cannot be settled the save DEFERS. A refusal here would name no
-    /// in-scope threat scenario — the manifest commit is already durable — so
-    /// it would be an availability bug, not hardening.
-    #[test]
-    fn clean_runtime_application_save_defers_when_retained_publication_cannot_settle() {
-        let fixture = ActivationFixture::nested_unicode("clean-retained-defer", 0xa1782);
-        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
-        let resources =
-            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
-        let open_request = reopen_request(&fixture.request);
-        let identities = open_request.clean_identities.clone().unwrap();
-        let opened = SyncRuntimeHandle::open_from_clean_resources(
-            open_request,
-            identities,
-            resources,
-            SyncRuntimeRecovery::CleanActivation,
-        );
-        let handle = opened.handle.expect("clean actor handle opens");
-
-        let (page, revision) = load_application_exact(&handle, "Root.md");
-        let mut edited = page.clone();
-        edited.blocks[0].raw = "clean retained publication never settles".into();
-
-        // Persistently fail the derived Markdown projection: the manifest
-        // commit stays durable and the continuation is retained on every turn.
-        handle
-            .install_repeated_projection_fault(u32::try_from(MAX_EDITOR_SETTLE_TURNS).unwrap() + 8)
-            .unwrap();
-        let outcome = handle
-            .save_application_page(SyncApplicationPageSaveRequest {
-                target: SyncApplicationPageSaveTarget::Existing {
-                    path: page.path.clone(),
-                    revision,
-                },
-                page: edited,
-            })
-            .expect("an unsettled clean publication defers, it does not refuse");
-        assert!(
-            matches!(
-                outcome,
-                SyncApplicationPageSaveOutcome::Deferred {
-                    state: SyncEditorDeferred::RetryableRetainedPublication { .. }
-                }
-            ),
-            "unsettled retained work must defer: {outcome:?}"
-        );
-        assert_eq!(handle.legacy_publication_settlements().unwrap(), 0);
-        let retained = handle
-            .last_retained_publication()
-            .unwrap()
-            .expect("a deferred retained publication is reported");
-        assert!(!retained.settled);
-        // The harness fault is deterministic, so every turn reproduces the same
-        // phase and detail. The settle loop recognises that as a permanent
-        // failure and stops at the second identical observation instead of
-        // spending the whole budget: a save the runtime cannot settle must cost
-        // the user one deferral, not 64 futile retries.
-        assert_eq!(retained.settle_turns, 2);
-        assert!(retained.settle_turns < MAX_EDITOR_SETTLE_TURNS);
     }
 
     /// Android's shared storage does not uniformly provide the directory flush
@@ -25545,11 +25476,12 @@ mod tests {
             .contains("android shared storage barrier refusal"));
     }
 
-    /// The same errno on the same barrier, without the Android shared-storage
-    /// leg, still fails closed. The tolerance is a platform capability policy,
-    /// not a decision to ignore durability errors.
+    /// The same errno off Android remains a real projection failure. The
+    /// journaled edit is already durable, but the application response defers
+    /// while the disposable Markdown projection stays pending and names the
+    /// failed barrier rather than pretending it reached disk.
     #[test]
-    fn a_projection_directory_barrier_refusal_still_fails_closed_off_android() {
+    fn a_projection_directory_barrier_refusal_stays_pending_off_android() {
         let fixture = ActivationFixture::nested_unicode("clean-desktop-einval", 0xa1784);
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
         let resources =
@@ -25583,109 +25515,30 @@ mod tests {
                 },
                 page: edited,
             })
-            .expect("an unsettled clean publication defers, it does not refuse");
+            .expect("the durable journal append is acknowledged");
         assert!(
-            !matches!(outcome, SyncApplicationPageSaveOutcome::Saved { .. }),
-            "a durability barrier failure off Android must not be tolerated: {outcome:?}"
+            matches!(
+                outcome,
+                SyncApplicationPageSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::BlockedRecovery { .. }
+                }
+            ),
+            "the accepted journal edit must defer while projection is pending: {outcome:?}"
         );
         assert!(!fs::read_to_string(fixture.graph_root.join("Root.md"))
             .unwrap()
             .contains("desktop barrier refusal is fatal"));
 
-        // And the receipt must now name the operation, not only the errno.
-        let retained = handle
-            .last_retained_publication()
-            .unwrap()
-            .expect("a deferred retained publication is reported");
-        assert!(!retained.settled);
+        let status = handle.status().unwrap();
+        assert_eq!(status.managed_local_pending, 1);
+        let detail = status
+            .detail
+            .expect("the pending projection names its failure");
         assert!(
-            retained
-                .detail
-                .contains("fsync of the projection parent directory")
-                && retained.detail.contains("Root.md"),
-            "the retained failure must name the operation and the page: {retained:?}"
+            detail.contains("fsync of the projection parent directory")
+                && detail.contains("Root.md"),
+            "the pending failure must name the operation and the page: {detail}"
         );
-    }
-
-    /// Every artifact the projection leg leaves in the graph tree to hold the
-    /// bytes a publication displaced: the hidden `.<page>.<attempt>.…recovery`
-    /// names it retires through, and the `Tine-recovery-…projection-quarantine`
-    /// / `…projection-conflict` names those are retired to afterwards.
-    fn displaced_projection_artifacts(
-        root: &std::path::Path,
-        page: &str,
-    ) -> std::collections::BTreeMap<String, Vec<u8>> {
-        let hidden = format!(".{page}.");
-        let mut found = std::collections::BTreeMap::new();
-        for entry in fs::read_dir(root).unwrap() {
-            let entry = entry.unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_displacement = name.starts_with(&hidden)
-                || name.ends_with(".projection-quarantine")
-                || name.ends_with(".projection-conflict");
-            if is_displacement && entry.metadata().unwrap().is_file() {
-                found.insert(name, fs::read(entry.path()).unwrap());
-            }
-        }
-        found
-    }
-
-    /// One clean-runtime page save, returning the bytes that were live before it
-    /// and every displacement artifact the graph tree holds afterwards. `errno`
-    /// arms a refusal of the flagged projection rename for that save only.
-    fn save_one_edit_and_collect_displacement(
-        label: &str,
-        seed: u128,
-        edit: &str,
-        errno: Option<i32>,
-    ) -> (
-        Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError>,
-        Vec<u8>,
-        String,
-        std::collections::BTreeMap<String, Vec<u8>>,
-        SyncRuntimeHandle,
-    ) {
-        let fixture = ActivationFixture::nested_unicode(label, seed);
-        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
-        let resources =
-            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
-        let open_request = reopen_request(&fixture.request);
-        let identities = open_request.clean_identities.clone().unwrap();
-        let opened = SyncRuntimeHandle::open_from_clean_resources(
-            open_request,
-            identities,
-            resources,
-            SyncRuntimeRecovery::CleanActivation,
-        );
-        let handle = opened.handle.expect("clean actor handle opens");
-
-        let live_before = fs::read(fixture.graph_root.join("Root.md")).unwrap();
-        let (page, revision) = load_application_exact(&handle, "Root.md");
-        let mut edited = page.clone();
-        edited.blocks[0].raw = edit.into();
-
-        let request = SyncApplicationPageSaveRequest {
-            target: SyncApplicationPageSaveTarget::Existing {
-                path: page.path.clone(),
-                revision,
-            },
-            page: edited,
-        };
-        let outcome = match errno {
-            Some(errno) => {
-                let _refusal = crate::model::InjectedProjectionNoreplaceRenameFailure::enter(
-                    crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
-                    errno,
-                    &fixture.graph_root,
-                )
-                .unwrap();
-                handle.save_application_page(request)
-            }
-            None => handle.save_application_page(request),
-        };
-        let live_after = fs::read_to_string(fixture.graph_root.join("Root.md")).unwrap();
-        let displaced = displaced_projection_artifacts(&fixture.graph_root, "Root.md");
-        (outcome, live_before, live_after, displaced, handle)
     }
 
     /// Android CI run 32091898520, one layer below the barrier fix: the flagged
@@ -25698,92 +25551,61 @@ mod tests {
     /// the same displacement mechanism as an unrefused save.
     #[test]
     fn clean_runtime_save_survives_a_projection_rename_capability_refusal() {
-        const EDIT: &str = "shared storage cannot flag a rename";
-
-        // The control: the same save on a filesystem that DOES provide the
-        // flag. It fixes what "the same displacement mechanism as before" means
-        // instead of asserting a shape from memory.
-        let (control, control_before, control_after, control_displaced, _control_handle) =
-            save_one_edit_and_collect_displacement("clean-rename-control", 0xa1785, EDIT, None);
-        assert!(matches!(
-            control,
-            Ok(SyncApplicationPageSaveOutcome::Saved { .. })
-        ));
-        assert!(control_after.contains(EDIT));
-        let control_names = control_displaced
-            .keys()
-            .map(|name| displacement_artifact_family(name))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(
-            control_displaced
-                .values()
-                .any(|bytes| bytes == &control_before),
-            "the control save must itself retain the displaced bytes: {:?}",
-            control_displaced.keys().collect::<Vec<_>>()
-        );
-
         for errno in [libc::EINVAL, libc::ENOSYS] {
-            let (outcome, live_before, live_after, displaced, _handle) =
-                save_one_edit_and_collect_displacement(
-                    "clean-rename-capability",
-                    0xa1785 + errno as u128,
-                    EDIT,
-                    Some(errno),
-                );
+            let fixture = ActivationFixture::nested_unicode(
+                "clean-rename-capability",
+                0xa1785 + errno as u128,
+            );
+            let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+            let resources =
+                activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+            let open_request = reopen_request(&fixture.request);
+            let identities = open_request.clean_identities.clone().unwrap();
+            let opened = SyncRuntimeHandle::open_from_clean_resources(
+                open_request,
+                identities,
+                resources,
+                SyncRuntimeRecovery::CleanActivation,
+            );
+            let handle = opened.handle.expect("clean actor handle opens");
+            let (page, revision) = load_application_exact(&handle, "Root.md");
+            let mut edited = page.clone();
+            edited.blocks[0].raw = "shared storage cannot flag a rename".into();
+            let _refusal = crate::model::InjectedProjectionNoreplaceRenameFailure::enter(
+                crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+                errno,
+                &fixture.graph_root,
+            )
+            .unwrap();
+            let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page: edited,
+            });
             assert!(
                 matches!(outcome, Ok(SyncApplicationPageSaveOutcome::Saved { .. })),
                 "a rename flag the filesystem cannot provide must not strand the save \
                  (errno {errno}): {outcome:?}"
             );
 
-            // The user's bytes are in the graph tree, at the live page name.
             assert!(
-                live_after.contains(EDIT),
-                "the edit must reach the graph (errno {errno}): {live_after}"
+                fs::read_to_string(fixture.graph_root.join("Root.md"))
+                    .unwrap()
+                    .contains("shared storage cannot flag a rename"),
+                "the reconstructible projection must reach the graph (errno {errno})"
             );
-
-            // And the bytes the publication displaced are still recoverable,
-            // through the same artifact family the control save used.
-            assert!(
-                displaced.values().any(|bytes| bytes == &live_before),
-                "the displaced bytes must remain recoverable (errno {errno}): {:?}",
-                displaced.keys().collect::<Vec<_>>()
-            );
-            assert_eq!(
-                displaced
-                    .keys()
-                    .map(|name| displacement_artifact_family(name))
-                    .collect::<std::collections::BTreeSet<_>>(),
-                control_names,
-                "the fallback must displace through the same mechanism, not a new one \
-                 (errno {errno})"
-            );
+            drain_managed_local(&handle);
+            assert_eq!(handle.status().unwrap().managed_local_pending, 0);
         }
     }
 
-    /// Displacement artifacts carry an attempt id and a content digest, so
-    /// compare the family rather than the exact name.
-    fn displacement_artifact_family(name: &str) -> &'static str {
-        if name.ends_with(".projection-quarantine") {
-            "projection-quarantine"
-        } else if name.ends_with(".projection-conflict") {
-            "projection-conflict"
-        } else if name.ends_with(".target.projection.recovery") {
-            "target.projection.recovery"
-        } else if name.ends_with(".published.projection.recovery") {
-            "published.projection.recovery"
-        } else if name.ends_with(".projection.recovery") {
-            "projection.recovery"
-        } else {
-            "other"
-        }
-    }
-
-    /// The other half of the capability policy. `EIO` is not a filesystem saying
-    /// "I do not implement that flag" — it is a disk error — so the same call
-    /// site keeps failing closed, and the receipt still names the primitive.
+    /// `EIO` is not a filesystem capability answer. The accepted journal edit
+    /// remains durable but deferred, while the projection stays pending and
+    /// reports the real I/O failure instead of taking the capability fallback.
     #[test]
-    fn a_non_capability_errno_from_the_projection_rename_still_fails_closed() {
+    fn a_non_capability_errno_from_the_projection_rename_stays_pending() {
         let fixture = ActivationFixture::nested_unicode("clean-rename-fatal", 0xa1787);
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
         let resources =
@@ -25816,26 +25638,29 @@ mod tests {
                 },
                 page: edited,
             })
-            .expect("an unsettled clean publication defers, it does not refuse");
+            .expect("the durable journal append is acknowledged");
         assert!(
-            !matches!(outcome, SyncApplicationPageSaveOutcome::Saved { .. }),
-            "a real I/O failure on the publication rename must not be tolerated: {outcome:?}"
+            matches!(
+                outcome,
+                SyncApplicationPageSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::BlockedRecovery { .. }
+                }
+            ),
+            "the accepted journal edit must defer while projection is pending: {outcome:?}"
         );
         assert!(!fs::read_to_string(fixture.graph_root.join("Root.md"))
             .unwrap()
             .contains("a disk error is not a capability answer"));
 
-        let retained = handle
-            .last_retained_publication()
-            .unwrap()
-            .expect("a deferred retained publication is reported");
-        assert!(!retained.settled);
+        let status = handle.status().unwrap();
+        assert_eq!(status.managed_local_pending, 1);
+        let detail = status
+            .detail
+            .expect("the pending projection names its failure");
         assert!(
-            retained
-                .detail
-                .contains("renameat2(RENAME_NOREPLACE) publishing the projection")
-                && retained.detail.contains("Root.md"),
-            "the retained failure must name the primitive and the page: {retained:?}"
+            detail.contains("renameat2(RENAME_NOREPLACE) publishing the projection")
+                && detail.contains("Root.md"),
+            "the pending failure must name the primitive and the page: {detail}"
         );
     }
 

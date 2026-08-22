@@ -54,7 +54,7 @@
           "crates/tine-core/src/model.rs::generation_bound_identity_validation_avoids_save_time_graph_reparse",
           "crates/tine-core/src/model.rs::default_journal_format_creates_journal",
           "crates/tine-core/src/model.rs::direct_cold_creation_joins_a_paused_paced_warm",
-          "crates/tine-core/src/model.rs::concurrent_direct_creation_proofs_join_one_build_and_census_independently",
+          "crates/tine-core/src/model.rs::concurrent_direct_creation_proofs_join_one_build_without_graph_censuses",
           "crates/tine-core/src/model.rs::racing_save_page_creators_serialize_and_reuse_one_published_build",
           "crates/tine-core/src/model.rs::late_page_build_claim_after_completed_install_is_non_owner",
           "crates/tine-core/src/model.rs::generation_drift_before_direct_install_refuses_without_retry_or_census",
@@ -1961,8 +1961,7 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "crates/tine-core/src/sync_runtime.rs::clean_actor_escalates_a_deterministic_retained_retry_to_a_named_stuck_state",
-          "crates/tine-core/src/sync_runtime.rs::clean_runtime_application_save_defers_when_retained_publication_cannot_settle"
+          "crates/tine-core/src/sync_runtime.rs::clean_actor_escalates_a_deterministic_retained_retry_to_a_named_stuck_state"
         ],
         "scenario": "sync.projection-r6-deterministic-refusal-liveness",
         "failBefore": "proven"
@@ -2469,13 +2468,13 @@
         "tests": [
           "crates/tine-core/src/model.rs::missing_target_creation_ignores_the_retained_shadow_peak_limit",
           "crates/tine-core/src/model.rs::direct_creation_census_accepts_aggregate_above_retained_byte_limit",
-          "crates/tine-core/src/model.rs::missing_target_creation_has_two_censuses_and_zero_shadow_or_parse_work",
+          "crates/tine-core/src/model.rs::missing_target_creation_has_zero_graph_census_shadow_or_parse_work",
           "crates/tine-core/src/model.rs::identity_preserving_existing_save_keeps_creation_evidence_warm",
           "crates/tine-core/src/model.rs::identity_changing_existing_save_refreshes_creation_evidence",
-          "crates/tine-core/src/model.rs::same_path_same_length_retitle_without_reconciliation_refuses_creation",
-          "crates/tine-core/src/model.rs::cache_generation_change_during_creation_census_fails_without_retry",
+          "crates/tine-core/src/model.rs::same_path_same_length_retitle_after_reconciliation_refuses_creation",
+          "crates/tine-core/src/model.rs::missing_target_creation_refuses_an_externally_retitled_owner",
           "crates/tine-core/src/model.rs::creation_refuses_historical_arbitrary_and_explicit_semantic_owners",
-          "crates/tine-core/src/model.rs::creation_refuses_hardlinks_without_changing_either_name",
+          "crates/tine-core/src/model.rs::unrelated_creation_does_not_mutate_existing_hardlinks",
           "crates/tine-core/src/model.rs::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
           "crates/tine-core/src/model.rs::creation_refuses_symlink_parent_and_leaf_without_touching_outside_bytes",
           "crates/tine-core/src/model.rs::external_exact_target_creator_wins_without_byte_change",
@@ -2592,8 +2591,9 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "crates/tine-core/src/model.rs::cache_generation_change_during_creation_census_fails_without_retry",
-          "crates/tine-core/src/model.rs::missing_target_creation_has_two_censuses_and_zero_shadow_or_parse_work"
+          "crates/tine-core/src/model.rs::missing_target_creation_has_zero_graph_census_shadow_or_parse_work",
+          "crates/tine-core/src/model.rs::missing_target_creation_refuses_an_externally_retitled_owner",
+          "crates/tine-core/src/model.rs::external_semantic_owner_creator_wins_before_creation_publication"
         ],
         "scenario": "direct-markdown.creation-census-concurrency",
         "failBefore": "proven"
@@ -4396,7 +4396,6 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "tine-storage::local_journal_v2 private single-writer preparation",
           "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/ManagedStorageSmokeTest.kt"
         ],
         "scenario": "android.managed-private-journal-activation-edit-crash-reopen",
