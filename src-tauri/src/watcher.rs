@@ -1436,6 +1436,66 @@ fn take_sparse_initial_tick(pending: &mut bool) -> bool {
     std::mem::take(pending)
 }
 
+struct WatchedGraph {
+    legacy_graph: LegacyGraphLease,
+    root: PathBuf,
+    snap: HashMap<PathBuf, FileStamp>,
+    baseline: bool,
+    last_reconcile_error: Option<String>,
+    retry: RetrySchedule,
+    /// Frontier already drained from `Pending` but not yet reconciled
+    /// successfully. It survives retry cycles and is acknowledged only after
+    /// the matching graph batch succeeds.
+    pending_observation_epoch: Option<GraphTextExternalObservationTicket>,
+}
+
+fn route_drained_direct_frontiers(
+    graphs: &mut HashMap<String, WatchedGraph>,
+    latest_entries: Vec<(String, Arc<GraphSlot>)>,
+    drained: &HashMap<PathBuf, GraphTextExternalObservationTicket>,
+) {
+    for (label, slot) in latest_entries {
+        let Ok((latest_graph, root)) = direct_watch_paths(&slot) else {
+            continue;
+        };
+        let Some(ticket) = drained.get(&root).copied() else {
+            continue;
+        };
+        if !latest_graph.owns_graph_text_external_observation_ticket(ticket) {
+            continue;
+        }
+        match graphs.get_mut(&label) {
+            Some(current) if current.root == root => {
+                if !current
+                    .legacy_graph
+                    .owns_graph_text_external_observation_ticket(ticket)
+                {
+                    current.legacy_graph = latest_graph;
+                    current.snap.clear();
+                    current.baseline = false;
+                    current.last_reconcile_error = None;
+                    current.retry = RetrySchedule::default();
+                    current.pending_observation_epoch = None;
+                }
+            }
+            _ => {
+                graphs.insert(
+                    label,
+                    WatchedGraph {
+                        legacy_graph: latest_graph,
+                        root,
+                        snap: HashMap::new(),
+                        baseline: false,
+                        last_reconcile_error: None,
+                        retry: RetrySchedule::default(),
+                        pending_observation_epoch: None,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
 /// them into the cache, emitting `graph-changed` so the UI can reload. Two
 /// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
@@ -1464,19 +1524,6 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         *slot = Some(tx.clone());
     }
     std::thread::spawn(move || {
-        struct WatchedGraph {
-            legacy_graph: LegacyGraphLease,
-            root: PathBuf,
-            snap: HashMap<PathBuf, FileStamp>,
-            baseline: bool,
-            last_reconcile_error: Option<String>,
-            retry: RetrySchedule,
-            /// Frontier already drained from `Pending` but not yet reconciled
-            /// successfully. It survives retry cycles and is acknowledged only
-            /// after the matching graph batch succeeds.
-            pending_observation_epoch: Option<GraphTextExternalObservationTicket>,
-        }
-
         struct WatchedSparse {
             handle: SyncRuntimeHandle,
             root: PathBuf,
@@ -1718,6 +1765,21 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     None,
                 )
             };
+            // The callback reads AppState independently from this loop. A
+            // same-root refresh can therefore publish a ticket for the new
+            // Graph after this cycle took its initial slot snapshot but before
+            // it drained Pending. Re-read only when a Direct frontier was
+            // drained and route it to the exact instance that minted it. A
+            // stale WatchedGraph must never consume the path while silently
+            // discarding the replacement's ticket.
+            if !drained_observation_epochs.is_empty() {
+                let latest_entries = app.state::<AppState>().graphs.read().unwrap().entries();
+                route_drained_direct_frontiers(
+                    &mut graphs,
+                    latest_entries,
+                    &drained_observation_epochs,
+                );
+            }
             // A focus-driven rescan demands the same full stat diff a kernel
             // rescan does, for the Direct lane and the managed lane alike.
             let explicit_rescan = pending_full_rescan();
@@ -3267,6 +3329,69 @@ mod tests {
         graph
             .save_page(&anchor, anchor.rev.as_deref())
             .expect("warm guarded identity save");
+    }
+
+    #[test]
+    fn drained_frontier_routes_to_a_same_root_replacement_instance() {
+        let graph_dir = TempGraph::new("watcher-drained-frontier-refresh");
+        graph_dir.write("pages/Anchor.md", "- anchor\n");
+
+        let old_slot = GraphSlot::new(Graph::open(&graph_dir.root), graph_dir.root.clone());
+        let old_graph = old_slot.legacy_graph_cloned().unwrap();
+        warm_direct_graph(&old_graph);
+        let old_ticket = old_graph.note_graph_text_external_observation();
+        let mut graphs = HashMap::from([(
+            "main".to_owned(),
+            WatchedGraph {
+                legacy_graph: old_graph,
+                root: graph_dir.root.clone(),
+                snap: HashMap::new(),
+                baseline: true,
+                last_reconcile_error: Some("retired retry".to_owned()),
+                retry: RetrySchedule::default(),
+                pending_observation_epoch: Some(old_ticket),
+            },
+        )]);
+
+        let replacement_slot = Arc::new(GraphSlot::new(
+            Graph::open(&graph_dir.root),
+            graph_dir.root.clone(),
+        ));
+        let replacement = replacement_slot.legacy_graph_cloned().unwrap();
+        warm_direct_graph(&replacement);
+        graph_dir.write(
+            "pages/Replacement Event.md",
+            "- external replacement event\n",
+        );
+        let external = graph_dir.path("pages/Replacement Event.md");
+        let replacement_ticket = replacement.note_graph_text_external_observation();
+        let drained = HashMap::from([(graph_dir.root.clone(), replacement_ticket)]);
+
+        route_drained_direct_frontiers(
+            &mut graphs,
+            vec![("main".to_owned(), replacement_slot)],
+            &drained,
+        );
+
+        let routed = graphs.get_mut("main").unwrap();
+        assert!(routed
+            .legacy_graph
+            .owns_graph_text_external_observation_ticket(replacement_ticket));
+        assert!(!routed.baseline);
+        assert!(routed.last_reconcile_error.is_none());
+        assert!(routed.pending_observation_epoch.is_none());
+
+        routed.pending_observation_epoch = Some(replacement_ticket);
+        routed.legacy_graph.sync_file_checked(&external).unwrap();
+        let reconciled = routed.pending_observation_epoch.take().unwrap();
+        assert!(routed
+            .legacy_graph
+            .acknowledge_graph_text_external_observations(reconciled));
+        routed
+            .legacy_graph
+            .save_page(&new_page("Creation After Refresh"), None)
+            .unwrap();
+        assert!(graph_dir.path("pages/Creation After Refresh.md").exists());
     }
 
     /// A quiet poll must publish an exact empty observation rather than an
