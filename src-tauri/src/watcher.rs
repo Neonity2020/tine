@@ -9,7 +9,10 @@ use tauri::{Emitter, Manager, State};
 use tine_core::sync_runtime::{
     SyncRuntimeHandle, SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncWatcherObservation,
 };
-use tine_core::{model::GraphTextExactFeedPathClass, model::PageKind, Graph};
+use tine_core::{
+    model::GraphTextExactFeedPathClass, model::GraphTextExternalObservationTicket, model::PageKind,
+    Graph,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct GraphChange {
@@ -115,7 +118,7 @@ struct Pending {
     /// Direct graph root. The callback records this while holding the same
     /// mutex used to add its notify event, so a drained batch can never
     /// acknowledge an event that is still waiting to enter the queue.
-    legacy_observation_epochs: HashMap<PathBuf, u64>,
+    legacy_observation_epochs: HashMap<PathBuf, GraphTextExternalObservationTicket>,
     need_full: bool,
     notify_error: bool,
     /// When the FIRST notify callback of the batch currently accumulating
@@ -169,16 +172,23 @@ impl Pending {
         self.notify_error = true;
     }
 
-    fn add_legacy_observations(&mut self, observations: Vec<(PathBuf, u64)>) {
-        for (root, epoch) in observations {
+    fn add_legacy_observations(
+        &mut self,
+        observations: Vec<(PathBuf, GraphTextExternalObservationTicket)>,
+    ) {
+        for (root, ticket) in observations {
             self.legacy_observation_epochs
                 .entry(root)
-                .and_modify(|current| *current = (*current).max(epoch))
-                .or_insert(epoch);
+                .and_modify(|current| {
+                    *current = current.later_for_same_instance(ticket).unwrap_or(ticket)
+                })
+                .or_insert(ticket);
         }
     }
 
-    fn take_legacy_observation_epochs(&mut self) -> HashMap<PathBuf, u64> {
+    fn take_legacy_observation_epochs(
+        &mut self,
+    ) -> HashMap<PathBuf, GraphTextExternalObservationTicket> {
         std::mem::take(&mut self.legacy_observation_epochs)
     }
 }
@@ -1204,7 +1214,7 @@ fn observe_legacy_graph_text_event(
 fn observe_legacy_graph_text_callback(
     app: &tauri::AppHandle,
     event: Option<&notify::Event>,
-) -> Vec<(PathBuf, u64)> {
+) -> Vec<(PathBuf, GraphTextExternalObservationTicket)> {
     let state = app.state::<AppState>();
     let entries = match state.graphs.read() {
         Ok(graphs) => graphs.entries(),
@@ -1216,7 +1226,7 @@ fn observe_legacy_graph_text_callback(
             continue;
         };
         if observe_legacy_graph_text_event(&graph, &root, event) {
-            observations.push((root, graph.graph_text_external_observation_epoch()));
+            observations.push((root, graph.graph_text_external_observation_ticket()));
         }
     }
     observations
@@ -1464,7 +1474,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             /// Frontier already drained from `Pending` but not yet reconciled
             /// successfully. It survives retry cycles and is acknowledged only
             /// after the matching graph batch succeeds.
-            pending_observation_epoch: Option<u64>,
+            pending_observation_epoch: Option<GraphTextExternalObservationTicket>,
         }
 
         struct WatchedSparse {
@@ -1540,6 +1550,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 };
                 match graphs.get_mut(&label) {
                     Some(current) if current.root == root => {
+                        if current.pending_observation_epoch.is_some_and(|ticket| {
+                            !legacy_graph.owns_graph_text_external_observation_ticket(ticket)
+                        }) {
+                            current.pending_observation_epoch = None;
+                        }
                         current.legacy_graph = legacy_graph;
                     }
                     _ => {
@@ -1709,11 +1724,15 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             let event_need_full = event_need_full || explicit_rescan.is_some();
             for (label, graph) in graphs.iter_mut() {
                 if let Some(epoch) = drained_observation_epochs.get(&graph.root).copied() {
-                    graph.pending_observation_epoch = Some(
-                        graph
-                            .pending_observation_epoch
-                            .map_or(epoch, |pending| pending.max(epoch)),
-                    );
+                    if graph
+                        .legacy_graph
+                        .owns_graph_text_external_observation_ticket(epoch)
+                    {
+                        graph.pending_observation_epoch =
+                            Some(graph.pending_observation_epoch.map_or(epoch, |pending| {
+                                pending.later_for_same_instance(epoch).unwrap_or(epoch)
+                            }));
+                    }
                 }
                 let initial_cycle = !graph.baseline;
                 if initial_cycle {
@@ -3347,7 +3366,7 @@ mod tests {
     }
 
     fn reconcile_external_path(graph: &Graph, path: &Path) {
-        let epoch = graph.graph_text_external_observation_epoch();
+        let epoch = graph.graph_text_external_observation_ticket();
         graph
             .sync_file_checked(path)
             .expect("debounced exact-path reconciliation");
@@ -3405,7 +3424,7 @@ mod tests {
             assert_eq!(deletion.exact_paths, vec![graph_dir.path(&deleted_rel)]);
             observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&delete_event));
             assert_new_page_waits_for_reconciliation(&graph, &format!("Delete {extension}"));
-            let delete_epoch = graph.graph_text_external_observation_epoch();
+            let delete_epoch = graph.graph_text_external_observation_ticket();
             graph
                 .sync_deleted_file(&graph_dir.path(&deleted_rel))
                 .expect("debounced deletion reconciliation");
@@ -3439,7 +3458,7 @@ mod tests {
             );
             observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&rename_event));
             assert_new_page_waits_for_reconciliation(&graph, &format!("New {extension}"));
-            let rename_epoch = graph.graph_text_external_observation_epoch();
+            let rename_epoch = graph.graph_text_external_observation_ticket();
             graph
                 .sync_deleted_file(&graph_dir.path(&old_rel))
                 .expect("debounced rename source reconciliation");
@@ -3476,7 +3495,7 @@ mod tests {
         ));
         pending.add_legacy_observations(vec![(
             graph_dir.root.clone(),
-            graph.graph_text_external_observation_epoch(),
+            graph.graph_text_external_observation_ticket(),
         )]);
         let batch_a = pending.take_legacy_observation_epochs();
 
@@ -3492,7 +3511,7 @@ mod tests {
         ));
         pending.add_legacy_observations(vec![(
             graph_dir.root.clone(),
-            graph.graph_text_external_observation_epoch(),
+            graph.graph_text_external_observation_ticket(),
         )]);
 
         graph.sync_file_checked(&path_a).unwrap();

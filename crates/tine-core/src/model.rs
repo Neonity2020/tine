@@ -2544,6 +2544,7 @@ pub struct Graph {
     /// differ; existing exact-owner saves keep their path-local validation.
     external_observation_epoch: std::sync::atomic::AtomicU64,
     external_reconciled_epoch: std::sync::atomic::AtomicU64,
+    external_observation_instance: u64,
     /// One explicit whole-graph cache-build flight. Owners parse without holding
     /// this mutex; joiners wait on the flight's own notification and therefore
     /// never wait while holding cache or index locks.
@@ -2643,6 +2644,28 @@ pub struct Graph {
     search_lanes: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
     >,
+}
+
+static NEXT_EXTERNAL_OBSERVATION_INSTANCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Opaque acknowledgement ticket for one exact `Graph` instance's raw watcher
+/// frontier. A same-root reopen cannot consume a ticket minted by its retired
+/// predecessor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphTextExternalObservationTicket {
+    instance: u64,
+    epoch: u64,
+}
+
+impl GraphTextExternalObservationTicket {
+    pub fn later_for_same_instance(self, other: Self) -> Option<Self> {
+        (self.instance == other.instance).then_some(if self.epoch >= other.epoch {
+            self
+        } else {
+            other
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -5297,6 +5320,8 @@ impl Graph {
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             external_observation_epoch: std::sync::atomic::AtomicU64::new(0),
             external_reconciled_epoch: std::sync::atomic::AtomicU64::new(0),
+            external_observation_instance: NEXT_EXTERNAL_OBSERVATION_INSTANCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             page_build_flight: std::sync::Mutex::new(None),
             #[cfg(test)]
             page_build_test: PageBuildTestState::default(),
@@ -6500,23 +6525,47 @@ impl Graph {
 
     /// Record a relevant raw watcher callback without touching graph bytes.
     /// Returns the epoch the callback published.
-    pub fn note_graph_text_external_observation(&self) -> u64 {
-        self.external_observation_epoch
+    pub fn note_graph_text_external_observation(&self) -> GraphTextExternalObservationTicket {
+        let epoch = self
+            .external_observation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            .saturating_add(1)
+            .saturating_add(1);
+        GraphTextExternalObservationTicket {
+            instance: self.external_observation_instance,
+            epoch,
+        }
     }
 
     /// Snapshot the raw-event frontier represented by one drained watcher batch.
-    pub fn graph_text_external_observation_epoch(&self) -> u64 {
-        self.external_observation_epoch
-            .load(std::sync::atomic::Ordering::Acquire)
+    pub fn graph_text_external_observation_ticket(&self) -> GraphTextExternalObservationTicket {
+        GraphTextExternalObservationTicket {
+            instance: self.external_observation_instance,
+            epoch: self
+                .external_observation_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
     }
 
     /// Admit exactly the drained frontier after successful reconciliation. A
-    /// newer callback cannot be accidentally acknowledged by an older batch.
-    pub fn acknowledge_graph_text_external_observations(&self, epoch: u64) {
+    /// newer callback cannot be accidentally acknowledged by an older batch,
+    /// and a same-root replacement cannot consume its predecessor's ticket.
+    pub fn acknowledge_graph_text_external_observations(
+        &self,
+        ticket: GraphTextExternalObservationTicket,
+    ) -> bool {
+        if ticket.instance != self.external_observation_instance {
+            return false;
+        }
         self.external_reconciled_epoch
-            .fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
+            .fetch_max(ticket.epoch, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    pub fn owns_graph_text_external_observation_ticket(
+        &self,
+        ticket: GraphTextExternalObservationTicket,
+    ) -> bool {
+        ticket.instance == self.external_observation_instance
     }
 
     fn graph_text_external_observation_pending(&self) -> bool {
@@ -36063,7 +36112,7 @@ mod tests {
         .unwrap();
         let late = dir.join("external/Late.md");
         graph.note_graph_text_external_observation();
-        let observed = graph.graph_text_external_observation_epoch();
+        let observed = graph.graph_text_external_observation_ticket();
         graph.sync_file_checked(&late).unwrap();
         graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
@@ -36712,6 +36761,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Same-root config refresh creates a new `Graph`. A frontier from the
+    /// retired instance must not advance or wedge the replacement's counters.
+    #[test]
+    fn watcher_ticket_cannot_cross_a_same_root_graph_refresh() {
+        let dir = scratch("watcher-ticket-same-root-refresh");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let retired = Graph::open(&dir);
+        retired.warm_cache();
+        let retired_ticket = retired.note_graph_text_external_observation();
+
+        let replacement = Graph::open(&dir);
+        replacement.warm_cache();
+        assert!(!replacement.owns_graph_text_external_observation_ticket(retired_ticket));
+        assert!(!replacement.acknowledge_graph_text_external_observations(retired_ticket));
+        replacement
+            .save_page(&direct_save_bench_new_page("Fresh Instance"), None)
+            .unwrap();
+        assert!(dir.join("pages/Fresh Instance.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// An exact watcher observation updates the retained semantic owner without
     /// rebuilding the complete index.
     #[test]
@@ -36917,7 +36987,7 @@ mod tests {
             .observe_graph_text_external_paths(std::iter::once(collision.as_path()), false)
             .unwrap();
         graph_b.note_graph_text_external_observation();
-        let observed = graph_b.graph_text_external_observation_epoch();
+        let observed = graph_b.graph_text_external_observation_ticket();
         graph_b.sync_file_checked(&collision).unwrap();
         graph_b.acknowledge_graph_text_external_observations(observed);
         let claimed = markdown_page_dto("Claimed Name", "Claimed Name", "- local\n").unwrap();
@@ -37158,7 +37228,7 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::once(external.as_path()), false)
             .unwrap();
-        let observed = graph.graph_text_external_observation_epoch();
+        let observed = graph.graph_text_external_observation_ticket();
         graph.sync_file_checked(&external).unwrap();
         graph.acknowledge_graph_text_external_observations(observed);
         let claimed = markdown_page_dto("Claimed Name", "Claimed Name", "- local\n").unwrap();
@@ -37169,7 +37239,7 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
-        let rescanned = graph.graph_text_external_observation_epoch();
+        let rescanned = graph.graph_text_external_observation_ticket();
         graph.sync_file_checked(&external).unwrap();
         graph.acknowledge_graph_text_external_observations(rescanned);
         assert_eq!(
@@ -41771,7 +41841,7 @@ mod tests {
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
         let owner = dir.join("pages/Owner.md");
-        let observed = graph.graph_text_external_observation_epoch();
+        let observed = graph.graph_text_external_observation_ticket();
         graph.sync_file_checked(&owner).unwrap();
         graph.acknowledge_graph_text_external_observations(observed);
         graph
@@ -41782,7 +41852,7 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
-        let observed = graph.graph_text_external_observation_epoch();
+        let observed = graph.graph_text_external_observation_ticket();
         graph.sync_file_checked(&owner).unwrap();
         graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
@@ -41795,7 +41865,7 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
-        let observed = graph.graph_text_external_observation_epoch();
+        let observed = graph.graph_text_external_observation_ticket();
         graph.sync_file_checked(&owner).unwrap();
         graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
