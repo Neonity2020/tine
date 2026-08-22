@@ -2529,13 +2529,21 @@ pub struct Graph {
     /// and is preferred over risking a stale slot after broad mutations.
     cache_index: RwLock<Option<PageCacheIndex>>,
     /// Generation-bound effective ownership and parse-failure evidence derived
-    /// from the warm physical-owner cache. Name-only creation combines this with
-    /// current metadata inventory and never reparses graph content during save.
+    /// from the warm physical-owner cache. Name-only creation uses this exact
+    /// generation plus target-local no-replace validation; raw watcher events
+    /// block creation until their debounced reconciliation has advanced it.
     effective_identity_index: RwLock<Option<Arc<EffectiveIdentityIndex>>>,
     /// Bumped on every cache mutation (upsert/remove). The lock-free cache build
     /// captures this before reading disk and rebuilds if a mutation raced it
     /// (which would otherwise install stale content over a concurrent save).
     cache_gen: std::sync::atomic::AtomicU64,
+    /// Raw watcher callbacks publish an O(1) admission barrier before their
+    /// debounced reconciliation. The app registry admits only one Graph slot per
+    /// canonical root, so this frontier is instance-local and cannot be cleared
+    /// by a different cache. Name-only creation refuses while the two epochs
+    /// differ; existing exact-owner saves keep their path-local validation.
+    external_observation_epoch: std::sync::atomic::AtomicU64,
+    external_reconciled_epoch: std::sync::atomic::AtomicU64,
     /// One explicit whole-graph cache-build flight. Owners parse without holding
     /// this mutex; joiners wait on the flight's own notification and therefore
     /// never wait while holding cache or index locks.
@@ -3388,7 +3396,6 @@ struct DirectCreationCensusFile {
 struct DirectCreationProof {
     target: ManagedPath,
     generation: u64,
-    files: std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>,
 }
 
 enum DirectCreationEvidence {
@@ -3396,7 +3403,6 @@ enum DirectCreationEvidence {
     Warm {
         generation: u64,
         identity_index: Arc<EffectiveIdentityIndex>,
-        disk_revs: std::collections::HashMap<PathBuf, String>,
     },
 }
 
@@ -5289,6 +5295,8 @@ impl Graph {
             cache_index: RwLock::new(None),
             effective_identity_index: RwLock::new(None),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
+            external_observation_epoch: std::sync::atomic::AtomicU64::new(0),
+            external_reconciled_epoch: std::sync::atomic::AtomicU64::new(0),
             page_build_flight: std::sync::Mutex::new(None),
             #[cfg(test)]
             page_build_test: PageBuildTestState::default(),
@@ -6466,10 +6474,10 @@ impl Graph {
     /// its 200 ms coalescing delay. Exact file paths update the retained final
     /// state under the same resource-wide authority as Tine writes. Overflow,
     /// notify errors, directory/configuration events, poll cycles, and any
-    /// ambiguous path invalidate the generation. Missing-target creation binds
-    /// one streaming byte digest census to this generation's cached semantic
-    /// evidence; an existing exact-owner save uses its retained path-local and
-    /// single-link proofs instead.
+    /// ambiguous path invalidate the generation. Missing-target creation stays
+    /// blocked from this callback until the debounced reconciler acknowledges
+    /// the observed epoch; an existing exact-owner save uses its retained
+    /// path-local and single-link proofs instead.
     pub fn observe_graph_text_external_paths<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
@@ -6477,6 +6485,9 @@ impl Graph {
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         let paths = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
+        if uncertain || !paths.is_empty() {
+            self.note_graph_text_external_observation();
+        }
         if uncertain {
             self.revoke_all_conflict_authority();
             self.invalidate_guarded_graph_text_identity("external watcher generation is uncertain");
@@ -6488,6 +6499,35 @@ impl Graph {
         let _ =
             self.update_guarded_graph_text_identity_paths(paths.iter().map(PathBuf::as_path), true);
         Ok(())
+    }
+
+    /// Record a relevant raw watcher callback without touching graph bytes.
+    /// Returns the epoch the callback published.
+    pub fn note_graph_text_external_observation(&self) -> u64 {
+        self.external_observation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    /// Snapshot the raw-event frontier represented by one drained watcher batch.
+    pub fn graph_text_external_observation_epoch(&self) -> u64 {
+        self.external_observation_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Admit exactly the drained frontier after successful reconciliation. A
+    /// newer callback cannot be accidentally acknowledged by an older batch.
+    pub fn acknowledge_graph_text_external_observations(&self, epoch: u64) {
+        self.external_reconciled_epoch
+            .fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn graph_text_external_observation_pending(&self) -> bool {
+        self.external_observation_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            != self
+                .external_reconciled_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -7747,9 +7787,15 @@ impl Graph {
     /// publication remain hard refusals rather than authority to rebuild around
     /// an unexplained gap.
     fn direct_creation_evidence(&self) -> io::Result<DirectCreationEvidence> {
+        if self.graph_text_external_observation_pending() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "external graph-text changes are awaiting watcher reconciliation",
+            ));
+        }
         let cache = self.cache.read().unwrap();
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let Some(pages) = cache.as_ref() else {
+        let Some(_pages) = cache.as_ref() else {
             let published_failures = !self.page_index_failures.read().unwrap().is_empty();
             let retained_failures = self
                 .effective_identity_index
@@ -7777,42 +7823,31 @@ impl Graph {
                     "graph has unknown effective identities for name-only creation",
                 )
             })?;
-        let failures = self.page_index_failures.read().unwrap().clone();
-        let disk_revs = self.disk_revs.read().unwrap().clone();
-        let cached_paths = pages
-            .iter()
-            .map(|(entry, _)| entry.path.clone())
-            .collect::<std::collections::HashSet<_>>();
-        if identity_index.generation() != generation
-            || identity_index.failures != failures
-            || identity_index.physical_paths != cached_paths
-            || disk_revs.len() != cached_paths.len()
-            || !disk_revs.keys().all(|path| cached_paths.contains(path))
-        {
+        if identity_index.generation() != generation {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "parsed identity and disk revision evidence is not one coherent generation",
+                "parsed identity evidence is not one coherent generation",
             ));
         }
-        if !failures.is_empty() {
+        if !identity_index.failures.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
                     "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
-                    failures.len()
+                    identity_index.failures.len()
                 ),
             ));
         }
         Ok(DirectCreationEvidence::Warm {
             generation,
             identity_index,
-            disk_revs,
         })
     }
 
-    /// Bind one coherent parsed ownership generation to one current filesystem
-    /// census. Cold evidence may own or join exactly one cache-build flight; the
-    /// second evidence read must be warm, and there is never a repair retry.
+    /// Bind creation to one coherent warm semantic-ownership generation. Cold
+    /// evidence may own or join exactly one cache-build flight; the second read
+    /// must be warm, and there is never a repair retry. Publication itself is
+    /// target-local and no-replace; ordinary creation never hashes the graph.
     fn direct_creation_proof(
         &self,
         permit: &ManagedTextWritePermit,
@@ -7824,11 +7859,9 @@ impl Graph {
             DirectCreationEvidence::Warm {
                 generation,
                 identity_index,
-                disk_revs,
             } => DirectCreationEvidence::Warm {
                 generation,
                 identity_index,
-                disk_revs,
             },
             DirectCreationEvidence::Cold => {
                 let outcome = self.repair_page_cache_once(permit);
@@ -7841,7 +7874,6 @@ impl Graph {
         let DirectCreationEvidence::Warm {
             generation,
             identity_index,
-            disk_revs,
         } = evidence
         else {
             return Err(PageBuildOutcome::Failed.creation_error());
@@ -7853,72 +7885,18 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        let files = self.capture_direct_creation_census(permit)?;
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "effective page identity evidence changed during the creation census",
+                "effective page identity evidence changed during creation validation",
             ));
-        }
-        if files.len() != disk_revs.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "creation census paths do not match the parsed identity snapshot",
-            ));
-        }
-
-        let mut resources = std::collections::BTreeMap::new();
-        for (path, file) in &files {
-            let absolute = self.root.join(path.as_str());
-            if disk_revs.get(&absolute).map(String::as_str)
-                != Some(hex_digest(&file.content_digest).as_str())
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "creation census revisions do not match the parsed identity snapshot",
-                ));
-            }
-            if file.link_count != 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text files alias one physical resource: {} has link count {}",
-                        path.as_str(),
-                        file.link_count
-                    ),
-                ));
-            }
-            if let Some(first) = resources.insert(file.file_resource_id, path) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text files alias one physical resource: {} and {}",
-                        first.as_str(),
-                        path.as_str()
-                    ),
-                ));
-            }
-            if path != &target && path.portable_key() == target.portable_key() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text paths share one portable case/NFC identity: {} and {}",
-                        path.as_str(),
-                        target.as_str()
-                    ),
-                ));
-            }
         }
         let requested_identity_elsewhere = identity_index
             .owners
             .get(&page_cache_key(kind, name))
             .is_some_and(|owners| !owners.is_empty());
         Ok((
-            DirectCreationProof {
-                target,
-                generation,
-                files,
-            },
+            DirectCreationProof { target, generation },
             requested_identity_elsewhere,
         ))
     }
@@ -8587,7 +8565,7 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        if managed_path != proof.target || proof.files.contains_key(&managed_path) {
+        if managed_path != proof.target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "creation proof does not bind one absent exact target",
@@ -8641,26 +8619,11 @@ impl Graph {
         self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
-        let live_files = match self.capture_direct_creation_census(permit) {
-            Ok(files) => files,
-            Err(error) => {
-                let _ = target.parent().remove_file(&temp);
-                return Err(error);
-            }
-        };
-        if live_files != proof.files {
+        if self.graph_text_external_observation_pending() {
             let _ = target.parent().remove_file(&temp);
-            if editor_episode.is_some() && self.managed_exists(permit, path)? {
-                return Err(self.observe_editor_conflict(
-                    permit,
-                    path,
-                    editor_episode,
-                    EditorConflictSite::CreatePublicationCollision,
-                ));
-            }
             return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "graph text files changed before creation publication",
+                io::ErrorKind::WouldBlock,
+                "external graph-text changes arrived before creation publication",
             ));
         }
         if let Err(error) =
@@ -11144,9 +11107,11 @@ impl Graph {
     /// Journals sorted newest-first.
     pub fn journals_desc(&self) -> Vec<PageEntry> {
         // Prefer the warmed whole-graph cache — its PageEntry list is kept current
-        // by cache_upsert/cache_remove, so we avoid a directory read + parse on
-        // every infinite-scroll feed append. Fall back to scanning the dir while
-        // the cache isn't built yet.
+        // by cache_upsert/cache_remove. Before warm completes, enumerate only
+        // metadata and filenames, then parse the handful of feed rows selected by
+        // journal_feed_page. Calling list_pages here used to read and parse every
+        // non-journal page on the foreground first-content path, immediately
+        // before background warm repeated that graph-sized work.
         let raw: Vec<PageEntry> = match self.cache.read().unwrap().as_ref() {
             Some(pages) => pages
                 .iter()
@@ -11154,7 +11119,9 @@ impl Graph {
                 .map(|(e, _)| e.clone())
                 .collect(),
             None => self
-                .list_pages()
+                .admit_retained_managed_text_writer()
+                .and_then(|permit| self.graph_text_entries(&permit))
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|entry| entry.kind == PageKind::Journal && entry.date_key.is_some())
                 .collect(),
@@ -13636,9 +13603,17 @@ impl Graph {
         // stamping it as current republishes that staleness permanently —
         // `list_pages` is keyed on generation equality, so it never rebuilds and
         // the missing page becomes unloadable.
-        if cache_built && !identity_changed && !is_new_page && !failures_changed {
-            if let Some((generation, _)) = self.page_list_cache.write().unwrap().as_mut() {
+        if cache_built && !failures_changed {
+            if let Some((generation, entries)) = self.page_list_cache.write().unwrap().as_mut() {
                 if *generation + 1 == newgen {
+                    if let Some(existing) = entries
+                        .iter_mut()
+                        .find(|entry| entry.path == evict_entry.path)
+                    {
+                        *existing = evict_entry.clone();
+                    } else {
+                        entries.push(evict_entry.clone());
+                    }
                     *generation = newgen;
                 }
             }
@@ -18968,7 +18943,10 @@ impl Graph {
             })
         {
             record.baseline = Some(content.to_owned());
-            record.prospective = false;
+            // The first save and the frontend's activation handoff are separate
+            // operations. Keep the issuing absent activation prospective until
+            // `finish_saved_editor_activation` returns its exact resolved target;
+            // clearing it here made that mandatory handoff disappear.
         }
     }
 
@@ -34898,6 +34876,31 @@ mod tests {
     }
 
     #[test]
+    fn cold_journal_inventory_does_not_read_or_parse_ordinary_pages() {
+        let dir = scratch("cold-journal-inventory-metadata-only");
+        for index in 0..128 {
+            fs::write(
+                dir.join("pages").join(format!("Ordinary {index}.md")),
+                format!("- ordinary {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("journals/2026_08_22.md"), "- today\n").unwrap();
+        fs::write(dir.join("journals/2026_08_21.md"), "- yesterday\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let journals = graph.journals_desc();
+
+        assert_eq!(journals.len(), 2);
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        assert!(graph.cache.read().unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn future_journals_are_feed_only_excluded_but_keep_raw_identity() {
         let dir = scratch("future-feed-raw-identity");
         fs::create_dir_all(dir.join("logseq")).unwrap();
@@ -35333,6 +35336,13 @@ mod tests {
         GRAPH_TEXT_VALIDATION_TARGET_READS.with(|reads| reads.set(0));
         let fresh = markdown_page_dto("Fresh Indexed", "Fresh Indexed", "- fresh\n").unwrap();
         graph.save_page(&fresh, None).unwrap();
+        assert!(
+            graph
+                .list_pages()
+                .iter()
+                .any(|entry| entry.name == "Fresh Indexed"),
+            "the generation-retagged page inventory must contain the new page"
+        );
         assert_eq!(
             GRAPH_TEXT_CONTENT_READS.with(Cell::get),
             1,
@@ -35549,7 +35559,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            0
         );
         assert!(graph.cache.read().unwrap().is_some());
         let _ = fs::remove_dir_all(&dir);
@@ -35584,7 +35594,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -35639,13 +35649,13 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn concurrent_direct_creation_proofs_join_one_build_and_census_independently() {
+    fn concurrent_direct_creation_proofs_join_one_build_without_graph_censuses() {
         let dir = scratch("concurrent-direct-creation-proofs");
         fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
         let graph = Arc::new(Graph::open(&dir));
@@ -35683,8 +35693,6 @@ mod tests {
         assert!(!second_owned_elsewhere);
         assert_eq!(first_proof.generation, second_proof.generation);
         assert_ne!(first_proof.target, second_proof.target);
-        assert_eq!(first_proof.files.len(), 1);
-        assert_eq!(second_proof.files.len(), 1);
         assert_eq!(*graph.page_build_test.joined.lock().unwrap(), 1);
         assert_eq!(
             graph
@@ -35712,7 +35720,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -35780,7 +35788,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            4
+            0
         );
         assert_eq!(*graph.page_build_test.joined.lock().unwrap(), 0);
         assert_eq!(
@@ -36056,6 +36064,11 @@ mod tests {
             "title:: Could Be Hidden\n\n- late\n",
         )
         .unwrap();
+        let late = dir.join("external/Late.md");
+        graph.note_graph_text_external_observation();
+        let observed = graph.graph_text_external_observation_epoch();
+        graph.sync_file_checked(&late).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
         let fresh = markdown_page_dto("Could Be Hidden", "Could Be Hidden", "- no\n").unwrap();
@@ -36143,7 +36156,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            3
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -36207,7 +36220,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            0
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -36675,6 +36688,33 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A debounced batch may finish after a newer raw callback has arrived. Its
+    /// acknowledgement must not clear that newer callback's creation barrier.
+    #[test]
+    fn older_watcher_batch_cannot_acknowledge_a_newer_observation() {
+        let dir = scratch("watcher-observation-frontier");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let older = graph.note_graph_text_external_observation();
+        let newer = graph.note_graph_text_external_observation();
+        graph.acknowledge_graph_text_external_observations(older);
+
+        let blocked = graph
+            .save_page(&direct_save_bench_new_page("Still Pending"), None)
+            .expect_err("the newer raw callback must remain pending");
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock, "{blocked}");
+        assert!(!dir.join("pages/Still Pending.md").exists());
+
+        graph.acknowledge_graph_text_external_observations(newer);
+        graph
+            .save_page(&direct_save_bench_new_page("Now Reconciled"), None)
+            .unwrap();
+        assert!(dir.join("pages/Now Reconciled.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// An exact watcher observation updates the retained semantic owner without
     /// rebuilding the complete index.
     #[test]
@@ -36879,6 +36919,10 @@ mod tests {
         graph_a
             .observe_graph_text_external_paths(std::iter::once(collision.as_path()), false)
             .unwrap();
+        graph_b.note_graph_text_external_observation();
+        let observed = graph_b.graph_text_external_observation_epoch();
+        graph_b.sync_file_checked(&collision).unwrap();
+        graph_b.acknowledge_graph_text_external_observations(observed);
         let claimed = markdown_page_dto("Claimed Name", "Claimed Name", "- local\n").unwrap();
         assert_eq!(
             graph_b.save_page(&claimed, None).unwrap_err().kind(),
@@ -37117,6 +37161,9 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::once(external.as_path()), false)
             .unwrap();
+        let observed = graph.graph_text_external_observation_epoch();
+        graph.sync_file_checked(&external).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         let claimed = markdown_page_dto("Claimed Name", "Claimed Name", "- local\n").unwrap();
         assert_eq!(
             graph.save_page(&claimed, None).unwrap_err().kind(),
@@ -37125,6 +37172,9 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
+        let rescanned = graph.graph_text_external_observation_epoch();
+        graph.sync_file_checked(&external).unwrap();
+        graph.acknowledge_graph_text_external_observations(rescanned);
         assert_eq!(
             graph.save_page(&claimed, None).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
@@ -40946,10 +40996,8 @@ mod tests {
     }
 
     /// A content-only existing save must carry the already-warm semantic
-    /// evidence forward. The immediately following creation may stream its
-    /// evidence and final-publication censuses, but may not rebuild, retain, or
-    /// parse the graph to recover evidence that the existing save already
-    /// proved unchanged.
+    /// evidence forward. The immediately following creation is target-local: it
+    /// may not census, rebuild, retain, or parse the graph.
     #[test]
     fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
         let dir = scratch("existing-save-then-create-warm-evidence");
@@ -40989,8 +41037,8 @@ mod tests {
             .expect("warm evidence must authorize the noncolliding creation");
         let after = graph.guarded_graph_text_identity_report();
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.direct_creation_censuses, 2);
-        assert_eq!(counters.direct_creation_files_hashed, 4);
+        assert_eq!(counters.direct_creation_censuses, 0);
+        assert_eq!(counters.direct_creation_files_hashed, 0);
         assert_eq!(counters.builder_enumerations, 0);
         assert_eq!(counters.parser_invocations, 0);
         assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
@@ -40998,7 +41046,7 @@ mod tests {
         assert_eq!(
             GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
             Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
-            "creation consumed the retained shadow capture hook"
+            "creation must not consume the retained shadow capture hook"
         );
         assert_eq!(
             fs::read(dir.join("pages/Existing.md")).unwrap(),
@@ -41215,11 +41263,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The whole validation/publication path consumes an evidence census and a
-    /// final publication census, but no managed retained-capture,
-    /// complete-index, or parse work.
+    /// The whole validation/publication path is target-local: no graph census,
+    /// retained capture, complete-index build, or parse work.
     #[test]
-    fn missing_target_creation_has_two_censuses_and_zero_shadow_or_parse_work() {
+    fn missing_target_creation_has_zero_graph_census_shadow_or_parse_work() {
         let dir = scratch("missing-target-one-streaming-census");
         for index in 0..24 {
             fs::write(
@@ -41235,9 +41282,6 @@ mod tests {
         .unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        graph
-            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
-            .unwrap();
         let before = graph.guarded_graph_text_identity_report();
         reset_graph_text_admission_test_counters();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
@@ -41246,8 +41290,8 @@ mod tests {
             .unwrap();
         let after = graph.guarded_graph_text_identity_report();
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.direct_creation_censuses, 2);
-        assert_eq!(counters.direct_creation_files_hashed, 50);
+        assert_eq!(counters.direct_creation_censuses, 0);
+        assert_eq!(counters.direct_creation_files_hashed, 0);
         assert_eq!(counters.builder_enumerations, 0);
         assert_eq!(counters.parser_invocations, 0);
         assert_eq!(
@@ -41263,10 +41307,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// An external retitle can preserve path, inode, and byte length. The
-    /// content digest installed with the parsed cache is what closes that gap.
+    /// A normally reconciled external retitle updates semantic ownership even
+    /// when path, inode, and byte length are unchanged.
     #[test]
-    fn same_path_same_length_retitle_without_reconciliation_refuses_creation() {
+    fn same_path_same_length_retitle_after_reconciliation_refuses_creation() {
         let dir = scratch("same-length-retitle-creation-proof");
         let owner = dir.join("pages/Owner.md");
         let before = b"title:: Alpha Name\n\n- owner\n";
@@ -41276,6 +41320,7 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         fs::write(&owner, after).unwrap();
+        graph.sync_file_checked(&owner).unwrap();
         reset_graph_text_admission_test_counters();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
         let target = dir.join("pages/Omega Name.md");
@@ -41287,39 +41332,10 @@ mod tests {
         assert!(!target.exists());
         assert_eq!(
             graph_text_admission_test_counters().direct_creation_censuses,
-            1
+            0
         );
         assert_eq!(graph_text_admission_test_counters().builder_enumerations, 0);
         assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A generation change during the first evidence census fails closed.
-    /// Creation neither reaches the final census nor mutates the target.
-    #[test]
-    fn cache_generation_change_during_creation_census_fails_without_retry() {
-        let dir = scratch("creation-census-generation-change");
-        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
-        fs::write(dir.join("pages/Other.md"), b"- other\n").unwrap();
-        let graph = Graph::open(&dir);
-        graph.warm_cache();
-        reset_graph_text_admission_test_counters();
-        DIRECT_CREATION_CENSUS_BUMP_CACHE_GEN.with(|armed| armed.set(true));
-        let target = dir.join("pages/Must Not Retry.md");
-        let error = graph
-            .save_page(&direct_save_bench_new_page("Must Not Retry"), None)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-        assert_eq!(
-            graph_text_admission_test_counters().direct_creation_censuses,
-            1
-        );
-        assert!(!target.exists());
-        assert_eq!(
-            fs::read(dir.join("pages/Target.md")).unwrap(),
-            b"- before\n"
-        );
-        assert_eq!(fs::read(dir.join("pages/Other.md")).unwrap(), b"- other\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -41369,7 +41385,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn creation_refuses_hardlinks_without_changing_either_name() {
+    fn unrelated_creation_does_not_mutate_existing_hardlinks() {
         let dir = scratch("creation-hardlink-refusal");
         fs::create_dir_all(dir.join("arbitrary")).unwrap();
         let incumbent = dir.join("pages/Owner.md");
@@ -41379,13 +41395,12 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         let target = dir.join("pages/Fresh Hardlink Check.md");
-        let error = graph
+        graph
             .save_page(&direct_save_bench_new_page("Fresh Hardlink Check"), None)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+            .expect("an unrelated no-replace creation need not rewrite existing aliases");
         assert_eq!(fs::read(&incumbent).unwrap(), b"- incumbent\n");
         assert_eq!(fs::read(&alias).unwrap(), b"- incumbent\n");
-        assert!(!target.exists());
+        assert!(target.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -41549,14 +41564,17 @@ mod tests {
     fn external_semantic_owner_creator_wins_before_creation_publication() {
         let dir = scratch("creation-external-semantic-owner-race");
         fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
-        let graph = Graph::open(&dir);
+        let graph = Arc::new(Graph::open(&dir));
         graph.warm_cache();
         let target = dir.join("pages/Raced Semantic.md");
         let owner = dir.join("pages/External.md");
         MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let owner = owner.clone();
+            let graph = Arc::clone(&graph);
             *hook.borrow_mut() = Some(Box::new(move || {
-                fs::write(owner, b"title:: Raced Semantic\n\n- external winner\n")
+                fs::write(owner, b"title:: Raced Semantic\n\n- external winner\n")?;
+                graph.note_graph_text_external_observation();
+                Ok(())
             }));
         });
 
@@ -41564,7 +41582,7 @@ mod tests {
             .save_page(&direct_save_bench_new_page("Raced Semantic"), None)
             .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
         assert_eq!(
             fs::read(&owner).unwrap(),
             b"title:: Raced Semantic\n\n- external winner\n"
@@ -41710,8 +41728,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A watcher-free external retitle invalidates the cached byte snapshot and
-    /// refuses creation without rebuilding semantic evidence.
+    /// A reconciled external retitle refuses duplicate semantic creation without
+    /// rebuilding or hashing the graph.
     #[test]
     fn missing_target_creation_refuses_an_externally_retitled_owner() {
         let dir = scratch("creation-proof-follows-external-retitle");
@@ -41719,6 +41737,9 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         fs::write(dir.join("pages/Owner.md"), b"title:: Omega Name\n\n- o\n").unwrap();
+        graph
+            .sync_file_checked(&dir.join("pages/Owner.md"))
+            .unwrap();
         let before = graph.guarded_graph_text_identity_report();
         reset_graph_text_admission_test_counters();
         let error = graph
@@ -41731,7 +41752,7 @@ mod tests {
         );
         assert_eq!(
             graph_text_admission_test_counters().direct_creation_censuses,
-            1
+            0
         );
         assert_eq!(graph_text_admission_test_counters().builder_enumerations, 0);
         assert!(!dir.join("pages/Omega Name.md").exists());
@@ -41752,6 +41773,10 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
+        let owner = dir.join("pages/Owner.md");
+        let observed = graph.graph_text_external_observation_epoch();
+        graph.sync_file_checked(&owner).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         graph
             .save_page(&direct_save_bench_new_page("Semantic Prime"), None)
             .unwrap();
@@ -41760,6 +41785,9 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
+        let observed = graph.graph_text_external_observation_epoch();
+        graph.sync_file_checked(&owner).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
         graph
             .save_page(&direct_save_bench_new_page("Same Bytes Proof"), None)
@@ -41770,6 +41798,9 @@ mod tests {
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
+        let observed = graph.graph_text_external_observation_epoch();
+        graph.sync_file_checked(&owner).unwrap();
+        graph.acknowledge_graph_text_external_observations(observed);
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
         let error = graph
             .save_page(&direct_save_bench_new_page("Omega Name"), None)

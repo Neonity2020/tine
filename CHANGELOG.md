@@ -22,6 +22,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Direct Files no longer repeats whole-graph work on ordinary foreground
+  paths.** Opening Journals before background warm now inventories filenames
+  without reading and parsing every ordinary page. Creating one page uses the
+  warm semantic-identity generation plus target-local no-replace publication,
+  instead of hashing the graph twice, and advances the cached page inventory
+  incrementally. Raw filesystem callbacks now publish an O(1) creation barrier;
+  the debounced watcher owns the single final read/parse, so event bursts do not
+  parse intermediate versions before coalescing.
+
 - **Applying a sync conflict no longer leaves the pre-merge editor behind.**
   Concord now drains the page's pending save, blocks mutations for the guarded
   merge, installs the exact page returned by the native commit, and only then

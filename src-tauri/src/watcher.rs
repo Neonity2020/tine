@@ -1160,20 +1160,28 @@ fn observe_legacy_graph_text_event(
     if !observation.relevant {
         return false;
     }
-    if observation.uncertain || !observation.exact_paths.is_empty() {
-        let _ = graph.observe_graph_text_external_paths(
-            observation.exact_paths.iter().map(PathBuf::as_path),
-            observation.uncertain,
-        );
+    // The raw platform callback is only an admission barrier. Reading and
+    // semantically parsing an exact path here defeated debounce: reconciliation
+    // read/parsed the same final file again 200 ms later, and a burst paid once
+    // per raw event before bulk coalescing even began. A relevant text event
+    // publishes an O(1) pending epoch so name-only creation refuses during the
+    // debounce window. Only genuinely ambiguous events invalidate the retained
+    // identity index; exact events remain eligible for one exact-path update by
+    // the debounced reconciler.
+    if observation.uncertain {
+        let _ = graph.observe_graph_text_external_paths(std::iter::empty::<&Path>(), true);
+    } else if !observation.exact_paths.is_empty() {
+        graph.note_graph_text_external_observation();
     }
     true
 }
 
 /// Linearize a platform callback with guarded graph-text writes before the
-/// watcher's debounce/reconciliation delay. The callback does not mutate the
-/// cache; it only advances the core-owned retained identity generation (or
-/// marks it uncertain) under the same resource-scoped mutation authority that
-/// `Graph::save_page` uses.
+/// watcher's debounce/reconciliation delay. The callback performs no content
+/// I/O: it publishes an admission epoch (and invalidates retained identity only
+/// when the event is ambiguous) under the same resource-scoped mutation
+/// authority that `Graph::save_page` uses. Debounced reconciliation captures
+/// each final path once.
 fn observe_legacy_graph_text_callback(app: &tauri::AppHandle, event: Option<&notify::Event>) {
     let state = app.state::<AppState>();
     let entries = match state.graphs.read() {
@@ -1651,6 +1659,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let owned = pending_for_graph(&paths, &graph.legacy_graph);
                 let full_owned = full_scan_owner_for_graph(&full_paths, &graph.legacy_graph);
                 let need_full = event_need_full || !inotify || !full_owned.is_empty() || retry_due;
+                let drained_observation_epoch =
+                    graph.legacy_graph.graph_text_external_observation_epoch();
                 let mut cycle_failed = false;
                 let mut attempted = false;
                 if need_full || !owned.is_empty() {
@@ -1714,6 +1724,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 } else if attempted {
                     graph.retry.succeeded();
                     graph.last_reconcile_error = None;
+                    graph
+                        .legacy_graph
+                        .acknowledge_graph_text_external_observations(drained_observation_epoch);
                 }
             }
             for (label, graph) in sparse_graphs.iter_mut() {
@@ -3255,6 +3268,22 @@ mod tests {
         );
     }
 
+    fn assert_new_page_waits_for_reconciliation(graph: &Graph, name: &str) {
+        assert_eq!(
+            graph.save_page(&new_page(name), None).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "{name} creation must not race the watcher debounce window"
+        );
+    }
+
+    fn reconcile_external_path(graph: &Graph, path: &Path) {
+        let epoch = graph.graph_text_external_observation_epoch();
+        graph
+            .sync_file_checked(path)
+            .expect("debounced exact-path reconciliation");
+        graph.acknowledge_graph_text_external_observations(epoch);
+    }
+
     #[test]
     fn legacy_graph_root_text_create_delete_rename_and_semantics_reach_guarded_identity() {
         use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
@@ -3278,6 +3307,8 @@ mod tests {
                     vec![graph_dir.path(&created_rel)],
                 )),
             ));
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Created {extension}"));
+            reconcile_external_path(&graph, &graph_dir.path(&created_rel));
             assert_new_page_refused(&graph, &format!("Created {extension}"));
 
             let deleted_rel = format!("nonstandard/deep/Delete {extension}.{extension}");
@@ -3290,6 +3321,8 @@ mod tests {
                     vec![graph_dir.path(&deleted_rel)],
                 )),
             );
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Delete {extension}"));
+            reconcile_external_path(&graph, &graph_dir.path(&deleted_rel));
             assert_new_page_refused(&graph, &format!("Delete {extension}"));
             graph_dir.remove(&deleted_rel);
             let delete_event = event(
@@ -3301,6 +3334,12 @@ mod tests {
             assert!(!deletion.uncertain);
             assert_eq!(deletion.exact_paths, vec![graph_dir.path(&deleted_rel)]);
             observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&delete_event));
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Delete {extension}"));
+            let delete_epoch = graph.graph_text_external_observation_epoch();
+            graph
+                .sync_deleted_file(&graph_dir.path(&deleted_rel))
+                .expect("debounced deletion reconciliation");
+            graph.acknowledge_graph_text_external_observations(delete_epoch);
 
             let old_rel = format!("nonstandard/deep/Old {extension}.{extension}");
             let new_rel = format!("nonstandard/deep/New {extension}.{extension}");
@@ -3313,6 +3352,8 @@ mod tests {
                     vec![graph_dir.path(&old_rel)],
                 )),
             );
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Old {extension}"));
+            reconcile_external_path(&graph, &graph_dir.path(&old_rel));
             assert_new_page_refused(&graph, &format!("Old {extension}"));
             graph_dir.rename(&old_rel, &new_rel);
             let rename_event = event(
@@ -3327,12 +3368,21 @@ mod tests {
                 vec![graph_dir.path(&old_rel), graph_dir.path(&new_rel)]
             );
             observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&rename_event));
+            assert_new_page_waits_for_reconciliation(&graph, &format!("New {extension}"));
+            let rename_epoch = graph.graph_text_external_observation_epoch();
+            graph
+                .sync_deleted_file(&graph_dir.path(&old_rel))
+                .expect("debounced rename source reconciliation");
+            graph
+                .sync_file_checked(&graph_dir.path(&new_rel))
+                .expect("debounced rename destination reconciliation");
+            graph.acknowledge_graph_text_external_observations(rename_epoch);
             assert_new_page_refused(&graph, &format!("New {extension}"));
         }
     }
 
     #[test]
-    fn legacy_uncertain_graph_root_events_advance_the_shared_resource_epoch() {
+    fn legacy_uncertain_graph_root_events_block_creation_until_reconciliation() {
         use notify::event::{CreateKind, EventKind, ModifyKind, RenameMode};
         use notify::event::{EventAttributes, Flag};
 
@@ -3345,9 +3395,8 @@ mod tests {
         ] {
             let graph_dir = TempGraph::new(&format!("uncertain-{case}"));
             graph_dir.write("pages/Anchor.md", "- anchor\n");
-            let observer = Graph::open(&graph_dir.root);
-            let guarded = Graph::open(&graph_dir.root);
-            warm_direct_graph(&guarded);
+            let graph = Graph::open(&graph_dir.root);
+            warm_direct_graph(&graph);
             graph_dir.write(
                 "nonstandard/deep/Physical.md",
                 &format!("title:: Epoch {case}\n\n- external\n"),
@@ -3389,15 +3438,15 @@ mod tests {
                 _ => unreachable!(),
             };
             let observation =
-                legacy_graph_text_observation(&observer, &graph_dir.root, event.as_ref());
+                legacy_graph_text_observation(&graph, &graph_dir.root, event.as_ref());
             assert!(observation.relevant, "{case}");
             assert!(observation.uncertain, "{case}");
             assert!(observe_legacy_graph_text_event(
-                &observer,
+                &graph,
                 &graph_dir.root,
                 event.as_ref(),
             ));
-            assert_new_page_refused(&guarded, &format!("Epoch {case}"));
+            assert_new_page_waits_for_reconciliation(&graph, &format!("Epoch {case}"));
         }
     }
 
