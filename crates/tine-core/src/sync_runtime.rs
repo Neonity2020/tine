@@ -3164,18 +3164,12 @@ impl SyncRuntimeHandle {
             phase: SyncRuntimeOpenPhase::RetainingGraph,
             elapsed: open_started.elapsed(),
         });
-        #[cfg(test)]
-        let phase_started = Instant::now();
         let graph = match Graph::open_checked(&request.graph_root) {
             Ok(graph) => graph,
             Err(error) => {
                 return refused(format!("cannot retain graph for discovery: {error}"));
             }
         };
-        #[cfg(test)]
-        let handle_graph_open = phase_started.elapsed();
-        #[cfg(test)]
-        let phase_started = Instant::now();
         let graph_resource_id = match graph.canonical_resource_id() {
             Ok(resource) => resource,
             Err(error) => return refused(format!("cannot identify graph for discovery: {error}")),
@@ -3184,18 +3178,12 @@ impl SyncRuntimeHandle {
             phase: SyncRuntimeOpenPhase::DiscoveringEnrollment,
             elapsed: open_started.elapsed(),
         });
-        #[cfg(test)]
-        let handle_graph_resource_identity = phase_started.elapsed();
-        #[cfg(test)]
-        let phase_started = Instant::now();
         let classification = discover_startup(&DiscoveryRequest {
             profile: StartupStorageProfile::ExperimentalSparse,
             graph_resource_id,
             runtime_root: &request.enrollment_root,
             archive_root: &request.archive_root,
         });
-        #[cfg(test)]
-        let handle_discovery = phase_started.elapsed();
         drop(graph);
         // Blank-slate ruling (Martin, 2026-08-20): every shape of pre-0.7
         // managed state — intact, mid-import, blocked, corrupt, mismatched,
@@ -37103,126 +37091,6 @@ mod tests {
                 receipt.clean,
             );
             drop(reopened.handle);
-        }
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct StartupBenchmarkNamedPage {
-        name: String,
-        path: String,
-        blocks: usize,
-        pre_block: Option<String>,
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct StartupBenchmarkGraphState {
-        pages: BTreeSet<String>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct StartupBenchmarkMilestones {
-        backend_open: Duration,
-        first_named_page: Duration,
-        whole_graph_on_demand: Duration,
-    }
-
-    #[derive(Clone, Debug)]
-    struct DirectStartupBenchmarkReceipt {
-        milestones: StartupBenchmarkMilestones,
-        paced_background_warmer: Duration,
-        named_page: StartupBenchmarkNamedPage,
-        graph_state: StartupBenchmarkGraphState,
-    }
-
-    fn startup_page_semantics(page: &PageDto) -> StartupBenchmarkNamedPage {
-        StartupBenchmarkNamedPage {
-            name: page.name.clone(),
-            path: page.path.clone(),
-            blocks: page.blocks.len(),
-            pre_block: page.pre_block.clone(),
-        }
-    }
-
-    fn startup_direct_kind(kind: PageKind) -> &'static str {
-        match kind {
-            PageKind::Page => "page",
-            PageKind::Journal => "journal",
-        }
-    }
-
-    fn startup_managed_kind(kind: SyncPageKind) -> &'static str {
-        match kind {
-            SyncPageKind::Page => "page",
-            SyncPageKind::Journal => "journal",
-        }
-    }
-
-    fn startup_direct_graph_state(graph: &Graph) -> StartupBenchmarkGraphState {
-        let pages = graph.with_pages(|pages| {
-            pages
-                .iter()
-                .map(|(entry, _)| {
-                    format!(
-                        "{}\u{0}{}\u{0}",
-                        startup_direct_kind(entry.kind),
-                        entry.rel_path,
-                    ) + &entry.name
-                })
-                .collect()
-        });
-        StartupBenchmarkGraphState { pages }
-    }
-
-    fn measure_direct_startup(
-        graph_root: &Path,
-        named_page: &str,
-        expected_pages: usize,
-    ) -> DirectStartupBenchmarkReceipt {
-        let started = Instant::now();
-        let graph = Graph::open_checked(graph_root).expect("direct Markdown graph opens");
-        let backend_open = started.elapsed();
-
-        let started = Instant::now();
-        let page = graph
-            .load_named(named_page, PageKind::Page)
-            .expect("direct named-page request succeeds")
-            .expect("synthetic named page exists");
-        let first_named_page = started.elapsed();
-        let named_page = startup_page_semantics(&page);
-
-        let started = Instant::now();
-        let graph_state = startup_direct_graph_state(&graph);
-        let whole_graph_on_demand = started.elapsed();
-        assert_eq!(
-            graph_state.pages.len(),
-            expected_pages,
-            "direct on-demand graph parse must expose every fixture page"
-        );
-
-        // This is intentionally not one of the three readiness milestones:
-        // direct Markdown normally runs a paced warmer in the background, while
-        // the prior `with_pages` measurement is the foreground work a user waits
-        // on when navigating before that warmer has completed.
-        let warming_graph =
-            Graph::open_checked(graph_root).expect("direct Markdown warmer graph opens");
-        let started = Instant::now();
-        warming_graph.warm_cache();
-        let paced_background_warmer = started.elapsed();
-        assert_eq!(
-            warming_graph.with_pages(|pages| pages.len()),
-            expected_pages,
-            "paced direct warmer must retain the same complete graph state"
-        );
-
-        DirectStartupBenchmarkReceipt {
-            milestones: StartupBenchmarkMilestones {
-                backend_open,
-                first_named_page,
-                whole_graph_on_demand,
-            },
-            paced_background_warmer,
-            named_page,
-            graph_state,
         }
     }
 
