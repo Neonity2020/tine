@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  adjustPaneSize,
   closeLayoutPane,
   closePane,
   focusPane,
@@ -15,6 +16,7 @@ import {
   visibleLayoutNode,
   paneRouter,
   resetPaneLayoutToSingle,
+  setSplitRatio,
   splitLayoutNode,
   splitPane,
   type LayoutNode,
@@ -559,6 +561,86 @@ describe("pane maximize (GH #285)", () => {
     expect(maximizedPaneId()).toBe(null);
     expect(visibleLayoutNode()).toEqual(layoutRoot());
     expect(focusedPaneId()).toBe(right);
+  });
+});
+
+describe("adjustPaneSize (GH #286)", () => {
+  it("is a no-op for a sole pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+
+    expect(adjustPaneSize("main", "width", true)).toBe(false);
+    expect(layoutRoot()).toEqual({ kind: "pane", paneId: "main" });
+  });
+
+  it("grows and shrinks the first child through its row split by five points", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    splitPane("main", "row");
+
+    expect(adjustPaneSize("main", "width", true)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", dir: "row", ratio: 0.55 });
+
+    expect(adjustPaneSize("main", "width", false)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", dir: "row", ratio: 0.5 });
+  });
+
+  it("moves the same ratio the other way for the second child", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+
+    expect(adjustPaneSize(right, "width", true)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.45 });
+
+    expect(adjustPaneSize(right, "width", false)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.5 });
+  });
+
+  it("adjusts height only through a column split, never through a row split", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    splitPane("main", "row");
+
+    expect(adjustPaneSize("main", "height", true)).toBe(false);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.5 });
+  });
+
+  it("walks past a nearer wrong-axis ancestor to the nearest matching one", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    const below = splitPane(right, "col")!;
+
+    // `below` sits under a col split inside the second row child: a width
+    // change must skip the nearer col ancestor and adjust the root row split.
+    expect(adjustPaneSize(below, "width", true)).toBe(true);
+
+    expect(layoutRoot()).toEqual({
+      kind: "split",
+      dir: "row",
+      ratio: 0.45, // second child holds `below`; growing it shrinks the ratio
+      children: [
+        { kind: "pane", paneId: "main" },
+        {
+          kind: "split",
+          dir: "col",
+          ratio: 0.5, // untouched — wrong axis for a width command
+          children: [
+            { kind: "pane", paneId: right },
+            { kind: "pane", paneId: below },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("respects the existing 15–85% clamps", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    splitPane("main", "row");
+    setSplitRatio([], 0.85);
+
+    expect(adjustPaneSize("main", "width", true)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.85 });
+
+    setSplitRatio([], 0.15);
+    expect(adjustPaneSize("main", "width", false)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.15 });
   });
 });
 

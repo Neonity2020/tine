@@ -75,6 +75,7 @@ import { decodeNavIntent } from "./navProtocol";
 import {
   closePane,
   focusPane,
+  adjustPaneSize,
   focusedPaneId,
   layoutHasMultiplePanes,
   layoutPaneIds,
@@ -329,6 +330,13 @@ const COMMANDS: CommandDef[] = [
   // GH #285: transient maximize — the pane borrows the whole pane area without
   // touching the split tree/ratios, so toggling restores the exact layout.
   { id: "pane/toggle-maximize", binding: "mod+alt+m", label: "Toggle maximize active pane", scope: "global", run: () => { togglePaneMaximize(); }, global: true },
+  // GH #286: resize the active pane through its nearest same-axis ancestor
+  // split (5 points a step, existing 15–85% clamps). Shipped unbound like
+  // pane/close — remappable, palette-discoverable.
+  { id: "pane/grow-width", binding: "", label: "Grow active pane width", scope: "global", run: () => { adjustPaneSize(focusedPaneId(), "width", true); }, global: true },
+  { id: "pane/shrink-width", binding: "", label: "Shrink active pane width", scope: "global", run: () => { adjustPaneSize(focusedPaneId(), "width", false); }, global: true },
+  { id: "pane/grow-height", binding: "", label: "Grow active pane height", scope: "global", run: () => { adjustPaneSize(focusedPaneId(), "height", true); }, global: true },
+  { id: "pane/shrink-height", binding: "", label: "Shrink active pane height", scope: "global", run: () => { adjustPaneSize(focusedPaneId(), "height", false); }, global: true },
   { id: "ui/toggle-theme", binding: "t t", label: "Toggle dark / light", scope: "global", run: toggleTheme },
   { id: "ui/toggle-brackets", binding: "mod+c mod+b", label: "Toggle reference brackets", scope: "global", run: () => changeShowBrackets(!showBrackets()), global: true },
   { id: "ui/toggle-left-sidebar", binding: "t l", label: "Toggle left sidebar", scope: "global", run: toggleSidebar },

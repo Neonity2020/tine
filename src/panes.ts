@@ -488,6 +488,33 @@ export function setSplitRatio(path: number[], ratio: number) {
   focusedRouter().scheduleSessionSave();
 }
 
+function panePath(node: LayoutNode, paneId: string, prefix: number[] = []): number[] | null {
+  if (node.kind === "pane") return node.paneId === paneId ? prefix : null;
+  return (
+    panePath(node.children[0], paneId, [...prefix, 0]) ??
+    panePath(node.children[1], paneId, [...prefix, 1])
+  );
+}
+
+// Keyboard pane sizing (GH #286): nudge the NEAREST ancestor split of the
+// matching axis by five percentage points so the pane's subtree enlarges or
+// shrinks through it. setSplitRatio applies the 15–85% clamps; a pane whose
+// ancestor chain has no split of that axis is a deliberate no-op.
+export function adjustPaneSize(paneId: string, axis: "width" | "height", grow: boolean): boolean {
+  const path = panePath(layoutRoot(), paneId);
+  if (!path || path.length === 0) return false;
+  const dir = axis === "width" ? "row" : "col";
+  for (let depth = path.length - 1; depth >= 0; depth--) {
+    const ancestor = nodeAtPath(layoutRoot(), path.slice(0, depth));
+    if (!ancestor || ancestor.kind !== "split" || ancestor.dir !== dir) continue;
+    const activeIsFirst = path[depth] === 0;
+    const delta = (grow ? 0.05 : -0.05) * (activeIsFirst ? 1 : -1);
+    setSplitRatio(path.slice(0, depth), ancestor.ratio + delta);
+    return true;
+  }
+  return false;
+}
+
 export function openRouteInOtherPane(route: Route, sourcePaneId = focusedPaneId()): string | null {
   const ids = layoutPaneIds();
   let target = nearestPane(layoutRoot(), sourcePaneId) ?? ids.find((id) => id !== sourcePaneId) ?? null;

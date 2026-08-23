@@ -7129,6 +7129,33 @@
         "failBefore": "proven"
       },
       "notes": "GH #285 minimal accepted design only: one remappable global command 'Toggle maximize active pane' (pane/toggle-maximize, default mod+alt+m, command-palette discoverable). Implementation is a pure view derivation, not a layout mutation: a transient maximizedPaneId signal makes visibleLayoutNode() return the single maximized leaf for the pane area (App.tsx PaneTree), while layoutRoot() — the input to session/workspace persistence — keeps the complete split tree and ratios, so nothing transient is serialized and toggling restores the exact arrangement including mutations made meanwhile. Safety: a single commitLayout() choke point clears the state when the maximized pane disappears from the tree; focusing another pane unmaximizes first so hidden panes are never focused invisibly; toggle is a no-op on a single-pane window; resetPaneLayoutToSingle clears it; split-tree mutations made while maximized remain and are restored on toggle. Deliberately out of scope per batch spec: hidden-pane stacks, per-pane 1-9 commands, a persistent chrome button (no obvious low-clutter home while maximized), and pane-select overlay rescaling while maximized. Sidebars/right sidebar/PDF pane are outside the pane area and unaffected. vitest-only evidence (6 cases); not yet exercised in a native session."
+    },
+    {
+      "id": "UI-PANE-RESIZE-KEYBOARD-286",
+      "title": "Grow/shrink active pane width/height commands nudge the nearest same-axis ancestor split by five percentage points in the direction that enlarges or shrinks the active subtree, honor the 15–85% clamps, and no-op without a matching-axis ancestor",
+      "family": "tabs",
+      "sources": {
+        "issues": [
+          286
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/panes.test.ts::adjustPaneSize (GH #286)::grows and shrinks the first child through its row split by five points",
+          "src/panes.test.ts::adjustPaneSize (GH #286)::moves the same ratio the other way for the second child",
+          "src/panes.test.ts::adjustPaneSize (GH #286)::walks past a nearer wrong-axis ancestor to the nearest matching one",
+          "src/panes.test.ts::adjustPaneSize (GH #286)::respects the existing 15–85% clamps"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #286, per the batch's pinned scope: four remappable global actions (pane/grow-width, pane/shrink-width, pane/grow-height, pane/shrink-height) shipped UNBOUND like the existing pane/close — remappable in settings and discoverable in the command palette; no setting and no ambiguous two-axis variant (the issue's 'way two') per spec. panes.ts::adjustPaneSize finds the pane's leaf path, walks ancestors from the nearest up picking the first split of the matching axis (row for width, col for height), and feeds the signed five-point nudge into the existing setSplitRatio clamp (first-child semantics: ratio sizes children[0]). Wrong-axis chains and sole panes are deliberate no-ops returning false. Session save scheduling is inherited from setSplitRatio. vitest-only evidence (6 cases incl. nested wrong-axis skip and clamp saturation); not yet exercised in a native session (E2E skipped at Martin's instruction in this sandbox)."
     }
   ]
 }
