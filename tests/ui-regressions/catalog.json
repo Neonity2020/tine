@@ -7474,6 +7474,31 @@
         "failBefore": "proven"
       },
       "notes": "Internal report against deployed f08e21eb: the native transaction committed safely, but both journal pages became inert and dim, the accepted DTO installation purged and reconstructed their loaded block trees, and the moved editor remounted while its page was still inert. The block therefore briefly disappeared and the caret was lost, preventing repeated move-up/down commands without another click. Fail-before was proven in two passes: the unchanged code produced two visibly-busy page sections while the actor response was pending; retaining the inert hold through accepted publication left document.body focused instead of the moved textarea. Managed moves now retain their persistence/replacement hold without using the destructive visual class, publish the accepted semantic delta while preserving loaded block identity, release inertness before that delta, and re-arm the exact editor/caret context for the adjacent journal mount. No-commit, blocked recovery, page replacement, undo/redo and selection routes retain their existing actor-owned behavior."
+    },
+    {
+      "id": "UI-ASSET-LINK-OS-OPENER-367",
+      "title": "A labeled link into assets/ opens its file or directory through the OS opener instead of the external-URL route",
+      "family": "asset-open",
+      "sources": {
+        "issues": [
+          367
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/assetLinkOpen.test.tsx",
+          "crates/tine-core/src/model.rs::tests::asset_path_for_open_accepts_files_directories_and_the_assets_root"
+        ],
+        "scenario": "assets.link-open-file-directory-root",
+        "failBefore": "proven"
+      },
+      "notes": "A labeled Markdown/Org link whose target resolves into assets/ (`[image](./assets/quick-capture.png)`, `[path](./assets/)`) hit the generic external-link fallback and was handed to the URL opener, which rejected the non-URL relative path, so nothing opened. The fallback opener decision is now graph-asset aware and extension/platform agnostic: files open in the system viewer, a nested directory or the assets root open in the file manager, and paths are percent-decoded first. The Rust open_asset boundary resolves via the same canonicalized assets containment as reads, now permitting directories and the empty name; the read path keeps its regular-file gate. Genuine http(s) links whose URL merely contains assets/ stay on the external-URL route. Fail-before proven by the clicking component test failing against the URL-route-only implementation (6 positive cases red, 2 negative controls green)."
     }
   ]
 }

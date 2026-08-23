@@ -3278,13 +3278,15 @@ pub(crate) fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&resolved).map_err(|e| e.to_string())
 }
 
-/// Open a graph asset (by its `assets/`-relative name) in the OS default app,
-/// e.g. a video/audio file in the system player. Path-gated to the assets dir
-/// (canonicalized) so a crafted name can't open a file outside the graph.
+/// Open a graph asset (by its `assets/`-relative name) in the OS default app —
+/// a file in its system viewer, a directory (or the empty name, i.e. the
+/// assets root itself like OG's `[...](./assets/)`) in the file manager.
+/// Path-gated to the assets dir (canonicalized) so a crafted name can't open
+/// anything outside the graph.
 #[tauri::command]
 pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
     let target = with_filesystem_graph(&state, |g| {
-        g.asset_file_for_read(&name).map_err(|e| e.to_string())
+        g.asset_path_for_open(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
     {

@@ -15368,6 +15368,24 @@ impl Graph {
         Ok(path)
     }
 
+    /// Resolve an asset path (regular file OR directory inside the approved
+    /// assets root) for the OS opener. An empty name is the assets root itself:
+    /// OG opens the empty `[...](./assets/)` link in the file manager (GH #367).
+    /// Reads/streaming keep `asset_file_for_read`'s regular-file gate; the
+    /// containment check is identical, so a symlink cannot escape assets/.
+    pub fn asset_path_for_open(&self, name: &str) -> io::Result<PathBuf> {
+        let assets = fs::canonicalize(self.assets_path())?;
+        if name.is_empty() {
+            return Ok(assets);
+        }
+        let relative = relative_asset_path(name)?;
+        let path = fs::canonicalize(self.assets_path().join(relative))?;
+        if !path.starts_with(&assets) || !(path.is_file() || path.is_dir()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid asset"));
+        }
+        Ok(path)
+    }
+
     /// Canonical, regular-file path for the native asset protocol. This is used
     /// for audio/video so WebView range requests read at most a small chunk
     /// instead of copying a multi-gigabyte file through Rust Vec → IPC → Blob.
@@ -37695,6 +37713,40 @@ mod tests {
         ] {
             assert!(graph.read_asset(bad).is_err(), "must reject {bad:?}");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn asset_path_for_open_accepts_files_directories_and_the_assets_root() {
+        // GH #367: the OS opener accepts a regular file, a nested directory,
+        // and the empty name (the assets root, OG's `[...](./assets/)`), while
+        // keeping the read-path's regular-file gate and traversal rejection.
+        let dir = scratch("asset-open");
+        let graph = Graph::open(&dir);
+        let nested_dir = dir.join("assets/some dir/报表");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let file = dir.join("assets/some dir/报表/API ref.docx");
+        fs::write(&file, b"doc").unwrap();
+        let assets = dir.join("assets").canonicalize().unwrap();
+
+        assert_eq!(graph.asset_path_for_open("").unwrap(), assets);
+        assert_eq!(
+            graph.asset_path_for_open("some dir").unwrap(),
+            dir.join("assets/some dir").canonicalize().unwrap()
+        );
+        assert_eq!(graph.asset_path_for_open("some dir/报表").unwrap(), nested_dir);
+        assert_eq!(
+            graph.asset_path_for_open("some dir/报表/API ref.docx").unwrap(),
+            file
+        );
+
+        for bad in ["../outside", "/outside", "back\\slash.png", "missing.png"] {
+            assert!(graph.asset_path_for_open(bad).is_err(), "must reject {bad:?}");
+        }
+        // The regular-file gate for reads is unchanged by the opener route.
+        assert!(graph.read_asset("").is_err());
+        assert!(graph.read_asset("some dir").is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -444,7 +444,13 @@ function renderLink(
         class="external-link"
         href={dest}
         {...(spanAttrs ?? {})}
-        onClick={(e) => { e.preventDefault(); e.stopPropagation(); void backend().openExternal(dest); }}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const rel = assetLinkRel(dest);
+          if (rel !== null) void backend().openAsset(rel);
+          else void backend().openExternal(dest);
+        }}
       >
         <Show when={s.label && s.label.length} fallback={dest}>{renderInlines(s.label!, blockId, spanMode, macroExpansion, format)}</Show>
       </a>
@@ -639,6 +645,25 @@ function assetRelPath(url: string): string | null {
   const normalized = url.replace(/\\/g, "/");
   const i = normalized.toLowerCase().indexOf("assets/");
   return i === -1 ? null : normalized.slice(i + "assets/".length);
+}
+
+// A clicked link into `assets/` — file, nested directory, or the assets root
+// itself — decoded for the OS opener (GH #367). Extension- and platform-
+// agnostic: whatever the file is, the OS default handler gets it. Returns null
+// for anything that is not a relative graph-asset reference (a crafted
+// `https://host/assets/x` URL must stay on the external-URL route; the RootDir
+// case is the empty string, e.g. `[path](./assets/)` or bare `./assets`).
+function assetLinkRel(dest: string): string | null {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(dest)) return null;
+  const normalized = dest.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (/(^|\/)assets$/i.test(normalized)) return "";
+  const rel = assetRelPath(dest);
+  if (rel === null) return null;
+  try {
+    return decodeURIComponent(rel);
+  } catch {
+    return rel;
+  }
 }
 
 // The width `%` CSS resolves against is the nearest BLOCK-level ancestor's
