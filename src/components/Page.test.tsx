@@ -2,7 +2,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { backend } from "../backend";
-import { graphBinding } from "../persistence";
+import { graphBinding, setBaseRev } from "../persistence";
+import { managedStorageRuntime } from "../managedStorageRuntime";
 import { notifyGraphRebound } from "../modeHooks";
 import { initParser } from "../render/parse";
 import {
@@ -16,6 +17,7 @@ import {
   flushPage,
   holdPageMutationUi,
   isDirty,
+  moveBlockFeed,
   pageToDto,
   setBlockMoving,
   undo,
@@ -506,6 +508,145 @@ describe("Journals feed generation lifecycle", () => {
       expect(doc.feed).toEqual([today, older]);
     } finally {
       mounted.dispose();
+    }
+  });
+
+  it("keeps a managed cross-day move visually steady and restores the moved editor", async () => {
+    vi.stubGlobal("IntersectionObserver", class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() { return []; }
+      root = null;
+      rootMargin = "0px";
+      thresholds = [0];
+    });
+    const today = journalTitle(new Date());
+    const older = "August 21st, 2026";
+    setDoc({
+      byId: {
+        today: node("today", "visible today", today),
+        older: node("older", "move me", older),
+      },
+      pages: [
+        { ...page(today, "journal", ["today"]), path: "journals/today.md" },
+        { ...page(older, "journal", ["older"]), path: "journals/older.md" },
+      ],
+      feed: [today, older],
+      loaded: true,
+    });
+    setBaseRev(today, "today-r1");
+    setBaseRev(older, "older-r1");
+    managedStorageRuntime.bind(7);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 7,
+      application_page_admission: {
+        binding_generation: 7,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+    vi.spyOn(backend(), "activateEditor").mockImplementation(async (path) => ({
+      activation: path.endsWith("today.md") ? 41 : 42,
+      target: path,
+      prospective: false,
+    }));
+    vi.spyOn(backend(), "journalFeedPage").mockResolvedValue(feedResponse([
+      {
+        name: today,
+        kind: "journal",
+        title: today,
+        pre_block: null,
+        path: "journals/today.md",
+        rev: "today-r1",
+        blocks: [{ id: "today", raw: "visible today", collapsed: false, children: [] }],
+      },
+      {
+        name: older,
+        kind: "journal",
+        title: older,
+        pre_block: null,
+        path: "journals/older.md",
+        rev: "older-r1",
+        blocks: [{ id: "older", raw: "move me", collapsed: false, children: [] }],
+      },
+    ]));
+    let accept!: (value: any) => void;
+    const actor = new Promise<any>((resolve) => { accept = resolve; });
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockReturnValue(actor);
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      await vi.waitFor(() => expect(
+        mounted.root.querySelector('[data-block-id="older"]'),
+        mounted.root.innerHTML,
+      ).not.toBeNull());
+      startEditing("older", 3);
+      await vi.waitFor(() => expect(mounted.root.querySelector('[data-block-id="older"] textarea')).not.toBeNull());
+      const originalEditor = mounted.root.querySelector<HTMLTextAreaElement>('[data-block-id="older"] textarea');
+      expect(originalEditor).not.toBeNull();
+      expect(document.activeElement).toBe(originalEditor);
+
+      setBlockMoving(true, older);
+      const pending = moveBlockFeed("older", -1);
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+      // A durable actor hold is not a destructive UI replacement. The page may
+      // reject another write for this short window, but it must not visibly dim.
+      expect(mounted.root.querySelectorAll(".page-mutation-busy")).toHaveLength(0);
+
+      accept({
+        binding_generation: 7,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission,
+        outcome: {
+          status: "committed",
+          episode_id: move.mock.calls[0][1].episode_id,
+          batch_id: "journal-focus",
+          recovered: false,
+          source: {
+            page: { name: older, kind: "journal", title: older, pre_block: null, path: "journals/older.md", rev: "older-r2", blocks: [] },
+            revision: "older-r2",
+          },
+          destination: {
+            page: {
+              name: today,
+              kind: "journal",
+              title: today,
+              pre_block: null,
+              path: "journals/today.md",
+              rev: "today-r2",
+              blocks: [
+                { id: "today", raw: "visible today", collapsed: false, children: [] },
+                { id: "older", raw: "move me", collapsed: false, children: [] },
+              ],
+            },
+            revision: "today-r2",
+          },
+        },
+      });
+      await expect(pending).resolves.toBe("crossed");
+      await flushMicrotasks();
+      setBlockMoving(false);
+
+      const movedEditor = mounted.root.querySelector<HTMLTextAreaElement>('[data-block-id="older"] textarea');
+      expect(movedEditor).not.toBeNull();
+      expect(movedEditor).not.toBe(originalEditor);
+      expect(document.activeElement).toBe(movedEditor);
+      expect(movedEditor!.selectionStart).toBe(3);
+      expect(doc.byId.older.page).toBe(today);
+    } finally {
+      setBlockMoving(false);
+      mounted.dispose();
+      managedStorageRuntime.clear();
+      managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+      vi.unstubAllGlobals();
     }
   });
 

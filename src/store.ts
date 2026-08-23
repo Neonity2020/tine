@@ -310,6 +310,7 @@ const editGenerations = new Map<string, number>();
 let editorTransactionClock = 0;
 const editorTransactionGenerations = new Map<string, number>();
 const [managedMoveBusyPages, setManagedMoveBusyPages] = createSignal<ReadonlySet<string>>(new Set());
+const [visibleMutationBusyPages, setVisibleMutationBusyPages] = createSignal<ReadonlySet<string>>(new Set());
 let managedMoveQueue: Promise<void> = Promise.resolve();
 let managedHistoryReplayRunning = false;
 let managedHistoryReplayEpoch = 0;
@@ -333,15 +334,24 @@ export function pageMutationBusy(name: string): boolean {
   return managedMoveBusyPages().has(name);
 }
 
+/** Whether the page should visibly present a destructive/replacement hold.
+ * Managed cross-page moves still hold persistence and replacement, but their
+ * accepted result is an ordinary outline movement and must not dim the feed. */
+export function pageMutationVisiblyBusy(name: string): boolean {
+  return visibleMutationBusyPages().has(name);
+}
+
 /** Keep the named page editors inert across one explicit native mutation.
  * This is UI ownership only; callers drain then separately hold persistence. */
 export function holdPageMutationUi(pages: readonly string[]): () => void {
   const held = [...new Set(pages)];
   setManagedMoveBusy(held, true);
+  setVisibleMutationBusy(held, true);
   let released = false;
   return () => {
     if (released) return;
     released = true;
+    setVisibleMutationBusy(held, false);
     setManagedMoveBusy(held, false);
     // Releasing explicit ownership is a real replacement-gate transition, just
     // like ending an edit or draining a save. A winner-file watcher event can
@@ -358,6 +368,12 @@ function setManagedMoveBusy(pages: readonly string[], busy: boolean): void {
   const next = new Set(managedMoveBusyPages());
   for (const page of pages) busy ? next.add(page) : next.delete(page);
   setManagedMoveBusyPages(next);
+}
+
+function setVisibleMutationBusy(pages: readonly string[], busy: boolean): void {
+  const next = new Set(visibleMutationBusyPages());
+  for (const page of pages) busy ? next.add(page) : next.delete(page);
+  setVisibleMutationBusyPages(next);
 }
 
 /** The page-instance generation WITHOUT creating one for a page that has none.
@@ -1286,6 +1302,7 @@ export function resetStore() {
   clearAllEditorActivations();
   clearAllEditorLeases();
   setManagedMoveBusyPages(new Set<string>());
+  setVisibleMutationBusyPages(new Set<string>());
   managedHistoryReplayEpoch++;
   managedHistoryReplayRunning = false;
   managedHistoryCommands.length = 0;
@@ -6226,6 +6243,7 @@ interface ManagedCrossPageMoveIntent {
   rootNodes: Node[];
   targetParentNode: Node | null;
   history: ManagedMoveHistorySpec | null;
+  editorContext: HistoryEditorContext | null;
 }
 
 function managedMoveAdmission() {
@@ -6270,21 +6288,60 @@ function blockDepth(id: string): number | null {
   return node ? depth : null;
 }
 
-function installManagedMovedPages(source: PageDto, destination: PageDto): void {
-  setBaseRev(source.name, source.rev ?? null);
-  setBaseRev(destination.name, destination.rev ?? null);
+function applyManagedMoveToLoadedState(intent: ManagedCrossPageMoveIntent): boolean {
+  let applied = false;
   setDoc(produce((state) => {
-    purgePageNodes(state, source.name);
-    purgePageNodes(state, destination.name);
-    for (const dto of [source, destination]) {
-      const page = toFeedPage(dto, state.byId);
-      const index = state.pages.findIndex((candidate) => candidate.name === dto.name);
-      if (index >= 0) state.pages[index] = page;
-      else state.pages.push(page);
+    const sourcePage = state.pages.find((page) => page.name === intent.sourcePage);
+    const destinationPage = state.pages.find((page) => page.name === intent.destinationPage);
+    const first = state.byId[intent.roots[0]];
+    if (!sourcePage || !destinationPage || !first) return;
+    const source = first.parent === null ? sourcePage.roots : state.byId[first.parent]?.children;
+    const destination = intent.placement.placement === "root"
+      ? destinationPage.roots
+      : state.byId[intent.placement.parent_identity]?.children;
+    if (!source
+      || !destination
+      || intent.roots.some((id) => !state.byId[id] || !source.includes(id))) return;
+    const moved = new Set(intent.roots);
+    source.splice(0, source.length, ...source.filter((id) => !moved.has(id)));
+    const position = Math.max(0, Math.min(intent.placement.position, destination.length));
+    destination.splice(position, 0, ...intent.roots);
+    for (const id of intent.roots) {
+      const node = state.byId[id]!;
+      node.parent = intent.placement.placement === "root" ? null : intent.placement.parent_identity;
+      const rewrite = intent.rewrites.get(id);
+      if (rewrite !== undefined) node.raw = rewrite;
+      reassignPage(state, id, intent.destinationPage);
     }
+    applied = true;
   }));
-  activatePageInstance(source.name);
-  activatePageInstance(destination.name);
+  return applied;
+}
+
+/** Publish an accepted actor move as the same semantic store delta the Direct
+ * path uses. Reconstructing both DTO trees discarded the mounted textarea and
+ * created a blank frame between journal days. The actor response remains the
+ * authority: exact revisions are adopted, and an unexpected normalization
+ * mismatch falls back to the ordinary replacement installer. */
+function installManagedMovedPages(
+  intent: ManagedCrossPageMoveIntent,
+  source: PageDto,
+  destination: PageDto,
+): void {
+  const applied = applyManagedMoveToLoadedState(intent);
+  const sourcePage = pageByName(source.name);
+  const destinationPage = pageByName(destination.name);
+  if (!applied
+    || !sourcePage
+    || !destinationPage
+    || !pageContentMatches(source, sourcePage)
+    || !pageContentMatches(destination, destinationPage)) {
+    upsertPage(source);
+    upsertPage(destination);
+  } else {
+    setBaseRev(source.name, source.rev ?? null);
+    setBaseRev(destination.name, destination.rev ?? null);
+  }
   invalidateUndoForPage(source.name);
   invalidateUndoForPage(destination.name);
   clearConflict(source.name);
@@ -6442,7 +6499,16 @@ async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Prom
       }
       return false;
     }
+    // The actor has committed and the response still owns both loaded page
+    // instances. End the inert window before the store delta remounts the block
+    // under the adjacent journal, and re-arm the captured caret for that mount.
+    setManagedMoveBusy([intent.sourcePage, intent.destinationPage], false);
+    if (intent.editorContext) {
+      const editor = doc.byId[intent.editorContext.blockId];
+      if (editor) restoreHistoryEditorContext(intent.editorContext, editor.raw.length);
+    }
     installManagedMovedPages(
+      intent,
       { ...result.outcome.source.page, rev: result.outcome.source.revision },
       { ...result.outcome.destination.page, rev: result.outcome.destination.revision },
     );
@@ -6520,6 +6586,13 @@ function enqueueManagedCrossPageMove(
       ? (doc.byId[placement.parent_identity] ? unwrap(doc.byId[placement.parent_identity]) : null)
       : null,
     history,
+    editorContext: (() => {
+      const context = captureHistoryEditorContext();
+      if (!context) return null;
+      let node = doc.byId[context.blockId];
+      while (node?.parent) node = doc.byId[node.parent];
+      return node && roots.includes(node.id) ? context : null;
+    })(),
   };
   const result = managedMoveQueue.then(() => runManagedCrossPageMove(intent));
   managedMoveQueue = result.then(() => undefined, () => undefined);
