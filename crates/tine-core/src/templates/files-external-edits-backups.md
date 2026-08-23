@@ -33,7 +33,7 @@ icon:: 🗄️
 	- A `*.sync-conflict-*` (or `(conflicted copy)`) file never appears as a page. Files carrying unresolved git or Fossil merge markers are also quarantined from ordinary saves rather than rewritten.
 	- Both kinds appear in one **N conflicts** queue at the bottom of the sidebar. Open a conflicted page to compare the complete versions block by block; choose keep-mine, keep-theirs, or keep-both for each real divergence, then **Apply resolution**. A common ancestor preselects one-sided changes when available. Nothing is auto-merged or auto-deleted, and leaving with choices unfinished never blocks you.
 	- Settings → **Backups & recovery** keeps the inventory: **Review in page…** opens a conflict and **Discard copy** moves a provider conflict copy to the trash.
-	- Tine's own operation-backed sync is a separate, opt-in **Testing only** mode — see [[Features/Managed sync]]. Ordinary provider sync needs no setup at all.
+	- Tine's own operation-backed sync is a separate, opt-in, **known-buggy** mode — see [[Features/Managed sync]]. Ordinary provider sync needs no setup at all.
 - ## Journal files named by title
 	- Tine does not silently rename journal files when a graph opens. If an otherwise valid journal uses its display title as its filename (for example `Jun 18th, 2026.md`), the day may look empty because the filename cannot be matched to its date.
 	- Settings → **Backups & recovery** → **Journal files named by title** lists these files. Review the list and choose the explicit rename action; Tine takes a snapshot first and never overwrites an occupied destination.

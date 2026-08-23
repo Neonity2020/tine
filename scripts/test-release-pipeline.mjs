@@ -61,6 +61,7 @@ const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-prin
 const referenceParity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-og-parity-references.mjs"), "utf8");
 const iosConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), "src-tauri/tauri.ios.conf.json"), "utf8"));
 const iosInfoPlist = fs.readFileSync(path.join(process.cwd(), "src-tauri/Info.ios.plist"), "utf8");
+const iosEntitlements = fs.readFileSync(path.join(process.cwd(), "src-tauri/Tine.ios.entitlements"), "utf8");
 const iosPrivacyManifest = fs.readFileSync(
   path.join(process.cwd(), "src-tauri/PrivacyInfo.xcprivacy"),
   "utf8"
@@ -252,12 +253,12 @@ assert.match(
 );
 assert.match(
   iosTestFlightWorkflow,
-  /name: Build signed TestFlight IPA[\s\S]*?--export-method release-testing[\s\S]*?--build-number "\$\{GITHUB_RUN_NUMBER\}"/,
+  /name: Install iCloud entitlements[\s\S]*?npm run ios:prepare-project[\s\S]*?name: Build signed TestFlight IPA[\s\S]*?--export-method release-testing[\s\S]*?--build-number "\$\{GITHUB_RUN_NUMBER\}"/,
   "TestFlight builds do not use a unique build number and the release-testing export method"
 );
 assert.match(
   iosTestFlightWorkflow,
-  /name: Verify signed IPA contract[\s\S]*?CFBundleIdentifier[\s\S]*?page\.tine\.Tine[\s\S]*?CFBundleDisplayName[\s\S]*?TineOutline[\s\S]*?PrivacyInfo\.xcprivacy[\s\S]*?embedded\.mobileprovision[\s\S]*?codesign --verify --deep --strict/,
+  /name: Verify signed IPA contract[\s\S]*?CFBundleIdentifier[\s\S]*?page\.tine\.Tine[\s\S]*?CFBundleDisplayName[\s\S]*?TineOutline[\s\S]*?PrivacyInfo\.xcprivacy[\s\S]*?embedded\.mobileprovision[\s\S]*?com\.apple\.developer\.icloud-container-identifiers[\s\S]*?codesign --verify --deep --strict[\s\S]*?CloudDocuments/,
   "the signed IPA is not checked against Tine's identity, privacy, provisioning, and signature contract"
 );
 assert.match(iosTestFlightWorkflow, /name: Validate IPA with App Store Connect\n\s+if: inputs\.action != 'build-only'/);
@@ -280,6 +281,16 @@ assert.equal(iosConfig.bundle.iOS.minimumSystemVersion, "14.0");
 assert.ok(iosConfig.bundle.resources.includes("PrivacyInfo.xcprivacy"));
 assert.match(iosInfoPlist, /<key>CFBundleDisplayName<\/key>\s*<string>TineOutline<\/string>/);
 assert.match(iosInfoPlist, /<key>ITSAppUsesNonExemptEncryption<\/key>\s*<false\/>/);
+assert.match(iosInfoPlist, /<key>NSUbiquitousContainers<\/key>[\s\S]*?iCloud\.page\.tine\.Tine[\s\S]*?NSUbiquitousContainerIsDocumentScopePublic[\s\S]*?<true\/>[\s\S]*?NSUbiquitousContainerName[\s\S]*?TineOutline/);
+for (const entitlement of [
+  "com.apple.developer.icloud-container-identifiers",
+  "com.apple.developer.icloud-services",
+  "CloudDocuments",
+  "com.apple.developer.ubiquity-container-identifiers",
+  "iCloud.page.tine.Tine",
+]) {
+  assert.ok(iosEntitlements.includes(entitlement), `iOS entitlements are missing ${entitlement}`);
+}
 for (const declaration of [
   "NSPrivacyTracking",
   "NSPrivacyCollectedDataTypes",

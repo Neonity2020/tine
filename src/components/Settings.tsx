@@ -2771,7 +2771,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       <div class="settings-section">Storage &amp; sync</div>
       <ExperimentalSection forceOpen={props.forceOpen}>
         <div class="settings-experimental-warning" role="note">
-          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything.
+          <strong>Known to be buggy.</strong> Tine-managed storage does not yet fully work in our own testing; we're actively working on it. Use it only on a graph you are comfortable testing. Direct files is a permanent, fully supported way to use Tine — not a step on the way to anything.
         </div>
         <Show
           when={!loading()}

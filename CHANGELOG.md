@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **The iOS beta can use a TineOutline-owned graph in iCloud Drive.** The native folder picker recommends `iCloud Drive → TineOutline` when iCloud is available and also accepts `On My iPhone/iPad → TineOutline`, while clearly refusing arbitrary third-party Files providers. Before Rust opens the selected graph, the iOS bridge requests any ubiquitous files that are not yet local. Signed TestFlight builds install and verify the exact iCloud Documents entitlements in both the provisioning profile and app signature.
+
 - **macOS release builds are now signed and notarized.** The universal direct-download app and DMG use Tine's Developer ID identity, authenticate notarization with a short-lived App Store Connect token, and must pass independent signature, team, stapled-ticket, Gatekeeper, and DMG-integrity checks before the release lane can be staged. Windows signing remains separate future work.
 
 - **Tine can now build a signed iOS beta for TestFlight.** A manual-only workflow creates and verifies a `TineOutline` IPA for the existing `page.tine.Tine` bundle ID, retains it as an immutable artifact by default, and only validates or uploads to TestFlight when that action is explicitly selected. It cannot submit or release a production App Store version. The iOS bundle includes its privacy manifest, export-compliance declaration, App Store provisioning proof, and a unique build number for each run.
@@ -19,6 +21,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Sheets now render in the HTML export and print output for any graph.** Until now, publishing a page holding a Tine Sheet emitted only the sheet's plain-bullet twin plus the visible `tine.*` view configuration, so the presentation — columns, grouping, computed cells — disappeared. Block-powered sheets now publish as meaningful read-only views: tables with their title/declared/formula/observed columns, typed checkbox cells, aggregate footers, and arithmetic formula columns; boards grouped by state, priority, tags, or fields, including query-backed boards; and grids with their positional cells, header rows, and nested grids. Numbered list blocks (`logseq.order-list-type:: number`) keep their ordinal markers, and blocks with LOGBOOK clock rows keep an elapsed-time badge while the drawer stays hidden. This applies to both whole-graph publishing and single-page print/PDF export.
 
 ### Changed
+
+- **The managed-storage opt-in now says plainly that it is known to be buggy.** Settings and the built-in Guide no longer describe it merely as experimental or not mature: they state that it does not yet fully work in Tine's own testing and that work is ongoing, while retaining Direct Files as a fully supported peer rather than a migration step.
 
 - **The first iOS beta keeps Wasm plugins disabled, as required by ADR 0052.** Installed guests are not loaded, the package/catalogue surface is absent from Settings, and plugin commands cannot register. Built-in and inert token themes remain available. Enabling iOS plugins later remains a separate product and App Review decision.
 

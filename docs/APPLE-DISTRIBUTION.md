@@ -70,6 +70,32 @@ not enable iOS plugins as part of release preparation; that decision requires
 the separate Apple guideline 4.7 catalogue, reporting, age-rating, and review
 work recorded by the ADR.
 
+### iCloud Drive capability
+
+The first useful TestFlight build supports exactly two graph roots owned by
+TineOutline:
+
+- `On My iPhone/iPad → TineOutline`;
+- `iCloud Drive → TineOutline`, backed by `iCloud.page.tine.Tine`.
+
+The iCloud location is the folder picker's recommended starting point when the
+device is signed in to iCloud. Tine prepares ubiquitous files before handing the
+graph to the ordinary guarded storage path; conflict handling remains Concord's
+job just as it is for another provider-delivered external edit. Arbitrary Files
+providers are intentionally outside this first boundary: Dropbox, Google Drive,
+OneDrive, Working Copy and similar roots require persisted security-scoped
+bookmarks and coordination that Tine does not yet implement. State this on the
+Welcome screen, when refusing an outside-container folder, and in TestFlight
+beta notes; do not present it as a warning about iCloud or ordinary conflicts.
+
+Before a signed build can pass, Apple Developer must contain an iCloud container
+with identifier `iCloud.page.tine.Tine`, the `page.tine.Tine` App ID must enable
+iCloud Documents and associate that container, and the App Store Connect
+provisioning profile must be regenerated. Replace `IOS_MOBILE_PROVISION` after
+regeneration. The workflow installs the tracked entitlements into Tauri's
+generated Xcode project and verifies that both the profile and final signature
+authorize the exact container and `CloudDocuments` service.
+
 An upload is not the end of TestFlight setup. In App Store Connect, wait for
 processing, answer any export-compliance prompt, complete the app privacy and
 beta-review information, select internal or external testers, and submit an
@@ -84,7 +110,9 @@ Before this branch is merged:
 2. `support@tine.page` must receive and send a test reply.
 3. A manual macOS candidate must pass signing, notarization, and Gatekeeper
    verification on GitHub's macOS runner, then be opened on a real Mac.
-4. The TestFlight workflow must pass `build-only`, then `validate`; upload needs
+4. The iCloud App ID/container association must exist and the regenerated
+   provisioning profile must replace `IOS_MOBILE_PROVISION`.
+5. The TestFlight workflow must pass `build-only`, then `validate`; upload needs
    Martin's explicit choice and a real iPhone smoke test.
-5. App Store Connect metadata, screenshots, privacy answers, and review notes
+6. App Store Connect metadata, screenshots, privacy answers, and review notes
    remain subject to Martin's approval.

@@ -1,7 +1,7 @@
 icon:: 📂
 
 - # Bring an existing graph
-	- Tine works directly on the same Markdown/Org files as Logseq — no import, no export, no lock-in. This **Direct files** mode is the normal mode; the separate **Testing only** storage & sync opt-in is documented at [[Features/Managed sync]].
+	- Tine works directly on the same Markdown/Org files as Logseq — no import, no export, no lock-in. This **Direct files** mode is the normal mode; the separate, **known-buggy** storage & sync opt-in is documented at [[Features/Managed sync]].
 - ## Open your graph
 	- 1. On the Welcome screen, choose **Open an existing graph** and pick the graph's top-level folder — usually the one containing `pages/`, `journals/`, and `logseq/`.
 	- 2. Later, use the graph-name menu at the top of the left sidebar → **Open graph…**, or Settings (**t s**) → **Graph** → **Open another graph…**. Graphs you have opened appear in the same sidebar menu for one-click switching.

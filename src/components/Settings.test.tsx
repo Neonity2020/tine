@@ -115,7 +115,7 @@ describe("Settings storage transitions", () => {
     application_page_admission: { binding_generation: 11, authority: "managed_unavailable" },
   });
 
-  it("discloses managed storage as experimental and keeps Direct files available", async () => {
+  it("discloses managed storage as known-buggy and keeps Direct files available", async () => {
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
     const root = document.createElement("div");
     document.body.append(root);
@@ -144,7 +144,8 @@ describe("Settings storage transitions", () => {
     await tick();
 
     expect(experimental.getAttribute("aria-expanded")).toBe("true");
-    expect(root.textContent).toContain("Tine-managed storage is for testing and is not yet mature.");
+    expect(root.textContent).toContain("Known to be buggy.");
+    expect(root.textContent).toContain("does not yet fully work in our own testing; we're actively working on it.");
     // Direct files and Tine-managed storage are peers. Neither description may
     // present the other as the destination, and the panel says so where a user
     // deciding between them will read it.

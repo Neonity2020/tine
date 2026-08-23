@@ -132,6 +132,10 @@ export type GraphFolderPickResult =
   | { status: "picked"; path: string }
   | { status: "permission-requested" | "permission-needed" | "cancelled" | "refused"; path?: string };
 
+export type PreparedGraphFolder =
+  | { status: "ready"; location: "local" | "icloud" }
+  | { status: "refused"; location?: undefined };
+
 export interface ClipboardAssetFile {
   path: string;
   name: string;
@@ -599,6 +603,9 @@ export interface Backend {
   /** Android native graph-folder picker. Returns a real filesystem path when
    *  picked; never a content URI. */
   pickGraphFolder(): Promise<GraphFolderPickResult>;
+  /** iOS: ensure a Tine-owned local/iCloud graph is locally readable before
+   *  Rust enumerates it. Other platforms never call this command. */
+  prepareGraphFolder(path: string): Promise<PreparedGraphFolder>;
   /** Native file picker (asset upload). Null if cancelled / unsupported. */
   pickFile(): Promise<string | null>;
   /** Android: take a photo with the camera (or pick an existing image) → base64
@@ -1414,6 +1421,9 @@ class TauriBackend implements Backend {
   }
   pickGraphFolder(): Promise<GraphFolderPickResult> {
     return this.call<GraphFolderPickResult>("pick_graph_folder");
+  }
+  prepareGraphFolder(path: string): Promise<PreparedGraphFolder> {
+    return this.call<PreparedGraphFolder>("prepare_graph_folder", { path });
   }
   capturePhoto(): Promise<MediaCaptureResult> {
     return this.call<MediaCaptureResult>("capture_photo");

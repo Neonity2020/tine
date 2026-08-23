@@ -86,6 +86,9 @@ jobs:
       - name: Generate iOS project
         run: npx tauri ios init --ci --verbose
 
+      - name: Install iCloud entitlements
+        run: npm run ios:prepare-project
+
       - name: Build signed TestFlight IPA
         env:
           IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
@@ -129,9 +132,15 @@ jobs:
           security cms -D -i "$app/embedded.mobileprovision" > "$RUNNER_TEMP/tine-profile.plist"
           [ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/tine-profile.plist")" = "$APPLE_TEAM_ID.page.tine.Tine" ]
           [ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$RUNNER_TEMP/tine-profile.plist")" = "false" ]
+          /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.icloud-container-identifiers' "$RUNNER_TEMP/tine-profile.plist" | grep -Fq 'iCloud.page.tine.Tine'
+          /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.ubiquity-container-identifiers' "$RUNNER_TEMP/tine-profile.plist" | grep -Fq 'iCloud.page.tine.Tine'
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dv --verbose=4 "$app" 2> "$RUNNER_TEMP/tine-ios-codesign.txt"
           grep -Fq "TeamIdentifier=$APPLE_TEAM_ID" "$RUNNER_TEMP/tine-ios-codesign.txt"
+          codesign -d --entitlements :- "$app" > "$RUNNER_TEMP/tine-ios-entitlements.plist"
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.icloud-container-identifiers' "$RUNNER_TEMP/tine-ios-entitlements.plist" | grep -Fq 'iCloud.page.tine.Tine'
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.icloud-services' "$RUNNER_TEMP/tine-ios-entitlements.plist" | grep -Fq 'CloudDocuments'
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.ubiquity-container-identifiers' "$RUNNER_TEMP/tine-ios-entitlements.plist" | grep -Fq 'iCloud.page.tine.Tine'
 
           staged="artifacts/TineOutline-${GITHUB_RUN_NUMBER}.ipa"
           cp "$ipa" "$staged"
@@ -191,4 +200,4 @@ jobs:
         run: |
           rm -rf "$HOME/.appstoreconnect/private_keys"
           rm -rf "$RUNNER_TEMP/tine-ipa"
-          rm -f "$RUNNER_TEMP/tine-profile.plist" "$RUNNER_TEMP/tine-ios-codesign.txt"
+          rm -f "$RUNNER_TEMP/tine-profile.plist" "$RUNNER_TEMP/tine-ios-codesign.txt" "$RUNNER_TEMP/tine-ios-entitlements.plist"
