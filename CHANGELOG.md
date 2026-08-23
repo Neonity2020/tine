@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
 
+- **Page-reference styling updates as soon as a referenced page gains content** (GH #355). A `[[Page]]` link could stay in the "missing page" style after its target was created later in the same session, refreshing only on restart. The existence answers now invalidate whenever the graph's page inventory changes, so links restyle immediately — both when a page appears and when one is deleted.
+
 - **Block reference locations can be collapsed to a compact overview** (GH #344). The expanded view you get from a block's reference-count badge now offers Collapse all / Expand all: collapsed groups show only their source page title (click any to re-expand to its breadcrumb and referenced block), making heavily referenced blocks easy to scan. The state is local to that view — the page-level Linked References section keeps its own.
 
 - **Arrow keys now move between bullets inside linked references, block references, query results, and embeds** (GH #341). Previously, pressing Up/Down while editing a block in one of those views moved the caret into the block's owning page outline — an editor that usually isn't visible there — so the cursor simply vanished. Navigation now steps through the blocks exactly as rendered in that view, while structural edits (merges, indent) keep operating on the real page outline.

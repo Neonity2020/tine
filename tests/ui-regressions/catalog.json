@@ -7266,6 +7266,32 @@
         "failBefore": "proven"
       },
       "notes": "GH #344: blocks referenced/embedded in many places showed every referrer group fully expanded — long and impossible to scan. The block-reference panel now has the same group-collapse affordance as page-level Linked References: a ▸/▾ disclosure per group and Collapse all / Expand all bulk buttons (shown when more than one group), reusing the existing .reference-group-header/.reference-group-disclosure/.reference-bulk-controls chrome (no new CSS). Collapse hides only the group's blocks container; the source page title row keeps its navigation (open, sidebar shift-click, new-tab middle-click, context menu). State is a plain per-instance createSignal — spec-demanded locality: the test asserts referenceSectionState.collapsedGroupsFor('linked', …) stays untouched, so this never conflates with or persists as the page-level section state. Group identity keys are kind+path+page so duplicate-name pages collapse independently. jsdom render-level evidence with mocked getBlockReferrers and the LiveRefGroup stub; breadcrumb/context content inside an expanded LiveRefGroup is covered by that component's own tests."
+    },
+    {
+      "id": "UI-REF-STYLE-INVENTORY-355",
+      "title": "A [[page]] reference restyles from the missing/blank style to the existing-page style immediately after same-session page creation, and a deleted page stops showing a stale existing result — the batched page-existence answers invalidate on page-inventory changes, not only on graph switches",
+      "family": "references",
+      "sources": {
+        "issues": [
+          355
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/pageExistsBatch.test.ts::pageExistsBatch::GH #355: page-inventory changes invalidate batched answers::restyles a same-session page creation immediately (missing → existing)",
+          "src/pageExistsBatch.test.ts::pageExistsBatch::GH #355: page-inventory changes invalidate batched answers::does not leave a stale positive result after the page disappears",
+          "src/pageExistsBatch.test.ts::pageExistsBatch::GH #355: page-inventory changes invalidate batched answers::keeps one name asked once per (graph × inventory) state"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #355: pageExistsBatch cached each name's existence FOR THE WHOLE GRAPH SESSION (invalidated only on graphEpoch change), so a page created after [[refs]] already rendered kept them styled as missing until restart. The cache now keys on (graphEpoch × pageInventoryRev): every physical inventory transition already bumps pageInventoryRev (baseline-null saves creating pages, deletePage, external watcher adds/removes incl. sync tools, guide installs, conflict merges), so both directions restyle immediately — missing→existing on creation and never a stale positive after deletion. Batching semantics are unchanged: one tick = one IPC, request order preserved, each name asked at most once per (graph × inventory) state, and 'unknown means alive' still guards first paint. Layer is the logic seam with a mocked backend/ui; the style consumers (link dimming) were not the defect and are untouched. Reported on Windows/Direct-files — the cache is platform-independent frontend state; stated plainly because no Windows run is possible in this lane."
     }
   ]
 }

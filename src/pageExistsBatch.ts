@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js";
 import { backend } from "./backend";
-import { graphEpoch } from "./ui";
+import { graphEpoch, pageInventoryRev } from "./ui";
 
 // Does the page behind a `[[ref]]` exist? Used to dim links that will open a
 // blank page (Martin's 2026-08-09 tine-choco report: a `title::`/filename
@@ -8,13 +8,19 @@ import { graphEpoch } from "./ui";
 //
 // Batched exactly like `pageIconBatch`: every reference rendered in one
 // microtask tick becomes ONE `existing_page_names` IPC, and each name is asked
-// at most once per open graph. The backend answer costs one memoized page-list
-// read, so per-reference cost here is a signal read plus an object lookup.
+// at most once per (graph × page-inventory) state. The backend answer costs one
+// memoized page-list read, so per-reference cost here is a signal read plus an
+// object lookup.
 //
 // UNKNOWN MEANS ALIVE. A reference renders normally until its batch resolves,
 // so a page of live links never flashes as dead; only a genuinely missing
 // target changes appearance, once.
+//
+// Answers live until the graph changes OR its page inventory moves (GH #355):
+// a same-session page creation must restyle every [[ref]] to that page
+// immediately, and a deletion must not leave a stale positive result behind.
 let cacheRev = -1;
+let cacheInventoryRev = -1;
 const [known, setKnown] = createSignal<Record<string, boolean>>({});
 const requested = new Set<string>();
 let pending: string[] = [];
@@ -22,8 +28,10 @@ let scheduled = false;
 
 function ensureRev() {
   const epoch = graphEpoch();
-  if (epoch !== cacheRev) {
+  const inventory = pageInventoryRev();
+  if (epoch !== cacheRev || inventory !== cacheInventoryRev) {
     cacheRev = epoch;
+    cacheInventoryRev = inventory;
     setKnown({});
     requested.clear();
     pending = [];
@@ -71,6 +79,7 @@ export function pageIsMissing(name: string): boolean {
 /** Test seam: forget every answer, as a graph switch would. */
 export function resetPageExistsBatch() {
   cacheRev = -1;
+  cacheInventoryRev = -1;
   setKnown({});
   requested.clear();
   pending = [];

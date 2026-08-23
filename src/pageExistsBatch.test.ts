@@ -3,6 +3,7 @@ import { describe, expect, it, beforeEach, vi } from "vitest";
 let existing: string[] = [];
 const calls: string[][] = [];
 let epoch = 1;
+let inventory = 0;
 
 vi.mock("./backend", () => ({
   backend: () => ({
@@ -12,7 +13,7 @@ vi.mock("./backend", () => ({
     },
   }),
 }));
-vi.mock("./ui", () => ({ graphEpoch: () => epoch }));
+vi.mock("./ui", () => ({ graphEpoch: () => epoch, pageInventoryRev: () => inventory }));
 
 const { pageIsMissing, resetPageExistsBatch } = await import("./pageExistsBatch");
 
@@ -23,6 +24,7 @@ describe("pageExistsBatch", () => {
     calls.length = 0;
     existing = [];
     epoch = 1;
+    inventory = 0;
     resetPageExistsBatch();
   });
 
@@ -74,5 +76,54 @@ describe("pageExistsBatch", () => {
     pageIsMissing("swap bribery");
     await settle();
     expect(pageIsMissing("swap bribery")).toBe(false);
+  });
+
+  describe("GH #355: page-inventory changes invalidate batched answers", () => {
+    it("restyles a same-session page creation immediately (missing → existing)", async () => {
+      pageIsMissing("Later Target");
+      await settle();
+      expect(pageIsMissing("Later Target")).toBe(true);
+
+      // The physical inventory moves (savePage baseline-null create, external
+      // add, etc.): the blank-page style must flip without a restart.
+      inventory++;
+      existing = ["Later Target"];
+      pageIsMissing("Later Target");
+      await settle();
+
+      expect(pageIsMissing("Later Target")).toBe(false);
+      expect(calls).toEqual([["Later Target"], ["Later Target"]]);
+    });
+
+    it("does not leave a stale positive result after the page disappears", async () => {
+      existing = ["Gone Soon"];
+      pageIsMissing("Gone Soon");
+      await settle();
+      expect(pageIsMissing("Gone Soon")).toBe(false);
+
+      inventory++;
+      existing = [];
+      pageIsMissing("Gone Soon");
+      await settle();
+
+      expect(pageIsMissing("Gone Soon")).toBe(true);
+      expect(calls).toEqual([["Gone Soon"], ["Gone Soon"]]);
+    });
+
+    it("keeps one name asked once per (graph × inventory) state", async () => {
+      existing = ["A"];
+      pageIsMissing("A");
+      await settle();
+      pageIsMissing("A");
+      await settle();
+      expect(calls).toEqual([["A"]]);
+
+      inventory++;
+      pageIsMissing("A");
+      await settle();
+      pageIsMissing("A");
+      await settle();
+      expect(calls).toEqual([["A"], ["A"]]);
+    });
   });
 });
