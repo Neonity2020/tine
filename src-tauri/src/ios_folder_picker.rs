@@ -67,6 +67,7 @@ pub(crate) async fn pick_graph_folder<R: Runtime>(
 
 #[tauri::command]
 pub(crate) async fn prepare_graph_folder<R: Runtime>(
+    _app: AppHandle<R>,
     picker: State<'_, IosFolderPicker<R>>,
     path: String,
 ) -> Result<PrepareGraphFolderResult, String> {
