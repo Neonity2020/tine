@@ -6973,6 +6973,31 @@
         "failBefore": "proven"
       },
       "notes": "GH #287 asked for a way to enlarge the Settings dialog (reporter: wasted space in long scroll views; 90% is fine). The desktop dialog gains a transient maximize/restore button in the pane head (inline SVG window glyphs, aria-pressed, labelled 'Maximize settings' / 'Restore settings size'). Geometry: the overlay trades its 12vh top gap for an even 4vh/4vw margin and the dialog fills it (~92vw x 92vh), all desktop-gated in @media (min-width: 481px) so a maximized-then-narrowed window can never break the mobile sheet's status-bar inset padding; <=480px keeps its existing full-viewport sheet and hides the control. The toggle is a pure class flip, so the selected settings page and scroll position ride through; the state resets on close (does not persist across modal reopen or restart). Verified numerically in headless Chromium: default 840x630 at (300,108) -> maximized 1325x828 at (58,36) on a 1440x900 viewport, active page 'Editor' retained across the toggle, reopen restores 840x630; mobile 390x844 shows display:none on the control and the unchanged 374x836 sheet. Scroll preservation asserted at render layer (scrollTop 120 survives both toggles); in the Chromium run the Editor pane simply clamped to its 38px max scroll at that width."
+    },
+    {
+      "id": "UI-CALC-TRAILING-BLANK-339",
+      "title": "A committed calculator block renders no phantom empty line for the fenced block's trailing newline, and no rows at all when fully blank",
+      "family": "calculator",
+      "sources": {
+        "issues": [
+          339
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/calc.test.ts::trailing blank lines (GH #339)",
+          "src/render/calcTrailingLines.test.tsx::CalcBlock trailing blank lines (GH #339)"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #339: while editing, the calc panel shows the correct number of lines, but after committing, the rendered CalcBlock showed one extra empty line. The parsed AST `code` of a fenced block ends with the newline before the closing fence, and evalCalc minted a row per split('\\n') line, so the trailing '' became a phantom row. evalCalc now drops only TRAILING blank lines (LF/CRLF/whitespace-only) before mapping; interior blanks keep their row position, the all-blank block renders zero rows, and evaluation state is provably untouched (blank lines never modify env or `last`; row outputs are identical with and without trailing blanks). Both consumers share the function: the static CalcBlock and the editor's live results panel. The committed on-disk source is unchanged - this is render-only; no parser/round-trip involvement."
     }
   ]
 }

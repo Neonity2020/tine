@@ -737,10 +737,18 @@ function formatValue(env: CalcEnvironment, value: Decimal): string {
   return formatNormal(env, value);
 }
 
-/** Evaluate a multi-line calc source; returns one entry per input line. */
+/** Evaluate a multi-line calc source; returns one entry per input line,
+ *  except trailing blank lines, which never mint rows (GH #339): a committed
+ *  ```calc block's AST `code` ends with a newline, and rendering a row for it
+ *  showed one phantom empty line after the last expression. Interior blanks
+ *  keep their position. Blank lines never touch the environment, so dropping
+ *  only trailing ones cannot change any result. */
 export function evalCalc(src: string): CalcLine[] {
   const env: CalcEnvironment = { values: new Map() };
-  return src.split("\n").map((line) => {
+  const lines = src.split("\n");
+  let end = lines.length;
+  while (end > 0 && /^\s*$/.test(lines[end - 1])) end--;
+  return lines.slice(0, end).map((line) => {
     const noComment = line.split("#")[0];
     if (!noComment.trim()) return { input: line, output: null };
     try {
