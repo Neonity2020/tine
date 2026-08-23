@@ -6940,6 +6940,27 @@
         "failBefore": "proven"
       },
       "notes": "Internal Android report after v0.6.94: join failed with `join bootstrap did not reach LocalActive: Retryable [details]`. The native command debug-formatted the complete tagged availability object; the privacy sanitizer correctly collapsed its brace-delimited body, losing the operation stage and reason. The command now emits ordinary bounded `stage: detail` text, which the sanitizer can redact token-by-token without deleting its diagnostic class. Every sticky managed-storage failure also carries a Copy details action for the already-sanitized complete message. The exact synthetic and 1,046-page anonymized Linux two-device journeys both pass join, forced-close recovery, partial delivery and bidirectional editing on this candidate, so this row deliberately claims diagnostic coverage rather than inventing an Android root-cause fix without the newly exposed detail."
+    },
+    {
+      "id": "UI-MANAGED-JOURNAL-CROSS-DAY-EDITOR-CONTINUITY-001",
+      "title": "A managed cross-day journal move stays visually continuous and keeps the moved block focused",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx",
+          "src/store.test.ts"
+        ],
+        "scenario": "managed.journal-cross-day-move-editor-continuity",
+        "failBefore": "proven"
+      },
+      "notes": "Internal report against deployed f08e21eb: the native transaction committed safely, but both journal pages became inert and dim, the accepted DTO installation purged and reconstructed their loaded block trees, and the moved editor remounted while its page was still inert. The block therefore briefly disappeared and the caret was lost, preventing repeated move-up/down commands without another click. Fail-before was proven in two passes: the unchanged code produced two visibly-busy page sections while the actor response was pending; retaining the inert hold through accepted publication left document.body focused instead of the moved textarea. Managed moves now retain their persistence/replacement hold without using the destructive visual class, publish the accepted semantic delta while preserving loaded block identity, release inertness before that delta, and re-arm the exact editor/caret context for the adjacent journal mount. No-commit, blocked recovery, page replacement, undo/redo and selection routes retain their existing actor-owned behavior."
     }
   ]
 }
