@@ -7371,6 +7371,33 @@
         "failBefore": "proven"
       },
       "notes": "GH #279: keyboard-centric embed workflows had to hand-assemble {{embed ((uuid))}}. New remappable editor command editor/copy-embed (default mod+shift+c, label per the issue's suggestion 'Copy block embed when no text is selected', Settings → Keybindings) routed through the existing command dispatch like the other editor commands, NOT a hardcoded branch: it commits the edit, resolves the block's persistent id:: via ensureBlockId (the same identity primitive the builtin Mod+C block-ref copy uses — never a synthesized unstable id), and writes through the writeClipboardText facade. With a live selection the handler returns false without preventDefault, preserving the platform's native copy. Binding collision checked — mod+shift+c was unassigned; the row sits beside editor/insert-link and follows its hand-pattern. Tests exercise the real command resolution path (installKeybindings): positive no-selection copy, selection decline, and the Mod+C block-ref sibling contract pinned in the same file."
+    },
+    {
+      "id": "UI-ENTER-LINE-BOUNDARY-361",
+      "title": "Enter with the caret immediately after an in-block newline splits there and consumes the boundary break: the new block starts with that line's text and the original keeps no trailing empty line, while Shift+Enter in-block newlines, mid-line splits, caret-at-start, Markdown and Org behavior are preserved",
+      "family": "editor-enter",
+      "sources": {
+        "issues": [
+          361
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editingBoundary.regression.test.ts::splitBlock at an in-block line boundary (GH #361)::consumes the boundary newline: neither block keeps an empty line",
+          "src/editingBoundary.regression.test.ts::splitBlock at an in-block line boundary (GH #361)::behaves identically in Org pages",
+          "src/components/Block.enterLineBoundary.test.tsx::Enter at an in-block line boundary (GH #361)::keeps Shift+Enter inserting an in-block newline",
+          "src/components/Block.enterLineBoundary.test.tsx::Enter at an in-block line boundary (GH #361)::leaves an ordinary mid-line split working exactly as before"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #361: a block 'line1\\nline2' with the caret at the start of line2 split into 'line1\\n' + 'line2' — the boundary break stayed behind as an empty line, diverging from Logseq on both desktop and mobile. store.splitBlock now recognizes the boundary class (offset>0 with visible[offset-1]==='\\n') and consumes exactly that one separator char: block1 loses the trailing newline and the new block starts with that line's text. Preserved and pinned: intentional interior blank lines from Shift+Enter (Enter on a blank second line yields 'line1' + '\\nline2'), mid-line splits, caret-at-very-start empty-block-before, ordered-list Org propagation, IME (Enter exits early while composing — code untouched), and mobile (the same splitBlock choke point feeds both platforms; the issue reported both). The fix is exclusively the editor split calculation — parser and round-trip untouched, per the batch's stop condition. ONE consciously updated neighbor: Block.codeFenceEnter's 'ordinary trailing blank line' case expected raw 'hello\\n' after Enter-at-end; its semantic (no special-block exit; still two roots) is unchanged and its raw expectation is now 'hello' under the same uniform boundary rule, with the change named in the test comment. Fail-before: 3 of 5 store tests and the new render boundary test fail on HEAD; the pin tests pass everywhere."
     }
   ]
 }

@@ -21,6 +21,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
 
+- **Enter at an in-block line break no longer leaves an empty first line** (GH #361). Pressing Enter with the caret right after an in-block newline now turns that newline into the block boundary, matching Logseq: the previous block ends with its last text line and the new block starts with the next line's actual text — on desktop and mobile. Shift+Enter's in-block newline, mid-line splits, and Enter at the very start of a block are unchanged.
+
 - **Blocks opened in the right sidebar always show their children** (GH #358). Shift-clicking the bullet of a collapsed block parked it in the sidebar but hid its child content until you first expanded it in the main page. The sidebar now treats the opened block as the root of its own view, exactly like zooming in the main page — children always render, and deeper collapsed blocks stay collapsed as expected.
 
 - **Page-reference styling updates as soon as a referenced page gains content** (GH #355). A `[[Page]]` link could stay in the "missing page" style after its target was created later in the same session, refreshing only on restart. The existence answers now invalidate whenever the graph's page inventory changes, so links restyle immediately — both when a page appears and when one is deleted.

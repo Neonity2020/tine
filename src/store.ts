@@ -3475,7 +3475,14 @@ export function splitBlock(
   // The caret offset is in editor-visible space (hidden props aren't shown), so
   // split the visible text and keep the hidden props on the original block.
   const { visible, hidden } = splitProps(node.raw, isBuiltinHidden, fmt);
-  const before = visible.slice(0, offset);
+  // GH #361: Enter at a source-line boundary — the caret sits immediately
+  // AFTER an in-block newline — turns that line into a new block WITHOUT
+  // retaining the boundary break as an empty line in either block (Logseq's
+  // behavior). The break becomes the structural separator instead.
+  const splitBefore = offset > 0 && visible[offset - 1] === "\n" ? offset - 1 : offset;
+  // `after` always starts at the caret (the first char of the new line); the
+  // consumed boundary break lives entirely in the discarded boundary char.
+  const before = visible.slice(0, splitBefore);
   const after = visible.slice(offset);
   const pageName = node.page;
   // Ordered-list items propagate: a block split off an ordered item is itself
