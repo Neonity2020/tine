@@ -1,17 +1,16 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
-import { For } from "solid-js";
 import { initParser } from "../render/parse";
 import { renderInlines } from "../render/inline";
-import { doc, loadSingle, pageByName, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
+import { resetStore } from "../store";
 import { backend } from "../backend";
-import { openPage, route } from "../router";
+import { openPage } from "../router";
 import { paneRouter, resetPaneLayoutToSingle } from "../panes";
-import { rightSidebar, setRightSidebar, setRightSidebarOpen, setFavorites, favoritesSectionExpanded } from "../ui";
+import { rightSidebar, setRightSidebar, setRightSidebarOpen, setFavorites } from "../ui";
 import { Sidebar } from "./Sidebar";
 import { NamespaceCrumb } from "./Namespace";
-import type { PageDto, RefGroup } from "../types";
+import type { RefGroup } from "../types";
 
 // GH #283 (approved contract): ONE modified-click decision across internal
 // page/block link surfaces:
@@ -46,16 +45,6 @@ function mount(node: () => JSX.Element): { root: HTMLDivElement; dispose: () => 
   const root = document.createElement("div");
   document.body.appendChild(root);
   return { root, dispose: render(node, root) };
-}
-
-function pageDto(name: string, lines: string[]): PageDto {
-  return {
-    name,
-    kind: "page",
-    title: name,
-    pre_block: null,
-    blocks: lines.map((raw, i) => ({ id: `b${i}`, raw, collapsed: false, children: [] })),
-  };
 }
 
 function tabsCount(): number {
@@ -105,7 +94,7 @@ describe("modified-click contract on internal links (GH #283)", () => {
       click(anchor(), { shiftKey: true });
       expect(rightSidebar().length).toBeGreaterThan(0);
       const item = rightSidebar()[0];
-      expect(item.name).toBe("Target Page");
+      expect(item.kind === "page" ? item.name : null).toBe("Target Page");
       expect(activeRouteName()).toBe("Elsewhere");
     } finally {
       dispose();

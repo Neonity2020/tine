@@ -39,7 +39,9 @@ fn page_and_block_surfaces_share_candidates_within_designed_windows() {
     fs::create_dir_all(dir.join("pages").join("数据")).unwrap();
     for i in 0..30 {
         fs::write(
-            dir.join("pages").join("数据").join(format!("医保 安全 规范 {i}.md")),
+            dir.join("pages")
+                .join("数据")
+                .join(format!("医保 安全 规范 {i}.md")),
             "- middle family\n",
         )
         .unwrap();
@@ -88,7 +90,10 @@ fn page_and_block_surfaces_share_candidates_within_designed_windows() {
         block_hits,
         friendly.has_more
     );
-    eprintln!("FR page first 12: {:?}", &page_hits[..page_hits.len().min(12)]);
+    eprintln!(
+        "FR page first 12: {:?}",
+        &page_hits[..page_hits.len().min(12)]
+    );
 
     let literal_blocks = QueryPlan::block_search_literal("医保", 20).execute(&graph, || false);
     eprintln!(
@@ -102,7 +107,10 @@ fn page_and_block_surfaces_share_candidates_within_designed_windows() {
     // shared executor + deterministic ties means one pool).
     for must in ["医保", "医保目录第0批", "医保目录第29批"] {
         assert!(qs_names.contains(&must), "quick_switch must contain {must}");
-        assert!(page_hits.contains(&must), "Ctrl+K page hits must contain {must}");
+        assert!(
+            page_hits.contains(&must),
+            "Ctrl+K page hits must contain {must}"
+        );
     }
     assert_eq!(
         &qs_names[..12],
@@ -134,7 +142,13 @@ fn literal_autocomplete_is_stable_across_character_swaps_and_dsl_tokens() {
     // otherwise identical strings differing by one character must not flip
     // between present/absent, and DSL-token characters stay literal.
     let dir = scratch("swap-ladder");
-    for name in ["ORb-target-page", "医保abc目标", "医保abd目标", "医保x目标", "OR 专题"] {
+    for name in [
+        "ORb-target-page",
+        "医保abc目标",
+        "医保abd目标",
+        "医保x目标",
+        "OR 专题",
+    ] {
         fs::write(
             dir.join("pages").join(format!("{name}.md")),
             "- swap ladder fixture pages\n",
@@ -144,7 +158,11 @@ fn literal_autocomplete_is_stable_across_character_swaps_and_dsl_tokens() {
     // Content blocks for the (( picker over the same token set.
     fs::write(dir.join("pages").join("generic blocks.md"), {
         let mut lines = String::new();
-        for l in ["ORb target block", "医保abc target block", "医保abd target block"] {
+        for l in [
+            "ORb target block",
+            "医保abc target block",
+            "医保abd target block",
+        ] {
             lines.push_str(&format!("- {l}\n"));
         }
         lines
