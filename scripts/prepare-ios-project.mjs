@@ -1,16 +1,100 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { execFileSync } from "node:child_process";
 
 const root = process.cwd();
 const source = path.join(root, "src-tauri", "Tine.ios.entitlements");
 const generatedRoot = path.join(root, "src-tauri", "gen", "apple");
+
+const signing = {
+  identity: process.env.IOS_SIGNING_IDENTITY,
+  profileUuid: process.env.IOS_PROVISIONING_PROFILE_UUID,
+  teamId: process.env.APPLE_DEVELOPMENT_TEAM,
+};
+
+const signingValues = Object.values(signing).filter(Boolean);
+if (signingValues.length > 0 && signingValues.length !== 3) {
+  throw new Error(
+    "iOS signing configuration requires IOS_SIGNING_IDENTITY, " +
+      "IOS_PROVISIONING_PROFILE_UUID, and APPLE_DEVELOPMENT_TEAM together",
+  );
+}
+
+function xml(value) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function yamlDoubleQuoted(value) {
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
 
 if (!fs.existsSync(source)) {
   throw new Error(`missing tracked iOS entitlements: ${source}`);
 }
 if (!fs.existsSync(generatedRoot)) {
   throw new Error("the generated iOS project is absent; run `npx tauri ios init --ci` first");
+}
+
+if (signingValues.length === 3) {
+  if (!/^Apple Distribution: .+ \([A-Z0-9]{10}\)$/.test(signing.identity)) {
+    throw new Error("IOS_SIGNING_IDENTITY is not an Apple Distribution identity");
+  }
+  if (!/^[A-F0-9]{8}(?:-[A-F0-9]{4}){3}-[A-F0-9]{12}$/i.test(signing.profileUuid)) {
+    throw new Error("IOS_PROVISIONING_PROFILE_UUID is not a provisioning profile UUID");
+  }
+  if (!/^[A-Z0-9]{10}$/.test(signing.teamId)) {
+    throw new Error("APPLE_DEVELOPMENT_TEAM is not an Apple team identifier");
+  }
+
+  const projectSpec = path.join(generatedRoot, "project.yml");
+  let project = fs.readFileSync(projectSpec, "utf8");
+  const marker = "    settings:\n      base:\n        ENABLE_BITCODE: false";
+  if (project.split(marker).length !== 2) {
+    throw new Error("generated iOS project does not contain the expected target settings block");
+  }
+  const configured = [
+    "    settings:",
+    "      base:",
+    "        CODE_SIGN_STYLE: Manual",
+    `        CODE_SIGN_IDENTITY: ${yamlDoubleQuoted(signing.identity)}`,
+    `        DEVELOPMENT_TEAM: ${signing.teamId}`,
+    `        PROVISIONING_PROFILE_SPECIFIER: ${yamlDoubleQuoted(signing.profileUuid)}`,
+    "        ENABLE_BITCODE: false",
+  ].join("\n");
+  project = project.replace(marker, configured);
+  fs.writeFileSync(projectSpec, project);
+
+  const exportOptions = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>signingStyle</key>
+  <string>manual</string>
+  <key>teamID</key>
+  <string>${xml(signing.teamId)}</string>
+  <key>signingCertificate</key>
+  <string>Apple Distribution</string>
+  <key>provisioningProfiles</key>
+  <dict>
+    <key>page.tine.Tine</key>
+    <string>${xml(signing.profileUuid)}</string>
+  </dict>
+</dict>
+</plist>
+`;
+  fs.writeFileSync(path.join(generatedRoot, "ExportOptions.plist"), exportOptions);
+
+  execFileSync(process.env.TINE_XCODEGEN_BIN || "xcodegen", ["generate", "--spec", projectSpec], {
+    cwd: generatedRoot,
+    stdio: "inherit",
+  });
+  console.log(`installed manual App Store signing config for profile ${signing.profileUuid}`);
 }
 
 const generated = [];

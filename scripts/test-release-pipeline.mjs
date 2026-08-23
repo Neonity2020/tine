@@ -253,21 +253,20 @@ assert.match(
 );
 assert.match(
   iosTestFlightWorkflow,
-  /name: Install iCloud entitlements[\s\S]*?npm run ios:prepare-project[\s\S]*?name: Build signed TestFlight IPA[\s\S]*?--export-method release-testing[\s\S]*?--build-number "\$\{GITHUB_RUN_NUMBER\}"/,
-  "TestFlight builds do not use a unique build number and the release-testing export method"
+  /name: Install iCloud entitlements and manual signing config[\s\S]*?npm run ios:prepare-project[\s\S]*?name: Build signed TestFlight IPA[\s\S]*?--export-method app-store-connect[\s\S]*?--build-number "\$\{GITHUB_RUN_NUMBER\}"/,
+  "TestFlight builds do not use a unique build number and the App Store Connect export method"
 );
 assert.match(
   iosTestFlightWorkflow,
-  /name: Install iOS signing identity[\s\S]*?security import "\$p12"[\s\S]*?-t cert -f pkcs12[\s\S]*?security set-key-partition-list[\s\S]*?security find-identity[\s\S]*?Apple Distribution: Martin Koutecky/,
-  "iOS signing must explicitly import PKCS#12 into an ephemeral keychain on macOS 26"
+  /name: Install iOS signing materials[\s\S]*?security import "\$p12"[\s\S]*?-t cert -f pkcs12[\s\S]*?security set-key-partition-list[\s\S]*?security find-identity[\s\S]*?security cms -D -i "\$profile"[\s\S]*?Provisioning Profiles[\s\S]*?IOS_PROVISIONING_PROFILE_UUID/,
+  "iOS signing must explicitly import PKCS#12 and the provisioning profile on macOS 26"
 );
 const iosWorkflowLines = iosTestFlightWorkflow.split(/\r?\n/);
 const iosBuildStep = yamlNamedStep(iosWorkflowLines, "Build signed TestFlight IPA").join("\n");
-assert.match(iosBuildStep, /IOS_MOBILE_PROVISION: \$\{\{ secrets\.IOS_MOBILE_PROVISION \}\}/);
 assert.doesNotMatch(
   iosBuildStep,
-  /IOS_CERTIFICATE(?:_PASSWORD)?:/,
-  "Tauri must not repeat its broken implicit-format certificate import after explicit keychain setup"
+  /IOS_(?:CERTIFICATE|CERTIFICATE_PASSWORD|MOBILE_PROVISION):/,
+  "Tauri must not repeat its broken signing-input mutation after explicit Xcode project setup"
 );
 assert.match(
   iosTestFlightWorkflow,
@@ -304,6 +303,56 @@ for (const entitlement of [
 ]) {
   assert.ok(iosEntitlements.includes(entitlement), `iOS entitlements are missing ${entitlement}`);
 }
+
+const iosPrepareFixture = fs.mkdtempSync(path.join(os.tmpdir(), "tine-ios-prepare-"));
+try {
+  const fixtureTauri = path.join(iosPrepareFixture, "src-tauri");
+  const fixtureApple = path.join(fixtureTauri, "gen", "apple");
+  const fixtureTarget = path.join(fixtureApple, "tine_iOS");
+  fs.mkdirSync(fixtureTarget, { recursive: true });
+  fs.writeFileSync(path.join(fixtureTauri, "Tine.ios.entitlements"), iosEntitlements);
+  fs.writeFileSync(
+    path.join(fixtureApple, "project.yml"),
+    [
+      "targets:",
+      "  tine_iOS:",
+      "    settings:",
+      "      base:",
+      "        ENABLE_BITCODE: false",
+      "",
+    ].join("\n"),
+  );
+  fs.writeFileSync(path.join(fixtureTarget, "tine_iOS.entitlements"), "stale");
+  const fakeXcodegen = path.join(iosPrepareFixture, "xcodegen");
+  fs.writeFileSync(fakeXcodegen, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+  execFileSync(process.execPath, [path.join(process.cwd(), "scripts/prepare-ios-project.mjs")], {
+    cwd: iosPrepareFixture,
+    env: {
+      ...process.env,
+      APPLE_DEVELOPMENT_TEAM: "RQ5V4LK7N2",
+      IOS_PROVISIONING_PROFILE_UUID: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+      IOS_SIGNING_IDENTITY: "Apple Distribution: Martin Koutecky (RQ5V4LK7N2)",
+      TINE_XCODEGEN_BIN: fakeXcodegen,
+    },
+    stdio: "pipe",
+  });
+
+  const preparedProject = fs.readFileSync(path.join(fixtureApple, "project.yml"), "utf8");
+  assert.match(preparedProject, /CODE_SIGN_STYLE: Manual/);
+  assert.match(preparedProject, /CODE_SIGN_IDENTITY: "Apple Distribution: Martin Koutecky \(RQ5V4LK7N2\)"/);
+  assert.match(preparedProject, /PROVISIONING_PROFILE_SPECIFIER: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"/);
+  const exportOptions = fs.readFileSync(path.join(fixtureApple, "ExportOptions.plist"), "utf8");
+  assert.match(exportOptions, /<key>signingStyle<\/key>\s*<string>manual<\/string>/);
+  assert.match(exportOptions, /<key>page\.tine\.Tine<\/key>\s*<string>AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE<\/string>/);
+  assert.equal(
+    fs.readFileSync(path.join(fixtureTarget, "tine_iOS.entitlements"), "utf8"),
+    iosEntitlements,
+  );
+} finally {
+  fs.rmSync(iosPrepareFixture, { recursive: true, force: true });
+}
+
 for (const declaration of [
   "NSPrivacyTracking",
   "NSPrivacyCollectedDataTypes",
