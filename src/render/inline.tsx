@@ -21,6 +21,7 @@ import { pageIcon } from "../pageIconBatch";
 import { pageIsMissing } from "../pageExistsBatch";
 import { typographic } from "./typography";
 import { coarseSpanAttrs, literalSpanAttrs, plainSpanAttrs, typographicPlainSpanAttrs, type SpanDomAttrs } from "./spans";
+import { createLongPress } from "./longPress";
 import { typographyMode } from "../ui";
 import { visibleBody } from "./block";
 import { AstBody } from "./body";
@@ -302,6 +303,12 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
   // read-only RefBlocks tree in a portaled popup. The fetch is lazy and guarded:
   // guide pages and links already inside a peek never arm another preview.
   const peek = createPeekBridge(() => insidePeek || isGuidePageName(targetName()));
+  // Mobile: a deliberate long-press raises the same context menu desktop
+  // right-click gives (GH #231). Quick tap, scroll, and text selection behave
+  // as before; the recognizer cancels on movement/release/cancel and only
+  // arms on primary touch/pen pointers.
+  const longPress = createLongPress(() => anchorEl);
+  onCleanup(longPress.dispose);
   const [preview] = createResource(
     () => (peek.open() && !isGuidePageName(targetName()) ? `${targetName()}\0${graphEpoch()}` : null),
     () => backend().getPage(targetName(), kind()),
@@ -321,6 +328,11 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
         onClick={open}
         onMouseEnter={peek.anchorEnter}
         onMouseLeave={peek.anchorLeave}
+        onPointerDown={longPress.onPointerDown}
+        onPointerMove={longPress.onPointerMove}
+        onPointerUp={longPress.onPointerUp}
+        onPointerCancel={longPress.onPointerCancel}
+
         onAuxClick={(e) => {
           if (e.button === 1) {
             e.preventDefault();

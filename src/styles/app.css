@@ -4742,6 +4742,10 @@ textarea {
   cursor: pointer;
   text-decoration: none;
   position: relative; /* anchor for the hover-peek card (GH #40) */
+  /* Touch long-press raises Tine's own context menu (GH #231); keep iOS's
+     native link callout bubble from stacking on top of it. Text selection is
+     unchanged (only the callout is suppressed). */
+  -webkit-touch-callout: none;
 }
 
 .page-ref:hover {
