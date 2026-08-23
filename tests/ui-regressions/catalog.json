@@ -7524,6 +7524,32 @@
         "failBefore": "proven"
       },
       "notes": "Searching an alias whose text was also referenced anywhere (e.g. alias:: Book plus a [[Book]] link) produced two page candidates: the owner carrying the alias match AND a path-less referenced virtual page named after the alias, which ranked first and opened a separate alias-named phantom page. The shared page-candidate executor now extends its existing referenced-name dedup to every alias of a file page (case-folded, comma- or full-width-comma-separated multi-alias values), so the alias text is never its own candidate in either run_graph_search (Ctrl+K) or quick_switch (the # / [[ autocomplete pool); a genuinely overlapping ordinary page name and unrelated referenced pages are unaffected. The owner row shows 'aka <alias>' context. Fail-before proven at the integration boundary: a synthetic-graph probe printed the phantom 'Book' hit first on the pre-fix code, and the permanent regression test fails when the owner-alias dedup is disabled; the QuickSwitcher alias-context assertion fails without the row change."
+    },
+    {
+      "id": "UI-CODEBLOCK-EDIT-LAYOUT-STABILITY-357",
+      "title": "Clicking a fenced code block enters an editor with the rendered card's own metrics instead of a proportional wrapped textarea that re-lays every line",
+      "family": "editor-rendering-transition",
+      "sources": {
+        "issues": [
+          357
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.codeFenceEdit.test.tsx",
+          "src/editor/codeFence.test.ts",
+          "scripts/shot-code-block-edit.mjs"
+        ],
+        "scenario": "codeblock.edit-rendered-layout-parity",
+        "failBefore": "proven"
+      },
+      "notes": "The rendered face of a whole-block code fence is .code-block: mono stack, 0.86em, line-height 1.5, padding 10px 12px, white-space pre with horizontal overflow. The editor that replaced it was the ordinary proportional 16px/26px wrapped textarea with no card, so focusing a code block re-laid every line — the 'layout jump'. The editor now presents as the SAME card while the block is code-shaped (detector: whole visible buffer is one md ```/~~~ fence or org #+BEGIN_SRC/#+BEGIN_EXAMPLE, calc excluded, mixed content excluded, unclosed fence tolerated while typing), including wrap=off so long lines scroll horizontally like the card; the buffer stays honest raw text with fences, and live transitions recompute per keystroke. Font override follows the existing --tine-editable-font precedent (.calc-wrap) because editables set font-family via an !important textarea rule. Fail-before proven causally: the component class assertions fail without the editor change, and the browser geometry harness (Chromium, deterministic screenshots) measured pre/post — wide 1120px height delta +76.1px / narrow 700px +154.1px (long line wraps into ~6 lines, no horizontal scroll, fontFamily/fontSize/lineHeight/padding all differ) → after: identical computed fonts/size/leading/padding, wrap=off, horizontal overflow, height delta 39.08px ≈ the two fence lines at both widths; failures list empty. Numeric geometry is the evidence; final visual approval remains with the manager. Typography modes never alter code text (literal in both), so they are unaffected by design."
     }
   ]
 }

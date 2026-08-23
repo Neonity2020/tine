@@ -145,6 +145,7 @@ import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
+import { codeFenceOnly } from "../editor/codeFence";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
 import { seedAssetBlob } from "../assetCache";
@@ -1180,6 +1181,13 @@ export function Editor(props: { id: string }): JSX.Element {
   // other block hides just the built-in id::/collapsed::. One fence-aware splitter.
   const hideFn = () => (isAnnot() ? hideAll : sheetCell ? isSheetCellHidden : isBuiltinHidden);
   const editorValue = createMemo(() => splitProps(node().raw, hideFn(), pageFmt()).visible);
+  // GH #357: the rendered face of a whole-block code fence is a mono, no-wrap,
+  // padded card (.code-block). The editor was the ordinary proportional wrapped
+  // textarea, so clicking a code block re-laid every line — the visible "jump".
+  // While the buffer IS code-shaped, present the editor as the same card
+  // (honest raw text, fences included). Mixed content / ```calc keep their own
+  // modes. Re-derived per keystroke so typing a fence in or out flips live.
+  const codeEditing = createMemo(() => codeFenceOnly(editorValue(), pageFmt()) !== null);
   const editorHeadingLevel = createMemo(() => {
     const visible = editorValue();
     if (visible.includes("\n")) return null;
@@ -3600,8 +3608,9 @@ export function Editor(props: { id: string }): JSX.Element {
       <textarea
         ref={ref}
         class="block-editor"
-        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null }}
+        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null, "code-edit": codeEditing() }}
         spellcheck={spellcheckEnabled()}
+        wrap={codeEditing() ? "off" : "soft"}
         value={isCalc() ? (calcLive() ?? "") : editorValue()}
         placeholder={cap?.bulletHint?.()}
         onInput={onInput}
