@@ -7673,6 +7673,30 @@
         "failBefore": "proven"
       },
       "notes": "Martin's approved contract both ways: (1) embedded content is live and source-authoritative — a source collapse/expand updates every visible embed immediately (before the fix, LiveRefGroup captured the source state ONCE per instance into initialCollapsed, so an already-visible embed only refreshed after leaving/reopening the page); (2) folding the embed's own presentation is ephemeral per occurrence, never lands on the source block or another occurrence, never writes collapsed:: or any file-format extension, and resets when the occurrence remounts or the app reloads. Implementation: for embed surface groups the default collapse answer IS the live stored node state; an occurrence's own fold records the store's per-block collapse write epoch (bumped inside writeCollapsed and the descendants batch) — the next source collapse write anywhere on that block reclaims authority by invalidating the epoch, so a fold-unfold-fold round trip cannot leave a ghost override. Occurrence-locality is the LiveRefGroup component instance (two {{embed}}s of one uuid are independent instances; nothing is shared across occurrences). Ref and query surfaces' existing 'the result view owns its copy' semantics are deliberately unchanged (their snapshot defaults and local folds ignore the epoch). failBefore proven: 3/4 component cases red pre-fix (source-authoritative live update, local fold expiry on later source move, collapsed-source local expansion expiry), the remount-reset case already green and serves as the preserved-behavior control. Test suites of Block embed depth/hierarchy, Live references, store, Page all stay green."
+    },
+    {
+      "id": "UI-MODIFIED-CLICK-CONTRACT-283",
+      "title": "One modified-click destination contract for every internal link surface: click navigates, Shift+click sidebar, Ctrl/Cmd+click background tab, middle-click background tab",
+      "family": "navigation-links",
+      "sources": {
+        "issues": [
+          283
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/linkModifiedClicks.test.tsx"
+        ],
+        "scenario": "links.modified-click-destination-contract",
+        "failBefore": "proven"
+      },
+      "notes": "Martin's approved pointer contract, one decision table per surface: plain click navigates; Shift-click opens the right sidebar; Ctrl(Win/Linux)/Cmd(macOS)+click opens a BACKGROUND tab (this is the change — PageRef/BlockRefView ctrl-click previously opened the other pane); middle-click opens a background tab everywhere plain-aux semantics existed; context menus keep exposing explicit destinations; and combined modifiers (shift+ctrl) keep plain-click meaning so nothing novel shadows shortcuts. Decision lives once in src/linkGesture.ts (not per surface — surfaces pick only their destination API), applied to: rendered page refs incl. tags and alias chips, block refs ((uuid)) incl. added middle-click, namespace crumb + sidebar tree labels, Favorites rows, Recent rows, All-pages rows, query result group headers, reference-group headers. The QuickSwitcher already conformed and serves as the control suite; its rows keep their existing middle+ctrl background behavior. failBefore: neutralizing the decision helper makes the 5 ctrl/meta cases red while plain/shift/middle/combined stay green. Text-selection and editor-focus behavior unchanged: shift still suppresses range selection at mousedown, middle mousedown prevents autoscroll, touch long-press (GH #231) is unaffected on all the same anchors."
     }
   ]
 }

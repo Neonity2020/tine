@@ -5,7 +5,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, useContext, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import { extOf, mediaKind } from "../media";
-import { openPage, openPageInNewTab, openPageAtBlock, focusBlock } from "../router";
+import { openPage, openPageInNewTab, openPageAtBlock, openInNewTab, focusBlock } from "../router";
 import { refClickZoom } from "../copySettings";
 import { isJournalTitle } from "../journal";
 import { openPdf, openPageInSidebar, openBlockInSidebar, openPageContextMenu, openBlockRefContextMenu, setLightbox, setAudioPlayer, dataRev, graphEpoch, graphMeta, pushToast, showBrackets } from "../ui";
@@ -35,7 +35,7 @@ import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { resolveBlockBatched } from "../resolveBatch";
 import { doc, setRaw, formatForPage, formatForBlock, blockRef } from "../store";
-import { PaneContext, focusedPaneId, openRouteInOtherPane } from "../panes";
+import { internalLinkDest } from "../linkGesture";
 import { QueryMacro, EmbedMacro, VideoMacro, TweetMacro, YoutubeTimestamp, ClozeMacro, ZoteroMacro } from "../components/Macro";
 import { NamespaceMacro } from "../components/Namespace";
 import { guideTargetForLink, isGuidePageName } from "../guide";
@@ -274,7 +274,6 @@ function createPeekBridge(disabled: () => boolean) {
 
 // A `[[page]]` / `#tag` anchor — shared by page_ref links, bare refs, and #tags.
 export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolean; blockId?: string; spanAttrs?: SpanDomAttrs }): JSX.Element {
-  const pane = useContext(PaneContext);
   const insidePeek = useContext(PeekContext);
   let anchorEl: HTMLAnchorElement | undefined;
   const sourcePage = () => (props.blockId ? doc.byId[props.blockId]?.page : undefined);
@@ -293,9 +292,9 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
   const kind = (): PageKind => (isGuidePageName(targetName()) ? "page" : isJournalTitle(targetName()) ? "journal" : "page");
   const open = (e: MouseEvent) => {
     e.stopPropagation();
-    if (e.ctrlKey || e.metaKey)
-      openRouteInOtherPane({ kind: "page", name: targetName(), pageKind: kind() }, pane?.paneId ?? focusedPaneId());
-    else if (e.shiftKey && !isGuidePageName(targetName())) openPageInSidebar(targetName(), kind());
+    const dest = internalLinkDest(e);
+    if (dest === "sidebar" && !isGuidePageName(targetName())) openPageInSidebar(targetName(), kind());
+    else if (dest === "background") openPageInNewTab(targetName(), kind());
     else openPage(targetName(), kind());
   };
 
@@ -1193,7 +1192,6 @@ function UserMacroView(props: { name: string; template: string; args: string[]; 
 // navigate to the source page on click and show a hover preview of the full
 // referenced block (mirrors OG); a missing target falls back to a short id.
 function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAttrs }): JSX.Element {
-  const pane = useContext(PaneContext);
   const insidePeek = useContext(PeekContext);
   let anchorEl: HTMLSpanElement | undefined;
   const [grp] = createResource(
@@ -1243,9 +1241,21 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
           ? "Click to open the highlight in its PDF; shift-click → sidebar; right-click for more"
           : "Click to go to the block; shift-click → sidebar; right-click for more"}
         // Suppress native shift-range-selection when shift+click opens the sidebar (GH #42).
-        onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
+        onMouseDown={(e) => { if (e.shiftKey || e.button === 1) e.preventDefault(); }}
         onMouseEnter={peek.anchorEnter}
         onMouseLeave={peek.anchorLeave}
+        // Middle-click → background tab with the block anchor (GH #283).
+        onAuxClick={(e) => {
+          if (e.button !== 1) return;
+          e.preventDefault();
+          e.stopPropagation();
+          const g = grp();
+          if (!g) return;
+          const ref = doc.byId[props.id]
+            ? blockRef(props.id)
+            : { uuid: props.id, page: g.page, pageKind: g.kind };
+          openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+        }}
         onContextMenu={(e) => {
           const g = grp();
           if (!g) return; // missing target → let the default menu through
@@ -1265,9 +1275,10 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
             ? blockRef(props.id)
             : { uuid: props.id, page: g.page, pageKind: g.kind };
           const ann = annotation();
-          // OG opens a referenced PDF annotation at its source page. Modifier
-          // clicks retain Tine's existing pane/sidebar navigation semantics.
-          if (ann && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+          const dest = internalLinkDest(e);
+          // OG opens a referenced PDF annotation at its source page (plain click
+          // only); modifier destinations follow the shared internal-link contract.
+          if (ann && dest === "default") {
             void backend()
               .getPage(g.page, g.kind)
               .then((page) => {
@@ -1281,12 +1292,11 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
           // Shift-click opens the referenced block in the right sidebar. Plain click:
           // Tine scrolls + flashes the block in context (default); the OG behavior —
           // zoom into the block as its own page — is opt-in (Settings → ref-click-zoom).
-          if (e.ctrlKey || e.metaKey)
-            openRouteInOtherPane(
-              { kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) },
-              pane?.paneId ?? focusedPaneId()
-            );
-          else if (e.shiftKey) openBlockInSidebar(ref);
+          // GH #283: Ctrl/Cmd+click opens a BACKGROUND tab, matching every other
+          // internal-link surface.
+          if (dest === "sidebar") openBlockInSidebar(ref);
+          else if (dest === "background")
+            openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
           else if (refClickZoom()) focusBlock(props.id);
           else openPageAtBlock({ name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
         }}

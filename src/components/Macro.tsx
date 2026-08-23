@@ -5,6 +5,7 @@ import { openPageTarget, openPageAtBlock, openPageTargetInNewTab } from "../rout
 import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
+import { internalLinkDest } from "../linkGesture";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { QueryBuilder } from "./QueryBuilder";
@@ -795,7 +796,9 @@ function QueryGroup(props: { group: () => RefGroup | undefined; flat?: boolean }
             class={props.flat ? "query-crumb" : "query-page"}
             onClick={(e) => {
               e.stopPropagation();
-              if (e.shiftKey) openPageInSidebar(target());
+              const dest = internalLinkDest(e);
+              if (dest === "sidebar") openPageInSidebar(target());
+              else if (dest === "background") openPageTargetInNewTab(target());
               else openPageTarget(target());
             }}
             onAuxClick={(e) => {
