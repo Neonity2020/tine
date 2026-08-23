@@ -489,6 +489,16 @@ enum EditorPublicationAuthority {
     ReconstructibleManagedProjection,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphTextPublicationValidation {
+    /// Standalone callers have not established graph-wide collision evidence.
+    CompleteIndex,
+    /// A surrounding transaction owns graph-text identity authority and has
+    /// already completed a bounded no-follow inventory. Publication still
+    /// repeats exact target, single-link, portable-path, and no-clobber checks.
+    TransactionInventory,
+}
+
 fn preflight_editor_publication_chain(
     authority: EditorPublicationAuthority,
     chain: &[Dir],
@@ -8612,16 +8622,6 @@ impl Graph {
         }
     }
 
-    fn managed_atomic_write(
-        &self,
-        permit: &ManagedTextWritePermit,
-        path: &Path,
-        bytes: &[u8],
-        create_new: bool,
-    ) -> io::Result<()> {
-        self.managed_atomic_write_with_conflict(permit, path, bytes, create_new, None)
-    }
-
     fn validate_direct_creation_proof_before_mutation(
         &self,
         permit: &ManagedTextWritePermit,
@@ -8732,21 +8732,94 @@ impl Graph {
         create_new: bool,
         editor_episode: Option<&ConflictEditorEpisode>,
     ) -> io::Result<()> {
+        self.managed_atomic_write_validated(
+            permit,
+            path,
+            bytes,
+            create_new,
+            editor_episode,
+            GraphTextPublicationValidation::CompleteIndex,
+        )
+    }
+
+    fn managed_atomic_write_from_transaction_inventory(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+        bytes: &[u8],
+        create_new: bool,
+    ) -> io::Result<()> {
+        self.managed_atomic_write_validated(
+            permit,
+            path,
+            bytes,
+            create_new,
+            None,
+            GraphTextPublicationValidation::TransactionInventory,
+        )
+    }
+
+    fn managed_atomic_write_validated(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+        bytes: &[u8],
+        create_new: bool,
+        editor_episode: Option<&ConflictEditorEpisode>,
+        validation: GraphTextPublicationValidation,
+    ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         // Establish the retained baseline before creating the staged inode. The
         // temp name is deliberately outside the graph-text namespace, but its
         // physical identity would otherwise be captured as a second owner when
         // the staged inode is later published at `path`.
-        let _ = self.guarded_graph_text_identity_index()?;
+        if validation == GraphTextPublicationValidation::CompleteIndex {
+            let _ = self.guarded_graph_text_identity_index()?;
+        }
+        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        if validation == GraphTextPublicationValidation::TransactionInventory {
+            self.validate_graph_text_portable_aliases_path_local(
+                permit,
+                &managed_path,
+                create_new,
+            )?;
+        }
         let target = self.managed_target(permit, path, true)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
-        if let Err(error) = self.validate_current_graph_text_collision_strict(
-            permit,
-            path,
-            self.managed_optional_file_identity(permit, path)?,
-        ) {
+        let validation_result = match validation {
+            GraphTextPublicationValidation::CompleteIndex => self
+                .validate_current_graph_text_collision_strict(
+                    permit,
+                    path,
+                    self.managed_optional_file_identity(permit, path)?,
+                )
+                .map(|_| ()),
+            GraphTextPublicationValidation::TransactionInventory => (|| {
+                self.validate_graph_text_portable_aliases_path_local(
+                    permit,
+                    &managed_path,
+                    create_new,
+                )?;
+                if create_new {
+                    match target.parent().symlink_metadata(&target.filename) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(error),
+                        Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+                    }
+                } else {
+                    self.validate_existing_graph_text_target_exact(&target, &managed_path, None)
+                        .map(|_| ())
+                }
+            })(),
+        };
+        if let Err(error) = validation_result {
             let _ = target.parent().remove_file(&temp);
             return Err(error);
         }
@@ -9061,10 +9134,62 @@ impl Graph {
         source: &Path,
         destination: &Path,
     ) -> io::Result<()> {
+        self.managed_move_noreplace_validated(
+            permit,
+            source,
+            destination,
+            GraphTextPublicationValidation::CompleteIndex,
+        )
+    }
+
+    fn managed_move_noreplace_from_transaction_inventory(
+        &self,
+        permit: &ManagedTextWritePermit,
+        source: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        self.managed_move_noreplace_validated(
+            permit,
+            source,
+            destination,
+            GraphTextPublicationValidation::TransactionInventory,
+        )
+    }
+
+    fn managed_move_noreplace_validated(
+        &self,
+        permit: &ManagedTextWritePermit,
+        source: &Path,
+        destination: &Path,
+        validation: GraphTextPublicationValidation,
+    ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
-        let _ = self.guarded_graph_text_identity_index()?;
+        if validation == GraphTextPublicationValidation::CompleteIndex {
+            let _ = self.guarded_graph_text_identity_index()?;
+        }
         let source_path = source.to_path_buf();
         let destination_path = destination.to_path_buf();
+        let source_managed = ManagedPath::parse(self.rel_path(&source_path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text source is not portable: {error}"),
+            )
+        })?;
+        let destination_managed =
+            ManagedPath::parse(self.rel_path(&destination_path)).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("guarded graph-text destination is not portable: {error}"),
+                )
+            })?;
+        if validation == GraphTextPublicationValidation::TransactionInventory {
+            self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
+            self.validate_graph_text_portable_aliases_path_local(
+                permit,
+                &destination_managed,
+                true,
+            )?;
+        }
         let source = self.managed_target(permit, &source_path, false)?;
         projection_optional_regular_metadata(source.parent(), &source.filename)?;
         let destination = self.managed_target(permit, &destination_path, true)?;
@@ -9074,6 +9199,20 @@ impl Graph {
             Err(error) => return Err(error),
         }
         managed_write_before_mutation_hook()?;
+        if validation == GraphTextPublicationValidation::TransactionInventory {
+            self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
+            self.validate_existing_graph_text_target_exact(&source, &source_managed, None)?;
+            self.validate_graph_text_portable_aliases_path_local(
+                permit,
+                &destination_managed,
+                true,
+            )?;
+            match destination.parent().symlink_metadata(&destination.filename) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            }
+        }
         rename_managed_noreplace(
             source.parent(),
             &source.filename,
@@ -14845,7 +14984,7 @@ impl Graph {
                         self.managed_create_dir_all(&write, parent)?;
                     }
                 }
-                self.managed_atomic_write(
+                self.managed_atomic_write_from_transaction_inventory(
                     &write,
                     &e.dst,
                     e.new_content.as_bytes(),
@@ -14858,7 +14997,9 @@ impl Graph {
                     self.managed_create_dir_all(&write, &trash)?;
                     let src_name = e.src.file_name().and_then(|s| s.to_str()).unwrap_or("page");
                     let staged = trash.join(format!("{}__rename__{src_name}", trash_stamp()));
-                    self.managed_move_noreplace(&write, &e.src, &staged)?;
+                    self.managed_move_noreplace_from_transaction_inventory(
+                        &write, &e.src, &staged,
+                    )?;
                     written.last_mut().unwrap().1 = Some(staged.clone());
                     // If a sync replacement won just before the atomic move, the
                     // staged bytes no longer match our baseline. Abort and restore
@@ -14879,7 +15020,10 @@ impl Graph {
                 if e.is_move && e.dst != e.src {
                     let source_restored = match staged_source {
                         Some(staged) => {
-                            self.managed_move_noreplace(&write, staged, &e.src).is_ok()
+                            self.managed_move_noreplace_from_transaction_inventory(
+                                &write, staged, &e.src,
+                            )
+                            .is_ok()
                                 || self.managed_exists(&write, &e.src).unwrap_or(false)
                         }
                         None => self.managed_exists(&write, &e.src).unwrap_or(false),
@@ -14903,7 +15047,12 @@ impl Graph {
                         .unwrap_or(false)
                     {
                         self.note_self_write(&e.dst, content_rev(&e.orig));
-                        let _ = self.managed_atomic_write(&write, &e.dst, e.orig.as_bytes(), false);
+                        let _ = self.managed_atomic_write_from_transaction_inventory(
+                            &write,
+                            &e.dst,
+                            e.orig.as_bytes(),
+                            false,
+                        );
                     } else {
                         self.recent_writes.lock().unwrap().remove(&e.dst);
                     }
@@ -35356,6 +35505,100 @@ mod tests {
         let other = fs::read_to_string(dir.join("pages").join("Other.md")).unwrap();
         assert!(other.contains("[[Beta]]"), "ref rewritten to [[Beta]]");
         assert!(!other.contains("[[Alpha]]"), "no stale [[Alpha]] left");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// REG-DIRECT-RENAME-RETAINED-SHADOW-LIMIT-364 causal witness. A rename
+    /// already performs one bounded, no-follow inventory and exact per-file
+    /// rechecks. Its nested publication primitives must not attempt to build a
+    /// second whole-graph retained-shadow index merely to write those files.
+    #[test]
+    fn rename_transaction_does_not_build_the_guarded_graph_index() {
+        let dir = scratch("rename-without-guarded-graph-index");
+        fs::write(dir.join("pages/Alpha.md"), "- alpha body\n").unwrap();
+        fs::write(dir.join("pages/Other.md"), "- see [[Alpha]] here\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        let before = graph.guarded_graph_text_identity_report();
+        GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
+            .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        graph
+            .rename_page("Alpha", "Beta")
+            .expect("bounded rename must not enter retained-shadow construction");
+        let after = graph.guarded_graph_text_identity_report();
+
+        assert_eq!(after.complete_builds, before.complete_builds);
+        assert_eq!(
+            GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
+            Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
+            "rename consumed the retained-shadow capture hook"
+        );
+        assert!(!dir.join("pages/Alpha.md").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Beta.md")).unwrap(),
+            "- alpha body\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Other.md")).unwrap(),
+            "- see [[Beta]] here\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn rename_transaction_inventory_still_refuses_physical_file_aliases() {
+        let dir = scratch("rename-inventory-hardlink-refusal");
+        let alpha = dir.join("pages/Alpha.md");
+        let alias = dir.join("pages/Alias.md");
+        fs::write(&alpha, "- alpha body\n").unwrap();
+        fs::hard_link(&alpha, &alias).unwrap();
+        let before = regular_file_tree(&dir.join("pages"));
+
+        let error = Graph::open(&dir).rename_page("Alpha", "Beta").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("alias one resource"));
+        assert_eq!(regular_file_tree(&dir.join("pages")), before);
+        assert!(!dir.join("pages/Beta.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reporter-shape receipt for GH #364. This is intentionally an explicit
+    /// release-gate probe rather than a per-commit unit test: creating 13,000
+    /// files is real filesystem work, while the causal no-index test above is
+    /// fast enough for the ordinary suite.
+    #[test]
+    #[ignore = "large reporter-shape regression; run before release"]
+    fn rename_transaction_succeeds_on_thirteen_thousand_page_graph() {
+        const PAGE_COUNT: usize = 13_000;
+        let dir = scratch("rename-thirteen-thousand-pages");
+        fs::write(dir.join("pages/Alpha.md"), "- alpha body\n").unwrap();
+        for index in 1..PAGE_COUNT {
+            let body = if index == PAGE_COUNT - 1 {
+                "- final reference [[Alpha]]\n"
+            } else {
+                "- unrelated\n"
+            };
+            fs::write(dir.join("pages").join(format!("Page{index:05}.md")), body).unwrap();
+        }
+        let graph = Graph::open(&dir);
+        let started = std::time::Instant::now();
+        graph
+            .rename_page("Alpha", "Beta")
+            .expect("13k-page Direct Files rename must remain bounded");
+        let elapsed = started.elapsed();
+
+        assert!(!dir.join("pages/Alpha.md").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Beta.md")).unwrap(),
+            "- alpha body\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Page12999.md")).unwrap(),
+            "- final reference [[Beta]]\n"
+        );
+        assert_eq!(regular_file_tree(&dir.join("pages")).len(), PAGE_COUNT);
+        eprintln!("GH #364 13k-page rename completed in {elapsed:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

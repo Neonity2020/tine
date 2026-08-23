@@ -4554,6 +4554,32 @@
         "failBefore": "inferred"
       },
       "notes": "B1 follow-up reconciliation on current master: the remaining confirmed defect from the issue timeline (autocomplete interpreting literal text as the Ctrl+K DSL, e.g. bare OR collapsing to an empty matcher) was already fixed on master by 294edbd0 (shipped v0.6.4) and stays green; this row instead pins the remaining cross-surface contract for the 医保-style report on a synthetic CJK graph (163 eligible page candidates): the page surfaces (quick_switch = the # / [[ pool, Ctrl+K's page branch) return the SAME top-12 order, the block surfaces (( picker and Ctrl+K blocks) both find all content blocks, truncation at the shared 100 window is identical and signalled only in Ctrl+K (has_more), and pools differ ONLY by design (( searches block TEXT, # / [[ search pages, Ctrl+K searches both). The character-swap ladder (1..3 chars, incl. DSL token literals like bare uppercase OR) is re-pinned at the public quick_switch/block_search_literal APIs, complementing the shipped fix's own token tests. failBefore=inferred: written after the shipped fix; the DSL rows' pre-fix failure mode is guaranteed by the shipped fix's own token tests, and the rest documents designed behavior."
+    },
+    {
+      "id": "REG-DIRECT-RENAME-RETAINED-SHADOW-LIMIT-364",
+      "title": "Direct Files page rename stays bounded on a 13,000-page graph",
+      "family": "direct-files-page-mutation",
+      "sources": {
+        "issues": [
+          364
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "rust-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::tests::rename_transaction_does_not_build_the_guarded_graph_index",
+          "crates/tine-core/src/model.rs::tests::rename_transaction_inventory_still_refuses_physical_file_aliases",
+          "crates/tine-core/src/model.rs::tests::rename_transaction_succeeds_on_thirteen_thousand_page_graph"
+        ],
+        "scenario": "direct-files.rename-large-graph-transaction",
+        "failBefore": "proven"
+      },
+      "notes": "GH #364 reported that both title and page-menu rename failed intermittently on a roughly 13,000-page Windows Direct Files graph with `guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`. The rename transaction already held graph-text identity authority, completed one bounded no-follow inventory, rejected directory/file aliases and logical/twin destinations, locked every touched path, re-read exact bytes before each publication, and retained rollback copies. Its nested generic atomic-write and no-replace-move helpers nevertheless tried to construct a second whole-graph retained-shadow identity index. The causal fail-before injects the reporter's exact retained-shadow peak refusal and proves rename no longer consumes that builder. Transaction-local publication now repeats only exact-target, single-link, portable-path and no-clobber checks; it updates an already-warm optional index but never builds one. The hard-link witness preserves the physical-alias refusal, and the explicit release-gate probe creates 13,000 real page files, renames one page, rewrites its distant reference, preserves the file count and records elapsed time."
     }
   ]
 }
