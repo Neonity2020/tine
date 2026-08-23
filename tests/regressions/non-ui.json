@@ -4448,6 +4448,35 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before was reproduced at current master 042054c1 and the frozen release candidate 475b6e72: after the journey saved pages/Smoke.md and crash-reopened with that durable frame still pending, SQLite inventory contained pages/Denní poznámky.md but exact-path loading reported Missing. Any pending managed frame globally disabled SQLite and fell back to a lazy hot engine that did not contain untouched pages. Exact-path reads now apply a path-local journal overlay over the exact-frontier SQLite baseline; unrelated pending work cannot hide the requested page."
+    },
+    {
+      "id": "REG-DIRECT-WINDOWS-EXACT-WATCHER-CREATION-366",
+      "title": "One exact Windows page event triggered a full-graph scan and exhausted every new-page save retry",
+      "family": "direct-files-data-safety-performance",
+      "sources": {
+        "issues": [
+          366
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows"
+      ],
+      "layer": "native-filesystem-watcher",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/watcher.rs::tests::windows_exact_page_events_stay_incremental_through_the_pending_queue",
+          "src-tauri/src/watcher.rs::tests::windows_unicode_event_reconciles_and_releases_new_page_creation",
+          "src-tauri/src/watcher.rs::tests::atomic_page_save_temp_events_stay_incremental",
+          "crates/tine-core/src/model.rs::tests::direct_creation_round_trips_a_chinese_page_name",
+          "crates/tine-core/src/model.rs::tests::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
+          "crates/tine-core/src/model.rs::tests::external_semantic_owner_creator_wins_before_creation_publication"
+        ],
+        "scenario": "direct.windows-exact-event-unicode-create-reconcile-create",
+        "failBefore": "proven"
+      },
+      "notes": "GH #366 on v0.6.94 / Windows 11 / Direct Files: creating TINE版本更新提示词 failed three times with `external graph-text changes arrived before creation publication`, then the editor became stuck dirty. Commit 416be3cb correctly made the raw Windows watcher treat ReadDirectoryChangesW `Create(Any)` and `Modify(Any)` as exact file events, but Pending::add_event independently classified the same event as unknown and scheduled a whole-graph diff. On the reporter's 13k-page graph that kept the safe external-change admission frontier raised beyond the frontend's complete 100 ms + 300 ms retry window. The current projection temp producer also writes `.projection.tmp`, while its regression used a retired `.tmp` spelling, so real atomic renames could take the same full-scan path. The fix makes both Windows exact event shapes and the current staging rename incremental. Fail-before is the cross-layer pending-queue test; pass-after proves one Chinese-named exact event reconciles without the full branch, lowers the admission frontier, and permits a subsequent creation. Unicode itself is covered as an accepted page name while the existing case/NFC alias, external semantic-owner and exact-target race refusals remain intact."
     }
   ]
 }
