@@ -7601,6 +7601,30 @@
         "failBefore": "proven"
       },
       "notes": "Mobile long-pressing a [[page]] link selected text (native behavior) instead of showing the desktop right-click menu. PageRef anchors now carry a small recognizer (src/render/longPress.ts): a primary touch/pen press held ~500ms within 10px dispatches a synthetic contextmenu AT THE ANCHOR, so the gesture enters the exact existing openPageContextMenu handler (which preventDefaults — that is also what suppresses the native selection/callout for this hold, plus a scoped -webkit-touch-callout:none on .page-ref). Quick taps navigate, larger movement cancels (scroll intent), pointer-cancel releases, mouse and secondary pointers never arm (desktop keeps right-click), nothing binds until a press starts, and text outside links is untouched bcause no handlers attach there. Fail-before proven: with the four pointer handlers removed transiently, the hold-to-menu component test fails while tap-navigation, native right-click, and the mouse/no-arm guards stay green. Lifecycle proven in jsdom with fake timers; the physical Android WebView (and iOS) confirmation of the native selection suppression is a manager item."
+    },
+    {
+      "id": "UI-SHEET-ADD-ROW-PLACEMENT-227",
+      "title": "Add row appends at the table's source bottom in every presentation; only an active ascending sort displays the empty new row at the view's top, which is the sort contract itself",
+      "family": "sheet-table",
+      "sources": {
+        "issues": [
+          227
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/SheetTable.addRow227.test.tsx"
+        ],
+        "scenario": "sheet.add-row-presentation-positions",
+        "failBefore": "unavailable"
+      },
+      "notes": "Investigation coverage for a needs-info report, not a defect fix: the only mechanism anywhere that can look like 'Add row inserts at the top' is an ACTIVE ascending title sort — the new empty row appends at the end of the source outline (order asserted unchanged) but, being empty, sorts FIRST in the rendered view, and the editor opens there. Unsorted tables (first/middle/last rows), empty tables, ascending, and descending presentations are now all pinned; grid mode shares the same bottom-append source semantics. failBefore unavailable: current code already passes everything — the probe documented behavior instead of exposing a variation to patch. The original report likely involved a title sort that nobody saw in the screenshots."
     }
   ]
 }
