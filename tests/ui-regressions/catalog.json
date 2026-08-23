@@ -7499,6 +7499,31 @@
         "failBefore": "proven"
       },
       "notes": "A labeled Markdown/Org link whose target resolves into assets/ (`[image](./assets/quick-capture.png)`, `[path](./assets/)`) hit the generic external-link fallback and was handed to the URL opener, which rejected the non-URL relative path, so nothing opened. The fallback opener decision is now graph-asset aware and extension/platform agnostic: files open in the system viewer, a nested directory or the assets root open in the file manager, and paths are percent-decoded first. The Rust open_asset boundary resolves via the same canonicalized assets containment as reads, now permitting directories and the empty name; the read path keeps its regular-file gate. Genuine http(s) links whose URL merely contains assets/ stay on the external-URL route. Fail-before proven by the clicking component test failing against the URL-route-only implementation (6 positive cases red, 2 negative controls green)."
+    },
+    {
+      "id": "UI-ALIAS-OWNER-NAVIGATION-353",
+      "title": "Selecting an alias search result navigates to the canonical owner page and shows the alias as match context, never a phantom alias page",
+      "family": "search-navigation",
+      "sources": {
+        "issues": [
+          353
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/query_plan.rs::tests::alias_reference_is_never_a_phantom_alias_page",
+          "src/components/QuickSwitcher.test.tsx"
+        ],
+        "scenario": "search.alias-owner-navigation",
+        "failBefore": "proven"
+      },
+      "notes": "Searching an alias whose text was also referenced anywhere (e.g. alias:: Book plus a [[Book]] link) produced two page candidates: the owner carrying the alias match AND a path-less referenced virtual page named after the alias, which ranked first and opened a separate alias-named phantom page. The shared page-candidate executor now extends its existing referenced-name dedup to every alias of a file page (case-folded, comma- or full-width-comma-separated multi-alias values), so the alias text is never its own candidate in either run_graph_search (Ctrl+K) or quick_switch (the # / [[ autocomplete pool); a genuinely overlapping ordinary page name and unrelated referenced pages are unaffected. The owner row shows 'aka <alias>' context. Fail-before proven at the integration boundary: a synthetic-graph probe printed the phantom 'Book' hit first on the pre-fix code, and the permanent regression test fails when the owner-alias dedup is disabled; the QuickSwitcher alias-context assertion fails without the row change."
     }
   ]
 }

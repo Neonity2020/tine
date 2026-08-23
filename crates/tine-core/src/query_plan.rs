@@ -1403,10 +1403,19 @@ fn execute_page_candidates(
             );
         }
     }
-    let have: HashSet<String> = file_pages
+    let mut have: HashSet<String> = file_pages
         .iter()
         .map(|page| canonical_fold(&page.name))
         .collect();
+    // GH #353: an alias of a file page names THAT page — the owner carries the
+    // identity (with `matched_alias` as display context). The alias text must
+    // never also appear as a referenced (virtual, path-less) page candidate:
+    // selecting that phantom row navigated to a standalone alias-named page.
+    for owner_aliases in aliases_by_owner.values() {
+        for alias in owner_aliases {
+            have.insert(canonical_fold(alias));
+        }
+    }
     for name in referenced {
         if cancelled() {
             return None;
@@ -2270,6 +2279,118 @@ mod tests {
             )],
             "a unique page name must retain ordinary alias matching"
         );
+
+        crate::test_support::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn alias_reference_is_never_a_phantom_alias_page() {
+        // GH #353: an alias text that is also referenced anywhere in the graph
+        // (`[[Book]]`) must not surface as its own selectable page — only the
+        // owner page may appear, carrying the matched alias as context. Covers
+        // canonical (case-folded) matching and multiple aliases.
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tine-query-plan-alias-ghost-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        // One owner page carrying TWO aliases (`alias:: Book, Reading`), the
+        // alias texts referenced elsewhere in the graph, one real page whose
+        // name merely overlaps an alias, and one unrelated referenced page.
+        fs::write(
+            dir.join("pages").join("Research Hub.md"),
+            "alias:: Book, Reading\n\n- actual reading notes\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Real Reading.md"),
+            "- a genuinely real page whose name contains an alias\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Notes.md"),
+            "- see [[Book]], [[Reading]] and [[Book Shelf]] for the list\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        for query in ["book", "BOOK", "Book", "reading"] {
+            let page_hits: Vec<(String, String, Option<String>)> = graph
+                .run_graph_search(query, 100, 0, false)
+                .hits
+                .into_iter()
+                .filter_map(|hit| match hit {
+                    QueryHit::Page {
+                        page,
+                        matched_alias,
+                        ..
+                    } => Some((page.name, page.rel_path, matched_alias)),
+                    QueryHit::Block { .. } => None,
+                })
+                .collect();
+            // The exact invariant: an alias's folded text must never be a
+            // path-less (referenced/virtual) page candidate. Unrelated
+            // referenced pages (e.g. "Book Shelf") MAY appear — they are real.
+            assert!(
+                page_hits.iter().all(|(name, rel_path, _)| {
+                    let folded = canonical_fold(name);
+                    !rel_path.is_empty()
+                        || (folded != "book" && folded != "reading")
+                }),
+                "query {query:?} must not offer a path-less phantom alias page: {page_hits:?}"
+            );
+            assert!(
+                page_hits
+                    .iter()
+                    .any(|(name, _, matched_alias)| name == "Research Hub" && matched_alias.is_some()),
+                "query {query:?} must carry the matched alias on the owner hit: {page_hits:?}"
+            );
+            // An ordinary page whose name merely contains the alias text is
+            // not affected by the alias-owner dedup ("Real Reading" still
+            // shows up for "reading"), and only the owner carries the alias.
+            if query == "reading" {
+                assert!(
+                    page_hits.iter().any(|(name, _, matched_alias)| {
+                        name == "Real Reading" && matched_alias.is_none()
+                    }),
+                    "an ordinary partial name match stays a hit: {page_hits:?}"
+                );
+            }
+            // A genuinely unrelated referenced page is NOT affected.
+            let shelf: Vec<String> = graph
+                .run_graph_search("Book Shelf", 100, 0, false)
+                .hits
+                .into_iter()
+                .filter_map(|hit| match hit {
+                    QueryHit::Page { page, .. } => Some(page.name),
+                    QueryHit::Block { .. } => None,
+                })
+                .collect();
+            assert!(
+                shelf.contains(&"Book Shelf".to_string()),
+                "a referenced page with no alias owner still surfaces: {shelf:?}"
+            );
+            // The legacy quick-switch pool (the `#` / `[[` autocomplete source)
+            // shares the same candidate boundary.
+            let switch_names: Vec<String> = graph
+                .quick_switch(query, 100)
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert!(
+                !switch_names
+                    .iter()
+                    .any(|name| canonical_fold(name) == "book" || canonical_fold(name) == "reading"),
+                "quick_switch must not offer the alias-named phantom: {switch_names:?}"
+            );
+        }
 
         crate::test_support::remove_dir_all(dir);
     }
