@@ -3308,11 +3308,9 @@ fn prepare_sparse_v2_join(
     )
     .map_err(|error| join_failure("local activation", error))?;
     let Some(handle) = activated.binding.handle() else {
-        let detail = format!(
-            "join bootstrap did not reach LocalActive: {:?}",
-            activated.binding.availability()
-        );
-        return Err(detail);
+        return Err(join_bootstrap_unavailable_detail(
+            activated.binding.availability(),
+        ));
     };
     handle
         .join_shared(descriptor)
@@ -3337,6 +3335,46 @@ fn prepare_sparse_v2_join(
             direct_source_generation: Some(direct_source_generation),
         },
     ))
+}
+
+/// Keep the retry's useful stage and reason in ordinary bounded text. Debug-
+/// formatting the tagged availability object wrapped both in braces, so the
+/// frontend's privacy sanitizer correctly collapsed the entire diagnostic to
+/// `[details]` and a phone report could not identify the failing operation.
+fn join_bootstrap_unavailable_detail(availability: &SparseV2Availability) -> String {
+    match availability {
+        SparseV2Availability::Retryable { stage, detail } => format!(
+            "join bootstrap did not reach LocalActive during {stage}: {detail}"
+        ),
+        SparseV2Availability::Blocked {
+            reason_code,
+            scenario_id,
+        } => format!(
+            "join bootstrap did not reach LocalActive: blocked ({reason_code}, scenario {scenario_id})"
+        ),
+        SparseV2Availability::Refused {
+            reason_code,
+            scenario_id,
+            detail,
+        } => format!(
+            "join bootstrap did not reach LocalActive: refused ({reason_code}, scenario {scenario_id}){}",
+            detail
+                .as_deref()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default(),
+        ),
+        other => format!(
+            "join bootstrap did not reach LocalActive: unexpected availability {}",
+            match other {
+                SparseV2Availability::LegacyDefault => "legacy_default",
+                SparseV2Availability::Joinable { .. } => "joinable",
+                SparseV2Availability::Active => "active_without_handle",
+                SparseV2Availability::Retryable { .. }
+                | SparseV2Availability::Blocked { .. }
+                | SparseV2Availability::Refused { .. } => unreachable!(),
+            }
+        ),
+    }
 }
 
 /// How this device's own managed identity stands to the graph another device
@@ -4185,6 +4223,19 @@ mod tests {
             None
         );
         assert_eq!(active.availability, SparseV2Availability::Active);
+    }
+
+    #[test]
+    fn retryable_join_bootstrap_preserves_stage_and_detail_without_debug_wrappers() {
+        let detail = join_bootstrap_unavailable_detail(&SparseV2Availability::Retryable {
+            stage: "shadow_import".into(),
+            detail: "source proof stopped at pages/研究.md".into(),
+        });
+        assert_eq!(
+            detail,
+            "join bootstrap did not reach LocalActive during shadow_import: source proof stopped at pages/研究.md"
+        );
+        assert!(!detail.contains('{') && !detail.contains('}'));
     }
 
     #[test]

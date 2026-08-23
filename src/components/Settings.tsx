@@ -2296,7 +2296,21 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const reportManagedFailure = (summary: string, detail: string, remedy?: string | null) => {
-    pushToast(`${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`, "error", { sticky: true });
+    const message = `${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`;
+    pushToast(message, "error", {
+      sticky: true,
+      action: {
+        label: "Copy details",
+        run: () => {
+          void writeClipboardTextResilient(message)
+            .then(() => pushToast("Managed storage details copied.", "success"))
+            .catch((error) => pushToast(
+              `Couldn't copy managed storage details: ${safeManagedErrorDetail(error)}`,
+              "error",
+            ));
+        },
+      },
+    });
   };
 
   /**

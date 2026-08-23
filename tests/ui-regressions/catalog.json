@@ -7404,6 +7404,76 @@
         "failBefore": "proven"
       },
       "notes": "GH #361: a block 'line1\\nline2' with the caret at the start of line2 retained the boundary newline as an empty line. store.splitBlock now consumes exactly that separator so the prior block loses the trailing newline and the new block starts with the line's text. The same rule handles blank or whitespace-only prefixes by moving the post-boundary text into the original block while preserving hidden properties; otherwise the start-of-block special case left the newline untouched. Preserved and pinned: intentional interior blank lines from Shift+Enter, mid-line splits, caret-at-zero empty-block-before, ordered-list Org propagation, IME, and mobile through the shared splitBlock choke point. Parser and round-trip behavior are untouched."
+    },
+    {
+      "id": "UI-MANAGED-SHARE-SINGLE-TERMINAL-OUTCOME-001",
+      "title": "Sync setup reports one terminal outcome instead of a transient red freshness failure followed by success",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/reloadOnFocus.test.tsx::leaves the terminal outcome to an active storage transition",
+          "src/managedStorageRuntime.test.ts::never reports the retired-actor window an enrollment cut opens on purpose",
+          "src/managedStorageRuntime.test.ts::reports a failure that outlives the transition exactly once"
+        ],
+        "scenario": "managed.share-focus-rescan-single-terminal-outcome",
+        "failBefore": "proven"
+      },
+      "notes": "Internal report after v0.6.94: enabling sync first showed the red focus-rescan toast `sync actor is unavailable`, then a green success toast. Share and join deliberately retire their actor and publish a reopened replacement before the owning command returns; managed runtime errors already respected that transition bracket, but reloadOnFocus independently treated its subordinate rescan as a terminal operation. A focus rescan that fails while this window owns a storage transition now releases the freshness/input barrier silently. The Settings command remains the sole owner and reports exactly one authoritative success or failure; ordinary rescan failures outside a transition are unchanged."
+    },
+    {
+      "id": "UI-MANAGED-JOIN-ACTIONABLE-DIAGNOSTIC-001",
+      "title": "A failed managed join preserves its safe stage and reason and offers a Copy details action",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/sync_runtime.rs::tests::retryable_join_bootstrap_preserves_stage_and_detail_without_debug_wrappers",
+          "src/components/Settings.test.tsx::starts shared discovery only after an explicit Direct Files join action"
+        ],
+        "scenario": "managed.join-retryable-stage-detail-copy",
+        "failBefore": "proven"
+      },
+      "notes": "Internal Android report after v0.6.94: join failed with `join bootstrap did not reach LocalActive: Retryable [details]`. The native command debug-formatted the complete tagged availability object; the privacy sanitizer correctly collapsed its brace-delimited body, losing the operation stage and reason. The command now emits ordinary bounded `stage: detail` text, which the sanitizer can redact token-by-token without deleting its diagnostic class. Every sticky managed-storage failure also carries a Copy details action for the already-sanitized complete message. The exact synthetic and 1,046-page anonymized Linux two-device journeys both pass join, forced-close recovery, partial delivery and bidirectional editing on this candidate, so this row deliberately claims diagnostic coverage rather than inventing an Android root-cause fix without the newly exposed detail."
+    },
+    {
+      "id": "UI-MANAGED-JOURNAL-CROSS-DAY-EDITOR-CONTINUITY-001",
+      "title": "A managed cross-day journal move stays visually continuous and keeps the moved block focused",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx",
+          "src/store.test.ts"
+        ],
+        "scenario": "managed.journal-cross-day-move-editor-continuity",
+        "failBefore": "proven"
+      },
+      "notes": "Internal report against deployed f08e21eb: the native transaction committed safely, but both journal pages became inert and dim, the accepted DTO installation purged and reconstructed their loaded block trees, and the moved editor remounted while its page was still inert. The block therefore briefly disappeared and the caret was lost, preventing repeated move-up/down commands without another click. Fail-before was proven in two passes: the unchanged code produced two visibly-busy page sections while the actor response was pending; retaining the inert hold through accepted publication left document.body focused instead of the moved textarea. Managed moves now retain their persistence/replacement hold without using the destructive visual class, publish the accepted semantic delta while preserving loaded block identity, release inertness before that delta, and re-arm the exact editor/caret context for the adjacent journal mount. No-commit, blocked recovery, page replacement, undo/redo and selection routes retain their existing actor-owned behavior."
     }
   ]
 }

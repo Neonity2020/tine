@@ -2236,6 +2236,7 @@ describe("managed actor-owned cross-page moves", () => {
     const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockReturnValue(actor);
     const save = vi.spyOn(backend(), "savePage");
     const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
+    const originalRoot = doc.byId.source;
     __setStoreMutationObserverForTest((observation) => {
       if (observation.kind === "publication") counts.publications++;
       else if (observation.kind === "dirty") counts.dirtyMarks++;
@@ -2266,6 +2267,7 @@ describe("managed actor-owned cross-page moves", () => {
       await pending;
       expect(pageByName("Source")!.roots).toEqual([]);
       expect(pageByName("Destination")!.roots).toEqual(["target", "source"]);
+      expect(doc.byId.source).toBe(originalRoot);
       expect(counts).toEqual({ publications: 1, dirtyMarks: 0, snapshots: 0 });
       expect(save).not.toHaveBeenCalled();
     } finally {

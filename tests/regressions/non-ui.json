@@ -4448,6 +4448,79 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before was reproduced at current master 042054c1 and the frozen release candidate 475b6e72: after the journey saved pages/Smoke.md and crash-reopened with that durable frame still pending, SQLite inventory contained pages/Denní poznámky.md but exact-path loading reported Missing. Any pending managed frame globally disabled SQLite and fell back to a lazy hot engine that did not contain untouched pages. Exact-path reads now apply a path-local journal overlay over the exact-frontier SQLite baseline; unrelated pending work cannot hide the requested page."
+    },
+    {
+      "id": "REG-DIRECT-WINDOWS-EXACT-WATCHER-CREATION-366",
+      "title": "One exact Windows page event triggered a full-graph scan and exhausted every new-page save retry",
+      "family": "direct-files-data-safety-performance",
+      "sources": {
+        "issues": [
+          366
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows"
+      ],
+      "layer": "native-filesystem-watcher",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/watcher.rs::tests::windows_exact_page_events_stay_incremental_through_the_pending_queue",
+          "src-tauri/src/watcher.rs::tests::windows_unicode_event_reconciles_and_releases_new_page_creation",
+          "src-tauri/src/watcher.rs::tests::atomic_page_save_temp_events_stay_incremental",
+          "crates/tine-core/src/model.rs::tests::direct_creation_round_trips_a_chinese_page_name",
+          "crates/tine-core/src/model.rs::tests::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
+          "crates/tine-core/src/model.rs::tests::external_semantic_owner_creator_wins_before_creation_publication"
+        ],
+        "scenario": "direct.windows-exact-event-unicode-create-reconcile-create",
+        "failBefore": "proven"
+      },
+      "notes": "GH #366 on v0.6.94 / Windows 11 / Direct Files: creating TINE版本更新提示词 failed three times with `external graph-text changes arrived before creation publication`, then the editor became stuck dirty. Commit 416be3cb correctly made the raw Windows watcher treat ReadDirectoryChangesW `Create(Any)` and `Modify(Any)` as exact file events, but Pending::add_event independently classified the same event as unknown and scheduled a whole-graph diff. On the reporter's 13k-page graph that kept the safe external-change admission frontier raised beyond the frontend's complete 100 ms + 300 ms retry window. The current projection temp producer also writes `.projection.tmp`, while its regression used a retired `.tmp` spelling, so real atomic renames could take the same full-scan path. The fix makes both Windows exact event shapes and the current staging rename incremental. Fail-before is the cross-layer pending-queue test; pass-after proves one Chinese-named exact event reconciles without the full branch, lowers the admission frontier, and permits a subsequent creation. Unicode itself is covered as an accepted page name while the existing case/NFC alias, external semantic-owner and exact-target race refusals remain intact."
+    },
+    {
+      "id": "REG-MANAGED-FOREGROUND-SETTLES-FINITE-PRIOR-WORK-292",
+      "title": "A managed page save depended on repeated frontend resubmission to advance finite prior actor work",
+      "family": "managed-storage-save-recovery",
+      "sources": {
+        "issues": [292],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "tine-core-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::tests::application_save_settles_finite_prior_clean_work_before_admission",
+          "crates/tine-core/src/sync_runtime.rs::tests::clean_runtime_application_save_never_enters_legacy_publication_settlement",
+          "crates/tine-core/src/sync_runtime.rs::tests::clean_actor_escalates_a_deterministic_retained_retry_to_a_named_stuck_state"
+        ],
+        "scenario": "managed.activate-retained-work-create-page-save",
+        "failBefore": "proven"
+      },
+      "notes": "GH #292 remained broken on v0.6.94 after activation became fast enough: creating page 20260823105223 returned `Tine-managed storage is updating this page`, exhausted the UI's 100 ms and 300 ms retries, left the draft dirty, and prevented clean close. Foreground admission advanced an earlier retained clean continuation exactly once and returned Deferred even when the continuation was finite and still making progress; every internal projection step therefore required another complete UI save request. The actor now drives the existing bounded, progress-aware retained-publication settlement before admitting the new page operation. Two identical non-progress failures still stop and defer, so a persistent filesystem error does not spin or get hidden. Fail-before injects two consecutive projection resumptions ahead of a new application page: the old contract defers the page, while the fixed actor settles its own prior work and saves it in the same request."
+    },
+    {
+      "id": "REG-MANAGED-JOURNAL-REORDER-CROSS-DAY-DERIVATIVE-20260823",
+      "title": "Rapid journal reorders followed by a cross-day move poisoned the managed runtime and flooded recovery alerts",
+      "family": "managed-storage-save-recovery",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "tine-core-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::tests::consecutive_foreground_saves_drain_without_rejecting_accepted_batches",
+          "crates/tine-core/src/sync_runtime.rs::tests::foreground_source_save_then_cross_page_move_drains_one_accepted_prefix",
+          "crates/tine-core/src/sync_runtime.rs::tests::repeated_root_reorders_then_cross_page_move_drain_causally"
+        ],
+        "scenario": "managed.journal-reorder-reorder-cross-day-drain-shutdown",
+        "failBefore": "proven"
+      },
+      "notes": "Internal v0.6.94 report: repeatedly moving a root upward inside a journal day and then across the day boundary produced `did not validate as one accepted operation` followed by a repeating `runtime binding changed` recovery flood. Two independent ordering defects composed. A second same-page edit authenticated the newer journal overlay but still eagerly validated the older clean-manifest rendering, so a legitimate reorder was refused. A correlated multi-page move could then stage directly in accepted history while its foreground page-save prefix was still pending; accepting the prefix could wake speculative dependent history and invalidate the clean runtime. Capture now uses the authenticated foreground predecessor without consulting its superseded manifest, derivative recovery admits the expected SQLite lag, and correlated multi-page transactions advance the pending foreground prefix one bounded turn at a time before staging. The exact two-journal fail-before performs two root reorders, crosses the leading root into the adjacent journal, drains to zero, and proves a safe shutdown."
     }
   ]
 }

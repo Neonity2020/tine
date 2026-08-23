@@ -41752,6 +41752,33 @@ mod tests {
         }
     }
 
+    /// GH #366's literal reporter page name. Unicode itself must not make an
+    /// otherwise ordinary Direct Files creation ambiguous; the neighboring test
+    /// retains the fail-closed NFC/NFD collision boundary.
+    #[test]
+    fn direct_creation_round_trips_a_chinese_page_name() {
+        let dir = scratch("creation-chinese-page-name");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let page = direct_save_bench_new_page("TINE版本更新提示词");
+
+        graph.save_page(&page, None).unwrap();
+
+        let path = dir.join("pages/TINE版本更新提示词.md");
+        assert!(path.exists());
+        assert_eq!(
+            graph
+                .load_named("TINE版本更新提示词", PageKind::Page)
+                .unwrap()
+                .unwrap()
+                .blocks[0]
+                .raw,
+            "created"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn creation_refuses_symlink_parent_and_leaf_without_touching_outside_bytes() {

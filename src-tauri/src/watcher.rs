@@ -461,6 +461,9 @@ fn is_tine_atomic_page_temp_path(path: &Path) -> bool {
     let Some(mut stem) = name.strip_suffix(".tmp") else {
         return false;
     };
+    if let Some(without_projection) = stem.strip_suffix(".projection") {
+        stem = without_projection;
+    }
     if let Some(without_new) = stem.strip_suffix(".new") {
         stem = without_new;
     }
@@ -539,14 +542,21 @@ fn watch_event_is_tool_noise(event: &notify::Event, roots: &HashSet<PathBuf>) ->
 fn incremental_page_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
 
-    let explicit_file_event = matches!(
+    let exact_file_event = matches!(
         event.kind,
         EventKind::Create(CreateKind::File)
             | EventKind::Modify(ModifyKind::Data(_))
             | EventKind::Modify(ModifyKind::Metadata(_))
             | EventKind::Remove(RemoveKind::File)
+            // Windows ReadDirectoryChangesW supplies an exact path but no
+            // create/modify sub-kind. The entry still exists, so the live
+            // metadata check below is the file witness. `Remove(Any)` remains
+            // deliberately absent: after removal we cannot distinguish a file
+            // from a directory subtree.
+            | EventKind::Create(CreateKind::Any)
+            | EventKind::Modify(ModifyKind::Any)
     );
-    let supported = explicit_file_event
+    let supported = exact_file_event
         || matches!(
             event.kind,
             EventKind::Modify(ModifyKind::Name(
@@ -563,9 +573,15 @@ fn incremental_page_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
         .paths
         .iter()
         .all(|path| is_page_file_path(path) || is_tine_atomic_page_temp_path(path));
-    if !all_text_or_temp && !explicit_file_event {
+    if !all_text_or_temp {
         // A rename without a file-kind witness may denote a directory subtree.
-        return None;
+        if !exact_file_event {
+            return None;
+        }
+        // An exact ordinary non-page file is outside Direct Files graph text.
+        // Keep it out of both the incremental and full queues. The raw observer
+        // likewise publishes no admission epoch for excluded paths.
+        return Some(Vec::new());
     }
     Some(
         event
@@ -2285,7 +2301,10 @@ mod tests {
         use notify::event::{EventKind, ModifyKind, RenameMode};
 
         let page = PathBuf::from("/graphs/a/pages/one.md");
-        let temp = PathBuf::from("/graphs/a/pages/.one.md.123.7.tmp");
+        // `create_projection_temp` uses this exact suffix. Keeping the producer's
+        // spelling here matters: the old test used a retired `.tmp` form and let
+        // every real atomic rename fall through to a full-graph scan.
+        let temp = PathBuf::from("/graphs/a/pages/.one.md.123.7.projection.tmp");
         let mut pending = Pending::default();
         pending.add_event(notify::Event {
             kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
@@ -2298,6 +2317,69 @@ mod tests {
             "Tine's own temp rename must not request a full scan"
         );
         assert_eq!(pending.paths, HashSet::from([page]));
+    }
+
+    /// GH #366. Windows reports ordinary file writes as `Create(Any)` or
+    /// `Modify(Any)`. The raw admission classifier already knew these were exact
+    /// page paths, but the queued classifier sent the same event through a full
+    /// graph diff. On a large graph that kept creation's external-change barrier
+    /// raised past every frontend retry.
+    #[test]
+    fn windows_exact_page_events_stay_incremental_through_the_pending_queue() {
+        use notify::event::{CreateKind, EventKind, ModifyKind};
+
+        let graph_dir = TempGraph::new("windows-pending-exact-page");
+        graph_dir.write("pages/TINE版本更新提示词.md", "- 中文内容\n");
+        let page = graph_dir.path("pages/TINE版本更新提示词.md");
+
+        for kind in [
+            EventKind::Create(CreateKind::Any),
+            EventKind::Modify(ModifyKind::Any),
+        ] {
+            let mut pending = Pending::default();
+            pending.add_event(event(kind, vec![page.clone()]));
+            assert_eq!(pending.paths, HashSet::from([page.clone()]), "{kind:?}");
+            assert!(pending.full_paths.is_empty(), "{kind:?}");
+            assert!(!pending.need_full, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn windows_unicode_event_reconciles_and_releases_new_page_creation() {
+        use notify::event::{CreateKind, EventKind};
+
+        let graph_dir = TempGraph::new("windows-unicode-frontier-release");
+        graph_dir.write("pages/Anchor.md", "- anchor\n");
+        let graph = Graph::open(&graph_dir.root);
+        warm_direct_graph(&graph);
+        let mut snap = collect_graph_text_files(&graph).files;
+
+        graph_dir.write("pages/TINE版本更新提示词.md", "- 中文内容\n");
+        let path = graph_dir.path("pages/TINE版本更新提示词.md");
+        let create = event(EventKind::Create(CreateKind::Any), vec![path.clone()]);
+        assert!(observe_legacy_graph_text_event(
+            &graph,
+            &graph_dir.root,
+            Some(&create),
+        ));
+        let frontier = graph.graph_text_external_observation_ticket();
+        assert_new_page_waits_for_reconciliation(&graph, "Blocked During Windows Event");
+
+        let mut pending = Pending::default();
+        pending.add_event(create);
+        let (changes, _conflicts, used_full, errors) =
+            reconcile_pending(&graph, &mut snap, &pending.paths, false, false);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!used_full, "one exact Windows page event must stay O(page)");
+        assert_eq!(changes.len(), 1);
+        assert!(graph.acknowledge_graph_text_external_observations(frontier));
+
+        graph
+            .save_page(&new_page("Creation After Windows Event"), None)
+            .unwrap();
+        assert!(graph_dir
+            .path("pages/Creation After Windows Event.md")
+            .exists());
     }
 
     #[test]

@@ -15377,8 +15377,15 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
             if replay.target() != bytes || replay.intent().annotations() != annotations.as_slice() {
                 return Err(EngineError::ProjectionManifest(
-                    "managed-local predecessor target is not its deterministic current rendering"
-                        .into(),
+                    format!(
+                        "managed-local predecessor target is not its deterministic current rendering (prepared_candidate={}, prepared_bytes_match={}, prepared_annotations_match={})",
+                        prepared_predecessor.is_some(),
+                        prepared_predecessor
+                            .is_some_and(|(prepared_bytes, _)| prepared_bytes == bytes.as_slice()),
+                        prepared_predecessor.is_some_and(|(_, prepared_annotations)| {
+                            prepared_annotations == annotations.as_slice()
+                        }),
+                    ),
                 ));
             }
             replay.intent().clone()
@@ -15956,26 +15963,37 @@ impl ShardedHotEngine {
                 })
                 .transpose()?
                 .flatten();
-            let clean_manifest_prior = roles
-                .semantic_predecessor
-                .and_then(|requirement_index| {
-                    let requirement = &draft.requirements[requirement_index];
-                    draft.pages[&requirement.page_id]
-                        .before
-                        .as_ref()
-                        .map(|before| (requirement.page_id, before))
-                })
-                .map(|(page_id, before)| {
-                    self.clean_manifest_projection_predecessor(
-                        path,
-                        page_id,
-                        before,
-                        current.as_deref(),
-                        external,
-                    )
-                })
-                .transpose()?
-                .flatten();
+            // A journal-durable foreground overlay is the newest exact
+            // predecessor for this path. Its accepted-manifest predecessor is
+            // necessarily older and may render different bytes (a reorder is
+            // the simplest example), so validating both authorities eagerly
+            // rejects a legitimate second edit before the first derivative is
+            // drained. Consult the clean manifest only when no authenticated
+            // managed-local predecessor exists.
+            let clean_manifest_prior = if managed_prior.is_none() {
+                roles
+                    .semantic_predecessor
+                    .and_then(|requirement_index| {
+                        let requirement = &draft.requirements[requirement_index];
+                        draft.pages[&requirement.page_id]
+                            .before
+                            .as_ref()
+                            .map(|before| (requirement.page_id, before))
+                    })
+                    .map(|(page_id, before)| {
+                        self.clean_manifest_projection_predecessor(
+                            path,
+                            page_id,
+                            before,
+                            current.as_deref(),
+                            external,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
             // `None` from the clean-manifest proof can mean that the exact
             // graph bytes need reconciliation, not that the page still belongs
             // to lazy genesis. Once a manifest head exists it supersedes the

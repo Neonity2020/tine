@@ -26,6 +26,7 @@ import {
   endFreshnessBarrier,
   installFreshnessInputGate,
 } from "./freshnessBarrier";
+import { managedStorageRuntime } from "./managedStorageRuntime";
 import { sweepReplaceable } from "./store";
 import { pushToast } from "./ui";
 
@@ -110,10 +111,16 @@ export function refreshOnReturnToWindow(now = Date.now()): Promise<void> {
     } catch (error) {
       // The watcher remains the primary path. Most importantly, a failed
       // fallback must release the input gate rather than strand the editor.
-      pushToast(
-        `Tine couldn't finish checking for external changes. Editing is available, but reopen the page before relying on it being current. (${String(error)})`,
-        "error",
-      );
+      // Share/join deliberately retires and republishes the managed actor.
+      // During that window this rescan is a subordinate probe, not a second
+      // operation with its own terminal outcome: the owning Settings command
+      // reports exactly one success or failure after the actor is reopened.
+      if (!managedStorageRuntime.transitioning()) {
+        pushToast(
+          `Tine couldn't finish checking for external changes. Editing is available, but reopen the page before relying on it being current. (${String(error)})`,
+          "error",
+        );
+      }
     } finally {
       endFreshnessBarrier();
       activeRefresh = null;

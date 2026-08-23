@@ -182,6 +182,7 @@ describe("Settings storage transitions", () => {
     expect(toasts().at(-1)).toMatchObject({
       message: "Couldn't join the synced graph: managed join could not find a shared provider descriptor",
       sticky: true,
+      action: { label: "Copy details" },
     });
     dispose();
   });
