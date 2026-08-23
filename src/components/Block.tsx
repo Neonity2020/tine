@@ -1138,11 +1138,15 @@ export function Editor(props: { id: string }): JSX.Element {
   // drives edit-focus arbitration when the same block renders in several surfaces.
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
-  // Generic ref/query surfaces intentionally return structural keyboard edits to
-  // the primary outline. An embed is a live editing surface: structural destinations
-  // (Enter, Arrow navigation, and empty-block merge/delete) must remain in the
-  // transclusion the user is looking at.
-  const editSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
+  // Ref/query surfaces are live editing surfaces for keyboard structural edits
+  // (GH #341): returning arrow navigation (Enter/merge/etc.) to the primary
+  // outline moved the caret into an editor that isn't rendered in the surface
+  // the user is looking at — the "cursor disappears" report. Same treatment
+  // embeds already had. Structural TOPOLOGY still consults page order for
+  // navOnly scopes (see store.mergeWithPrev/Next); only the edit DESTINATION
+  // changes here.
+  const editSurface = () =>
+    surfaceKey.startsWith("ref:") || surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
   let pluginSlashInvocation = 0;
   let editorMounted = true;
@@ -2578,7 +2582,7 @@ export function Editor(props: { id: string }): JSX.Element {
     commit(ref.value);
     setBlockMoving(true, doc.byId[props.id]?.page);
     startEditing(props.id, start);
-    const move = outlineScope
+    const move = outlineScope && !outlineScope.navOnly
       ? (moveItem(props.id, dir), Promise.resolve())
       : moveBlockFeed(props.id, dir).then(() => undefined);
     void move.then(() => {
@@ -2705,7 +2709,7 @@ export function Editor(props: { id: string }): JSX.Element {
       // On an in-block list line, Tab nests the LIST ITEM (intra-block), not the block.
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll) { nudgeListItem(ll, +2); return true; }
-      if (outlineScope?.roots.includes(props.id)) return true;
+      if (!outlineScope?.navOnly && outlineScope?.roots.includes(props.id)) return true;
       commit(ref.value); indentBlock(props.id, ref.selectionStart); return true;
     },
     "editor/outdent": (e) => {
@@ -2926,6 +2930,9 @@ export function Editor(props: { id: string }): JSX.Element {
     const start = ref.selectionStart;
     const end = ref.selectionEnd;
     const raw = ref.value;
+    // A navOnly display-list scope must never act as a merge/structural
+    // topology — keep every structural read on page order in that case.
+    const structuralScope = outlineScope?.navOnly ? null : outlineScope;
 
     // Ctrl/Cmd+Shift+V is Logseq's universal raw-paste gesture.
     // ClipboardEvent does not expose modifier keys, so remember the preceding
@@ -3207,12 +3214,12 @@ export function Editor(props: { id: string }): JSX.Element {
           return;
         }
         commit(raw);
-        if (mergeWithPrev(props.id, outlineScope, editSurface())) {
+        if (mergeWithPrev(props.id, structuralScope, editSurface())) {
           e.preventDefault();
           return;
         }
         const n = doc.byId[props.id];
-        const next = nextVisible(props.id, outlineScope);
+        const next = nextVisible(props.id, structuralScope);
         if (n && splitProps(n.raw, hideFn(), pageFmt()).visible.trim() === "" && n.children.length === 0 && next && doc.byId[next]?.page === n.page) {
           e.preventDefault();
           deleteBlock(props.id);
@@ -3225,12 +3232,12 @@ export function Editor(props: { id: string }): JSX.Element {
       // calc block itself (same rule as Backspace), and never absorb an
       // annotation/calc block's raw text into this one.
       if (isAnnot() || isCalc()) return;
-      const next = nextVisible(props.id, outlineScope);
+      const next = nextVisible(props.id, structuralScope);
       if (next) {
         const nextRaw = doc.byId[next]?.raw ?? "";
         if (isAnnotationBlock(nextRaw) || calcSource(nextRaw) !== null) return;
         commit(raw);
-        if (mergeWithNext(props.id, outlineScope, editSurface())) {
+        if (mergeWithNext(props.id, structuralScope, editSurface())) {
           e.preventDefault();
           const caretAt = start; // join point = the block's pre-merge end
           queueMicrotask(() => {

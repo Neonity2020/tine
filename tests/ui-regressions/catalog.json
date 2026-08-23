@@ -7212,6 +7212,34 @@
         "failBefore": "proven"
       },
       "notes": "GH #273: the reporter filtered a Linked References view by two positive chips and got zero rows because includes ANDed (ins.every). Includes now OR (ins.some, with the zero-include case still vacuous), excludes stay cumulative (outs.every), and content matching stays conjunctive. One-line predicate change inside LinkedReferences.tsx shown(); facet matching already normalizes case via norm() on both sides (pinned by a case-fold test). The cycle include→exclude→off chip UX, per-page persisted filter state, counts, load-more/evidence tracking, and the 'N of M references' summary are unchanged; no copy claimed AND anywhere. jsdom render-level evidence with mocked getBacklinks/getBacklinkFilterContext; the two genuinely behavior-changing tests fail on HEAD, the three companions pin unchanged semantics."
+    },
+    {
+      "id": "UI-REF-SURFACE-ARROW-NAV-341",
+      "title": "Arrow navigation from an edited block inside linked-reference, block-reference, query, and embed surfaces stays in that rendered surface and moves to the adjacent rendered block instead of hiding the caret in the owning page outline",
+      "family": "caret-navigation",
+      "sources": {
+        "issues": [
+          341
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/LiveRefGroup.nav.test.tsx::arrow navigation inside ref/query/embed groups (GH #341)::ArrowDown crosses display roots into the next rendered root",
+          "src/components/LiveRefGroup.nav.test.tsx::arrow navigation inside ref/query/embed groups (GH #341)::ArrowUp moves to the previous rendered block, not the page-order sibling",
+          "src/components/LiveRefGroup.nav.test.tsx::arrow navigation inside ref/query/embed groups (GH #341)::embed groups get the same rendered-order navigation",
+          "src/outlineScope.nav.test.ts::navOnly outline scope visible order (GH #341)::honors the surface collapse contract instead of durable collapse flags",
+          "src/outlineScope.nav.test.ts::navOnly outline scope visible order (GH #341)::merge from a navOnly scope merges the PAGE-order sibling, not the rendered neighbor"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #341: editing a block inside linked references and pressing Up/Down left the surface — nextVisible/prevVisible consulted the block's OWN page outline (a sibling the ref view does not render adjacently) and startEditing went unscoped, so the editor mounted outside the surface (or nowhere) and the caret visually disappeared. The fix reuses the existing mechanisms instead of inventing a second tree: LiveRefGroup (the ONE renderer behind linked refs, block refs, query results, and embeds) now provides an OutlineScopeContext carrying its display roots (reactive getter), the surface collapse contract (so scoped order mirrors what is actually rendered), and navOnly: true; Block.editSurface keeps keyboard edits inside ref: surfaces exactly as embeds already did. Structural safety: navOnly scopes are display lists, NOT topology — store.mergeWithPrev/Next normalize them to page order (a Backspace can never weld rendered neighbors across subtrees; unit-pinned), Block's merge/empty-block/Delete branches read structuralScope, indent/move commands ignore navOnly scopes, and the empty-root backspace DOM test pins the unchanged outcome. Scoped selection (Escape) and the surface identity arbitration are unchanged. Evidence: 5 node tests + 5 jsdom render tests with display order deliberately reversed from page order; 7 of 10 fail on HEAD in exactly the new-behavior assertions, the rest pin unchanged semantics."
     }
   ]
 }
