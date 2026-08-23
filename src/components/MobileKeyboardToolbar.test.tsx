@@ -102,6 +102,94 @@ describe("MobileKeyboardToolbar", () => {
     dispose();
   });
 
+  it("consumes the full hide-keyboard gesture instead of touching through (GH #336)", async () => {
+    platform.mobile = true;
+    const { render } = await import("solid-js/web");
+    const bridge = await import("../editorCommandBridge");
+    const { MobileKeyboardToolbar } = await import("./MobileKeyboardToolbar");
+    const calls: string[] = [];
+    const unregister = bridge.registerFocusedEditorCommandBridge({
+      blockId: "b1",
+      dispatch: () => true,
+      blur() {
+        calls.push("blur");
+      },
+    });
+    // The "block underneath": anything the trailing synthesized click could hit.
+    const probe = document.createElement("button");
+    let probeClicks = 0;
+    probe.onclick = () => probeClicks++;
+    document.body.appendChild(probe);
+    const { div, dispose } = mount(render, MobileKeyboardToolbar);
+    const toolbarOf = () => div.querySelector("[data-mobile-keyboard-toolbar]");
+    expect(toolbarOf()).not.toBeNull();
+
+    // pointerdown blurs (keyboard starts hiding) — unchanged behavior.
+    const hide = toolbarOf()!.querySelector<HTMLButtonElement>(".mobile-keyboard-toolbar-hide")!;
+    const down = new Event("pointerdown", { bubbles: true, cancelable: true });
+    hide.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(true);
+    expect(calls).toEqual(["blur"]);
+
+    // The IME actually closes: viewport grows back to full height. On Android
+    // this is exactly when the toolbar used to vanish mid-gesture.
+    Object.defineProperty(window, "visualViewport", {
+      value: { height: 800, offsetTop: 0, addEventListener: vi.fn(), removeEventListener: vi.fn() },
+      configurable: true,
+    });
+    window.dispatchEvent(new Event("resize"));
+    expect(toolbarOf()).not.toBeNull();
+
+    // The gesture's trailing click lands on the still-mounted button and is
+    // swallowed there; the page underneath never sees it.
+    const hideStill = toolbarOf()!.querySelector<HTMLButtonElement>(".mobile-keyboard-toolbar-hide")!;
+    const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+    hideStill.dispatchEvent(click);
+    expect(click.defaultPrevented).toBe(true);
+    expect(calls).toEqual(["blur"]);
+    expect(probeClicks).toBe(0);
+
+    // Once the click is consumed, the toolbar retires with the hidden keyboard.
+    expect(toolbarOf()).toBeNull();
+
+    probe.remove();
+    unregister();
+    dispose();
+  });
+
+  it("releases a cancelled hide-keyboard gesture after its safety window", async () => {
+    platform.mobile = true;
+    const { render } = await import("solid-js/web");
+    const bridge = await import("../editorCommandBridge");
+    const { MobileKeyboardToolbar } = await import("./MobileKeyboardToolbar");
+    const unregister = bridge.registerFocusedEditorCommandBridge({
+      blockId: "b1",
+      dispatch: () => true,
+      blur() {},
+    });
+    const { div, dispose } = mount(render, MobileKeyboardToolbar);
+    const toolbarOf = () => div.querySelector("[data-mobile-keyboard-toolbar]");
+
+    const hide = toolbarOf()!.querySelector<HTMLButtonElement>(".mobile-keyboard-toolbar-hide")!;
+    vi.useFakeTimers();
+    hide.dispatchEvent(new Event("pointerdown", { bubbles: true, cancelable: true }));
+    Object.defineProperty(window, "visualViewport", {
+      value: { height: 800, offsetTop: 0, addEventListener: vi.fn(), removeEventListener: vi.fn() },
+      configurable: true,
+    });
+    window.dispatchEvent(new Event("resize"));
+    expect(toolbarOf()).not.toBeNull();
+
+    // pointercancel / lost events: no click ever arrives, so the safety window
+    // retires the gesture instead of leaking a permanently-visible toolbar.
+    vi.advanceTimersByTime(800);
+    expect(toolbarOf()).toBeNull();
+    vi.useRealTimers();
+
+    unregister();
+    dispose();
+  });
+
   it("does not render on desktop even with a focused editor bridge", async () => {
     platform.mobile = false;
     const { render } = await import("solid-js/web");

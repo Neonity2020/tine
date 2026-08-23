@@ -6998,6 +6998,31 @@
         "failBefore": "proven"
       },
       "notes": "GH #339: while editing, the calc panel shows the correct number of lines, but after committing, the rendered CalcBlock showed one extra empty line. The parsed AST `code` of a fenced block ends with the newline before the closing fence, and evalCalc minted a row per split('\\n') line, so the trailing '' became a phantom row. evalCalc now drops only TRAILING blank lines (LF/CRLF/whitespace-only) before mapping; interior blanks keep their row position, the all-blank block renders zero rows, and evaluation state is provably untouched (blank lines never modify env or `last`; row outputs are identical with and without trailing blanks). Both consumers share the function: the static CalcBlock and the editor's live results panel. The committed on-disk source is unchanged - this is render-only; no parser/round-trip involvement."
+    },
+    {
+      "id": "UI-ANDROID-HIDE-KEYBOARD-TOUCH-336",
+      "title": "Hiding the Android keyboard from the editor toolbar consumes the complete touch gesture; nothing underneath receives the trailing tap",
+      "family": "android-shell",
+      "sources": {
+        "issues": [
+          336
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/MobileKeyboardToolbar.test.tsx::consumes the full hide-keyboard gesture instead of touching through (GH #336)",
+          "src/components/MobileKeyboardToolbar.test.tsx::releases a cancelled hide-keyboard gesture after its safety window"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #336: the Hide-keyboard button blurred the editor on pointerdown, which dropped the IME and unmounted the whole toolbar MID-GESTURE; Android then delivered the gesture's synthesized pointerup/click to whatever block sat behind the toolbar ('touch-through'). The button now arms a short gesture window on pointerdown (blurring exactly as before): the toolbar stays mounted until the trailing click is consumed on the button itself (preventDefault + stopPropagation), and an AT/keyboard activation with no pointer gesture still blurs. A 700ms safety window retires the gesture on pointercancel/lost events so a stuck toolbar can never leak. jsdom cannot route synthesized clicks by coordinates the way Android WebView does, so the lifecycle test simulates the exact sequence: pointerdown -> blur -> IME-close resize (viewport grows back) -> trailing click; pre-fix the toolbar is gone before the click (both new tests fail on the HEAD component), post-fix it persists, swallows the click (probe behind it untouched), then retires. Physical Android confirmation (uninstallable phantom tap on a real keyboard) remains a manager smoke-test item per the dossier."
     }
   ]
 }

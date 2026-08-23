@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
 
+- **Android: hiding the keyboard no longer taps the note behind the toolbar** (GH #336). The editor toolbar's hide-keyboard button blurred the editor on touch-down, which closed the keyboard and removed the toolbar mid-gesture, so the tap's release landed on whatever block happened to be underneath. The button now consumes the whole touch gesture.
+
 - **Calculator blocks no longer render a phantom empty line** (GH #339). After exiting edit mode, a ```calc block showed one extra blank row below the last expression (the fenced block's trailing newline was rendered as a row). Blank lines between expressions still keep their positions.
 
 - **The Settings dialog can be enlarged on desktop** (GH #287). A new maximize/restore button in the Settings header grows the dialog to nearly fill the window with a comfortable margin, preserving the selected page and scroll position; closing Settings always restores the default size. Narrow/mobile screens are unchanged — the sheet already fills the viewport there.
