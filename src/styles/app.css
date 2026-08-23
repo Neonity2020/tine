@@ -1890,6 +1890,25 @@ textarea {
   display: flex;
   overflow: hidden;
 }
+/* Transient maximized Settings (GH #287): desktop only. The overlay trades
+   its large breathing gap for a small even margin and the dialog fills it —
+   near-viewport without going full-bleed. Narrow/mobile viewports keep their
+   own full-sheet rules below and must never see this geometry (it would break
+   the status-bar inset padding), so everything here is gated ≥481px. */
+@media (min-width: 481px) {
+  .modal-overlay.settings-maximized {
+    padding-top: calc(var(--overlay-inset-top) + 4vh);
+    padding-right: calc(var(--overlay-inset-right) + 4vw);
+    padding-bottom: calc(var(--overlay-inset-bottom) + 4vh);
+    padding-left: calc(var(--overlay-inset-left) + 4vw);
+  }
+  .settings-maximized .settings-modal {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+  }
+}
 /* Left tab navigation (OG-style). */
 .settings-nav {
   width: 200px;
@@ -3057,6 +3076,10 @@ textarea {
   }
   .settings-nav-title,
   .settings-nav-foot {
+    display: none;
+  }
+  /* The sheet already owns the whole viewport here — no maximize chrome. */
+  .settings-maximize {
     display: none;
   }
   .settings-nav-item {

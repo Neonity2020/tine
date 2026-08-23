@@ -6946,6 +6946,33 @@
         "failBefore": "proven"
       },
       "notes": "GH #345: the pane scroller `<main class=main-content tabindex=-1>` is a programmatic scroll/focus target; a click on empty page space focuses it, and the next keypress flips the UA's focus-visible heuristic so the browser paints its default frame (white on Windows WebView2/WebKitGTK) around the whole content area. Reproduced literally in headless Chromium pre-fix: click -> matchesFocus true, focusVisible false, outlineStyle none; keypress -> focusVisible true, outlineStyle auto 1px. Post-fix the same run leaves focus semantics intact (still focusable, still :matches(:focus-visible)) with outlineStyle none. The suppression is `.main-content:focus { outline: none }` only: the deliberate pane-select ring (`.pane-selected`, separate elements) is pinned by the style contract test, and actionable controls keep their own :focus-visible cues. The reporter's second repro (leaving pane-select with Esc after clicking the content) is the same focused-scroller mechanism and is covered by the same rule."
+    },
+    {
+      "id": "UI-SETTINGS-MAXIMIZE-287",
+      "title": "Desktop Settings grows to a near-viewport dialog from a transient maximize/restore control, preserving page and scroll, while narrow viewports keep their full sheet without the control",
+      "family": "settings",
+      "sources": {
+        "issues": [
+          287
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Settings.maximize.test.tsx::Settings maximize (GH #287)",
+          "src/styles/settingsMaximize.test.ts::settings maximize geometry (GH #287)"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #287 asked for a way to enlarge the Settings dialog (reporter: wasted space in long scroll views; 90% is fine). The desktop dialog gains a transient maximize/restore button in the pane head (inline SVG window glyphs, aria-pressed, labelled 'Maximize settings' / 'Restore settings size'). Geometry: the overlay trades its 12vh top gap for an even 4vh/4vw margin and the dialog fills it (~92vw x 92vh), all desktop-gated in @media (min-width: 481px) so a maximized-then-narrowed window can never break the mobile sheet's status-bar inset padding; <=480px keeps its existing full-viewport sheet and hides the control. The toggle is a pure class flip, so the selected settings page and scroll position ride through; the state resets on close (does not persist across modal reopen or restart). Verified numerically in headless Chromium: default 840x630 at (300,108) -> maximized 1325x828 at (58,36) on a 1440x900 viewport, active page 'Editor' retained across the toggle, reopen restores 840x630; mobile 390x844 shows display:none on the control and the unchanged 374x836 sheet. Scroll preservation asserted at render layer (scrollTop 120 survives both toggles); in the Chromium run the Editor pane simply clamped to its 38px max scroll at that width."
     }
   ]
 }

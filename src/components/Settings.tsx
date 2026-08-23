@@ -314,6 +314,15 @@ export function Settings(): JSX.Element {
   // Settings owns its semantic Escape rungs.  Registering here (rather than in
   // App) keeps shortcut recording/search/disclosures from being skipped by a
   // blanket modal close and ensures disposal follows this component lifetime.
+  // Transient maximize (GH #287): a pure geometry toggle on the dialog, so the
+  // selected page and scroll position ride through untouched, and closing the
+  // modal always restores the default size for the next open.
+  const [maximized, setMaximized] = createSignal(false);
+  createEffect(() => {
+    if (settingsOpen()) return;
+    setMaximized(false);
+  });
+
   createEffect(() => {
     if (!settingsOpen()) return;
     const unregister = registerTransientLayer({
@@ -353,7 +362,7 @@ export function Settings(): JSX.Element {
 
   return (
     <Show when={settingsOpen()}>
-      <div class="modal-overlay" onClick={closeSettings}>
+      <div class="modal-overlay" classList={{ "settings-maximized": maximized() }} onClick={closeSettings}>
         <div class="settings-modal" onClick={(e) => e.stopPropagation()}>
           <aside class="settings-nav">
             <div class="settings-nav-title">Settings</div>
@@ -389,6 +398,29 @@ export function Settings(): JSX.Element {
                   }
                 }}
               />
+              {/* Desktop-only near-viewport toggle (hidden ≤480px by CSS, where
+                  the sheet already owns the viewport) — GH #287. */}
+              <button
+                class="icon-btn settings-maximize"
+                type="button"
+                title={maximized() ? "Restore settings size" : "Maximize settings"}
+                aria-label={maximized() ? "Restore settings size" : "Maximize settings"}
+                aria-pressed={maximized()}
+                onClick={() => setMaximized(!maximized())}
+              >
+                <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2">
+                  {maximized() ? (
+                    <>
+                      {/* restore: two overlapping squares while maximized. */}
+                      <rect x="7" y="3" width="14" height="14" rx="1.5" />
+                      <path d="M3 10v9.5A1.5 1.5 0 0 0 4.5 21H14" />
+                    </>
+                  ) : (
+                    /* maximize: one empty square */
+                    <rect x="3.5" y="3.5" width="17" height="17" rx="1.5" />
+                  )}
+                </svg>
+              </button>
               <button class="icon-btn" onClick={closeSettings}>
                 ✕
               </button>
