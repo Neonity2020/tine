@@ -2042,7 +2042,7 @@ fn execute_manifested_projection_work_located(
         let current = projection_phase!(
             "authorize_write",
             engine
-                .authorize_projection_write(work.page_id())
+                .authorize_clean_accepted_projection_write(work.page_id())
                 .map_err(ProjectionError::Engine)
         )?;
         let replay = projection_phase!(

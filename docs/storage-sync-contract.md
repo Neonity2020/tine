@@ -922,6 +922,32 @@ Likewise, admission tracks its exact live staged set. Final status history may
 remain available for point answers, but an ordinary drain turn must never scan
 that lifetime map merely to rediscover the handful of currently staged batches.
 
+Advancing the clean runtime's authenticated accepted-frontier roots follows the
+same rule. The document overlay and accepted-batch maps are persistent
+path-copying authenticated trees: one accepted operation updates only its
+changed document keys and its one new batch key. It must not clone, sort, or
+rehash every document touched earlier in the run or every earlier accepted
+batch. The incrementally maintained root is required to be byte-identical to a
+canonical complete rebuild; the complete rebuild remains only a differential
+oracle and an explicit rebuild operation.
+
+Provider frontier publication likewise consumes an incrementally maintained
+set of direct frontier tips rather than materializing every document frontier.
+Clean projection attach rebuilds an exact path-to-latest-batch map during
+accepted replay and decodes only current path heads after the endpoint becomes
+available; it must not replay all accepted manifests merely to locate terminal
+projection work. While a later foreground suffix remains application-visible,
+projection of its accepted prefix is authorized against accepted state, not
+against those later journal-only catalog heads.
+
+A block-only peer operation is also page-local at this boundary. A receiver may
+have concurrently advanced the catalog by adding or renaming an unrelated page;
+that graph-wide frontier difference must not refuse the peer operation. The
+receiver authenticates the exact current identity rows for every affected page
+and holds their name, path, home, and kind to the manifested projection. A
+conflict on one of those rows remains a refusal; an unrelated catalog advance
+does not.
+
 These are work-shape requirements, not thread-placement advice. Moving an
 O(graph), O(history), or O(pending-prefix) operation to a background turn does
 not satisfy the contract. The 100/10,000-page move receipt and forbidden-work

@@ -20,9 +20,9 @@ use crate::oplog::object_store::{BatchInspection, StoreError};
 use crate::oplog::{
     decode_managed_local_record, AcceptedBatchEvent, BatchDisposition, BatchId, ContentDigest,
     DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath,
-    ManifestObjectRef, ManifestProjectionTarget, ObjectStore, PageId, ProjectionEndpointBinding,
-    ProjectionReceiptStore, ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine,
-    SqliteFrontier, TailOverlay, WorkspaceId,
+    ManifestObjectRef, ObjectStore, PageId, ProjectionEndpointBinding, ProjectionReceiptStore,
+    ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine, SqliteFrontier,
+    TailOverlay, WorkspaceId,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -689,17 +689,13 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     let mut projection_superseded = BTreeMap::new();
     for projection in record.projections() {
         let intent = projection.intent();
-        let exact_target = match intent.target() {
-            ManifestProjectionTarget::Present { bytes, .. } => bytes.as_slice(),
-            ManifestProjectionTarget::Absent => {
-                return conflict(
-                    ManagedLocalDrainStage::Authenticate,
-                    "managed-local drain does not accept deletion targets",
-                )
-            }
-        };
+        let exact_target = intent.target().bytes();
         let superseded = match graph.read_projection_input(intent.path()) {
             Ok(Some(current)) => {
+                let current_matches_target = exact_target.is_some_and(|target| current == target);
+                let current_matches_base = projection
+                    .precondition_base()
+                    .is_some_and(|base| current == base.bytes());
                 let successor = superseding_projections
                     .map(|index| {
                         index.observe_successor(
@@ -720,13 +716,11 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                 }
                 if successor.latest_sequence.is_some()
                     && (successor.current_matches_target
-                        || current == exact_target
-                        || current == projection.precondition_base().bytes())
+                        || current_matches_target
+                        || current_matches_base)
                 {
                     true
-                } else if current == exact_target
-                    || current == projection.precondition_base().bytes()
-                {
+                } else if current_matches_target || current_matches_base {
                     false
                 } else {
                     return conflict(
@@ -735,6 +729,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                     );
                 }
             }
+            Ok(None) if exact_target.is_none() || projection.precondition_base().is_none() => false,
             Ok(None) => {
                 return conflict(
                     ManagedLocalDrainStage::Authenticate,
@@ -1042,10 +1037,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     }
     for projection in record.projections() {
         let intent = projection.intent();
-        let exact_target = intent
-            .target()
-            .bytes()
-            .expect("authenticated managed-local projection is present");
+        let exact_target = intent.target().bytes();
         let expected_work = match exact_work(&record, projection, endpoint) {
             Ok(work) => work,
             Err(error) => return conflict(ManagedLocalDrainStage::ProjectionAdoption, error),
@@ -1065,8 +1057,8 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             &expected_work,
         ) {
             let current = graph.read_projection_input(intent.path());
-            return if matches!(current, Ok(Some(bytes)) if bytes != exact_target && bytes != projection.precondition_base().bytes())
-            {
+            let conflicts = matches!(current, Ok(Some(bytes)) if exact_target.is_none_or(|target| bytes != target) && projection.precondition_base().is_none_or(|base| bytes != base.bytes()));
+            return if conflicts {
                 conflict(
                     ManagedLocalDrainStage::ProjectionAdoption,
                     error.to_string(),

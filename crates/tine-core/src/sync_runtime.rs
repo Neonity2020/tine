@@ -7844,12 +7844,8 @@ fn clean_frontier_head(
         .accepted_frontier_root()
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
     let tips = engine
-        .exact_frontier()
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-        .documents()
-        .iter()
-        .flat_map(|document| document.direct_dependency_heads().iter().copied())
-        .collect::<Vec<_>>();
+        .accepted_frontier_tip_batches()
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
     SharedProviderFrontierHeadV1::new(
         descriptor.workspace_id(),
         descriptor.lineage_digest(),
@@ -8704,7 +8700,7 @@ struct LatestTaskQueryOverlayEntry {
 #[derive(Default)]
 struct ManagedLocalPendingIndex {
     records_by_batch: BTreeMap<BatchId, ManagedLocalRecord>,
-    projection_targets: BTreeMap<(String, PageId), BTreeMap<u64, Vec<u8>>>,
+    projection_targets: BTreeMap<(String, PageId), BTreeMap<u64, Option<Vec<u8>>>>,
     projection_sequences_by_digest: BTreeMap<(String, PageId, ContentDigest), BTreeSet<u64>>,
 }
 
@@ -8719,9 +8715,7 @@ impl ManagedLocalPendingIndex {
         let mut record_keys = BTreeSet::new();
         for projection in record.projections() {
             let intent = projection.intent();
-            let bytes = intent.target().bytes().ok_or_else(|| {
-                "pending managed-local projection has an absent target".to_owned()
-            })?;
+            let bytes = intent.target().bytes();
             let key = (intent.path().as_str().to_owned(), intent.page_id());
             if !record_keys.insert(key.clone())
                 || self
@@ -8733,17 +8727,23 @@ impl ManagedLocalPendingIndex {
                     "duplicate pending managed-local projection at sequence {sequence}"
                 ));
             }
-            entries.push((key, bytes.to_vec(), ContentDigest::of(bytes)));
+            entries.push((
+                key,
+                bytes.map(|bytes| bytes.to_vec()),
+                bytes.map(ContentDigest::of),
+            ));
         }
         for (key, bytes, digest) in entries {
             self.projection_targets
                 .entry(key.clone())
                 .or_default()
                 .insert(sequence, bytes);
-            self.projection_sequences_by_digest
-                .entry((key.0, key.1, digest))
-                .or_default()
-                .insert(sequence);
+            if let Some(digest) = digest {
+                self.projection_sequences_by_digest
+                    .entry((key.0, key.1, digest))
+                    .or_default()
+                    .insert(sequence);
+            }
         }
         self.records_by_batch.insert(batch_id, record);
         Ok(())
@@ -8763,31 +8763,31 @@ impl ManagedLocalPendingIndex {
         }
         for projection in record.projections() {
             let intent = projection.intent();
-            let bytes = intent.target().bytes().ok_or_else(|| {
-                "pending managed-local projection has an absent target".to_owned()
-            })?;
+            let bytes = intent.target().bytes();
             let key = (intent.path().as_str().to_owned(), intent.page_id());
             if self
                 .projection_targets
                 .get(&key)
                 .and_then(|targets| targets.get(&sequence))
-                .is_none_or(|target| target.as_slice() != bytes)
+                .is_none_or(|target| target.as_deref() != bytes)
             {
                 return Err("pending projection target index differs from its record".into());
             }
-            let digest_key = (key.0, key.1, ContentDigest::of(bytes));
-            if self
-                .projection_sequences_by_digest
-                .get(&digest_key)
-                .is_none_or(|sequences| !sequences.contains(&sequence))
-            {
-                return Err("pending projection digest index differs from its record".into());
+            if let Some(bytes) = bytes {
+                let digest_key = (key.0, key.1, ContentDigest::of(bytes));
+                if self
+                    .projection_sequences_by_digest
+                    .get(&digest_key)
+                    .is_none_or(|sequences| !sequences.contains(&sequence))
+                {
+                    return Err("pending projection digest index differs from its record".into());
+                }
             }
         }
         self.records_by_batch.remove(&batch_id);
         for projection in record.projections() {
             let intent = projection.intent();
-            let bytes = intent.target().bytes().expect("validated above");
+            let bytes = intent.target().bytes();
             let key = (intent.path().as_str().to_owned(), intent.page_id());
             let targets = self
                 .projection_targets
@@ -8797,14 +8797,16 @@ impl ManagedLocalPendingIndex {
             if targets.is_empty() {
                 self.projection_targets.remove(&key);
             }
-            let digest_key = (key.0, key.1, ContentDigest::of(bytes));
-            let sequences = self
-                .projection_sequences_by_digest
-                .get_mut(&digest_key)
-                .expect("validated above");
-            sequences.remove(&sequence);
-            if sequences.is_empty() {
-                self.projection_sequences_by_digest.remove(&digest_key);
+            if let Some(bytes) = bytes {
+                let digest_key = (key.0, key.1, ContentDigest::of(bytes));
+                let sequences = self
+                    .projection_sequences_by_digest
+                    .get_mut(&digest_key)
+                    .expect("validated above");
+                sequences.remove(&sequence);
+                if sequences.is_empty() {
+                    self.projection_sequences_by_digest.remove(&digest_key);
+                }
             }
         }
         Ok(())
@@ -8846,7 +8848,7 @@ impl ManagedLocalSuccessorIndex for ManagedLocalPendingIndex {
                     .get(&key)
                     .and_then(|targets| targets.get(&sequence))
             })
-            .is_some_and(|target| target.as_slice() == current);
+            .is_some_and(|target| target.as_deref() == Some(current));
         ManagedLocalSuccessorObservation {
             latest_sequence,
             current_matches_target,
@@ -9918,6 +9920,17 @@ struct ApplicationCurrentPage {
     page: PageDto,
     revision: String,
     editor: EditorCurrentPage,
+}
+
+enum TrustedEditorForegroundTarget {
+    Existing {
+        page: PageDto,
+        response_evidence: TrustedLocalResponseEvidence,
+        projection: PreparedEditorProjection,
+    },
+    New {
+        home_document_id: DocumentId,
+    },
 }
 
 struct HotApplicationSavePage {
@@ -15072,7 +15085,16 @@ impl RuntimeActor {
                 old,
                 new,
                 expected_path,
-            } => self.plan_application_page_rename(&old, &new, expected_path.as_deref())?,
+            } => {
+                let Some(transaction) =
+                    self.plan_application_page_rename(&old, &new, expected_path.as_deref())?
+                else {
+                    return Ok(SyncApplicationUnitOutcome::Applied);
+                };
+                let page_home_hints = self.application_unit_page_home_hints(&transaction)?;
+                return self
+                    .execute_foreground_application_unit_transaction(transaction, page_home_hints);
+            }
             SyncApplicationGraphMutationRequest::DeletePage {
                 name,
                 page_kind,
@@ -15337,7 +15359,10 @@ impl RuntimeActor {
         let transaction =
             OperationTransaction::new(vec![SemanticOperation::DeletePage { page_id }])
                 .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("delete_plan"))?;
-        self.execute_application_unit_transaction(transaction)
+        self.execute_foreground_application_unit_transaction(
+            transaction,
+            BTreeMap::from([(page_id, current.editor.page.home_document_id)]),
+        )
     }
 
     fn plan_application_page_merge(
@@ -15704,6 +15729,237 @@ impl RuntimeActor {
                 }
             },
         }
+    }
+
+    fn application_unit_page_home_hints(
+        &self,
+        transaction: &OperationTransaction,
+    ) -> Result<BTreeMap<PageId, DocumentId>, SyncApplicationPageRequestError> {
+        let mut page_ids = BTreeSet::new();
+        for operation in &transaction.operations {
+            match operation {
+                SemanticOperation::RenamePagesAndRewriteReferrers {
+                    page_changes,
+                    page_preamble_rewrites,
+                    ..
+                } => {
+                    page_ids.extend(page_changes.iter().map(|change| change.page_id));
+                    page_ids.extend(page_preamble_rewrites.iter().map(|change| change.page_id));
+                }
+                SemanticOperation::EditPagePath { page_id, .. }
+                | SemanticOperation::SetPageKind { page_id, .. }
+                | SemanticOperation::SetPagePreamble { page_id, .. }
+                | SemanticOperation::DeletePage { page_id } => {
+                    page_ids.insert(*page_id);
+                }
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    ..
+                } => {
+                    page_ids.insert(*page_id);
+                    // A created page has no current materialized row to read.
+                    // Insert its transaction-owned immutable home immediately.
+                    let mut hints = BTreeMap::from([(*page_id, *home_document_id)]);
+                    for existing in page_ids.iter().copied().filter(|id| id != page_id) {
+                        let page = self
+                            .active_engine()
+                            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+                            .materialize_page(existing)
+                            .map_err(|_| {
+                                SyncApplicationPageRequestError::ActorRefusedAt(
+                                    "application_unit_page_home",
+                                )
+                            })?;
+                        hints.insert(existing, page.home_document_id);
+                    }
+                    return Ok(hints);
+                }
+                _ => {}
+            }
+        }
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        page_ids
+            .into_iter()
+            .map(|page_id| {
+                engine
+                    .materialize_page(page_id)
+                    .map(|page| (page_id, page.home_document_id))
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_unit_page_home",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    fn execute_foreground_application_unit_transaction(
+        &mut self,
+        transaction: OperationTransaction,
+        page_home_hints: BTreeMap<PageId, DocumentId>,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        let batch_id = BatchId::new();
+        let prepared = {
+            let clean = self
+                .clean
+                .as_mut()
+                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+            let mut session = clean
+                .runtime
+                .admit_clean_mutation(&self.graph)
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_unit_foreground_bindings",
+                    )
+                })?;
+            OperationalCoordinator::prepare_clean_trusted_local_compound(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                &transaction,
+                batch_id,
+                &page_home_hints,
+            )
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_unit_foreground_prepare",
+                )
+            })?
+        };
+        let PreparedLocalMutationState::Prepared(prepared) = prepared else {
+            return self.execute_application_unit_transaction(transaction);
+        };
+        let committed = {
+            let clean = self
+                .clean
+                .as_mut()
+                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+            let managed = self
+                .managed_local
+                .as_mut()
+                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+            let mut session = clean
+                .runtime
+                .admit_clean_mutation(&self.graph)
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_unit_foreground_bindings",
+                    )
+                })?;
+            let (_, engine, _) = session.parts().map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_unit_foreground_bindings",
+                )
+            })?;
+            TrustedLocalCommitCoordinator::commit_compound(&mut managed.journal, engine, prepared)
+        };
+        let committed = match committed {
+            Ok(TrustedLocalCompoundOutcome::Committed(committed)) => committed,
+            Ok(TrustedLocalCompoundOutcome::CommittedRecoveryRequired {
+                prepared: _,
+                last_error,
+            }) => {
+                self.terminal = Some(format!(
+                    "journal-committed application mutation needs hot-overlay recovery: {last_error}"
+                ));
+                return Ok(SyncApplicationUnitOutcome::Deferred {
+                    state: SyncEditorDeferred::BlockedRecovery {
+                        batch_id: Some(batch_id.to_string()),
+                        phase: SyncLocalMutationPhase::ProjectionDrain,
+                        retained_publication: true,
+                    },
+                });
+            }
+            Err(TrustedLocalCommitError::JournalAppend(
+                ManagedLocalAppendError::AppendOutcomeUnknown(_),
+            )) => {
+                self.terminal = Some(
+                    "a managed-storage application mutation journal append had an uncertain outcome; restart Tine so the journal can be replayed"
+                        .into(),
+                );
+                return Ok(SyncApplicationUnitOutcome::Deferred {
+                    state: SyncEditorDeferred::BlockedRecovery {
+                        batch_id: Some(batch_id.to_string()),
+                        phase: SyncLocalMutationPhase::ArchiveStage,
+                        retained_publication: true,
+                    },
+                });
+            }
+            Err(_) => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_unit_foreground_commit",
+                ));
+            }
+        };
+
+        let sequence = committed.sequence();
+        let prepared = committed.prepared_record();
+        let managed = self
+            .managed_local
+            .as_mut()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let expected = managed
+            .frames
+            .back()
+            .map_or(managed.checkpoint.next_sequence(), |frame| {
+                frame.sequence().saturating_add(1)
+            });
+        if sequence != expected || managed.journal.next_sequence() != sequence.saturating_add(1) {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_unit_foreground_queue_monotonicity",
+            ));
+        }
+        let frame = LocalJournalFrame::new(
+            managed.journal.device_id(),
+            sequence,
+            prepared.payload_kind(),
+            prepared.journal_payload().to_vec(),
+        );
+        let record = crate::oplog::decode_managed_local_record(&frame).map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_unit_foreground_record_decode",
+            )
+        })?;
+        managed.pending_index.insert(record.clone()).map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_unit_foreground_queue_index",
+            )
+        })?;
+        for projection in record.projections() {
+            managed.note_latest_projection_frame(projection.intent().path().clone(), frame.clone());
+            if projection.intent().target().bytes().is_none() {
+                continue;
+            }
+            let Some(post_page) = committed.post_pages().get(&projection.intent().page_id()) else {
+                continue;
+            };
+            let Some(target) = projection.intent().target().bytes() else {
+                continue;
+            };
+            let Ok(parsed) = self
+                .graph
+                .parse_exact_page_dto(projection.intent().path(), target)
+            else {
+                continue;
+            };
+            let Ok(editor) = editor_current_page_from_materialized(
+                post_page.clone(),
+                MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+            ) else {
+                continue;
+            };
+            let Ok(application) = join_application_page(parsed, editor) else {
+                continue;
+            };
+            if let Ok(overlay) = latest_task_query_overlay_page_from_application(&application) {
+                managed.install_latest_task_query_overlay(sequence, overlay);
+            }
+        }
+        managed.frames.push_back(frame);
+        Ok(SyncApplicationUnitOutcome::Applied)
     }
 
     fn trash_application_journal_file(
@@ -17029,11 +17285,11 @@ impl RuntimeActor {
                         transaction,
                         affected.into_iter().map(|id| id.to_string()).collect(),
                         None::<ApplicationCurrentPage>,
-                        Some((
-                            trusted_target_page,
-                            trusted_target_evidence,
-                            prepared_editor_projection,
-                        )),
+                        Some(TrustedEditorForegroundTarget::Existing {
+                            page: trusted_target_page,
+                            response_evidence: trusted_target_evidence,
+                            projection: prepared_editor_projection,
+                        }),
                     )
                 }
                 SyncEditorSaveTarget::New {
@@ -17130,7 +17386,7 @@ impl RuntimeActor {
                         Some(transaction),
                         vec![page_id.to_string()],
                         None,
-                        None,
+                        Some(TrustedEditorForegroundTarget::New { home_document_id }),
                     )
                 }
             };
@@ -17293,18 +17549,28 @@ impl RuntimeActor {
         transaction: OperationTransaction,
         page_id: PageId,
         affected_page_ids: Vec<String>,
-        trusted_target: Option<(
-            PageDto,
-            TrustedLocalResponseEvidence,
-            PreparedEditorProjection,
-        )>,
+        trusted_target: Option<TrustedEditorForegroundTarget>,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
         if self.clean.is_none() {
             return Err(SyncEditorRequestError::ActorUnavailable);
         }
-        let Some((target_page, response_evidence, prepared_editor_projection)) = trusted_target
-        else {
+        let Some(trusted_target) = trusted_target else {
             return self.execute_clean_editor_transaction(transaction, page_id, affected_page_ids);
+        };
+        let (target_page, response_evidence, prepared_editor_projection) = match trusted_target {
+            TrustedEditorForegroundTarget::Existing {
+                page,
+                response_evidence,
+                projection,
+            } => (page, response_evidence, projection),
+            TrustedEditorForegroundTarget::New { home_document_id } => {
+                return self.execute_foreground_new_editor_transaction(
+                    transaction,
+                    page_id,
+                    home_document_id,
+                    affected_page_ids,
+                );
+            }
         };
         let base_revision =
             target_page
@@ -17397,6 +17663,191 @@ impl RuntimeActor {
             }
             committed => self.finish_clean_foreground_editor_outcome(committed, affected_page_ids),
         }
+    }
+
+    /// Create a page at the same durable foreground boundary used by compound
+    /// moves: append the authenticated record and publish its semantic hot
+    /// overlay before returning. SQLite, accepted-history expansion and the
+    /// Markdown projection are derivatives owned by the actor tick, not work
+    /// the page-creation caller must wait for.
+    fn execute_foreground_new_editor_transaction(
+        &mut self,
+        transaction: OperationTransaction,
+        page_id: PageId,
+        home_document_id: DocumentId,
+        affected_page_ids: Vec<String>,
+    ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
+        let batch_id = BatchId::new();
+        let page_home_hints = BTreeMap::from([(page_id, home_document_id)]);
+        let prepared = {
+            let clean = self
+                .clean
+                .as_mut()
+                .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+            let mut session = clean
+                .runtime
+                .admit_clean_mutation(&self.graph)
+                .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_bindings"))?;
+            OperationalCoordinator::prepare_clean_trusted_local_compound(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                &transaction,
+                batch_id,
+                &page_home_hints,
+            )
+            .map_err(|error| {
+                if runtime_debug_diagnostics_enabled() {
+                    eprintln!(
+                        "[tine] clean new-page foreground preparation for {batch_id} failed during {:?}: {}",
+                        error.phase(),
+                        error.detail()
+                    );
+                }
+                SyncEditorRequestError::ActorRefusedAt("new_page_prepare")
+            })?
+        };
+        let PreparedLocalMutationState::Prepared(prepared) = prepared else {
+            return self.execute_clean_editor_transaction(transaction, page_id, affected_page_ids);
+        };
+        let committed = {
+            let clean = self
+                .clean
+                .as_mut()
+                .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+            let managed = self
+                .managed_local
+                .as_mut()
+                .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+            let mut session = clean
+                .runtime
+                .admit_clean_mutation(&self.graph)
+                .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_bindings"))?;
+            let (_, engine, _) = session
+                .parts()
+                .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_bindings"))?;
+            TrustedLocalCommitCoordinator::commit_compound(&mut managed.journal, engine, prepared)
+        };
+        let committed = match committed {
+            Ok(TrustedLocalCompoundOutcome::Committed(committed)) => committed,
+            Ok(TrustedLocalCompoundOutcome::CommittedRecoveryRequired {
+                prepared: _,
+                last_error,
+            }) => {
+                self.terminal = Some(format!(
+                    "journal-committed new page needs hot-overlay recovery: {last_error}"
+                ));
+                return Ok(SyncEditorSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::BlockedRecovery {
+                        batch_id: Some(batch_id.to_string()),
+                        phase: SyncLocalMutationPhase::ProjectionDrain,
+                        retained_publication: true,
+                    },
+                    affected_page_ids,
+                });
+            }
+            Err(TrustedLocalCommitError::JournalAppend(
+                ManagedLocalAppendError::AppendOutcomeUnknown(_),
+            )) => {
+                self.terminal = Some(
+                    "a managed-storage new-page journal append had an uncertain outcome; restart Tine so the journal can be replayed"
+                        .into(),
+                );
+                return Ok(SyncEditorSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::BlockedRecovery {
+                        batch_id: Some(batch_id.to_string()),
+                        phase: SyncLocalMutationPhase::ArchiveStage,
+                        retained_publication: true,
+                    },
+                    affected_page_ids,
+                });
+            }
+            Err(error) => {
+                if runtime_debug_diagnostics_enabled() {
+                    eprintln!("[tine] clean new-page foreground commit failed: {error}");
+                }
+                return Err(SyncEditorRequestError::ActorRefusedAt(
+                    "new_page_foreground_commit",
+                ));
+            }
+        };
+
+        let sequence = committed.sequence();
+        let prepared = committed.prepared_record();
+        let managed = self
+            .managed_local
+            .as_mut()
+            .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+        let expected = managed
+            .frames
+            .back()
+            .map_or(managed.checkpoint.next_sequence(), |frame| {
+                frame.sequence().saturating_add(1)
+            });
+        if sequence != expected || managed.journal.next_sequence() != sequence.saturating_add(1) {
+            return Err(SyncEditorRequestError::ActorRefusedAt(
+                "new_page_managed_queue_monotonicity",
+            ));
+        }
+        let frame = LocalJournalFrame::new(
+            managed.journal.device_id(),
+            sequence,
+            prepared.payload_kind(),
+            prepared.journal_payload().to_vec(),
+        );
+        let record = crate::oplog::decode_managed_local_record(&frame)
+            .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_record_decode"))?;
+        managed
+            .pending_index
+            .insert(record.clone())
+            .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_queue_index"))?;
+        for projection in record.projections() {
+            managed.note_latest_projection_frame(projection.intent().path().clone(), frame.clone());
+        }
+        managed.frames.push_back(frame);
+
+        let post_page =
+            committed
+                .post_pages()
+                .get(&page_id)
+                .ok_or(SyncEditorRequestError::ActorRefusedAt(
+                    "new_page_post_page_missing",
+                ))?;
+        let projection = record
+            .projections()
+            .iter()
+            .find(|projection| projection.intent().page_id() == page_id)
+            .ok_or(SyncEditorRequestError::ActorRefusedAt(
+                "new_page_projection_missing",
+            ))?;
+        let target =
+            projection
+                .intent()
+                .target()
+                .bytes()
+                .ok_or(SyncEditorRequestError::ActorRefusedAt(
+                    "new_page_target_missing",
+                ))?;
+        let parsed = self
+            .graph
+            .parse_exact_page_dto(projection.intent().path(), target)
+            .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_response_parse"))?;
+        let editor = editor_current_page_from_materialized(
+            post_page.clone(),
+            MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+        )?;
+        let application = join_application_page(parsed, editor)
+            .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_response_join"))?;
+        if let Ok(overlay) = latest_task_query_overlay_page_from_application(&application) {
+            managed.install_latest_task_query_overlay(sequence, overlay);
+        }
+        let page = application.editor.dto.clone();
+        self.prepared_application_reply = Some((batch_id.to_string(), application));
+        Ok(SyncEditorSaveOutcome::Durable {
+            batch_id: batch_id.to_string(),
+            page,
+            affected_page_ids,
+        })
     }
 
     fn finish_clean_foreground_editor_outcome(
@@ -24010,6 +24461,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sync_head_publication_and_projection_attach_do_not_scan_graph_or_history() {
+        let runtime = include_str!("sync_runtime.rs");
+        let frontier = runtime
+            .split_once("fn clean_frontier_head(")
+            .and_then(|(_, tail)| tail.split_once("\nfn publish_clean_archive_batch"))
+            .map(|(body, _)| body)
+            .expect("clean frontier publication keeps a narrow source boundary");
+        assert!(frontier.contains("accepted_frontier_tip_batches"));
+        assert!(
+            !frontier.contains("exact_frontier"),
+            "publishing one sync head must not materialize every document frontier"
+        );
+
+        let engine = include_str!("oplog/hot_engine.rs");
+        let attach = engine
+            .split_once("pub(crate) fn attach_clean_projection_endpoint")
+            .and_then(|(_, tail)| tail.split_once("\n    fn clean_projection_runtime_binding"))
+            .map(|(body, _)| body)
+            .expect("clean projection attach keeps a narrow source boundary");
+        assert!(attach.contains("clean_projection_head_batches"));
+        assert!(
+            !attach.contains("accepted_sequence.values"),
+            "attaching an endpoint must not replay every accepted batch"
+        );
+    }
+
     /// The journal-feed route flushes a currently edited source page and then
     /// immediately submits the cross-page move. The foreground flush may still
     /// be waiting in the managed-local derivative queue when the correlated
@@ -26765,6 +27243,7 @@ mod tests {
                 ..BlockDto::default()
             }],
         );
+        drain_managed_local(&handle);
         accepted_new_application_page(
             &handle,
             "Clean Rename Source/Child",
@@ -26774,6 +27253,7 @@ mod tests {
                 ..BlockDto::default()
             }],
         );
+        drain_managed_local(&handle);
         assert_eq!(
             handle
                 .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
@@ -26784,6 +27264,7 @@ mod tests {
                 .unwrap(),
             SyncApplicationUnitOutcome::Applied
         );
+        drain_managed_local(&handle);
         let (renamed, _) =
             load_application_logical(&handle, "Clean Rename Target", SyncPageKind::Page);
         assert_eq!(renamed.blocks[0].raw, "rename body");
@@ -26800,6 +27281,7 @@ mod tests {
                 ..BlockDto::default()
             }],
         );
+        drain_managed_local(&handle);
         let (destination, _) = accepted_new_application_page(
             &handle,
             "Clean Merge Destination",
@@ -26809,6 +27291,7 @@ mod tests {
                 ..BlockDto::default()
             }],
         );
+        drain_managed_local(&handle);
         accepted_new_application_page(
             &handle,
             "Clean Merge Source/Child",
@@ -26818,6 +27301,7 @@ mod tests {
                 ..BlockDto::default()
             }],
         );
+        drain_managed_local(&handle);
         assert_eq!(
             handle
                 .mutate_application_graph(SyncApplicationGraphMutationRequest::MergePages {
@@ -26829,6 +27313,7 @@ mod tests {
                 .unwrap(),
             SyncApplicationUnitOutcome::Applied
         );
+        drain_managed_local(&handle);
         let (merged, _) =
             load_application_logical(&handle, "Clean Merge Destination", SyncPageKind::Page);
         assert_eq!(merged.blocks.len(), 2);
@@ -26846,6 +27331,7 @@ mod tests {
                 ..BlockDto::default()
             }],
         );
+        drain_managed_local(&handle);
         assert_eq!(
             handle
                 .mutate_application_graph(SyncApplicationGraphMutationRequest::RenameFileToPage {
@@ -26855,6 +27341,7 @@ mod tests {
                 .unwrap(),
             SyncApplicationUnitOutcome::Applied
         );
+        drain_managed_local(&handle);
         let (rescued, _) = load_application_logical(&handle, "Clean Rescued", SyncPageKind::Page);
         assert_eq!(rescued.blocks[0].raw, "rescue body");
         assert_eq!(
@@ -26867,6 +27354,7 @@ mod tests {
                 .unwrap(),
             SyncApplicationUnitOutcome::Applied
         );
+        drain_managed_local(&handle);
 
         assert!(matches!(
             handle
@@ -26874,6 +27362,7 @@ mod tests {
                 .unwrap(),
             SyncApplicationPdfOpenOutcome::Ready { .. }
         ));
+        drain_managed_local(&handle);
         let hls_name = crate::pdf::hls_page_name(&crate::pdf::asset_key("paper.pdf"));
         let (hls, _) = load_application_logical(&handle, &hls_name, SyncPageKind::Page);
         assert!(hls
@@ -26889,10 +27378,70 @@ mod tests {
         };
         assert!(result.created);
         assert!(result.created_pages.len() > 5);
+        let pending_before_tick = handle.status().unwrap().managed_local_pending;
+        assert!(pending_before_tick >= result.created_pages.len());
+        let mut last_tick = None;
+        for _ in 0..64 {
+            last_tick = Some(handle.tick().unwrap());
+            if handle.status().unwrap().managed_local_pending < pending_before_tick {
+                break;
+            }
+        }
+        assert!(
+            handle.status().unwrap().managed_local_pending < pending_before_tick,
+            "guide foreground prefix did not advance: status={:?}, last_tick={last_tick:?}",
+            handle.status().unwrap()
+        );
+        drain_managed_local(&handle);
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn consecutive_page_creations_compose_without_graph_wide_or_derivative_work() {
+        let fixture = ActivationFixture::scaled("bounded-page-create", 0xa1773, 97);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("page-create fixture activates");
+        drive_initial_feed_with_turn_budget(&handle, 256);
+
+        let before = handle
+            .managed_application_save_instrumentation()
+            .expect("page-create test reads counters");
+        accepted_new_application_page(
+            &handle,
+            "Bounded Create",
+            vec![BlockDto {
+                id: "temporary-bounded-create".into(),
+                raw: "bounded page creation".into(),
+                ..BlockDto::default()
+            }],
+        );
+        accepted_new_application_page(
+            &handle,
+            "Bounded Create Two",
+            vec![BlockDto {
+                id: "temporary-bounded-create-two".into(),
+                raw: "second bounded page creation".into(),
+                ..BlockDto::default()
+            }],
+        );
+        let after = handle
+            .managed_application_save_instrumentation()
+            .expect("page-create test reads post counters");
+        assert_eq!(
+            after.forbidden.since(before.forbidden),
+            ForbiddenCommitWork::default(),
+            "consecutive page creation must neither scan the graph nor wait for derivative work"
+        );
+        assert_eq!(
+            after.graph_wide.since(before.graph_wide),
+            GraphWideCommitWork::default(),
+            "consecutive page creation must not perform graph-wide work"
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 2);
     }
 
     #[test]
@@ -38492,6 +39041,145 @@ mod tests {
             assert!(
                 caller_p95 < Duration::from_millis(50),
                 "cross-page caller p95 must remain below 50 ms at {total_pages} pages: {caller_p95:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark: bounded page create, rename, and delete at graph scale"]
+    fn managed_page_mutations_100_and_10000_page_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_page_mutations_100_and_10000_page_manual_benchmark -- --ignored --nocapture"
+        );
+        const SAMPLES: usize = 5;
+        let page_counts = std::env::var("TINE_MANAGED_PAGE_MUTATION_BENCH_PAGES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| part.trim().parse::<usize>().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![100, 10_000]);
+        for (scale_index, total_pages) in page_counts.into_iter().enumerate() {
+            assert!(total_pages >= 4);
+            let fixture = ActivationFixture::scaled(
+                &format!("managed-page-mutations-{total_pages}"),
+                0xa1900 + scale_index as u128 * 0x100,
+                total_pages - 3,
+            );
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+            let handle = activated.handle.expect("page-mutation benchmark activates");
+            drive_initial_feed_with_turn_budget(&handle, total_pages.saturating_add(128));
+            let assert_bounded =
+                |label: &str,
+                 before: ManagedApplicationSaveInstrumentation,
+                 after: ManagedApplicationSaveInstrumentation| {
+                    let forbidden = after.forbidden.since(before.forbidden);
+                    assert_eq!(
+                        (
+                            forbidden.sqlite_drains,
+                            forbidden.archive_object_reads,
+                            forbidden.projection_receipt_loads,
+                            forbidden.graph_wide_catalog_decodes,
+                            forbidden.graph_wide_catalog_validations,
+                        ),
+                        (0, 0, 0, 0, 0),
+                        "{label} performed forbidden global/derivative work: {forbidden:?}"
+                    );
+                    assert_eq!(
+                        after.graph_wide.since(before.graph_wide),
+                        GraphWideCommitWork::default(),
+                        "{label} performed graph-wide work"
+                    );
+                };
+
+            let mut create_samples = Vec::with_capacity(SAMPLES);
+            let mut rename_samples = Vec::with_capacity(SAMPLES);
+            let mut delete_samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..SAMPLES {
+                let source_name = format!("Bounded mutation source {sample}");
+                let target_name = format!("Bounded mutation target {sample}");
+
+                let before = handle
+                    .managed_application_save_instrumentation()
+                    .expect("page-create benchmark reads counters");
+                let started = Instant::now();
+                let (created, _) = accepted_new_application_page(
+                    &handle,
+                    &source_name,
+                    vec![BlockDto {
+                        id: format!("temporary-bounded-create-{sample}"),
+                        raw: "bounded page mutation".into(),
+                        ..BlockDto::default()
+                    }],
+                );
+                create_samples.push(started.elapsed());
+                let after = handle
+                    .managed_application_save_instrumentation()
+                    .expect("page-create benchmark reads post counters");
+                assert_bounded("one-page creation", before, after);
+                drain_managed_local(&handle);
+
+                let before = handle
+                    .managed_application_save_instrumentation()
+                    .expect("page-rename benchmark reads counters");
+                let started = Instant::now();
+                assert_eq!(
+                    handle
+                        .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                            old: source_name.clone(),
+                            new: target_name.clone(),
+                            expected_path: Some(created.path),
+                        })
+                        .unwrap(),
+                    SyncApplicationUnitOutcome::Applied
+                );
+                rename_samples.push(started.elapsed());
+                let after = handle
+                    .managed_application_save_instrumentation()
+                    .expect("page-rename benchmark reads post counters");
+                assert_bounded("one-page rename", before, after);
+                drain_managed_local(&handle);
+
+                let (renamed, _) =
+                    load_application_logical(&handle, &target_name, SyncPageKind::Page);
+                let before = handle
+                    .managed_application_save_instrumentation()
+                    .expect("page-delete benchmark reads counters");
+                let started = Instant::now();
+                assert_eq!(
+                    handle
+                        .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                            name: target_name,
+                            page_kind: SyncPageKind::Page,
+                            expected_path: Some(renamed.path),
+                        })
+                        .unwrap(),
+                    SyncApplicationUnitOutcome::Applied
+                );
+                delete_samples.push(started.elapsed());
+                let after = handle
+                    .managed_application_save_instrumentation()
+                    .expect("page-delete benchmark reads post counters");
+                assert_bounded("one-page deletion", before, after);
+                drain_managed_local(&handle);
+            }
+
+            let receipt = |samples: &[Duration]| (startup_median(samples), startup_p95(samples));
+            let (create_p50, create_p95) = receipt(&create_samples);
+            let (rename_p50, rename_p95) = receipt(&rename_samples);
+            let (delete_p50, delete_p95) = receipt(&delete_samples);
+            eprintln!(
+                "managed_page_mutations pages={total_pages} samples={SAMPLES} create_p50_ms={:.3} create_p95_ms={:.3} rename_p50_ms={:.3} rename_p95_ms={:.3} delete_p50_ms={:.3} delete_p95_ms={:.3}",
+                startup_ms(create_p50),
+                startup_ms(create_p95),
+                startup_ms(rename_p50),
+                startup_ms(rename_p95),
+                startup_ms(delete_p50),
+                startup_ms(delete_p95),
             );
         }
     }

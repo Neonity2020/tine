@@ -576,7 +576,14 @@ impl TrustedLocalCommitCoordinator {
             });
         }
         let projection = prepared.record().projection();
-        let expected_base = projection.precondition_base().bytes();
+        let expected_base = projection
+            .precondition_base()
+            .ok_or_else(|| {
+                TrustedLocalCommitError::InvalidPreparedInput(
+                    "existing-page trusted commit has an absent projection precondition".into(),
+                )
+            })?
+            .bytes();
         let exact_target = projection.intent().target().bytes().ok_or_else(|| {
             TrustedLocalCommitError::InvalidPreparedInput(
                 "eligible prepared record unexpectedly has an absent target".into(),
@@ -675,7 +682,14 @@ impl TrustedLocalCommitCoordinator {
         record: &ManagedLocalRecord,
     ) -> Result<TrustedLocalRestartProjectionInput, TrustedLocalCommitError> {
         let projection = record.projection();
-        let expected_base = projection.precondition_base().bytes();
+        let expected_base = projection
+            .precondition_base()
+            .ok_or_else(|| {
+                TrustedLocalCommitError::InvalidPreparedInput(
+                    "existing-page projection restart has an absent precondition".into(),
+                )
+            })?
+            .bytes();
         let exact_target = projection.intent().target().bytes().ok_or_else(|| {
             TrustedLocalCommitError::InvalidPreparedInput(
                 "decoded managed-local record has an absent target".into(),
@@ -756,7 +770,9 @@ fn prepared_page_mismatch(
         PageKind::Journal => ManagedTextKind::Journal,
     };
     if projection.intent().path().as_str() != page.path
-        || projection.precondition_base().source_path().as_str() != page.path
+        || projection
+            .precondition_base()
+            .is_none_or(|base| base.source_path().as_str() != page.path)
         || post_page.path.as_str() != page.path
         || post_page.name.as_str() != page.name
         || post_page.kind != expected_kind
