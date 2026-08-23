@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, onCleanup, onMount, untrack, useContext, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { doc, ensurePageLoaded, formatForPage, pageByName } from "../store";
+import { collapseEpochOf, doc, ensurePageLoaded, formatForPage, pageByName } from "../store";
 import { Block, CollapseSurfaceContext, OutlineScopeContext, SurfaceContext, type CollapseSurfaceApi } from "./Block";
 import { RefBlocks } from "./RefBlocks";
 import { observeNear, unobserveNear } from "../lazyObserve";
@@ -136,7 +136,14 @@ export function LiveRefGroup(props: {
   const surface = `${props.surface === "embed" ? "embed" : "ref"}:` + createUniqueId();
   const resultRootIds = createMemo(() => new Set(props.blocks.map((block) => block.id)));
   const initialCollapsed = new Map<string, boolean>();
-  const [localCollapsed, setLocalCollapsed] = createSignal<Record<string, boolean>>({});
+  // Local fold rows. For EMBED occurrences the row is ephemeral (GH #360):
+  // `epoch` remembers the source's collapse write generation at fold time;
+  // once the source moves again (epoch advances) the row is stale and the
+  // occurrence follows the source. Ref/query surfaces keep the pre-existing
+  // "the result view owns its copy" semantics and ignore `epoch`.
+  interface LocalCollapseRow { v: boolean; epoch: number }
+  const [localCollapsed, setLocalCollapsed] = createSignal<Record<string, LocalCollapseRow>>({});
+  const isEmbed = () => props.surface === "embed";
   const relativeDepth = (id: string): number | null => {
     const roots = resultRootIds();
     if (roots.has(id)) return 0;
@@ -152,6 +159,8 @@ export function LiveRefGroup(props: {
     return null;
   };
   const defaultCollapsed = (id: string, stored: boolean): boolean => {
+    // Embeds are live and source-authoritative (GH #360): never snapshot.
+    if (isEmbed()) return stored;
     const previous = initialCollapsed.get(id);
     if (previous !== undefined) return previous;
     const depth = relativeDepth(id);
@@ -159,20 +168,29 @@ export function LiveRefGroup(props: {
     // Released OG initializes reference/query disclosure from the source state
     // and default-open level 2, then keeps that copy local to the result view.
     // Tine's displayed hit is relative depth 0, so branches immediately below it
-    // default folded. Embeds deliberately retain source disclosure semantics.
+    // default folded.
     const initial = stored || (props.surface !== "embed" && depth !== null && depth >= 1 && hasChildren);
     initialCollapsed.set(id, initial);
     return initial;
   };
   const collapseSurface: CollapseSurfaceApi = {
     collapsed: (id, stored) => {
+      if (isEmbed()) {
+        const local = localCollapsed()[id];
+        // The local fold governs only while the source hasn't written another
+        // collapse since — a source move reclaims authority immediately.
+        return local && local.epoch === collapseEpochOf(id) ? local.v : stored;
+      }
       const local = localCollapsed();
-      return Object.prototype.hasOwnProperty.call(local, id) ? local[id] : defaultCollapsed(id, stored);
+      return Object.prototype.hasOwnProperty.call(local, id) ? local[id].v : defaultCollapsed(id, stored);
     },
-    toggle: (id, current) => setLocalCollapsed((state) => ({ ...state, [id]: !current })),
+    toggle: (id, current) => setLocalCollapsed((state) => ({
+      ...state,
+      [id]: { v: !current, epoch: collapseEpochOf(id) },
+    })),
     setMany: (ids, collapsed) => setLocalCollapsed((state) => {
       const next = { ...state };
-      for (const id of ids) next[id] = collapsed;
+      for (const id of ids) next[id] = { v: collapsed, epoch: collapseEpochOf(id) };
       return next;
     }),
   };
@@ -206,7 +224,7 @@ export function LiveRefGroup(props: {
       }
       setLocalCollapsed((state) => {
         let changed = false;
-        const next: Record<string, boolean> = {};
+        const next: Record<string, LocalCollapseRow> = {};
         for (const [id, value] of Object.entries(state)) {
           if (present.has(id)) next[id] = value;
           else changed = true;

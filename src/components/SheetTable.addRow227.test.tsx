@@ -15,7 +15,7 @@ import { installKeybindings } from "../keybindings";
 let disposeKeys: (() => void) | null = null;
 beforeAll(async () => {
   await initParser();
-  disposeKeys = installKeybindings()();
+  disposeKeys = installKeybindings();
 });
 
 afterEach(() => {

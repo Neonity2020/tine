@@ -311,6 +311,16 @@ let editorTransactionClock = 0;
 const editorTransactionGenerations = new Map<string, number>();
 const [managedMoveBusyPages, setManagedMoveBusyPages] = createSignal<ReadonlySet<string>>(new Set());
 const [visibleMutationBusyPages, setVisibleMutationBusyPages] = createSignal<ReadonlySet<string>>(new Set());
+// Monotonic per-block count of SOURCE collapse writes (setCollapsed /
+// setCollapsedDeep / setCollapsedDescendants via writeCollapsed). Surfaces
+// keeping an ephemeral local fold (embeds, GH #360) compare the epoch captured
+// at fold time: once it advances, the local fold is stale and the source
+// reclaims authority.
+const [collapseEpochById, setCollapseEpochById] = createSignal<Record<string, number>>({});
+export const collapseEpochOf = (id: string): number => collapseEpochById()[id] ?? 0;
+function bumpCollapseEpoch(id: string) {
+  setCollapseEpochById((state) => ({ ...state, [id]: (state[id] ?? 0) + 1 }));
+}
 let managedMoveQueue: Promise<void> = Promise.resolve();
 let managedHistoryReplayRunning = false;
 let managedHistoryReplayEpoch = 0;
@@ -1303,6 +1313,7 @@ export function resetStore() {
   clearAllEditorLeases();
   setManagedMoveBusyPages(new Set<string>());
   setVisibleMutationBusyPages(new Set<string>());
+  setCollapseEpochById({});
   managedHistoryReplayEpoch++;
   managedHistoryReplayRunning = false;
   managedHistoryCommands.length = 0;
@@ -4755,6 +4766,7 @@ function writeCollapsed(id: string, collapsed: boolean) {
   const nextRaw = rawWithCollapsed(n.raw, collapsed, formatForBlock(id));
   setDoc("byId", id, "collapsed", collapsed);
   if (nextRaw !== n.raw) setDoc("byId", id, "raw", nextRaw);
+  bumpCollapseEpoch(id);
 }
 
 /** Collapse or expand a block and its entire descendant subtree. */
@@ -4817,6 +4829,7 @@ export function setCollapsedDescendants(id: string, collapsed: boolean) {
       }
     })
   );
+  for (const change of changes) bumpCollapseEpoch(change.id);
   markDirty(root.page);
 }
 
