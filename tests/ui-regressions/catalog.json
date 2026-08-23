@@ -6,7 +6,9 @@
       "title": "A Direct Files save conflict enters Concord with both exact versions, survives restart, and resolves without the retired global conflict bar",
       "family": "external-change-conflict-resolution",
       "sources": {
-        "issues": [337],
+        "issues": [
+          337
+        ],
         "commits": []
       },
       "platforms": [
@@ -31,7 +33,9 @@
       "title": "Applying a sync conflict copy installs the exact committed merge and returns the journal to ordinary conflict-free editing",
       "family": "external-change-conflict-resolution",
       "sources": {
-        "issues": [337],
+        "issues": [
+          337
+        ],
         "commits": []
       },
       "platforms": [
@@ -466,11 +470,11 @@
         "scenario": "topbar.responsive-workspace-overflow",
         "failBefore": "proven"
       },
-      "notes": "GH #205. The full workspace label moved from the no-wrap toolbar to a sidebar header; the toolbar retains only a compact W fallback when that sidebar is not mounted. A topbar inline-size container query keeps sidebar, search, Settings, and native window controls visible while calendar, journals, theme, right sidebar, and history actions use one transient-layer overflow menu below the available-width threshold. The threshold is 460px inline-size, chosen so the fixed clusters (which need ~364px) stay visible whenever they fit \u2014 the earlier 760px value over-collapsed and hid actions with the toolbar half empty. Follow-up (2026-07-21, reporter Louis-15): the single 460px breakpoint collapsed navigation and optional actions together, so Back/Forward were only reachable through the overflow menu on a phone. Split into two tiers per Martin's priority (navigation > right-side actions > tabs): 460px collapses optional actions only, a 300px floor additionally collapses Back/Forward, and the menu hides its duplicated Back/Forward between the tiers. Verified with the Chromium screenshot harness at 900/440/390/280px (fail-before: 0 navigation actions visible at 440px). The topbar also gained position:relative; z-index:45 as stacking hardening for a reporter-only Windows transparent-dropdown report that does NOT reproduce in Chromium \u2014 not a claimed fix."
+      "notes": "GH #205. The full workspace label moved from the no-wrap toolbar to a sidebar header; the toolbar retains only a compact W fallback when that sidebar is not mounted. A topbar inline-size container query keeps sidebar, search, Settings, and native window controls visible while calendar, journals, theme, right sidebar, and history actions use one transient-layer overflow menu below the available-width threshold. The threshold is 460px inline-size, chosen so the fixed clusters (which need ~364px) stay visible whenever they fit — the earlier 760px value over-collapsed and hid actions with the toolbar half empty. Follow-up (2026-07-21, reporter Louis-15): the single 460px breakpoint collapsed navigation and optional actions together, so Back/Forward were only reachable through the overflow menu on a phone. Split into two tiers per Martin's priority (navigation > right-side actions > tabs): 460px collapses optional actions only, a 300px floor additionally collapses Back/Forward, and the menu hides its duplicated Back/Forward between the tiers. Verified with the Chromium screenshot harness at 900/440/390/280px (fail-before: 0 navigation actions visible at 440px). The topbar also gained position:relative; z-index:45 as stacking hardening for a reporter-only Windows transparent-dropdown report that does NOT reproduce in Chromium — not a claimed fix."
     },
     {
       "id": "UI-TOPBAR-OVERFLOW-OUTSIDE-DISMISS-205",
-      "title": "The top-bar overflow (\"\u2026\") menu closes when the user clicks anywhere outside it",
+      "title": "The top-bar overflow (\"…\") menu closes when the user clicks anywhere outside it",
       "family": "topbar",
       "sources": {
         "issues": [
@@ -5011,7 +5015,7 @@
         "scenario": "search.global-block-topk-and-og-caps",
         "failBefore": "proven"
       },
-      "notes": "GH #186. Page/tag candidates were already a global BinaryHeap top-k, but block-ref production walked pages in traversal order and broke at the cap with a flat score, so a strong block match on a late page was silently omitted. Fixed: query_plan::execute_blocks builds a global bounded-heap top-k with real per-block relevance (match-class > word-boundary > earlier-offset > shorter-text > fewer-occurrences, deterministic tie-break by (page rel_path, in-page index) \u2014 bare traversal index was nondeterministic because walk_page_files reads fs::read_dir unsorted; regression block_search_topk_ties_sort_rel_path_with_reversed_page_snapshot forces a reversed page snapshot); OG caps adopted (inline pages 100 / block-refs 20; Ctrl+K 100/100 ranked pool, existing chunked presentation); autocomplete fold NFKC->NFC to match #137/backend. Fail-before proven (best block on last page survives + ranks ahead of weaker earlier matches; NFC-vs-NFKC ordering). Manager-reviewed block top-k + green (tine-core 455, autocomplete 50, component 20); not separately adversarially verified (search-ordering, lower risk than #137)."
+      "notes": "GH #186. Page/tag candidates were already a global BinaryHeap top-k, but block-ref production walked pages in traversal order and broke at the cap with a flat score, so a strong block match on a late page was silently omitted. Fixed: query_plan::execute_blocks builds a global bounded-heap top-k with real per-block relevance (match-class > word-boundary > earlier-offset > shorter-text > fewer-occurrences, deterministic tie-break by (page rel_path, in-page index) — bare traversal index was nondeterministic because walk_page_files reads fs::read_dir unsorted; regression block_search_topk_ties_sort_rel_path_with_reversed_page_snapshot forces a reversed page snapshot); OG caps adopted (inline pages 100 / block-refs 20; Ctrl+K 100/100 ranked pool, existing chunked presentation); autocomplete fold NFKC->NFC to match #137/backend. Fail-before proven (best block on last page survives + ranks ahead of weaker earlier matches; NFC-vs-NFKC ordering). Manager-reviewed block top-k + green (tine-core 455, autocomplete 50, component 20); not separately adversarially verified (search-ordering, lower risk than #137)."
     },
     {
       "id": "UI-SETTINGS-MOBILE-SCROLL-001",
@@ -5030,7 +5034,7 @@
         "tests": [],
         "scenario": null,
         "failBefore": "reconstructed",
-        "exemption": "Martin internal report (Android Settings not scrollable). CSS-layout fix: in the mobile column layout (.settings-modal flex-direction:column at max-width:480px) .settings-pane lacked min-height:0, so it grew to its content height and .settings-pane-body's overflow-y:auto scroll never engaged, leaving lower settings clipped by the modal's overflow:hidden \u2014 the textbook flexbox min-height:auto scroll bug. Fixed by adding min-height:0 to .settings-pane and .settings-pane-body. jsdom cannot exercise CSS layout, and headless-Chromium navigation to Settings in the mobile drawer layout could not be automated here (confirmed the app DOES enter the mobile column layout at narrow viewports). Needs mobile-viewport/device confirmation, pending with the other Android items (#192, M-B)."
+        "exemption": "Martin internal report (Android Settings not scrollable). CSS-layout fix: in the mobile column layout (.settings-modal flex-direction:column at max-width:480px) .settings-pane lacked min-height:0, so it grew to its content height and .settings-pane-body's overflow-y:auto scroll never engaged, leaving lower settings clipped by the modal's overflow:hidden — the textbook flexbox min-height:auto scroll bug. Fixed by adding min-height:0 to .settings-pane and .settings-pane-body. jsdom cannot exercise CSS layout, and headless-Chromium navigation to Settings in the mobile drawer layout could not be automated here (confirmed the app DOES enter the mobile column layout at narrow viewports). Needs mobile-viewport/device confirmation, pending with the other Android items (#192, M-B)."
       }
     },
     {
@@ -5101,7 +5105,7 @@
         "scenario": "references.single-mention-occurrence-controls-hidden",
         "failBefore": "proven"
       },
-      "notes": "GH #200. Each backlink block rendered Tine's OccurrenceControls (ReferenceEvidence.tsx) always-on (LiveRefGroup.tsx + reference excerpt rows): a '{n} mention(s)' label plus one numbered occurrence-jump button per mention. For a single-mention block (the common case) this is a redundant '1 mention' + lone '1' button, which the reporter found confusing. OG (logseq@6e7afa8) shows NEITHER a per-block mention count nor occurrence-jump buttons in Linked References (only the separate ((block))-ref-count badge, which Tine also has and which correctly shows nothing for a non-block-referenced block). Per Martin's decision (option B), OccurrenceControls now renders only when occurrences.length>1 \u2014 removing the redundancy for single mentions while keeping jump-to-occurrence where multiple mentions make it useful. Render test: 1 mention -> no .reference-occurrence-controls / no 'mention' text; 3 mentions -> '3 mentions' + 3 jump buttons. Fail-before proven (pre-fix rendered controls unconditionally). LinkedReferences/UnlinkedReferences/LiveRefGroup render tests green."
+      "notes": "GH #200. Each backlink block rendered Tine's OccurrenceControls (ReferenceEvidence.tsx) always-on (LiveRefGroup.tsx + reference excerpt rows): a '{n} mention(s)' label plus one numbered occurrence-jump button per mention. For a single-mention block (the common case) this is a redundant '1 mention' + lone '1' button, which the reporter found confusing. OG (logseq@6e7afa8) shows NEITHER a per-block mention count nor occurrence-jump buttons in Linked References (only the separate ((block))-ref-count badge, which Tine also has and which correctly shows nothing for a non-block-referenced block). Per Martin's decision (option B), OccurrenceControls now renders only when occurrences.length>1 — removing the redundancy for single mentions while keeping jump-to-occurrence where multiple mentions make it useful. Render test: 1 mention -> no .reference-occurrence-controls / no 'mention' text; 3 mentions -> '3 mentions' + 3 jump buttons. Fail-before proven (pre-fix rendered controls unconditionally). LinkedReferences/UnlinkedReferences/LiveRefGroup render tests green."
     },
     {
       "id": "UI-SETTINGS-SHOW-BRACKETS-001",
@@ -5284,7 +5288,7 @@
         "scenario": "properties.editor-name-value-autocomplete",
         "failBefore": "proven"
       },
-      "notes": "OG-parity catalogue pick (property.autocomplete, LIVE-BACKLOG s9). OG (og-1.0.0 6e7afa8eb): name trigger handler/editor.cljs:1907-1924; key->value transition editor.cljs:2211-2226; candidates db/model.cljs:1394-1405,1422-1443 + search.cljs:184-215; hidden-key policy util/property.cljs:18-24. Pre-fix Tine detectTrigger had no property branch at all. Fix: property-name/property-value trigger kinds in src/editor/autocomplete.ts (line-anchored key alphabet, fence-guarded, value stage only after this editor selected its key); two-stage picker in Block.tsx (fuzzy rank, Create entries, canonical fold via propertyKeyNorm \u2014 single spelling policy); dedicated bounded backend boundary query_facets{autocomplete:true} -> autocomplete_property_facets_bounded (includes page preambles + template/title, excludes OG hidden built-ins + graph :block-hidden-properties, item/byte budget) leaving query-builder facets untouched. Necessity gate manager-run: 3 trigger tests + the replace-span/value-flow component test fail pre-fix; the prose/fence no-trigger guard passes pre-fix. jsdom-layer proof; real-app confirm pending."
+      "notes": "OG-parity catalogue pick (property.autocomplete, LIVE-BACKLOG s9). OG (og-1.0.0 6e7afa8eb): name trigger handler/editor.cljs:1907-1924; key->value transition editor.cljs:2211-2226; candidates db/model.cljs:1394-1405,1422-1443 + search.cljs:184-215; hidden-key policy util/property.cljs:18-24. Pre-fix Tine detectTrigger had no property branch at all. Fix: property-name/property-value trigger kinds in src/editor/autocomplete.ts (line-anchored key alphabet, fence-guarded, value stage only after this editor selected its key); two-stage picker in Block.tsx (fuzzy rank, Create entries, canonical fold via propertyKeyNorm — single spelling policy); dedicated bounded backend boundary query_facets{autocomplete:true} -> autocomplete_property_facets_bounded (includes page preambles + template/title, excludes OG hidden built-ins + graph :block-hidden-properties, item/byte budget) leaving query-builder facets untouched. Necessity gate manager-run: 3 trigger tests + the replace-span/value-flow component test fail pre-fix; the prose/fence no-trigger guard passes pre-fix. jsdom-layer proof; real-app confirm pending."
     },
     {
       "id": "UI-MACRO-HICCUP-RICH-001",
@@ -5357,7 +5361,7 @@
         "scenario": "references.property-key-page-membership",
         "failBefore": "proven"
       },
-      "notes": "OG-parity catalogue pick (og-parity.properties-config.property-key-page-backlinks.url, frozen class A). NOT co-fixed by property-value-backlinks (that covers [[ref]] IN values). OG (og-1.0.0 6e7afa8eb graph_parser/block.cljs:134-188): eligible property NAMES create page refs independently of value refs, enabled when :property-pages/enabled? is true or absent, minus excludelist and the exact editable+hidden built-in sets (property.cljs:46-108 + srs.cljs:763-769 card-* extension keys) \u2014 all transcribed verbatim into reference_evidence.rs and compared via property_key_norm. Pre-fix Tine's ReferenceSourceProjection kept only property VALUE offsets, so `url:: https://x` created no membership (replay: backlinks_bounded returned only the value-ref control). Fix: explicit_property_key occurrence at the KEY's source span for both page preambles and block properties; config.rs parses :property-pages/enabled?+excludelist. Fail-before (worker-run, Sol/high): key-membership test fails pre-fix with only the value-ref witness present. Full tine-core 514 pass (manager-run). Known bounded limitation: scoped cache invalidation uses default-enabled policy (can only over-invalidate, never stale) \u2014 config-exact invalidation is a follow-up. Rust-layer proof; live LinkedReferences surface confirm pending."
+      "notes": "OG-parity catalogue pick (og-parity.properties-config.property-key-page-backlinks.url, frozen class A). NOT co-fixed by property-value-backlinks (that covers [[ref]] IN values). OG (og-1.0.0 6e7afa8eb graph_parser/block.cljs:134-188): eligible property NAMES create page refs independently of value refs, enabled when :property-pages/enabled? is true or absent, minus excludelist and the exact editable+hidden built-in sets (property.cljs:46-108 + srs.cljs:763-769 card-* extension keys) — all transcribed verbatim into reference_evidence.rs and compared via property_key_norm. Pre-fix Tine's ReferenceSourceProjection kept only property VALUE offsets, so `url:: https://x` created no membership (replay: backlinks_bounded returned only the value-ref control). Fix: explicit_property_key occurrence at the KEY's source span for both page preambles and block properties; config.rs parses :property-pages/enabled?+excludelist. Fail-before (worker-run, Sol/high): key-membership test fails pre-fix with only the value-ref witness present. Full tine-core 514 pass (manager-run). Known bounded limitation: scoped cache invalidation uses default-enabled policy (can only over-invalidate, never stale) — config-exact invalidation is a follow-up. Rust-layer proof; live LinkedReferences surface confirm pending."
     },
     {
       "id": "UI-HISTORY-PAGE-ONLY-MODE-001",
@@ -5474,7 +5478,7 @@
     },
     {
       "id": "UI-NUMLIST-CONTINUATION-001",
-      "title": "Enter on a numbered-list block makes the new sibling numbered; Enter on an EMPTY non-nested numbered block stops the list (removes the property, no new block); Backspace at offset 0 removes only the property keeping the text \u2014 in-block markdown lists keep their separate behavior",
+      "title": "Enter on a numbered-list block makes the new sibling numbered; Enter on an EMPTY non-nested numbered block stops the list (removes the property, no new block); Backspace at offset 0 removes only the property keeping the text — in-block markdown lists keep their separate behavior",
       "family": "editor",
       "sources": {
         "issues": [],
@@ -5519,7 +5523,7 @@
     },
     {
       "id": "UI-CLIPBOARD-RAW-PASTE-UNIVERSAL-001",
-      "title": "Ctrl/Cmd+Shift+V pastes the clipboard's literal plain text for EVERY payload kind \u2014 single-line rich HTML, selected bare URL, multiline \u2014 replacing the selection with no outline/link/image/file interpretation; empty plain flavor claims the gesture and changes nothing",
+      "title": "Ctrl/Cmd+Shift+V pastes the clipboard's literal plain text for EVERY payload kind — single-line rich HTML, selected bare URL, multiline — replacing the selection with no outline/link/image/file interpretation; empty plain flavor claims the gesture and changes nothing",
       "family": "clipboard",
       "sources": {
         "issues": [],
@@ -5537,7 +5541,7 @@
         "scenario": "clipboard.raw-paste-universal",
         "failBefore": "proven"
       },
-      "notes": "OG-parity catalogue lane outliner-editor row 12 (frozen receipt 012--clipboard-raw-paste). OG (og-1.0.0 6e7afa8eb): editor-on-paste-raw! handler/paste.cljs:262-271 \u2014 delete selection, insert clipboard text, no branches. Pre-fix Tine honored the latch only for multiline text; single-line rich HTML became an outline and a selected bare URL became a link. Raw branch now runs first in onPaste, before file/sheet/HTML/link/video/image decisions; splice is byte-exact prefix+text+suffix. Fail-before (manager park/restore): rich-HTML, selected-URL, empty-flavor tests fail pre-fix; multiline raw controls pass by design. jsdom synthetic ClipboardEvent; WebKitGTK flavor ordering/permissions need real-app smoke."
+      "notes": "OG-parity catalogue lane outliner-editor row 12 (frozen receipt 012--clipboard-raw-paste). OG (og-1.0.0 6e7afa8eb): editor-on-paste-raw! handler/paste.cljs:262-271 — delete selection, insert clipboard text, no branches. Pre-fix Tine honored the latch only for multiline text; single-line rich HTML became an outline and a selected bare URL became a link. Raw branch now runs first in onPaste, before file/sheet/HTML/link/video/image decisions; splice is byte-exact prefix+text+suffix. Fail-before (manager park/restore): rich-HTML, selected-URL, empty-flavor tests fail pre-fix; multiline raw controls pass by design. jsdom synthetic ClipboardEvent; WebKitGTK flavor ordering/permissions need real-app smoke."
     },
     {
       "id": "UI-CLIPBOARD-HTML-IMG-VIDEO-001",
@@ -5584,7 +5588,7 @@
         "scenario": "editor.heading-auto-depth",
         "failBefore": "proven"
       },
-      "notes": "OG-parity catalogue lane outliner-editor row 7 (frozen receipt 007--editor-heading-auto). OG (og-1.0.0 6e7afa8eb): render precedence + depth rule components/block.cljs:1948-1959; transition clearing handler/editor.cljs:3822-3862; markdown prefix set/clear commands.cljs:623-638; org property path handler/editor.cljs:888-904. Pre-fix Tine mapped heading:: true to hard-coded H1 and the DTO path discarded the boolean (facetsFromDto dropped it). One shared effectiveHeadingLevel resolver serves Block, RefBlocks (query/ref/embed fallbacks), and SheetGrid \u2014 closes the known two-facet-renderer divergence risk for headings. No Rust change: BlockDto.properties already carried the parsed state. Fail-before (manager park/restore): 9 render + 3 slash tests fail pre-fix; explicit-precedence control passed pre-fix by design (existing behavior). Serialization byte-exact for both formats; untouched siblings byte-identical. jsdom proof; native menu/caret polish needs real-app E2E."
+      "notes": "OG-parity catalogue lane outliner-editor row 7 (frozen receipt 007--editor-heading-auto). OG (og-1.0.0 6e7afa8eb): render precedence + depth rule components/block.cljs:1948-1959; transition clearing handler/editor.cljs:3822-3862; markdown prefix set/clear commands.cljs:623-638; org property path handler/editor.cljs:888-904. Pre-fix Tine mapped heading:: true to hard-coded H1 and the DTO path discarded the boolean (facetsFromDto dropped it). One shared effectiveHeadingLevel resolver serves Block, RefBlocks (query/ref/embed fallbacks), and SheetGrid — closes the known two-facet-renderer divergence risk for headings. No Rust change: BlockDto.properties already carried the parsed state. Fail-before (manager park/restore): 9 render + 3 slash tests fail pre-fix; explicit-precedence control passed pre-fix by design (existing behavior). Serialization byte-exact for both formats; untouched siblings byte-identical. jsdom proof; native menu/caret polish needs real-app E2E."
     },
     {
       "id": "UI-CLIPBOARD-PLAINTEXT-POLICY-001",
@@ -5815,7 +5819,7 @@
         "scenario": "clipboard.private-block-payload",
         "failBefore": "proven"
       },
-      "notes": "CB1 workstream (ledger Q6, Martin 2026-07-21). OG parity: og-1.0.0 6e7afa8eb copy writes id-stripped text (common.cljs:12-16) + private flavor (util.cljc:842-851); paste checks payload first (paste.cljs:179-191); keep-uuid? is cut-only from INTERNAL op-type (paste.cljs:184-190), cleared after paste (editor.cljs:2072-2076). Tine transport differs intentionally (recorded): app-internal per-webview slot + normalized text/plain association instead of OG's Chromium-only web custom format \u2014 clipboard flavors stay byte-identical, no id/graph-path leak, grant unforgeable. Data-safety: 3-round adversarial spec loop (.replay-notes/CB1-specverify*-report.md); cut-source retirement flush w/ page-instance generations; whole-graph resolveBlocks absence check fail-closed; final no-await check-and-insert; one-shot grant; refuse-redo on id conflict. Native WebKitGTK text round-trip probe green (scripts/e2e-clipboard-roundtrip.mjs). Cross-session/cross-webview identity paste intentionally not provided."
+      "notes": "CB1 workstream (ledger Q6, Martin 2026-07-21). OG parity: og-1.0.0 6e7afa8eb copy writes id-stripped text (common.cljs:12-16) + private flavor (util.cljc:842-851); paste checks payload first (paste.cljs:179-191); keep-uuid? is cut-only from INTERNAL op-type (paste.cljs:184-190), cleared after paste (editor.cljs:2072-2076). Tine transport differs intentionally (recorded): app-internal per-webview slot + normalized text/plain association instead of OG's Chromium-only web custom format — clipboard flavors stay byte-identical, no id/graph-path leak, grant unforgeable. Data-safety: 3-round adversarial spec loop (.replay-notes/CB1-specverify*-report.md); cut-source retirement flush w/ page-instance generations; whole-graph resolveBlocks absence check fail-closed; final no-await check-and-insert; one-shot grant; refuse-redo on id conflict. Native WebKitGTK text round-trip probe green (scripts/e2e-clipboard-roundtrip.mjs). Cross-session/cross-webview identity paste intentionally not provided."
     },
     {
       "id": "UI-SLASH-TODAY-FORMAT-220",
@@ -5937,7 +5941,7 @@
         "scenario": "sheets.table-stable-column-resize",
         "failBefore": "proven"
       },
-      "notes": "The table-only tine.table-widths grammar URI-encodes stable title/FieldId keys, rejects malformed values, and bounds serialized pixels. Pointer-edge tests cover live preview, one guarded owner-property commit, cancel, independent reset, field reorder, remount, duplicate surfaces, and both block/page homes. The native sheet journey now expresses horizontal usability and durable reset without making exact pixels authoritative, but the local candidate run stopped before its first check because the initial .ls-block never appeared; keep this reported until that observation runs. Coordinate-grid tine.col-widths remains unchanged. 2026-08-12: the held observation ran. scripts/e2e-sheets.mjs PASSED in the linux-release catalog against the v0.6.93 candidate binary (appSha256 75b3c2e9\u2026, commit 651d605e), in both ordinary and strict release mode, so the row advances past `reported`. Released in v0.6.93."
+      "notes": "The table-only tine.table-widths grammar URI-encodes stable title/FieldId keys, rejects malformed values, and bounds serialized pixels. Pointer-edge tests cover live preview, one guarded owner-property commit, cancel, independent reset, field reorder, remount, duplicate surfaces, and both block/page homes. The native sheet journey now expresses horizontal usability and durable reset without making exact pixels authoritative, but the local candidate run stopped before its first check because the initial .ls-block never appeared; keep this reported until that observation runs. Coordinate-grid tine.col-widths remains unchanged. 2026-08-12: the held observation ran. scripts/e2e-sheets.mjs PASSED in the linux-release catalog against the v0.6.93 candidate binary (appSha256 75b3c2e9…, commit 651d605e), in both ordinary and strict release mode, so the row advances past `reported`. Released in v0.6.93."
     },
     {
       "id": "UI-SHEET-TABLE-COLUMN-REORDER-217",
@@ -6086,7 +6090,7 @@
         "scenario": "context-menu.block-open-in-new-tab",
         "failBefore": "proven"
       },
-      "notes": "GH #257. blockActions gained an 'Open in new tab' item after 'Zoom into block' in both editable and read-only variants. It reuses persistentBlockRef + openInNewTab \u2014 the same route the bullet middle-click builds \u2014 so the new tab survives a reload/restart via id:: persistence. Read-only blocks also offer it, matching the middle-click handler which does not check readOnly."
+      "notes": "GH #257. blockActions gained an 'Open in new tab' item after 'Zoom into block' in both editable and read-only variants. It reuses persistentBlockRef + openInNewTab — the same route the bullet middle-click builds — so the new tab survives a reload/restart via id:: persistence. Read-only blocks also offer it, matching the middle-click handler which does not check readOnly."
     },
     {
       "id": "UI-CALC-RESULT-COPY-228",
@@ -6185,7 +6189,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "Martin internal report: after midnight, yesterday's journal kept showing today's carry buttons (Carry from previous day / Carry last N days) instead of switching to 'Carry unfinished tasks \u2192 today'. Root cause: CarryActions.isToday compared the page name against journalTitle(new Date()) evaluated once at mount \u2014 nothing reactive, so the choice never re-evaluated. Fix: journal.ts gains a reactive currentDayKey (one-shot DST-safe timeout chain re-armed each midnight, plus focus/visibility resync for sleeping machines) and localDateFromDayKey so the compared title derives from the SAME reactive value; CarryActions reads it. Fail-before proven in-tree: with the pre-fix bare new Date() comparison, only the two rollover tests fail while the three static-shape tests pass."
+      "notes": "Martin internal report: after midnight, yesterday's journal kept showing today's carry buttons (Carry from previous day / Carry last N days) instead of switching to 'Carry unfinished tasks → today'. Root cause: CarryActions.isToday compared the page name against journalTitle(new Date()) evaluated once at mount — nothing reactive, so the choice never re-evaluated. Fix: journal.ts gains a reactive currentDayKey (one-shot DST-safe timeout chain re-armed each midnight, plus focus/visibility resync for sleeping machines) and localDateFromDayKey so the compared title derives from the SAME reactive value; CarryActions reads it. Fail-before proven in-tree: with the pre-fix bare new Date() comparison, only the two rollover tests fail while the three static-shape tests pass."
     },
     {
       "id": "UI-RENDERED-SELECTION-DELETE-001",
@@ -6211,7 +6215,7 @@
         "scenario": "editor.rendered-selection-delete",
         "failBefore": "proven"
       },
-      "notes": "Martin internal report: selecting block text and pressing Delete/Backspace sometimes does nothing, seemingly speed-dependent. Real-app matrix (27 cases, WebKitGTK) showed editor selections always delete; the dead keypress is a RENDERED-view (not-editing) text selection \u2014 Tine separates rendered view from textarea, the drag is treated as text selection not a click-to-edit, and Delete reaches no editor (selection stays, nothing changes). Fix: window-capture Delete/Backspace with a non-collapsed selection inside one block's rendered wrapper maps endpoints to source offsets (render/spans.ts) and splices visible text via the normal setRaw path (undo, dirty), then opens the editor at the join point. Conservative no-ops: cross-block selections, selections inside atomic constructs (links/chips \u2014 coarse spans snap to the same edge), annotation/calc blocks, read-only pages, blocks already being edited, modals open, unmapped endpoints. Side observation (untouched): WebKit smart-delete on native double-click word selections eats one trailing space uniformly (fast and slow)."
+      "notes": "Martin internal report: selecting block text and pressing Delete/Backspace sometimes does nothing, seemingly speed-dependent. Real-app matrix (27 cases, WebKitGTK) showed editor selections always delete; the dead keypress is a RENDERED-view (not-editing) text selection — Tine separates rendered view from textarea, the drag is treated as text selection not a click-to-edit, and Delete reaches no editor (selection stays, nothing changes). Fix: window-capture Delete/Backspace with a non-collapsed selection inside one block's rendered wrapper maps endpoints to source offsets (render/spans.ts) and splices visible text via the normal setRaw path (undo, dirty), then opens the editor at the join point. Conservative no-ops: cross-block selections, selections inside atomic constructs (links/chips — coarse spans snap to the same edge), annotation/calc blocks, read-only pages, blocks already being edited, modals open, unmapped endpoints. Side observation (untouched): WebKit smart-delete on native double-click word selections eats one trailing space uniformly (fast and slow)."
     },
     {
       "id": "UI-SIDEBAR-DRAG-REORDER-211",
@@ -6261,7 +6265,7 @@
         "scenario": "graph.home-page-open-and-stale",
         "failBefore": "proven"
       },
-      "notes": "GH #245. homePage.ts stores the per-graph setting as an app-settings string keyed by graph root (frontend-only; adding a config.edn owner would have touched the prohibited Rust storage surface). graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads \u2014 never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before proven by manager mutation probe at integration (2026-08-06): disabling the loadGraphPath home-page call fails 2 of the 19 tests in graph.test.tsx. Tests were written after the implementation in the delegated lane; the probe supplies the causal evidence."
+      "notes": "GH #245. homePage.ts stores the per-graph setting as an app-settings string keyed by graph root (frontend-only; adding a config.edn owner would have touched the prohibited Rust storage surface). graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads — never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before proven by manager mutation probe at integration (2026-08-06): disabling the loadGraphPath home-page call fails 2 of the 19 tests in graph.test.tsx. Tests were written after the implementation in the delegated lane; the probe supplies the causal evidence."
     },
     {
       "id": "UI-THEME-SYSTEM-MODE-193",
@@ -6388,7 +6392,7 @@
     },
     {
       "id": "UI-EDITOR-MATH-BLOCK-ENTER-278",
-      "title": "Enter and multiline paste inside a $$ \u2026 $$ environment keep the block together instead of splitting it",
+      "title": "Enter and multiline paste inside a $$ … $$ environment keep the block together instead of splitting it",
       "family": "editor-enter",
       "sources": {
         "issues": [
@@ -6418,10 +6422,14 @@
       "title": "Clicking a task marker label uses Logseq's open-state toggle and never removes DONE",
       "family": "editor-task-markers",
       "sources": {
-        "issues": [259],
+        "issues": [
+          259
+        ],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
@@ -6440,14 +6448,20 @@
       "title": "Generic custom.css image sizing does not constrain the full-screen lightbox",
       "family": "image-lightbox",
       "sources": {
-        "issues": [319],
+        "issues": [
+          319
+        ],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
-        "tests": ["src/components/Lightbox.customCss.test.tsx"],
+        "tests": [
+          "src/components/Lightbox.customCss.test.tsx"
+        ],
         "scenario": "image.lightbox-custom-css-geometry",
         "failBefore": "proven"
       },
@@ -6458,14 +6472,23 @@
       "title": "Native page selections exclude Add block and reference-section UI labels",
       "family": "native-text-selection",
       "sources": {
-        "issues": [328],
+        "issues": [
+          328
+        ],
         "commits": []
       },
-      "platforms": ["android", "linux", "macos", "windows"],
+      "platforms": [
+        "android",
+        "linux",
+        "macos",
+        "windows"
+      ],
       "layer": "unit",
       "status": "covered",
       "coverage": {
-        "tests": ["src/styles/uiChromeSelection.test.ts"],
+        "tests": [
+          "src/styles/uiChromeSelection.test.ts"
+        ],
         "scenario": "selection.page-content-excludes-ui-chrome",
         "failBefore": "proven"
       },
@@ -6522,7 +6545,7 @@
         "scenario": "references.section-expand-state-survives-remount",
         "failBefore": "proven"
       },
-      "notes": "Reported on a >5,000-page graph: a page with ~173 linked references collapsed its own section while scrolling or expanding a group, while ~48 references behaved. The flag was a component-local signal, so ANY remount of the page subtree reset it, and OG_REFERENCE_COLLAPSE_THRESHOLD=100 makes 'reset' mean collapsed \u2014 which is precisely the 48-fine/173-broken split. Moving the state to src/referenceSectionState.ts makes the symptom impossible whatever causes the remount, which is what the reporter asked for ('stay in current existing state no matter what'). Memory-only: OG's collapse-above-100 default still applies on a fresh start, and resetStore clears it on graph switch. NOT YET REPRODUCED on a real large graph \u2014 the remount trigger (suspected Page.tsx pagesToRender() going transiently empty) is unconfirmed; keep reported until a large-graph user or the Direct Files perf audit confirms."
+      "notes": "Reported on a >5,000-page graph: a page with ~173 linked references collapsed its own section while scrolling or expanding a group, while ~48 references behaved. The flag was a component-local signal, so ANY remount of the page subtree reset it, and OG_REFERENCE_COLLAPSE_THRESHOLD=100 makes 'reset' mean collapsed — which is precisely the 48-fine/173-broken split. Moving the state to src/referenceSectionState.ts makes the symptom impossible whatever causes the remount, which is what the reporter asked for ('stay in current existing state no matter what'). Memory-only: OG's collapse-above-100 default still applies on a fresh start, and resetStore clears it on graph switch. NOT YET REPRODUCED on a real large graph — the remount trigger (suspected Page.tsx pagesToRender() going transiently empty) is unconfirmed; keep reported until a large-graph user or the Direct Files perf audit confirms."
     },
     {
       "id": "UI-EDITOR-FOLLOW-LINK-AT-CARET-274",
@@ -6688,10 +6711,14 @@
       "title": "Property autocomplete remains usable when authored entirely from the keyboard",
       "family": "editor-autocomplete",
       "sources": {
-        "issues": [306],
+        "issues": [
+          306
+        ],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
@@ -6709,10 +6736,14 @@
       "title": "Dragging a block into the deep target zone makes it a child of that block",
       "family": "outline-drag-drop",
       "sources": {
-        "issues": [326],
+        "issues": [
+          326
+        ],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "unit",
       "status": "covered",
       "coverage": {
@@ -6730,10 +6761,14 @@
       "title": "Custom CSS can enable Inter OpenType stylistic sets and character variants",
       "family": "custom-css",
       "sources": {
-        "issues": [298],
+        "issues": [
+          298
+        ],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "unit",
       "status": "covered",
       "coverage": {
@@ -6750,10 +6785,15 @@
       "title": "The release E2E distinguishes undelivered native ArrowDown input from broken page-header traversal",
       "family": "e2e-harness",
       "sources": {
-        "issues": [330],
+        "issues": [
+          330
+        ],
         "commits": []
       },
-      "platforms": ["linux", "windows"],
+      "platforms": [
+        "linux",
+        "windows"
+      ],
       "layer": "native",
       "status": "covered",
       "coverage": {
@@ -6771,10 +6811,14 @@
       "title": "The release E2E distinguishes an unready GTK upload chooser from an upload product failure",
       "family": "e2e-harness",
       "sources": {
-        "issues": [329],
+        "issues": [
+          329
+        ],
         "commits": []
       },
-      "platforms": ["linux"],
+      "platforms": [
+        "linux"
+      ],
       "layer": "native",
       "status": "covered",
       "coverage": {
@@ -6792,10 +6836,14 @@
       "title": "The release E2E waits for semantic block-embed content before interacting with it",
       "family": "e2e-harness",
       "sources": {
-        "issues": [315],
+        "issues": [
+          315
+        ],
         "commits": []
       },
-      "platforms": ["linux"],
+      "platforms": [
+        "linux"
+      ],
       "layer": "native",
       "status": "covered",
       "coverage": {
@@ -6817,7 +6865,9 @@
         "issues": [],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "native",
       "status": "covered",
       "coverage": {
@@ -6862,7 +6912,9 @@
         "issues": [],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "native",
       "status": "covered",
       "coverage": {
@@ -7023,6 +7075,33 @@
         "failBefore": "proven"
       },
       "notes": "GH #336: the Hide-keyboard button blurred the editor on pointerdown, which dropped the IME and unmounted the whole toolbar MID-GESTURE; Android then delivered the gesture's synthesized pointerup/click to whatever block sat behind the toolbar ('touch-through'). The button now arms a short gesture window on pointerdown (blurring exactly as before): the toolbar stays mounted until the trailing click is consumed on the button itself (preventDefault + stopPropagation), and an AT/keyboard activation with no pointer gesture still blurs. A 700ms safety window retires the gesture on pointercancel/lost events so a stuck toolbar can never leak. jsdom cannot route synthesized clicks by coordinates the way Android WebView does, so the lifecycle test simulates the exact sequence: pointerdown -> blur -> IME-close resize (viewport grows back) -> trailing click; pre-fix the toolbar is gone before the click (both new tests fail on the HEAD component), post-fix it persists, swallows the click (probe behind it untouched), then retires. Physical Android confirmation (uninstallable phantom tap on a real keyboard) remains a manager smoke-test item per the dossier."
+    },
+    {
+      "id": "UI-PANE-MOVE-SPAWNS-MISSING-282",
+      "title": "Move Tab to pane {left,right,up,down} with no pane in that direction grows the layout: a multi-tab source donates its active tab into a new pane on that side; a one-tab source opens the new pane as a mirror of the current tab/history and stays intact",
+      "family": "tabs",
+      "sources": {
+        "issues": [
+          282
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/panes.test.ts::moveActiveTabInDirection (GH #282)::spawns a right-hand mirror pane from a single one-tab pane",
+          "src/panes.test.ts::moveActiveTabInDirection (GH #282)::places the spawned pane before the source for left/up and after it for down",
+          "src/panes.test.ts::moveActiveTabInDirection (GH #282)::donates only the active tab when a multi-tab source grows a missing neighbor",
+          "src/panes.test.ts::moveActiveTabInDirection (GH #282)::mirrors a lone journals tab instead of refusing when there is no neighbor"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #282 (VS Code-style 'Move Tab to pane {dir}' spawning the missing group). Previously the command no-op'ed whenever no pane lay in the direction — including the reporter's one-pane starting case, which needs it most. The new panes.ts moveActiveTabInDirection keeps the existing definite-move path when a neighbor exists (including the deliberate refusal to move a feed pane's lone journals tab), and otherwise splits the source in the requested direction: a multi-tab source donates only its active tab (moveTabToSplitPane), while a one-tab source — which Tine cannot empty — gets the same plain mirror split as pane-select Enter (splitSnapshotForNewPane semantics, including the journals-duplicate redirect to a selected feed day). New pane is focused, session save stays on the existing scheduleSessionSave boundary, and the mod+alt+shift+arrow bindings now call the shared function without the old layoutHasMultiplePanes() gate. Verified in vitest (7 new pane-layout cases across all four directions, one-tab/multi-tab/journals states, and the row-layout other-axis split); unit level only — not yet exercised in a native WebKit session."
     }
   ]
 }

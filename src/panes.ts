@@ -25,7 +25,12 @@ import {
 } from "./store";
 import { journalTitle } from "./journal";
 import { isMobilePlatform } from "./nativeChrome";
-import { nearestPane, takeBlockSelectionForPaneReturn } from "./paneSelect";
+import {
+  nearestPane,
+  nearestPaneInDirection,
+  takeBlockSelectionForPaneReturn,
+  type PaneDirection,
+} from "./paneSelect";
 
 export type LayoutNode =
   | {
@@ -350,6 +355,27 @@ export function moveTabToPane(
 export function moveActiveTabToPane(sourcePaneId: string, targetPaneId: string): boolean {
   if (sourcePaneId === targetPaneId) return false;
   return moveTabToPane(sourcePaneId, paneRouter(sourcePaneId).activeId(), targetPaneId);
+}
+
+// Directional "Move tab to pane" (GH #282): a real move when a pane lies that
+// way, but with no neighbor the command grows the layout in the requested
+// direction — the VS Code gesture a one-pane workflow uses to spawn its second
+// pane. A multi-tab source donates its active tab into the new pane; a one-tab
+// source cannot be emptied (Tine has no empty-pane route), so the new pane
+// opens as a mirror of the current tab/history instead and the original stays.
+export function moveActiveTabInDirection(sourcePaneId: string, dir: PaneDirection): string | null {
+  if (!layoutPaneIds().includes(sourcePaneId)) return null;
+  const target = nearestPaneInDirection(layoutRoot(), sourcePaneId, dir);
+  if (target) return moveActiveTabToPane(sourcePaneId, target) ? target : null;
+  const side: "left" | "right" | "top" | "bottom" =
+    dir === "up" ? "top" : dir === "down" ? "bottom" : dir;
+  const source = paneRouter(sourcePaneId);
+  if (source.tabs().length > 1) {
+    return moveTabToSplitPane(sourcePaneId, source.activeId(), sourcePaneId, side);
+  }
+  return splitPane(sourcePaneId, side === "left" || side === "right" ? "row" : "col", {
+    position: side === "left" || side === "top" ? "before" : "after",
+  });
 }
 
 export function moveTabToSplitPane(

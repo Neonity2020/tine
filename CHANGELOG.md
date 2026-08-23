@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
 
+- **Move Tab to pane {left,right,up,down} now creates the pane when none exists** (GH #282). Previously the command did nothing unless a pane already lay in that direction — so from a one-pane window (the most common starting point) it never did anything at all. With several tabs in the source pane, the active tab moves into a new pane on the requested side; with only one tab, the new pane opens as a mirror of the current tab and history and the original stays, since Tine panes are never empty. Moving into an already-existing pane behaves exactly as before.
+
 - **Android: hiding the keyboard no longer taps the note behind the toolbar** (GH #336). The editor toolbar's hide-keyboard button blurred the editor on touch-down, which closed the keyboard and removed the toolbar mid-gesture, so the tap's release landed on whatever block happened to be underneath. The button now consumes the whole touch gesture.
 
 - **Calculator blocks no longer render a phantom empty line** (GH #339). After exiting edit mode, a ```calc block showed one extra blank row below the last expression (the fenced block's trailing newline was rendered as a row). Blank lines between expressions still keep their positions.
