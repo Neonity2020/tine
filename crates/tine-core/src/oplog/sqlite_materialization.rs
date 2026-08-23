@@ -2243,6 +2243,42 @@ impl<'a> SqliteMaterializedRead<'a> {
         )
     }
 
+    pub fn navigation_pages_by_name_key(
+        &self,
+        name_key: &str,
+        limit: usize,
+    ) -> Result<Vec<MaterializedNavigationPageRow>, MaterializationError> {
+        convert_rows(
+            self.inner
+                .navigation_pages_by_name_key_with_header_validation(
+                    name_key,
+                    limit,
+                    validate_storage_page_header,
+                )?,
+            navigation_page_row_from_storage,
+        )
+    }
+
+    pub fn navigation_pages_by_name_key_namespace_after(
+        &self,
+        parent_name_key: &str,
+        after: Option<(&str, PageId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedNavigationPageRow>, MaterializationError> {
+        let after_page_id = after.map(|(_, page_id)| page_id.as_uuid().into_bytes());
+        convert_rows(
+            self.inner
+                .navigation_pages_by_name_key_namespace_after_with_header_validation(
+                    parent_name_key,
+                    after.map(|(name_key, _)| name_key),
+                    after_page_id.as_ref(),
+                    limit,
+                    validate_storage_page_header,
+                )?,
+            navigation_page_row_from_storage,
+        )
+    }
+
     pub fn navigation_aliases_after(
         &self,
         after: Option<(&ManagedPath, &str, PageId)>,

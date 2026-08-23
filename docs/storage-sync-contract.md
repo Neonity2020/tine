@@ -911,6 +911,13 @@ identity. The derivative may read only the affected page identities and
 materialize those pages from the retained accepted catalog proof. It must not
 decode or validate the graph-sized catalog merely to apply a bounded move.
 
+Page rename discovery follows the same bounded-work rule. An ordinary rename
+may point-read the exact normalized source and target names and range-read the
+source namespace descendants; it must not enumerate the graph page inventory.
+Collision-rename/merge uses the identical name and namespace indexes before its
+reference rewrite. Work may scale with the renamed namespace and actual
+referrers, never with unrelated pages.
+
 Likewise, admission tracks its exact live staged set. Final status history may
 remain available for point answers, but an ordinary drain turn must never scan
 that lifetime map merely to rediscover the handful of currently staged batches.

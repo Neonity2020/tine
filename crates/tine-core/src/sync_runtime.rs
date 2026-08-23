@@ -115,7 +115,9 @@ use crate::oplog::sqlite::{
 use crate::oplog::sqlite::{
     ApplicationRuntimeRoot, LeasedWorkspaceProjection, WorkspaceRuntimeLease,
 };
-use crate::oplog::sqlite_materialization::MaterializedTaskCandidateBlockRow;
+use crate::oplog::sqlite_materialization::{
+    MaterializedNavigationPageRow, MaterializedTaskCandidateBlockRow,
+};
 use crate::oplog::sync_layout::MANAGED_LOCAL_JOURNAL_DIR as MANAGED_LOCAL_JOURNAL_NAMESPACE;
 #[cfg(test)]
 use crate::oplog::trusted_local_commit::{
@@ -13621,6 +13623,76 @@ impl RuntimeActor {
         Ok(pages)
     }
 
+    /// Return every ordinary page at one normalized logical name without
+    /// enumerating the graph. Multiple rows are retained so callers can reject
+    /// malformed/colliding identities rather than choosing an arbitrary owner.
+    fn application_pages_at_name_key_ready(
+        &self,
+        name_key: &str,
+    ) -> Result<Vec<MaterializedNavigationPageRow>, SyncApplicationPageRequestError> {
+        self.application_materialized_read_ready()?
+            .navigation_pages_by_name_key(name_key, MAX_MATERIALIZATION_QUERY_ROWS)
+            .map(|rows| {
+                rows.into_iter()
+                    .filter(|row| row.kind == ManagedTextKind::Page)
+                    .collect()
+            })
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("application_page_name_key_lookup")
+            })
+    }
+
+    /// Return the namespace descendants of one normalized page name through
+    /// the SQLite `(name_key, page_id)` range index. Work is proportional to
+    /// the namespace being renamed, never to the graph containing it.
+    fn application_page_namespace_ready(
+        &self,
+        parent_name_key: &str,
+    ) -> Result<Vec<MaterializedNavigationPageRow>, SyncApplicationPageRequestError> {
+        let read = self.application_materialized_read_ready()?;
+        const BATCH: usize = 256;
+        let mut cursor: Option<(String, PageId)> = None;
+        let mut pages = Vec::new();
+        loop {
+            let batch = read
+                .navigation_pages_by_name_key_namespace_after(
+                    parent_name_key,
+                    cursor
+                        .as_ref()
+                        .map(|(name_key, page_id)| (name_key.as_str(), *page_id)),
+                    BATCH,
+                )
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_page_namespace_lookup",
+                    )
+                })?;
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+            for page in batch {
+                cursor = Some((page.name_key.clone(), page.page_id));
+                if page.kind == ManagedTextKind::Page {
+                    pages.push(page);
+                }
+            }
+            if batch_len < BATCH {
+                break;
+            }
+        }
+        Ok(pages)
+    }
+
+    fn application_page_rename_sources_ready(
+        &self,
+        old_key: &str,
+    ) -> Result<Vec<MaterializedNavigationPageRow>, SyncApplicationPageRequestError> {
+        let mut pages = self.application_pages_at_name_key_ready(old_key)?;
+        pages.extend(self.application_page_namespace_ready(old_key)?);
+        Ok(pages)
+    }
+
     fn load_application_page(
         &mut self,
         request: SyncApplicationPageLoadRequest,
@@ -15065,64 +15137,50 @@ impl RuntimeActor {
             return Ok(None);
         }
         let old_key = crate::refs::normalize(old);
-        let namespace_prefix = format!("{old_key}/");
         let old_chars = old.chars().count();
-        let inventory = self.application_inventory_ready()?;
-        let primary = inventory
-            .iter()
-            .find(|entry| entry.kind == PageKind::Page && crate::refs::same_page(&entry.name, old));
+        let mut selected = self.application_page_rename_sources_ready(&old_key)?;
+        let primary = selected.iter().find(|entry| entry.name_key == old_key);
         if let Some(expected) = expected_path {
-            if primary.is_none_or(|entry| entry.rel_path != expected) {
+            if primary.is_none_or(|entry| entry.path.as_str() != expected) {
                 return Err(SyncApplicationPageRequestError::ActorRefusedAt(
                     "rename_stale_page_target",
                 ));
             }
         }
 
-        let mut selected = inventory
-            .iter()
-            .filter(|entry| entry.kind == PageKind::Page)
-            .filter_map(|entry| {
-                let key = crate::refs::normalize(&entry.name);
-                let primary = key == old_key;
-                (primary || key.starts_with(&namespace_prefix)).then(|| {
-                    let target_name = if primary {
-                        new.to_owned()
-                    } else {
-                        format!(
-                            "{new}{}",
-                            entry.name.chars().skip(old_chars).collect::<String>()
-                        )
-                    };
-                    (entry, target_name)
-                })
-            })
-            .collect::<Vec<_>>();
         if selected.is_empty() {
             return Ok(None);
         }
 
         let selected_paths = selected
             .iter()
-            .map(|(entry, _)| entry.rel_path.as_str())
+            .map(|entry| entry.path.as_str().to_owned())
             .collect::<HashSet<_>>();
         let mut target_names = HashSet::new();
         let mut target_paths = HashSet::new();
         let mut requests = Vec::with_capacity(selected.len());
-        for (entry, target_name) in selected.drain(..) {
+        for entry in selected.drain(..) {
+            let primary = entry.name_key == old_key;
+            let target_name = if primary {
+                new.to_owned()
+            } else {
+                format!(
+                    "{new}{}",
+                    entry.name.chars().skip(old_chars).collect::<String>()
+                )
+            };
             let target_key = crate::refs::normalize(&target_name);
             if !target_names.insert(target_key.clone())
-                || inventory.iter().any(|other| {
-                    !selected_paths.contains(other.rel_path.as_str())
-                        && other.kind == PageKind::Page
-                        && crate::refs::normalize(&other.name) == target_key
-                })
+                || self
+                    .application_pages_at_name_key_ready(&target_key)?
+                    .iter()
+                    .any(|other| !selected_paths.contains(other.path.as_str()))
             {
                 return Err(SyncApplicationPageRequestError::ActorRefusedAt(
                     "rename_target_identity",
                 ));
             }
-            let format = Format::from_path(Path::new(&entry.rel_path));
+            let format = Format::from_path(Path::new(entry.path.as_str()));
             let target_path = self
                 .graph
                 .new_sparse_page_path_for_format(&target_name, PageKind::Page, format)
@@ -15352,29 +15410,17 @@ impl RuntimeActor {
             // rewritten in their DTOs below because their blocks participate in
             // the merge transaction rather than surviving as independent pages.
             let old_key = crate::refs::normalize(old);
-            let namespace_prefix = format!("{old_key}/");
             let old_chars = old.chars().count();
-            let inventory = self.application_inventory_ready()?;
-            let selected_paths = inventory
+            let selected = self.application_page_rename_sources_ready(&old_key)?;
+            let selected_paths = selected
                 .iter()
-                .filter(|entry| {
-                    entry.kind == PageKind::Page && {
-                        let key = crate::refs::normalize(&entry.name);
-                        key == old_key || key.starts_with(&namespace_prefix)
-                    }
-                })
-                .map(|entry| entry.rel_path.as_str())
+                .map(|entry| entry.path.as_str())
                 .collect::<HashSet<_>>();
             let mut target_names = HashSet::new();
             let mut target_paths = HashSet::new();
             let mut requests = Vec::new();
-            for entry in inventory.iter().filter(|entry| {
-                entry.kind == PageKind::Page && {
-                    let key = crate::refs::normalize(&entry.name);
-                    key == old_key || key.starts_with(&namespace_prefix)
-                }
-            }) {
-                let primary = crate::refs::same_page(&entry.name, old);
+            for entry in &selected {
+                let primary = entry.name_key == old_key;
                 let target_name = if primary {
                     new.to_owned()
                 } else {
@@ -15385,12 +15431,13 @@ impl RuntimeActor {
                 };
                 let target_key = crate::refs::normalize(&target_name);
                 if !target_names.insert(target_key.clone())
-                    || inventory.iter().any(|other| {
-                        !selected_paths.contains(other.rel_path.as_str())
-                            && other.kind == PageKind::Page
-                            && crate::refs::normalize(&other.name) == target_key
-                            && !(primary && other.rel_path == destination_path)
-                    })
+                    || self
+                        .application_pages_at_name_key_ready(&target_key)?
+                        .iter()
+                        .any(|other| {
+                            !selected_paths.contains(other.path.as_str())
+                                && !(primary && other.path.as_str() == destination_path)
+                        })
                 {
                     return Err(SyncApplicationPageRequestError::ActorRefusedAt(
                         "merge_rename_target_identity",
@@ -15403,7 +15450,7 @@ impl RuntimeActor {
                         .new_sparse_page_path_for_format(
                             &target_name,
                             PageKind::Page,
-                            Format::from_path(Path::new(&entry.rel_path)),
+                            Format::from_path(Path::new(entry.path.as_str())),
                         )
                         .map_err(|_| {
                             SyncApplicationPageRequestError::ActorRefusedAt(
@@ -23934,6 +23981,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn application_page_renames_use_exact_name_and_namespace_indexes() {
+        let source = include_str!("sync_runtime.rs");
+        let ordinary = source
+            .split_once("fn plan_application_page_rename")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Delete one ordinary managed page"))
+            .map(|(body, _)| body)
+            .expect("ordinary rename keeps a narrow source boundary");
+        let collision = source
+            .split_once("fn plan_application_page_merge")
+            .and_then(|(_, tail)| tail.split_once("\n    fn plan_application_file_rescue"))
+            .map(|(body, _)| body)
+            .expect("collision rename keeps a narrow source boundary");
+        for (label, body) in [("ordinary", ordinary), ("collision", collision)] {
+            assert!(
+                body.contains("application_page_rename_sources_ready"),
+                "{label} rename must select only the exact page and namespace descendants"
+            );
+            assert!(
+                body.contains("application_pages_at_name_key_ready"),
+                "{label} rename must point-check proposed target identities"
+            );
+            assert!(
+                !body.contains("application_inventory_ready"),
+                "{label} rename must not enumerate unrelated graph pages"
+            );
+        }
+    }
+
     /// The journal-feed route flushes a currently edited source page and then
     /// immediately submits the cross-page move. The foreground flush may still
     /// be waiting in the managed-local derivative queue when the correlated
@@ -26689,6 +26765,15 @@ mod tests {
                 ..BlockDto::default()
             }],
         );
+        accepted_new_application_page(
+            &handle,
+            "Clean Rename Source/Child",
+            vec![BlockDto {
+                id: "temporary-rename-child".into(),
+                raw: "rename child body".into(),
+                ..BlockDto::default()
+            }],
+        );
         assert_eq!(
             handle
                 .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
@@ -26702,6 +26787,9 @@ mod tests {
         let (renamed, _) =
             load_application_logical(&handle, "Clean Rename Target", SyncPageKind::Page);
         assert_eq!(renamed.blocks[0].raw, "rename body");
+        let (renamed_child, _) =
+            load_application_logical(&handle, "Clean Rename Target/Child", SyncPageKind::Page);
+        assert_eq!(renamed_child.blocks[0].raw, "rename child body");
 
         let (source, _) = accepted_new_application_page(
             &handle,
@@ -26721,6 +26809,15 @@ mod tests {
                 ..BlockDto::default()
             }],
         );
+        accepted_new_application_page(
+            &handle,
+            "Clean Merge Source/Child",
+            vec![BlockDto {
+                id: "temporary-merge-child".into(),
+                raw: "merge child body".into(),
+                ..BlockDto::default()
+            }],
+        );
         assert_eq!(
             handle
                 .mutate_application_graph(SyncApplicationGraphMutationRequest::MergePages {
@@ -26736,6 +26833,9 @@ mod tests {
             load_application_logical(&handle, "Clean Merge Destination", SyncPageKind::Page);
         assert_eq!(merged.blocks.len(), 2);
         assert!(merged.blocks[1].raw.contains("[[Clean Merge Destination]]"));
+        let (merged_child, _) =
+            load_application_logical(&handle, "Clean Merge Destination/Child", SyncPageKind::Page);
+        assert_eq!(merged_child.blocks[0].raw, "merge child body");
 
         let (stray, _) = accepted_new_application_page(
             &handle,
