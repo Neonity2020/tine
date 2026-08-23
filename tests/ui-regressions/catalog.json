@@ -7240,6 +7240,32 @@
         "failBefore": "proven"
       },
       "notes": "GH #341: editing a block inside linked references and pressing Up/Down left the surface — nextVisible/prevVisible consulted the block's OWN page outline (a sibling the ref view does not render adjacently) and startEditing went unscoped, so the editor mounted outside the surface (or nowhere) and the caret visually disappeared. The fix reuses the existing mechanisms instead of inventing a second tree: LiveRefGroup (the ONE renderer behind linked refs, block refs, query results, and embeds) now provides an OutlineScopeContext carrying its display roots (reactive getter), the surface collapse contract (so scoped order mirrors what is actually rendered), and navOnly: true; Block.editSurface keeps keyboard edits inside ref: surfaces exactly as embeds already did. Structural safety: navOnly scopes are display lists, NOT topology — store.mergeWithPrev/Next normalize them to page order (a Backspace can never weld rendered neighbors across subtrees; unit-pinned), Block's merge/empty-block/Delete branches read structuralScope, indent/move commands ignore navOnly scopes, and the empty-root backspace DOM test pins the unchanged outcome. Scoped selection (Escape) and the surface identity arbitration are unchanged. Evidence: 5 node tests + 5 jsdom render tests with display order deliberately reversed from page order; 7 of 10 fail on HEAD in exactly the new-behavior assertions, the rest pin unchanged semantics."
+    },
+    {
+      "id": "UI-BLOCKREFS-COLLAPSE-ALL-344",
+      "title": "The expanded block-reference locations view offers Collapse all / Expand all; collapsed groups show only the source page title, remain individually expandable, and re-expand to breadcrumb + block context, with state local to that view",
+      "family": "block-refs",
+      "sources": {
+        "issues": [
+          344
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/BlockReferences.test.tsx::block referrer panel group collapse (GH #344)::collapse-all reduces every group to its source page title, and a single disclosure re-expands it",
+          "src/components/BlockReferences.test.tsx::block referrer panel group collapse (GH #344)::expand-all restores every group's detail after collapse-all",
+          "src/components/BlockReferences.test.tsx::block referrer panel group collapse (GH #344)::offers no bulk controls for a single group, but the group still collapses"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #344: blocks referenced/embedded in many places showed every referrer group fully expanded — long and impossible to scan. The block-reference panel now has the same group-collapse affordance as page-level Linked References: a ▸/▾ disclosure per group and Collapse all / Expand all bulk buttons (shown when more than one group), reusing the existing .reference-group-header/.reference-group-disclosure/.reference-bulk-controls chrome (no new CSS). Collapse hides only the group's blocks container; the source page title row keeps its navigation (open, sidebar shift-click, new-tab middle-click, context menu). State is a plain per-instance createSignal — spec-demanded locality: the test asserts referenceSectionState.collapsedGroupsFor('linked', …) stays untouched, so this never conflates with or persists as the page-level section state. Group identity keys are kind+path+page so duplicate-name pages collapse independently. jsdom render-level evidence with mocked getBlockReferrers and the LiveRefGroup stub; breadcrumb/context content inside an expanded LiveRefGroup is covered by that component's own tests."
     }
   ]
 }

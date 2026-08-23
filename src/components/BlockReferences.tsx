@@ -1,4 +1,4 @@
-import { For, Show, createResource, type JSX } from "solid-js";
+import { For, Show, createResource, createSignal, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { dataRev, graphEpoch } from "../ui";
 import { openPage, openPageInNewTab } from "../router";
@@ -19,40 +19,81 @@ export function BlockReferences(props: { id: string }): JSX.Element {
   );
   const count = () => (groups() ?? []).reduce((acc, g) => acc + g.blocks.length, 0);
 
+  // GH #344: group-level collapse for the compact title-only overview. LOCAL
+  // to this view instance — deliberately not conflated with the page-level
+  // Linked References section state. A collapsed group shows only its source
+  // page title and stays individually expandable back to its full
+  // breadcrumb + referenced-block context.
+  const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
+  const groupKey = (g: { page: string; kind: string; path?: string }) =>
+    `${g.kind}\0${g.path ?? ""}\0${g.page}`;
+  const groupCollapsed = (g: { page: string; kind: string; path?: string }) =>
+    collapsedGroups().has(groupKey(g));
+  const setGroupCollapsed = (g: { page: string; kind: string; path?: string }, value: boolean) => {
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      if (value) next.add(groupKey(g));
+      else next.delete(groupKey(g));
+      return next;
+    });
+  };
+  const setAllGroups = (value: boolean) => {
+    setCollapsedGroups(value ? new Set((groups() ?? []).map(groupKey)) : new Set<string>());
+  };
+
   return (
     <Show when={groups() && groups()!.length > 0}>
       <div class="block-references-inner">
         <div class="block-references-header">
           {count()} Linked Reference{count() === 1 ? "" : "s"}
         </div>
+        <Show when={(groups() ?? []).length > 1}>
+          <div class="reference-bulk-controls" aria-label="Reference page groups">
+            <button type="button" onClick={() => setAllGroups(true)}>Collapse all</button>
+            <button type="button" onClick={() => setAllGroups(false)}>Expand all</button>
+          </div>
+        </Show>
         <For each={groups()}>
           {(g) => (
             <div class="reference-group">
-              <div
-                class="reference-page"
-                onClick={(e) => {
-                  if (e.shiftKey) openPageInSidebar(g.page, g.kind);
-                  else openPage(g.page, g.kind);
-                }}
-                onAuxClick={(e) => {
-                  if (e.button === 1) {
+              <div class="reference-group-header">
+                <button
+                  type="button"
+                  class="reference-group-disclosure"
+                  aria-expanded={!groupCollapsed(g)}
+                  aria-label={`${groupCollapsed(g) ? "Expand" : "Collapse"} references from ${g.page}`}
+                  onClick={() => setGroupCollapsed(g, !groupCollapsed(g))}
+                >
+                  {groupCollapsed(g) ? "▸" : "▾"}
+                </button>
+                <div
+                  class="reference-page"
+                  onClick={(e) => {
+                    if (e.shiftKey) openPageInSidebar(g.page, g.kind);
+                    else openPage(g.page, g.kind);
+                  }}
+                  onAuxClick={(e) => {
+                    if (e.button === 1) {
+                      e.preventDefault();
+                      openPageInNewTab(g.page, g.kind);
+                    }
+                  }}
+                  onContextMenu={(e) => {
+                    if (!shouldOpenTextContextMenu(e.target)) return;
                     e.preventDefault();
-                    openPageInNewTab(g.page, g.kind);
-                  }
-                }}
-                onContextMenu={(e) => {
-                  if (!shouldOpenTextContextMenu(e.target)) return;
-                  e.preventDefault();
-                  openPageContextMenu(e.clientX, e.clientY, g.page, g.kind);
-                }}
-              >
-                {g.page}
+                    openPageContextMenu(e.clientX, e.clientY, g.page, g.kind);
+                  }}
+                >
+                  {g.page}
+                </div>
               </div>
-              <div class="reference-blocks">
-                {/* OG shows each referrer's ancestor breadcrumb in the block-ref
-                    panel (:breadcrumb-show? true) for "where does this live" context. */}
-                <LiveRefGroup page={g.page} kind={g.kind} blocks={g.blocks} surface="ref" showBreadcrumb />
-              </div>
+              <Show when={!groupCollapsed(g)}>
+                <div class="reference-blocks">
+                  {/* OG shows each referrer's ancestor breadcrumb in the block-ref
+                      panel (:breadcrumb-show? true) for "where does this live" context. */}
+                  <LiveRefGroup page={g.page} kind={g.kind} blocks={g.blocks} surface="ref" showBreadcrumb />
+                </div>
+              </Show>
             </div>
           )}
         </For>

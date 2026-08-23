@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
 
+- **Block reference locations can be collapsed to a compact overview** (GH #344). The expanded view you get from a block's reference-count badge now offers Collapse all / Expand all: collapsed groups show only their source page title (click any to re-expand to its breadcrumb and referenced block), making heavily referenced blocks easy to scan. The state is local to that view — the page-level Linked References section keeps its own.
+
 - **Arrow keys now move between bullets inside linked references, block references, query results, and embeds** (GH #341). Previously, pressing Up/Down while editing a block in one of those views moved the caret into the block's owning page outline — an editor that usually isn't visible there — so the cursor simply vanished. Navigation now steps through the blocks exactly as rendered in that view, while structural edits (merges, indent) keep operating on the real page outline.
 
 - **Linked References: include filter chips now combine with OR** (GH #273). Selecting two pages/tags in the filter panel previously required every backlink to reference both, so the union you meant to keep collapsed to nothing. A backlink now survives when it carries any included facet; exclude chips still subtract cumulatively, and typed search still narrows the result further.
