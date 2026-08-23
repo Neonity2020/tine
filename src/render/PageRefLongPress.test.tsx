@@ -72,10 +72,16 @@ describe("page-ref long-press gesture (GH #231)", () => {
         const r = route();
         expect(r.kind === "page" ? r.name : null).not.toBe("Some Page"); // the gesture alone never navigates
       }
-      // Releasing late fires nothing more.
+      // Releasing a completed hold must also consume the browser's
+      // compatibility click; otherwise the menu opens and then navigates away.
       anchor().dispatchEvent(touch("pointerup", 41, 62));
+      anchor().dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
       vi.advanceTimersByTime(2 * LONG_PRESS_DELAY);
       expect(contextMenu()?.kind).toBe("page");
+      {
+        const r = route();
+        expect(r.kind === "page" ? r.name : null).not.toBe("Some Page");
+      }
     } finally {
       dispose();
     }

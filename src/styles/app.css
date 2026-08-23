@@ -4748,6 +4748,10 @@ textarea {
   -webkit-touch-callout: none;
 }
 
+.tag {
+  -webkit-touch-callout: none;
+}
+
 .page-ref:hover {
   text-decoration: underline;
 }

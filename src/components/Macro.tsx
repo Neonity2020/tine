@@ -281,8 +281,10 @@ export function QueryMacro(props: {
   // A COLLAPSED query keys off the form only (no dataRev), so it fetches once for
   // its count and doesn't re-run a whole-graph scan on every save while hidden;
   // expanding it (key flips to include dataRev) refreshes it.
+  const queryRequestKey = () =>
+    `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
   const [groups] = createResource(
-    () => `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`,
+    queryRequestKey,
     async (requestKey) => {
       const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
       const searchSource = friendlySearch();
@@ -299,6 +301,7 @@ export function QueryMacro(props: {
             false
           ),
         );
+        if (queryRequestKey() !== requestKey) return [];
         setSearchExecution(execution);
         const grouped = new Map<string, RefGroup>();
         for (const hit of execution.hits) {
@@ -320,6 +323,7 @@ export function QueryMacro(props: {
           `advanced\0${page ?? ""}\0${requestKey}`,
           () => backend().runAdvancedQuery(executableForm(), page),
         );
+        if (queryRequestKey() !== requestKey) return [];
         setAdvInfo({ ran: r.ran, ignored: r.ignored, supported: r.supported });
         return r.groups;
       }
@@ -722,7 +726,9 @@ export function QueryMacro(props: {
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       const target = { name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) };
-                                      if (e.shiftKey) openPageInSidebar(target);
+                                      const dest = internalLinkDest(e);
+                                      if (dest === "sidebar") openPageInSidebar(target);
+                                      else if (dest === "background") openPageTargetInNewTab(target);
                                       else openPageTarget(target);
                                     }}
                                     onAuxClick={(e) => {

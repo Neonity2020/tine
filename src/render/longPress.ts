@@ -10,8 +10,10 @@ export const LONG_PRESS_MOVE_TOLERANCE = 10; // px — beyond it, the hold is a 
 export interface LongPressHandlers {
   onPointerDown(e: PointerEvent): void;
   onPointerMove(e: PointerEvent): void;
-  onPointerUp(): void;
-  onPointerCancel(): void;
+  onPointerUp(e: PointerEvent): void;
+  onPointerCancel(e: PointerEvent): void;
+  /** Consume the compatibility click emitted when a completed hold releases. */
+  consumeClick(): boolean;
   dispose(): void;
 }
 
@@ -27,11 +29,21 @@ export interface LongPressHandlers {
 export function createLongPress(target: () => HTMLElement | undefined): LongPressHandlers {
   let armed: { id: number; x: number; y: number } | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let firedPointer: number | null = null;
+  let clearSuppressionTimer: ReturnType<typeof setTimeout> | null = null;
+  let suppressClick = false;
   const cancel = () => {
     armed = null;
     if (timer !== null) {
       clearTimeout(timer);
       timer = null;
+    }
+  };
+  const clearSuppression = () => {
+    suppressClick = false;
+    if (clearSuppressionTimer !== null) {
+      clearTimeout(clearSuppressionTimer);
+      clearSuppressionTimer = null;
     }
   };
   return {
@@ -43,6 +55,7 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
       timer = setTimeout(() => {
         // Firing is terminal for THIS gesture; release later does nothing more.
         cancel();
+        firedPointer = armedNow.id;
         const el = target();
         if (!el) return;
         el.dispatchEvent(
@@ -61,14 +74,31 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
       const dy = e.clientY - armed.y;
       if (Math.abs(dx) > LONG_PRESS_MOVE_TOLERANCE || Math.abs(dy) > LONG_PRESS_MOVE_TOLERANCE) cancel();
     },
-    onPointerUp() {
+    onPointerUp(e: PointerEvent) {
+      if (firedPointer === e.pointerId) {
+        firedPointer = null;
+        suppressClick = true;
+        // Compatibility `click` follows pointerup immediately. Keep the guard
+        // briefly, then release it if this WebView emits no click.
+        clearSuppressionTimer = setTimeout(clearSuppression, 250);
+        e.preventDefault();
+        e.stopPropagation();
+      }
       cancel();
     },
-    onPointerCancel() {
+    onPointerCancel(e: PointerEvent) {
+      if (firedPointer === e.pointerId) firedPointer = null;
       cancel();
+    },
+    consumeClick() {
+      if (!suppressClick) return false;
+      clearSuppression();
+      return true;
     },
     dispose() {
       cancel();
+      firedPointer = null;
+      clearSuppression();
     },
   };
 }

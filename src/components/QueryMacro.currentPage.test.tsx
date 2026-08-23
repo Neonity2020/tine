@@ -8,7 +8,7 @@ import { resetSharedQueryResultsForTests } from "../queryResultCache";
 import { doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import { openPage, route } from "../router";
 import { resetPaneLayoutToSingle } from "../panes";
-import type { RefGroup } from "../types";
+import type { QueryExecution, RefGroup } from "../types";
 
 // GH #301 (approved): a query whose text explicitly carries `<% current page %>`
 // binds that marker to the FOCUSED pane's route page and re-runs when that page
@@ -67,6 +67,22 @@ function groupsFor(...ids: string[]): RefGroup[] {
     kind: "page",
     blocks: ids.map((id) => ({ id, raw: doc.byId[id]?.raw ?? id, collapsed: false, children: [] })),
   }];
+}
+
+function searchFor(id: "rowA" | "rowB"): QueryExecution {
+  return {
+    hits: [{
+      entity: "block",
+      page: "Sheet",
+      kind: "page",
+      block: { id, raw: doc.byId[id].raw, collapsed: false, children: [] },
+      display_text: doc.byId[id].raw,
+      evidence: [],
+    }],
+    diagnostics: [],
+    explanation: { branches: [] },
+    cancelled: false,
+  };
 }
 
 function tick(): Promise<void> {
@@ -168,6 +184,29 @@ describe("query `<% current page %>` dispatch to the focused pane (GH #301)", ()
       deferred.get(String(runQuery.mock.calls[1][0]))!(groupsFor("rowB"));
       await settle();
       deferred.get(String(runQuery.mock.calls[0][0]))!(groupsFor("rowA"));
+      await settle();
+      expect(root.textContent).toContain("RowB-Presented");
+      expect(root.textContent).not.toContain("RowA-Presented");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("a stale friendly-search completion cannot overwrite the latest search presentation", async () => {
+    loadQueryDoc('{{query (search "<% current page %>")}}\ntine.view:: search');
+    const deferred = new Map<string, (result: QueryExecution) => void>();
+    const runGraphSearch = vi.spyOn(backend(), "runGraphSearch").mockImplementation(
+      (query: string) => new Promise<QueryExecution>((resolve) => deferred.set(query, resolve)),
+    );
+    openPage("Focus A", "page");
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(runGraphSearch).toHaveBeenCalledTimes(1));
+      openPage("Focus B", "page");
+      await vi.waitFor(() => expect(runGraphSearch).toHaveBeenCalledTimes(2));
+      deferred.get(String(runGraphSearch.mock.calls[1][0]))!(searchFor("rowB"));
+      await settle();
+      deferred.get(String(runGraphSearch.mock.calls[0][0]))!(searchFor("rowA"));
       await settle();
       expect(root.textContent).toContain("RowB-Presented");
       expect(root.textContent).not.toContain("RowA-Presented");

@@ -291,6 +291,11 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
     !props.tag && !isGuidePageName(targetName()) && pageIsMissing(targetName());
   const kind = (): PageKind => (isGuidePageName(targetName()) ? "page" : isJournalTitle(targetName()) ? "journal" : "page");
   const open = (e: MouseEvent) => {
+    if (longPress.consumeClick()) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     e.stopPropagation();
     const dest = internalLinkDest(e);
     if (dest === "sidebar" && !isGuidePageName(targetName())) openPageInSidebar(targetName(), kind());

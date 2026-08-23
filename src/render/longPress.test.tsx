@@ -52,6 +52,8 @@ describe("createLongPress", () => {
     expect(heard[0].clientY).toBe(60);
     // Exactly once: releasing late must not re-fire anything.
     el.dispatchEvent(pointer("pointerup", 40, 60));
+    expect(handlers.consumeClick()).toBe(true);
+    expect(handlers.consumeClick()).toBe(false);
     vi.advanceTimersByTime(2 * LONG_PRESS_DELAY);
     expect(heard).toHaveLength(1);
   });

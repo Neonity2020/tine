@@ -316,10 +316,15 @@ const [visibleMutationBusyPages, setVisibleMutationBusyPages] = createSignal<Rea
 // keeping an ephemeral local fold (embeds, GH #360) compare the epoch captured
 // at fold time: once it advances, the local fold is stale and the source
 // reclaims authority.
-const [collapseEpochById, setCollapseEpochById] = createSignal<Record<string, number>>({});
-export const collapseEpochOf = (id: string): number => collapseEpochById()[id] ?? 0;
+const [collapseEpochState, setCollapseEpochState] = createStore<{ byId: Record<string, number> }>({ byId: {} });
+export const collapseEpochOf = (id: string): number => collapseEpochState.byId[id] ?? 0;
 function bumpCollapseEpoch(id: string) {
-  setCollapseEpochById((state) => ({ ...state, [id]: (state[id] ?? 0) + 1 }));
+  setCollapseEpochState("byId", id, (epoch = 0) => epoch + 1);
+}
+function bumpCollapseEpochs(ids: readonly string[]) {
+  setCollapseEpochState("byId", produce((epochs) => {
+    for (const id of ids) epochs[id] = (epochs[id] ?? 0) + 1;
+  }));
 }
 let managedMoveQueue: Promise<void> = Promise.resolve();
 let managedHistoryReplayRunning = false;
@@ -1313,7 +1318,7 @@ export function resetStore() {
   clearAllEditorLeases();
   setManagedMoveBusyPages(new Set<string>());
   setVisibleMutationBusyPages(new Set<string>());
-  setCollapseEpochById({});
+  setCollapseEpochState("byId", {});
   managedHistoryReplayEpoch++;
   managedHistoryReplayRunning = false;
   managedHistoryCommands.length = 0;
@@ -4829,7 +4834,7 @@ export function setCollapsedDescendants(id: string, collapsed: boolean) {
       }
     })
   );
-  for (const change of changes) bumpCollapseEpoch(change.id);
+  bumpCollapseEpochs(changes.map((change) => change.id));
   markDirty(root.page);
 }
 

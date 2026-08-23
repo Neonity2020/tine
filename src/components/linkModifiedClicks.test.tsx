@@ -10,6 +10,8 @@ import { paneRouter, resetPaneLayoutToSingle } from "../panes";
 import { rightSidebar, setRightSidebar, setRightSidebarOpen, setFavorites } from "../ui";
 import { Sidebar } from "./Sidebar";
 import { NamespaceCrumb } from "./Namespace";
+import { LinkedReferences } from "./LinkedReferences";
+import { QueryMacro } from "./Macro";
 import type { RefGroup } from "../types";
 
 // GH #283 (approved contract): ONE modified-click decision across internal
@@ -207,6 +209,54 @@ describe("modified-click contract on internal links (GH #283)", () => {
       click(row, { ctrlKey: true });
       expect(tabsCount()).toBe(before + 1);
       expect(newBackgroundPage()).toBe("Fav One");
+    } finally {
+      m.dispose();
+    }
+  });
+
+  it("linked-reference page headers use the shared background-tab destination", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([{
+      page: "Backlink Owner",
+      kind: "page",
+      blocks: [{ id: "backlink-1", raw: "mentions [[Target]]", collapsed: false, children: [] }],
+    }]);
+    const m = mount(() => <LinkedReferences name="Target" />);
+    try {
+      const header = await vi.waitFor(() => {
+        const el = m.root.querySelector<HTMLElement>(".reference-page");
+        expect(el?.textContent).toContain("Backlink Owner");
+        return el!;
+      });
+      openPage("Elsewhere", "page");
+      const before = tabsCount();
+      click(header, { ctrlKey: true });
+      expect(tabsCount()).toBe(before + 1);
+      expect(activeRouteName()).toBe("Elsewhere");
+      expect(newBackgroundPage()).toBe("Backlink Owner");
+    } finally {
+      m.dispose();
+    }
+  });
+
+  it("legacy query-table page cells use the shared background-tab destination", async () => {
+    vi.spyOn(backend(), "runQuery").mockResolvedValue([{
+      page: "Query Owner",
+      kind: "page",
+      blocks: [{ id: "query-hit", raw: "TODO row", collapsed: false, children: [] }],
+    }]);
+    const m = mount(() => <QueryMacro body={'query (task TODO) {:table-view? true}'} />);
+    try {
+      const cell = await vi.waitFor(() => {
+        const el = m.root.querySelector<HTMLElement>(".qt-page");
+        expect(el?.textContent).toContain("Query Owner");
+        return el!;
+      });
+      openPage("Elsewhere", "page");
+      const before = tabsCount();
+      click(cell, { ctrlKey: true });
+      expect(tabsCount()).toBe(before + 1);
+      expect(activeRouteName()).toBe("Elsewhere");
+      expect(newBackgroundPage()).toBe("Query Owner");
     } finally {
       m.dispose();
     }
