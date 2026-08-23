@@ -125,6 +125,22 @@ export async function loadGraphPath(
     return { kind: "aborted" };
   }
   if (hadGraph) await flushSession();
+  if (path && (await platformKind()) === "ios") {
+    try {
+      const prepared = await backend().prepareGraphFolder(path);
+      if (prepared.status !== "ready") {
+        pushToast(
+          "TineOutline can only open folders inside On My iPhone or iCloud Drive → TineOutline.",
+          "error",
+          { sticky: true }
+        );
+        return { kind: "aborted" };
+      }
+    } catch (error) {
+      pushToast(`Couldn't prepare the iCloud graph. (${String(error)})`, "error", { sticky: true });
+      return { kind: "aborted" };
+    }
+  }
   if (!(await authorizeGraphAccess(path))) return { kind: "aborted" };
   // This is the last await before the backend graph binding can change.  Flush
   // delayed view state plus complete highlight/area mutations under A; only a
@@ -534,7 +550,10 @@ export async function switchGraph(): Promise<LoadGraphPathOutcome> {
       pushToast('Grant "All files access" for Tine, then tap Open again.', "info");
     }
     if (platform === "ios" && result.status === "refused") {
-      pushToast("Tine can only open folders inside On My iPhone → Tine.", "info");
+      pushToast(
+        "Choose a folder inside On My iPhone or iCloud Drive → TineOutline. Other Files providers aren't supported yet.",
+        "info"
+      );
     }
     return { kind: "aborted" };
   }
@@ -555,10 +574,40 @@ async function openPickedGraphPath(path: string): Promise<LoadGraphPathOutcome> 
  *  narrated demo graph there, open it, and land on the "Welcome to Tine" tour.
  *  No-op if the folder picker is cancelled. */
 export async function createNewGraph(): Promise<LoadGraphPathOutcome> {
-  const dir = (await isMobile())
-    ? await backend().defaultGraphParent()
-    : await backend().pickFolder("Choose where to create your new graph");
+  const platform = await platformKind();
+  let dir: string | null;
+  if (platform === "ios") {
+    const result = await backend().pickGraphFolder();
+    if (result.status === "refused") {
+      pushToast(
+        "Choose a folder inside On My iPhone or iCloud Drive → TineOutline. Other Files providers aren't supported yet.",
+        "info"
+      );
+      return { kind: "aborted" };
+    }
+    dir = result.status === "picked" ? result.path : null;
+  } else {
+    dir = (await isMobile())
+      ? await backend().defaultGraphParent()
+      : await backend().pickFolder("Choose where to create your new graph");
+  }
   if (!dir) return { kind: "aborted" };
+  if (platform === "ios") {
+    try {
+      const prepared = await backend().prepareGraphFolder(dir);
+      if (prepared.status !== "ready") {
+        pushToast(
+          "TineOutline can only create graphs inside On My iPhone or iCloud Drive → TineOutline.",
+          "error",
+          { sticky: true }
+        );
+        return { kind: "aborted" };
+      }
+    } catch (error) {
+      pushToast(`Couldn't prepare the iCloud location. (${String(error)})`, "error", { sticky: true });
+      return { kind: "aborted" };
+    }
+  }
   let root: string;
   try {
     root = await backend().createGraph(dir);

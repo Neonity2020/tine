@@ -1,15 +1,23 @@
-import { createEffect, createSignal, onCleanup, Show, type JSX } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { switchGraph, createNewGraph } from "../graph";
 import { isTauri } from "../backend";
 import { WindowControls } from "./WindowChrome";
 import { osDrawsWindowControls } from "../nativeChrome";
 import { registerTransientLayer } from "../transientLayers";
+import { platformKind } from "../platform";
 
 /** First-run onboarding. Shown (as a full-cover layer) when the app starts with
  *  no graph configured: choose to open an existing Logseq graph, or create a new
  *  one that comes pre-loaded with a short guided demo. */
 export function Welcome(props: { onClose?: () => void } = {}): JSX.Element {
   const [busy, setBusy] = createSignal<null | "open" | "create">(null);
+  const [ios, setIos] = createSignal(false);
+
+  onMount(() => {
+    void platformKind()
+      .then((platform) => setIos(platform === "ios"))
+      .catch(() => setIos(false));
+  });
 
   const run = (which: "open" | "create", fn: () => Promise<unknown>) => async () => {
     if (busy()) return;
@@ -54,6 +62,12 @@ export function Welcome(props: { onClose?: () => void } = {}): JSX.Element {
         </p>
 
         <div class="welcome-actions">
+          <Show when={ios()}>
+            <p class="welcome-busy">
+              On iPhone and iPad, graphs can live in On My iPhone or iCloud Drive → TineOutline.
+              Other Files providers aren't supported yet.
+            </p>
+          </Show>
           <button
             class="welcome-choice"
             disabled={!!busy()}

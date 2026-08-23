@@ -5,8 +5,11 @@ import UniformTypeIdentifiers
 
 final class GraphFolderPickerPlugin: Plugin, UIDocumentPickerDelegate {
   private static let markerName = ".tine-container"
+  private static let iCloudContainerIdentifier = "iCloud.page.tine.Tine"
+  private static let materializationTimeout: TimeInterval = 120
 
   private var documentsURL: URL?
+  private var iCloudDocumentsURL: URL?
   private var containerSetupError: String?
   private var pendingInvoke: Invoke?
 
@@ -44,6 +47,84 @@ final class GraphFolderPickerPlugin: Plugin, UIDocumentPickerDelegate {
     return documents.standardizedFileURL.resolvingSymlinksInPath()
   }
 
+  private static func prepareICloudDocumentsContainer() throws -> URL? {
+    guard FileManager.default.ubiquityIdentityToken != nil else { return nil }
+    guard let container = FileManager.default.url(
+      forUbiquityContainerIdentifier: iCloudContainerIdentifier
+    ) else { return nil }
+
+    let documents = container.appendingPathComponent("Documents", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: documents,
+      withIntermediateDirectories: true,
+      attributes: nil
+    )
+    let marker = documents.appendingPathComponent(markerName, isDirectory: false)
+    if !FileManager.default.fileExists(atPath: marker.path) {
+      try Data().write(to: marker, options: .atomic)
+    }
+    return documents.standardizedFileURL.resolvingSymlinksInPath()
+  }
+
+  private static func isInside(_ selected: URL, container: URL) -> Bool {
+    let selectedPath = selected.standardizedFileURL.resolvingSymlinksInPath().path
+    let containerPath = container.standardizedFileURL.resolvingSymlinksInPath().path
+    return selectedPath == containerPath || selectedPath.hasPrefix(containerPath + "/")
+  }
+
+  private static func downloadUbiquitousContents(at root: URL) throws {
+    let fileManager = FileManager.default
+    if fileManager.isUbiquitousItem(at: root) {
+      try fileManager.startDownloadingUbiquitousItem(at: root)
+    }
+    let keys: [URLResourceKey] = [
+      .isDirectoryKey,
+      .isUbiquitousItemKey,
+      .ubiquitousItemDownloadingStatusKey,
+      .ubiquitousItemDownloadingErrorKey,
+    ]
+    let deadline = Date().addingTimeInterval(materializationTimeout)
+
+    while true {
+      var pending = 0
+      guard let enumerator = fileManager.enumerator(
+        at: root,
+        includingPropertiesForKeys: keys,
+        options: [],
+        errorHandler: { _, _ in false }
+      ) else {
+        throw NSError(
+          domain: "page.tine.app.folder-picker",
+          code: 3,
+          userInfo: [NSLocalizedDescriptionKey: "TineOutline couldn't enumerate the iCloud graph."]
+        )
+      }
+
+      for case let item as URL in enumerator {
+        let values = try item.resourceValues(forKeys: Set(keys))
+        if let error = values.ubiquitousItemDownloadingError { throw error }
+        guard values.isUbiquitousItem == true else { continue }
+        if values.ubiquitousItemDownloadingStatus != .current {
+          try fileManager.startDownloadingUbiquitousItem(at: item)
+          pending += 1
+        }
+      }
+
+      if pending == 0 { return }
+      if Date() >= deadline {
+        throw NSError(
+          domain: "page.tine.app.folder-picker",
+          code: 4,
+          userInfo: [
+            NSLocalizedDescriptionKey:
+              "The iCloud graph is still downloading. Keep TineOutline open and try again."
+          ]
+        )
+      }
+      Thread.sleep(forTimeInterval: 0.25)
+    }
+  }
+
   @available(iOS 14.0, *)
   @objc public func pickGraphFolder(_ invoke: Invoke) {
     guard let documentsURL else {
@@ -53,23 +134,62 @@ final class GraphFolderPickerPlugin: Plugin, UIDocumentPickerDelegate {
       return
     }
 
-    DispatchQueue.main.async {
-      guard self.pendingInvoke == nil else {
-        invoke.reject("A folder picker is already open.")
-        return
-      }
-      guard let viewController = self.manager.viewController else {
-        invoke.reject("Tine couldn't present the iOS folder picker.")
-        return
-      }
+    DispatchQueue.global(qos: .userInitiated).async {
+      let iCloudDocuments = try? Self.prepareICloudDocumentsContainer()
+      DispatchQueue.main.async {
+        guard self.pendingInvoke == nil else {
+          invoke.reject("A folder picker is already open.")
+          return
+        }
+        guard let viewController = self.manager.viewController else {
+          invoke.reject("Tine couldn't present the iOS folder picker.")
+          return
+        }
 
-      self.pendingInvoke = invoke
-      let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
-      picker.delegate = self
-      picker.directoryURL = documentsURL
-      picker.allowsMultipleSelection = false
-      picker.modalPresentationStyle = .fullScreen
-      viewController.present(picker, animated: true)
+        self.pendingInvoke = invoke
+        self.iCloudDocumentsURL = iCloudDocuments
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
+        picker.delegate = self
+        picker.directoryURL = iCloudDocuments ?? documentsURL
+        picker.allowsMultipleSelection = false
+        picker.modalPresentationStyle = .fullScreen
+        viewController.present(picker, animated: true)
+      }
+    }
+  }
+
+  @objc public func prepareGraphFolder(_ invoke: Invoke) {
+    struct Args: Decodable { let path: String }
+
+    do {
+      let args = try invoke.parseArgs(Args.self)
+      let selected = URL(fileURLWithPath: args.path, isDirectory: true)
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          guard let local = self.documentsURL else {
+            throw NSError(
+              domain: "page.tine.app.folder-picker",
+              code: 2,
+              userInfo: [NSLocalizedDescriptionKey: "TineOutline's local Documents container is unavailable."]
+            )
+          }
+          if Self.isInside(selected, container: local) {
+            invoke.resolve(["status": "ready", "location": "local"])
+            return
+          }
+          if let iCloud = try Self.prepareICloudDocumentsContainer(),
+             Self.isInside(selected, container: iCloud) {
+            try Self.downloadUbiquitousContents(at: selected)
+            invoke.resolve(["status": "ready", "location": "icloud"])
+            return
+          }
+          invoke.resolve(["status": "refused"])
+        } catch {
+          invoke.reject(error.localizedDescription)
+        }
+      }
+    } catch {
+      invoke.reject(error.localizedDescription)
     }
   }
 
@@ -85,13 +205,13 @@ final class GraphFolderPickerPlugin: Plugin, UIDocumentPickerDelegate {
     }
 
     let resolved = selected.standardizedFileURL.resolvingSymlinksInPath()
-    let documentsPath = documentsURL.path
-    let selectedPath = resolved.path
-    let isInsideDocuments = selectedPath == documentsPath
-      || selectedPath.hasPrefix(documentsPath + "/")
+    let isInsideLocal = Self.isInside(resolved, container: documentsURL)
+    let isInsideICloud = iCloudDocumentsURL.map {
+      Self.isInside(resolved, container: $0)
+    } ?? false
 
-    if isInsideDocuments {
-      invoke.resolve(["status": "picked", "path": selectedPath])
+    if isInsideLocal || isInsideICloud {
+      invoke.resolve(["status": "picked", "path": resolved.path])
     } else {
       invoke.resolve(["status": "refused"])
     }

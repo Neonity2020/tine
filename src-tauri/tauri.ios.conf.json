@@ -7,5 +7,11 @@
         "title": "Tine"
       }
     ]
+  },
+  "bundle": {
+    "iOS": {
+      "developmentTeam": "RQ5V4LK7N2",
+      "minimumSystemVersion": "14.0"
+    }
   }
 }

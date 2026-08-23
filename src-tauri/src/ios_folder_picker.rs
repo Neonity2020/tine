@@ -29,12 +29,30 @@ pub(crate) struct GraphFolderPickResult {
     path: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareGraphFolderPayload<'a> {
+    path: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct PrepareGraphFolderResult {
+    status: String,
+    location: Option<String>,
+}
+
 pub(crate) struct IosFolderPicker<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> IosFolderPicker<R> {
     fn pick_graph_folder(&self) -> Result<GraphFolderPickResult, String> {
         self.0
             .run_mobile_plugin("pickGraphFolder", ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn prepare_graph_folder(&self, path: &str) -> Result<PrepareGraphFolderResult, String> {
+        self.0
+            .run_mobile_plugin("prepareGraphFolder", PrepareGraphFolderPayload { path })
             .map_err(|e| e.to_string())
     }
 }
@@ -45,6 +63,15 @@ pub(crate) async fn pick_graph_folder<R: Runtime>(
     picker: State<'_, IosFolderPicker<R>>,
 ) -> Result<GraphFolderPickResult, String> {
     picker.pick_graph_folder()
+}
+
+#[tauri::command]
+pub(crate) async fn prepare_graph_folder<R: Runtime>(
+    _app: AppHandle<R>,
+    picker: State<'_, IosFolderPicker<R>>,
+    path: String,
+) -> Result<PrepareGraphFolderResult, String> {
+    picker.prepare_graph_folder(&path)
 }
 
 fn init_ios<R: Runtime, C: serde::de::DeserializeOwned>(

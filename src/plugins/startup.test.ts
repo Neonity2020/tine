@@ -74,6 +74,25 @@ afterEach(() => {
 });
 
 describe("community extension startup revocations", () => {
+  it("keeps the Wasm plugin host off on iOS while retaining inert themes", async () => {
+    const api = backend();
+    vi.spyOn(api, "appPlatform").mockResolvedValue("ios");
+    vi.spyOn(api, "loadPluginRegistryCache").mockResolvedValue({ kind: "absent" });
+    vi.spyOn(api, "getAppString").mockImplementation(async (key, fallback) => key === "theme.packages.v1" ? "[]" : fallback);
+    const listInstalled = vi.spyOn(api, "listInstalledPlugins");
+    const initializePlugins = vi.spyOn(pluginManager, "initialize");
+    vi.stubGlobal("fetch", vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    })));
+
+    const startup = await startCommunityExtensions({ cacheTimeoutMs: 100, networkTimeoutMs: 10, platform: "ios" });
+    await startup.pluginInitialization;
+    await startup.liveRefresh;
+
+    expect(initializePlugins).not.toHaveBeenCalled();
+    expect(listInstalled).not.toHaveBeenCalled();
+  });
+
   it("verifies cached revocations before plugin activation while the live fetch stalls", async () => {
     const api = backend();
     vi.spyOn(api, "loadPluginRegistryCache").mockResolvedValue({

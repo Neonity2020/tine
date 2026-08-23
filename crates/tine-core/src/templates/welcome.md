@@ -22,5 +22,5 @@ icon:: 👋
 	- [[Features/Sheets]] — grids, field tables, and task boards over plain bullets.
 	- [[Features/PDF annotation]] — highlight PDFs and turn them into linked notes.
 	- [[Features/Plugins]] — add small capability-limited extensions or token themes without giving code unrestricted access to Tine.
-	- [[Features/Managed sync]] — learn about the separate, opt-in **Testing only** mode for operation-backed sync that keeps your Markdown/Org graph in place.
+	- [[Features/Managed sync]] — learn about the separate, opt-in, **known-buggy** mode for operation-backed sync that keeps your Markdown/Org graph in place.
 	- When you're ready, point Tine at your **own** Logseq graph: open Settings (**t s**) and pick a different folder — [[Start/Bring an existing graph]] walks you through it. Your notes stay exactly where they are.

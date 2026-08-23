@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { GraphFolderPickResult } from "./backend";
+import type { GraphFolderPickResult, PreparedGraphFolder } from "./backend";
 import type { GraphMeta, PageDto } from "./types";
 
 const META: GraphMeta = {
@@ -67,6 +67,9 @@ async function loadHarness(
     }),
     readCustomCss: vi.fn(async () => ""),
     pickGraphFolder: vi.fn(async () => pickerResult),
+    prepareGraphFolder: vi.fn(async (): Promise<PreparedGraphFolder> => ({ status: "ready", location: "local" })),
+    defaultGraphParent: vi.fn(async () => "/mock"),
+    createGraph: vi.fn(async () => META.root),
     pageAliases: vi.fn(async () => [["page1", "other"], ["shortcut", "other"]] as [string, string][]),
     listPages: vi.fn(async () => [
       { name: "page1", kind: "page" as const, date_key: null, path: "pages/page1.md" },
@@ -148,9 +151,9 @@ async function loadHarness(
   vi.doMock("./guide", () => ({ maybeShowGuideAnnouncement: vi.fn() }));
   vi.doMock("./editorController", () => ({ endEdit: vi.fn() }));
 
-  const { ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph } = await import("./graph");
+  const { createNewGraph, ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph } = await import("./graph");
   return {
-    ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph,
+    createNewGraph, ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph,
     api, events, setAliasMap, pushToast,
     drainPdfWork, retirePdfOwnership, activatePdfOwnership, closePdf,
     applyTemplateVars, prepareTemplateVars,
@@ -172,6 +175,7 @@ describe("mobile graph folder picker", () => {
 
     await expect(harness.switchGraph()).resolves.toEqual({ kind: "loaded", root: META.root });
     expect(harness.api.pickGraphFolder).toHaveBeenCalledOnce();
+    expect(harness.api.prepareGraphFolder).toHaveBeenCalledWith(META.root);
     expect(harness.api.loadGraph).toHaveBeenCalledWith(META.root);
   });
 
@@ -188,9 +192,42 @@ describe("mobile graph folder picker", () => {
     await expect(harness.switchGraph()).resolves.toEqual({ kind: "aborted" });
     expect(harness.api.loadGraph).not.toHaveBeenCalled();
     expect(harness.pushToast).toHaveBeenCalledWith(
-      "Tine can only open folders inside On My iPhone → Tine.",
+      "Choose a folder inside On My iPhone or iCloud Drive → TineOutline. Other Files providers aren't supported yet.",
       "info"
     );
+  });
+
+  it("prepares the chosen iCloud location before creating an iOS graph", async () => {
+    const harness = await loadHarness(
+      null,
+      undefined,
+      true,
+      true,
+      "ios",
+      { status: "picked", path: META.root }
+    );
+
+    await expect(harness.createNewGraph()).resolves.toEqual({ kind: "loaded", root: META.root });
+    expect(harness.api.pickGraphFolder).toHaveBeenCalledOnce();
+    expect(harness.api.defaultGraphParent).not.toHaveBeenCalled();
+    expect(harness.api.prepareGraphFolder).toHaveBeenNthCalledWith(1, META.root);
+    expect(harness.api.createGraph).toHaveBeenCalledWith(META.root);
+  });
+
+  it("refuses an iOS graph before native graph inspection when its container is outside scope", async () => {
+    const harness = await loadHarness(
+      null,
+      undefined,
+      true,
+      false,
+      "ios",
+      { status: "picked", path: META.root }
+    );
+    harness.api.prepareGraphFolder.mockResolvedValue({ status: "refused" });
+
+    await expect(harness.switchGraph()).resolves.toEqual({ kind: "aborted" });
+    expect(harness.api.inspectGraphAccess).not.toHaveBeenCalled();
+    expect(harness.api.loadGraph).not.toHaveBeenCalled();
   });
 
   it("keeps a partial-provider picked graph failure sticky and retries the same target", async () => {

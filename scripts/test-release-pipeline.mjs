@@ -28,6 +28,10 @@ const commit = "a".repeat(40);
 const repository = "martinkoutecky/tine";
 const layout = releaseLayout(version);
 const releaseWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/release.yml"), "utf8");
+const iosTestFlightWorkflow = fs.readFileSync(
+  path.join(process.cwd(), ".github/workflows/ios-testflight.yml"),
+  "utf8"
+);
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
 const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
@@ -55,6 +59,16 @@ const issue295Scenario = fs.readFileSync(
 );
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
 const referenceParity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-og-parity-references.mjs"), "utf8");
+const iosConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), "src-tauri/tauri.ios.conf.json"), "utf8"));
+const iosInfoPlist = fs.readFileSync(path.join(process.cwd(), "src-tauri/Info.ios.plist"), "utf8");
+const iosEntitlements = fs.readFileSync(path.join(process.cwd(), "src-tauri/Tine.ios.entitlements"), "utf8");
+const iosPrivacyManifest = fs.readFileSync(
+  path.join(process.cwd(), "src-tauri/PrivacyInfo.xcprivacy"),
+  "utf8"
+);
+const aboutTab = fs.readFileSync(path.join(process.cwd(), "src/components/AboutTab.tsx"), "utf8");
+const websiteIndex = fs.readFileSync(path.join(process.cwd(), "website/index.html"), "utf8");
+const websitePrivacy = fs.readFileSync(path.join(process.cwd(), "website/privacy.html"), "utf8");
 const windowsScenarios = [
   "e2e-windows-smoke.mjs",
   "e2e-og-parity-references.mjs",
@@ -204,6 +218,180 @@ assert.match(
   /name: Verify Android 9 native-loader compatibility[\s\S]*?unzip -p "\$apk" lib\/arm64-v8a\/libtine_lib\.so[\s\S]*?readelf --dyn-syms --wide[\s\S]*?renameat2/,
   "Android release packaging must inspect the final APK native library and reject the API-30 renameat2 wrapper"
 );
+
+// Apple distribution is fail-closed and stays deliberately separate from
+// publication: the desktop release lane proves Developer ID notarization, while
+// iOS is manual-only and defaults to preserving a signed artifact without upload.
+assert.match(
+  releaseWorkflow,
+  /name: Prepare macOS signing and notarization credentials[\s\S]*?if: matrix\.lane == 'macos-universal'[\s\S]*?APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}[\s\S]*?APPLE_API_PRIVATE_KEY: \$\{\{ secrets\.APPLE_API_PRIVATE_KEY \}\}[\s\S]*?security create-keychain[\s\S]*?security import "\$p12"[\s\S]*?-f pkcs12[\s\S]*?security find-identity[\s\S]*?chmod 600 "\$key_path"[\s\S]*?APPLE_API_KEY_PATH=\$key_path/,
+  "macOS release signing does not explicitly install the Developer ID identity or protect the temporary App Store Connect key"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Build Tauri bundles\n\s+if: matrix\.lane != 'macos-universal'[\s\S]*?name: Build signed and notarized macOS bundles\n\s+if: matrix\.lane == 'macos-universal'[\s\S]*?APPLE_SIGNING_IDENTITY: \$\{\{ secrets\.APPLE_SIGNING_IDENTITY \}\}[\s\S]*?APPLE_API_ISSUER: \$\{\{ secrets\.APPLE_API_ISSUER \}\}/,
+  "Apple signing secrets are not isolated to the macOS release lane"
+);
+const macosBuildBlock = releaseWorkflow.match(
+  /name: Build signed and notarized macOS bundles[\s\S]*?run: npm run tauri build -- \$\{\{ matrix\.args \}\}/
+)?.[0] ?? "";
+assert.doesNotMatch(
+  macosBuildBlock,
+  /APPLE_CERTIFICATE(?:_PASSWORD)?:/,
+  "the macOS Tauri build must use the explicitly installed identity instead of re-importing the PKCS#12 file"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Verify macOS signature and stapled notarization ticket[\s\S]*?codesign --verify --deep --strict[\s\S]*?Authority=Developer ID Application:[\s\S]*?TeamIdentifier=\$APPLE_TEAM_ID[\s\S]*?xcrun stapler validate[\s\S]*?spctl --assess[\s\S]*?hdiutil verify/,
+  "the macOS lane does not independently prove signing, notarization, Gatekeeper acceptance, and DMG integrity"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Remove macOS signing material\n\s+if: always\(\) && matrix\.lane == 'macos-universal'[\s\S]*?security delete-keychain[\s\S]*?app-store-connect-private-keys/,
+  "temporary macOS signing material is not cleaned after failures"
+);
+
+assert.doesNotMatch(iosTestFlightWorkflow, /\n\s+push:/, "TestFlight workflow must never run on push");
+assert.match(iosTestFlightWorkflow, /workflow_dispatch:[\s\S]*?default: build-only[\s\S]*?- validate[\s\S]*?- upload/);
+assert.match(iosTestFlightWorkflow, /permissions:\n\s+contents: read/);
+assert.match(
+  iosTestFlightWorkflow,
+  /name: Require iOS distribution secrets[\s\S]*?IOS_CERTIFICATE[\s\S]*?IOS_MOBILE_PROVISION[\s\S]*?inputs\.action[^\n]*!= "build-only"[\s\S]*?APPLE_API_PRIVATE_KEY/,
+  "the iOS workflow does not distinguish local signing secrets from optional App Store Connect actions"
+);
+assert.match(
+  iosTestFlightWorkflow,
+  /uses: swatinem\/rust-cache@v2[\s\S]*?cache-on-failure: true/,
+  "the expensive iOS target cache is not preserved after post-build contract failures",
+);
+assert.match(
+  iosTestFlightWorkflow,
+  /name: Install iCloud entitlements and manual signing config[\s\S]*?npm run ios:prepare-project[\s\S]*?name: Build signed TestFlight IPA[\s\S]*?--export-method app-store-connect[\s\S]*?--build-number "\$\{GITHUB_RUN_NUMBER\}"/,
+  "TestFlight builds do not use a unique build number and the App Store Connect export method"
+);
+assert.match(
+  iosTestFlightWorkflow,
+  /name: Install iOS signing materials[\s\S]*?security import "\$p12"[\s\S]*?-t cert -f pkcs12[\s\S]*?security set-key-partition-list[\s\S]*?security find-identity[\s\S]*?security cms -D -i "\$profile"[\s\S]*?Provisioning Profiles[\s\S]*?IOS_PROVISIONING_PROFILE_UUID/,
+  "iOS signing must explicitly import PKCS#12 and the provisioning profile on macOS 26"
+);
+const iosWorkflowLines = iosTestFlightWorkflow.split(/\r?\n/);
+const iosBuildStep = yamlNamedStep(iosWorkflowLines, "Build signed TestFlight IPA").join("\n");
+assert.doesNotMatch(
+  iosBuildStep,
+  /IOS_(?:CERTIFICATE|CERTIFICATE_PASSWORD|MOBILE_PROVISION):/,
+  "Tauri must not repeat its broken signing-input mutation after explicit Xcode project setup"
+);
+assert.match(
+  iosTestFlightWorkflow,
+  /name: Verify signed IPA contract[\s\S]*?expect_plist[\s\S]*?CFBundleIdentifier[\s\S]*?page\.tine\.Tine[\s\S]*?CFBundleDisplayName[\s\S]*?TineOutline[\s\S]*?root privacy manifest[\s\S]*?embedded provisioning profile[\s\S]*?com\.apple\.developer\.icloud-container-identifiers[\s\S]*?codesign --verify --deep --strict[\s\S]*?CloudDocuments/,
+  "the signed IPA is not checked against Tine's identity, privacy, provisioning, and signature contract"
+);
+assert.match(iosTestFlightWorkflow, /name: Validate IPA with App Store Connect\n\s+if: inputs\.action != 'build-only'/);
+assert.match(iosTestFlightWorkflow, /name: Upload IPA to TestFlight\n\s+if: inputs\.action == 'upload'/);
+assert.match(
+  iosTestFlightWorkflow,
+  /name: Remove Apple signing material\n\s+if: always\(\)[\s\S]*?security delete-keychain[\s\S]*?\.appstoreconnect\/private_keys/,
+  "temporary iOS App Store Connect authentication is not cleaned after failures"
+);
+assert.doesNotMatch(
+  iosTestFlightWorkflow,
+  /contents:\s*write|git tag|git push|gh release|submit-for-review|release-to-users/i,
+  "the TestFlight lane may publish source/releases or submit a production App Store release"
+);
+
+assert.equal(iosConfig.app.windows.length, 1, "iOS must retain its single-window contract");
+assert.equal(iosConfig.app.windows[0].label, "main");
+assert.equal(iosConfig.bundle.iOS.developmentTeam, "RQ5V4LK7N2");
+assert.equal(iosConfig.bundle.iOS.minimumSystemVersion, "14.0");
+assert.equal(iosConfig.bundle.resources, undefined, "the privacy manifest must not be nested under Tauri's assets folder");
+assert.match(iosInfoPlist, /<key>CFBundleDisplayName<\/key>\s*<string>TineOutline<\/string>/);
+assert.match(iosInfoPlist, /<key>ITSAppUsesNonExemptEncryption<\/key>\s*<false\/>/);
+assert.match(iosInfoPlist, /<key>NSUbiquitousContainers<\/key>[\s\S]*?iCloud\.page\.tine\.Tine[\s\S]*?NSUbiquitousContainerIsDocumentScopePublic[\s\S]*?<true\/>[\s\S]*?NSUbiquitousContainerName[\s\S]*?TineOutline/);
+for (const entitlement of [
+  "com.apple.developer.icloud-container-identifiers",
+  "com.apple.developer.icloud-services",
+  "CloudDocuments",
+  "com.apple.developer.ubiquity-container-identifiers",
+  "iCloud.page.tine.Tine",
+]) {
+  assert.ok(iosEntitlements.includes(entitlement), `iOS entitlements are missing ${entitlement}`);
+}
+
+const iosPrepareFixture = fs.mkdtempSync(path.join(os.tmpdir(), "tine-ios-prepare-"));
+try {
+  const fixtureTauri = path.join(iosPrepareFixture, "src-tauri");
+  const fixtureApple = path.join(fixtureTauri, "gen", "apple");
+  const fixtureTarget = path.join(fixtureApple, "tine_iOS");
+  fs.mkdirSync(fixtureTarget, { recursive: true });
+  fs.writeFileSync(path.join(fixtureTauri, "Tine.ios.entitlements"), iosEntitlements);
+  fs.writeFileSync(path.join(fixtureTauri, "PrivacyInfo.xcprivacy"), iosPrivacyManifest);
+  fs.writeFileSync(
+    path.join(fixtureApple, "project.yml"),
+    [
+      "targets:",
+      "  tine_iOS:",
+      "    sources:",
+      "      - path: Assets.xcassets",
+      "    settings:",
+      "      base:",
+      "        ENABLE_BITCODE: false",
+      "",
+    ].join("\n"),
+  );
+  fs.writeFileSync(path.join(fixtureTarget, "tine_iOS.entitlements"), "stale");
+  const fakeXcodegen = path.join(iosPrepareFixture, "xcodegen");
+  fs.writeFileSync(fakeXcodegen, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+
+  execFileSync(process.execPath, [path.join(process.cwd(), "scripts/prepare-ios-project.mjs")], {
+    cwd: iosPrepareFixture,
+    env: {
+      ...process.env,
+      APPLE_DEVELOPMENT_TEAM: "RQ5V4LK7N2",
+      IOS_PROVISIONING_PROFILE_UUID: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+      IOS_SIGNING_IDENTITY: "Apple Distribution: Martin Koutecky (RQ5V4LK7N2)",
+      TINE_XCODEGEN_BIN: fakeXcodegen,
+    },
+    stdio: "pipe",
+  });
+
+  const preparedProject = fs.readFileSync(path.join(fixtureApple, "project.yml"), "utf8");
+  assert.match(preparedProject, /CODE_SIGN_STYLE: Manual/);
+  assert.match(preparedProject, /- path: PrivacyInfo\.xcprivacy\s+buildPhase: resources/);
+  assert.match(preparedProject, /CODE_SIGN_IDENTITY: "Apple Distribution: Martin Koutecky \(RQ5V4LK7N2\)"/);
+  assert.match(preparedProject, /PROVISIONING_PROFILE_SPECIFIER: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"/);
+  const exportOptions = fs.readFileSync(path.join(fixtureApple, "ExportOptions.plist"), "utf8");
+  assert.match(exportOptions, /<key>signingStyle<\/key>\s*<string>manual<\/string>/);
+  assert.match(exportOptions, /<key>page\.tine\.Tine<\/key>\s*<string>AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE<\/string>/);
+  assert.equal(
+    fs.readFileSync(path.join(fixtureTarget, "tine_iOS.entitlements"), "utf8"),
+    iosEntitlements,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(fixtureApple, "PrivacyInfo.xcprivacy"), "utf8"),
+    iosPrivacyManifest,
+  );
+} finally {
+  fs.rmSync(iosPrepareFixture, { recursive: true, force: true });
+}
+
+for (const declaration of [
+  "NSPrivacyTracking",
+  "NSPrivacyCollectedDataTypes",
+  "NSPrivacyAccessedAPICategoryFileTimestamp",
+  "C617.1",
+  "3B52.1",
+  "NSPrivacyAccessedAPICategorySystemBootTime",
+  "35F9.1",
+]) {
+  assert.ok(iosPrivacyManifest.includes(declaration), `iOS privacy manifest is missing ${declaration}`);
+}
+assert.match(aboutTab, /const PRIVACY = "https:\/\/tine\.page\/privacy\.html"/);
+assert.match(aboutTab, /const SUPPORT_EMAIL = "mailto:support@tine\.page"/);
+assert.match(aboutTab, /nativePlatform\(\) === "desktop" \|\| nativePlatform\(\) === "android"[\s\S]*?KOFI/);
+assert.match(websiteIndex, /href="privacy\.html">Privacy<\/a>/);
+assert.match(websitePrivacy, /Tine does not upload your graph or note contents to Tine servers/);
+assert.match(websitePrivacy, /remote image, video, iframe, or other web embed/);
+assert.match(websitePrivacy, /mailto:support@tine\.page/);
 
 // Architecture guard: the expensive Linux release build must test that exact
 // binary before it can be staged for the atomic assembler/publisher. Windows

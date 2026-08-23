@@ -725,6 +725,8 @@ pub fn run() {
             android_folder_picker::pick_graph_folder,
             #[cfg(target_os = "ios")]
             ios_folder_picker::pick_graph_folder,
+            #[cfg(target_os = "ios")]
+            ios_folder_picker::prepare_graph_folder,
             android_media::capture_photo,
             android_media::start_recording,
             android_media::stop_recording,

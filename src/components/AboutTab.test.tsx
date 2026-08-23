@@ -44,6 +44,8 @@ describe("AboutTab", () => {
       expect(text).toContain("tine.page");
       expect(text).toContain("GitHub");
       expect(text).toContain("Ko-fi");
+      expect(text).toContain("Privacy");
+      expect(text).toContain("Email support");
       expect(text).not.toMatch(/created (by|with)/i);
     } finally {
       dispose();
@@ -74,6 +76,8 @@ describe("AboutTab", () => {
       await flush();
       expect(host.textContent).not.toContain("Check for updates");
       expect(host.textContent).toContain("Updates arrive through your app's distribution channel");
+      if (platform === "ios") expect(host.textContent).not.toContain("Ko-fi");
+      else expect(host.textContent).toContain("Ko-fi");
     } finally {
       dispose();
     }
@@ -88,6 +92,7 @@ describe("AboutTab", () => {
       await flush();
       expect(host.textContent).not.toContain("Check for updates");
       expect(host.textContent).not.toContain("distribution channel");
+      expect(host.textContent).not.toContain("Ko-fi");
     } finally {
       dispose();
     }

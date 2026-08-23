@@ -1956,6 +1956,9 @@ export function mockBackend(): Backend {
     async pickGraphFolder() {
       return { status: "cancelled" as const };
     },
+    async prepareGraphFolder(_path: string) {
+      return { status: "ready" as const, location: "local" as const };
+    },
     async pickFile(): Promise<string | null> {
       return null;
     },
