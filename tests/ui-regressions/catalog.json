@@ -6907,7 +6907,7 @@
         "commits": []
       },
       "platforms": ["all"],
-      "layer": "frontend-runtime",
+      "layer": "unit",
       "status": "covered",
       "coverage": {
         "tests": [
@@ -6929,7 +6929,7 @@
         "commits": []
       },
       "platforms": ["all"],
-      "layer": "native-frontend-diagnostic",
+      "layer": "native",
       "status": "covered",
       "coverage": {
         "tests": [

@@ -4499,6 +4499,28 @@
         "failBefore": "proven"
       },
       "notes": "GH #292 remained broken on v0.6.94 after activation became fast enough: creating page 20260823105223 returned `Tine-managed storage is updating this page`, exhausted the UI's 100 ms and 300 ms retries, left the draft dirty, and prevented clean close. Foreground admission advanced an earlier retained clean continuation exactly once and returned Deferred even when the continuation was finite and still making progress; every internal projection step therefore required another complete UI save request. The actor now drives the existing bounded, progress-aware retained-publication settlement before admitting the new page operation. Two identical non-progress failures still stop and defer, so a persistent filesystem error does not spin or get hidden. Fail-before injects two consecutive projection resumptions ahead of a new application page: the old contract defers the page, while the fixed actor settles its own prior work and saves it in the same request."
+    },
+    {
+      "id": "REG-MANAGED-JOURNAL-REORDER-CROSS-DAY-DERIVATIVE-20260823",
+      "title": "Rapid journal reorders followed by a cross-day move poisoned the managed runtime and flooded recovery alerts",
+      "family": "managed-storage-save-recovery",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "tine-core-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::tests::consecutive_foreground_saves_drain_without_rejecting_accepted_batches",
+          "crates/tine-core/src/sync_runtime.rs::tests::foreground_source_save_then_cross_page_move_drains_one_accepted_prefix",
+          "crates/tine-core/src/sync_runtime.rs::tests::repeated_root_reorders_then_cross_page_move_drain_causally"
+        ],
+        "scenario": "managed.journal-reorder-reorder-cross-day-drain-shutdown",
+        "failBefore": "proven"
+      },
+      "notes": "Internal v0.6.94 report: repeatedly moving a root upward inside a journal day and then across the day boundary produced `did not validate as one accepted operation` followed by a repeating `runtime binding changed` recovery flood. Two independent ordering defects composed. A second same-page edit authenticated the newer journal overlay but still eagerly validated the older clean-manifest rendering, so a legitimate reorder was refused. A correlated multi-page move could then stage directly in accepted history while its foreground page-save prefix was still pending; accepting the prefix could wake speculative dependent history and invalidate the clean runtime. Capture now uses the authenticated foreground predecessor without consulting its superseded manifest, derivative recovery admits the expected SQLite lag, and correlated multi-page transactions advance the pending foreground prefix one bounded turn at a time before staging. The exact two-journal fail-before performs two root reorders, crosses the leading root into the adjacent journal, drains to zero, and proves a safe shutdown."
     }
   ]
 }

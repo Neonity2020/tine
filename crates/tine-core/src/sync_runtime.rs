@@ -14199,7 +14199,7 @@ impl RuntimeActor {
             episode_id: episode_id.clone(),
             reason,
         };
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_exclusive_editor_turn() {
             return Ok(SyncApplicationMoveSubtreesOutcome::Deferred { episode_id, state });
         }
         let parsed_episode_id = Uuid::parse_str(&request.episode_id).map_err(|_| {
@@ -16790,6 +16790,47 @@ impl RuntimeActor {
         self.prepare_editor_turn()
     }
 
+    /// Correlated multi-page transactions are committed directly to accepted
+    /// history. They must not be staged ahead of foreground page frames whose
+    /// exact projections they causally depend on: doing so lets accepting an
+    /// older frame also wake the speculative transaction, after which a failed
+    /// caller has already mutated the engine. Advance one bounded derivative
+    /// turn and ask the caller to retry until that prefix is settled. Ordinary
+    /// same-page saves retain the low-latency overlay path and may still queue.
+    fn prepare_exclusive_editor_turn(&mut self) -> EditorTurnReadiness {
+        if let deferred @ EditorTurnReadiness::Deferred(_) = self.prepare_editor_turn() {
+            return deferred;
+        }
+        let foreground_pending = self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| managed.pending_commit.is_some() || !managed.frames.is_empty());
+        if !foreground_pending {
+            return EditorTurnReadiness::Ready;
+        }
+        let tick = self.tick_clean_foreground_derivative();
+        let foreground_pending = self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| managed.pending_commit.is_some() || !managed.frames.is_empty());
+        if !foreground_pending {
+            return EditorTurnReadiness::Ready;
+        }
+        match tick {
+            Some(
+                SyncRuntimeTick::RecoveryBlocked(_)
+                | SyncRuntimeTick::Blocked(_)
+                | SyncRuntimeTick::Failed(_)
+                | SyncRuntimeTick::Terminal(_),
+            ) => EditorTurnReadiness::Deferred(SyncEditorDeferred::BlockedRecovery {
+                batch_id: None,
+                phase: SyncLocalMutationPhase::ArchiveStage,
+                retained_publication: true,
+            }),
+            _ => EditorTurnReadiness::Deferred(SyncEditorDeferred::RetryableExternalWork),
+        }
+    }
+
     fn exact_projection_read_available(&self) -> bool {
         self.local_mutation.is_none()
             && self.terminal.is_none()
@@ -16851,6 +16892,13 @@ impl RuntimeActor {
                 prepared_editor_projection,
             )
             .map_err(|error| {
+                if runtime_debug_diagnostics_enabled() {
+                    eprintln!(
+                        "[tine] clean trusted-local preparation failed during {:?}: {}",
+                        error.phase(),
+                        error.detail()
+                    );
+                }
                 SyncEditorRequestError::ActorRefusedWithCode(
                     trusted_local_preparation_refusal_code(error.phase()),
                 )
@@ -17236,7 +17284,7 @@ impl RuntimeActor {
                     ))
                 }
             };
-            let mut session = match clean.runtime.admit_clean_mutation(&self.graph) {
+            let mut session = match clean.runtime.admit_clean_derived_recovery(&self.graph) {
                 Ok(session) => session,
                 Err(error) => {
                     return Some(SyncRuntimeTick::RecoveryBlocked(format!(
@@ -23269,6 +23317,193 @@ mod tests {
         }));
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// Repeated keyboard movement can save the same journal page several
+    /// times before the derivative worker drains its first durable frame. A
+    /// later cross-day move first waits for that prefix, so every already
+    /// projected foreground frame must remain acceptable and must not poison
+    /// the clean runtime. Regression for the v0.6.94 journal-feed recovery
+    /// toast flood reported on 2026-08-23.
+    #[test]
+    fn consecutive_foreground_saves_drain_without_rejecting_accepted_batches() {
+        let fixture =
+            ActivationFixture::nested_unicode("clean-foreground-consecutive-saves", 0xa170);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("consecutive-save fixture activates");
+        drive_initial_feed(&handle);
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let (page, revision) =
+            save_application_block_text(&handle, page, revision, "first upward move");
+        let (_page, _revision) =
+            save_application_block_text(&handle, page, revision, "second upward move");
+        assert_eq!(handle.status().unwrap().managed_local_pending, 2);
+
+        for _ in 0..64 {
+            if handle.status().unwrap().managed_local_pending == 0 {
+                break;
+            }
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Failed(_)
+                        | SyncRuntimeTick::Terminal(_)
+                ),
+                "a valid consecutive foreground prefix must drain: {tick:?}"
+            );
+        }
+        assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The journal-feed route flushes a currently edited source page and then
+    /// immediately submits the cross-page move. The foreground flush may still
+    /// be waiting in the managed-local derivative queue when the correlated
+    /// move is authored; draining that prefix afterwards must not reinterpret
+    /// the durable save as an invalid acceptance.
+    #[test]
+    fn foreground_source_save_then_cross_page_move_drains_one_accepted_prefix() {
+        let fixture = ActivationFixture::nested_unicode("clean-foreground-then-cross-page", 0xa171);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("foreground-move fixture activates");
+        let mut request = simple_application_move_request(&handle, "Foreground Move");
+
+        let (source, source_revision) = load_application_exact(&handle, &request.source_path);
+        let (source, source_revision) = save_application_block_text(
+            &handle,
+            source,
+            source_revision,
+            "edited immediately before crossing the journal boundary",
+        );
+        request.source_revision = source_revision;
+        request.roots[0].identity = source.blocks[0].id.clone();
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+
+        let moved = accepted_application_move(&handle, &request);
+        assert!(matches!(
+            moved,
+            SyncApplicationMoveSubtreesOutcome::Committed { .. }
+        ));
+        drain_managed_local(&handle);
+        assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// Match the journal-feed keyboard journey more closely: two foreground
+    /// page saves are projected first, then the leading root crosses to another
+    /// page while both save frames are still in the derivative queue.
+    #[test]
+    fn repeated_root_reorders_then_cross_page_move_drain_causally() {
+        let fixture = ActivationFixture::nested_unicode("clean-reorders-then-cross-page", 0xa172);
+        fs::write(
+            fixture.graph_root.join("diary/nested/24-07-2026.org"),
+            b"* destination journal\n",
+        )
+        .unwrap();
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("reorder-move fixture activates");
+        drive_initial_feed(&handle);
+        let (mut source, mut source_revision) =
+            load_application_exact(&handle, "diary/nested/25-07-2026.org");
+        let (destination, destination_revision) =
+            load_application_exact(&handle, "diary/nested/24-07-2026.org");
+
+        source.blocks.push(application_move_test_root("second", 0));
+        source.blocks.push(application_move_test_root("third", 0));
+        (source, source_revision) = match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: source.path.clone(),
+                    revision: source_revision,
+                },
+                page: source,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("root fixture expansion did not save: {other:?}"),
+        };
+        drain_managed_local(&handle);
+
+        source.blocks.swap(1, 2);
+        (source, source_revision) = match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: source.path.clone(),
+                    revision: source_revision,
+                },
+                page: source,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("first reorder did not save: {other:?}"),
+        };
+        source.blocks.swap(0, 1);
+        (source, source_revision) = match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: source.path.clone(),
+                    revision: source_revision,
+                },
+                page: source,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("second reorder did not save: {other:?}"),
+        };
+        assert_eq!(handle.status().unwrap().managed_local_pending, 2);
+
+        let request = SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: source.path.clone(),
+            source_revision,
+            destination_path: destination.path.clone(),
+            destination_revision,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: source.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Root {
+                position: destination.blocks.len(),
+            },
+            admission: application_move_admission(),
+        };
+        assert!(matches!(
+            accepted_application_move(&handle, &request),
+            SyncApplicationMoveSubtreesOutcome::Committed { .. }
+        ));
+        drain_managed_local(&handle);
+        assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }
