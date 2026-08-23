@@ -27,7 +27,7 @@ import { EmojiText } from "../render/emoji";
 import { backend } from "../backend";
 import { doc, ensurePageLoaded, onPageBecameReplaceable, pageByName, resolveBlockRef } from "../store";
 import { visibleBody } from "../render/block";
-import { Block, SurfaceContext } from "./Block";
+import { Block, OutlineScopeContext, SurfaceContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
 import { endEditForSurface } from "../editorController";
@@ -476,7 +476,13 @@ function BlockItem(props: {
         >
           {(n) => (
             <div id={bodyId} class="rs-item-body">
-              <Block id={n().id} />
+              {/* GH #358: a block parked here is the ROOT of this view — reuse
+                  the zoomed view's outline-scope contract so its children
+                  render regardless of the source outline's collapsed flag.
+                  Descendant collapse states stay respected. */}
+              <OutlineScopeContext.Provider value={{ roots: [n().id], forceExpandedRoot: n().id }}>
+                <Block id={n().id} forceExpanded />
+              </OutlineScopeContext.Provider>
             </div>
           )}
         </Show>

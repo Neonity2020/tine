@@ -515,7 +515,24 @@ export function QuickSwitcher(): JSX.Element {
                               swallowNextPaste = true;
                               setTimeout(() => (swallowNextPaste = false), 200);
                               openInBackground(it);
-                            } else if (e.button === 0) choose(it);
+                            } else if (e.button === 0) {
+                              // GH #288: pointer modifiers mirror the Enter-key
+                              // semantics — Ctrl/Cmd+click = background tab like
+                              // middle-click (no PRIMARY paste to swallow; the
+                              // switcher stays open), Alt+click = other pane,
+                              // Shift+click = right sidebar. Create/command rows
+                              // keep only their existing safe actions.
+                              const cmdCtrl = e.ctrlKey || e.metaKey;
+                              if (cmdCtrl && !e.altKey && !e.shiftKey && (it.t === "page" || it.t === "block")) {
+                                openInBackground(it);
+                              } else if (!switcherEmbryo() && e.shiftKey && !e.altKey && !cmdCtrl && (it.t === "page" || it.t === "block")) {
+                                chooseSidebar(it);
+                              } else if (!switcherEmbryo() && e.altKey) {
+                                void chooseOther(it);
+                              } else {
+                                choose(it);
+                              }
+                            }
                           }}
                         >
                           <Row item={it} />

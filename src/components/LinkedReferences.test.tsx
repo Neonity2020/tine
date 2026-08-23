@@ -335,3 +335,138 @@ describe("Linked References filters", () => {
     dispose();
   });
 });
+
+// GH #273: positive include chips OR (a backlink stays when ANY included
+// page/tag is present); excludes stay cumulative, zero positives is
+// unconstrained, and the text filter stays conjunctive with the facet result.
+describe("Linked References include chips OR (GH #273)", () => {
+  const mk = (
+    entries: { id: string; text: string; facets: string[] }[],
+    page = "Jul 10th, 2026"
+  ) => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([
+      {
+        page,
+        kind: "journal",
+        blocks: entries.map((entry) => block(entry.id, `${entry.text} [[My Project]]`)),
+      },
+    ]);
+    vi.spyOn(backend(), "getBacklinkFilterContext").mockResolvedValue({
+      entries: entries.map((entry) => ({
+        page,
+        kind: "journal",
+        block_id: entry.id,
+        text: entry.text,
+        facets: entry.facets,
+      })),
+    });
+  };
+
+  async function mountFiltered(entries: { id: string; text: string; facets: string[] }[]) {
+    mk(entries);
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="My Project" />, root);
+    await tick();
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
+    await tick();
+    return { root, dispose };
+  }
+
+  const chip = (root: HTMLElement, name: string) =>
+    [...root.querySelectorAll<HTMLButtonElement>(".ref-filter-chip")].find((el) =>
+      el.textContent?.replace(/\s+/g, " ").trim().startsWith(name)
+    );
+
+  const shownIds = (root: HTMLElement) =>
+    [...root.querySelectorAll<HTMLElement>(".test-ref-group")]
+      .map((el) => el.textContent)
+      .filter(Boolean)
+      .join("|");
+
+  it("union-matches any included page/tag instead of requiring all of them", async () => {
+    const { root, dispose } = await mountFiltered([
+      { id: "bk-a", text: "Note one", facets: ["work"] },
+      { id: "bk-b", text: "Note two", facets: ["fun"] },
+      { id: "bk-c", text: "Note three", facets: ["other"] },
+    ]);
+
+    chip(root, "work")!.click();
+    chip(root, "fun")!.click();
+
+    expect(root.querySelector(".references-count")?.textContent).toBe("2");
+    expect(shownIds(root)).toBe("bk-a,bk-b");
+    dispose();
+  });
+
+  it("keeps exclude chips cumulative over the included union", async () => {
+    const { root, dispose } = await mountFiltered([
+      { id: "bk-a", text: "Note one", facets: ["work", "pin"] },
+      { id: "bn", text: "Note two", facets: ["fun"] },
+      { id: "bk-c", text: "Note three", facets: ["work"] },
+    ]);
+
+    chip(root, "work")!.click();
+    chip(root, "fun")!.click();
+    expect(root.querySelector(".references-count")?.textContent).toBe("3");
+
+    // pin: off → include → exclude (clicks cycle)
+    const pin = chip(root, "pin")!;
+    pin.click();
+    pin.click();
+
+    expect(root.querySelector(".references-count")?.textContent).toBe("2");
+    expect(shownIds(root)).toBe("bn,bk-c");
+    dispose();
+  });
+
+  it("treats zero positive chips as unconstrained, as before", async () => {
+    const { root, dispose } = await mountFiltered([
+      { id: "bk-a", text: "Note one", facets: ["work", "pin"] },
+      { id: "bn", text: "Note two", facets: ["fun"] },
+      { id: "bk-c", text: "Note three", facets: ["work"] },
+    ]);
+
+    const pin = chip(root, "pin")!;
+    pin.click(); // include
+    pin.click(); // exclude
+
+    expect(root.querySelector(".references-count")?.textContent).toBe("2");
+    expect(shownIds(root)).toBe("bn,bk-c");
+    dispose();
+  });
+
+  it("folds case when matching included names", async () => {
+    const { root, dispose } = await mountFiltered([
+      { id: "bk-a", text: "Note one", facets: ["WORK"] },
+      { id: "bk-b", text: "Note two", facets: ["work"] },
+    ]);
+
+    chip(root, "WORK")!.click();
+
+    expect(root.querySelector(".references-count")?.textContent).toBe("2");
+    expect(shownIds(root)).toBe("bk-a,bk-b");
+    dispose();
+  });
+
+  it("keeps the text filter conjunctive with the included union", async () => {
+    const { root, dispose } = await mountFiltered([
+      { id: "bk-a", text: "apple pie", facets: ["work"] },
+      { id: "bk-b", text: "banana bread", facets: ["work"] },
+    ]);
+
+    chip(root, "work")!.click();
+    expect(root.querySelector(".references-count")?.textContent).toBe("2");
+
+    const search = root.querySelector<HTMLInputElement>('input[aria-label="Search linked reference text"]')!;
+    search.value = "apple";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await wait(200);
+    await tick();
+
+    expect(root.querySelector(".references-count")?.textContent).toBe("1");
+    expect(shownIds(root)).toBe("bk-a");
+    dispose();
+  });
+});

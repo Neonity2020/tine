@@ -2313,10 +2313,21 @@ export function pageVisibleOrder(pageName: string): string[] {
 }
 
 /** Model-only description of the outline currently rendered around a block.
- * Zoom uses a single root whose durable collapse is overridden for this view. */
+ * Zoom uses a single root whose durable collapse is overridden for this view.
+ *
+ * Reference/query/embed groups render an ARBITRARY display list of roots
+ * (backlink hits, query results) that is not the outline. Such a scope is
+ * `navOnly`: arrow navigation and view-local selection read it, but
+ * structural mutations (merges/indents/moves) must NOT treat the display list
+ * as the outline — they fall back to page order instead (GH #341). */
 export interface OutlineScope {
   roots: string[];
   forceExpandedRoot?: string;
+  /** A secondary surface's collapse contract (e.g. LiveRefGroup's local
+   * collapse), so the scoped visible order mirrors what is actually rendered
+   * rather than the durable `node.collapsed` flags. */
+  collapsed?: (id: string, stored: boolean) => boolean;
+  navOnly?: boolean;
 }
 
 function scopedVisibleOrder(scope: OutlineScope): string[] {
@@ -2326,7 +2337,8 @@ function scopedVisibleOrder(scope: OutlineScope): string[] {
       const node = doc.byId[id];
       if (!node) continue;
       order.push(id);
-      const expanded = !node.collapsed || id === scope.forceExpandedRoot;
+      const collapsed = scope.collapsed?.(id, node.collapsed) ?? node.collapsed;
+      const expanded = !collapsed || id === scope.forceExpandedRoot;
       if (expanded && node.children.length && !blockIsOpaqueSheetView(id)) walk(node.children);
     }
   };
@@ -3480,7 +3492,14 @@ export function splitBlock(
   // The caret offset is in editor-visible space (hidden props aren't shown), so
   // split the visible text and keep the hidden props on the original block.
   const { visible, hidden } = splitProps(node.raw, isBuiltinHidden, fmt);
-  const before = visible.slice(0, offset);
+  // GH #361: Enter at a source-line boundary — the caret sits immediately
+  // AFTER an in-block newline — turns that line into a new block WITHOUT
+  // retaining the boundary break as an empty line in either block (Logseq's
+  // behavior). The break becomes the structural separator instead.
+  const splitBefore = offset > 0 && visible[offset - 1] === "\n" ? offset - 1 : offset;
+  // `after` always starts at the caret (the first char of the new line); the
+  // consumed boundary break lives entirely in the discarded boundary char.
+  const before = visible.slice(0, splitBefore);
   const after = visible.slice(offset);
   const pageName = node.page;
   // Ordered-list items propagate: a block split off an ordered item is itself
@@ -3501,6 +3520,10 @@ export function splitBlock(
     const emptyId = freshId();
     setDoc(
       produce((s) => {
+        // At offset zero the original block is untouched. At a later line
+        // boundary, however, the blank prefix and its separator become the new
+        // empty block, so the original must retain only the post-boundary text.
+        if (offset > 0) s.byId[id].raw = joinProps(after, hidden, fmt);
         s.byId[emptyId] = {
           id: emptyId,
           raw: orderedEmpty,
@@ -3621,6 +3644,10 @@ export function mergeWithPrev(
   editingSurface: string | null = null,
 ): boolean {
   if (!blockWritable(id)) return false;
+  // A navOnly display-list scope (ref/query/embed group) is never a merge
+  // topology: merging into a rendered neighbor could weld unrelated subtrees
+  // that merely sit adjacent in the RESULT list. Fall back to page order.
+  if (scope?.navOnly) scope = null;
   const prev = prevVisible(id, scope);
   if (prev === null) return false;
   const node = doc.byId[id];
@@ -3678,6 +3705,8 @@ export function mergeWithNext(
   editingSurface: string | null = null,
 ): boolean {
   if (!blockWritable(id)) return false;
+  // See mergeWithPrev: navOnly display lists are never a merge topology.
+  if (scope?.navOnly) scope = null;
   const next = nextVisible(id, scope);
   if (next === null) return false;
   const node = doc.byId[id];

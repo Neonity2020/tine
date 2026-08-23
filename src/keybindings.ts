@@ -28,12 +28,15 @@ import {
   pushToast,
   openPdfExport,
   pdfTarget,
+  graphMeta,
   dismissMobileDrawer,
 } from "./ui";
 import { restoreDrawerFocus } from "./mobileDrawers";
 import { followLinkUnderCaret, openLinkUnderCaretInSidebar } from "./followLink";
 import { dismissTopTransient } from "./transientLayers";
 import { carryDaysBack } from "./carry";
+import { openConfiguredHomePage } from "./homePage";
+import { journalTitle, parseJournalTitle } from "./journal";
 import {
   openJournals,
   goBack,
@@ -42,7 +45,9 @@ import {
   reopenClosedTab,
   activateNextTab,
   activatePrevTab,
+  openPage,
   route,
+  sameRoute,
 } from "./router";
 import {
   undo,
@@ -75,13 +80,15 @@ import { decodeNavIntent } from "./navProtocol";
 import {
   closePane,
   focusPane,
+  adjustPaneSize,
   focusedPaneId,
   layoutHasMultiplePanes,
   layoutPaneIds,
   layoutRoot,
-  moveActiveTabToPane,
+  moveActiveTabInDirection,
   paneRouter,
   splitPane,
+  togglePaneMaximize,
   splitPaneAtSeam,
   splitRootAtEdge,
 } from "./panes";
@@ -160,10 +167,38 @@ function focusPaneInDirection(dir: PaneDirection) {
   if (target) focusPane(target);
 }
 
-function moveActiveTabInDirection(dir: PaneDirection) {
-  if (!layoutHasMultiplePanes()) return;
-  const target = nearestPaneInDirection(layoutRoot(), focusedPaneId(), dir);
-  if (target) moveActiveTabToPane(focusedPaneId(), target);
+// GH #276: the remaining Logseq journal/navigation hotstrings beside `g j`.
+// gh reuses the graph home-page resolver; when no home is configured or the
+// configured page no longer resolves, the journals landing is home (OG's
+// default) — the user-visible outcome, not a dead key.
+export function goHome() {
+  const root = graphMeta()?.root;
+  const startingRoute = { ...route() };
+  const isCurrent = () => graphMeta()?.root === root && sameRoute(route(), startingRoute);
+  void openConfiguredHomePage(root ?? "", isCurrent).then((navigated) => {
+    if (!navigated && isCurrent()) openJournals();
+  });
+}
+
+// gn/gp step calendar DAYS (local Y/M/D constructor, so month/year/leap-day
+// edges land correctly), never millisecond arithmetic. Inside a journal the
+// anchor is that journal's date via the shared title parser; anywhere else it
+// is today, per OG.
+export function goAdjacentJournal(dir: 1 | -1) {
+  const r = route();
+  const anchor =
+    r.kind === "page" && r.pageKind === "journal"
+      ? parseJournalTitle(r.name) ?? new Date()
+      : new Date();
+  const target = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + dir);
+  openPage(journalTitle(target), "journal");
+}
+
+// With no pane in the requested direction, the panes.ts implementation grows
+// the layout instead of no-op'ing (GH #282), so the single-pane gate the focus
+// commands keep does not apply here.
+function moveActiveTab(dir: PaneDirection) {
+  moveActiveTabInDirection(focusedPaneId(), dir);
 }
 
 function enterPaneSelectFromFocus() {
@@ -286,6 +321,10 @@ const COMMANDS: CommandDef[] = [
   // mod-chord, so it fires even while editing; remap it in Settings if you like.
   { id: "ui/toggle-devtools", binding: "mod+shift+j", label: "Toggle developer tools", scope: "global", run: openDevtools, global: true },
   { id: "go/journals", binding: "g j", label: "Go to journals", scope: "global", run: openJournals },
+  // GH #276: Logseq's remaining default navigation hotstrings.
+  { id: "go/home", binding: "g h", label: "Go to home page", scope: "global", run: goHome },
+  { id: "go/journal-next", binding: "g n", label: "Go to next journal day", scope: "global", run: () => goAdjacentJournal(1) },
+  { id: "go/journal-prev", binding: "g p", label: "Go to previous journal day", scope: "global", run: () => goAdjacentJournal(-1) },
   { id: "go/keyboard-shortcuts", binding: "g s", label: "Go to keyboard shortcuts", scope: "global", run: () => openSettings("shortcuts") },
   // Browser-style history nav (per-tab back/forward). Special-cased in the
   // dispatcher so they fire even while editing a block; remappable like any other.
@@ -320,10 +359,20 @@ const COMMANDS: CommandDef[] = [
   { id: "pane/focus-right", binding: "mod+alt+right", label: "Focus pane right", scope: "global", run: () => focusPaneInDirection("right"), global: true },
   { id: "pane/focus-up", binding: "mod+alt+up", label: "Focus pane up", scope: "global", run: () => focusPaneInDirection("up"), global: true },
   { id: "pane/focus-down", binding: "mod+alt+down", label: "Focus pane down", scope: "global", run: () => focusPaneInDirection("down"), global: true },
-  { id: "pane/move-tab-left", binding: "mod+alt+shift+left", label: "Move tab to pane left", scope: "global", run: () => moveActiveTabInDirection("left"), global: true },
-  { id: "pane/move-tab-right", binding: "mod+alt+shift+right", label: "Move tab to pane right", scope: "global", run: () => moveActiveTabInDirection("right"), global: true },
-  { id: "pane/move-tab-up", binding: "mod+alt+shift+up", label: "Move tab to pane up", scope: "global", run: () => moveActiveTabInDirection("up"), global: true },
-  { id: "pane/move-tab-down", binding: "mod+alt+shift+down", label: "Move tab to pane down", scope: "global", run: () => moveActiveTabInDirection("down"), global: true },
+  { id: "pane/move-tab-left", binding: "mod+alt+shift+left", label: "Move tab to pane left", scope: "global", run: () => moveActiveTab("left"), global: true },
+  { id: "pane/move-tab-right", binding: "mod+alt+shift+right", label: "Move tab to pane right", scope: "global", run: () => moveActiveTab("right"), global: true },
+  { id: "pane/move-tab-up", binding: "mod+alt+shift+up", label: "Move tab to pane up", scope: "global", run: () => moveActiveTab("up"), global: true },
+  { id: "pane/move-tab-down", binding: "mod+alt+shift+down", label: "Move tab to pane down", scope: "global", run: () => moveActiveTab("down"), global: true },
+  // GH #285: transient maximize — the pane borrows the whole pane area without
+  // touching the split tree/ratios, so toggling restores the exact layout.
+  { id: "pane/toggle-maximize", binding: "mod+alt+m", label: "Toggle maximize active pane", scope: "global", run: () => { togglePaneMaximize(); }, global: true },
+  // GH #286: resize the active pane through its nearest same-axis ancestor
+  // split (5 points a step, existing 15–85% clamps). Shipped unbound like
+  // pane/close — remappable, palette-discoverable.
+  { id: "pane/grow-width", binding: "", label: "Grow active pane width", scope: "global", run: () => { adjustPaneSize(focusedPaneId(), "width", true); }, global: true },
+  { id: "pane/shrink-width", binding: "", label: "Shrink active pane width", scope: "global", run: () => { adjustPaneSize(focusedPaneId(), "width", false); }, global: true },
+  { id: "pane/grow-height", binding: "", label: "Grow active pane height", scope: "global", run: () => { adjustPaneSize(focusedPaneId(), "height", true); }, global: true },
+  { id: "pane/shrink-height", binding: "", label: "Shrink active pane height", scope: "global", run: () => { adjustPaneSize(focusedPaneId(), "height", false); }, global: true },
   { id: "ui/toggle-theme", binding: "t t", label: "Toggle dark / light", scope: "global", run: toggleTheme },
   { id: "ui/toggle-brackets", binding: "mod+c mod+b", label: "Toggle reference brackets", scope: "global", run: () => changeShowBrackets(!showBrackets()), global: true },
   { id: "ui/toggle-left-sidebar", binding: "t l", label: "Toggle left sidebar", scope: "global", run: toggleSidebar },
@@ -393,6 +442,9 @@ const COMMANDS: CommandDef[] = [
   { id: "editor/strike-through", binding: "mod+shift+s", label: "Strikethrough", scope: "editor" },
   { id: "editor/highlight", binding: "mod+shift+h", label: "Highlight", scope: "editor" },
   { id: "editor/insert-link", binding: "mod+l", label: "Insert link", scope: "editor" },
+  // GH #279: the embed counterpart of builtin Mod+C (copy block ref) — with a
+  // text selection the handler declines so the platform's ordinary copy runs.
+  { id: "editor/copy-embed", binding: "mod+shift+c", label: "Copy block embed when no text is selected", scope: "editor" },
   { id: "editor/clear-block", binding: "alt+l", label: "Clear block content", scope: "editor" },
   // Emacs-style cursor/kill motions.
   { id: "editor/kill-line-before", binding: "alt+u", label: "Delete to line start", scope: "editor" },

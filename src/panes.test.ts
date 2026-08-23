@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  adjustPaneSize,
   closeLayoutPane,
   closePane,
   focusPane,
@@ -7,10 +8,16 @@ import {
   layoutPaneIds,
   layoutRoot,
   focusedPaneId,
+  maximizedPaneId,
+  moveActiveTabInDirection,
   moveActiveTabToPane,
   moveTabToSplitPane,
+  togglePaneMaximize,
+  visibleLayoutNode,
   paneRouter,
   resetPaneLayoutToSingle,
+  setFocusedPaneId,
+  setSplitRatio,
   splitLayoutNode,
   splitPane,
   type LayoutNode,
@@ -324,6 +331,331 @@ describe("pane layout mutations", () => {
     focusPane(target);
 
     expect(hasSelection()).toBe(false);
+  });
+});
+
+describe("moveActiveTabInDirection (GH #282)", () => {
+  it("moves the active tab into the pane that already lies in the direction", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+
+    expect(moveActiveTabInDirection("main", "right")).toBe(right);
+
+    expect(layoutPaneIds(layoutRoot())).toEqual([right]);
+    expect(focusedPaneId()).toBe(right);
+  });
+
+  it("spawns a right-hand mirror pane from a single one-tab pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+
+    const created = moveActiveTabInDirection("main", "right")!;
+
+    expect(created).toBeTruthy();
+    expect(layoutRoot()).toEqual({
+      kind: "split",
+      dir: "row",
+      ratio: 0.5,
+      children: [
+        { kind: "pane", paneId: "main" },
+        { kind: "pane", paneId: created },
+      ],
+    });
+    // One-tab source has no empty-pane route: the original tab stays and the
+    // new pane opens as a mirror of the same tab history.
+    expect(paneRouter("main").route()).toEqual({ kind: "page", name: "Source", pageKind: "page" });
+    expect(paneRouter(created).route()).toEqual({ kind: "page", name: "Source", pageKind: "page" });
+    expect(focusedPaneId()).toBe(created);
+  });
+
+  it("places the spawned pane before the source for left/up and after it for down", () => {
+    for (const [dir, axis, first] of [
+      ["left", "row", true],
+      ["up", "col", true],
+      ["down", "col", false],
+    ] as const) {
+      resetPaneLayoutToSingle(pageSnapshot("Source"));
+
+      const created = moveActiveTabInDirection("main", dir)!;
+
+      const layout = layoutRoot();
+      expect(layout.kind).toBe("split");
+      if (layout.kind !== "split") throw new Error("expected a split layout");
+      expect(layout.dir).toBe(axis);
+      expect(layout.children).toEqual(
+        first
+          ? [{ kind: "pane", paneId: created }, { kind: "pane", paneId: "main" }]
+          : [{ kind: "pane", paneId: "main" }, { kind: "pane", paneId: created }]
+      );
+      expect(paneRouter("main").route()).toMatchObject({ kind: "page", name: "Source" });
+      expect(paneRouter(created).route()).toMatchObject({ kind: "page", name: "Source" });
+      resetPaneLayoutToSingle(journalsSnapshot());
+    }
+  });
+
+  it("donates only the active tab when a multi-tab source grows a missing neighbor", () => {
+    resetPaneLayoutToSingle({
+      tabs: [
+        { history: [{ kind: "page", name: "One", pageKind: "page" }], pos: 0, pinned: false },
+        { history: [{ kind: "page", name: "Two", pageKind: "page" }], pos: 0, pinned: false },
+      ],
+      activeIndex: 0,
+    });
+
+    const created = moveActiveTabInDirection("main", "down")!;
+
+    expect(layoutRoot()).toMatchObject({ kind: "split", dir: "col" });
+    expect(paneRouter("main").tabs().map((t) => t.history[0])).toEqual([
+      { kind: "page", name: "Two", pageKind: "page" },
+    ]);
+    expect(paneRouter(created).route()).toEqual({ kind: "page", name: "One", pageKind: "page" });
+    expect(focusedPaneId()).toBe(created);
+  });
+
+  it("splits the other axis when the layout extends only horizontally", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+
+    const created = moveActiveTabInDirection("main", "down")!;
+
+    expect(layoutRoot()).toEqual({
+      kind: "split",
+      dir: "row",
+      ratio: 0.5,
+      children: [
+        {
+          kind: "split",
+          dir: "col",
+          ratio: 0.5,
+          children: [
+            { kind: "pane", paneId: "main" },
+            { kind: "pane", paneId: created },
+          ],
+        },
+        { kind: "pane", paneId: right },
+      ],
+    });
+    expect(paneRouter(created).route()).toMatchObject({ kind: "page", name: "Source" });
+    expect(focusedPaneId()).toBe(created);
+  });
+
+  it("mirrors a lone journals tab instead of refusing when there is no neighbor", () => {
+    const created = moveActiveTabInDirection("main", "right")!;
+
+    expect(created).toBeTruthy();
+    expect(layoutPaneIds(layoutRoot())).toEqual(["main", created]);
+    expect(paneRouter("main").route()).toEqual({ kind: "journals" });
+  });
+
+  it("keeps the existing refusal for a lone journals tab that already has a neighbor", () => {
+    const right = splitPane("main", "row", { focusNew: false })!;
+    focusPane("main");
+
+    expect(moveActiveTabInDirection("main", "right")).toBe(null);
+    expect(layoutPaneIds(layoutRoot())).toEqual(["main", right]);
+    expect(paneRouter("main").route()).toEqual({ kind: "journals" });
+  });
+});
+
+describe("pane maximize (GH #285)", () => {
+  it("is a no-op on a single-pane window", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+
+    expect(togglePaneMaximize("main")).toBe(false);
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+  });
+
+  it("shows only the maximized pane while keeping the real tree and ratios untouched", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+    const treeBefore = layoutRoot();
+
+    expect(togglePaneMaximize("main")).toBe(true);
+
+    expect(maximizedPaneId()).toBe("main");
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+    // Session/workspace persistence reads layoutRoot(): the full tree (with
+    // its ratio) survives maximization, so nothing transient is serialized.
+    expect(layoutRoot()).toEqual(treeBefore);
+    expect(layoutRoot()).toEqual({
+      kind: "split",
+      dir: "row",
+      ratio: 0.5,
+      children: [
+        { kind: "pane", paneId: "main" },
+        { kind: "pane", paneId: right },
+      ],
+    });
+
+    expect(togglePaneMaximize("main")).toBe(true);
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual(treeBefore);
+  });
+
+  it("keeps mutations made while maximized, restoring the evolved tree exactly", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row", { focusNew: false })!;
+    togglePaneMaximize("main");
+
+    const below = splitPane(right, "col", { focusNew: false })!;
+
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+    expect(togglePaneMaximize("main")).toBe(true);
+    expect(visibleLayoutNode()).toEqual({
+      kind: "split",
+      dir: "row",
+      ratio: 0.5,
+      children: [
+        { kind: "pane", paneId: "main" },
+        {
+          kind: "split",
+          dir: "col",
+          ratio: 0.5,
+          children: [
+            { kind: "pane", paneId: right },
+            { kind: "pane", paneId: below },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("clears when the maximized pane disappears, showing the surviving tree", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    togglePaneMaximize("main");
+
+    expect(closePane("main")).toBe(true);
+
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: right });
+    expect(layoutRoot()).toEqual({ kind: "pane", paneId: right });
+  });
+
+  it("stays engaged when a sibling pane closes, and collapses gracefully to one pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+    togglePaneMaximize("main");
+
+    expect(closePane(right)).toBe(true);
+
+    // Only the maximized pane is left; the visible surface is still just it.
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+    // Toggling again from this degenerate state still unmaximizes cleanly.
+    expect(togglePaneMaximize("main")).toBe(true);
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+  });
+
+  it("restores the full layout when focus escapes to another pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+    togglePaneMaximize("main");
+
+    focusPane(right);
+
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual(layoutRoot());
+    expect(focusedPaneId()).toBe(right);
+  });
+
+  it("restores the full layout through the shared focus-state boundary", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+    togglePaneMaximize("main");
+
+    // Session/history adapters use this lower-level boundary directly.
+    setFocusedPaneId(right);
+
+    expect(maximizedPaneId()).toBeNull();
+    expect(visibleLayoutNode()).toEqual(layoutRoot());
+    expect(focusedPaneId()).toBe(right);
+  });
+});
+
+describe("adjustPaneSize (GH #286)", () => {
+  it("is a no-op for a sole pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+
+    expect(adjustPaneSize("main", "width", true)).toBe(false);
+    expect(layoutRoot()).toEqual({ kind: "pane", paneId: "main" });
+  });
+
+  it("grows and shrinks the first child through its row split by five points", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    splitPane("main", "row");
+
+    expect(adjustPaneSize("main", "width", true)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", dir: "row", ratio: 0.55 });
+
+    expect(adjustPaneSize("main", "width", false)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", dir: "row", ratio: 0.5 });
+  });
+
+  it("moves the same ratio the other way for the second child", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+
+    expect(adjustPaneSize(right, "width", true)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.45 });
+
+    expect(adjustPaneSize(right, "width", false)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.5 });
+  });
+
+  it("adjusts height only through a column split, never through a row split", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    splitPane("main", "row");
+
+    expect(adjustPaneSize("main", "height", true)).toBe(false);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.5 });
+  });
+
+  it("walks past a nearer wrong-axis ancestor to the nearest matching one", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    const below = splitPane(right, "col")!;
+
+    // `below` sits under a col split inside the second row child: a width
+    // change must skip the nearer col ancestor and adjust the root row split.
+    expect(adjustPaneSize(below, "width", true)).toBe(true);
+
+    expect(layoutRoot()).toEqual({
+      kind: "split",
+      dir: "row",
+      ratio: 0.45, // second child holds `below`; growing it shrinks the ratio
+      children: [
+        { kind: "pane", paneId: "main" },
+        {
+          kind: "split",
+          dir: "col",
+          ratio: 0.5, // untouched — wrong axis for a width command
+          children: [
+            { kind: "pane", paneId: right },
+            { kind: "pane", paneId: below },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("respects the existing 15–85% clamps", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    splitPane("main", "row");
+    setSplitRatio([], 0.85);
+
+    expect(adjustPaneSize("main", "width", true)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.85 });
+
+    setSplitRatio([], 0.15);
+    expect(adjustPaneSize("main", "width", false)).toBe(true);
+    expect(layoutRoot()).toMatchObject({ kind: "split", ratio: 0.15 });
   });
 });
 

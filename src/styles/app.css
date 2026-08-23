@@ -648,6 +648,10 @@ textarea {
 }
 
 .tab-title {
+  /* Grow into the tab's free space so the close control stays pinned to the
+     right edge at any width; min-width: 0 keeps long titles ellipsizing. */
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -661,13 +665,20 @@ textarea {
 }
 
 .tab-close {
+  flex: none;
   opacity: 0;
-  font-size: 11px;
-  border-radius: 3px;
   padding: 0 3px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
 }
 
-.tab:hover .tab-close {
+.tab:hover .tab-close,
+.tab-close:focus-visible {
   opacity: 0.6;
 }
 
@@ -837,6 +848,17 @@ textarea {
   flex: 1;
   min-width: 0; /* shrink horizontally when the right sidebar/PDF pane is open */
   overflow-y: auto;
+}
+
+/* The pane scroller is tabindex="-1" purely as a programmatic focus target
+   (keybindings, scroll APIs); it is not an actionable control. A click on
+   empty space focuses it, and the next keypress flips the UA's focus-visible
+   heuristic, painting the default white focus frame around the whole content
+   area (GH #345). Only the UA-default frame is suppressed here: the deliberate
+   `.pane-selected` select ring and every actionable control's `:focus-visible`
+   cue live on other elements/rules and are unaffected. */
+.main-content:focus {
+  outline: none;
 }
 
 /* Solo-pane shell: a non-scrolling, positioned wrapper so the pane-select
@@ -1867,6 +1889,25 @@ textarea {
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
   display: flex;
   overflow: hidden;
+}
+/* Transient maximized Settings (GH #287): desktop only. The overlay trades
+   its large breathing gap for a small even margin and the dialog fills it —
+   near-viewport without going full-bleed. Narrow/mobile viewports keep their
+   own full-sheet rules below and must never see this geometry (it would break
+   the status-bar inset padding), so everything here is gated ≥481px. */
+@media (min-width: 481px) {
+  .modal-overlay.settings-maximized {
+    padding-top: calc(var(--overlay-inset-top) + 4vh);
+    padding-right: calc(var(--overlay-inset-right) + 4vw);
+    padding-bottom: calc(var(--overlay-inset-bottom) + 4vh);
+    padding-left: calc(var(--overlay-inset-left) + 4vw);
+  }
+  .settings-maximized .settings-modal {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+  }
 }
 /* Left tab navigation (OG-style). */
 .settings-nav {
@@ -3035,6 +3076,10 @@ textarea {
   }
   .settings-nav-title,
   .settings-nav-foot {
+    display: none;
+  }
+  /* The sheet already owns the whole viewport here — no maximize chrome. */
+  .settings-maximize {
     display: none;
   }
   .settings-nav-item {

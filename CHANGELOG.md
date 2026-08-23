@@ -18,6 +18,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Tine now publishes a plain-language privacy policy and support contact.** The in-app About tab links to both, the website links to the policy, and the policy distinguishes local graph data from the limited update, plugin-catalogue, documentation, and voluntary-support traffic Tine can make.
 
+- **New editor command: Copy block embed** (GH #279) — `Mod+Shift+C` copies `{{embed ((block-id))}}` for the current block using its durable `id::`, the embed counterpart of the existing `Mod+C` block-reference copy. Remappable in Settings → Keybindings; with text selected it gets out of the way so normal copy works.
+
+- **Logseq navigation hotstrings `gh`, `gn`, `gp`** (GH #276). `g h` opens the graph's configured home page (falling back to the journals landing when none is set — Logseq's default home), `g n` / `g p` open the next and previous journal day relative to the journal you're in (or relative to today anywhere else), in the graph's configured journal title format. All three are remappable.
+
 - **Sheets now render in the HTML export and print output for any graph.** Until now, publishing a page holding a Tine Sheet emitted only the sheet's plain-bullet twin plus the visible `tine.*` view configuration, so the presentation — columns, grouping, computed cells — disappeared. Block-powered sheets now publish as meaningful read-only views: tables with their title/declared/formula/observed columns, typed checkbox cells, aggregate footers, and arithmetic formula columns; boards grouped by state, priority, tags, or fields, including query-backed boards; and grids with their positional cells, header rows, and nested grids. Numbered list blocks (`logseq.order-list-type:: number`) keep their ordinal markers, and blocks with LOGBOOK clock rows keep an elapsed-time badge while the drawer stays hidden. This applies to both whole-graph publishing and single-page print/PDF export.
 
 ### Changed
@@ -30,6 +34,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
+
+- **Enter at an in-block line break no longer leaves an empty first line** (GH #361). Pressing Enter with the caret right after an in-block newline now turns that newline into the block boundary, matching Logseq: the previous block ends with its last text line and the new block starts with the next line's actual text — on desktop and mobile. Shift+Enter's in-block newline, mid-line splits, and Enter at the very start of a block are unchanged.
+
+- **Blocks opened in the right sidebar always show their children** (GH #358). Shift-clicking the bullet of a collapsed block parked it in the sidebar but hid its child content until you first expanded it in the main page. The sidebar now treats the opened block as the root of its own view, exactly like zooming in the main page — children always render, and deeper collapsed blocks stay collapsed as expected.
+
+- **Page-reference styling updates as soon as a referenced page gains content** (GH #355). A `[[Page]]` link could stay in the "missing page" style after its target was created later in the same session, refreshing only on restart. The existence answers now invalidate whenever the graph's page inventory changes, so links restyle immediately — both when a page appears and when one is deleted.
+
+- **Block reference locations can be collapsed to a compact overview** (GH #344). The expanded view you get from a block's reference-count badge now offers Collapse all / Expand all: collapsed groups show only their source page title and disclosure button, which re-expands the breadcrumb and referenced block while the title itself keeps its normal navigation behavior. The state is local to that view — the page-level Linked References section keeps its own.
+
+- **Arrow keys now move between bullets inside linked references, block references, query results, and embeds** (GH #341). Previously, pressing Up/Down while editing a block in one of those views moved the caret into the block's owning page outline — an editor that usually isn't visible there — so the cursor simply vanished. Navigation now steps through the blocks exactly as rendered in that view, while structural edits (merges, indent) keep operating on the real page outline.
+
+- **Linked References: include filter chips now combine with OR** (GH #273). Selecting two pages/tags in the filter panel previously required every backlink to reference both, so the union you meant to keep collapsed to nothing. A backlink now survives when it carries any included facet; exclude chips still subtract cumulatively, and typed search still narrows the result further.
+
+- **Search and Quick Switcher results support modified clicks** (GH #288). Middle-click and Ctrl/Cmd+click open a result in a background tab of the current pane while the switcher stays open, so you can fan several hits out at once; Alt+click opens in the other pane; Shift+click opens pages and blocks in the right sidebar. Ordinary clicks, Enter, and the existing Shift/Alt+Enter shortcuts are unchanged. This is the same action set the Enter-key modifiers already offered, now reachable by mouse.
+
+- **New actions: keyboard pane resizing** (GH #286). Four remappable commands — Grow/Shrink active pane width and Grow/Shrink active pane height — nudge the nearest split of the matching axis by five points per step (the existing 15–85% limits apply). They ship unbound so you can assign your own chords in Settings → Keybindings, and are also available from the command palette.
+
+- **New action: Toggle maximize active pane** (GH #285). One pane can temporarily borrow the whole pane area (sidebars untouched) — useful when limited space wraps long lines in a multi-pane split. Toggling again restores the exact split arrangement and sizes; the state never survives into sessions or workspaces. Default shortcut `Ctrl/Cmd+Alt+M`, remappable and available from the command palette.
+
+- **Move Tab to pane {left,right,up,down} now creates the pane when none exists** (GH #282). Previously the command did nothing unless a pane already lay in that direction — so from a one-pane window (the most common starting point) it never did anything at all. With several tabs in the source pane, the active tab moves into a new pane on the requested side; with only one tab, the new pane opens as a mirror of the current tab and history and the original stays, since Tine panes are never empty. Moving into an already-existing pane behaves exactly as before.
+
+- **Android: hiding the keyboard no longer taps the note behind the toolbar** (GH #336). The editor toolbar's hide-keyboard button blurred the editor on touch-down, which closed the keyboard and removed the toolbar mid-gesture, so the tap's release landed on whatever block happened to be underneath. The button now consumes the whole touch gesture.
+
+- **Calculator blocks no longer render a phantom empty line** (GH #339). After exiting edit mode, a ```calc block showed one extra blank row below the last expression (the fenced block's trailing newline was rendered as a row). Blank lines between expressions still keep their positions.
+
+- **The Settings dialog can be enlarged on desktop** (GH #287). A new maximize/restore button in the Settings header grows the dialog to nearly fill the window with a comfortable margin, preserving the selected page and scroll position; closing Settings always restores the default size. Narrow/mobile screens are unchanged — the sheet already fills the viewport there.
+
+- **Tab close buttons always sit at the tab's right edge** (GH #340). With short titles the ✕ no longer drifts to just after the text — it stays pinned rightmost at any tab width — and it is now a real keyboard-focusable button with its own "Close tab" tooltip instead of showing the tab's "Double-click to pin" hint.
+
+- **No more white frame around the page after clicking empty space and pressing a key** (GH #345). Clicking an empty spot of the main content focused the page scroller, and the next keypress flipped the browser's focus heuristic, painting its default white frame around the whole content area. Only that default frame is suppressed — the pane-select ring and the usual focus cues on buttons and other controls are unchanged.
 
 ## [0.6.94] - 2026-08-22
 

@@ -3,16 +3,20 @@ import { describe, expect, it, beforeEach, vi } from "vitest";
 let existing: string[] = [];
 const calls: string[][] = [];
 let epoch = 1;
+let inventory = 0;
+let queuedResponses: Promise<string[]>[] = [];
 
 vi.mock("./backend", () => ({
   backend: () => ({
     existingPageNames: async (names: string[]) => {
       calls.push([...names]);
+      const queued = queuedResponses.shift();
+      if (queued) return queued;
       return names.filter((name) => existing.includes(name));
     },
   }),
 }));
-vi.mock("./ui", () => ({ graphEpoch: () => epoch }));
+vi.mock("./ui", () => ({ graphEpoch: () => epoch, pageInventoryRev: () => inventory }));
 
 const { pageIsMissing, resetPageExistsBatch } = await import("./pageExistsBatch");
 
@@ -23,6 +27,8 @@ describe("pageExistsBatch", () => {
     calls.length = 0;
     existing = [];
     epoch = 1;
+    inventory = 0;
+    queuedResponses = [];
     resetPageExistsBatch();
   });
 
@@ -74,5 +80,72 @@ describe("pageExistsBatch", () => {
     pageIsMissing("swap bribery");
     await settle();
     expect(pageIsMissing("swap bribery")).toBe(false);
+  });
+
+  describe("GH #355: page-inventory changes invalidate batched answers", () => {
+    it("restyles a same-session page creation immediately (missing → existing)", async () => {
+      pageIsMissing("Later Target");
+      await settle();
+      expect(pageIsMissing("Later Target")).toBe(true);
+
+      // The physical inventory moves (savePage baseline-null create, external
+      // add, etc.): the blank-page style must flip without a restart.
+      inventory++;
+      existing = ["Later Target"];
+      pageIsMissing("Later Target");
+      await settle();
+
+      expect(pageIsMissing("Later Target")).toBe(false);
+      expect(calls).toEqual([["Later Target"], ["Later Target"]]);
+    });
+
+    it("does not leave a stale positive result after the page disappears", async () => {
+      existing = ["Gone Soon"];
+      pageIsMissing("Gone Soon");
+      await settle();
+      expect(pageIsMissing("Gone Soon")).toBe(false);
+
+      inventory++;
+      existing = [];
+      pageIsMissing("Gone Soon");
+      await settle();
+
+      expect(pageIsMissing("Gone Soon")).toBe(true);
+      expect(calls).toEqual([["Gone Soon"], ["Gone Soon"]]);
+    });
+
+    it("keeps one name asked once per (graph × inventory) state", async () => {
+      existing = ["A"];
+      pageIsMissing("A");
+      await settle();
+      pageIsMissing("A");
+      await settle();
+      expect(calls).toEqual([["A"]]);
+
+      inventory++;
+      pageIsMissing("A");
+      await settle();
+      pageIsMissing("A");
+      await settle();
+      expect(calls).toEqual([["A"], ["A"]]);
+    });
+
+    it("ignores an older inventory response that arrives after creation", async () => {
+      let resolveOld!: (names: string[]) => void;
+      queuedResponses.push(new Promise<string[]>((resolve) => { resolveOld = resolve; }));
+      pageIsMissing("Racing Target");
+      await Promise.resolve();
+
+      inventory++;
+      existing = ["Racing Target"];
+      pageIsMissing("Racing Target");
+      await settle();
+      expect(pageIsMissing("Racing Target")).toBe(false);
+
+      resolveOld([]);
+      await settle();
+      expect(pageIsMissing("Racing Target")).toBe(false);
+      expect(calls).toEqual([["Racing Target"], ["Racing Target"]]);
+    });
   });
 });

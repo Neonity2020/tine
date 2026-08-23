@@ -242,7 +242,13 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
           const entry = rootEntry(g, b);
           const facets = new Set(entry.facets.map(norm));
           const contentMatches = !searching || matcherMatches(parsed, entry.normalizedText, entry.text);
-          return contentMatches && ins.every((i) => facets.has(i)) && outs.every((o) => !facets.has(o));
+          // GH #273: positive include chips OR — a backlink stays when ANY
+          // included page/tag is present, and zero positive chips leaves the
+          // facet side unconstrained (today's behavior). Exclude chips stay
+          // cumulative and the text filter stays conjunctive with the facets.
+          return contentMatches
+            && (ins.length === 0 || ins.some((i) => facets.has(i)))
+            && outs.every((o) => !facets.has(o));
         }),
       }))
       .map((g) => {

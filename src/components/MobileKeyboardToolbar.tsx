@@ -126,8 +126,26 @@ export function MobileKeyboardToolbar(): JSX.Element {
     if (isMobilePlatform) queueMicrotask(updateDock);
   });
 
+  // GH #336: the hide button's pointerdown blurs the editor, which drops the
+  // keyboard and would unmount this toolbar MID-GESTURE — Android then delivers
+  // the gesture's synthesized pointerup/click to whatever moved underneath
+  // ("touch-through" onto the page). Stay mounted until the trailing click is
+  // consumed here, with a short safety window for pointercancel/lost events.
+  const [hideGesture, setHideGesture] = createSignal(false);
+  const [hideGestureDockTop, setHideGestureDockTop] = createSignal<number | null>(null);
+  let hideGestureTimer: ReturnType<typeof setTimeout> | undefined;
+  const cancelHideGesture = () => {
+    if (hideGestureTimer !== undefined) clearTimeout(hideGestureTimer);
+    hideGestureTimer = undefined;
+    setHideGestureDockTop(null);
+    setHideGesture(false);
+  };
+  onCleanup(() => {
+    if (hideGestureTimer !== undefined) clearTimeout(hideGestureTimer);
+  });
+
   const visible = () =>
-    !!focusedEditorCommandBridge() && (keyboardVisible() || focusedFallback());
+    (!!focusedEditorCommandBridge() && (keyboardVisible() || focusedFallback())) || hideGesture();
 
   // Publish the toolbar's on-screen top as a CSS var so the fixed help "?" FAB
   // (and any other bottom-anchored chrome) can lift ABOVE it instead of
@@ -156,7 +174,10 @@ export function MobileKeyboardToolbar(): JSX.Element {
   });
 
   const style = () => ({
-    top: `calc(${Math.max(0, dockTop())}px - env(safe-area-inset-bottom))`,
+    // The viewport grows while the keyboard closes. Keep the button under the
+    // active pointer until its trailing click is consumed; otherwise a mounted
+    // toolbar can still move away and expose the note before pointer-up.
+    top: `calc(${Math.max(0, hideGestureDockTop() ?? dockTop())}px - env(safe-area-inset-bottom))`,
   });
   const keepEditorFocus = (e: Event) => e.preventDefault();
   const run = (action: ToolbarAction) => {
@@ -166,9 +187,22 @@ export function MobileKeyboardToolbar(): JSX.Element {
     }
     dispatchFocusedEditorCommand(action.command);
   };
-  const hideKeyboard = (e?: Event) => {
-    e?.preventDefault();
+  const beginHideGesture = (e: Event) => {
+    e.preventDefault();
+    if (hideGestureTimer !== undefined) clearTimeout(hideGestureTimer);
+    setHideGestureDockTop(dockTop());
+    hideGestureTimer = setTimeout(cancelHideGesture, 700);
+    setHideGesture(true);
     blurFocusedEditor();
+  };
+  const endHideGesture = (e: MouseEvent) => {
+    // The gesture's trailing click is consumed here so nothing underneath can
+    // ever receive it. An AT/keyboard activation arrives without a pointer
+    // gesture, and still needs the blur itself.
+    e.preventDefault();
+    e.stopPropagation();
+    if (!hideGesture()) blurFocusedEditor();
+    cancelHideGesture();
   };
 
   return (
@@ -209,9 +243,9 @@ export function MobileKeyboardToolbar(): JSX.Element {
           class="mobile-keyboard-toolbar-btn mobile-keyboard-toolbar-hide"
           title="Hide keyboard"
           aria-label="Hide keyboard"
-          onPointerDown={hideKeyboard}
+          onPointerDown={beginHideGesture}
           onMouseDown={keepEditorFocus}
-          onClick={() => hideKeyboard()}
+          onClick={endHideGesture}
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <rect x="3" y="5" width="18" height="10" rx="2" />
