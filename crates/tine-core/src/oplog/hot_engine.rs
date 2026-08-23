@@ -3648,9 +3648,7 @@ impl CaptureSealedPendingLocalPredecessor {
         }
         let entry = engine
             .local_overlay
-            .entries
-            .iter()
-            .find(|entry| entry.sequence == self.sequence && entry.batch_id == self.batch_id)
+            .entry(self.sequence, self.batch_id)
             .ok_or_else(|| {
                 EngineError::ProjectionManifest(
                     "capture-sealed managed-local predecessor authority was removed before finalization"
@@ -7404,6 +7402,15 @@ impl Default for CommittedLocalOverlay {
             commitment: ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0"),
             work: Cell::new(ManagedLocalWork::default()),
         }
+    }
+}
+
+impl CommittedLocalOverlay {
+    fn entry(&self, sequence: u64, batch_id: BatchId) -> Option<&CommittedLocalOverlayEntry> {
+        let index = *self.entry_by_batch.get(&batch_id)?;
+        self.entries
+            .get(index)
+            .filter(|entry| entry.sequence == sequence && entry.batch_id == batch_id)
     }
 }
 
@@ -11468,6 +11475,26 @@ impl ShardedHotEngine {
             .merge_direct_head_causal_clocks(scratch_roots, direct_causal_heads)?
             .into_iter()
             .collect::<BTreeMap<_, _>>();
+        // A local peer is a sequential author even when its immediately prior
+        // batch affected a different document and has already left the hot
+        // suffix. Document dependency heads therefore do not necessarily name
+        // that prior batch. The process-local causal chain is the bounded
+        // accepted-author baseline for exactly this peer; merge only the
+        // immediately preceding counter, never unrelated peers or history.
+        if let Some(prior_counter) = causal_dot.counter().checked_sub(1) {
+            if prior_counter > 0
+                && self
+                    .ephemeral_causal_chain
+                    .borrow()
+                    .get(&causal_dot.peer_id())
+                    .is_some_and(|(counter, _)| *counter == prior_counter)
+            {
+                clock
+                    .entry(causal_dot.peer_id())
+                    .and_modify(|current| *current = (*current).max(prior_counter))
+                    .or_insert(prior_counter);
+            }
+        }
         let expected = clock
             .get(&causal_dot.peer_id())
             .copied()
@@ -15974,9 +16001,7 @@ impl ShardedHotEngine {
         };
         let entry = self
             .local_overlay
-            .entries
-            .iter()
-            .find(|entry| entry.sequence == sequence && entry.batch_id == batch_id)
+            .entry(sequence, batch_id)
             .ok_or_else(|| {
                 EngineError::ProjectionManifest(
                     "managed-local predecessor authority is no longer in the committed prefix"
@@ -21085,6 +21110,23 @@ impl ShardedHotEngine {
             status,
             ArchiveStatus::Accepted { .. } | ArchiveStatus::Quarantined
         ) {
+            // Quarantined batches are validated, unpublished causal evidence.
+            // Descendants offered after the terminal latch may name them as
+            // direct heads, so the inline engine must retain their sparse clock
+            // just as it retains accepted clocks. This is bounded by the
+            // offered terminal suffix and never makes the state visible.
+            if self.scratch.is_none()
+                && matches!(status, ArchiveStatus::Quarantined)
+                && !self.ephemeral_causal_clocks.contains_key(&batch_id)
+            {
+                let clock = self
+                    .archive
+                    .get(&batch_id)
+                    .and_then(|batch| self.derive_ephemeral_causal_clock(batch.manifest()).ok());
+                if let Some(clock) = clock {
+                    self.ephemeral_causal_clocks.insert(batch_id, clock);
+                }
+            }
             if let Some(batch) = self.archive.get(&batch_id) {
                 let dot = batch.manifest().causal_dot();
                 let mut chain = self.ephemeral_causal_chain.borrow_mut();
@@ -37803,6 +37845,16 @@ mod validation_tests {
         assert!(
             !local_predecessor.contains("entries.iter()"),
             "composing queued local edits must point-read the latest projection rather than scan the pending prefix"
+        );
+        let managed_authority = function(
+            "validate_managed_local_projection_authority",
+            "validate_clean_manifest_projection_authority",
+        );
+        assert!(managed_authority.contains(".entry(sequence, batch_id)"));
+        assert!(
+            !managed_authority.contains("local_overlay.entries")
+                && !managed_authority.contains("entries.iter()"),
+            "revalidating queued local authority must point-read its batch index"
         );
 
         let production = source
