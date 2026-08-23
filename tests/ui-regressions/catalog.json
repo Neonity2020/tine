@@ -7156,6 +7156,34 @@
         "failBefore": "proven"
       },
       "notes": "GH #286, per the batch's pinned scope: four remappable global actions (pane/grow-width, pane/shrink-width, pane/grow-height, pane/shrink-height) shipped UNBOUND like the existing pane/close — remappable in settings and discoverable in the command palette; no setting and no ambiguous two-axis variant (the issue's 'way two') per spec. panes.ts::adjustPaneSize finds the pane's leaf path, walks ancestors from the nearest up picking the first split of the matching axis (row for width, col for height), and feeds the signed five-point nudge into the existing setSplitRatio clamp (first-child semantics: ratio sizes children[0]). Wrong-axis chains and sole panes are deliberate no-ops returning false. Session save scheduling is inherited from setSplitRatio. vitest-only evidence (6 cases incl. nested wrong-axis skip and clamp saturation); not yet exercised in a native session (E2E skipped at Martin's instruction in this sandbox)."
+    },
+    {
+      "id": "UI-SWITCHER-MODIFIED-CLICK-288",
+      "title": "Search/Quick Switcher result rows: middle-click and Ctrl/Cmd+click open a background tab in the origin pane without closing the switcher, Alt+click opens in the other pane and closes, Shift+click opens pages/blocks in the right sidebar and closes, and create/command rows keep only their safe existing actions",
+      "family": "quick-switcher",
+      "sources": {
+        "issues": [
+          288
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QuickSwitcher.modifiedClicks.test.tsx::QuickSwitcher modified clicks (GH #288)::middle-click opens a background tab in the origin pane, keeps the switcher open, and swallows the follow-up paste",
+          "src/components/QuickSwitcher.modifiedClicks.test.tsx::QuickSwitcher modified clicks (GH #288)::Ctrl/Cmd+click behaves like middle-click: background tab, switcher and input focus stay",
+          "src/components/QuickSwitcher.modifiedClicks.test.tsx::QuickSwitcher modified clicks (GH #288)::Alt+click uses the existing other-pane action and closes the switcher",
+          "src/components/QuickSwitcher.modifiedClicks.test.tsx::QuickSwitcher modified clicks (GH #288)::Shift+click opens page results in the right sidebar and closes the switcher",
+          "src/components/QuickSwitcher.modifiedClicks.test.tsx::QuickSwitcher modified clicks (GH #288)::Shift+click opens block results in the right sidebar"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #288. The row's single onMouseDown handler now routes left-click modifiers exactly like the Enter-key ladder the switcher already had: Ctrl/Cmd+click is the middle-click action (openInBackground/origin pane/switcher stays open) expressible without a middle mouse button, Alt+click = chooseOther, Shift+click = chooseSidebar for page|block; create/command rows fall through to choose/chooseOther — the same 'safe existing actions' Enter/Alt+Enter give them. Embryo-mode gating mirrors the keyboard (Alt/Shift disabled; middle/Ctrl background fan deliberately kept as it already was). PRIMARY-selection paste is swallowed only for real middle clicks; Ctrl/Cmd+click is button 0 and triggers no PRIMARY paste. Ordinary left-click, Enter, and the existing keyboard equivalents are pinned by tests in the same file (5 pre-existing-behavior tests stayed green on HEAD). jsdom render-level evidence via solid-js/web events; focus preservation verified via preventDefault + activeElement assertions; native browser confirmation of the click matrix remains a manager smoke item."
     }
   ]
 }

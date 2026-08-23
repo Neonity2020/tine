@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
 
+- **Search and Quick Switcher results support modified clicks** (GH #288). Middle-click and Ctrl/Cmd+click open a result in a background tab of the current pane while the switcher stays open, so you can fan several hits out at once; Alt+click opens in the other pane; Shift+click opens pages and blocks in the right sidebar. Ordinary clicks, Enter, and the existing Shift/Alt+Enter shortcuts are unchanged. This is the same action set the Enter-key modifiers already offered, now reachable by mouse.
+
 - **New actions: keyboard pane resizing** (GH #286). Four remappable commands — Grow/Shrink active pane width and Grow/Shrink active pane height — nudge the nearest split of the matching axis by five points per step (the existing 15–85% limits apply). They ship unbound so you can assign your own chords in Settings → Keybindings, and are also available from the command palette.
 
 - **New action: Toggle maximize active pane** (GH #285). One pane can temporarily borrow the whole pane area (sidebars untouched) — useful when limited space wraps long lines in a multi-pane split. Toggling again restores the exact split arrangement and sizes; the state never survives into sessions or workspaces. Default shortcut `Ctrl/Cmd+Alt+M`, remappable and available from the command palette.
