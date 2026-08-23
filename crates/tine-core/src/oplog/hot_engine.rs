@@ -37,12 +37,13 @@ use super::object_store::{
 };
 use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
-    extract_validated_catalog_page_names, prepare_authored_page_name_transition,
-    prepare_ephemeral_page_name_transition, prepare_page_name_transition,
-    AuthenticatedCatalogPageNameCheckpointV1, AuthenticatedPageNameExactStateV1,
-    AuthoritativeCatalogPageNameObservationsV1, DetachedBootstrapPageNameCreation,
-    EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1, PageNameOwnershipRootV1,
-    PageNameOwnershipStore, PageNamePublicationCandidateV1, PageNameTransitionError,
+    extract_semantic_page_name_observations, extract_validated_catalog_page_names,
+    prepare_authored_page_name_transition, prepare_ephemeral_page_name_transition,
+    prepare_page_name_transition, AuthenticatedCatalogPageNameCheckpointV1,
+    AuthenticatedPageNameExactStateV1, AuthoritativeCatalogPageNameObservationsV1,
+    DetachedBootstrapPageNameCreation, EphemeralPageNameOwnershipStateV1,
+    PageNameConflictEvidenceV1, PageNameOwnershipRootV1, PageNameOwnershipStore,
+    PageNamePublicationCandidateV1, PageNameTransitionError,
 };
 use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathIndexStore, PortablePathOccupied, PortablePathRecord,
@@ -118,6 +119,20 @@ pub(crate) struct LocalMutationDetailTimings {
     pub(crate) core_total: std::time::Duration,
     pub(crate) core_preflight: std::time::Duration,
     pub(crate) author_operations_inclusive: std::time::Duration,
+    pub(crate) move_source_home: std::time::Duration,
+    pub(crate) move_destination_home: std::time::Duration,
+    pub(crate) move_page_home_working_hits: usize,
+    pub(crate) move_page_home_hint_hits: usize,
+    pub(crate) move_page_home_sqlite_hits: usize,
+    pub(crate) move_page_home_scratch_hits: usize,
+    pub(crate) move_page_home_hot_catalog_hits: usize,
+    pub(crate) move_source_working: std::time::Duration,
+    pub(crate) move_membership_read: std::time::Duration,
+    pub(crate) move_subtree_collect: std::time::Duration,
+    pub(crate) move_owner_updates: std::time::Duration,
+    pub(crate) move_source_deletes: std::time::Duration,
+    pub(crate) move_destination_working: std::time::Duration,
+    pub(crate) move_destination_inserts: std::time::Duration,
     pub(crate) before_semantic_snapshots_child: std::time::Duration,
     pub(crate) identity_trigger_validation: std::time::Duration,
     pub(crate) after_semantic_snapshots: std::time::Duration,
@@ -174,6 +189,20 @@ thread_local! {
             core_total: std::time::Duration::ZERO,
             core_preflight: std::time::Duration::ZERO,
             author_operations_inclusive: std::time::Duration::ZERO,
+            move_source_home: std::time::Duration::ZERO,
+            move_destination_home: std::time::Duration::ZERO,
+            move_page_home_working_hits: 0,
+            move_page_home_hint_hits: 0,
+            move_page_home_sqlite_hits: 0,
+            move_page_home_scratch_hits: 0,
+            move_page_home_hot_catalog_hits: 0,
+            move_source_working: std::time::Duration::ZERO,
+            move_membership_read: std::time::Duration::ZERO,
+            move_subtree_collect: std::time::Duration::ZERO,
+            move_owner_updates: std::time::Duration::ZERO,
+            move_source_deletes: std::time::Duration::ZERO,
+            move_destination_working: std::time::Duration::ZERO,
+            move_destination_inserts: std::time::Duration::ZERO,
             before_semantic_snapshots_child: std::time::Duration::ZERO,
             identity_trigger_validation: std::time::Duration::ZERO,
             after_semantic_snapshots: std::time::Duration::ZERO,
@@ -505,7 +534,7 @@ struct CurrentPathCatalogTransition {
 /// likewise a point lookup rather than a complete catalog reconstruction.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CurrentPathCatalogStoredRow {
+pub(crate) struct CurrentPathCatalogStoredRow {
     schema_version: u32,
     name: LogicalPageName,
     path: ManagedPath,
@@ -3628,7 +3657,19 @@ impl CaptureSealedPendingLocalPredecessor {
                         .into(),
                 )
             })?;
-        let intent = &entry.projection.intent;
+        let intent = entry
+            .projections
+            .iter()
+            .find(|projection| {
+                projection.intent.page_id() == self.page_id && projection.intent.path() == path
+            })
+            .map(|projection| &projection.intent)
+            .ok_or_else(|| {
+                EngineError::ProjectionManifest(
+                    "capture-sealed managed-local predecessor projection was removed before finalization"
+                        .into(),
+                )
+            })?;
         let target = intent.target();
         if intent.workspace_id() != self.workspace_id
             || intent.source_endpoint_id() != source.endpoint_id
@@ -4476,13 +4517,9 @@ struct AcceptedDocumentCacheKey {
 /// Loro version identity of one decoded document, captured when the engine
 /// retained it and reproved before every reuse.
 ///
-/// A [`LoroDoc`] is a reference-counted handle with interior mutability, so
-/// "the retained decode is still the decode that was published" is not a fact
-/// the type system carries. It is, however, cheap to observe: applying a local
-/// operation or importing an update advances the oplog version, and checking
-/// the document out moves the state version or detaches it. All four
-/// observations are bounded by the document's peer count, not by its size, so
-/// reproving them costs nothing at graph scale.
+/// A compact semantic version comparison for bounded documents. This must not
+/// be used as a supposedly cheap guard around a graph-sized catalog: its
+/// version vector grows with the catalog's author/peer population.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DecodedDocumentVersion {
     detached: bool,
@@ -4528,7 +4565,10 @@ struct RetainedDecodedCatalog {
     dependencies: DocumentDependencies,
     document_id: DocumentId,
     causal_state_digest: DocumentCausalDigest,
-    version: DecodedDocumentVersion,
+    /// The exact retained document passed `validate_catalog_document` before
+    /// publication. The document is private immutable engine state, so this
+    /// proof remains valid for every read-only clone of the same causal state.
+    catalog_shape_proven: bool,
     document: LoroDoc,
 }
 
@@ -4549,9 +4589,6 @@ pub(crate) struct RetainedCatalogDecodeStats {
     pub(crate) decodes: usize,
     /// Retained decodes served in place of a full decode.
     pub(crate) reuses: usize,
-    /// Retained entries dropped because the decoded document no longer
-    /// presented the Loro version it was published with.
-    pub(crate) mutation_refusals: usize,
 }
 
 /// Event-local exact-document loader for one authenticated accepted root.
@@ -4572,6 +4609,10 @@ pub(crate) struct AcceptedRootMaterializer<'engine> {
     /// counter that separates "this event resolved the catalog" from "this
     /// event read the whole catalog checkpoint off disk again".
     exact_catalog_decodes: usize,
+    /// Whether the catalog currently held in `documents` already carries the
+    /// graph-shape proof established before it entered the retained cache.
+    /// Re-deriving this proof calls `LoroDoc::get_value` and is O(graph).
+    catalog_shape_proven: bool,
     /// Root/kind-bound decoded-segment sessions, held for the materializer's
     /// whole life exactly as the bootstrap bulk materializer holds them.
     /// Without them every document resolution re-walked the scratch LSM from
@@ -4630,7 +4671,6 @@ pub(crate) struct BootstrapBulkMaterializer<'engine> {
     /// SQLite for a clean lazy-genesis runtime.
     rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
     catalog: LoroDoc,
-    catalog_version: DecodedDocumentVersion,
     catalog_dependencies: DocumentDependencies,
     exact_document_loads: Cell<usize>,
     projection_claim_resolutions: Cell<BootstrapProjectionClaimResolutionStats>,
@@ -4675,11 +4715,6 @@ impl BootstrapBulkMaterializer<'_> {
     pub(crate) fn terminal_current_path_rows(
         &self,
     ) -> Result<Vec<CurrentPathCatalogRow>, EngineError> {
-        if DecodedDocumentVersion::of(&self.catalog) != self.catalog_version {
-            return Err(EngineError::Archive(
-                "terminal catalog changed while deriving current path rows".into(),
-            ));
-        }
         read_all_pages(&self.catalog).map(|pages| {
             pages
                 .into_iter()
@@ -4713,15 +4748,10 @@ impl BootstrapBulkMaterializer<'_> {
         }
 
         let mut page_documents = BTreeMap::<PageId, DocumentId>::new();
-        // Construction proved the complete catalog once. Reprove the retained
-        // Loro identity cheaply before reusing that shape authority; repeating
-        // `get_value` here would make every bounded chunk graph-sized again.
-        if DecodedDocumentVersion::of(&self.catalog) != self.catalog_version {
-            return Err(EngineError::MalformedDocument {
-                document_id: self.engine.catalog_document_id,
-                reason: "bootstrap bulk catalog changed after validation".into(),
-            });
-        }
+        // Construction proved the complete catalog once. This private
+        // materializer never exposes a mutation-capable catalog handle, so the
+        // proof remains valid for every bounded chunk. Recomputing a Loro
+        // version here was itself proportional to the graph's peer population.
         let validated_catalog = ValidatedCatalogDocument {
             catalog_document_id: self.engine.catalog_document_id,
             document: &self.catalog,
@@ -5146,27 +5176,40 @@ impl AcceptedRootMaterializer<'_> {
         &mut self,
         document_id: DocumentId,
     ) -> Result<Option<AcceptedDocumentCacheKey>, EngineError> {
-        // The accepted-frontier lookup is the authority and it runs first, on
-        // every resolution, hit or miss. It is what proves that this exact
-        // causal state is the one *this* accepted root selects for this
-        // document, and it refuses a blocked engine, an unauthenticated root
-        // and an absent document before any reuse is even considered.
-        // `accepted_frontier_documents_many_authenticated_with_session` assumes
-        // its caller already authenticated, so the blocked-engine refusal that
-        // the single-point entry performs must stay explicit here: it is
-        // supposed to run on every resolution, hit or miss.
+        // The engine must still refuse blocked state on every resolution. The
+        // catalog, however, has a stronger bounded shortcut: accepted evidence
+        // carries the complete changed-document set, so a retained catalog
+        // binding can be advanced from the prior root to the post root exactly
+        // when the catalog was absent from that set. Rewalking the authenticated
+        // frontier trie to rediscover that same dependency on every ordinary
+        // content save made a one-page derivative grow with the graph. Other
+        // documents, and any root whose catalog binding was not retained, take
+        // the ordinary authenticated point lookup below.
         self.engine.ensure_not_blocked()?;
-        let Some(dependencies) = self
-            .engine
-            .accepted_frontier_documents_many_authenticated_with_session(
-                &self.root,
-                &[document_id],
-                self.accepted_frontier_session.as_mut(),
-            )?
-            .pop()
+        let is_catalog = document_id == self.engine.catalog_document_id;
+        let dependencies = match is_catalog
+            .then(|| {
+                self.engine
+                    .retained_accepted_catalog_dependencies(&self.root)
+            })
             .flatten()
-        else {
-            return Ok(None);
+        {
+            Some(dependencies) => dependencies,
+            None => {
+                let Some(dependencies) = self
+                    .engine
+                    .accepted_frontier_documents_many_authenticated_with_session(
+                        &self.root,
+                        &[document_id],
+                        self.accepted_frontier_session.as_mut(),
+                    )?
+                    .pop()
+                    .flatten()
+                else {
+                    return Ok(None);
+                };
+                dependencies
+            }
         };
         let key = AcceptedDocumentCacheKey {
             frontier_state_digest: self.root.state_digest(),
@@ -5179,14 +5222,14 @@ impl AcceptedRootMaterializer<'_> {
             }
             return Ok(Some(key));
         }
-        let is_catalog = document_id == self.engine.catalog_document_id;
         if is_catalog {
-            if let Some(document) = self
+            if let Some((document, catalog_shape_proven)) = self
                 .engine
                 .retained_accepted_document(document_id, key.causal_state_digest)
             {
                 self.documents.insert(key, document);
                 self.document_keys.insert(document_id, key);
+                self.catalog_shape_proven = catalog_shape_proven;
                 self.exact_document_loads = self.exact_document_loads.saturating_add(1);
                 self.exact_catalog_loads = self.exact_catalog_loads.saturating_add(1);
                 return Ok(Some(key));
@@ -5201,6 +5244,10 @@ impl AcceptedRootMaterializer<'_> {
             .remove(&document_id)
             .ok_or(EngineError::MissingDocument(document_id))?;
         if is_catalog {
+            // Establish the graph-sized shape proof once, before publication.
+            // Every later bounded derivative reuses it with this exact private
+            // immutable causal state instead of walking the whole catalog.
+            validate_catalog_document(self.engine.catalog_document_id, &document)?;
             // Publication happens only here, after the full load and every
             // integrity proof inside it succeeded. A refused or malformed
             // checkpoint returns above and leaves any prior valid entry alone.
@@ -5210,6 +5257,7 @@ impl AcceptedRootMaterializer<'_> {
                 key.causal_state_digest,
                 &document,
             );
+            self.catalog_shape_proven = true;
         }
         self.documents.insert(key, document);
         self.document_keys.insert(document_id, key);
@@ -5238,7 +5286,18 @@ impl AcceptedRootMaterializer<'_> {
         };
         let page_state = {
             let catalog = self.document(catalog_key)?;
-            validate_catalog_page(self.engine.catalog_document_id, catalog, page_id)?
+            if !self.catalog_shape_proven {
+                return Err(EngineError::Archive(
+                    "accepted-root catalog lacks its retained shape proof".into(),
+                ));
+            }
+            read_validated_catalog_page(
+                ValidatedCatalogDocument {
+                    catalog_document_id: self.engine.catalog_document_id,
+                    document: catalog,
+                },
+                page_id,
+            )?
         };
         let Some(PageState::Live {
             home_document_id: page_document_id,
@@ -5275,11 +5334,19 @@ impl AcceptedRootMaterializer<'_> {
         let engine = self.engine;
         let document_keys = &self.document_keys;
         let documents = &self.documents;
-        let mut page = engine.materialize_page_from_document_lookup(page_id, |document_id| {
-            document_keys
-                .get(&document_id)
-                .and_then(|key| documents.get(key))
-        })?;
+        let catalog = self.document(catalog_key)?;
+        let mut page = engine.materialize_page_in_catalog_window(
+            Some(ValidatedCatalogDocument {
+                catalog_document_id: engine.catalog_document_id,
+                document: catalog,
+            }),
+            page_id,
+            |document_id| {
+                document_keys
+                    .get(&document_id)
+                    .and_then(|key| documents.get(key))
+            },
+        )?;
         let reads_after = self.engine.archive_read_stats();
         page.stats.physical_manifest_reads = reads_after
             .manifest_reads
@@ -5315,6 +5382,23 @@ pub(crate) trait ProjectionClaimSource {
     /// released, or colliding key; this bounded baseline lookup is consulted
     /// only when the suffix has no event for the key at all.
     fn exact_page_owner(&self, _path: &ManagedPath) -> Result<Option<PageId>, EngineError> {
+        Ok(None)
+    }
+
+    /// Resolve one accepted page's immutable membership-shard identity from
+    /// the disposable exact-frontier projection. Local overlay pages may not
+    /// be present yet, so callers retain their bounded authoritative fallback.
+    fn page_home(&self, _page_id: PageId) -> Result<Option<DocumentId>, EngineError> {
+        Ok(None)
+    }
+
+    /// Resolve exact accepted page identities from the disposable projection
+    /// at the same frontier as this read handle. Returning `None` means this
+    /// source does not carry page rows; `Some` may omit genuinely absent IDs.
+    fn page_identities(
+        &self,
+        _page_ids: &BTreeSet<PageId>,
+    ) -> Result<Option<BTreeMap<PageId, CurrentPathCatalogStoredRow>>, EngineError> {
         Ok(None)
     }
 }
@@ -5400,6 +5484,44 @@ impl ProjectionClaimSource for super::SqliteMaterializedRead<'_> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect())
+    }
+
+    fn page_home(&self, page_id: PageId) -> Result<Option<DocumentId>, EngineError> {
+        self.page(page_id)
+            .map(|page| page.map(|page| page.home_document_id))
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    fn page_identities(
+        &self,
+        page_ids: &BTreeSet<PageId>,
+    ) -> Result<Option<BTreeMap<PageId, CurrentPathCatalogStoredRow>>, EngineError> {
+        let mut rows = BTreeMap::new();
+        for page_id in page_ids {
+            let Some(page) = self
+                .page(*page_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+            else {
+                continue;
+            };
+            let name = LogicalPageName::parse(page.name).map_err(|error| {
+                EngineError::ProjectionManifest(format!(
+                    "clean SQLite page {page_id} has an invalid logical name: {error}"
+                ))
+            })?;
+            rows.insert(
+                *page_id,
+                CurrentPathCatalogStoredRow {
+                    schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
+                    accepted_name_digest: ContentDigest::of(name.as_str().as_bytes()),
+                    name,
+                    path: page.path,
+                    kind: page.kind,
+                    home_document_id: page.home_document_id,
+                },
+            );
+        }
+        Ok(Some(rows))
     }
 
     fn exact_page_owner(&self, path: &ManagedPath) -> Result<Option<PageId>, EngineError> {
@@ -5836,6 +5958,12 @@ impl ReplayTimingStats {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EngineInstrumentation {
     pub catalog_hot_state_loads: usize,
+    #[cfg(test)]
+    pub catalog_authenticated_exact_loads: usize,
+    #[cfg(test)]
+    pub catalog_current_loads: usize,
+    #[cfg(test)]
+    pub authenticated_page_identity_lookups: usize,
     pub prepare_transactions: usize,
     pub prepare_document_head_visits: usize,
     pub author_snapshot_clones: usize,
@@ -6590,6 +6718,7 @@ pub struct ManagedLocalWork {
     pub update_bytes_imported: usize,
     pub accepted_base_documents_loaded: usize,
     pub retained_author_candidates_used: usize,
+    pub predecessor_index_lookups: usize,
 }
 
 impl ManagedLocalWork {
@@ -6603,6 +6732,8 @@ impl ManagedLocalWork {
                 - earlier.accepted_base_documents_loaded,
             retained_author_candidates_used: self.retained_author_candidates_used
                 - earlier.retained_author_candidates_used,
+            predecessor_index_lookups: self.predecessor_index_lookups
+                - earlier.predecessor_index_lookups,
         }
     }
 }
@@ -6618,7 +6749,7 @@ pub struct PreparedManagedLocalRecord {
     sequence: u64,
     journal_payload: Vec<u8>,
     record: ManagedLocalRecord,
-    post_page: MaterializedPage,
+    post_pages: BTreeMap<PageId, MaterializedPage>,
     retained_author_mutation_token: Option<u64>,
     retained_author_candidate: Option<ValidatedManagedLocalCandidate>,
 }
@@ -6640,8 +6771,15 @@ impl PreparedManagedLocalRecord {
         ManagedLocalJournalPayloadKind::RecordV1
     }
 
-    pub const fn post_page(&self) -> &MaterializedPage {
-        &self.post_page
+    pub fn post_page(&self) -> &MaterializedPage {
+        self.post_pages
+            .values()
+            .next()
+            .expect("managed-local records retain at least one post-page")
+    }
+
+    pub const fn post_pages(&self) -> &BTreeMap<PageId, MaterializedPage> {
+        &self.post_pages
     }
 
     pub const fn record(&self) -> &ManagedLocalRecord {
@@ -6653,7 +6791,7 @@ impl PreparedManagedLocalRecord {
 pub enum ManagedLocalApplyOutcome {
     Applied {
         batch_id: BatchId,
-        page: MaterializedPage,
+        pages: BTreeMap<PageId, MaterializedPage>,
     },
 }
 
@@ -6753,7 +6891,7 @@ impl ManagedLocalProjection {
 pub struct ManagedLocalRecord {
     sequence: u64,
     prepared_batch: PreparedBatch,
-    projection: ManagedLocalProjection,
+    projections: Vec<ManagedLocalProjection>,
     semantic_effect: SemanticEffect,
     crdt_updates: BTreeMap<DocumentId, CrdtUpdatePayload>,
 }
@@ -6767,8 +6905,14 @@ impl ManagedLocalRecord {
         &self.prepared_batch
     }
 
-    pub const fn projection(&self) -> &ManagedLocalProjection {
-        &self.projection
+    pub fn projection(&self) -> &ManagedLocalProjection {
+        self.projections
+            .first()
+            .expect("managed-local records retain at least one projection")
+    }
+
+    pub fn projections(&self) -> &[ManagedLocalProjection] {
+        &self.projections
     }
 }
 
@@ -7114,45 +7258,55 @@ fn managed_local_record_from_prepared(
         prepared_batch.objects(),
     )
     .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
-    let [intent] = projection_objects.intents() else {
+    let intents = projection_objects.intents();
+    if intents.is_empty() {
         return Err(ManagedLocalRecordError::Unsupported(
-            "managed-local content edits require exactly one finalized projection intent".into(),
-        ));
-    };
-    if intent.render_base().is_some() {
-        return Err(ManagedLocalRecordError::Unsupported(
-            "moves and renames remain on the slow path".into(),
+            "managed-local edits require at least one finalized projection intent".into(),
         ));
     }
-    let precondition_reference = match intent.precondition() {
-        ManifestProjectionPrecondition::Present { base } => base,
-        ManifestProjectionPrecondition::Absent => {
-            return Err(ManagedLocalRecordError::Unsupported(
-                "page creation remains on the slow path".into(),
-            ));
-        }
-    };
-    if matches!(intent.target(), ManifestProjectionTarget::Absent) {
+    if intents.iter().any(|intent| intent.render_base().is_some()) {
         return Err(ManagedLocalRecordError::Unsupported(
-            "page deletion remains on the slow path".into(),
+            "path moves and renames remain on the slow path".into(),
         ));
     }
-    let precondition_base = projection_objects
-        .bases()
-        .get(&precondition_reference.document_id())
-        .cloned()
-        .ok_or_else(|| {
-            ManagedLocalRecordError::CorruptPayload(
-                "projection precondition base is missing from the prepared batch".into(),
-            )
-        })?;
-    if precondition_base.source_page_id() != intent.page_id()
-        || precondition_base.source_path() != intent.path()
-    {
-        return Err(ManagedLocalRecordError::CorruptPayload(
-            "projection base page/path differs from its target intent".into(),
-        ));
-    }
+    let projections = intents
+        .iter()
+        .map(|intent| {
+            let precondition_reference = match intent.precondition() {
+                ManifestProjectionPrecondition::Present { base } => base,
+                ManifestProjectionPrecondition::Absent => {
+                    return Err(ManagedLocalRecordError::Unsupported(
+                        "page creation remains on the slow path".into(),
+                    ));
+                }
+            };
+            if matches!(intent.target(), ManifestProjectionTarget::Absent) {
+                return Err(ManagedLocalRecordError::Unsupported(
+                    "page deletion remains on the slow path".into(),
+                ));
+            }
+            let precondition_base = projection_objects
+                .bases()
+                .get(&precondition_reference.document_id())
+                .cloned()
+                .ok_or_else(|| {
+                    ManagedLocalRecordError::CorruptPayload(
+                        "projection precondition base is missing from the prepared batch".into(),
+                    )
+                })?;
+            if precondition_base.source_page_id() != intent.page_id()
+                || precondition_base.source_path() != intent.path()
+            {
+                return Err(ManagedLocalRecordError::CorruptPayload(
+                    "projection base page/path differs from its target intent".into(),
+                ));
+            }
+            Ok(ManagedLocalProjection {
+                intent: (*intent).clone(),
+                precondition_base,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let semantic_object = prepared_batch
         .objects()
@@ -7167,9 +7321,13 @@ fn managed_local_record_from_prepared(
         ));
     }
     let affected = affected_projection_pages(&semantic_effect);
-    if affected.len() != 1 || !affected.contains(&intent.page_id()) {
+    let projected = projections
+        .iter()
+        .map(|projection| projection.intent.page_id())
+        .collect::<BTreeSet<_>>();
+    if affected != projected {
         return Err(ManagedLocalRecordError::Unsupported(
-            "a managed-local record must affect exactly one existing page".into(),
+            "a managed-local record must project every and only affected existing page".into(),
         ));
     }
     let mut crdt_updates = BTreeMap::new();
@@ -7195,10 +7353,7 @@ fn managed_local_record_from_prepared(
     Ok(ManagedLocalRecord {
         sequence,
         prepared_batch,
-        projection: ManagedLocalProjection {
-            intent: intent.clone(),
-            precondition_base,
-        },
+        projections,
         semantic_effect,
         crdt_updates,
     })
@@ -7209,13 +7364,18 @@ struct CommittedLocalOverlayEntry {
     sequence: u64,
     batch_id: BatchId,
     causal_dot: BatchCausalDot,
-    projection: ManagedLocalProjection,
+    projections: Vec<ManagedLocalProjection>,
 }
 
 #[derive(Debug)]
 struct CommittedLocalOverlay {
     next_sequence: u64,
     entries: Vec<CommittedLocalOverlayEntry>,
+    /// Exact pending-record membership for retry/recovery point lookups.
+    entry_by_batch: BTreeMap<BatchId, usize>,
+    /// Latest pending projection for one semantic page/path. A new local edit
+    /// composes with this predecessor without walking the journal prefix.
+    latest_projection: BTreeMap<(PageId, ManagedPath), (usize, usize)>,
     documents: BTreeMap<DocumentId, LoroDoc>,
     document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
@@ -7224,7 +7384,7 @@ struct CommittedLocalOverlay {
 }
 
 struct ValidatedManagedLocalCandidate {
-    page: MaterializedPage,
+    pages: BTreeMap<PageId, MaterializedPage>,
     documents: BTreeMap<DocumentId, LoroDoc>,
     document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     block_claims: Vec<(u128, ImmutableHomeClaim)>,
@@ -7236,6 +7396,8 @@ impl Default for CommittedLocalOverlay {
         Self {
             next_sequence: 0,
             entries: Vec::new(),
+            entry_by_batch: BTreeMap::new(),
+            latest_projection: BTreeMap::new(),
             documents: BTreeMap::new(),
             document_heads: BTreeMap::new(),
             block_claims: AHashMap::new(),
@@ -7735,7 +7897,13 @@ impl ShardedHotEngine {
         exact_base: &[u8],
     ) -> Option<Vec<AnnotatedIdentity>> {
         let last = self.local_overlay.entries.last()?;
-        let intent = &last.projection.intent;
+        let intent = last
+            .projections
+            .iter()
+            .find(|projection| {
+                projection.intent.page_id() == page_id && projection.intent.path() == path
+            })
+            .map(|projection| &projection.intent)?;
         if last.batch_id != intent.source_batch_id()
             || intent.page_id() != page_id
             || intent.path() != path
@@ -9059,6 +9227,10 @@ impl ShardedHotEngine {
         }
     }
 
+    pub(crate) fn managed_local_batch_is_visible(&self, batch_id: BatchId) -> bool {
+        self.local_overlay.entry_by_batch.contains_key(&batch_id)
+    }
+
     /// Restore the journal cursor represented by an authenticated drain
     /// checkpoint. Checkpointed records already live in canonical accepted
     /// history, so replaying them into the hot overlay would apply them twice;
@@ -9073,6 +9245,8 @@ impl ShardedHotEngine {
         }
         if self.local_overlay.next_sequence != 0
             || !self.local_overlay.entries.is_empty()
+            || !self.local_overlay.entry_by_batch.is_empty()
+            || !self.local_overlay.latest_projection.is_empty()
             || !self.local_overlay.documents.is_empty()
             || !self.local_overlay.document_heads.is_empty()
             || !self.local_overlay.block_claims.is_empty()
@@ -9101,8 +9275,12 @@ impl ShardedHotEngine {
         else {
             return false;
         };
-        let intent = &entry.projection.intent;
-        entry.projection.intent = ManifestedProjectionIntent::new(
+        let projection = entry
+            .projections
+            .first_mut()
+            .expect("managed-local overlay entry retains a projection");
+        let intent = &projection.intent;
+        projection.intent = ManifestedProjectionIntent::new(
             intent.workspace_id(),
             intent.source_batch_id(),
             intent.source_author_device_id(),
@@ -9135,7 +9313,11 @@ impl ShardedHotEngine {
         else {
             return false;
         };
-        let intent = &entry.projection.intent;
+        let projection = entry
+            .projections
+            .first_mut()
+            .expect("managed-local overlay entry retains a projection");
+        let intent = &projection.intent;
         let foreign_document_id = DocumentId::from_uuid(Uuid::from_u128(0xfeed_f00d));
         let mut documents = intent.post_frontier().documents().to_vec();
         documents.push(
@@ -9144,7 +9326,7 @@ impl ShardedHotEngine {
         );
         let frontier = FrontierV2::new(documents)
             .expect("test-only foreign frontier remains canonically ordered");
-        entry.projection.intent = ManifestedProjectionIntent::new(
+        projection.intent = ManifestedProjectionIntent::new(
             intent.workspace_id(),
             intent.source_batch_id(),
             intent.source_author_device_id(),
@@ -9211,6 +9393,8 @@ impl ShardedHotEngine {
         }
         let removed = self.local_overlay.entries.len();
         self.local_overlay.entries.clear();
+        self.local_overlay.entry_by_batch.clear();
+        self.local_overlay.latest_projection.clear();
         self.local_overlay.documents.clear();
         self.local_overlay.document_heads.clear();
         self.local_overlay.block_claims.clear();
@@ -9263,7 +9447,14 @@ impl ShardedHotEngine {
         let Some(phase_started) = started.take() else {
             return;
         };
-        phases[phase] = phases[phase].saturating_add(phase_started.elapsed().as_nanos());
+        let elapsed = phase_started.elapsed();
+        phases[phase] = phases[phase].saturating_add(elapsed.as_nanos());
+        if super::phase_trace_enabled() {
+            eprintln!(
+                "PHASE TIME Engine.validate_and_apply.phase_{phase} {:.3}ms",
+                elapsed.as_secs_f64() * 1_000.0,
+            );
+        }
         *started = Some(Instant::now());
     }
 
@@ -9348,6 +9539,18 @@ impl ShardedHotEngine {
             .unwrap_or_default();
         EngineInstrumentation {
             catalog_hot_state_loads: self.catalog_hot_state_loads.get(),
+            #[cfg(test)]
+            catalog_authenticated_exact_loads: self
+                .catalog_checkpoint_loads
+                .get()
+                .authenticated_exact,
+            #[cfg(test)]
+            catalog_current_loads: self.catalog_checkpoint_loads.get().current,
+            #[cfg(test)]
+            authenticated_page_identity_lookups: self
+                .reference_source_observations
+                .get()
+                .authenticated_page_identity_lookups,
             prepare_transactions: work.prepare_transactions,
             prepare_document_head_visits: work.prepare_document_head_visits,
             author_snapshot_clones: work.author_snapshot_clones,
@@ -10441,6 +10644,7 @@ impl ShardedHotEngine {
             exact_document_loads: 0,
             exact_catalog_loads: 0,
             exact_catalog_decodes: 0,
+            catalog_shape_proven: false,
             accepted_frontier_session,
             external_exact_session,
         })
@@ -10549,14 +10753,24 @@ impl ShardedHotEngine {
             .remove(&self.catalog_document_id)
             .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
         validate_catalog(self.catalog_document_id, &catalog)?;
-        let catalog_version = DecodedDocumentVersion::of(&catalog);
+        // Bootstrap/rebuild already paid for and authenticated this exact
+        // graph-sized decode. Publish it into the engine's one-entry retained
+        // catalog so the first ordinary derivative after activation does not
+        // repeat the whole-catalog load. A historical materializer binds the
+        // entry to its historical root and therefore cannot be reused by a
+        // different current root.
+        self.retain_accepted_document(
+            root,
+            catalog_dependencies.clone(),
+            catalog_dependencies.causal_state_digest(),
+            &catalog,
+        );
         Ok(BootstrapBulkMaterializer {
             engine: self,
             root: root.clone(),
             current_claim_root_proven,
             rebuild_claim_source,
             catalog,
-            catalog_version,
             catalog_dependencies,
             exact_document_loads: Cell::new(1),
             projection_claim_resolutions: Cell::new(
@@ -11250,6 +11464,38 @@ impl ShardedHotEngine {
         causal_dot: BatchCausalDot,
         direct_causal_heads: &[BatchId],
     ) -> Result<Vec<(CausalPeerId, u64)>, EngineError> {
+        let mut clock = self
+            .merge_direct_head_causal_clocks(scratch_roots, direct_causal_heads)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let expected = clock
+            .get(&causal_dot.peer_id())
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| EngineError::Archive("causal counter overflowed".into()))?;
+        if causal_dot.counter() != expected {
+            return Err(EngineError::InvalidCrdt(format!(
+                "causal dot {:?}:{} is not gap-free; expected {expected}",
+                causal_dot.peer_id(),
+                causal_dot.counter()
+            )));
+        }
+        clock.insert(causal_dot.peer_id(), causal_dot.counter());
+        Ok(clock.into_iter().collect())
+    }
+
+    /// Merge the authenticated sparse clocks of a frontier's direct heads.
+    ///
+    /// The result is the complete causal past represented by those heads. It
+    /// is therefore the bounded answer to "does this frontier contain that
+    /// causal dot?"; callers must not reconstruct every ancestral batch to
+    /// answer that question.
+    fn merge_direct_head_causal_clocks(
+        &self,
+        scratch_roots: &ScratchRoots,
+        direct_causal_heads: &[BatchId],
+    ) -> Result<Vec<(CausalPeerId, u64)>, EngineError> {
         let mut clock = BTreeMap::<CausalPeerId, u64>::new();
         if let Some(store) = &self.scratch {
             for parent in direct_causal_heads {
@@ -11277,20 +11523,6 @@ impl ShardedHotEngine {
                 }
             }
         }
-        let expected = clock
-            .get(&causal_dot.peer_id())
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| EngineError::Archive("causal counter overflowed".into()))?;
-        if causal_dot.counter() != expected {
-            return Err(EngineError::InvalidCrdt(format!(
-                "causal dot {:?}:{} is not gap-free; expected {expected}",
-                causal_dot.peer_id(),
-                causal_dot.counter()
-            )));
-        }
-        clock.insert(causal_dot.peer_id(), causal_dot.counter());
         Ok(clock.into_iter().collect())
     }
 
@@ -11334,45 +11566,6 @@ impl ShardedHotEngine {
     pub fn page_name_index_root(&self) -> Result<&PageNameOwnershipRootV1, EngineError> {
         self.ensure_not_blocked()?;
         Ok(&self.page_name_root)
-    }
-
-    /// Read only the requested catalog page states at one authenticated
-    /// accepted root. This is an ordinary oplog/catalog observation, not an
-    /// identity-index lookup, and therefore remains after Patricia removal.
-    pub(crate) fn accepted_catalog_page_states(
-        &self,
-        root: &AcceptedFrontierRoot,
-        page_ids: &[PageId],
-    ) -> Result<BTreeMap<PageId, Option<PageState>>, EngineError> {
-        self.begin_point_operation();
-        self.authenticate_accepted_frontier_root(root)?;
-        if page_ids.len() > super::page_name_index::MAX_PAGE_NAME_POINT_BATCH
-            || page_ids.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err(EngineError::Archive(
-                "accepted catalog page-state request is not canonical or exceeds its bound".into(),
-            ));
-        }
-        if root == &AcceptedFrontierRoot::empty() {
-            return Ok(page_ids.iter().map(|page_id| (*page_id, None)).collect());
-        }
-        let catalog = self.load_document_at_accepted_frontier(root, self.catalog_document_id)?;
-        if let Some(catalog) = &catalog {
-            validate_catalog(self.catalog_document_id, catalog)?;
-        }
-        page_ids
-            .iter()
-            .map(|page_id| {
-                let state = catalog
-                    .as_ref()
-                    .map(|catalog| {
-                        validate_catalog_page(self.catalog_document_id, catalog, *page_id)
-                    })
-                    .transpose()?
-                    .flatten();
-                Ok((*page_id, state))
-            })
-            .collect()
     }
 
     /// Materialize the already-authenticated causal clock used by ordinary
@@ -12240,11 +12433,20 @@ impl ShardedHotEngine {
         batch: ValidatedBatch,
         claim_source: &dyn ProjectionClaimSource,
     ) -> StageOutcome {
+        let trace_started = super::phase_trace_enabled().then(std::time::Instant::now);
         let batch_id = batch.manifest().batch_id();
         if let Err(error) = self.ensure_terminal_staging_authority() {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
         }
         let outcome = self.stage_ready_internal(batch, false, None, None, Some(claim_source));
+        if let Some(started) = trace_started {
+            eprintln!(
+                "PHASE TIME Engine.stage_ready_with_claim_source statuses={} accepted={} {:.3}ms",
+                self.statuses.len(),
+                self.accepted_sequence.len(),
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         self.resolve_pending_author(batch_id, &outcome.disposition);
         outcome
     }
@@ -13220,6 +13422,8 @@ impl ShardedHotEngine {
                 transaction,
                 TransactionCapture::None,
                 None,
+                None,
+                None,
             )?
             .prepared)
     }
@@ -13234,6 +13438,8 @@ impl ShardedHotEngine {
             super::BatchOrigin::BootstrapImport,
             transaction,
             TransactionCapture::DetachedBootstrap,
+            None,
+            None,
             None,
         )
     }
@@ -13590,6 +13796,7 @@ impl ShardedHotEngine {
             effect,
             &new_exact_shards,
             catalog_pages,
+            None,
         )?;
         self.record_replay_timing_elapsed(validation_started, |timing, elapsed| {
             timing.identity_binding_nanos = timing.identity_binding_nanos.saturating_add(elapsed);
@@ -13679,7 +13886,7 @@ impl ShardedHotEngine {
             &causal_roots,
             batch_id,
             manifest.causal_dot(),
-            &BTreeSet::new(),
+            manifest.causal_dependency_heads(),
             effect,
         )?;
         self.record_replay_timing_elapsed(identity_started, |timing, elapsed| {
@@ -13893,6 +14100,7 @@ impl ShardedHotEngine {
         transaction: &OperationTransaction,
         prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
         claim_source: Option<&dyn ProjectionClaimSource>,
+        page_home_hints: Option<&BTreeMap<PageId, DocumentId>>,
     ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
         self.draft_admitted_local_author_transaction_with_batch_id(
             authority,
@@ -13900,6 +14108,7 @@ impl ShardedHotEngine {
             transaction,
             prepared_editor_projection,
             claim_source,
+            page_home_hints,
         )
     }
 
@@ -13914,6 +14123,7 @@ impl ShardedHotEngine {
         transaction: &OperationTransaction,
         prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
         claim_source: Option<&dyn ProjectionClaimSource>,
+        page_home_hints: Option<&BTreeMap<PageId, DocumentId>>,
     ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
         if authority.workspace_id() != self.workspace_id
             || authority.generation().generation != self.history_generation
@@ -13946,6 +14156,7 @@ impl ShardedHotEngine {
                 None,
                 prepared_editor_projection.take(),
                 claim_source,
+                page_home_hints,
             ) {
                 Ok(draft) => {
                     #[cfg(test)]
@@ -13980,6 +14191,7 @@ impl ShardedHotEngine {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -13996,6 +14208,7 @@ impl ShardedHotEngine {
             transaction,
             None,
             Some(prepared_editor_projection),
+            None,
             None,
         )
     }
@@ -14046,7 +14259,7 @@ impl ShardedHotEngine {
             sequence,
             journal_payload,
             record,
-            post_page: candidate.page.clone(),
+            post_pages: candidate.pages.clone(),
             retained_author_mutation_token,
             retained_author_candidate: retained_author_mutation_token.map(|_| candidate),
         })
@@ -14130,11 +14343,16 @@ impl ShardedHotEngine {
                 found: record.sequence,
             });
         }
+        let page_ids = record
+            .projections
+            .iter()
+            .map(|projection| projection.intent.page_id())
+            .collect::<BTreeSet<_>>();
         let candidate = self.validate_managed_local_overlay_candidate(
             manifest,
             &record.semantic_effect,
             &record.crdt_updates,
-            record.projection.intent.page_id(),
+            &page_ids,
             manifest.dependency_frontier(),
         )?;
         self.validate_managed_local_projection_candidate(record, candidate)
@@ -14145,35 +14363,47 @@ impl ShardedHotEngine {
         record: &ManagedLocalRecord,
         candidate: ValidatedManagedLocalCandidate,
     ) -> Result<ValidatedManagedLocalCandidate, ManagedLocalRecordError> {
-        if candidate.page.path != *record.projection.intent.path() {
-            return Err(ManagedLocalRecordError::CorruptPayload(
-                "projection path differs from the semantic post-page".into(),
-            ));
-        }
-        let state = ProjectionPageState {
-            page: candidate.page.clone(),
-            frontier: record.projection.intent.post_frontier().clone(),
-            claim_evidence: record.projection.intent.claim_evidence().to_vec(),
-        };
-        let planned = super::projection::plan_projection_with_layout_annotations(
-            self.workspace_id,
-            &state,
-            Some(record.projection.precondition_base.bytes()),
-            Some(record.projection.precondition_base.annotations()),
-        )
-        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
-        let (target_bytes, target_annotations) = match record.projection.intent.target() {
-            ManifestProjectionTarget::Present {
-                bytes, annotations, ..
-            } => (bytes, annotations),
-            ManifestProjectionTarget::Absent => unreachable!("decoded record requires Present"),
-        };
-        if planned.target() != target_bytes
-            || planned.intent().annotations() != target_annotations.as_slice()
-        {
-            return Err(ManagedLocalRecordError::CorruptPayload(
-                "projection target differs from deterministic semantic rendering".into(),
-            ));
+        for projection in &record.projections {
+            let page = candidate
+                .pages
+                .get(&projection.intent.page_id())
+                .ok_or_else(|| {
+                    ManagedLocalRecordError::CorruptPayload(
+                        "projection has no semantic post-page".into(),
+                    )
+                })?;
+            if page.path != *projection.intent.path() {
+                return Err(ManagedLocalRecordError::CorruptPayload(
+                    "projection path differs from the semantic post-page".into(),
+                ));
+            }
+            let state = ProjectionPageState {
+                page: page.clone(),
+                frontier: projection.intent.post_frontier().clone(),
+                claim_evidence: projection.intent.claim_evidence().to_vec(),
+            };
+            let planned = super::projection::plan_projection_with_layout_annotations(
+                self.workspace_id,
+                &state,
+                Some(projection.precondition_base.bytes()),
+                Some(projection.precondition_base.annotations()),
+            )
+            .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+            let (target_bytes, target_annotations) = match projection.intent.target() {
+                ManifestProjectionTarget::Present {
+                    bytes, annotations, ..
+                } => (bytes, annotations),
+                ManifestProjectionTarget::Absent => {
+                    unreachable!("decoded record requires Present")
+                }
+            };
+            if planned.target() != target_bytes
+                || planned.intent().annotations() != target_annotations.as_slice()
+            {
+                return Err(ManagedLocalRecordError::CorruptPayload(
+                    "projection target differs from deterministic semantic rendering".into(),
+                ));
+            }
         }
         Ok(candidate)
     }
@@ -14243,21 +14473,34 @@ impl ShardedHotEngine {
                     .into(),
             ));
         }
-        let page_id = record.projection.intent.page_id();
+        let page_ids = record
+            .projections
+            .iter()
+            .map(|projection| projection.intent.page_id())
+            .collect::<BTreeSet<_>>();
         let affected = affected_projection_pages(&record.semantic_effect);
-        if affected.len() != 1 || !affected.contains(&page_id) {
+        if affected != page_ids {
             return Err(ManagedLocalRecordError::Unsupported(
-                "a managed-local record must affect exactly one existing page".into(),
+                "a managed-local record must project every and only affected existing page".into(),
             ));
         }
 
-        let (documents, retained_projection) = if consume {
+        let (documents, retained_projections) = if consume {
             let mut pending = self
                 .pending_author_documents
                 .borrow_mut()
                 .take()
                 .expect("matching pending author evidence exists");
-            (pending.documents, pending.projection_pages.remove(&page_id))
+            let projections = page_ids
+                .iter()
+                .filter_map(|page_id| {
+                    pending
+                        .projection_pages
+                        .remove(page_id)
+                        .map(|page| (*page_id, page))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (pending.documents, projections)
         } else {
             let pending = self.pending_author_documents.borrow();
             let pending = pending
@@ -14271,7 +14514,16 @@ impl ShardedHotEngine {
                         clone_doc(document, 1).map(|copy| (*document_id, copy))
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?,
-                pending.projection_pages.get(&page_id).cloned(),
+                page_ids
+                    .iter()
+                    .filter_map(|page_id| {
+                        pending
+                            .projection_pages
+                            .get(page_id)
+                            .cloned()
+                            .map(|page| (*page_id, page))
+                    })
+                    .collect::<BTreeMap<_, _>>(),
             )
         };
         let expected_batch_heads = manifest
@@ -14337,19 +14589,23 @@ impl ShardedHotEngine {
                 },
             ));
         }
-        let retained_projection = retained_projection.ok_or_else(|| {
-            ManagedLocalRecordError::CorruptPayload(
-                "retained author evidence has no exact post-projection page".into(),
-            )
-        })?;
-        if retained_projection.page.page_id != page_id
-            || retained_projection.page.path != *record.projection.intent.path()
-            || retained_projection.frontier != *record.projection.intent.post_frontier()
-            || retained_projection.claim_evidence != record.projection.intent.claim_evidence()
-        {
+        if retained_projections.len() != record.projections.len() {
             return Err(ManagedLocalRecordError::CorruptPayload(
-                "retained author projection differs from its finalized intent".into(),
+                "retained author evidence is missing an exact post-projection page".into(),
             ));
+        }
+        for projection in &record.projections {
+            let page_id = projection.intent.page_id();
+            let retained_projection = &retained_projections[&page_id];
+            if retained_projection.page.page_id != page_id
+                || retained_projection.page.path != *projection.intent.path()
+                || retained_projection.frontier != *projection.intent.post_frontier()
+                || retained_projection.claim_evidence != projection.intent.claim_evidence()
+            {
+                return Err(ManagedLocalRecordError::CorruptPayload(
+                    "retained author projection differs from its finalized intent".into(),
+                ));
+            }
         }
         // The finalizer produced the intent target from this exact retained
         // projection state and the prepared-batch fingerprint binds that
@@ -14357,7 +14613,10 @@ impl ShardedHotEngine {
         // a repeated proof of established private state; recovered or foreign
         // records still take the full validation path.
         let candidate = ValidatedManagedLocalCandidate {
-            page: retained_projection.page,
+            pages: retained_projections
+                .into_iter()
+                .map(|(page_id, projection)| (page_id, projection.page))
+                .collect(),
             documents,
             document_heads,
             block_claims,
@@ -14440,12 +14699,25 @@ impl ShardedHotEngine {
                 .or_default()
                 .insert(claim);
         }
+        let entry_index = self.local_overlay.entries.len();
         self.local_overlay.entries.push(CommittedLocalOverlayEntry {
             sequence: record.sequence,
             batch_id: manifest.batch_id(),
             causal_dot: manifest.causal_dot(),
-            projection: record.projection.clone(),
+            projections: record.projections.clone(),
         });
+        self.local_overlay
+            .entry_by_batch
+            .insert(manifest.batch_id(), entry_index);
+        for (projection_index, projection) in record.projections.iter().enumerate() {
+            self.local_overlay.latest_projection.insert(
+                (
+                    projection.intent.page_id(),
+                    projection.intent.path().clone(),
+                ),
+                (entry_index, projection_index),
+            );
+        }
         self.local_overlay.next_sequence = next_sequence;
         let mut work = self.local_overlay.work.get();
         work.commits_applied = work.commits_applied.saturating_add(1);
@@ -14459,7 +14731,7 @@ impl ShardedHotEngine {
         self.advance_author_mutation_generation();
         Ok(ManagedLocalApplyOutcome::Applied {
             batch_id: manifest.batch_id(),
-            page: candidate.page,
+            pages: candidate.pages,
         })
     }
 
@@ -14468,7 +14740,7 @@ impl ShardedHotEngine {
         manifest: &OperationBatch,
         effect: &SemanticEffect,
         updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
-        page_id: PageId,
+        page_ids: &BTreeSet<PageId>,
         expected_pre_frontier: &FrontierV2,
     ) -> Result<ValidatedManagedLocalCandidate, ManagedLocalRecordError> {
         if manifest.workspace_id() != self.workspace_id {
@@ -14510,9 +14782,9 @@ impl ShardedHotEngine {
             ));
         }
         let affected = affected_projection_pages(effect);
-        if affected.len() != 1 || !affected.contains(&page_id) {
+        if &affected != page_ids {
             return Err(ManagedLocalRecordError::Unsupported(
-                "a managed-local record must affect exactly one existing page".into(),
+                "a managed-local record must project every and only affected existing page".into(),
             ));
         }
         let mut before_documents = BTreeMap::new();
@@ -14622,9 +14894,15 @@ impl ShardedHotEngine {
                 },
             ));
         }
-        let page = self.materialize_hot_page_with_overrides(page_id, &after_documents)?;
+        let pages = page_ids
+            .iter()
+            .map(|page_id| {
+                self.materialize_hot_page_with_overrides(*page_id, &after_documents)
+                    .map(|page| (*page_id, page))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         Ok(ValidatedManagedLocalCandidate {
-            page,
+            pages,
             documents: after_documents,
             document_heads: post_heads,
             block_claims,
@@ -14720,6 +14998,7 @@ impl ShardedHotEngine {
             None,
             None,
             None,
+            None,
         );
         let oracle_copies = self.prospective_catalog_document_copies() - oracle_copies;
         let oracle_shape_visits = self
@@ -14738,6 +15017,7 @@ impl ShardedHotEngine {
             author,
             origin,
             transaction,
+            None,
             None,
             None,
             None,
@@ -14861,6 +15141,7 @@ impl ShardedHotEngine {
             Some(observation),
             None,
             claim_source,
+            None,
         )
     }
 
@@ -14872,6 +15153,7 @@ impl ShardedHotEngine {
         observation: Option<ExternalImportObservationMaterial>,
         mut prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
         claim_source: Option<&dyn ProjectionClaimSource>,
+        page_home_hints: Option<&BTreeMap<PageId, DocumentId>>,
     ) -> Result<AuthorTransactionDraft, EngineError> {
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
@@ -14890,6 +15172,8 @@ impl ShardedHotEngine {
             transaction,
             TransactionCapture::Projection,
             observation,
+            claim_source,
+            page_home_hints,
         )?;
         let affected_pages = affected_projection_pages(&parts.semantic_effect);
         let mut pages = BTreeMap::new();
@@ -15228,7 +15512,16 @@ impl ShardedHotEngine {
         let Some(last) = self.local_overlay.entries.last() else {
             return Ok(None);
         };
-        let intent = &last.projection.intent;
+        let Some(intent) = last
+            .projections
+            .iter()
+            .find(|projection| {
+                projection.intent.page_id() == page_id && projection.intent.path() == &page.path
+            })
+            .map(|projection| &projection.intent)
+        else {
+            return Ok(None);
+        };
         if last.batch_id != intent.source_batch_id()
             || intent.page_id() != page_id
             || intent.path() != &page.path
@@ -15320,12 +15613,20 @@ impl ShardedHotEngine {
         before: &ProjectionPageState,
         prepared_predecessor: Option<(&[u8], &[AnnotatedIdentity])>,
     ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
-        let Some(entry) = self.local_overlay.entries.iter().rev().find(|entry| {
-            entry.projection.intent.page_id() == page_id && entry.projection.intent.path() == path
-        }) else {
+        let Some((entry_index, projection_index)) = self
+            .local_overlay
+            .latest_projection
+            .get(&(page_id, path.clone()))
+            .copied()
+        else {
             return Ok(None);
         };
-        let intent = &entry.projection.intent;
+        let entry = &self.local_overlay.entries[entry_index];
+        let projection = &entry.projections[projection_index];
+        let mut work = self.local_overlay.work.get();
+        work.predecessor_index_lookups = work.predecessor_index_lookups.saturating_add(1);
+        self.local_overlay.work.set(work);
+        let intent = &projection.intent;
         let ManifestProjectionTarget::Present {
             bytes, annotations, ..
         } = intent.target()
@@ -15682,7 +15983,19 @@ impl ShardedHotEngine {
                         .into(),
                 )
             })?;
-        let intent = &entry.projection.intent;
+        let intent = entry
+            .projections
+            .iter()
+            .find(|projection| {
+                projection.intent.path() == path
+                    && projection.intent.page_id() == prior.intent.page_id()
+            })
+            .map(|projection| &projection.intent)
+            .ok_or_else(|| {
+                EngineError::ProjectionManifest(
+                    "managed-local predecessor authority has no matching projection".into(),
+                )
+            })?;
         let target = intent.target();
         if intent.path() != path
             || intent.page_id() != prior.intent.page_id()
@@ -16692,6 +17005,8 @@ impl ShardedHotEngine {
         transaction: &OperationTransaction,
         capture: TransactionCapture,
         observation: Option<ExternalImportObservationMaterial>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+        page_home_hints: Option<&BTreeMap<PageId, DocumentId>>,
     ) -> Result<PreparedTransactionParts, EngineError> {
         #[cfg(test)]
         let core_started = Instant::now();
@@ -16826,6 +17141,8 @@ impl ShardedHotEngine {
                 &mut read_only_catalog,
                 author.crdt_peer_id,
                 origin,
+                claim_source,
+                page_home_hints,
                 operation,
             )?;
         }
@@ -17088,15 +17405,22 @@ impl ShardedHotEngine {
         };
         let portable_path_root =
             if origin != BatchOrigin::BootstrapImport && !effect.pages().is_empty() {
-                let catalog = working
-                    .get(&self.catalog_document_id)
-                    .ok_or_else(|| {
-                        EngineError::InvalidTransaction(
-                            "page effect has no prospective catalog document".into(),
-                        )
-                    })?
-                    .document();
-                let prospective_pages = validate_catalog(self.catalog_document_id, catalog)?;
+                let prospective_pages = effect
+                    .pages()
+                    .iter()
+                    .map(|delta| {
+                        delta
+                            .after
+                            .clone()
+                            .map(|state| (delta.page_id, state))
+                            .ok_or_else(|| {
+                                EngineError::InvalidTransaction(
+                                    "page effect removed a catalog row instead of tombstoning it"
+                                        .into(),
+                                )
+                            })
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
                 let candidate = self.prepare_portable_path_updates(
                     &self.scratch_roots,
                     author.batch_id,
@@ -17116,29 +17440,12 @@ impl ShardedHotEngine {
                 self.portable_path_root
             };
         if origin != BatchOrigin::BootstrapImport && !effect.pages().is_empty() {
-            let current_catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
-            let prospective_catalog = working
-                .get(&self.catalog_document_id)
-                .ok_or_else(|| {
-                    EngineError::InvalidTransaction(
-                        "page effect has no prospective catalog document".into(),
-                    )
-                })?
-                .document();
-            let exact_before_pages =
-                self.exact_page_name_observations(&effect, &current_catalog)?;
+            let exact_before_pages = extract_semantic_page_name_observations(effect.pages(), false)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
             let authenticated_exact = self
                 .authenticated_exact_catalog_page_names(manifest.dependency_frontier(), &effect)?;
-            let requested_page_ids = effect
-                .pages()
-                .iter()
-                .map(|delta| delta.page_id)
-                .collect::<Vec<_>>();
-            let prospective_pages = extract_validated_catalog_page_names(
-                &validate_catalog(self.catalog_document_id, prospective_catalog)?,
-                &requested_page_ids,
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
+            let prospective_pages = extract_semantic_page_name_observations(effect.pages(), true)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
             let candidate = self
                 .prepare_page_name_updates(
                     &self.scratch_roots,
@@ -17618,8 +17925,14 @@ impl ShardedHotEngine {
         } else {
             None
         };
-        let page_state = match catalog.as_ref() {
-            Some(catalog) => {
+        let effect_page_state = effect
+            .pages()
+            .iter()
+            .find(|delta| delta.page_id == page_id)
+            .and_then(|delta| delta.after.clone());
+        let page_state = match (effect_page_state, catalog.as_ref()) {
+            (Some(state), _) if !self.uses_previous_document_derivation() => state,
+            (None, Some(catalog)) | (Some(_), Some(catalog)) => {
                 self.record_prospective_catalog_shape_validation(catalog.document());
                 let Some(state) =
                     validate_catalog_page(self.catalog_document_id, catalog.document(), page_id)?
@@ -17628,7 +17941,7 @@ impl ShardedHotEngine {
                 };
                 state
             }
-            None => {
+            (None, None) | (Some(_), None) => {
                 let prior = prior.ok_or(EngineError::PageNotFound(page_id))?;
                 PageState::Live {
                     name: prior.page.name.clone(),
@@ -17721,6 +18034,23 @@ impl ShardedHotEngine {
                         .map(ProspectiveDocument::document)
                 },
                 |participant_page_id| {
+                    if !self.uses_previous_document_derivation() {
+                        if let Some(state) = effect
+                            .pages()
+                            .iter()
+                            .find(|delta| delta.page_id == participant_page_id)
+                            .and_then(|delta| delta.after.clone())
+                        {
+                            return Ok(Some(state));
+                        }
+                        return match self.current_hot_page_state(participant_page_id) {
+                            Ok(state) => Ok(Some(state)),
+                            Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => {
+                                Ok(None)
+                            }
+                            Err(error) => Err(error),
+                        };
+                    }
                     if let Some(catalog) = documents.get(&self.catalog_document_id) {
                         self.record_prospective_catalog_shape_validation(catalog.document());
                         return validate_catalog_page(
@@ -17811,7 +18141,8 @@ impl ShardedHotEngine {
         &self,
         batch_id: BatchId,
         effect: &SemanticEffect,
-        after: &BTreeMap<DocumentId, EngineDocument>,
+        before: &BTreeMap<DocumentId, &LoroDoc>,
+        after: &BTreeMap<DocumentId, &LoroDoc>,
         updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
         claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(), EngineError> {
@@ -17892,14 +18223,195 @@ impl ShardedHotEngine {
             BatchOrigin::LocalMutation | BatchOrigin::BootstrapImport => None,
         };
 
+        // A block-only operation cannot change page identity. The exact
+        // accepted current-path catalog is already authenticated at this
+        // frontier, so materialize only the affected pages from its bounded
+        // rows instead of decoding the graph-sized CRDT catalog as projection
+        // support. Page mutations retain the complete catalog validation path.
+        let stable_page_states = if effect.pages().is_empty() {
+            let page_ids = projection
+                .intents()
+                .iter()
+                .map(ManifestedProjectionIntent::page_id)
+                .chain(
+                    projection
+                        .bases()
+                        .values()
+                        .map(AnnotatedProjectionBase::source_page_id),
+                )
+                .collect::<BTreeSet<_>>();
+            let rows = match claim_source
+                .map(|source| source.page_identities(&page_ids))
+                .transpose()?
+                .flatten()
+            {
+                Some(rows) => rows,
+                None if self.scratch.is_some() => {
+                    self.authenticated_current_page_catalog_rows(&page_ids)?
+                }
+                None => BTreeMap::new(),
+            };
+            // During cold tail replay SQLite may not yet contain immutable
+            // baseline rows. The engine's current catalog document is already
+            // accepted and shape-validated, and a block-only effect cannot
+            // alter it, so missing SQLite rows may be resolved by bounded map
+            // reads from that exact current document. Do not decode/validate
+            // the complete catalog again for each replayed block operation.
+            let current_catalog = (rows.len() != page_ids.len())
+                .then(|| self.current_catalog_document())
+                .transpose()?
+                .flatten();
+            let states = page_ids
+                .into_iter()
+                .map(|page_id| {
+                    let state = if let Some(row) = rows.get(&page_id) {
+                        PageState::Live {
+                            name: row.name.clone(),
+                            path: row.path.clone(),
+                            home_document_id: row.home_document_id,
+                            kind: row.kind,
+                        }
+                    } else if let Some(state) = current_catalog
+                        .map(|catalog| read_page_state(catalog, page_id))
+                        .transpose()?
+                        .flatten()
+                    {
+                        if state.home_document_id() == self.catalog_document_id {
+                            return Err(EngineError::MalformedDocument {
+                                document_id: self.catalog_document_id,
+                                reason: format!(
+                                    "catalog cannot be the immutable home of page {page_id}"
+                                ),
+                            });
+                        }
+                        state
+                    } else {
+                        return Err(EngineError::ProjectionManifest(
+                            "block-only projection page has no authenticated current-page row"
+                                .into(),
+                        ));
+                    };
+                    Ok((page_id, state))
+                })
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?;
+            Some(states)
+        } else {
+            None
+        };
+        let stable_catalog_dependencies = stable_page_states
+            .as_ref()
+            .map(|_| self.current_hot_document_dependencies_by_id(self.catalog_document_id))
+            .transpose()?;
+
+        // Projection intents for different affected pages commonly depend on
+        // the same large read-only catalog. Build one exact support-document
+        // context for the entire batch instead of reconstructing that catalog
+        // independently for every post-state and every annotated base.
+        let operation_frontier = batch.manifest().dependency_frontier();
+        let mut support_dependencies = BTreeMap::<DocumentId, DocumentDependencies>::new();
+        for frontier in projection
+            .intents()
+            .iter()
+            .map(ManifestedProjectionIntent::post_frontier)
+            .chain(
+                projection
+                    .bases()
+                    .values()
+                    .map(AnnotatedProjectionBase::prior_frontier),
+            )
+        {
+            for dependencies in frontier.documents() {
+                if dependencies.document_id() == self.catalog_document_id {
+                    if let Some(expected) = &stable_catalog_dependencies {
+                        if dependencies != expected {
+                            return Err(EngineError::ProjectionManifest(
+                                "block-only projection names a non-current catalog frontier".into(),
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                if dependencies
+                    .direct_dependency_heads()
+                    .binary_search(&batch_id)
+                    .is_ok()
+                    || operation_frontier.documents().iter().any(|candidate| {
+                        candidate.document_id() == dependencies.document_id()
+                            && candidate == dependencies
+                    })
+                {
+                    continue;
+                }
+                match support_dependencies.entry(dependencies.document_id()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(dependencies.clone());
+                    }
+                    Entry::Occupied(entry) if entry.get() == dependencies => {}
+                    Entry::Occupied(_) => {
+                        return Err(EngineError::ProjectionManifest(
+                            "one projection object set names two exact states for the same support document"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        let support_documents = if support_dependencies.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.reconstruct_projection_frontier(&FrontierV2::new(
+                support_dependencies.into_values().collect(),
+            )?)?
+        };
+
         for intent in projection.intents() {
-            let documents =
-                self.manifest_post_documents(intent.post_frontier(), batch_id, after, updates)?;
-            let page = match self.materialize_page_from_documents(intent.page_id(), &documents) {
+            let intent_started = super::phase_trace_enabled().then(std::time::Instant::now);
+            let documents_started = super::phase_trace_enabled().then(std::time::Instant::now);
+            let documents = self.projection_frontier_document_refs(
+                intent.post_frontier(),
+                batch_id,
+                operation_frontier,
+                after,
+                &support_documents,
+                updates,
+                true,
+                stable_catalog_dependencies.as_ref(),
+            )?;
+            if let Some(started) = documents_started {
+                eprintln!(
+                    "PHASE TIME Engine.projection_transition.post_documents path={} documents={} {:.3}ms",
+                    intent.path(),
+                    documents.len(),
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+            let materialize_started = super::phase_trace_enabled().then(std::time::Instant::now);
+            let page_result = match stable_page_states
+                .as_ref()
+                .and_then(|states| states.get(&intent.page_id()))
+            {
+                Some(state) => self.materialize_page_from_state(
+                    intent.page_id(),
+                    state.clone(),
+                    |id| documents.get(&id).copied(),
+                    0,
+                ),
+                None => self.materialize_page_from_document_lookup(intent.page_id(), |id| {
+                    documents.get(&id).copied()
+                }),
+            };
+            let page = match page_result {
                 Ok(page) => Some(page),
                 Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => None,
                 Err(error) => return Err(error),
             };
+            if let Some(started) = materialize_started {
+                eprintln!(
+                    "PHASE TIME Engine.projection_transition.materialize_page path={} {:.3}ms",
+                    intent.path(),
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
             match intent.target() {
                 ManifestProjectionTarget::Absent => {
                     if !intent.claim_evidence().is_empty() {
@@ -17931,10 +18443,11 @@ impl ShardedHotEngine {
                     }
                     let expected_evidence = self.projection_claim_evidence_after_batch(
                         batch.manifest().dependency_frontier(),
-                        effect,
+                        Some(effect),
                         &page,
                         &documents,
                         claim_source,
+                        stable_page_states.as_ref(),
                     )?;
                     if expected_evidence != intent.claim_evidence() {
                         return Err(EngineError::ProjectionClaimEvidenceMismatch);
@@ -17943,7 +18456,6 @@ impl ShardedHotEngine {
                         self.catalog_document_id,
                         &page,
                         &expected_evidence,
-                        &documents,
                     )?;
                     let declared_documents = intent
                         .post_frontier()
@@ -18021,7 +18533,17 @@ impl ShardedHotEngine {
                         )));
                     }
                 } else {
-                    self.validate_manifested_base(base, claim_source)?;
+                    self.validate_manifested_base_from_documents(
+                        base,
+                        batch_id,
+                        operation_frontier,
+                        before,
+                        &support_documents,
+                        updates,
+                        claim_source,
+                        stable_page_states.as_ref(),
+                        stable_catalog_dependencies.as_ref(),
+                    )?;
                 }
             } else if external_observation.as_ref().is_some_and(|observation| {
                 observation
@@ -18042,7 +18564,24 @@ impl ShardedHotEngine {
                     .ok_or_else(|| {
                         EngineError::ProjectionManifest("render base is unavailable".into())
                     })?;
-                self.validate_manifested_base(base, claim_source)?;
+                self.validate_manifested_base_from_documents(
+                    base,
+                    batch_id,
+                    operation_frontier,
+                    before,
+                    &support_documents,
+                    updates,
+                    claim_source,
+                    stable_page_states.as_ref(),
+                    stable_catalog_dependencies.as_ref(),
+                )?;
+            }
+            if let Some(started) = intent_started {
+                eprintln!(
+                    "PHASE TIME Engine.projection_transition.intent_total path={} {:.3}ms",
+                    intent.path(),
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
             }
         }
         Ok(())
@@ -18125,37 +18664,61 @@ impl ShardedHotEngine {
         ))
     }
 
-    fn validate_manifested_base(
+    #[allow(clippy::too_many_arguments)]
+    fn validate_manifested_base_from_documents(
         &self,
         base: &AnnotatedProjectionBase,
+        batch_id: BatchId,
+        operation_frontier: &FrontierV2,
+        before: &BTreeMap<DocumentId, &LoroDoc>,
+        support_documents: &BTreeMap<DocumentId, LoroDoc>,
+        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
         claim_source: Option<&dyn ProjectionClaimSource>,
+        stable_page_states: Option<&BTreeMap<PageId, PageState>>,
+        stable_catalog_dependencies: Option<&DocumentDependencies>,
     ) -> Result<(), EngineError> {
-        let state = match self.authorize_projection_recovery_inner(
-            base.source_page_id(),
+        let documents = self.projection_frontier_document_refs(
             base.prior_frontier(),
-            base.claim_evidence(),
-            claim_source,
-        ) {
-            Ok(authorization) => authorization.into_state(),
-            Err(EngineError::ProjectionAuthorizationUnavailable) if self.scratch.is_none() => {
-                match claim_source {
-                    Some(source) => self.materialize_page_for_projection_with_claim_source(
-                        base.source_page_id(),
-                        source,
-                    )?,
-                    None => self.materialize_page_for_projection(base.source_page_id())?,
-                }
-            }
-            Err(error) => return Err(error),
+            batch_id,
+            operation_frontier,
+            before,
+            support_documents,
+            updates,
+            false,
+            stable_catalog_dependencies,
+        )?;
+        let page = match stable_page_states.and_then(|states| states.get(&base.source_page_id())) {
+            Some(state) => self.materialize_page_from_state(
+                base.source_page_id(),
+                state.clone(),
+                |id| documents.get(&id).copied(),
+                0,
+            )?,
+            None => self.materialize_page_from_document_lookup(base.source_page_id(), |id| {
+                documents.get(&id).copied()
+            })?,
         };
-        if state.page.path != *base.source_path()
-            || state.frontier != *base.prior_frontier()
-            || state.claim_evidence != base.claim_evidence()
+        let expected_claim_evidence = self.projection_claim_evidence_after_batch(
+            base.prior_frontier(),
+            None,
+            &page,
+            &documents,
+            claim_source,
+            stable_page_states,
+        )?;
+        if base.workspace_id() != self.workspace_id
+            || page.path != *base.source_path()
+            || expected_claim_evidence != base.claim_evidence()
         {
             return Err(EngineError::ProjectionManifest(
                 "annotated base prior binding does not match exact semantic state".into(),
             ));
         }
+        let state = ProjectionPageState {
+            page,
+            frontier: base.prior_frontier().clone(),
+            claim_evidence: expected_claim_evidence,
+        };
         let replay = super::projection::plan_projection_with_layout_annotations(
             self.workspace_id,
             &state,
@@ -18171,60 +18734,76 @@ impl ShardedHotEngine {
         Ok(())
     }
 
-    fn manifest_post_documents(
+    fn projection_frontier_document_refs<'document>(
         &self,
         frontier: &FrontierV2,
         batch_id: BatchId,
-        after: &BTreeMap<DocumentId, EngineDocument>,
+        operation_frontier: &FrontierV2,
+        operation_documents: &BTreeMap<DocumentId, &'document LoroDoc>,
+        support_documents: &'document BTreeMap<DocumentId, LoroDoc>,
         updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
-    ) -> Result<BTreeMap<DocumentId, LoroDoc>, EngineError> {
-        let accepted = FrontierV2::new(
-            frontier
-                .documents()
-                .iter()
-                .filter(|dependencies| {
-                    dependencies
-                        .direct_dependency_heads()
-                        .binary_search(&batch_id)
-                        .is_err()
-                })
-                .cloned()
-                .collect(),
-        )?;
-        let mut documents = if accepted.documents().is_empty() {
-            BTreeMap::new()
-        } else {
-            self.reconstruct_projection_frontier(&accepted)?
-        };
+        allow_current_batch: bool,
+        omitted_exact_dependencies: Option<&DocumentDependencies>,
+    ) -> Result<BTreeMap<DocumentId, &'document LoroDoc>, EngineError> {
+        let mut documents = BTreeMap::new();
         for dependencies in frontier.documents() {
+            if omitted_exact_dependencies.is_some_and(|expected| expected == dependencies) {
+                continue;
+            }
+            if omitted_exact_dependencies
+                .is_some_and(|expected| expected.document_id() == dependencies.document_id())
+            {
+                return Err(EngineError::ProjectionManifest(
+                    "projection frontier names an omitted document at a different exact frontier"
+                        .into(),
+                ));
+            }
             let has_current = dependencies
                 .direct_dependency_heads()
                 .binary_search(&batch_id)
                 .is_ok();
-            if !has_current {
-                continue;
+            if has_current {
+                if !allow_current_batch
+                    || dependencies.direct_dependency_heads() != [batch_id]
+                    || !updates.contains_key(&dependencies.document_id())
+                {
+                    return Err(EngineError::ProjectionManifest(
+                        "post frontier current-batch head is not exact".into(),
+                    ));
+                }
             }
-            if dependencies.direct_dependency_heads() != [batch_id]
-                || !updates.contains_key(&dependencies.document_id())
-            {
+            let operation_exact = operation_frontier
+                .documents()
+                .iter()
+                .find(|candidate| candidate.document_id() == dependencies.document_id());
+            let document = if has_current {
+                operation_documents
+                    .get(&dependencies.document_id())
+                    .copied()
+            } else if operation_exact == Some(dependencies) {
+                operation_documents
+                    .get(&dependencies.document_id())
+                    .copied()
+            } else {
+                support_documents.get(&dependencies.document_id())
+            }
+            .ok_or_else(|| {
+                EngineError::ProjectionManifest(
+                    "projection frontier exact support document is unavailable".into(),
+                )
+            })?;
+            if !has_current && operation_exact.is_some() && operation_exact != Some(dependencies) {
                 return Err(EngineError::ProjectionManifest(
-                    "post frontier current-batch head is not exact".into(),
+                    "projection frontier names an operation document at a different exact frontier"
+                        .into(),
                 ));
             }
-            let document = after
-                .get(&dependencies.document_id())
-                .ok_or_else(|| {
-                    EngineError::ProjectionManifest(
-                        "post frontier current-batch document is missing".into(),
-                    )
-                })?
-                .document();
             if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
                 return Err(EngineError::FrontierVectorMismatch(
                     dependencies.document_id(),
                 ));
             }
-            documents.insert(dependencies.document_id(), clone_doc(document, 1)?);
+            documents.insert(dependencies.document_id(), document);
         }
         Ok(documents)
     }
@@ -18232,16 +18811,17 @@ impl ShardedHotEngine {
     fn projection_claim_evidence_after_batch(
         &self,
         dependency_frontier: &FrontierV2,
-        effect: &SemanticEffect,
+        effect: Option<&SemanticEffect>,
         page: &MaterializedPage,
-        documents: &BTreeMap<DocumentId, LoroDoc>,
+        documents: &BTreeMap<DocumentId, &LoroDoc>,
         claim_source: Option<&dyn ProjectionClaimSource>,
+        stable_page_states: Option<&BTreeMap<PageId, PageState>>,
     ) -> Result<Vec<ProjectionClaimEvidence>, EngineError> {
         let mut requested =
             page_logseq_references(&page.path, page.preamble.as_deref(), &page.blocks);
         requested.extend(page.blocks.iter().filter_map(|block| block.logseq_uuid));
         let mut additions = BTreeMap::<LogseqUuid, BTreeSet<ProjectionClaimParticipant>>::new();
-        for delta in effect.blocks() {
+        for delta in effect.into_iter().flat_map(SemanticEffect::blocks) {
             let before = delta.before.as_ref().and_then(|state| state.logseq_uuid);
             let after = delta.after.as_ref().and_then(|state| state.logseq_uuid);
             if before != after {
@@ -18273,7 +18853,32 @@ impl ShardedHotEngine {
                 continue;
             }
             let entry = ProjectionClaimEvidence::new(uuid, participants.into_iter().collect())?;
-            match self.resolve_logseq_uuid_from_documents(uuid, &entry, documents)? {
+            let resolution = match stable_page_states {
+                Some(states) => self.resolve_logseq_uuid_from_document_lookup_with_page_state(
+                    uuid,
+                    &entry,
+                    |document_id| documents.get(&document_id).copied(),
+                    |page_id| {
+                        if let Some(state) = states.get(&page_id) {
+                            return Ok(Some(state.clone()));
+                        }
+                        Ok(self
+                            .authenticated_current_page_catalog_row(page_id)?
+                            .map(|row| PageState::Live {
+                                name: row.name,
+                                path: row.path,
+                                home_document_id: row.home_document_id,
+                                kind: row.kind,
+                            }))
+                    },
+                )?,
+                None => {
+                    self.resolve_logseq_uuid_from_document_lookup(uuid, &entry, |document_id| {
+                        documents.get(&document_id).copied()
+                    })?
+                }
+            };
+            match resolution {
                 LogseqUuidResolution::Ambiguous { claim_count } => {
                     return Err(EngineError::AmbiguousLogseqUuid {
                         logseq_uuid: uuid,
@@ -18523,18 +19128,24 @@ impl ShardedHotEngine {
     /// query (audit 4, P2 — the eager per-save O(history) scan).
     fn refresh_nonlinear_watermark(&self) -> Result<(), EngineError> {
         use std::sync::atomic::Ordering::Relaxed;
-        let status = self.status();
-        let accepted = status.accepted_batches()?;
-        let count = accepted.len() as u64;
+        // The accepted count and sequence map are themselves authenticated
+        // engine state. Do not materialize the complete durable status history
+        // merely to discover that no new batch exists: projection checks call
+        // this on ordinary page work, where O(history) bookkeeping is both
+        // unnecessary and user-visible.
+        let count = self.accepted_batch_count()?;
         if self.linearity_scanned_count.load(Relaxed) == count {
             return Ok(());
         }
         let scanned = self.linearity_scanned_sequence.load(Relaxed);
         let mut max_sequence = scanned;
         let mut watermark = self.nonlinear_watermark.load(Relaxed);
-        let ids: Vec<BatchId> = accepted.iter().map(|entry| entry.batch_id).collect();
-        drop(status);
-        for batch_id in ids {
+        for sequence in scanned.saturating_add(1)..=count {
+            let batch_id = self.accepted_batch_id_at(sequence)?.ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "accepted sequence {sequence} is absent below accepted count {count}"
+                ))
+            })?;
             let evidence = match self.accepted_batch_evidence(batch_id) {
                 Ok(evidence) => evidence,
                 // An unreadable evidence row errs toward "linear", which is
@@ -18542,9 +19153,11 @@ impl ShardedHotEngine {
                 // watermark — same posture as the scan this replaces.
                 Err(_) => continue,
             };
-            let sequence = evidence.acceptance_sequence();
-            if sequence <= scanned {
-                continue;
+            if evidence.acceptance_sequence() != sequence {
+                return Err(EngineError::Archive(format!(
+                    "accepted sequence {sequence} points at evidence sequence {}",
+                    evidence.acceptance_sequence()
+                )));
             }
             max_sequence = max_sequence.max(sequence);
             if !self.accepted_batch_is_causally_linear(batch_id)? {
@@ -18666,141 +19279,6 @@ impl ShardedHotEngine {
             ProjectionWorkTarget::Absent | ProjectionWorkTarget::Present(_) => {}
         }
         Ok(store)
-    }
-
-    fn projection_frontier_dominates(
-        &self,
-        newer: &FrontierV2,
-        older: &FrontierV2,
-    ) -> Result<bool, EngineError> {
-        for old in older.documents() {
-            let Ok(index) = newer
-                .documents()
-                .binary_search_by_key(&old.document_id(), DocumentDependencies::document_id)
-            else {
-                return Ok(false);
-            };
-            let new = &newer.documents()[index];
-            if !self.document_dependencies_dominate(new, old)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// A page transition can stop depending on a document (for example when a
-    /// subtree moves away from the page). In that case the document correctly
-    /// disappears from the page's compact projection frontier even though the
-    /// authoring batch still causally descends from its former head.
-    fn projection_transition_frontier_dominates(
-        &self,
-        newer: &FrontierV2,
-        older: &FrontierV2,
-    ) -> Result<bool, EngineError> {
-        let direct_heads = newer
-            .documents()
-            .iter()
-            .flat_map(|document| document.direct_dependency_heads().iter().copied())
-            .collect::<BTreeSet<_>>();
-        let mut ancestry = None;
-        for old in older.documents() {
-            if let Ok(index) = newer
-                .documents()
-                .binary_search_by_key(&old.document_id(), DocumentDependencies::document_id)
-            {
-                if !self.document_dependencies_dominate(&newer.documents()[index], old)? {
-                    return Ok(false);
-                }
-                continue;
-            }
-            if old.direct_dependency_heads().is_empty() {
-                return Ok(false);
-            }
-            let ancestry = match &ancestry {
-                Some(ancestry) => ancestry,
-                None => ancestry.insert(self.projection_direct_head_ancestry(&direct_heads)?),
-            };
-            if !old
-                .direct_dependency_heads()
-                .iter()
-                .all(|head| direct_heads.contains(head) || ancestry.contains_key(head))
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn document_dependencies_dominate(
-        &self,
-        newer: &DocumentDependencies,
-        older: &DocumentDependencies,
-    ) -> Result<bool, EngineError> {
-        if newer.document_id() != older.document_id() {
-            return Ok(false);
-        }
-        if newer.causal_state_digest() == older.causal_state_digest() {
-            return Ok(true);
-        }
-        let mut newer_counters = newer.peer_counters().iter().peekable();
-        for older_counter in older.peer_counters() {
-            while newer_counters
-                .peek()
-                .is_some_and(|counter| counter.peer_id() < older_counter.peer_id())
-            {
-                newer_counters.next();
-            }
-            let Some(newer_counter) = newer_counters.peek() else {
-                return Ok(false);
-            };
-            if newer_counter.peer_id() != older_counter.peer_id()
-                || newer_counter.max_counter() < older_counter.max_counter()
-            {
-                return Ok(false);
-            }
-        }
-        let direct_heads = newer
-            .direct_dependency_heads()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if direct_heads
-            .iter()
-            .copied()
-            .eq(older.direct_dependency_heads().iter().copied())
-        {
-            return Ok(true);
-        }
-        let ancestry = self.projection_direct_head_ancestry(&direct_heads)?;
-        Ok(older
-            .direct_dependency_heads()
-            .iter()
-            .all(|head| direct_heads.contains(head) || ancestry.contains_key(head)))
-    }
-
-    fn projection_direct_head_ancestry(
-        &self,
-        direct_heads: &BTreeSet<BatchId>,
-    ) -> Result<BTreeMap<BatchId, OperationBatch>, EngineError> {
-        match self.collect_batch_ancestry(direct_heads, self.is_blocked()) {
-            Ok(ancestry) => Ok(ancestry),
-            Err(EngineError::MissingDependency(candidate))
-                if direct_heads.contains(&candidate)
-                    && matches!(self.statuses.get(&candidate), Some(ArchiveStatus::Staged)) =>
-            {
-                let dependencies = self
-                    .archive
-                    .get(&candidate)
-                    .ok_or(EngineError::MissingDependency(candidate))?
-                    .manifest()
-                    .causal_dependency_heads()
-                    .iter()
-                    .copied()
-                    .collect();
-                self.collect_batch_ancestry(&dependencies, self.is_blocked())
-            }
-            Err(error) => return Err(error),
-        }
     }
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {
@@ -19626,9 +20104,14 @@ impl ShardedHotEngine {
                 }
             }
         } else {
-            let ancestry = self.collect_batch_ancestry(&heads, self.is_blocked())?;
+            let heads = heads.into_iter().collect::<Vec<_>>();
+            let clock = self.merge_direct_head_causal_clocks(&self.scratch_roots, &heads)?;
             for introduction in record.introductions {
-                if ancestry.contains_key(&introduction.batch_id) {
+                if clock
+                    .binary_search_by_key(&introduction.causal_dot.peer_id(), |(peer, _)| *peer)
+                    .ok()
+                    .is_some_and(|index| clock[index].1 >= introduction.causal_dot.counter())
+                {
                     participants.insert(ProjectionClaimParticipant::new(
                         introduction.block_id,
                         introduction.home_document_id,
@@ -20306,11 +20789,14 @@ impl ShardedHotEngine {
         &mut self,
         claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Vec<AcceptedBatch> {
+        let trace = super::phase_trace_enabled();
+        let total_started = trace.then(std::time::Instant::now);
         let mut accepted = Vec::new();
         'drain: loop {
             if self.is_blocked() || self.history_failure.is_some() {
                 break;
             }
+            let scan_started = trace.then(std::time::Instant::now);
             let staged: Vec<BatchId> = self
                 .statuses
                 .iter()
@@ -20318,6 +20804,14 @@ impl ShardedHotEngine {
                     matches!(status, ArchiveStatus::Staged).then_some(*batch_id)
                 })
                 .collect();
+            if let Some(started) = scan_started {
+                eprintln!(
+                    "PHASE TIME Engine.drain_staged.status_scan statuses={} staged={} {:.3}ms",
+                    self.statuses.len(),
+                    staged.len(),
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
             let mut progressed = false;
             for batch_id in staged {
                 self.record_drain_candidate_visit();
@@ -20330,6 +20824,7 @@ impl ShardedHotEngine {
                     progressed = true;
                     continue;
                 }
+                let decoded_started = trace.then(std::time::Instant::now);
                 let updates = match self.decoded_updates(batch_id) {
                     Ok(updates) => updates,
                     Err(error) => {
@@ -20338,6 +20833,12 @@ impl ShardedHotEngine {
                         continue;
                     }
                 };
+                if let Some(started) = decoded_started {
+                    eprintln!(
+                        "PHASE TIME Engine.drain_staged.decoded_updates {:.3}ms",
+                        started.elapsed().as_secs_f64() * 1_000.0,
+                    );
+                }
                 if let Err(error) = self.validate_dependency_witnesses(frontier, &updates) {
                     self.set_final_status(batch_id, ArchiveStatus::Rejected(error));
                     progressed = true;
@@ -20364,7 +20865,15 @@ impl ShardedHotEngine {
                         }
                     }
                 }
-                match self.validate_and_apply(batch_id, true, None, None, claim_source) {
+                let apply_started = trace.then(std::time::Instant::now);
+                let application = self.validate_and_apply(batch_id, true, None, None, claim_source);
+                if let Some(started) = apply_started {
+                    eprintln!(
+                        "PHASE TIME Engine.drain_staged.validate_and_apply {:.3}ms",
+                        started.elapsed().as_secs_f64() * 1_000.0,
+                    );
+                }
+                match application {
                     Ok(BatchApplication::Accepted { no_op, evidence }) => {
                         self.set_final_status(
                             batch_id,
@@ -20401,6 +20910,13 @@ impl ShardedHotEngine {
         }
         if self.is_blocked() {
             self.drain_blocked_evidence(claim_source);
+        }
+        if let Some(started) = total_started {
+            eprintln!(
+                "PHASE TIME Engine.drain_staged.total accepted={} {:.3}ms",
+                accepted.len(),
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
         }
         accepted
     }
@@ -21239,7 +21755,7 @@ impl ShardedHotEngine {
         &self,
         document_id: DocumentId,
         causal_state_digest: DocumentCausalDigest,
-    ) -> Option<LoroDoc> {
+    ) -> Option<(LoroDoc, bool)> {
         if document_id != self.catalog_document_id {
             return None;
         }
@@ -21247,32 +21763,23 @@ impl ShardedHotEngine {
         if !self.retained_catalog_enabled.get() {
             return None;
         }
-        let mut retained = self.retained_accepted_catalog.borrow_mut();
+        let retained = self.retained_accepted_catalog.borrow();
         let entry = retained.as_ref()?;
         if entry.document_id != document_id || entry.causal_state_digest != causal_state_digest {
             return None;
         }
-        if DecodedDocumentVersion::of(&entry.document) != entry.version {
-            // Something advanced or checked out the decoded document through a
-            // shared handle, so it is no longer the state that was published
-            // under this identity. Drop it and decode again rather than serve
-            // it; the ordinary path below is always available.
-            *retained = None;
-            #[cfg(test)]
-            {
-                let mut stats = self.retained_catalog_decode_stats.get();
-                stats.mutation_refusals = stats.mutation_refusals.saturating_add(1);
-                self.retained_catalog_decode_stats.set(stats);
-            }
-            return None;
-        }
+        // The retained catalog is private engine state. Its only escape is the
+        // event-local materializer below, whose uses are read-only. Rechecking
+        // the Loro version here walked the graph-sized peer vector on every
+        // bounded save and protected only against an impossible internal API
+        // violation.
         #[cfg(test)]
         {
             let mut stats = self.retained_catalog_decode_stats.get();
             stats.reuses = stats.reuses.saturating_add(1);
             self.retained_catalog_decode_stats.set(stats);
         }
-        Some(entry.document.clone())
+        Some((entry.document.clone(), entry.catalog_shape_proven))
     }
 
     /// Retain one decoded catalog under the content identity it was loaded at.
@@ -21304,7 +21811,7 @@ impl ShardedHotEngine {
             dependencies,
             document_id,
             causal_state_digest,
-            version: DecodedDocumentVersion::of(document),
+            catalog_shape_proven: true,
             document: document.clone(),
         });
         #[cfg(test)]
@@ -21395,14 +21902,6 @@ impl ShardedHotEngine {
     fn forget_retained_accepted_documents(&self) {
         *self.retained_accepted_catalog.borrow_mut() = None;
         self.retained_catalog_dependency_anchor.set(None);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_accepted_catalog_document_for_test(&self) -> Option<LoroDoc> {
-        self.retained_accepted_catalog
-            .borrow()
-            .as_ref()
-            .map(|entry| entry.document.clone())
     }
 
     #[cfg(test)]
@@ -22008,7 +22507,8 @@ impl ShardedHotEngine {
                 .as_ref()
                 .unwrap_or(&self.scratch_roots)
                 .clone();
-            match self.validate_and_apply_pending_author(
+            let pending_started = super::phase_trace_enabled().then(std::time::Instant::now);
+            let pending_result = self.validate_and_apply_pending_author(
                 batch_id,
                 batch.manifest().causal_dot(),
                 allow_publication,
@@ -22019,7 +22519,19 @@ impl ShardedHotEngine {
                 &declared_effect,
                 pending_documents,
                 claim_source,
-            ) {
+            );
+            if let Some(started) = pending_started {
+                let disposition = match &pending_result {
+                    Ok(Some(_)) => "accepted",
+                    Ok(None) => "not-applicable",
+                    Err(_) => "error-fallback",
+                };
+                eprintln!(
+                    "PHASE TIME Engine.validate_and_apply.pending_author disposition={disposition} {:.3}ms",
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+            match pending_result {
                 Ok(Some(application)) => return Ok(application),
                 Err(error) if self.precommit_history_publication_failure.is_some() => {
                     return Err(error);
@@ -22160,6 +22672,7 @@ impl ShardedHotEngine {
             &validated_new_shards.documents,
         )?;
         Self::record_validation_phase(&mut self.validation_phase_nanos, 4, &mut phase_started);
+        let semantic_compare_started = super::phase_trace_enabled().then(std::time::Instant::now);
         let derived_catalog_pages =
             compare_declared_effect_against_snapshots_with_catalog_skipping(
                 &declared_effect,
@@ -22167,13 +22680,38 @@ impl ShardedHotEngine {
                 &after_snapshots,
                 &validated_new_shards,
             )?;
+        if let Some(started) = semantic_compare_started {
+            eprintln!(
+                "PHASE TIME Engine.validate_and_apply.semantic_compare {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        let projection_transition_started =
+            super::phase_trace_enabled().then(std::time::Instant::now);
+        let before_document_refs = before
+            .iter()
+            .map(|(document_id, document)| (*document_id, document.document()))
+            .collect::<BTreeMap<_, _>>();
+        let after_document_refs = after
+            .iter()
+            .map(|(document_id, document)| (*document_id, document.document()))
+            .collect::<BTreeMap<_, _>>();
         self.validate_manifested_projection_transition(
             batch_id,
             &declared_effect,
-            &after,
+            &before_document_refs,
+            &after_document_refs,
             &updates,
             claim_source,
         )?;
+        drop(after_document_refs);
+        drop(before_document_refs);
+        if let Some(started) = projection_transition_started {
+            eprintln!(
+                "PHASE TIME Engine.validate_and_apply.projection_transition {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         Self::record_validation_phase(&mut self.validation_phase_nanos, 5, &mut phase_started);
         // Prepare every current-state replacement first. No visible document is
         // changed until all imports and structural checks have succeeded.
@@ -22183,6 +22721,7 @@ impl ShardedHotEngine {
         let mut divergent_validated_catalog_pages = None;
         let mut proven_exact_current_documents = BTreeSet::new();
         let mut current_catalog_page_names = None;
+        let replacement_loop_started = super::phase_trace_enabled().then(std::time::Instant::now);
         for (document_id, update) in &updates {
             let exact_before_vector = &exact_before_vectors[document_id];
             let hot_current = if self.is_blocked() {
@@ -22327,28 +22866,32 @@ impl ShardedHotEngine {
             }
             replacements.insert(*document_id, replacement);
         }
+        if let Some(started) = replacement_loop_started {
+            eprintln!(
+                "PHASE TIME Engine.validate_and_apply.replacement_loop documents={} {:.3}ms",
+                updates.len(),
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         let validated_catalog_pages = divergent_validated_catalog_pages
             .as_ref()
             .or(derived_catalog_pages);
+        let prospective_references_started =
+            super::phase_trace_enabled().then(std::time::Instant::now);
         self.validate_prospective_references(
             &replacements,
             &declared_effect,
             &new_exact_shards,
             validated_catalog_pages,
+            claim_source,
         )?;
+        if let Some(started) = prospective_references_started {
+            eprintln!(
+                "PHASE TIME Engine.validate_and_apply.prospective_references {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         Self::record_validation_phase(&mut self.validation_phase_nanos, 6, &mut phase_started);
-        let dependencies = if self.scratch.is_none()
-            && declared_effect
-                .blocks()
-                .iter()
-                .any(|delta| delta.before.is_none() && delta.after.is_some())
-        {
-            self.collect_batch_ancestry(&declared_batch_heads(&frontier), self.is_blocked())?
-                .into_keys()
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
         let starting_roots = candidate_roots.unwrap_or_else(|| self.scratch_roots.clone());
         let causal_dot = self.archive[&batch_id].manifest().causal_dot();
         let causal_dependency_heads = self.archive[&batch_id]
@@ -22459,7 +23002,7 @@ impl ShardedHotEngine {
             &starting_roots,
             batch_id,
             self.archive[&batch_id].manifest().causal_dot(),
-            &dependencies,
+            &causal_dependency_heads,
             &declared_effect,
         )?;
         self.record_replay_timing_elapsed(identity_roles_started, |timing, elapsed| {
@@ -24214,46 +24757,34 @@ impl ShardedHotEngine {
 
         let requested = keys.iter().copied().collect::<Vec<_>>();
         let mut records = self.portable_path_records_many(&requested)?;
-        let current_catalog = if records.is_empty() {
-            None
-        } else {
-            Some(self.clone_validation_document(self.catalog_document_id, 1)?)
-        };
-        for (key, record) in &records {
-            let Some(occupied) = record.occupied() else {
-                continue;
-            };
-            let state = current_catalog
-                .as_ref()
-                .and_then(|catalog| read_page_state(catalog, occupied.page_id()).transpose())
-                .transpose()?;
-            if state.as_ref().and_then(PageState::path) != Some(occupied.exact_path())
-                || occupied.exact_path().portable_key().digest() != *key
-            {
-                return Err(EngineError::Archive(
-                    "portable-path index occupancy is misbound to current catalog state".into(),
-                ));
-            }
-        }
+        // The authenticated portable-path point is the derived authority for
+        // this exact key. Its complete catalog/index equivalence is proved when
+        // the index is built or recovered; re-cloning the graph catalog here
+        // for every bounded page mutation merely repeats that proof on the hot
+        // path. Ordinary admission reads only the requested path records.
 
         let candidate_clock = if let Some(store) = &self.scratch {
             super::causal_index::batch_record(store, scratch_roots, batch_id)
                 .map_err(|error| EngineError::Archive(error.to_string()))?
+                .map(|record| record.clock().to_vec())
         } else {
             None
         };
-        let dependency_batches = if candidate_clock.is_none() {
-            self.collect_batch_ancestry(&declared_batch_heads(frontier), self.is_blocked())?
-                .into_keys()
-                .collect::<BTreeSet<_>>()
-        } else {
-            BTreeSet::new()
+        let candidate_clock = match candidate_clock {
+            Some(clock) => clock,
+            None => self.derive_inline_causal_clock(
+                scratch_roots,
+                causal_dot,
+                &declared_batch_heads(frontier)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )?,
         };
         let contains = |dot: BatchCausalDot, batch: BatchId| {
             candidate_clock
-                .as_ref()
-                .is_some_and(|clock| clock.contains(dot))
-                || dependency_batches.contains(&batch)
+                .binary_search_by_key(&dot.peer_id(), |(peer, _)| *peer)
+                .ok()
+                .is_some_and(|index| candidate_clock[index].1 >= dot.counter())
                 || batch == batch_id
         };
 
@@ -24545,19 +25076,31 @@ impl ShardedHotEngine {
             &before_snapshots,
             &after_snapshots,
         )?;
+        let before_document_refs = before_documents
+            .iter()
+            .map(|(document_id, document)| (*document_id, document))
+            .collect::<BTreeMap<_, _>>();
+        let pending_document_refs = pending_documents
+            .iter()
+            .map(|(document_id, document)| (*document_id, document))
+            .collect::<BTreeMap<_, _>>();
+        self.validate_manifested_projection_transition(
+            batch_id,
+            &declared_effect,
+            &before_document_refs,
+            &pending_document_refs,
+            updates,
+            claim_source,
+        )?;
+        drop(pending_document_refs);
+        drop(before_document_refs);
+
         let pending_engine_documents = pending_documents
             .iter()
             .map(|(document_id, document)| {
                 (*document_id, EngineDocument::InMemory(document.clone()))
             })
             .collect();
-        self.validate_manifested_projection_transition(
-            batch_id,
-            &declared_effect,
-            &pending_engine_documents,
-            updates,
-            claim_source,
-        )?;
 
         let mut new_exact_shards = BTreeSet::new();
         for (document_id, replacement) in &pending_documents {
@@ -24580,6 +25123,7 @@ impl ShardedHotEngine {
             &declared_effect,
             &new_exact_shards,
             derived_catalog_pages,
+            claim_source,
         )?;
         let portable_paths = self.prepare_portable_path_updates(
             candidate_roots,
@@ -24625,23 +25169,15 @@ impl ShardedHotEngine {
             &portable_paths,
             !portable_paths.conflicts.is_empty(),
         )?;
-        let dependencies = if self.scratch.is_none()
-            && declared_effect
-                .blocks()
-                .iter()
-                .any(|delta| delta.before.is_none() && delta.after.is_some())
-        {
-            self.collect_batch_ancestry(&declared_batch_heads(frontier), self.is_blocked())?
-                .into_keys()
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+        let causal_dependency_heads = self.archive[&batch_id]
+            .manifest()
+            .causal_dependency_heads()
+            .to_vec();
         let identity = self.validate_and_prepare_semantic_roles_and_block_homes(
             candidate_roots,
             batch_id,
             causal_dot,
-            &dependencies,
+            &causal_dependency_heads,
             &declared_effect,
         )?;
         let portable_path_blocked = !portable_paths.conflicts.is_empty();
@@ -25767,7 +26303,9 @@ impl ShardedHotEngine {
         effect: &SemanticEffect,
         new_exact_shards: &BTreeSet<DocumentId>,
         validated_catalog_pages: Option<&BTreeMap<PageId, PageState>>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(), EngineError> {
+        let trace_started = super::phase_trace_enabled().then(std::time::Instant::now);
         let catalog;
         let loaded_pages;
         let pages = if let Some(pages) = validated_catalog_pages {
@@ -25775,13 +26313,68 @@ impl ShardedHotEngine {
         } else if let Some(replacement) = replacements.get(&self.catalog_document_id) {
             loaded_pages = validate_catalog(self.catalog_document_id, replacement.document())?;
             Some(&loaded_pages)
-        } else if self.scratch.is_some() {
+        } else if self.scratch.is_some() || claim_source.is_some() {
             None
         } else {
             catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
             loaded_pages = validate_catalog(self.catalog_document_id, &catalog)?;
             Some(&loaded_pages)
         };
+        let authenticated_page_rows = if pages.is_none() {
+            let mut page_ids = BTreeSet::new();
+            for (document_id, shard) in replacements {
+                if *document_id == self.catalog_document_id {
+                    continue;
+                }
+                if let Some(page_id) = shard_page_id(shard.document())? {
+                    page_ids.insert(page_id);
+                }
+            }
+            let mut rows = match claim_source
+                .map(|source| source.page_identities(&page_ids))
+                .transpose()?
+                .flatten()
+            {
+                Some(rows) => rows,
+                None if self.scratch.is_some() => {
+                    self.authenticated_current_page_catalog_rows(&page_ids)?
+                }
+                None => BTreeMap::new(),
+            };
+            if rows.len() != page_ids.len() {
+                if let Some(catalog) = self.current_catalog_document()? {
+                    for page_id in &page_ids {
+                        if rows.contains_key(page_id) {
+                            continue;
+                        }
+                        let Some(PageState::Live {
+                            name,
+                            path,
+                            home_document_id,
+                            kind,
+                        }) = read_page_state(catalog, *page_id)?
+                        else {
+                            continue;
+                        };
+                        rows.insert(
+                            *page_id,
+                            CurrentPathCatalogStoredRow {
+                                schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
+                                accepted_name_digest: ContentDigest::of(name.as_str().as_bytes()),
+                                name,
+                                path,
+                                kind,
+                                home_document_id,
+                            },
+                        );
+                    }
+                }
+            }
+            rows
+        } else {
+            BTreeMap::new()
+        };
+        let identity_elapsed = trace_started.map(|started| started.elapsed());
 
         // A changed catalog entry must name an extant immutable home whose
         // retained shard identity agrees with that entry. This is scoped to
@@ -25812,6 +26405,7 @@ impl ShardedHotEngine {
                 });
             }
         }
+        let page_delta_elapsed = trace_started.map(|started| started.elapsed());
 
         // These are validation-only membership indexes: canonical ordering is
         // neither observed nor serialized. Hash lookup keeps a large batch
@@ -25865,7 +26459,8 @@ impl ShardedHotEngine {
             {
                 Some(home_document_id)
             } else {
-                self.authenticated_current_page_catalog_row(page_id)?
+                authenticated_page_rows
+                    .get(&page_id)
                     .map(|row| row.home_document_id)
             };
             let Some(expected_home_document_id) = expected_home_document_id else {
@@ -25919,6 +26514,20 @@ impl ShardedHotEngine {
                     });
                 }
             }
+        }
+        if let Some(started) = trace_started {
+            let total = started.elapsed();
+            let identity = identity_elapsed.unwrap_or_default();
+            let page_deltas = page_delta_elapsed.unwrap_or(identity);
+            eprintln!(
+                "PHASE TIME Engine.prospective_references identities={:.3}ms page_deltas={:.3}ms replacement_validation={:.3}ms total={:.3}ms replacements={} authenticated_rows={}",
+                identity.as_secs_f64() * 1_000.0,
+                page_deltas.saturating_sub(identity).as_secs_f64() * 1_000.0,
+                total.saturating_sub(page_deltas).as_secs_f64() * 1_000.0,
+                total.as_secs_f64() * 1_000.0,
+                replacements.len(),
+                authenticated_page_rows.len(),
+            );
         }
         Ok(())
     }
@@ -26007,7 +26616,7 @@ impl ShardedHotEngine {
         scratch_roots: &ScratchRoots,
         batch_id: BatchId,
         causal_dot: BatchCausalDot,
-        dependencies: &BTreeSet<BatchId>,
+        causal_dependency_heads: &[BatchId],
         effect: &SemanticEffect,
     ) -> Result<IdentityPublicationCandidate, EngineError> {
         let validation_started = Instant::now();
@@ -26078,18 +26687,40 @@ impl ShardedHotEngine {
                     .map_err(|error| EngineError::Archive(error.to_string()))?
                     .ok_or_else(|| {
                         EngineError::Archive("missing tentative causal batch record".into())
-                    })?,
+                    })?
+                    .clock()
+                    .to_vec(),
             )
         } else {
             None
         };
+        let candidate_clock = match candidate_clock {
+            Some(clock) => clock,
+            None => {
+                self.derive_inline_causal_clock(scratch_roots, causal_dot, causal_dependency_heads)?
+            }
+        };
         for (block_key, block_id, _) in &candidates {
             let causally_reused = existing_by_key.get(block_key).is_some_and(|existing| {
                 existing.iter().any(|existing| {
-                    if let Some(clock) = &candidate_clock {
-                        existing.causal_dot().is_none_or(|dot| clock.contains(dot))
+                    if let Some(dot) = existing.causal_dot() {
+                        candidate_clock
+                            .binary_search_by_key(&dot.peer_id(), |(peer, _)| *peer)
+                            .ok()
+                            .is_some_and(|index| candidate_clock[index].1 >= dot.counter())
                     } else {
-                        dependencies.contains(&existing.batch_id)
+                        self.ephemeral_causal_clocks
+                            .get(&existing.batch_id)
+                            .is_some_and(|existing_clock| {
+                                existing_clock.iter().all(|(peer, counter)| {
+                                    candidate_clock
+                                        .binary_search_by_key(peer, |(candidate_peer, _)| {
+                                            *candidate_peer
+                                        })
+                                        .ok()
+                                        .is_some_and(|index| candidate_clock[index].1 >= *counter)
+                                })
+                            })
                     }
                 })
             });
@@ -26281,6 +26912,8 @@ impl ShardedHotEngine {
         read_only_catalog: &mut AuthorCatalogLookup,
         peer_id: CrdtPeerId,
         origin: BatchOrigin,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+        page_home_hints: Option<&BTreeMap<PageId, DocumentId>>,
         operation: &SemanticOperation,
     ) -> Result<(), EngineError> {
         match operation {
@@ -26388,8 +27021,13 @@ impl ShardedHotEngine {
                         "page preamble exceeds the semantic bound".into(),
                     ));
                 }
-                let page_document_id =
-                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
+                let page_document_id = self.page_home_from_working(
+                    working,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
+                    *page_id,
+                )?;
                 let was_working = working.contains_key(&page_document_id);
                 let shard = self.ensure_working_document(
                     working,
@@ -26437,8 +27075,13 @@ impl ShardedHotEngine {
                 )?;
             }
             SemanticOperation::RestoreSubtree { page_id, blocks } => {
-                let page_home =
-                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
+                let page_home = self.page_home_from_working(
+                    working,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
+                    *page_id,
+                )?;
                 // Restores re-assert values that one side of a concurrent race
                 // may already hold, and loro skips same-value map writes, so a
                 // touched document can end up with zero new operations. A
@@ -26512,8 +27155,13 @@ impl ShardedHotEngine {
                 order,
                 content,
             } => {
-                let page_home =
-                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
+                let page_home = self.page_home_from_working(
+                    working,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
+                    *page_id,
+                )?;
                 if block.home_document_id != page_home {
                     return Err(EngineError::InvalidTransaction(
                         "new block home must be its creation page shard".into(),
@@ -26646,10 +27294,34 @@ impl ShardedHotEngine {
                 parent,
                 order,
             } => {
-                let source_id =
-                    self.page_home_from_working(working, read_only_catalog, *from_page_id)?;
-                let destination_id =
-                    self.page_home_from_working(working, read_only_catalog, *to_page_id)?;
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
+                let source_id = self.page_home_from_working(
+                    working,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
+                    *from_page_id,
+                )?;
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_source_home += move_stage_started.elapsed()
+                });
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
+                let destination_id = self.page_home_from_working(
+                    working,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
+                    *to_page_id,
+                )?;
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_destination_home += move_stage_started.elapsed()
+                });
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
                 let source = self.ensure_working_document(
                     working,
                     before_vectors,
@@ -26657,7 +27329,19 @@ impl ShardedHotEngine {
                     source_id,
                     peer_id,
                 )?;
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_source_working += move_stage_started.elapsed()
+                });
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
                 let all = read_memberships(source_id, source)?;
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_membership_read += move_stage_started.elapsed()
+                });
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
                 let root_claim = all
                     .get(&root.block_id)
                     .ok_or(EngineError::BlockNotFound(root.block_id))?;
@@ -26678,6 +27362,12 @@ impl ShardedHotEngine {
                     }
                     moved.push((block_id, claim));
                 }
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_subtree_collect += move_stage_started.elapsed()
+                });
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
                 for (block_id, claim) in &moved {
                     let home = self.ensure_working_document(
                         working,
@@ -26688,16 +27378,28 @@ impl ShardedHotEngine {
                     )?;
                     set_owner(home, *block_id, BlockOwner::Page(*to_page_id))?;
                 }
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_owner_updates += move_stage_started.elapsed()
+                });
                 let source = working
                     .get(&source_id)
                     .expect("source is working")
                     .document();
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
                 for (block_id, _) in &moved {
                     source
                         .get_map(SHARD_MEMBERS)
                         .delete(&block_id.to_string())
                         .map_err(loro_error)?;
                 }
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_source_deletes += move_stage_started.elapsed()
+                });
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
                 let destination = self.ensure_working_document(
                     working,
                     before_vectors,
@@ -26705,9 +27407,19 @@ impl ShardedHotEngine {
                     destination_id,
                     peer_id,
                 )?;
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_destination_working += move_stage_started.elapsed()
+                });
+                #[cfg(test)]
+                let move_stage_started = Instant::now();
                 for (block_id, claim) in moved {
                     insert_membership(destination, block_id, &claim)?;
                 }
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_destination_inserts += move_stage_started.elapsed()
+                });
             }
             SemanticOperation::ReorderBlock {
                 block_id,
@@ -26715,8 +27427,13 @@ impl ShardedHotEngine {
                 parent,
                 order,
             } => {
-                let page_document_id =
-                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
+                let page_document_id = self.page_home_from_working(
+                    working,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
+                    *page_id,
+                )?;
                 let page = self.ensure_working_document(
                     working,
                     before_vectors,
@@ -26735,8 +27452,13 @@ impl ShardedHotEngine {
                 root_block_id,
                 page_id,
             } => {
-                let page_document_id =
-                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
+                let page_document_id = self.page_home_from_working(
+                    working,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
+                    *page_id,
+                )?;
                 let page = self.ensure_working_document(
                     working,
                     before_vectors,
@@ -26802,8 +27524,13 @@ impl ShardedHotEngine {
                     }
                 }
                 for rewrite in page_preamble_rewrites {
-                    let page_document_id =
-                        self.page_home_from_working(working, read_only_catalog, rewrite.page_id)?;
+                    let page_document_id = self.page_home_from_working(
+                        working,
+                        read_only_catalog,
+                        claim_source,
+                        page_home_hints,
+                        rewrite.page_id,
+                    )?;
                     let shard = self.ensure_working_document(
                         working,
                         before_vectors,
@@ -26872,6 +27599,8 @@ impl ShardedHotEngine {
                         read_only_catalog,
                         peer_id,
                         origin,
+                        claim_source,
+                        page_home_hints,
                         &SemanticOperation::SetPagePreamble {
                             page_id: rewrite.page_id,
                             preamble: rewrite.new_preamble.clone(),
@@ -26886,6 +27615,8 @@ impl ShardedHotEngine {
                         read_only_catalog,
                         peer_id,
                         origin,
+                        claim_source,
+                        page_home_hints,
                         &SemanticOperation::EditBlockContent {
                             block: rewrite.block,
                             content: rewrite.new_content.clone(),
@@ -27066,19 +27797,60 @@ impl ShardedHotEngine {
         &self,
         working: &BTreeMap<DocumentId, EngineDocument>,
         read_only_catalog: &mut AuthorCatalogLookup,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+        page_home_hints: Option<&BTreeMap<PageId, DocumentId>>,
         page_id: PageId,
     ) -> Result<DocumentId, EngineError> {
         if let Some(catalog) = working.get(&self.catalog_document_id) {
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.move_page_home_working_hits += 1;
+            });
             return Ok(require_live_page(catalog.document(), page_id)?.home_document_id());
+        }
+        // The application boundary already authenticated these page identities
+        // and checked their exact revisions before constructing the compound
+        // move.  They are therefore the strongest and cheapest authority for
+        // the two homes involved in this operation, independent of whether the
+        // engine happens to have a scratch store.
+        if let Some(home_document_id) =
+            page_home_hints.and_then(|hints| hints.get(&page_id).copied())
+        {
+            read_only_catalog
+                .page_homes
+                .insert(page_id, home_document_id);
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.move_page_home_hint_hits += 1;
+            });
+            return Ok(home_document_id);
         }
         if self.scratch.is_some() {
             if let Some(home_document_id) = read_only_catalog.page_homes.get(&page_id) {
                 return Ok(*home_document_id);
             }
+            if let Some(home_document_id) = claim_source
+                .map(|source| source.page_home(page_id))
+                .transpose()?
+                .flatten()
+            {
+                read_only_catalog
+                    .page_homes
+                    .insert(page_id, home_document_id);
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_page_home_sqlite_hits += 1;
+                });
+                return Ok(home_document_id);
+            }
             if let Some(row) = self.authenticated_current_page_catalog_row(page_id)? {
                 read_only_catalog
                     .page_homes
                     .insert(page_id, row.home_document_id);
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_page_home_scratch_hits += 1;
+                });
                 return Ok(row.home_document_id);
             }
             let catalog = self.read_only_catalog(read_only_catalog)?;
@@ -27091,6 +27863,10 @@ impl ShardedHotEngine {
             };
         }
         let catalog = self.clone_current_hot_document(self.catalog_document_id, 1)?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.move_page_home_hot_catalog_hits += 1;
+        });
         Ok(require_live_page(&catalog, page_id)?.home_document_id())
     }
 
@@ -27734,16 +28510,8 @@ fn projection_page_document_ids(
     catalog_document_id: DocumentId,
     page: &MaterializedPage,
     evidence: &[ProjectionClaimEvidence],
-    documents: &BTreeMap<DocumentId, LoroDoc>,
 ) -> Result<BTreeSet<DocumentId>, EngineError> {
-    let page_document_id = documents
-        .iter()
-        .filter(|(document_id, _)| **document_id != catalog_document_id)
-        .find_map(|(document_id, document)| {
-            (shard_page_id(document).ok().flatten() == Some(page.page_id)).then_some(*document_id)
-        })
-        .ok_or(EngineError::MissingDocument(catalog_document_id))?;
-    let mut required = BTreeSet::from([catalog_document_id, page_document_id]);
+    let mut required = BTreeSet::from([catalog_document_id, page.home_document_id]);
     required.extend(page.stats.distinct_home_documents.iter().copied());
     required.extend(
         evidence
@@ -29150,6 +29918,7 @@ pub(super) fn validate_catalog_document(
     catalog_document_id: DocumentId,
     document: &LoroDoc,
 ) -> Result<ValidatedCatalogDocument<'_>, EngineError> {
+    crate::fast_commit::note_graph_wide_catalog_validation();
     let page_count = document.get_map(CATALOG_PAGES).len();
     update_cursor_probe(|probe| {
         probe.catalog_document_validations = probe.catalog_document_validations.saturating_add(1);
@@ -34055,6 +34824,8 @@ mod validation_tests {
                 &mut read_only_catalog,
                 CrdtPeerId::from_u64(68_005),
                 BatchOrigin::LocalMutation,
+                None,
+                None,
                 &operation.operations[0],
             ),
             Err(EngineError::InvalidTransaction(_))
@@ -34076,6 +34847,8 @@ mod validation_tests {
                     )
                     .unwrap(),
                 },
+                None,
+                None,
                 &operation.operations[0],
             )
             .unwrap();
@@ -34761,7 +35534,7 @@ mod validation_tests {
                 1,
             )
             .unwrap(),
-            &BTreeSet::new(),
+            &[],
             &effect,
         );
         assert!(matches!(
@@ -36880,7 +37653,7 @@ mod validation_tests {
             "only the three audited clean paths may stage with a claim source"
         );
         assert_eq!(
-            production.matches("stage_ready_with_claim_source").count(),
+            production.matches("stage_ready_with_claim_source(").count(),
             4,
             "one declaration plus exactly three clean-path call sites"
         );
@@ -36926,6 +37699,120 @@ mod validation_tests {
         assert!(
             !clock.contains("collect_batch_ancestry") && !clock.contains("self.archive"),
             "inline causal-clock construction must use only direct-head lookups"
+        );
+    }
+
+    #[test]
+    fn ordinary_identity_and_path_admission_never_walks_batch_ancestry() {
+        let source = include_str!("hot_engine.rs");
+        let function = |name: &str, next: &str| {
+            let start = source
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} remains present"));
+            let tail = &source[start..];
+            let end = [
+                format!("\n    fn {next}("),
+                format!("\n    pub(crate) fn {next}("),
+                format!("\n    pub fn {next}("),
+            ]
+            .iter()
+            .filter_map(|marker| tail.find(marker))
+            .min()
+            .unwrap_or_else(|| panic!("{name} remains bounded by {next}"))
+                + start;
+            &source[start..end]
+        };
+
+        for (name, body) in [
+            (
+                "prepare_portable_path_updates",
+                function(
+                    "prepare_portable_path_updates",
+                    "commit_portable_path_updates",
+                ),
+            ),
+            (
+                "validate_and_prepare_semantic_roles_and_block_homes",
+                function(
+                    "validate_and_prepare_semantic_roles_and_block_homes",
+                    "block_home_claims_many",
+                ),
+            ),
+            (
+                "logseq_claim_evidence_at_frontier",
+                function(
+                    "logseq_claim_evidence_at_frontier",
+                    "resolve_logseq_uuid_from_documents",
+                ),
+            ),
+        ] {
+            assert!(
+                !body.contains("collect_batch_ancestry"),
+                "ordinary {name} must answer causality from sparse direct-head clocks"
+            );
+        }
+        let portable = function(
+            "prepare_portable_path_updates",
+            "commit_portable_path_updates",
+        );
+        assert!(portable.contains("portable_path_records_many(&requested)"));
+        assert!(
+            !portable.contains("clone_validation_document")
+                && !portable.contains("validate_catalog"),
+            "bounded path admission must trust the authenticated requested-key index rather than re-prove whole-catalog equivalence"
+        );
+        let linearity = function(
+            "refresh_nonlinear_watermark",
+            "accepted_nonlinear_batch_ids",
+        );
+        assert!(linearity.contains("accepted_batch_count()"));
+        assert!(linearity.contains("accepted_batch_id_at(sequence)"));
+        assert!(
+            !linearity.contains("accepted_batches()")
+                && !linearity.contains("accepted_batch_ids()")
+                && !linearity.contains("collect_batch_ancestry"),
+            "ordinary linearity refresh must inspect only newly accepted sequence points"
+        );
+        let retained_catalog = function("retained_accepted_document", "retain_accepted_document");
+        assert!(
+            !retained_catalog.contains("DecodedDocumentVersion::of"),
+            "bounded retained-catalog reuse must not recompute the graph-sized Loro version"
+        );
+        let bootstrap_chunk = function("materialize_chunk", "materialize_pages");
+        assert!(
+            !bootstrap_chunk.contains("DecodedDocumentVersion::of")
+                && !bootstrap_chunk.contains("validate_catalog"),
+            "each bootstrap chunk must reuse the catalog proof established once at materializer construction"
+        );
+        let bootstrap_constructor = function(
+            "bootstrap_bulk_materializer_with_lookup_budget",
+            "materialize_page_at_accepted_root",
+        );
+        assert!(
+            bootstrap_constructor.contains("retain_accepted_document("),
+            "activation/rebuild must seed the retained catalog instead of making the first ordinary derivative decode it again"
+        );
+        let local_predecessor = function(
+            "managed_local_projection_predecessor",
+            "capture_author_transaction",
+        );
+        assert!(
+            local_predecessor.contains("latest_projection")
+                && local_predecessor.contains(".get(&(page_id, path.clone()))")
+        );
+        assert!(
+            !local_predecessor.contains("entries.iter()"),
+            "composing queued local edits must point-read the latest projection rather than scan the pending prefix"
+        );
+
+        let production = source
+            .split("#[cfg(test)]\nmod validation_tests")
+            .next()
+            .expect("production half remains identifiable");
+        assert_eq!(
+            production.matches("collect_batch_ancestry(").count(),
+            6,
+            "five full ancestry call sites plus their definition stay confined to conflict/reconstruction paths"
         );
     }
 

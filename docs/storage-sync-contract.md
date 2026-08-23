@@ -898,6 +898,23 @@ cleanup, not permission to forget it: reopen selects the greatest authenticated
 generation and retries removal of every older tuple before advancing derivative
 work.
 
+Cross-page subtree movement uses the same foreground boundary as a page save.
+The source and destination CRDT updates and exact projections are one compound
+journal record; once that record is durable, both pages enter the hot overlay
+atomically and the application may return them without waiting for archive,
+SQLite, receipt, or provider derivatives. A subsequent move composes with the
+latest pending `(page, path)` projection through an exact in-memory index; it
+must not scan the pending journal prefix. The derivative may read only the
+affected page identities and materialize those pages from the retained accepted
+catalog proof. It must not decode or validate the graph-sized catalog merely to
+apply a bounded move.
+
+These are work-shape requirements, not thread-placement advice. Moving an
+O(graph), O(history), or O(pending-prefix) operation to a background turn does
+not satisfy the contract. The 100/10,000-page move receipt and forbidden-work
+counters enforce graph-size-invariant foreground work and the absence of a
+whole-catalog derivative validation.
+
 The clean baseline-plus-manifest runtime and the retired legacy coordinator are
 two **distinct** retained-publication state machines, and a request may never be
 routed from one into the other.

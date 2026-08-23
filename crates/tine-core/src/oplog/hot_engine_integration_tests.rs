@@ -3082,10 +3082,11 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
         ));
         assert_eq!(engine.fatal_evidence(), Some(&expected));
         let expected_handle = engine.fatal_evidence_handle().unwrap();
-        assert!(matches!(
-            engine.stage_ready(staged).disposition,
-            BatchDisposition::Quarantined
-        ));
+        let outcome = engine.stage_ready(staged);
+        assert!(
+            matches!(outcome.disposition, BatchDisposition::Quarantined),
+            "concurrent duplicate claim must quarantine, got {outcome:?}"
+        );
         assert!(matches!(
             engine.stage_ready(conflicting).disposition,
             BatchDisposition::Quarantined

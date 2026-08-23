@@ -1984,38 +1984,75 @@ fn execute_manifested_projection_work_located(
     work: &ProjectionWork,
     handoff: Option<&crate::model::PublishedHandoffLatch>,
 ) -> Result<(), ProjectionError> {
-    let endpoint = engine
-        .projection_endpoint_binding()
-        .ok_or(ProjectionError::EndpointBindingMismatch)?;
+    let trace = super::phase_trace_enabled();
+    let total_started = trace.then(std::time::Instant::now);
+    macro_rules! projection_phase {
+        ($label:literal, $expression:expr) => {{
+            let started = trace.then(std::time::Instant::now);
+            let value = $expression;
+            if let Some(started) = started {
+                eprintln!(
+                    "PHASE TIME Projection.{} path={} {:.3}ms",
+                    $label,
+                    work.path(),
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+            value
+        }};
+    }
+    let endpoint = projection_phase!(
+        "endpoint_binding",
+        engine
+            .projection_endpoint_binding()
+            .ok_or(ProjectionError::EndpointBindingMismatch)
+    )?;
     let receipt_store_id = engine
         .projection_receipt_store_id()
         .ok_or(ProjectionError::EndpointBindingMismatch)?;
     if receipts.store_id() != receipt_store_id {
         return Err(ProjectionError::EndpointBindingMismatch);
     }
-    receipts.require_endpoint(endpoint)?;
-    if graph.canonical_resource_id()? != endpoint.graph_resource_id {
+    projection_phase!("require_endpoint", receipts.require_endpoint(endpoint))?;
+    if projection_phase!("canonical_resource", graph.canonical_resource_id())?
+        != endpoint.graph_resource_id
+    {
         return Err(ProjectionError::EndpointBindingMismatch);
     }
-    retire_pending_projection_recovery(graph, receipts)?;
-    let archive = engine
-        .authorize_clean_projection_work(projection, work)
-        .map_err(ProjectionError::Engine)?;
-    let decoded = decode_manifested_projection_work(&archive, work)?;
+    projection_phase!(
+        "retire_pending_recovery",
+        retire_pending_projection_recovery(graph, receipts)
+    )?;
+    let archive = projection_phase!(
+        "authorize_work",
+        engine
+            .authorize_clean_projection_work(projection, work)
+            .map_err(ProjectionError::Engine)
+    )?;
+    let decoded = projection_phase!(
+        "decode_work",
+        decode_manifested_projection_work(&archive, work)
+    )?;
     let manifested = decoded.manifested();
     let target = decoded.target_bytes();
     let expected_base = decoded.annotated_base();
     let guarded_layout = decoded.guarded_layout();
     let local_attempt_intent = decoded.receiver_local_intent().clone();
     if let Some(target) = target {
-        let current = engine
-            .authorize_projection_write(work.page_id())
-            .map_err(ProjectionError::Engine)?;
-        let replay = plan_projection_with_layout_annotations(
-            engine.workspace_id(),
-            current.state(),
-            expected_base.map(AnnotatedProjectionBase::bytes),
-            expected_base.map(AnnotatedProjectionBase::annotations),
+        let current = projection_phase!(
+            "authorize_write",
+            engine
+                .authorize_projection_write(work.page_id())
+                .map_err(ProjectionError::Engine)
+        )?;
+        let replay = projection_phase!(
+            "replay_plan",
+            plan_projection_with_layout_annotations(
+                engine.workspace_id(),
+                current.state(),
+                expected_base.map(AnnotatedProjectionBase::bytes),
+                expected_base.map(AnnotatedProjectionBase::annotations),
+            )
         )?;
         let target_matches = replay.target() == target;
         let layout_matches = replay.guarded_layout() == guarded_layout;
@@ -2043,9 +2080,12 @@ fn execute_manifested_projection_work_located(
     // This is the first of several durable receipt steps per document; time it to
     // test that hypothesis instead of assuming it.
     let intent_started = super::phase_trace_enabled().then(std::time::Instant::now);
-    receipts.publish_intent(
-        &local_attempt_intent,
-        expected_base.map(AnnotatedProjectionBase::bytes),
+    projection_phase!(
+        "publish_intent_total",
+        receipts.publish_intent(
+            &local_attempt_intent,
+            expected_base.map(AnnotatedProjectionBase::bytes),
+        )
     )?;
     if let Some(started) = intent_started {
         eprintln!(
@@ -2053,11 +2093,19 @@ fn execute_manifested_projection_work_located(
             started.elapsed().as_secs_f64() * 1000.0,
         );
     }
-    if receipts.load_completion(&local_attempt_intent)?.is_some() {
+    if projection_phase!(
+        "load_completion",
+        receipts.load_completion(&local_attempt_intent)
+    )?
+    .is_some()
+    {
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
         return Ok(());
     }
-    let attempts = receipts.load_attempt_reservations(&local_attempt_intent)?;
+    let attempts = projection_phase!(
+        "load_attempts",
+        receipts.load_attempt_reservations(&local_attempt_intent)
+    )?;
     let has_attempts = !attempts.is_empty();
     let recovery_result = if !has_attempts {
         None
@@ -2143,81 +2191,95 @@ fn execute_manifested_projection_work_located(
                 );
             }
             fail_during_manifested_projection_for_harness()?;
-            let current = graph
-                .read_projection_input(work.path())
-                .map_err(ProjectionError::Io)?;
+            let current = projection_phase!(
+                "read_projection_input",
+                graph
+                    .read_projection_input(work.path())
+                    .map_err(ProjectionError::Io)
+            )?;
             let target_is_already_exact =
                 target.is_some_and(|target| current.as_deref() == Some(target));
-            let write_result = if target_is_already_exact {
-                match (handoff, target.expect("exact present target")) {
-                    (Some(handoff), target) => handoff.recover_page_projection_with_layout(
-                        graph,
-                        manifested.path().as_str(),
-                        expected_base.map(AnnotatedProjectionBase::bytes),
-                        target,
-                        &guarded_layout,
-                        &mut authority,
-                    ),
-                    (None, target) => graph.recover_page_projection_with_layout(
-                        manifested.path().as_str(),
-                        expected_base.map(AnnotatedProjectionBase::bytes),
-                        target,
-                        &guarded_layout,
-                        &mut authority,
-                    ),
-                }
-            } else if target.is_none() && current.is_none() {
-                match handoff {
-                    Some(handoff) => handoff.confirm_removed_page_projection(
-                        graph,
-                        manifested.path().as_str(),
-                        &mut authority,
-                    ),
-                    None => graph.confirm_removed_page_projection(
-                        manifested.path().as_str(),
-                        &mut authority,
-                    ),
-                }
-            } else {
-                match (handoff, target) {
-                    (Some(handoff), Some(target)) => handoff.write_page_projection_with_layout(
-                        graph,
-                        manifested.path().as_str(),
-                        expected_base.map(AnnotatedProjectionBase::bytes),
-                        target,
-                        &guarded_layout,
-                        &mut authority,
-                    ),
-                    (None, Some(target)) => graph.write_page_projection_with_layout(
-                        manifested.path().as_str(),
-                        expected_base.map(AnnotatedProjectionBase::bytes),
-                        target,
-                        &guarded_layout,
-                        &mut authority,
-                    ),
-                    (Some(handoff), None) => {
-                        let base = expected_base
-                            .as_ref()
-                            .ok_or(ProjectionError::WorkIntentMismatch)?;
-                        handoff.remove_page_projection(
+            let write_result = projection_phase!(
+                "graph_write",
+                if target_is_already_exact {
+                    match (handoff, target.expect("exact present target")) {
+                        (Some(handoff), target) => handoff.recover_page_projection_with_layout(
                             graph,
                             manifested.path().as_str(),
-                            base.bytes(),
+                            expected_base.map(AnnotatedProjectionBase::bytes),
+                            target,
+                            &guarded_layout,
                             &mut authority,
-                        )
-                    }
-                    (None, None) => {
-                        let base = expected_base
-                            .as_ref()
-                            .ok_or(ProjectionError::WorkIntentMismatch)?;
-                        graph.remove_page_projection(
+                        ),
+                        (None, target) => graph.recover_page_projection_with_layout(
                             manifested.path().as_str(),
-                            base.bytes(),
+                            expected_base.map(AnnotatedProjectionBase::bytes),
+                            target,
+                            &guarded_layout,
                             &mut authority,
-                        )
+                        ),
+                    }
+                } else if target.is_none() && current.is_none() {
+                    match handoff {
+                        Some(handoff) => handoff.confirm_removed_page_projection(
+                            graph,
+                            manifested.path().as_str(),
+                            &mut authority,
+                        ),
+                        None => graph.confirm_removed_page_projection(
+                            manifested.path().as_str(),
+                            &mut authority,
+                        ),
+                    }
+                } else {
+                    match (handoff, target) {
+                        (Some(handoff), Some(target)) => handoff.write_page_projection_with_layout(
+                            graph,
+                            manifested.path().as_str(),
+                            expected_base.map(AnnotatedProjectionBase::bytes),
+                            target,
+                            &guarded_layout,
+                            &mut authority,
+                        ),
+                        (None, Some(target)) => graph.write_page_projection_with_layout(
+                            manifested.path().as_str(),
+                            expected_base.map(AnnotatedProjectionBase::bytes),
+                            target,
+                            &guarded_layout,
+                            &mut authority,
+                        ),
+                        (Some(handoff), None) => {
+                            let base = expected_base
+                                .as_ref()
+                                .ok_or(ProjectionError::WorkIntentMismatch)?;
+                            handoff.remove_page_projection(
+                                graph,
+                                manifested.path().as_str(),
+                                base.bytes(),
+                                &mut authority,
+                            )
+                        }
+                        (None, None) => {
+                            let base = expected_base
+                                .as_ref()
+                                .ok_or(ProjectionError::WorkIntentMismatch)?;
+                            graph.remove_page_projection(
+                                manifested.path().as_str(),
+                                base.bytes(),
+                                &mut authority,
+                            )
+                        }
                     }
                 }
-            };
+            );
+            if trace {
+                if let Err(error) = &write_result {
+                    eprintln!(
+                        "PHASE DETAIL Projection.graph_write_failed path={} error={error}",
+                        work.path(),
+                    );
+                }
+            }
             match write_result {
                 Ok(proof) => (proof, authority),
                 Err(error)
@@ -2232,8 +2294,21 @@ fn execute_manifested_projection_work_located(
             }
         }
     };
-    receipts.publish_completion(authority, &local_attempt_intent, &proof)?;
-    retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
+    projection_phase!(
+        "publish_completion",
+        receipts.publish_completion(authority, &local_attempt_intent, &proof)
+    )?;
+    projection_phase!(
+        "retire_completed_recovery",
+        retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)
+    )?;
+    if let Some(started) = total_started {
+        eprintln!(
+            "PHASE TIME Projection.total path={} {:.3}ms",
+            work.path(),
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
     Ok(())
 }
 

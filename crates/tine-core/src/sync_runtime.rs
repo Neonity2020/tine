@@ -75,6 +75,10 @@ use crate::oplog::lazy_genesis::{
     LazyGenesisProviderIndexV1, LAZY_GENESIS_PROVIDER_CHUNK_BYTES,
 };
 use crate::oplog::local_active::CleanLocalRuntime;
+#[cfg(test)]
+use crate::oplog::local_journal_drain::{
+    last_managed_local_drain_stage_timings, ManagedLocalDrainStageTimings,
+};
 use crate::oplog::local_journal_drain::{
     resume_clean_managed_local_journal_drain, ManagedLocalDerivativeAuthority,
     ManagedLocalDerivativePublisher, ManagedLocalDrainCheckpoint, ManagedLocalDrainContinuation,
@@ -119,7 +123,8 @@ use crate::oplog::trusted_local_commit::{
 use crate::oplog::trusted_local_commit::{
     TrustedLocalCommitCoordinator, TrustedLocalCommitError, TrustedLocalCommitOutcome,
     TrustedLocalCommitted, TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
-    TrustedLocalResponseEvidence, TrustedLocalRestartProjectionOutcome,
+    TrustedLocalCompoundCommitted, TrustedLocalCompoundOutcome, TrustedLocalResponseEvidence,
+    TrustedLocalRestartProjectionOutcome,
 };
 #[cfg(test)]
 use crate::oplog::wire::{
@@ -265,11 +270,56 @@ struct ManagedApplicationSaveInstrumentation {
     forbidden: ForbiddenCommitWork,
     graph_wide: GraphWideCommitWork,
     engine: crate::oplog::hot_engine::EngineInstrumentation,
+    managed_local_work: crate::oplog::hot_engine::ManagedLocalWork,
     provider_pending: usize,
     managed_local_pending: usize,
     managed_local_next_sequence: u64,
     prepared_editor_projection: PreparedEditorProjectionInstrumentation,
     guarded_graph_validation_parse_pairs: usize,
+    move_stages: ManagedApplicationMoveStageTimings,
+    derivative_stages: ManagedLocalDrainStageTimings,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ManagedApplicationMoveStageTimings {
+    preparation: Duration,
+    episode_publication: Duration,
+    journal_and_hot_overlay: Duration,
+    queue_and_response: Duration,
+    foreground_total: Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_APPLICATION_MOVE_STAGE_TIMINGS:
+        std::cell::Cell<ManagedApplicationMoveStageTimings> =
+            const { std::cell::Cell::new(ManagedApplicationMoveStageTimings {
+                preparation: Duration::ZERO,
+                episode_publication: Duration::ZERO,
+                journal_and_hot_overlay: Duration::ZERO,
+                queue_and_response: Duration::ZERO,
+                foreground_total: Duration::ZERO,
+            }) };
+}
+
+#[cfg(test)]
+fn reset_application_move_stage_timings() {
+    LAST_APPLICATION_MOVE_STAGE_TIMINGS.set(ManagedApplicationMoveStageTimings::default());
+}
+
+#[cfg(test)]
+fn note_application_move_stage(update: impl FnOnce(&mut ManagedApplicationMoveStageTimings)) {
+    LAST_APPLICATION_MOVE_STAGE_TIMINGS.with(|timings| {
+        let mut current = timings.get();
+        update(&mut current);
+        timings.set(current);
+    });
+}
+
+#[cfg(test)]
+fn last_application_move_stage_timings() -> ManagedApplicationMoveStageTimings {
+    LAST_APPLICATION_MOVE_STAGE_TIMINGS.get()
 }
 
 /// Actor-local, test-only accounting for the managed application query paths.
@@ -8429,10 +8479,11 @@ fn run_actor_loop(
             }
             #[cfg(test)]
             ActorRequest::ManagedApplicationSaveInstrumentation { reply } => {
-                let engine = actor
+                let active_engine = actor
                     .active_engine()
-                    .expect("active test actor retains its clean runtime")
-                    .instrumentation();
+                    .expect("active test actor retains its clean runtime");
+                let engine = active_engine.instrumentation();
+                let managed_local_work = active_engine.managed_local_work();
                 let _ = reply.send(ManagedApplicationSaveInstrumentation {
                     application_stages: last_application_save_stage_timings(),
                     preparation_stages: last_trusted_local_preparation_stage_timings(),
@@ -8442,6 +8493,7 @@ fn run_actor_loop(
                     forbidden: forbidden_commit_work(),
                     graph_wide: graph_wide_commit_work(),
                     engine,
+                    managed_local_work,
                     provider_pending: actor.provider_pending.len(),
                     managed_local_pending: actor
                         .managed_local
@@ -8454,6 +8506,8 @@ fn run_actor_loop(
                     prepared_editor_projection: prepared_editor_projection_instrumentation(),
                     guarded_graph_validation_parse_pairs:
                         crate::model::journal_projection_guarded_parse_pairs_for_runtime_test(),
+                    move_stages: last_application_move_stage_timings(),
+                    derivative_stages: last_managed_local_drain_stage_timings(),
                 });
                 false
             }
@@ -9345,17 +9399,19 @@ fn open_clean_foreground_journal(
                 frame.sequence()
             )
         })?;
-        let path = record.projection().intent().path().clone();
-        let key = path.as_str().to_owned();
-        latest_projection_frames.insert(key.clone(), frame.clone());
-        latest_task_query_overlay.insert(
-            key,
-            LatestTaskQueryOverlayEntry {
-                sequence: frame.sequence(),
-                path,
-                state: LatestTaskQueryOverlayState::Incomplete,
-            },
-        );
+        for projection in record.projections() {
+            let path = projection.intent().path().clone();
+            let key = path.as_str().to_owned();
+            latest_projection_frames.insert(key.clone(), frame.clone());
+            latest_task_query_overlay.insert(
+                key,
+                LatestTaskQueryOverlayEntry {
+                    sequence: frame.sequence(),
+                    path,
+                    state: LatestTaskQueryOverlayState::Incomplete,
+                },
+            );
+        }
     }
     if checkpoint.next_sequence() != 0 || !recovered_frames.is_empty() {
         let mut session = runtime
@@ -9373,27 +9429,6 @@ fn open_clean_foreground_journal(
                 )
             })?;
         for frame in &recovered_frames {
-            let record = crate::oplog::decode_managed_local_record(frame).map_err(display)?;
-            if latest_projection_frames
-                .get(record.projection().intent().path().as_str())
-                .is_some_and(|latest| latest.sequence() == frame.sequence())
-            {
-                let input = TrustedLocalCommitCoordinator::restart_projection_input(&record)
-                    .map_err(display)?;
-                if let TrustedLocalRestartProjectionOutcome::CommittedPending(pending) =
-                    TrustedLocalCommitCoordinator::recover_projection_after_restart(
-                        graph,
-                        frame.clone(),
-                        input,
-                    )
-                {
-                    return Err(format!(
-                        "clean foreground journal cannot recover {}: {}",
-                        pending.relative_path(),
-                        pending.last_error()
-                    ));
-                }
-            }
             engine.replay_managed_local_record(frame).map_err(|error| {
                 format!(
                     "cannot restore clean foreground journal record {}:{}: {error}",
@@ -13531,12 +13566,16 @@ impl RuntimeActor {
                 "application_load_pending_foreground_record",
             )
         })?;
-        let intent = record.projection().intent();
-        if intent.path() != path {
+        let Some(intent) = record
+            .projections()
+            .iter()
+            .find(|projection| projection.intent().path() == path)
+            .map(|projection| projection.intent())
+        else {
             return Err(SyncApplicationPageRequestError::ActorRefusedAt(
                 "application_load_pending_foreground_path",
             ));
-        }
+        };
         let Some(target) = intent.target().bytes() else {
             return Ok(Some(ApplicationExactLoad::Missing));
         };
@@ -13658,10 +13697,12 @@ impl RuntimeActor {
             .map(|frame| {
                 crate::oplog::decode_managed_local_record(frame)
                     .map(|record| {
-                        let intent = record.projection().intent();
-                        intent.path() == &managed_path
-                            && intent.target().bytes().is_some()
-                            && intent.page_id() == hot.current.editor.page.page_id
+                        record.projections().iter().any(|projection| {
+                            let intent = projection.intent();
+                            intent.path() == &managed_path
+                                && intent.target().bytes().is_some()
+                                && intent.page_id() == hot.current.editor.page.page_id
+                        })
                     })
                     .map_err(|_| {
                         SyncApplicationPageRequestError::ActorRefusedAt(
@@ -14199,7 +14240,7 @@ impl RuntimeActor {
             episode_id: episode_id.clone(),
             reason,
         };
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_exclusive_editor_turn() {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
             return Ok(SyncApplicationMoveSubtreesOutcome::Deferred { episode_id, state });
         }
         let parsed_episode_id = Uuid::parse_str(&request.episode_id).map_err(|_| {
@@ -14216,6 +14257,13 @@ impl RuntimeActor {
         if let ApplicationMoveEpisodeLookup::Complete(record) = &existing_episode {
             match self.application_move_accepted(record) {
                 Ok(true) => return self.application_move_committed_outcome(record, true),
+                Ok(false)
+                    if self.active_engine().is_ok_and(|engine| {
+                        engine.managed_local_batch_is_visible(record.batch_id)
+                    }) =>
+                {
+                    return self.application_move_committed_outcome(record, true)
+                }
                 Ok(false) => {}
                 Err(reason) => return Ok(no_commit(reason)),
             }
@@ -14483,37 +14531,170 @@ impl RuntimeActor {
             }
         }
 
-        match self.execute_local_transaction_with_batch_id(
+        self.execute_foreground_application_move(
             transaction,
-            Some(batch_id),
-            Some(episode_draft),
-        ) {
-            SyncLocalMutationOutcome::Durable {
-                batch_id: durable_batch_id,
-            } => {
-                debug_assert_eq!(durable_batch_id, batch_id);
-                let record =
-                    match self.load_application_move_episode(parsed_episode_id, request_digest)? {
-                        Ok(ApplicationMoveEpisodeLookup::Complete(record)) => record,
-                        Ok(ApplicationMoveEpisodeLookup::Missing)
-                        | Ok(ApplicationMoveEpisodeLookup::Pending(_)) => {
-                            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
-                                "move_episode_not_durable",
-                            ))
-                        }
-                        Err(reason) => return Ok(no_commit(reason)),
-                    };
-                match self.application_move_accepted(&record) {
-                    Ok(true) => self.application_move_committed_outcome(&record, false),
-                    Ok(false) => Ok(no_commit(SyncApplicationMoveConflict::EpisodeNotCommitted)),
-                    Err(reason) => Ok(no_commit(reason)),
-                }
-            }
-            outcome => Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
-                episode_id,
-                state: editor_deferred_from_local(outcome),
-            }),
+            batch_id,
+            episode_draft,
+            source.editor.page.page_id,
+            source.editor.page.home_document_id,
+            destination.editor.page.page_id,
+            destination.editor.page.home_document_id,
+        )
+    }
+
+    fn execute_foreground_application_move(
+        &mut self,
+        transaction: OperationTransaction,
+        batch_id: BatchId,
+        episode: ApplicationMoveEpisodeDraft,
+        source_page_id: PageId,
+        source_home_document_id: DocumentId,
+        destination_page_id: PageId,
+        destination_home_document_id: DocumentId,
+    ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
+        #[cfg(test)]
+        reset_application_move_stage_timings();
+        #[cfg(test)]
+        let foreground_started = Instant::now();
+        #[cfg(test)]
+        let fail_episode_publication =
+            std::mem::take(&mut self.fail_next_move_episode_publication_after_write);
+        #[cfg(not(test))]
+        let fail_episode_publication = false;
+        #[cfg(test)]
+        let stage_started = Instant::now();
+        let page_home_hints = BTreeMap::from([
+            (source_page_id, source_home_document_id),
+            (destination_page_id, destination_home_document_id),
+        ]);
+        let prepared = {
+            let clean = self
+                .clean
+                .as_mut()
+                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+            let mut session = clean
+                .runtime
+                .admit_clean_mutation(&self.graph)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_bindings"))?;
+            OperationalCoordinator::prepare_clean_trusted_local_compound(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                &transaction,
+                batch_id,
+                &page_home_hints,
+            )
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_prepare"))?
+        };
+        #[cfg(test)]
+        note_application_move_stage(|timings| timings.preparation = stage_started.elapsed());
+        let PreparedLocalMutationState::Prepared(prepared) = prepared else {
+            return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode.episode_id.to_string(),
+                state: SyncEditorDeferred::RetryableExternalWork,
+            });
+        };
+        let manifest_fingerprint =
+            ContentDigest::of(&prepared.prepared_batch().manifest().encode().map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_manifest_encode")
+            })?);
+        #[cfg(test)]
+        let stage_started = Instant::now();
+        if persist_application_move_episode(
+            &self.move_episode_directory,
+            &episode.finish(manifest_fingerprint),
+            fail_episode_publication,
+        )
+        .is_err()
+        {
+            return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode.episode_id.to_string(),
+                state: SyncEditorDeferred::RetryableExternalWork,
+            });
         }
+        #[cfg(test)]
+        note_application_move_stage(|timings| {
+            timings.episode_publication = stage_started.elapsed()
+        });
+
+        #[cfg(test)]
+        let stage_started = Instant::now();
+        let committed = {
+            let clean = self
+                .clean
+                .as_mut()
+                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+            let managed = self
+                .managed_local
+                .as_mut()
+                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+            let mut session = clean
+                .runtime
+                .admit_clean_mutation(&self.graph)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_bindings"))?;
+            let (_, engine, _) = session
+                .parts()
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_bindings"))?;
+            TrustedLocalCommitCoordinator::commit_compound(&mut managed.journal, engine, prepared)
+        };
+        #[cfg(test)]
+        note_application_move_stage(|timings| {
+            timings.journal_and_hot_overlay = stage_started.elapsed()
+        });
+        let committed = match committed {
+            Ok(TrustedLocalCompoundOutcome::Committed(committed)) => committed,
+            Ok(TrustedLocalCompoundOutcome::CommittedRecoveryRequired {
+                prepared: _,
+                last_error,
+            }) => {
+                self.terminal = Some(format!(
+                    "journal-committed foreground move needs hot-overlay recovery: {last_error}"
+                ));
+                return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                    episode_id: episode.episode_id.to_string(),
+                    state: SyncEditorDeferred::BlockedRecovery {
+                        batch_id: Some(batch_id.to_string()),
+                        phase: SyncLocalMutationPhase::ProjectionDrain,
+                        retained_publication: true,
+                    },
+                });
+            }
+            Err(TrustedLocalCommitError::JournalAppend(
+                ManagedLocalAppendError::AppendOutcomeUnknown(_),
+            )) => {
+                self.terminal = Some(
+                    "a managed-storage move journal append had an uncertain outcome; restart Tine so the journal can be replayed"
+                        .into(),
+                );
+                return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                    episode_id: episode.episode_id.to_string(),
+                    state: SyncEditorDeferred::BlockedRecovery {
+                        batch_id: Some(batch_id.to_string()),
+                        phase: SyncLocalMutationPhase::ArchiveStage,
+                        retained_publication: true,
+                    },
+                });
+            }
+            Err(_) => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_foreground_commit",
+                ))
+            }
+        };
+        #[cfg(test)]
+        let stage_started = Instant::now();
+        let outcome = self.finish_foreground_application_move(
+            committed,
+            episode.episode_id,
+            source_page_id,
+            destination_page_id,
+        );
+        #[cfg(test)]
+        note_application_move_stage(|timings| {
+            timings.queue_and_response = stage_started.elapsed();
+            timings.foreground_total = foreground_started.elapsed();
+        });
+        outcome
     }
 
     fn resolve_application_move_subtrees(
@@ -14570,6 +14751,69 @@ impl RuntimeActor {
         episode: &ApplicationMoveEpisodeRecord,
         recovered: bool,
     ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
+        if let Some(frame) = self.managed_local.as_ref().and_then(|managed| {
+            managed.frames.iter().find(|frame| {
+                crate::oplog::decode_managed_local_record(frame).is_ok_and(|record| {
+                    record.prepared_batch().manifest().batch_id() == episode.batch_id
+                })
+            })
+        }) {
+            let record = crate::oplog::decode_managed_local_record(frame).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_recovery_record_decode")
+            })?;
+            let application = |page_id: PageId| {
+                let page = self
+                    .active_engine()
+                    .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+                    .materialize_page(page_id)
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt("move_recovery_materialize")
+                    })?;
+                let projection = record
+                    .projections()
+                    .iter()
+                    .find(|projection| projection.intent().page_id() == page_id)
+                    .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "move_recovery_projection_missing",
+                    ))?;
+                let target = projection.intent().target().bytes().ok_or(
+                    SyncApplicationPageRequestError::ActorRefusedAt("move_recovery_target_missing"),
+                )?;
+                let parsed = self
+                    .graph
+                    .parse_exact_page_dto(projection.intent().path(), target)
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "move_recovery_response_parse",
+                        )
+                    })?;
+                let editor =
+                    editor_current_page_from_materialized(page, MAX_SYNC_APPLICATION_PAGE_BLOCKS)
+                        .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "move_recovery_response_editor",
+                        )
+                    })?;
+                join_application_page(parsed, editor).map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt("move_recovery_response_join")
+                })
+            };
+            let source = application(episode.source_page_id)?;
+            let destination = application(episode.destination_page_id)?;
+            return Ok(SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id: episode.episode_id.to_string(),
+                batch_id: episode.batch_id.to_string(),
+                recovered,
+                source: SyncApplicationMovedPage {
+                    page: source.page,
+                    revision: source.revision,
+                },
+                destination: SyncApplicationMovedPage {
+                    page: destination.page,
+                    revision: destination.revision,
+                },
+            });
+        }
         let source = self.load_application_page_id_ready(episode.source_page_id)?;
         let destination = self.load_application_page_id_ready(episode.destination_page_id)?;
         Ok(SyncApplicationMoveSubtreesOutcome::Committed {
@@ -17099,6 +17343,95 @@ impl RuntimeActor {
             .map_err(|_| SyncEditorRequestError::ActorRefusedAt("trusted_local_response_join"))
     }
 
+    fn finish_foreground_application_move(
+        &mut self,
+        committed: TrustedLocalCompoundCommitted,
+        episode_id: Uuid,
+        source_page_id: PageId,
+        destination_page_id: PageId,
+    ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
+        let batch_id = committed.batch_id();
+        let sequence = committed.sequence();
+        let prepared = committed.prepared_record();
+        let managed = self
+            .managed_local
+            .as_mut()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let expected = managed
+            .frames
+            .back()
+            .map_or(managed.checkpoint.next_sequence(), |frame| {
+                frame.sequence().saturating_add(1)
+            });
+        if sequence != expected || managed.journal.next_sequence() != sequence.saturating_add(1) {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "move_managed_queue_monotonicity",
+            ));
+        }
+        let frame = LocalJournalFrame::new(
+            managed.journal.device_id(),
+            sequence,
+            prepared.payload_kind(),
+            prepared.journal_payload().to_vec(),
+        );
+        let record = crate::oplog::decode_managed_local_record(&frame).map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("move_managed_record_decode")
+        })?;
+        for projection in record.projections() {
+            managed.note_latest_projection_frame(projection.intent().path().clone(), frame.clone());
+        }
+        managed.frames.push_back(frame);
+
+        let application = |page_id: PageId| {
+            let page = committed.post_pages().get(&page_id).ok_or(
+                SyncApplicationPageRequestError::ActorRefusedAt("move_post_page_missing"),
+            )?;
+            let projection = record
+                .projections()
+                .iter()
+                .find(|projection| projection.intent().page_id() == page_id)
+                .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_projection_missing",
+                ))?;
+            let target = projection.intent().target().bytes().ok_or(
+                SyncApplicationPageRequestError::ActorRefusedAt("move_target_missing"),
+            )?;
+            let parsed = self
+                .graph
+                .parse_exact_page_dto(projection.intent().path(), target)
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt("move_response_parse")
+                })?;
+            let editor = editor_current_page_from_materialized(
+                page.clone(),
+                MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+            )
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_response_editor"))?;
+            join_application_page(parsed, editor)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_response_join"))
+        };
+        let source = application(source_page_id)?;
+        let destination = application(destination_page_id)?;
+        for current in [&source, &destination] {
+            if let Ok(overlay) = latest_task_query_overlay_page_from_application(current) {
+                managed.install_latest_task_query_overlay(sequence, overlay);
+            }
+        }
+        Ok(SyncApplicationMoveSubtreesOutcome::Committed {
+            episode_id: episode_id.to_string(),
+            batch_id: batch_id.to_string(),
+            recovered: false,
+            source: SyncApplicationMovedPage {
+                revision: source.revision,
+                page: source.page,
+            },
+            destination: SyncApplicationMovedPage {
+                revision: destination.revision,
+                page: destination.page,
+            },
+        })
+    }
+
     fn advance_clean_foreground_pending_commit(&mut self) -> Result<bool, String> {
         let Some(pending) = self
             .managed_local
@@ -17257,16 +17590,31 @@ impl RuntimeActor {
                 return Some(SyncRuntimeTick::Terminal(detail));
             }
         };
-        let superseding_projection = self
+        let superseding_projections = self
             .managed_local
             .as_ref()
-            .and_then(|managed| {
-                managed
-                    .latest_projection_frames
-                    .get(record.projection().intent().path().as_str())
+            .map(|managed| {
+                let mut successors = BTreeMap::<String, Vec<_>>::new();
+                for successor_frame in managed
+                    .frames
+                    .iter()
+                    .skip(1)
+                    .filter(|successor| successor.sequence() > frame.sequence())
+                {
+                    let Ok(successor) = crate::oplog::decode_managed_local_record(successor_frame)
+                    else {
+                        continue;
+                    };
+                    for projection in successor.projections() {
+                        successors
+                            .entry(projection.intent().path().as_str().to_owned())
+                            .or_default()
+                            .push(successor_frame.clone());
+                    }
+                }
+                successors
             })
-            .filter(|successor| successor.sequence() > frame.sequence())
-            .cloned();
+            .filter(|successors| !successors.is_empty());
         let batch_id = record.prepared_batch().manifest().batch_id();
         let mut publisher = ManagedLocalPublisherAttempt {
             batch_id,
@@ -17307,7 +17655,7 @@ impl RuntimeActor {
                 engine,
                 database,
                 &frame,
-                superseding_projection.as_ref(),
+                superseding_projections.as_ref(),
                 &checkpoint,
                 continuation.as_ref(),
                 &mut publisher,
@@ -17337,18 +17685,20 @@ impl RuntimeActor {
                     managed.checkpoint = completion.checkpoint;
                     managed.checkpoint_batch_id = Some(completion.batch_id);
                     managed.frames.pop_front();
-                    if managed
-                        .latest_projection_frames
-                        .get(record.projection().intent().path().as_str())
-                        .is_some_and(|latest| latest.sequence() == completion.sequence)
-                    {
-                        managed
+                    for projection in record.projections() {
+                        if managed
                             .latest_projection_frames
-                            .remove(record.projection().intent().path().as_str());
-                        managed.retire_latest_task_query_overlay(
-                            record.projection().intent().path(),
-                            completion.sequence,
-                        );
+                            .get(projection.intent().path().as_str())
+                            .is_some_and(|latest| latest.sequence() == completion.sequence)
+                        {
+                            managed
+                                .latest_projection_frames
+                                .remove(projection.intent().path().as_str());
+                            managed.retire_latest_task_query_overlay(
+                                projection.intent().path(),
+                                completion.sequence,
+                            );
+                        }
                     }
                     managed.continuation = None;
                     managed.last_failure = None;
@@ -22162,14 +22512,18 @@ mod tests {
     }
 
     fn drain_managed_local(handle: &SyncRuntimeHandle) {
+        let mut last_tick = None;
         for _ in 0..4096 {
             if handle.status().unwrap().managed_local_pending == 0 {
                 handle.tick().unwrap();
                 return;
             }
-            handle.tick().unwrap();
+            last_tick = Some(handle.tick().unwrap());
         }
-        panic!("managed-local drain did not settle");
+        panic!(
+            "managed-local drain did not settle: status={:?}, last_tick={last_tick:?}",
+            handle.status().unwrap()
+        );
     }
 
     fn save_application_block_text(
@@ -23339,10 +23693,24 @@ mod tests {
         drive_initial_feed(&handle);
 
         let (page, revision) = load_application_exact(&handle, "Root.md");
+        let before = handle
+            .managed_application_save_instrumentation()
+            .expect("consecutive-save fixture reads initial work");
         let (page, revision) =
             save_application_block_text(&handle, page, revision, "first upward move");
         let (_page, _revision) =
             save_application_block_text(&handle, page, revision, "second upward move");
+        let after = handle
+            .managed_application_save_instrumentation()
+            .expect("consecutive-save fixture reads composed work");
+        assert_eq!(
+            after
+                .managed_local_work
+                .since(before.managed_local_work)
+                .predecessor_index_lookups,
+            1,
+            "the second queued save must find its predecessor through one exact index lookup",
+        );
         assert_eq!(handle.status().unwrap().managed_local_pending, 2);
 
         for _ in 0..64 {
@@ -23374,7 +23742,7 @@ mod tests {
     /// move is authored; draining that prefix afterwards must not reinterpret
     /// the durable save as an invalid acceptance.
     #[test]
-    fn foreground_source_save_then_cross_page_move_drains_one_accepted_prefix() {
+    fn foreground_source_and_destination_saves_then_cross_page_move_drain_causally() {
         let fixture = ActivationFixture::nested_unicode("clean-foreground-then-cross-page", 0xa171);
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
         let resources =
@@ -23399,7 +23767,16 @@ mod tests {
         );
         request.source_revision = source_revision;
         request.roots[0].identity = source.blocks[0].id.clone();
-        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        let (destination, destination_revision) =
+            load_application_exact(&handle, &request.destination_path);
+        let (_destination, destination_revision) = save_application_block_text(
+            &handle,
+            destination,
+            destination_revision,
+            "destination edited immediately before receiving the moved block",
+        );
+        request.destination_revision = destination_revision;
+        assert_eq!(handle.status().unwrap().managed_local_pending, 2);
 
         let moved = accepted_application_move(&handle, &request);
         assert!(matches!(
@@ -25945,7 +26322,10 @@ mod tests {
         drop(handle);
 
         let reopened = SyncRuntimeHandle::open(open_request);
-        let reopened = reopened.handle.expect("clean move cold-reopens");
+        let reopen_status = reopened.status.clone();
+        let reopened = reopened
+            .handle
+            .unwrap_or_else(|| panic!("clean move cold-reopens: {reopen_status:?}"));
         let observation = reopened.resolve_application_move_subtrees(request).unwrap();
         assert!(matches!(
             observation.move_outcome,
@@ -25956,6 +26336,126 @@ mod tests {
         ));
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn foreground_cross_page_move_crash_reopens_from_the_local_journal() {
+        let fixture = ActivationFixture::nested_unicode("foreground-move-crash-reopen", 0xa17711);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request.clone(),
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("foreground move actor opens");
+        let request = simple_application_move_request(&handle, "Foreground Crash Move");
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: false,
+                ..
+            }
+        ));
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+
+        // Simulate force-close before archive, SQLite, or Markdown projection
+        // drains. The local journal is already the commit boundary.
+        drop(handle);
+        let reopened = SyncRuntimeHandle::open(open_request);
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened.handle.expect("foreground move crash-reopens");
+        match handle
+            .resolve_application_move_subtrees(request)
+            .unwrap()
+            .move_outcome
+        {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: true,
+                source,
+                destination,
+                ..
+            } => {
+                assert!(source.page.blocks.is_empty());
+                assert_eq!(destination.page.blocks.len(), 2);
+            }
+            other => panic!("journal-recovered move was not visible: {other:?}"),
+        }
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn foreground_cross_page_move_is_bounded_and_does_no_graph_wide_work() {
+        let fixture = ActivationFixture::nested_unicode("foreground-move-bounded", 0xa17712);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("bounded move fixture activates");
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "Bounded Foreground Move");
+        let before = handle
+            .managed_application_save_instrumentation()
+            .expect("bounded move reads foreground counters");
+        let started = Instant::now();
+        assert!(matches!(
+            handle.move_application_subtrees(request).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: false,
+                ..
+            }
+        ));
+        let caller = started.elapsed();
+        let after = handle
+            .managed_application_save_instrumentation()
+            .expect("bounded move reads post-commit counters");
+        assert!(after.forbidden.since(before.forbidden).is_none());
+        assert_eq!(
+            after.graph_wide.since(before.graph_wide),
+            GraphWideCommitWork::default()
+        );
+        assert!(
+            after.local_mutation_detail.move_page_home_hint_hits >= 2,
+            "foreground compound move must use its authenticated page-home hints: {:?}",
+            after.local_mutation_detail
+        );
+        assert_eq!(
+            after.local_mutation_detail.move_page_home_hot_catalog_hits, 0,
+            "foreground compound move must not clone the catalog to resolve page homes"
+        );
+        let stages = after.move_stages;
+        eprintln!(
+            "foreground_cross_page_move caller={caller:?} stages={stages:?} preparation={:?} mutation={:?}",
+            after.preparation_stages,
+            after.local_mutation_detail
+        );
+        assert!(
+            stages.foreground_total <= caller,
+            "{stages:?} caller={caller:?}"
+        );
+        let accounted = stages.preparation
+            + stages.episode_publication
+            + stages.journal_and_hot_overlay
+            + stages.queue_and_response;
+        assert!(
+            accounted <= stages.foreground_total,
+            "foreground stage accounting exceeds total: {stages:?}"
+        );
+        assert_eq!(
+            after.managed_local_pending,
+            before.managed_local_pending + 1
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }
@@ -37485,6 +37985,216 @@ mod tests {
             Duration::from_millis(15)
         } else {
             Duration::from_millis(50)
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark: journal-first cross-page foreground and derivative latency"]
+    fn managed_cross_page_move_100_and_10000_page_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_cross_page_move_100_and_10000_page_manual_benchmark -- --ignored --nocapture"
+        );
+        const SAMPLES: usize = 7;
+        let page_counts = std::env::var("TINE_MANAGED_MOVE_BENCH_PAGES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| part.trim().parse::<usize>().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![100, 10_000]);
+        for (scale_index, total_pages) in page_counts.into_iter().enumerate() {
+            assert!(total_pages >= 4);
+            let fixture = ActivationFixture::scaled(
+                &format!("managed-cross-page-move-{total_pages}"),
+                0xa1880 + scale_index as u128 * 0x100,
+                total_pages - 3,
+            );
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+            let handle = activated.handle.expect("move benchmark activates");
+            drive_initial_feed_with_turn_budget(&handle, total_pages.saturating_add(128));
+            let (mut left, mut left_revision) = load_application_exact(&handle, "Root.md");
+            let (mut right, mut right_revision) =
+                load_application_exact(&handle, "diary/nested/25-07-2026.org");
+            let moved_identity = left.blocks[0].id.clone();
+
+            let mut caller_samples = Vec::with_capacity(SAMPLES);
+            let mut foreground_samples = Vec::with_capacity(SAMPLES);
+            let mut preparation_samples = Vec::with_capacity(SAMPLES);
+            let mut episode_samples = Vec::with_capacity(SAMPLES);
+            let mut journal_overlay_samples = Vec::with_capacity(SAMPLES);
+            let mut response_samples = Vec::with_capacity(SAMPLES);
+            let mut derivative_samples = Vec::with_capacity(SAMPLES);
+            let mut derivative_stages = BTreeMap::<String, Duration>::new();
+            let mut last_detail = None;
+            let mut last_derivative_detail = None;
+            for sample in 0..SAMPLES {
+                let left_to_right = sample % 2 == 0;
+                let (source, source_revision, destination, destination_revision) = if left_to_right
+                {
+                    (&left, &left_revision, &right, &right_revision)
+                } else {
+                    (&right, &right_revision, &left, &left_revision)
+                };
+                let request = SyncApplicationMoveSubtreesRequest {
+                    episode_id: Uuid::new_v4().to_string(),
+                    source_path: source.path.clone(),
+                    source_revision: source_revision.clone(),
+                    destination_path: destination.path.clone(),
+                    destination_revision: destination_revision.clone(),
+                    roots: vec![SyncApplicationMoveRoot {
+                        identity: moved_identity.clone(),
+                        raw_rewrite: None,
+                    }],
+                    placement: SyncApplicationMovePlacement::Root { position: 0 },
+                    admission: application_move_admission(),
+                };
+                let before = handle
+                    .managed_application_save_instrumentation()
+                    .expect("move benchmark reads foreground counters");
+                let started = Instant::now();
+                let outcome = handle.move_application_subtrees(request).unwrap();
+                caller_samples.push(started.elapsed());
+                let SyncApplicationMoveSubtreesOutcome::Committed {
+                    recovered: false,
+                    source,
+                    destination,
+                    ..
+                } = outcome
+                else {
+                    panic!("move benchmark foreground outcome was not direct: {outcome:?}");
+                };
+                if left_to_right {
+                    left = source.page;
+                    left_revision = source.revision;
+                    right = destination.page;
+                    right_revision = destination.revision;
+                } else {
+                    right = source.page;
+                    right_revision = source.revision;
+                    left = destination.page;
+                    left_revision = destination.revision;
+                }
+                let after = handle
+                    .managed_application_save_instrumentation()
+                    .expect("move benchmark reads post-commit counters");
+                assert!(after.forbidden.since(before.forbidden).is_none());
+                assert_eq!(
+                    after.graph_wide.since(before.graph_wide),
+                    GraphWideCommitWork::default()
+                );
+                foreground_samples.push(after.move_stages.foreground_total);
+                preparation_samples.push(after.move_stages.preparation);
+                episode_samples.push(after.move_stages.episode_publication);
+                journal_overlay_samples.push(after.move_stages.journal_and_hot_overlay);
+                response_samples.push(after.move_stages.queue_and_response);
+                last_detail = Some(after);
+                let derivative_started = Instant::now();
+                for _ in 0..4096 {
+                    let status = handle.status().unwrap();
+                    if status.managed_local_pending == 0 {
+                        break;
+                    }
+                    let stage = status
+                        .managed_local_stage
+                        .unwrap_or_else(|| "unknown".into());
+                    let stage_started = Instant::now();
+                    let tick = handle.tick().unwrap();
+                    *derivative_stages.entry(stage).or_default() += stage_started.elapsed();
+                    assert!(
+                        !matches!(
+                            tick,
+                            SyncRuntimeTick::RecoveryBlocked(_)
+                                | SyncRuntimeTick::Blocked(_)
+                                | SyncRuntimeTick::Failed(_)
+                                | SyncRuntimeTick::Terminal(_)
+                        ),
+                        "move benchmark derivative failed: {tick:?}"
+                    );
+                }
+                assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+                let after_derivative = handle
+                    .managed_application_save_instrumentation()
+                    .expect("move benchmark reads derivative instrumentation");
+                assert_eq!(
+                    after_derivative.engine.catalog_authenticated_exact_loads,
+                    after.engine.catalog_authenticated_exact_loads,
+                    "block-only move derivative must not reconstruct the graph-sized catalog",
+                );
+                assert_eq!(
+                    after_derivative.engine.catalog_current_loads,
+                    after.engine.catalog_current_loads,
+                    "block-only move derivative must not load the graph-sized current catalog",
+                );
+                assert_eq!(
+                    after_derivative.engine.authenticated_page_identity_lookups,
+                    after.engine.authenticated_page_identity_lookups,
+                    "block-only move derivative must use exact SQLite page rows rather than the legacy authenticated scratch catalog",
+                );
+                assert_eq!(
+                    after_derivative.forbidden.graph_wide_catalog_validations,
+                    after.forbidden.graph_wide_catalog_validations,
+                    "block-only move derivative must reuse the retained catalog shape proof rather than validating the graph-sized catalog",
+                );
+                last_derivative_detail = Some(after_derivative.derivative_stages);
+                derivative_samples.push(derivative_started.elapsed());
+            }
+
+            let receipt = |samples: &[Duration]| (startup_median(samples), startup_p95(samples));
+            let (caller_p50, caller_p95) = receipt(&caller_samples);
+            let (foreground_p50, foreground_p95) = receipt(&foreground_samples);
+            let (preparation_p50, preparation_p95) = receipt(&preparation_samples);
+            let (episode_p50, episode_p95) = receipt(&episode_samples);
+            let (journal_p50, journal_p95) = receipt(&journal_overlay_samples);
+            let (response_p50, response_p95) = receipt(&response_samples);
+            let (derivative_p50, derivative_p95) = receipt(&derivative_samples);
+            eprintln!(
+                "managed_cross_page_move pages={total_pages} samples={SAMPLES} caller_p50_ms={:.3} caller_p95_ms={:.3} foreground_p50_ms={:.3} foreground_p95_ms={:.3} preparation_p50_ms={:.3} preparation_p95_ms={:.3} episode_p50_ms={:.3} episode_p95_ms={:.3} journal_overlay_p50_ms={:.3} journal_overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} derivative_p50_ms={:.3} derivative_p95_ms={:.3}",
+                startup_ms(caller_p50),
+                startup_ms(caller_p95),
+                startup_ms(foreground_p50),
+                startup_ms(foreground_p95),
+                startup_ms(preparation_p50),
+                startup_ms(preparation_p95),
+                startup_ms(episode_p50),
+                startup_ms(episode_p95),
+                startup_ms(journal_p50),
+                startup_ms(journal_p95),
+                startup_ms(response_p50),
+                startup_ms(response_p95),
+                startup_ms(derivative_p50),
+                startup_ms(derivative_p95),
+            );
+            let detail = last_detail.expect("move benchmark records at least one sample");
+            assert!(
+                detail.local_mutation_detail.move_page_home_hint_hits >= 2,
+                "scale receipt must use the bounded page-home route: {:?}",
+                detail.local_mutation_detail
+            );
+            assert_eq!(
+                detail.local_mutation_detail.move_page_home_hot_catalog_hits,
+                0
+            );
+            eprintln!(
+                "managed_cross_page_move_detail pages={total_pages} preparation={:?} mutation={:?} commit={:?}",
+                detail.preparation_stages,
+                detail.local_mutation_detail,
+                detail.commit_stages,
+            );
+            eprintln!(
+                "managed_cross_page_move_derivative_stages pages={total_pages} stages={derivative_stages:?}"
+            );
+            eprintln!(
+                "managed_cross_page_move_derivative_detail pages={total_pages} stages={:?}",
+                last_derivative_detail.expect("move benchmark records derivative detail")
+            );
+            assert!(
+                caller_p95 < Duration::from_millis(50),
+                "cross-page caller p95 must remain below 50 ms at {total_pages} pages: {caller_p95:?}"
+            );
         }
     }
 

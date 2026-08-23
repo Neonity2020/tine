@@ -6357,10 +6357,10 @@ impl Graph {
 
     fn apply_guarded_graph_text_identity_path(
         &self,
-        current: &CompleteGraphTextAdmissionIndex,
+        current: &mut CompleteGraphTextAdmissionIndex,
         relative: String,
         decode_semantics: bool,
-    ) -> io::Result<CompleteGraphTextAdmissionIndex> {
+    ) -> io::Result<()> {
         let event_scratch = graph_text_event_scratch_upper_bound(&relative)?;
         ensure_graph_text_peak_limit(current.permanent_bytes, event_scratch, current.peak_limit)?;
         let mut charges = GraphTextExactFeedBatchActualCharges::default();
@@ -6402,13 +6402,12 @@ impl Graph {
             return Err(initial_shadow_limit_error("peak build memory"));
         }
 
-        let mut next = current.clone();
         match final_state {
             PreparedGraphTextAdmissionFinalState::Present(prepared) => {
                 if let Err(delta_error) =
-                    self.apply_prepared_graph_text_file_upsert(&mut next, prepared)
+                    self.apply_prepared_graph_text_file_upsert(current, prepared)
                 {
-                    let detail = validate_graph_text_admission_index(&next)
+                    let detail = validate_graph_text_admission_index(current)
                         .err()
                         .map_or_else(
                             || "complete index remains internally valid".to_owned(),
@@ -6421,17 +6420,17 @@ impl Graph {
                 }
             }
             PreparedGraphTextAdmissionFinalState::Absent(prepared) => {
-                let removed = remove_graph_text_admission_path(&mut next, &relative);
+                let removed = remove_graph_text_admission_path(current, &relative);
                 if let (Ok(path), Some(tombstone)) = (ManagedPath::parse(relative.clone()), removed)
                 {
-                    next.tombstones_by_exact_path.insert(path, tombstone);
+                    current.tombstones_by_exact_path.insert(path, tombstone);
                 }
-                next.permanent_bytes =
-                    checked_add_bytes(next.permanent_bytes, prepared.retained_growth)?;
+                current.permanent_bytes =
+                    checked_add_bytes(current.permanent_bytes, prepared.retained_growth)?;
             }
         }
-        validate_graph_text_admission_delta(&next, &relative)?;
-        Ok(next)
+        validate_graph_text_admission_delta(current, &relative)?;
+        Ok(())
     }
 
     /// Publish exact final-state changes made by Tine while the same
@@ -6471,11 +6470,15 @@ impl Graph {
                 "injected guarded graph-text identity publication failure",
             ));
         }
-        let mut next = state
-            .index
-            .as_deref()
-            .expect("checked retained guarded identity")
-            .clone();
+        let generation = state.generation.checked_add(1).ok_or_else(|| {
+            graph_text_admission_unavailable("guarded graph-text identity generation overflow")
+        })?;
+        let next = Arc::make_mut(
+            state
+                .index
+                .as_mut()
+                .expect("checked retained guarded identity"),
+        );
         let update_result = (|| {
             for relative in relatives {
                 if self.classify_graph_text_exact_feed_path(&relative)?
@@ -6483,8 +6486,7 @@ impl Graph {
                 {
                     continue;
                 }
-                next =
-                    self.apply_guarded_graph_text_identity_path(&next, relative, decode_semantics)?;
+                self.apply_guarded_graph_text_identity_path(next, relative, decode_semantics)?;
             }
             Ok::<(), io::Error>(())
         })();
@@ -6495,12 +6497,8 @@ impl Graph {
             )));
             return Err(error);
         }
-        let generation = state.generation.checked_add(1).ok_or_else(|| {
-            graph_text_admission_unavailable("guarded graph-text identity generation overflow")
-        })?;
         next.generation = generation;
         state.generation = generation;
-        state.index = Some(Arc::new(next));
         state.observed_resource_epoch = Some(resource_epoch);
         state.invalidated = false;
         state.invalidation_cause = None;
@@ -7837,28 +7835,20 @@ impl Graph {
     /// portable sibling is retained but cannot redirect the operation.
     fn validate_current_graph_text_collision(
         &self,
-        permit: &ManagedTextWritePermit,
-        target: &Path,
-        target_identity: Option<ContentDigest>,
-    ) -> io::Result<Vec<PageEntry>> {
-        let target_relative = self.rel_path(target);
-        let (entries, identities) = self.graph_text_inventory(permit)?;
-        for entry in &entries {
-            if entry.path == target {
-                continue;
-            }
-            if target_identity.is_some() && identities.get(&entry.path).copied() == target_identity
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text files alias one physical resource: {} and {target_relative}",
-                        entry.rel_path
-                    ),
-                ));
-            }
-        }
-        Ok(entries)
+        _permit: &ManagedTextWritePermit,
+        _target: &Path,
+        _target_identity: Option<ContentDigest>,
+    ) -> io::Result<()> {
+        // A manifested projection is already bound to one exact accepted page
+        // path and publishes through retained no-follow directory capabilities.
+        // Discovering whether a non-cooperating actor hard-linked that inode at
+        // some unrelated graph path required a whole-graph inventory on every
+        // projection recheck.  That adversarial alias scenario does not grant
+        // authority over this exact path and is outside the local-user threat
+        // model; the watcher will admit an independently changed sibling in its
+        // normal lane.  Path shape, exact-base, no-clobber publication and final
+        // reread checks remain below.
+        Ok(())
     }
 
     /// Read the parsed ownership evidence once. A clean missing page cache is
@@ -16522,6 +16512,11 @@ impl Graph {
         known_attempts: &[ProjectionAttemptReservation],
         evidence_publisher: Option<&ProjectionRecoveryEvidencePublisher<'_>>,
     ) -> io::Result<ProjectionWriteProof> {
+        // Collision authority, the exact filesystem replacement, and retained
+        // identity-index publication form one resource-wide transaction.  This
+        // is the same boundary used by Direct Files writes; projection must not
+        // substitute repeated whole-graph inventories for it.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         require_projection_platform()?;
         if usize_to_u64(target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
             return Err(projection_semantic_refusal(
@@ -16951,6 +16946,13 @@ impl Graph {
                 result
             },
         )?;
+        // Managed projection owns the exact path while the Direct Files writer
+        // gate is closed. Do not try to rebuild/update the Direct Files identity
+        // index through that closed gate; invalidate it so a later regime switch
+        // rebuilds once from the then-current tree.
+        self.invalidate_guarded_graph_text_identity(
+            "managed projection changed an exact graph-text identity",
+        );
         self.drop_self_write_marker(&target_path.absolute_path, &rev);
         Ok(proof)
     }

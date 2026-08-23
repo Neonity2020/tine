@@ -2263,23 +2263,27 @@ impl ScratchStore {
     ) -> Result<Option<Vec<u8>>, ScratchError> {
         validate_authenticated_catalog_root(root)?;
         self.physical.record_point_reads(1);
-        let mut current = root.root.as_ref().map(|page_ref| AuthenticatedMapChild {
-            key: root.root_key.expect("validated nonempty catalog root"),
-            digest: root.root_digest,
-            page_ref: page_ref.clone(),
-        });
-        for _ in 0..=MAX_AUTHENTICATED_MAP_DEPTH {
-            let Some(child) = current else {
-                return Ok(None);
-            };
-            let node = self.read_authenticated_catalog_node(&child)?;
-            match key.cmp(&node.key) {
-                std::cmp::Ordering::Equal => return Ok(Some(node.value)),
-                std::cmp::Ordering::Less => current = node.left,
-                std::cmp::Ordering::Greater => current = node.right,
-            }
-        }
-        Err(ScratchError::IndexCapacity)
+        self.physical
+            .with_page_reader(|reader| {
+                let mut current = root.root.as_ref().map(|page_ref| AuthenticatedMapChild {
+                    key: root.root_key.expect("validated nonempty catalog root"),
+                    digest: root.root_digest,
+                    page_ref: page_ref.clone(),
+                });
+                for _ in 0..=MAX_AUTHENTICATED_MAP_DEPTH {
+                    let Some(child) = current else {
+                        return Ok(None);
+                    };
+                    let node = read_authenticated_catalog_node_from_reader(reader, &child)?;
+                    match key.cmp(&node.key) {
+                        std::cmp::Ordering::Equal => return Ok(Some(node.value)),
+                        std::cmp::Ordering::Less => current = node.left,
+                        std::cmp::Ordering::Greater => current = node.right,
+                    }
+                }
+                Err(tine_storage::ScratchRunError::IndexCapacity)
+            })
+            .map_err(Into::into)
     }
 
     pub(crate) fn authenticated_catalog_lookup_many(
@@ -2294,42 +2298,48 @@ impl ScratchStore {
             return Ok(found);
         }
         self.physical.record_point_reads(requested.len());
-        let mut pending = root.root.as_ref().map_or_else(Vec::new, |page_ref| {
-            vec![(
-                AuthenticatedMapChild {
-                    key: root.root_key.expect("validated nonempty catalog root"),
-                    digest: root.root_digest,
-                    page_ref: page_ref.clone(),
-                },
-                0_usize,
-                requested.len(),
-                0_usize,
-            )]
-        });
-        let mut visited = BTreeSet::new();
-        while let Some((child, start, end, depth)) = pending.pop() {
-            if depth > MAX_AUTHENTICATED_MAP_DEPTH || !visited.insert(child.page_ref.offset) {
-                return Err(ScratchError::MalformedPage);
-            }
-            let node = self.read_authenticated_catalog_node(&child)?;
-            let split = requested[start..end].partition_point(|key| *key < node.key) + start;
-            let matched = split < end && requested[split] == node.key;
-            if matched {
-                found.insert(node.key, node.value.clone());
-            }
-            if start < split {
-                if let Some(left) = node.left {
-                    pending.push((left, start, split, depth + 1));
+        self.physical
+            .with_page_reader(|reader| {
+                let mut pending = root.root.as_ref().map_or_else(Vec::new, |page_ref| {
+                    vec![(
+                        AuthenticatedMapChild {
+                            key: root.root_key.expect("validated nonempty catalog root"),
+                            digest: root.root_digest,
+                            page_ref: page_ref.clone(),
+                        },
+                        0_usize,
+                        requested.len(),
+                        0_usize,
+                    )]
+                });
+                let mut visited = BTreeSet::new();
+                while let Some((child, start, end, depth)) = pending.pop() {
+                    if depth > MAX_AUTHENTICATED_MAP_DEPTH || !visited.insert(child.page_ref.offset)
+                    {
+                        return Err(tine_storage::ScratchRunError::MalformedPage);
+                    }
+                    let node = read_authenticated_catalog_node_from_reader(reader, &child)?;
+                    let split =
+                        requested[start..end].partition_point(|key| *key < node.key) + start;
+                    let matched = split < end && requested[split] == node.key;
+                    if matched {
+                        found.insert(node.key, node.value.clone());
+                    }
+                    if start < split {
+                        if let Some(left) = node.left {
+                            pending.push((left, start, split, depth + 1));
+                        }
+                    }
+                    let right_start = split + usize::from(matched);
+                    if right_start < end {
+                        if let Some(right) = node.right {
+                            pending.push((right, right_start, end, depth + 1));
+                        }
+                    }
                 }
-            }
-            let right_start = split + usize::from(matched);
-            if right_start < end {
-                if let Some(right) = node.right {
-                    pending.push((right, right_start, end, depth + 1));
-                }
-            }
-        }
-        Ok(found)
+                Ok(found)
+            })
+            .map_err(Into::into)
     }
 
     pub(crate) fn authenticated_catalog_upsert(
@@ -3725,6 +3735,25 @@ fn validate_authenticated_catalog_node(
         return Err(ScratchError::MalformedPage);
     }
     Ok(())
+}
+
+fn read_authenticated_catalog_node_from_reader(
+    reader: &mut tine_storage::ScratchPageReader<'_>,
+    child: &AuthenticatedMapChild,
+) -> Result<AuthenticatedCatalogNode, tine_storage::ScratchRunError> {
+    let node: AuthenticatedCatalogNode =
+        reader.read_page(&child.page_ref, ScratchPageKind::CurrentPathCatalog)?;
+    if validate_authenticated_catalog_node(&node).is_err() {
+        return Err(tine_storage::ScratchRunError::MalformedPage);
+    }
+    if node.key != child.key
+        || child.page_ref.key_min != child.key
+        || child.page_ref.key_max != child.key
+        || authenticated_catalog_node_digest(&node) != child.digest
+    {
+        return Err(tine_storage::ScratchRunError::PageBindingMismatch);
+    }
+    Ok(node)
 }
 
 fn validate_causal_accumulator_node(node: &CausalAccumulatorNode) -> Result<(), ScratchError> {

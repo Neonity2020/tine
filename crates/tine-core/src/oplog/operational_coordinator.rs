@@ -349,6 +349,53 @@ fn classify_authorization_failure(error: RuntimePromotionError) -> OperationalCo
 pub(crate) struct OperationalCoordinator;
 
 impl OperationalCoordinator {
+    /// Prepare a bounded existing-page transaction for the durable foreground
+    /// journal without forcing accepted-history, SQLite, or graph projection
+    /// work into the caller's turn. Unlike the editor-specialized variant,
+    /// this admits every affected existing-page projection in the batch.
+    pub(crate) fn prepare_clean_trusted_local_compound(
+        session: &mut CleanRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        transaction: &OperationTransaction,
+        correlated_batch_id: BatchId,
+        page_home_hints: &std::collections::BTreeMap<PageId, super::DocumentId>,
+    ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
+        #[cfg(test)]
+        {
+            reset_trusted_local_preparation_stage_timings();
+            super::hot_engine::reset_local_mutation_detail_timings();
+        }
+        #[cfg(test)]
+        let parts_started = Instant::now();
+        let (admission, engine, database) = session.parts().map_err(|refusal| {
+            OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+        })?;
+        #[cfg(test)]
+        note_trusted_local_preparation_stage(|timings| {
+            timings.session_parts = parts_started.elapsed();
+        });
+        let claim_source = database.materialized_read().map_err(|error| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Draft,
+                format!("clean SQLite identity candidates are unavailable: {error}"),
+            )
+        })?;
+        prepare_local_inner(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            LocalDraftSource::Promoted {
+                batch_id: Some(correlated_batch_id),
+            },
+            transaction,
+            None,
+            Some(&claim_source),
+            Some(page_home_hints),
+        )
+    }
+
     /// Prepare one ordinary existing-page edit for the clean runtime's durable
     /// foreground journal boundary.
     ///
@@ -393,6 +440,7 @@ impl OperationalCoordinator {
             transaction,
             Some(prepared_editor_projection),
             Some(&claim_source),
+            None,
         )
     }
 }
@@ -454,6 +502,7 @@ fn execute_clean_local_inner(
         transaction,
         None,
         Some(&claim_source),
+        None,
     )? {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
         PreparedLocalMutationState::ReconciliationRequired(_) => {
@@ -920,6 +969,7 @@ impl OperationalCoordinator {
             transaction,
             None,
             None,
+            None,
         )
     }
 }
@@ -1002,6 +1052,7 @@ fn prepare_local_inner(
     transaction: &OperationTransaction,
     prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     claim_source: Option<&dyn super::hot_engine::ProjectionClaimSource>,
+    page_home_hints: Option<&std::collections::BTreeMap<PageId, super::DocumentId>>,
 ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
     #[cfg(test)]
     let bindings_started = Instant::now();
@@ -1051,12 +1102,14 @@ fn prepare_local_inner(
                     transaction,
                     prepared_editor_projection,
                     claim_source,
+                    page_home_hints,
                 ),
                 None => engine.draft_admitted_local_author_transaction(
                     &authority,
                     transaction,
                     prepared_editor_projection,
                     claim_source,
+                    page_home_hints,
                 ),
             }
             .map_err(|error| {

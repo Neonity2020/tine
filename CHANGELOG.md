@@ -65,6 +65,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **No more white frame around the page after clicking empty space and pressing a key** (GH #345). Clicking an empty spot of the main content focused the page scroller, and the next keypress flipped the browser's focus heuristic, painting its default white frame around the whole content area. Only that default frame is suppressed — the pane-select ring and the usual focus cues on buttons and other controls are unchanged.
 
+- **Managed-storage block moves across journal-day boundaries now stay immediate and keep keyboard focus.** The source and destination publish as one durable foreground transaction, so archive/SQLite derivatives no longer dim or stall the interface before the block appears on the adjacent day. The foreground path is graph-size invariant at 100 and 10,000 pages, and rapid queued edits use exact pending-projection indexes instead of repeatedly scanning the journal prefix.
+
 ## [0.6.94] - 2026-08-22
 
 ### Added

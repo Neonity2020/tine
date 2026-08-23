@@ -109,14 +109,52 @@ pub(crate) fn extract_authoritative_catalog_page_names(
     if requested_page_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(StoreError::NonCanonicalPageNamePointKeys);
     }
+    let validated = super::hot_engine::validate_catalog_document(catalog_document_id, document)
+        .map_err(|_| StoreError::MalformedPageNameIndex)?;
     let entries = requested_page_ids
         .iter()
         .map(|page_id| {
-            super::hot_engine::validate_catalog_page(catalog_document_id, document, *page_id)
+            super::hot_engine::read_validated_catalog_page(validated, *page_id)
                 .map(|state| (*page_id, state))
                 .map_err(|_| StoreError::MalformedPageNameIndex)
         })
         .collect::<Result<_, _>>()?;
+    Ok(AuthoritativeCatalogPageNameObservationsV1 { entries })
+}
+
+/// Select exact affected-page observations from an already validated semantic
+/// effect. Local typed authoring derives this effect from the engine's current
+/// catalog and its prospective document; re-decoding the complete graph-sized
+/// catalog to recover the same bounded before/after rows is redundant work.
+pub(crate) fn extract_semantic_page_name_observations(
+    page_deltas: &[PageDelta],
+    prospective: bool,
+) -> Result<AuthoritativeCatalogPageNameObservationsV1, StoreError> {
+    if page_deltas.len() > MAX_PAGE_NAME_POINT_BATCH {
+        return Err(StoreError::PageNamePointBatchTooLarge {
+            actual: page_deltas.len(),
+            limit: MAX_PAGE_NAME_POINT_BATCH,
+        });
+    }
+    if page_deltas
+        .windows(2)
+        .any(|pair| pair[0].page_id >= pair[1].page_id)
+    {
+        return Err(StoreError::NonCanonicalPageNamePointKeys);
+    }
+    let entries = page_deltas
+        .iter()
+        .map(|delta| {
+            (
+                delta.page_id,
+                if prospective {
+                    delta.after.clone()
+                } else {
+                    delta.before.clone()
+                },
+            )
+        })
+        .collect();
     Ok(AuthoritativeCatalogPageNameObservationsV1 { entries })
 }
 

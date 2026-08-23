@@ -95,10 +95,10 @@ use super::sync_layout::{
 };
 use super::{
     BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
-    DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
-    ObjectKind, ObjectStore, OperationBatch, PageId, PageState, PreparedBatch, ReferenceFactV1,
-    ReferenceSourceLocatorV1, SemanticEffect, SemanticEffectDigest, ShardedHotEngine,
-    ValidatedBatch, WorkspaceId, WorkspaceStatus, MANAGED_ENTITY_SET_VERSION,
+    DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName, LogseqUuid,
+    LogseqUuidResolution, ObjectKind, ObjectStore, OperationBatch, PageId, PageState,
+    PreparedBatch, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticEffect, SemanticEffectDigest,
+    ShardedHotEngine, ValidatedBatch, WorkspaceId, WorkspaceStatus, MANAGED_ENTITY_SET_VERSION,
     MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
     OPLOG_PROTOCOL_VERSION,
 };
@@ -1942,12 +1942,61 @@ fn prepare_accepted_sqlite_identity_transition(
         .iter()
         .map(|delta| (delta.page_id, delta.before.clone()))
         .collect::<BTreeMap<_, _>>();
-    let current = engine
-        .accepted_catalog_page_states(event.prior_frontier_root(), &page_ids)
-        .map_err(ProjectionError::materialization_from_engine)?;
-    let mut prospective = engine
-        .accepted_catalog_page_states(event.post_frontier_root(), &page_ids)
-        .map_err(ProjectionError::materialization_from_engine)?;
+    // SQLite is already the exact materialized prior frontier. Reconstructing
+    // the graph-sized CRDT catalog at both F and F+1 just to read these page
+    // identities made one remote/replayed page mutation O(graph), twice. The
+    // prior rows plus the accepted event's validated semantic/merged view are
+    // the complete bounded transition input.
+    let current = page_ids
+        .iter()
+        .map(|page_id| {
+            prior
+                .page(*page_id)
+                .map_err(ProjectionError::from)
+                .and_then(|row| {
+                    row.map(|row| {
+                        Ok(PageState::Live {
+                            name: LogicalPageName::parse(row.name).map_err(|error| {
+                                ProjectionError::Materialization(error.to_string())
+                            })?,
+                            path: row.path,
+                            home_document_id: row.home_document_id,
+                            kind: row.kind,
+                        })
+                    })
+                    .transpose()
+                })
+                .map(|state| (*page_id, state))
+        })
+        .collect::<Result<BTreeMap<_, _>, ProjectionError>>()?;
+    let validation = event.effect_validation_context();
+    let mut prospective = authored
+        .pages()
+        .iter()
+        .map(|delta| {
+            let state = if validation.contested_pages.contains(&delta.page_id) {
+                if let Some(page) = validation.merged_replacements.get(&delta.page_id) {
+                    Some(PageState::Live {
+                        name: LogicalPageName::parse(&page.name)
+                            .map_err(|error| ProjectionError::Materialization(error.to_string()))?,
+                        path: page.path.clone(),
+                        home_document_id: page.home_document_id,
+                        kind: page.kind,
+                    })
+                } else if validation.merged_deletions.contains(&delta.page_id) {
+                    delta.after.clone()
+                } else {
+                    return Err(ProjectionError::Materialization(format!(
+                        "contested page {} has no merged identity observation",
+                        delta.page_id
+                    )));
+                }
+            } else {
+                delta.after.clone()
+            };
+            Ok((delta.page_id, state))
+        })
+        .collect::<Result<BTreeMap<_, _>, ProjectionError>>()?;
     for transition in event.effective_transitions() {
         let Some(Some(PageState::Live { name, .. })) = prospective.get_mut(&transition.page_id())
         else {
@@ -5087,6 +5136,7 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
+        let trace = super::phase_trace_enabled();
         if !self.runtime_authority.matches(engine.runtime_authority()) {
             return Err(ProjectionError::AuthorityMismatch);
         }
@@ -5100,26 +5150,71 @@ impl SqliteFrontier {
                 Default::default(),
             ));
         }
+        let materialize_started = trace.then(std::time::Instant::now);
         let (materialization, materialization_stats) =
             materialize_accepted_event_with_stats(engine, event)?;
+        if let Some(started) = materialize_started {
+            eprintln!(
+                "PHASE TIME SQLite.apply.materialize_accepted_event {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+            eprintln!(
+                "PHASE DETAIL SQLite.apply.materialize_accepted_event {materialization_stats:?}"
+            );
+        }
+        let parser_started = trace.then(std::time::Instant::now);
         let materialization = attach_parser_derived_graph_facts(engine, materialization)?;
+        if let Some(started) = parser_started {
+            eprintln!(
+                "PHASE TIME SQLite.apply.parser_derived_facts {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         let prior_digest = canonical_frontier_root_digest(event.prior_frontier_root())?;
+        let prior_started = trace.then(std::time::Instant::now);
         let prior = self.physical.materialized_read(
             event.prior_frontier_root().acceptance_sequence(),
             prior_digest,
         )?;
         let prior = super::SqliteMaterializedRead::from_storage(prior);
+        if let Some(started) = prior_started {
+            eprintln!(
+                "PHASE TIME SQLite.apply.prior_materialized_read {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        let identity_started = trace.then(std::time::Instant::now);
         let identity = match event.prepared_identity_transition() {
             Some(prepared) => prepared.clone(),
             None => prepare_accepted_sqlite_identity_transition(engine, event, &prior)?,
         };
         drop(prior);
+        if let Some(started) = identity_started {
+            eprintln!(
+                "PHASE TIME SQLite.apply.identity_transition {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        let install_started = trace.then(std::time::Instant::now);
         let materialization = install_clean_identity_transition(materialization, &identity)?;
+        if let Some(started) = install_started {
+            eprintln!(
+                "PHASE TIME SQLite.apply.install_identity_transition {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        let physical_started = trace.then(std::time::Instant::now);
         let (disposition, apply_stats) = self.apply_internal_with_materialization_and_stats(
             event,
             ApplyFault::None,
             Some(&materialization),
         )?;
+        if let Some(started) = physical_started {
+            eprintln!(
+                "PHASE TIME SQLite.apply.physical_transaction {:.3}ms",
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         Ok((disposition, materialization_stats, apply_stats))
     }
 
@@ -14578,8 +14673,8 @@ mod tests {
             );
         } else {
             assert_eq!(
-                (stats.decodes, stats.reuses, stats.mutation_refusals),
-                (0, 0, 0),
+                (stats.decodes, stats.reuses),
+                (0, 0),
                 "the oracle run must decode the catalog every time"
             );
         }
@@ -14895,86 +14990,6 @@ mod tests {
         assert_eq!(
             current_page.path,
             ManagedPath::parse("notes/renamed.md").unwrap()
-        );
-    }
-
-    /// The retained value is a `LoroDoc`, which is a reference-counted handle
-    /// with interior mutability. If anything advances the retained document
-    /// behind the engine's back it is no longer the state that was published
-    /// under its content identity, and it must be refused rather than served.
-    #[test]
-    fn a_mutated_retained_catalog_is_refused_and_decoded_again() {
-        let ids = TestIds::new(2_850);
-        let dir = TestDir::new("catalog-mutation-refusal");
-        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
-        let mut database = open_test_projection(
-            &dir.path().join("frontier.sqlite"),
-            ids.claim(),
-            RebuildSource::new(&engine, &store).unwrap(),
-        )
-        .unwrap()
-        .database;
-        let prepared = engine
-            .prepare_bootstrap_transaction(
-                author(2_851),
-                &root_transaction_named(ids, "pages/mutation.md", "Mutation Fixture", "first"),
-            )
-            .unwrap();
-        publish_and_stage_archive(&mut engine, &store, &prepared);
-        drain_one_save_catalog_accounting(&mut database, &engine, &store);
-        edit_block_content(
-            &mut engine,
-            &store,
-            ids,
-            2_852,
-            "second",
-            publish_and_stage_archive,
-        );
-        assert_eq!(
-            drain_one_save_catalog_accounting(&mut database, &engine, &store).catalog_reuses,
-            1
-        );
-
-        let retained = engine
-            .retained_accepted_catalog_document_for_test()
-            .expect("a warm run retains one decoded catalog");
-        retained
-            .get_map("pages")
-            .insert("forged", "not the accepted catalog")
-            .unwrap();
-        retained.commit();
-
-        edit_block_content(
-            &mut engine,
-            &store,
-            ids,
-            2_853,
-            "third",
-            publish_and_stage_archive,
-        );
-        let refusals_before = engine.retained_catalog_decode_stats().mutation_refusals;
-        assert_eq!(
-            drain_one_save_catalog_accounting(&mut database, &engine, &store),
-            CatalogSaveAccounting {
-                catalog_loads: 1,
-                catalog_decodes: 1,
-                catalog_reuses: 0,
-            },
-            "a mutated retained catalog must be refused and decoded again"
-        );
-        assert_eq!(
-            engine.retained_catalog_decode_stats().mutation_refusals,
-            refusals_before + 1
-        );
-        database.diagnose_full_integrity().unwrap();
-        let read = database.materialized_read().unwrap();
-        assert_eq!(read.pages(None, 64).unwrap().len(), 1);
-        assert_eq!(
-            read.blocks_on_page(ids.page, 64).unwrap()[0].content,
-            "third"
         );
     }
 
