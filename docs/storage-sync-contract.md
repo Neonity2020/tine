@@ -904,10 +904,16 @@ journal record; once that record is durable, both pages enter the hot overlay
 atomically and the application may return them without waiting for archive,
 SQLite, receipt, or provider derivatives. A subsequent move composes with the
 latest pending `(page, path)` projection through an exact in-memory index; it
-must not scan the pending journal prefix. The derivative may read only the
-affected page identities and materialize those pages from the retained accepted
-catalog proof. It must not decode or validate the graph-sized catalog merely to
-apply a bounded move.
+must not scan the pending journal prefix. Pending records are decoded once on
+recovery or append; derivative turns point-query `(path, page, sequence)` target
+and digest postings, and uncertain move retries point-query the pending batch
+identity. The derivative may read only the affected page identities and
+materialize those pages from the retained accepted catalog proof. It must not
+decode or validate the graph-sized catalog merely to apply a bounded move.
+
+Likewise, admission tracks its exact live staged set. Final status history may
+remain available for point answers, but an ordinary drain turn must never scan
+that lifetime map merely to rediscover the handful of currently staged batches.
 
 These are work-shape requirements, not thread-placement advice. Moving an
 O(graph), O(history), or O(pending-prefix) operation to a background turn does
