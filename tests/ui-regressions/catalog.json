@@ -6897,6 +6897,31 @@
         "failBefore": "unavailable"
       },
       "notes": "Reported internally by Martin: with the Settings modal open, the hardware Back gesture did not close it. The frontend rungs were never at fault - dispatchAndroidBack, the transient registry and Settings' three-rung dismiss all behave correctly in the real app composition, which is why the defect survived. androidx's OnBackPressedDispatcher hands a gesture to the LAST-ADDED enabled callback, and Tauri's core AppPlugin adds its own from its Kotlin constructor, which runs on the Rust startup thread tao spawns inside Rust.create() - after MainActivity.onCreate has already returned. AppPlugin therefore sat ABOVE Tine's SafeBack owner, took its no-listener branch (Tine registers android-safe-back on its own plugin, never back-button on Tauri's) and answered Back with WebView.goBack() whenever the WebView had history. The mobile router pushes one history entry per navigation, so after the user's first navigation every Back popped a route BEHIND whatever was on screen and no rung ever ran; before that first navigation canGoBack() is false, AppPlugin re-dispatches and Back works, which is why this read as intermittent. SafeBackPlugin now claims ownership from its own constructor and again from load(), both strictly later than every plugin registered so far. The frontend semantic regression is blocking and green. The native WebView instrumentation remains in the Android runtime job but is explicitly quarantined after the 2026-08-22 two-attempt stop-loss: on GitHub's software-graphics emulator the process aborts before any JUnit assertion with Android libc reporting pthread_mutex_lock on a destroyed mutex. Managed-storage activation/crash-recovery tests run in a separate instrumentation lifetime and remain fully blocking."
+    },
+    {
+      "id": "UI-TAB-CLOSE-RIGHTMOST-340",
+      "title": "The tab close control stays pinned to the tab's right edge at any width and is a keyboard-operable button with its own Close tab tooltip",
+      "family": "tabs",
+      "sources": {
+        "issues": [
+          340
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/TabBar.test.tsx::TabBar close control (GH #340)::is a real button with its own Close tab name, not the tab's pin tooltip",
+          "src/styles/tabBarChrome.test.ts::tab close stays rightmost (GH #340)"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #340: a short title sized the tab near its 112px minimum but the close control sat directly after the text instead of at the tab's right edge, inviting accidental closes, and hovering it showed the inherited tab tooltip ('Double-click to pin (sticky)') instead of anything about closing. Both were layout/semantics only: the title now absorbs the tab's free space (flex: 1 1 auto with min-width: 0, so long titles still ellipsize) and the control is a real <button type=button> with an explicit title/aria-label 'Close tab'. Pointer-drag exemption, middle-click close, pinning and the last-tab guard are unchanged, and keyboard focus reveals the ✕ like hover does. jsdom cannot see the layout half, so that half was verified numerically in headless Chromium (closeRight == tabRight - 10px padding, titleRight == closeLeft - 6px gap, on both the Journals tab and a short-titled 'Tine' tab); screenshot eyeballing was unavailable in this worker session (no image input)."
     }
   ]
 }

@@ -648,6 +648,10 @@ textarea {
 }
 
 .tab-title {
+  /* Grow into the tab's free space so the close control stays pinned to the
+     right edge at any width; min-width: 0 keeps long titles ellipsizing. */
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -661,13 +665,20 @@ textarea {
 }
 
 .tab-close {
+  flex: none;
   opacity: 0;
-  font-size: 11px;
-  border-radius: 3px;
   padding: 0 3px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
 }
 
-.tab:hover .tab-close {
+.tab:hover .tab-close,
+.tab-close:focus-visible {
   opacity: 0.6;
 }
 

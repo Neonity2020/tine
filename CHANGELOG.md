@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
 
+- **Tab close buttons always sit at the tab's right edge** (GH #340). With short titles the ✕ no longer drifts to just after the text — it stays pinned rightmost at any tab width — and it is now a real keyboard-focusable button with its own "Close tab" tooltip instead of showing the tab's "Double-click to pin" hint.
+
 ## [0.6.94] - 2026-08-22
 
 ### Added
