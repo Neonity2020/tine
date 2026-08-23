@@ -43,6 +43,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          cache-on-failure: true
 
       - uses: actions/setup-node@v4
         with:
@@ -163,10 +164,31 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
+          fail() {
+            echo "::error::$*"
+            exit 1
+          }
+          require_file() {
+            [ -f "$1" ] || fail "$2 is missing"
+          }
+          expect_plist() {
+            local file="$1" key="$2" expected="$3" label="$4" actual
+            actual="$(/usr/libexec/PlistBuddy -c "Print :$key" "$file")" ||
+              fail "$label is absent"
+            [ "$actual" = "$expected" ] ||
+              fail "$label mismatch: expected '$expected', got '$actual'"
+          }
+          expect_plist_contains() {
+            local file="$1" key="$2" expected="$3" label="$4" actual
+            actual="$(/usr/libexec/PlistBuddy -c "Print :$key" "$file")" ||
+              fail "$label is absent"
+            grep -Fq "$expected" <<< "$actual" ||
+              fail "$label does not contain '$expected'"
+          }
+
           ipa=$(find src-tauri/gen/apple/build/arm64 -maxdepth 1 -type f -name '*.ipa' -print -quit)
           if [ -z "$ipa" ]; then
-            echo "::error::Tauri did not produce an iOS IPA"
-            exit 1
+            fail "Tauri did not produce an iOS IPA"
           fi
 
           unpack="$RUNNER_TEMP/tine-ipa"
@@ -175,29 +197,30 @@ jobs:
           unzip -q "$ipa" -d "$unpack"
           app=$(find "$unpack/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)
           if [ -z "$app" ]; then
-            echo "::error::IPA does not contain an application bundle"
-            exit 1
+            fail "IPA does not contain an application bundle"
           fi
 
           info="$app/Info.plist"
-          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info")" = "page.tine.Tine" ]
-          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$info")" = "TineOutline" ]
-          [ "$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$info")" = "false" ]
-          [ -f "$app/PrivacyInfo.xcprivacy" ]
-          [ -f "$app/embedded.mobileprovision" ]
+          require_file "$info" "application Info.plist"
+          expect_plist "$info" CFBundleIdentifier page.tine.Tine "bundle identifier"
+          expect_plist "$info" CFBundleDisplayName TineOutline "bundle display name"
+          expect_plist "$info" ITSAppUsesNonExemptEncryption false "export-compliance declaration"
+          require_file "$app/PrivacyInfo.xcprivacy" "root privacy manifest"
+          require_file "$app/embedded.mobileprovision" "embedded provisioning profile"
 
           security cms -D -i "$app/embedded.mobileprovision" > "$RUNNER_TEMP/tine-profile.plist"
-          [ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/tine-profile.plist")" = "$APPLE_TEAM_ID.page.tine.Tine" ]
-          [ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$RUNNER_TEMP/tine-profile.plist")" = "false" ]
-          /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.icloud-container-identifiers' "$RUNNER_TEMP/tine-profile.plist" | grep -Fq 'iCloud.page.tine.Tine'
-          /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.ubiquity-container-identifiers' "$RUNNER_TEMP/tine-profile.plist" | grep -Fq 'iCloud.page.tine.Tine'
+          expect_plist "$RUNNER_TEMP/tine-profile.plist" Entitlements:application-identifier "$APPLE_TEAM_ID.page.tine.Tine" "profile application identifier"
+          expect_plist "$RUNNER_TEMP/tine-profile.plist" Entitlements:get-task-allow false "profile distribution policy"
+          expect_plist_contains "$RUNNER_TEMP/tine-profile.plist" Entitlements:com.apple.developer.icloud-container-identifiers iCloud.page.tine.Tine "profile iCloud container"
+          expect_plist_contains "$RUNNER_TEMP/tine-profile.plist" Entitlements:com.apple.developer.ubiquity-container-identifiers iCloud.page.tine.Tine "profile ubiquity container"
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dv --verbose=4 "$app" 2> "$RUNNER_TEMP/tine-ios-codesign.txt"
-          grep -Fq "TeamIdentifier=$APPLE_TEAM_ID" "$RUNNER_TEMP/tine-ios-codesign.txt"
+          grep -Fq "TeamIdentifier=$APPLE_TEAM_ID" "$RUNNER_TEMP/tine-ios-codesign.txt" ||
+            fail "code signature does not belong to the configured Apple team"
           codesign -d --entitlements :- "$app" > "$RUNNER_TEMP/tine-ios-entitlements.plist"
-          /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.icloud-container-identifiers' "$RUNNER_TEMP/tine-ios-entitlements.plist" | grep -Fq 'iCloud.page.tine.Tine'
-          /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.icloud-services' "$RUNNER_TEMP/tine-ios-entitlements.plist" | grep -Fq 'CloudDocuments'
-          /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.ubiquity-container-identifiers' "$RUNNER_TEMP/tine-ios-entitlements.plist" | grep -Fq 'iCloud.page.tine.Tine'
+          expect_plist_contains "$RUNNER_TEMP/tine-ios-entitlements.plist" com.apple.developer.icloud-container-identifiers iCloud.page.tine.Tine "signed iCloud container"
+          expect_plist_contains "$RUNNER_TEMP/tine-ios-entitlements.plist" com.apple.developer.icloud-services CloudDocuments "signed iCloud service"
+          expect_plist_contains "$RUNNER_TEMP/tine-ios-entitlements.plist" com.apple.developer.ubiquity-container-identifiers iCloud.page.tine.Tine "signed ubiquity container"
 
           staged="artifacts/TineOutline-${GITHUB_RUN_NUMBER}.ipa"
           cp "$ipa" "$staged"

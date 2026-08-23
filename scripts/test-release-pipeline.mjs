@@ -253,6 +253,11 @@ assert.match(
 );
 assert.match(
   iosTestFlightWorkflow,
+  /uses: swatinem\/rust-cache@v2[\s\S]*?cache-on-failure: true/,
+  "the expensive iOS target cache is not preserved after post-build contract failures",
+);
+assert.match(
+  iosTestFlightWorkflow,
   /name: Install iCloud entitlements and manual signing config[\s\S]*?npm run ios:prepare-project[\s\S]*?name: Build signed TestFlight IPA[\s\S]*?--export-method app-store-connect[\s\S]*?--build-number "\$\{GITHUB_RUN_NUMBER\}"/,
   "TestFlight builds do not use a unique build number and the App Store Connect export method"
 );
@@ -270,7 +275,7 @@ assert.doesNotMatch(
 );
 assert.match(
   iosTestFlightWorkflow,
-  /name: Verify signed IPA contract[\s\S]*?CFBundleIdentifier[\s\S]*?page\.tine\.Tine[\s\S]*?CFBundleDisplayName[\s\S]*?TineOutline[\s\S]*?PrivacyInfo\.xcprivacy[\s\S]*?embedded\.mobileprovision[\s\S]*?com\.apple\.developer\.icloud-container-identifiers[\s\S]*?codesign --verify --deep --strict[\s\S]*?CloudDocuments/,
+  /name: Verify signed IPA contract[\s\S]*?expect_plist[\s\S]*?CFBundleIdentifier[\s\S]*?page\.tine\.Tine[\s\S]*?CFBundleDisplayName[\s\S]*?TineOutline[\s\S]*?root privacy manifest[\s\S]*?embedded provisioning profile[\s\S]*?com\.apple\.developer\.icloud-container-identifiers[\s\S]*?codesign --verify --deep --strict[\s\S]*?CloudDocuments/,
   "the signed IPA is not checked against Tine's identity, privacy, provisioning, and signature contract"
 );
 assert.match(iosTestFlightWorkflow, /name: Validate IPA with App Store Connect\n\s+if: inputs\.action != 'build-only'/);
@@ -290,7 +295,7 @@ assert.equal(iosConfig.app.windows.length, 1, "iOS must retain its single-window
 assert.equal(iosConfig.app.windows[0].label, "main");
 assert.equal(iosConfig.bundle.iOS.developmentTeam, "RQ5V4LK7N2");
 assert.equal(iosConfig.bundle.iOS.minimumSystemVersion, "14.0");
-assert.ok(iosConfig.bundle.resources.includes("PrivacyInfo.xcprivacy"));
+assert.equal(iosConfig.bundle.resources, undefined, "the privacy manifest must not be nested under Tauri's assets folder");
 assert.match(iosInfoPlist, /<key>CFBundleDisplayName<\/key>\s*<string>TineOutline<\/string>/);
 assert.match(iosInfoPlist, /<key>ITSAppUsesNonExemptEncryption<\/key>\s*<false\/>/);
 assert.match(iosInfoPlist, /<key>NSUbiquitousContainers<\/key>[\s\S]*?iCloud\.page\.tine\.Tine[\s\S]*?NSUbiquitousContainerIsDocumentScopePublic[\s\S]*?<true\/>[\s\S]*?NSUbiquitousContainerName[\s\S]*?TineOutline/);
@@ -311,11 +316,14 @@ try {
   const fixtureTarget = path.join(fixtureApple, "tine_iOS");
   fs.mkdirSync(fixtureTarget, { recursive: true });
   fs.writeFileSync(path.join(fixtureTauri, "Tine.ios.entitlements"), iosEntitlements);
+  fs.writeFileSync(path.join(fixtureTauri, "PrivacyInfo.xcprivacy"), iosPrivacyManifest);
   fs.writeFileSync(
     path.join(fixtureApple, "project.yml"),
     [
       "targets:",
       "  tine_iOS:",
+      "    sources:",
+      "      - path: Assets.xcassets",
       "    settings:",
       "      base:",
       "        ENABLE_BITCODE: false",
@@ -340,6 +348,7 @@ try {
 
   const preparedProject = fs.readFileSync(path.join(fixtureApple, "project.yml"), "utf8");
   assert.match(preparedProject, /CODE_SIGN_STYLE: Manual/);
+  assert.match(preparedProject, /- path: PrivacyInfo\.xcprivacy\s+buildPhase: resources/);
   assert.match(preparedProject, /CODE_SIGN_IDENTITY: "Apple Distribution: Martin Koutecky \(RQ5V4LK7N2\)"/);
   assert.match(preparedProject, /PROVISIONING_PROFILE_SPECIFIER: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"/);
   const exportOptions = fs.readFileSync(path.join(fixtureApple, "ExportOptions.plist"), "utf8");
@@ -348,6 +357,10 @@ try {
   assert.equal(
     fs.readFileSync(path.join(fixtureTarget, "tine_iOS.entitlements"), "utf8"),
     iosEntitlements,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(fixtureApple, "PrivacyInfo.xcprivacy"), "utf8"),
+    iosPrivacyManifest,
   );
 } finally {
   fs.rmSync(iosPrepareFixture, { recursive: true, force: true });
