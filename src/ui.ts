@@ -251,16 +251,17 @@ export function setTypographyMode(m: TypographyMode) {
   bumpGraphEpoch(); // re-render open pages so the change is immediate
 }
 
-// --- editor auto-pairing (a Tine convenience, OFF by default): typing `(`/`[`/
-// `{`/`"`/backtick inserts the matching closer (caret between), wraps a selection,
-// types-through a closer, and Backspace deletes an empty pair. The always-on
-// OG-style `[[`→`[[]]` page-ref pairing is separate (autoPairEdit) and unaffected.
-// Local editor pref, persisted like the others. ---
+// --- editor auto-pairing (ON by default — GH #291 OG parity: Logseq inserts
+// the counterpart when you type `(`/`{`/`[`/`"`/backtick). Typing one inserts
+// the matching closer (caret between), wraps a selection, types through a
+// closer, and Backspace deletes an empty pair. The always-on OG-style
+// `[[`→`[[]]` page-ref pairing is separate (autoPairEdit) and unaffected.
+// Persisted house-style: null/absent = ON, explicit "0" = opt-out. ---
 const AUTOPAIR_KEY = "logseq-claude.autopair";
-export const [autoPairing, setAutoPairingSig] = createSignal(loadStr(AUTOPAIR_KEY) === "1");
+export const [autoPairing, setAutoPairingSig] = createSignal(loadStr(AUTOPAIR_KEY) !== "0");
 export function setAutoPairing(v: boolean) {
   setAutoPairingSig(v);
-  saveStr(AUTOPAIR_KEY, v ? "1" : null);
+  saveStr(AUTOPAIR_KEY, v ? null : "0");
 }
 
 // --- first day of week (calendar + scheduled/deadline date pickers) ---

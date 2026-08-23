@@ -1500,7 +1500,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
 
       <Field
         label="Auto-pair brackets & quotes"
-        hint="Typing ( [ { &quot; ` inserts the matching closer with the caret between, wraps a selection, types through a closer, and Backspace on an empty pair clears both. (Page-ref `[[ ]]` always auto-closes.) Off by default — turn it on if you like it."
+        hint="Typing ( [ { &quot; ` inserts the matching closer with the caret between, wraps a selection, types through a closer, and Backspace on an empty pair clears both — the Logseq behaviour, ON by default. (Page-ref `[[ ]]` always auto-closes either way.) Turn it off if you dislike pairing."
       >
         <Toggle on={autoPairing()} onClick={() => setAutoPairing(!autoPairing())} />
       </Field>

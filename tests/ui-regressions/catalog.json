@@ -7550,6 +7550,31 @@
         "failBefore": "proven"
       },
       "notes": "The rendered face of a whole-block code fence is .code-block: mono stack, 0.86em, line-height 1.5, padding 10px 12px, white-space pre with horizontal overflow. The editor that replaced it was the ordinary proportional 16px/26px wrapped textarea with no card, so focusing a code block re-laid every line — the 'layout jump'. The editor now presents as the SAME card while the block is code-shaped (detector: whole visible buffer is one md ```/~~~ fence or org #+BEGIN_SRC/#+BEGIN_EXAMPLE, calc excluded, mixed content excluded, unclosed fence tolerated while typing), including wrap=off so long lines scroll horizontally like the card; the buffer stays honest raw text with fences, and live transitions recompute per keystroke. Font override follows the existing --tine-editable-font precedent (.calc-wrap) because editables set font-family via an !important textarea rule. Fail-before proven causally: the component class assertions fail without the editor change, and the browser geometry harness (Chromium, deterministic screenshots) measured pre/post — wide 1120px height delta +76.1px / narrow 700px +154.1px (long line wraps into ~6 lines, no horizontal scroll, fontFamily/fontSize/lineHeight/padding all differ) → after: identical computed fonts/size/leading/padding, wrap=off, horizontal overflow, height delta 39.08px ≈ the two fence lines at both widths; failures list empty. Numeric geometry is the evidence; final visual approval remains with the manager. Typography modes never alter code text (literal in both), so they are unaffected by design."
+    },
+    {
+      "id": "UI-AUTOPAIR-DEFAULT-OG-PARITY-291",
+      "title": "Typing ( { [ \" or backtick inserts the counterpart by default, and one shared persisted decision governs all of them",
+      "family": "editor-typing",
+      "sources": {
+        "issues": [
+          291
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.autopairMatrix.test.tsx",
+          "src/editor/autopair.test.ts"
+        ],
+        "scenario": "editor.autopair-default-matrix",
+        "failBefore": "proven"
+      },
+      "notes": "The timeline's contradiction (works for one reporter, not another AS the OG-inline addition; explicit opt-out persists as '0'. The character set and mechanics are intentionally NOT extended by this fix: repair was at the shared decision, matching the dossier."
     }
   ]
 }
