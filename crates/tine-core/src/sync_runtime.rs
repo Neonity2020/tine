@@ -38537,6 +38537,86 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
+    fn managed_crash_reopen_aged_history_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release --lib managed_crash_reopen_aged_history_manual_benchmark -- --ignored --nocapture"
+        );
+        let source = real_graph_copy_source_from_env("TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY");
+        let rounds = std::env::var("TINE_MANAGED_CRASH_REOPEN_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(32);
+        let fixture = ActivationFixture::copied_graph("managed-crash-reopen-aged", 0xa0e7, &source);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("real graph copy activates");
+        drive_initial_feed(&handle);
+
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("managed page inventory did not load: {other:?}"),
+        };
+        let mut editable = pages
+            .into_iter()
+            .map(|entry| entry.rel_path)
+            .filter(|path| !load_application_exact(&handle, path).0.blocks.is_empty())
+            .take(rounds.max(1))
+            .collect::<Vec<_>>();
+        editable.sort();
+        assert!(!editable.is_empty(), "real graph copy has an editable page");
+
+        let aging_started = Instant::now();
+        for round in 0..rounds {
+            let path = &editable[round % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("aged-history benchmark edit {round}"),
+            );
+            drain_managed_local(&handle);
+        }
+        let aging = aging_started.elapsed();
+
+        let pending_path = editable[rounds % editable.len()].clone();
+        let (page, revision) = load_application_exact(&handle, &pending_path);
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "aged-history benchmark pending edit",
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drop(handle);
+
+        let started = Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let elapsed = started.elapsed();
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("aged history reopens safely");
+        let (page, _) = load_application_exact(&reopened, &pending_path);
+        assert_eq!(page.blocks[0].raw, "aged-history benchmark pending edit");
+        eprintln!(
+            "managed_crash_reopen_aged rounds={rounds} aging_ms={:.3} elapsed_ms={:.3}",
+            startup_ms(aging),
+            startup_ms(elapsed),
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "aged-history crash reopen exceeded the 10-second real-corpus recovery ceiling: elapsed_ms={:.3}",
+            startup_ms(elapsed),
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     #[ignore = "manual release benchmark: committed edit to peer-visible latency on two graph copies"]
     fn managed_two_device_sync_latency_real_corpora_manual_benchmark() {
         assert!(
@@ -42339,6 +42419,128 @@ mod tests {
                 None,
             );
         }
+    }
+
+    #[test]
+    #[ignore = "manual release gate: managed reads on an explicitly supplied graph copy"]
+    fn managed_application_read_real_graph_copy_manual_gate() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this gate is release-only; run with TINE_MANAGED_READ_REAL_GRAPH_COPY=<copy> cargo test -p tine-core --release --lib managed_application_read_real_graph_copy_manual_gate -- --ignored --nocapture"
+        );
+        let source_root = real_graph_copy_source_from_env("TINE_MANAGED_READ_REAL_GRAPH_COPY");
+        let fixture = ActivationFixture::copied_graph(
+            "managed-application-read-real-copy",
+            0xa140,
+            &source_root,
+        );
+        let source = user_graph_bytes(&fixture.graph_root);
+        let direct_graph = Graph::open(&fixture.graph_root);
+        let mut direct_entries = direct_graph.list_pages();
+        direct_entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        assert!(!direct_entries.is_empty());
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(activation_handle);
+
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("managed reopen retains its actor");
+        let feed_started = Instant::now();
+        let mut managed_entries = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("managed page inventory did not load: {other:?}"),
+        };
+        managed_entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        let inventory_semantics = |entries: &[PageEntry]| {
+            entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.rel_path.clone(),
+                        entry.name.clone(),
+                        entry.kind,
+                        entry.date_key,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            inventory_semantics(&managed_entries),
+            inventory_semantics(&direct_entries)
+        );
+
+        let mut journals = managed_entries
+            .iter()
+            .filter(|entry| entry.kind == PageKind::Journal && entry.date_key.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        journals.sort_by_key(|entry| std::cmp::Reverse(entry.date_key.unwrap_or(0)));
+        for entry in journals.iter().take(3) {
+            let direct = direct_graph.load_page(entry).unwrap();
+            let managed = load_application_exact(&handle, &entry.rel_path).0;
+            assert_parser_dto_semantics(&direct, &managed);
+        }
+        let feed_elapsed = feed_started.elapsed();
+
+        let mut direct_samples = Vec::with_capacity(direct_entries.len());
+        let mut managed_samples = Vec::with_capacity(direct_entries.len());
+        let mut slowest = (Duration::ZERO, String::new());
+        for entry in &direct_entries {
+            let direct_started = Instant::now();
+            let direct = direct_graph.load_page(entry).unwrap();
+            direct_samples.push(direct_started.elapsed());
+
+            let managed_started = Instant::now();
+            let managed = load_application_exact(&handle, &entry.rel_path).0;
+            let managed_elapsed = managed_started.elapsed();
+            if managed_elapsed > slowest.0 {
+                slowest = (managed_elapsed, entry.rel_path.clone());
+            }
+            managed_samples.push(managed_elapsed);
+            assert_parser_dto_semantics(&direct, &managed);
+        }
+        let direct_p50 = startup_median(&direct_samples);
+        let direct_p95 = startup_p95(&direct_samples);
+        let managed_p50 = startup_median(&managed_samples);
+        let managed_p95 = startup_p95(&managed_samples);
+        eprintln!(
+            "managed_real_graph_read_gate pages={} direct_p50_ms={:.3} direct_p95_ms={:.3} managed_p50_ms={:.3} managed_p95_ms={:.3} journals_first_page_ms={:.3} slowest_managed_ms={:.3} slowest_path={:?}",
+            direct_entries.len(),
+            startup_ms(direct_p50),
+            startup_ms(direct_p95),
+            startup_ms(managed_p50),
+            startup_ms(managed_p95),
+            startup_ms(feed_elapsed),
+            startup_ms(slowest.0),
+            slowest.1,
+        );
+        assert!(
+            managed_p50 <= Duration::from_millis(50)
+                && managed_p50 <= direct_p50.saturating_mul(10),
+            "real-copy managed page-open p50 failed: direct={direct_p50:?}, managed={managed_p50:?}"
+        );
+        assert!(
+            managed_p95 <= Duration::from_millis(50)
+                && managed_p95 <= direct_p95.saturating_mul(10),
+            "real-copy managed page-open p95 failed: direct={direct_p95:?}, managed={managed_p95:?}"
+        );
+        assert!(
+            feed_elapsed <= Duration::from_millis(500),
+            "real-copy Journals first-page gate failed: {feed_elapsed:?}"
+        );
+        assert_eq!(user_graph_bytes(&fixture.graph_root), source);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     /// The Journals back-gesture, staged.

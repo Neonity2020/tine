@@ -25,7 +25,11 @@ if (!fs.existsSync(secondaryGraph)) throw new Error(`secondary graph fixture is 
 fs.mkdirSync(outputDir, { recursive: true });
 
 const commit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-const common = ["test", "-p", "tine-core", "--release"];
+// Every selected gate lives in tine-core's library test target. Restrict Cargo
+// to that target: compiling and launching every integration-test binary added
+// minutes of unrelated work and, worse, made a stale filter look plausibly
+// busy while it actually ran zero tests.
+const common = ["test", "-p", "tine-core", "--release", "--lib"];
 const runs = [
   {
     name: "aged-crash-reopen",
@@ -117,6 +121,14 @@ for (const entry of runs) {
   fs.writeFileSync(path.join(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   if (result.status !== 0) {
     throw new Error(`${entry.name} failed with status ${result.status}; see ${receipt.log}`);
+  }
+  const passed = [...output.matchAll(/test result: ok\. (\d+) passed/g)]
+    .reduce((total, match) => total + Number(match[1]), 0);
+  if (passed !== 1) {
+    throw new Error(
+      `${entry.name} matched ${passed} tests instead of exactly one; `
+      + `the release gate name is stale or ambiguous; see ${receipt.log}`,
+    );
   }
 }
 
