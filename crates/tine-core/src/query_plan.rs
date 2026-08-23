@@ -2341,15 +2341,15 @@ mod tests {
             assert!(
                 page_hits.iter().all(|(name, rel_path, _)| {
                     let folded = canonical_fold(name);
-                    !rel_path.is_empty()
-                        || (folded != "book" && folded != "reading")
+                    !rel_path.is_empty() || (folded != "book" && folded != "reading")
                 }),
                 "query {query:?} must not offer a path-less phantom alias page: {page_hits:?}"
             );
             assert!(
                 page_hits
                     .iter()
-                    .any(|(name, _, matched_alias)| name == "Research Hub" && matched_alias.is_some()),
+                    .any(|(name, _, matched_alias)| name == "Research Hub"
+                        && matched_alias.is_some()),
                 "query {query:?} must carry the matched alias on the owner hit: {page_hits:?}"
             );
             // An ordinary page whose name merely contains the alias text is

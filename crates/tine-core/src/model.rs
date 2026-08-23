@@ -37735,14 +37735,22 @@ mod tests {
             graph.asset_path_for_open("some dir").unwrap(),
             dir.join("assets/some dir").canonicalize().unwrap()
         );
-        assert_eq!(graph.asset_path_for_open("some dir/报表").unwrap(), nested_dir);
         assert_eq!(
-            graph.asset_path_for_open("some dir/报表/API ref.docx").unwrap(),
+            graph.asset_path_for_open("some dir/报表").unwrap(),
+            nested_dir
+        );
+        assert_eq!(
+            graph
+                .asset_path_for_open("some dir/报表/API ref.docx")
+                .unwrap(),
             file
         );
 
         for bad in ["../outside", "/outside", "back\\slash.png", "missing.png"] {
-            assert!(graph.asset_path_for_open(bad).is_err(), "must reject {bad:?}");
+            assert!(
+                graph.asset_path_for_open(bad).is_err(),
+                "must reject {bad:?}"
+            );
         }
         // The regular-file gate for reads is unchanged by the opener route.
         assert!(graph.read_asset("").is_err());
