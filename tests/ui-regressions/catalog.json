@@ -7345,6 +7345,32 @@
         "failBefore": "proven"
       },
       "notes": "GH #276: only `g j` existed from Logseq's default home/journal hotstrings. Added `g h` go/home, `g n` go/journal-next, `g p` go/journal-prev as remappable global commands. gh reuses the existing graph home-page resolver (homePage.ts), which now reports whether it navigated (was void; graph.ts caller unaffected) so unconfigured-or-stale homes fall through to the journals landing — OG's default home, and a live outcome instead of a dead key; manager should verify the default-home=journals claim against OG source (I could not in this lane). gn/gp anchor at the current journal route's date via the SHARED parsejournalTitle parser (no second parser), step ±1 calendar day through the local Y/M/D Date constructor (correct across month, year, and leap-day edges — never millisecond arithmetic), and open via the same openPage(journalTitle(date), 'journal') route CalendarJump uses, honoring the graph's configured :journal/page-title-format in both directions. Anchoring outside a journal (ordinary pages, the journals feed, query views) uses today. Unit-level route assertions with mocked backend and fake timers."
+    },
+    {
+      "id": "UI-EDITOR-COPY-EMBED-279",
+      "title": "The remappable Mod+Shift+C editor command copies {{embed ((uuid))}} for the current block via its persistent id:: through the shared clipboard facade, and declines (native copy) when text is selected",
+      "family": "editor",
+      "sources": {
+        "issues": [
+          279
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.copyEmbed.test.tsx::copy block embed command (GH #279)::copies {{embed ((uuid))}} for the current block when nothing is selected",
+          "src/components/Block.copyEmbed.test.tsx::copy block embed command (GH #279)::declines with a live selection: no preventDefault, no clipboard write",
+          "src/components/Block.copyEmbed.test.tsx::copy block embed command (GH #279)::keeps the sibling contract intact: Mod+C with no selection copies ((uuid))"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #279: keyboard-centric embed workflows had to hand-assemble {{embed ((uuid))}}. New remappable editor command editor/copy-embed (default mod+shift+c, label per the issue's suggestion 'Copy block embed when no text is selected', Settings → Keybindings) routed through the existing command dispatch like the other editor commands, NOT a hardcoded branch: it commits the edit, resolves the block's persistent id:: via ensureBlockId (the same identity primitive the builtin Mod+C block-ref copy uses — never a synthesized unstable id), and writes through the writeClipboardText facade. With a live selection the handler returns false without preventDefault, preserving the platform's native copy. Binding collision checked — mod+shift+c was unassigned; the row sits beside editor/insert-link and follows its hand-pattern. Tests exercise the real command resolution path (installKeybindings): positive no-selection copy, selection decline, and the Mod+C block-ref sibling contract pinned in the same file."
     }
   ]
 }

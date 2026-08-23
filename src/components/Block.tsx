@@ -2678,6 +2678,24 @@ export function Editor(props: { id: string }): JSX.Element {
     "editor/strike-through": (e) => { e.preventDefault(); applyInlineFormat("strikethrough"); return true; },
     "editor/highlight": (e) => { e.preventDefault(); applyInlineFormat("highlight"); return true; },
     "editor/insert-link": (e) => { e.preventDefault(); applyEdit(insertLink(ref.value, ref.selectionStart, ref.selectionEnd, pageFmt())); return true; },
+    // GH #279: embed counterpart of the builtin Mod+C block-ref copy. With a
+    // live selection decline (return false, no preventDefault) so the
+    // platform's ordinary copy keeps its meaning. Uses the same persistent
+    // block id:: as Mod+C and the shared clipboard facade.
+    "editor/copy-embed": (e) => {
+      if (ref.selectionStart !== ref.selectionEnd) return false;
+      e.preventDefault();
+      commit(ref.value);
+      void ensureBlockId(props.id).then((uuid) => {
+        if (uuid) {
+          void writeClipboardText(`{{embed ((${uuid}))}}`);
+          pushToast("Copied block embed", "success");
+        } else {
+          pushToast("Couldn't save the block id — embed not copied.", "error");
+        }
+      });
+      return true;
+    },
     "editor/clear-block": (e) => { e.preventDefault(); applyEdit({ text: "", start: 0, end: 0 }); return true; },
     "editor/kill-line-before": (e) => { e.preventDefault(); applyEdit(killLineBefore(ref.value, ref.selectionStart)); return true; },
     "editor/kill-line-after": (e) => { e.preventDefault(); applyEdit(killLineAfter(ref.value, ref.selectionStart)); return true; },
