@@ -89,10 +89,47 @@ jobs:
       - name: Install iCloud entitlements
         run: npm run ios:prepare-project
 
-      - name: Build signed TestFlight IPA
+      # macOS 26 no longer reliably infers PKCS#12 input for `security import`.
+      # Import explicitly before Tauri runs so its implicit-format path is not
+      # used; the ephemeral keychain remains in the user search list for Xcode.
+      - name: Install iOS signing identity
+        shell: bash
         env:
           IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/tine-ios-signing.keychain-db"
+          p12="$RUNNER_TEMP/tine-ios-distribution.p12"
+          keychain_password="$(openssl rand -hex 32)"
+
+          printf '%s' "$IOS_CERTIFICATE" | base64 --decode > "$p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" \
+            -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 \
+            -k "$keychain"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain"
+
+          keychains=("$keychain")
+          while IFS= read -r listed; do
+            listed="${listed//\"/}"
+            listed="${listed#"${listed%%[![:space:]]*}"}"
+            [ -n "$listed" ] && keychains+=("$listed")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "${keychains[@]}"
+          security find-identity -v -p codesigning "$keychain" |
+            grep -Fq "Apple Distribution: Martin Koutecky ($APPLE_TEAM_ID)"
+
+          rm -f "$p12"
+          echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build signed TestFlight IPA
+        env:
           IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
         run: >-
           npx tauri ios build
@@ -198,6 +235,10 @@ jobs:
         if: always()
         shell: bash
         run: |
+          if [ -n "${IOS_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$IOS_SIGNING_KEYCHAIN" || true
+          fi
           rm -rf "$HOME/.appstoreconnect/private_keys"
           rm -rf "$RUNNER_TEMP/tine-ipa"
+          rm -f "$RUNNER_TEMP/tine-ios-distribution.p12"
           rm -f "$RUNNER_TEMP/tine-profile.plist" "$RUNNER_TEMP/tine-ios-codesign.txt" "$RUNNER_TEMP/tine-ios-entitlements.plist"

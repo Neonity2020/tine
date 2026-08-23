@@ -258,6 +258,19 @@ assert.match(
 );
 assert.match(
   iosTestFlightWorkflow,
+  /name: Install iOS signing identity[\s\S]*?security import "\$p12"[\s\S]*?-t cert -f pkcs12[\s\S]*?security set-key-partition-list[\s\S]*?security find-identity[\s\S]*?Apple Distribution: Martin Koutecky/,
+  "iOS signing must explicitly import PKCS#12 into an ephemeral keychain on macOS 26"
+);
+const iosWorkflowLines = iosTestFlightWorkflow.split(/\r?\n/);
+const iosBuildStep = yamlNamedStep(iosWorkflowLines, "Build signed TestFlight IPA").join("\n");
+assert.match(iosBuildStep, /IOS_MOBILE_PROVISION: \$\{\{ secrets\.IOS_MOBILE_PROVISION \}\}/);
+assert.doesNotMatch(
+  iosBuildStep,
+  /IOS_CERTIFICATE(?:_PASSWORD)?:/,
+  "Tauri must not repeat its broken implicit-format certificate import after explicit keychain setup"
+);
+assert.match(
+  iosTestFlightWorkflow,
   /name: Verify signed IPA contract[\s\S]*?CFBundleIdentifier[\s\S]*?page\.tine\.Tine[\s\S]*?CFBundleDisplayName[\s\S]*?TineOutline[\s\S]*?PrivacyInfo\.xcprivacy[\s\S]*?embedded\.mobileprovision[\s\S]*?com\.apple\.developer\.icloud-container-identifiers[\s\S]*?codesign --verify --deep --strict[\s\S]*?CloudDocuments/,
   "the signed IPA is not checked against Tine's identity, privacy, provisioning, and signature contract"
 );
@@ -265,7 +278,7 @@ assert.match(iosTestFlightWorkflow, /name: Validate IPA with App Store Connect\n
 assert.match(iosTestFlightWorkflow, /name: Upload IPA to TestFlight\n\s+if: inputs\.action == 'upload'/);
 assert.match(
   iosTestFlightWorkflow,
-  /name: Remove Apple signing material\n\s+if: always\(\)[\s\S]*?\.appstoreconnect\/private_keys/,
+  /name: Remove Apple signing material\n\s+if: always\(\)[\s\S]*?security delete-keychain[\s\S]*?\.appstoreconnect\/private_keys/,
   "temporary iOS App Store Connect authentication is not cleaned after failures"
 );
 assert.doesNotMatch(
