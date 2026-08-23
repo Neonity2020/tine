@@ -6919,6 +6919,27 @@
         "failBefore": "proven"
       },
       "notes": "Internal report after v0.6.94: enabling sync first showed the red focus-rescan toast `sync actor is unavailable`, then a green success toast. Share and join deliberately retire their actor and publish a reopened replacement before the owning command returns; managed runtime errors already respected that transition bracket, but reloadOnFocus independently treated its subordinate rescan as a terminal operation. A focus rescan that fails while this window owns a storage transition now releases the freshness/input barrier silently. The Settings command remains the sole owner and reports exactly one authoritative success or failure; ordinary rescan failures outside a transition are unchanged."
+    },
+    {
+      "id": "UI-MANAGED-JOIN-ACTIONABLE-DIAGNOSTIC-001",
+      "title": "A failed managed join preserves its safe stage and reason and offers a Copy details action",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "native-frontend-diagnostic",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/sync_runtime.rs::tests::retryable_join_bootstrap_preserves_stage_and_detail_without_debug_wrappers",
+          "src/components/Settings.test.tsx::starts shared discovery only after an explicit Direct Files join action"
+        ],
+        "scenario": "managed.join-retryable-stage-detail-copy",
+        "failBefore": "proven"
+      },
+      "notes": "Internal Android report after v0.6.94: join failed with `join bootstrap did not reach LocalActive: Retryable [details]`. The native command debug-formatted the complete tagged availability object; the privacy sanitizer correctly collapsed its brace-delimited body, losing the operation stage and reason. The command now emits ordinary bounded `stage: detail` text, which the sanitizer can redact token-by-token without deleting its diagnostic class. Every sticky managed-storage failure also carries a Copy details action for the already-sanitized complete message. The exact synthetic and 1,046-page anonymized Linux two-device journeys both pass join, forced-close recovery, partial delivery and bidirectional editing on this candidate, so this row deliberately claims diagnostic coverage rather than inventing an Android root-cause fix without the newly exposed detail."
     }
   ]
 }
