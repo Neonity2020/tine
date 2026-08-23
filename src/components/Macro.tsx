@@ -1,9 +1,11 @@
 import { For, Show, Switch, Match, createMemo, createResource, createSignal, useContext, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
 import { backend } from "../backend";
+import { focusedRouter } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab } from "../router";
 import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
+import { internalLinkDest } from "../linkGesture";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { QueryBuilder } from "./QueryBuilder";
@@ -125,7 +127,26 @@ export function QueryMacro(props: {
   // display defaults.
   const parsed = createMemo(() => splitQuery(arg()));
   const form = () => parsed().form;
-  const friendlySearch = createMemo(() => savedDslToFriendlySearch(form()));
+  // GH #301: `<% current page %>` inside a query binds to the FOCUSED pane's
+  // route page and re-runs on navigation. Substitution is execution-only —
+  // authoring text and every editing/display derivation keep the literal dyvar
+  // (the same house rule as template insertion in editor/templateVars.ts).
+  const currentPageMarker = createMemo(() => /<%\s*current page\s*%>/i.test(arg()));
+  const focusedQueryPage = () => {
+    const r = focusedRouter().route();
+    return r.kind === "page" ? r.name : undefined;
+  };
+  const executableForm = createMemo(() => {
+    const f = form();
+    if (!currentPageMarker()) return f;
+    const pageName = focusedQueryPage();
+    if (!pageName) return f; // no focused page: leave verbatim, like templates
+    return f.replace(/<%\s*current page\s*%>/gi, `[[${pageName}]]`);
+  });
+  // The query LANGUAGE decision rides the same substituted form the execution
+  // uses (never authoring rewrites): presentation and execution can't disagree
+  // about what ran (GH #301).
+  const friendlySearch = createMemo(() => savedDslToFriendlySearch(executableForm()));
   const sheet = createMemo(() => {
     if (!props.blockId || !doc.byId[props.blockId]) return null;
     return sheetConfig(facetsOf(doc.byId[props.blockId].raw, formatForBlock(props.blockId)).properties);
@@ -260,8 +281,10 @@ export function QueryMacro(props: {
   // A COLLAPSED query keys off the form only (no dataRev), so it fetches once for
   // its count and doesn't re-run a whole-graph scan on every save while hidden;
   // expanding it (key flips to include dataRev) refreshes it.
+  const queryRequestKey = () =>
+    `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
   const [groups] = createResource(
-    () => `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}`,
+    queryRequestKey,
     async (requestKey) => {
       const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
       const searchSource = friendlySearch();
@@ -278,6 +301,7 @@ export function QueryMacro(props: {
             false
           ),
         );
+        if (queryRequestKey() !== requestKey) return [];
         setSearchExecution(execution);
         const grouped = new Map<string, RefGroup>();
         for (const hit of execution.hits) {
@@ -297,13 +321,14 @@ export function QueryMacro(props: {
         const r = await sharedQueryResult(
           scope,
           `advanced\0${page ?? ""}\0${requestKey}`,
-          () => backend().runAdvancedQuery(form(), page),
+          () => backend().runAdvancedQuery(executableForm(), page),
         );
+        if (queryRequestKey() !== requestKey) return [];
         setAdvInfo({ ran: r.ran, ignored: r.ignored, supported: r.supported });
         return r.groups;
       }
       setAdvInfo(null);
-      return sharedQueryResult(scope, `simple\0${requestKey}`, () => backend().runQuery(form()));
+      return sharedQueryResult(scope, `simple\0${requestKey}`, () => backend().runQuery(executableForm()));
     }
   );
   const groupsError = () => {
@@ -701,7 +726,9 @@ export function QueryMacro(props: {
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       const target = { name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) };
-                                      if (e.shiftKey) openPageInSidebar(target);
+                                      const dest = internalLinkDest(e);
+                                      if (dest === "sidebar") openPageInSidebar(target);
+                                      else if (dest === "background") openPageTargetInNewTab(target);
                                       else openPageTarget(target);
                                     }}
                                     onAuxClick={(e) => {
@@ -775,7 +802,9 @@ function QueryGroup(props: { group: () => RefGroup | undefined; flat?: boolean }
             class={props.flat ? "query-crumb" : "query-page"}
             onClick={(e) => {
               e.stopPropagation();
-              if (e.shiftKey) openPageInSidebar(target());
+              const dest = internalLinkDest(e);
+              if (dest === "sidebar") openPageInSidebar(target());
+              else if (dest === "background") openPageTargetInNewTab(target());
               else openPageTarget(target());
             }}
             onAuxClick={(e) => {

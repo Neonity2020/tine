@@ -6135,12 +6135,13 @@
         "tests": [
           "src/selectionExpand.test.ts",
           "src/components/Block.selectAll.test.tsx",
-          "src/store.test.ts"
+          "src/store.test.ts",
+          "src/components/SheetGrid.interact.test.tsx"
         ],
         "scenario": "editor.select-all-ladder-and-shift-up-subtree",
         "failBefore": "proven"
       },
-      "notes": "GH #262. First press stays native textarea select-all (jsdom test models it via explicit setSelectionRange). selectBlockSubtree selects the block's visible subtree in the active outline scope; expandBlockSelection climbs one ancestor per press, tops out at the whole scoped visible order and no-ops there. The ladder state (selectAllHead) resets on any other selection mutation (selectBlock/extendSelectionTo/moveSelection/clearSelection). Grid cell editors keep their own whole-grid mod+a (SHEET_CELL_BLOCKED_EDITOR_COMMANDS). Shift+Up: selectedIds completes the visible subtree of any selected ancestor of the anchor in reverse-direction selections only; forward Shift+Down shape unchanged. Store-level tests cover ladder, collapsed parents, scoped orders, reset, idempotence; component test covers the editing-mode escalation incl. empty blocks."
+      "notes": "GH #262. First press stays native textarea select-all (jsdom test models it via explicit setSelectionRange). selectBlockSubtree selects the block's visible subtree in the active outline scope; expandBlockSelection climbs one ancestor per press, tops out at the whole scoped visible order and no-ops there. The ladder state (selectAllHead) resets on any other selection mutation (selectBlock/extendSelectionTo/moveSelection/clearSelection). Grid cell editors keep their own whole-grid mod+a (SHEET_CELL_BLOCKED_EDITOR_COMMANDS). Shift+Up: selectedIds completes the visible subtree of any selected ancestor of the anchor in reverse-direction selections only; forward Shift+Down shape unchanged. Store-level tests cover ladder, collapsed parents, scoped orders, reset, idempotence; component test covers the editing-mode escalation incl. empty blocks. Boundary revalidation of the contradictory 2026-08-11 status comment: the controlling commit 0ca3488d (hierarchical Ctrl/Cmd+A ladder, symmetric Shift+Up) shipped in v0.6.91 and is an ancestor of the revalidated base, so 'not addressed at v0.6.92' was stale — the 'comment' predated rechecking actually-mentioned behaviors on the released code. The same suites stay green on this branch (8/8, 2/2, 227/227), and the grid-cell editor boundary asserted in that comment response is now itself pinned: a cell editor's Mod+A neither enters the outline ladder nor loses its own cell editing (SHEET_CELL_BLOCKED_EDITOR_COMMANDS covers select-all)."
     },
     {
       "id": "UI-BLOCK-BOUNDARY-NAV-213",
@@ -7474,6 +7475,228 @@
         "failBefore": "proven"
       },
       "notes": "Internal report against deployed f08e21eb: the native transaction committed safely, but both journal pages became inert and dim, the accepted DTO installation purged and reconstructed their loaded block trees, and the moved editor remounted while its page was still inert. The block therefore briefly disappeared and the caret was lost, preventing repeated move-up/down commands without another click. Fail-before was proven in two passes: the unchanged code produced two visibly-busy page sections while the actor response was pending; retaining the inert hold through accepted publication left document.body focused instead of the moved textarea. Managed moves now retain their persistence/replacement hold without using the destructive visual class, publish the accepted semantic delta while preserving loaded block identity, release inertness before that delta, and re-arm the exact editor/caret context for the adjacent journal mount. No-commit, blocked recovery, page replacement, undo/redo and selection routes retain their existing actor-owned behavior."
+    },
+    {
+      "id": "UI-ASSET-LINK-OS-OPENER-367",
+      "title": "A labeled link into assets/ opens its file or directory through the OS opener instead of the external-URL route",
+      "family": "asset-open",
+      "sources": {
+        "issues": [
+          367
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/assetLinkOpen.test.tsx",
+          "crates/tine-core/src/model.rs::tests::asset_path_for_open_accepts_files_directories_and_the_assets_root"
+        ],
+        "scenario": "assets.link-open-file-directory-root",
+        "failBefore": "proven"
+      },
+      "notes": "A labeled Markdown/Org link whose target resolves into assets/ (`[image](./assets/quick-capture.png)`, `[path](./assets/)`) hit the generic external-link fallback and was handed to the URL opener, which rejected the non-URL relative path, so nothing opened. The fallback opener decision is now graph-asset aware and extension/platform agnostic: files open in the system viewer, a nested directory or the assets root open in the file manager, and paths are percent-decoded first. The Rust open_asset boundary resolves via the same canonicalized assets containment as reads, now permitting directories and the empty name; the read path keeps its regular-file gate. Genuine http(s) links whose URL merely contains assets/ stay on the external-URL route. Fail-before proven by the clicking component test failing against the URL-route-only implementation (6 positive cases red, 2 negative controls green)."
+    },
+    {
+      "id": "UI-ALIAS-OWNER-NAVIGATION-353",
+      "title": "Selecting an alias search result navigates to the canonical owner page and shows the alias as match context, never a phantom alias page",
+      "family": "search-navigation",
+      "sources": {
+        "issues": [
+          353
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/query_plan.rs::tests::alias_reference_is_never_a_phantom_alias_page",
+          "src/components/QuickSwitcher.test.tsx"
+        ],
+        "scenario": "search.alias-owner-navigation",
+        "failBefore": "proven"
+      },
+      "notes": "Searching an alias whose text was also referenced anywhere (e.g. alias:: Book plus a [[Book]] link) produced two page candidates: the owner carrying the alias match AND a path-less referenced virtual page named after the alias, which ranked first and opened a separate alias-named phantom page. The shared page-candidate executor now extends its existing referenced-name dedup to every alias of a file page (case-folded, comma- or full-width-comma-separated multi-alias values), so the alias text is never its own candidate in either run_graph_search (Ctrl+K) or quick_switch (the # / [[ autocomplete pool); a genuinely overlapping ordinary page name and unrelated referenced pages are unaffected. The owner row shows 'aka <alias>' context. Fail-before proven at the integration boundary: a synthetic-graph probe printed the phantom 'Book' hit first on the pre-fix code, and the permanent regression test fails when the owner-alias dedup is disabled; the QuickSwitcher alias-context assertion fails without the row change."
+    },
+    {
+      "id": "UI-CODEBLOCK-EDIT-LAYOUT-STABILITY-357",
+      "title": "Clicking a fenced code block enters an editor with the rendered card's own metrics instead of a proportional wrapped textarea that re-lays every line",
+      "family": "editor-rendering-transition",
+      "sources": {
+        "issues": [
+          357
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.codeFenceEdit.test.tsx",
+          "src/editor/codeFence.test.ts",
+          "scripts/shot-code-block-edit.mjs"
+        ],
+        "scenario": "codeblock.edit-rendered-layout-parity",
+        "failBefore": "proven"
+      },
+      "notes": "The rendered face of a whole-block code fence is .code-block: mono stack, 0.86em, line-height 1.5, padding 10px 12px, white-space pre with horizontal overflow. The editor that replaced it was the ordinary proportional 16px/26px wrapped textarea with no card, so focusing a code block re-laid every line — the 'layout jump'. The editor now presents as the SAME card while the block is code-shaped (detector: whole visible buffer is one md ```/~~~ fence or org #+BEGIN_SRC/#+BEGIN_EXAMPLE, calc excluded, mixed content excluded, unclosed fence tolerated while typing), including wrap=off so long lines scroll horizontally like the card; the buffer stays honest raw text with fences, and live transitions recompute per keystroke. Font override follows the existing --tine-editable-font precedent (.calc-wrap) because editables set font-family via an !important textarea rule. Fail-before proven causally: the component class assertions fail without the editor change, and the browser geometry harness (Chromium, deterministic screenshots) measured pre/post — wide 1120px height delta +76.1px / narrow 700px +154.1px (long line wraps into ~6 lines, no horizontal scroll, fontFamily/fontSize/lineHeight/padding all differ) → after: identical computed fonts/size/leading/padding, wrap=off, horizontal overflow, height delta 39.08px ≈ the two fence lines at both widths; failures list empty. Numeric geometry is the evidence; final visual approval remains with the manager. Typography modes never alter code text (literal in both), so they are unaffected by design."
+    },
+    {
+      "id": "UI-AUTOPAIR-DEFAULT-OG-PARITY-291",
+      "title": "Typing ( { [ \" or backtick inserts the counterpart by default, and one shared persisted decision governs all of them",
+      "family": "editor-typing",
+      "sources": {
+        "issues": [
+          291
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.autopairMatrix.test.tsx",
+          "src/editor/autopair.test.ts"
+        ],
+        "scenario": "editor.autopair-default-matrix",
+        "failBefore": "proven"
+      },
+      "notes": "The timeline's contradiction (works for one reporter, not another AS the OG-inline addition; explicit opt-out persists as '0'. The character set and mechanics are intentionally NOT extended by this fix: repair was at the shared decision, matching the dossier."
+    },
+    {
+      "id": "UI-PAGEREF-LONGPRESS-MENU-231",
+      "title": "A deliberate long-press on a page link raises the same page context menu as desktop right-click, while tap, scroll and selection keep their behavior",
+      "family": "mobile-gestures",
+      "sources": {
+        "issues": [
+          231
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/PageRefLongPress.test.tsx",
+          "src/render/longPress.test.tsx"
+        ],
+        "scenario": "mobile.pageref-longpress-menu",
+        "failBefore": "proven"
+      },
+      "notes": "Mobile long-pressing a [[page]] link selected text (native behavior) instead of showing the desktop right-click menu. PageRef anchors now carry a small recognizer (src/render/longPress.ts): a primary touch/pen press held ~500ms within 10px dispatches a synthetic contextmenu AT THE ANCHOR, so the gesture enters the exact existing openPageContextMenu handler (which preventDefaults — that is also what suppresses the native selection/callout for this hold, plus a scoped -webkit-touch-callout:none on .page-ref). Quick taps navigate, larger movement cancels (scroll intent), pointer-cancel releases, mouse and secondary pointers never arm (desktop keeps right-click), nothing binds until a press starts, and text outside links is untouched bcause no handlers attach there. Fail-before proven: with the four pointer handlers removed transiently, the hold-to-menu component test fails while tap-navigation, native right-click, and the mouse/no-arm guards stay green. Lifecycle proven in jsdom with fake timers; the physical Android WebView (and iOS) confirmation of the native selection suppression is a manager item."
+    },
+    {
+      "id": "UI-SHEET-ADD-ROW-PLACEMENT-227",
+      "title": "Add row appends at the table's source bottom in every presentation; only an active ascending sort displays the empty new row at the view's top, which is the sort contract itself",
+      "family": "sheet-table",
+      "sources": {
+        "issues": [
+          227
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/SheetTable.addRow227.test.tsx"
+        ],
+        "scenario": "sheet.add-row-presentation-positions",
+        "failBefore": "unavailable"
+      },
+      "notes": "Investigation coverage for a needs-info report, not a defect fix: the only mechanism anywhere that can look like 'Add row inserts at the top' is an ACTIVE ascending title sort — the new empty row appends at the end of the source outline (order asserted unchanged) but, being empty, sorts FIRST in the rendered view, and the editor opens there. Unsorted tables (first/middle/last rows), empty tables, ascending, and descending presentations are now all pinned; grid mode shares the same bottom-append source semantics. failBefore unavailable: current code already passes everything — the probe documented behavior instead of exposing a variation to patch. The original report likely involved a title sort that nobody saw in the screenshots."
+    },
+    {
+      "id": "UI-QUERY-CURRENT-PAGE-NAV-301",
+      "title": "A query declaring <% current page %> binds the focused pane's page, re-runs on navigation, and never lets a stale result overwrite the latest page's result",
+      "family": "query-execution",
+      "sources": {
+        "issues": [
+          301
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryMacro.currentPage.test.tsx"
+        ],
+        "scenario": "query.current-page-nav-dispatch",
+        "failBefore": "proven"
+      },
+      "notes": "Martin-approved semantics: the dyvar's page is the FOCUSED pane's route page (binding for rerun), while the owner-page binding passed to the engine (:query-page use) is untouched. QueryMacro now computes an execution-only form: the literal `<% current page %>` (whitespace- and case-tolerant, like templateVars) is replaced by [[focused page]] only in the text handed to runQuery/runAdvancedQuery/savedDslToFriendlySearch; the authored macro and every editing/display derivation keep the literal marker. The refetch key gains the focused page only when the marker is present — no global rerun on navigation, redundant same-page transitions are coalesced, and sharedQueryResult's per-key caching keeps the WeakRef hit for returning to a page. Stale async results can't overwrite: createResource re-issues per key and drops superseded resolutions. failBefore proven: 4/5 component cases red without the change (the marker-less no-rerun control was already green). The EDN `:inputs [:current-page]` form and the full datalog entity binding remain out of engine scope — see the report for the explicit boundary; no clause was run differently to fake it."
+    },
+    {
+      "id": "UI-EMBED-COLLAPSE-CONTRACT-360",
+      "title": "Embeds track their source block's collapse state live, while each embed occurrence's own folding is ephemeral, occurrence-local, and never persisted",
+      "family": "embed-collapse",
+      "sources": {
+        "issues": [
+          360
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.embedCollapse.test.tsx"
+        ],
+        "scenario": "embed.collapse-source-live-plus-ephemeral-fold",
+        "failBefore": "proven"
+      },
+      "notes": "Martin's approved contract both ways: (1) embedded content is live and source-authoritative — a source collapse/expand updates every visible embed immediately (before the fix, LiveRefGroup captured the source state ONCE per instance into initialCollapsed, so an already-visible embed only refreshed after leaving/reopening the page); (2) folding the embed's own presentation is ephemeral per occurrence, never lands on the source block or another occurrence, never writes collapsed:: or any file-format extension, and resets when the occurrence remounts or the app reloads. Implementation: for embed surface groups the default collapse answer IS the live stored node state; an occurrence's own fold records the store's per-block collapse write epoch (bumped inside writeCollapsed and the descendants batch) — the next source collapse write anywhere on that block reclaims authority by invalidating the epoch, so a fold-unfold-fold round trip cannot leave a ghost override. Occurrence-locality is the LiveRefGroup component instance (two {{embed}}s of one uuid are independent instances; nothing is shared across occurrences). Ref and query surfaces' existing 'the result view owns its copy' semantics are deliberately unchanged (their snapshot defaults and local folds ignore the epoch). failBefore proven: 3/4 component cases red pre-fix (source-authoritative live update, local fold expiry on later source move, collapsed-source local expansion expiry), the remount-reset case already green and serves as the preserved-behavior control. Test suites of Block embed depth/hierarchy, Live references, store, Page all stay green."
+    },
+    {
+      "id": "UI-MODIFIED-CLICK-CONTRACT-283",
+      "title": "One modified-click destination contract for every internal link surface: click navigates, Shift+click sidebar, Ctrl/Cmd+click background tab, middle-click background tab",
+      "family": "navigation-links",
+      "sources": {
+        "issues": [
+          283
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/linkModifiedClicks.test.tsx"
+        ],
+        "scenario": "links.modified-click-destination-contract",
+        "failBefore": "proven"
+      },
+      "notes": "Martin's approved pointer contract, one decision table per surface: plain click navigates; Shift-click opens the right sidebar; Ctrl(Win/Linux)/Cmd(macOS)+click opens a BACKGROUND tab (this is the change — PageRef/BlockRefView ctrl-click previously opened the other pane); middle-click opens a background tab everywhere plain-aux semantics existed; context menus keep exposing explicit destinations; and combined modifiers (shift+ctrl) keep plain-click meaning so nothing novel shadows shortcuts. Decision lives once in src/linkGesture.ts (not per surface — surfaces pick only their destination API), applied to: rendered page refs incl. tags and alias chips, block refs ((uuid)) incl. added middle-click, namespace crumb + sidebar tree labels, Favorites rows, Recent rows, All-pages rows, query result group headers, reference-group headers. The QuickSwitcher already conformed and serves as the control suite; its rows keep their existing middle+ctrl background behavior. failBefore: neutralizing the decision helper makes the 5 ctrl/meta cases red while plain/shift/middle/combined stay green. Text-selection and editor-focus behavior unchanged: shift still suppresses range selection at mousedown, middle mousedown prevents autoscroll, touch long-press (GH #231) is unaffected on all the same anchors."
     }
   ]
 }

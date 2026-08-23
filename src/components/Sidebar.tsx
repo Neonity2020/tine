@@ -6,6 +6,7 @@ import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, repor
 import { backend } from "../backend";
 import { allPages as allGraphPages, pageListLabels } from "../pages";
 import { EmojiText } from "../render/emoji";
+import { internalLinkDest } from "../linkGesture";
 import { NamespaceTree } from "./Namespace";
 import type { PageKind } from "../types";
 import { registerTransientLayer } from "../transientLayers";
@@ -175,7 +176,8 @@ export function Sidebar(props: {
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
                           if (rowReorderClickSuppressed()) return;
-                          openSidebarPageTarget(fav.name, fav.kind, e.shiftKey ? "sidebar" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
+                          const dest = internalLinkDest(e);
+                          openSidebarPageTarget(fav.name, fav.kind, dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
                         }}
                         onAuxClick={(e) => {
                           if (e.button === 1) {
@@ -226,7 +228,9 @@ export function Sidebar(props: {
                         classList={{ active: isActive(target().name, target().path) }}
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
-                          if (e.shiftKey) openPageInSidebar(target());
+                          const dest = internalLinkDest(e);
+                          if (dest === "sidebar") openPageInSidebar(target());
+                          else if (dest === "background") openPageTargetInNewTab(target());
                           else { openPageTarget(target()); props.onActiveNavigationComplete?.(); }
                         }}
                         onAuxClick={(e) => {
@@ -268,9 +272,14 @@ export function Sidebar(props: {
                   class="nav-page"
                   classList={{ active: isActive(p.name, p.path) }}
                   onMouseDown={shiftGuard}
-                  onClick={(e) =>
-                    e.shiftKey ? openPageInSidebar({ name: p.name, pageKind: "page", path: p.path }) : openEntry(p.path, p.name)
-                  }
+                  onClick={(e) => {
+                    const dest = internalLinkDest(e);
+                    if (dest === "sidebar") openPageInSidebar({ name: p.name, pageKind: "page", path: p.path });
+                    else if (dest === "background") p.path
+                      ? openInNewTab({ kind: "page", name: p.name, pageKind: "page", path: p.path })
+                      : openPageInNewTab(p.name, "page");
+                    else openEntry(p.path, p.name);
+                  }}
                   onAuxClick={(e) => {
                     if (e.button === 1) {
                       e.preventDefault();

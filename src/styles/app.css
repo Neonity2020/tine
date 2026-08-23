@@ -4558,6 +4558,29 @@ textarea {
   display: block;
 }
 
+/* While the block being edited IS one fenced code block, the editor wears the
+   same card as the rendered .code-block (mono, no soft wrap, same padding and
+   metrics), so clicking a code region no longer re-lays it out (GH #357).
+   Font/line-height/padding numbers mirror .code-block exactly — keep them in
+   sync. `wrap="off"` on the textarea is the functional side of no-soft-wrap. */
+.block-editor.code-edit {
+  background: var(--code-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 4px 0;
+  /* Editable fonts are set via the !important textarea rule above — override
+     the --tine-editable-font variable like .calc-wrap does, not font-family. */
+  --tine-editable-font: "MonoLisa", "Fira Code", "JetBrains Mono", Menlo, Monaco,
+    Consolas, "Courier New", var(--tine-editable-emoji-font), monospace;
+  font-size: 0.86em;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-height: 0;
+}
+
 .block-editor.h1 { font-size: 1.7em; font-weight: 600; line-height: 1.3; }
 .block-editor.h2 { font-size: 1.4em; font-weight: 600; line-height: 1.3; }
 .block-editor.h3 { font-size: 1.2em; font-weight: 600; line-height: 1.3; }
@@ -4719,6 +4742,14 @@ textarea {
   cursor: pointer;
   text-decoration: none;
   position: relative; /* anchor for the hover-peek card (GH #40) */
+  /* Touch long-press raises Tine's own context menu (GH #231); keep iOS's
+     native link callout bubble from stacking on top of it. Text selection is
+     unchanged (only the callout is suppressed). */
+  -webkit-touch-callout: none;
+}
+
+.tag {
+  -webkit-touch-callout: none;
 }
 
 .page-ref:hover {
@@ -8152,6 +8183,20 @@ img.emoji {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* Alias context on a switcher row whose match came through an alias: muted,
+   right-aligned, never longer than a fraction of the row (GH #353). */
+.switcher-alias {
+  margin-left: auto;
+  padding-left: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 45%;
+  flex: 0 1 auto;
 }
 
 .switcher-page {

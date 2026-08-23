@@ -3,6 +3,7 @@ import { backend } from "../backend";
 import { dataRev, graphEpoch } from "../ui";
 import { openPage, openPageInNewTab } from "../router";
 import { openPageInSidebar, openPageContextMenu } from "../ui";
+import { internalLinkDest } from "../linkGesture";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { blockExternalId } from "../store";
@@ -69,7 +70,9 @@ export function BlockReferences(props: { id: string }): JSX.Element {
                 <div
                   class="reference-page"
                   onClick={(e) => {
-                    if (e.shiftKey) openPageInSidebar(g.page, g.kind);
+                    const dest = internalLinkDest(e);
+                    if (dest === "sidebar") openPageInSidebar(g.page, g.kind);
+                    else if (dest === "background") openPageInNewTab(g.page, g.kind);
                     else openPage(g.page, g.kind);
                   }}
                   onAuxClick={(e) => {

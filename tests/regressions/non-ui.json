@@ -4483,10 +4483,14 @@
       "title": "A managed page save depended on repeated frontend resubmission to advance finite prior actor work",
       "family": "managed-storage-save-recovery",
       "sources": {
-        "issues": [292],
+        "issues": [
+          292
+        ],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "tine-core-storage",
       "status": "covered",
       "coverage": {
@@ -4508,7 +4512,9 @@
         "issues": [],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "tine-core-storage",
       "status": "covered",
       "coverage": {
@@ -4521,6 +4527,33 @@
         "failBefore": "proven"
       },
       "notes": "Internal v0.6.94 report: repeatedly moving a root upward inside a journal day and then across the day boundary produced `did not validate as one accepted operation` followed by a repeating `runtime binding changed` recovery flood. Two independent ordering defects composed. A second same-page edit authenticated the newer journal overlay but still eagerly validated the older clean-manifest rendering, so a legitimate reorder was refused. A correlated multi-page move could then stage directly in accepted history while its foreground page-save prefix was still pending; accepting the prefix could wake speculative dependent history and invalidate the clean runtime. Capture now uses the authenticated foreground predecessor without consulting its superseded manifest, derivative recovery admits the expected SQLite lag, and correlated multi-page transactions advance the pending foreground prefix one bounded turn at a time before staging. The exact two-journal fail-before performs two root reorders, crosses the leading root into the adjacent journal, drains to zero, and proves a safe shutdown."
+    },
+    {
+      "id": "REG-AUTOCOMPLETE-SURFACE-POOLS-186",
+      "title": "Ctrl+K, #, [[ and (( share candidates within each surface's designed entity pool and window; autocomplete input stays literal and stable across character swaps",
+      "family": "search-autocomplete-reliability",
+      "sources": {
+        "issues": [
+          186
+        ],
+        "commits": [
+          "294edbd0"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "rust-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/issue186_surfaces.rs::literal_autocomplete_is_stable_across_character_swaps_and_dsl_tokens",
+          "crates/tine-core/tests/issue186_surfaces.rs::page_and_block_surfaces_share_candidates_within_designed_windows"
+        ],
+        "scenario": "search.autocomplete-surface-pool-contract",
+        "failBefore": "inferred"
+      },
+      "notes": "B1 follow-up reconciliation on current master: the remaining confirmed defect from the issue timeline (autocomplete interpreting literal text as the Ctrl+K DSL, e.g. bare OR collapsing to an empty matcher) was already fixed on master by 294edbd0 (shipped v0.6.4) and stays green; this row instead pins the remaining cross-surface contract for the 医保-style report on a synthetic CJK graph (163 eligible page candidates): the page surfaces (quick_switch = the # / [[ pool, Ctrl+K's page branch) return the SAME top-12 order, the block surfaces (( picker and Ctrl+K blocks) both find all content blocks, truncation at the shared 100 window is identical and signalled only in Ctrl+K (has_more), and pools differ ONLY by design (( searches block TEXT, # / [[ search pages, Ctrl+K searches both). The character-swap ladder (1..3 chars, incl. DSL token literals like bare uppercase OR) is re-pinned at the public quick_switch/block_search_literal APIs, complementing the shipped fix's own token tests. failBefore=inferred: written after the shipped fix; the DSL rows' pre-fix failure mode is guaranteed by the shipped fix's own token tests, and the rest documents designed behavior."
     }
   ]
 }
