@@ -224,13 +224,21 @@ assert.match(
 // iOS is manual-only and defaults to preserving a signed artifact without upload.
 assert.match(
   releaseWorkflow,
-  /name: Prepare macOS signing and notarization credentials[\s\S]*?if: matrix\.lane == 'macos-universal'[\s\S]*?APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}[\s\S]*?APPLE_API_PRIVATE_KEY: \$\{\{ secrets\.APPLE_API_PRIVATE_KEY \}\}[\s\S]*?chmod 600 "\$key_path"[\s\S]*?APPLE_API_KEY_PATH=\$key_path/,
-  "macOS release signing does not fail closed or protect the temporary App Store Connect key"
+  /name: Prepare macOS signing and notarization credentials[\s\S]*?if: matrix\.lane == 'macos-universal'[\s\S]*?APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}[\s\S]*?APPLE_API_PRIVATE_KEY: \$\{\{ secrets\.APPLE_API_PRIVATE_KEY \}\}[\s\S]*?security create-keychain[\s\S]*?security import "\$p12"[\s\S]*?-f pkcs12[\s\S]*?security find-identity[\s\S]*?chmod 600 "\$key_path"[\s\S]*?APPLE_API_KEY_PATH=\$key_path/,
+  "macOS release signing does not explicitly install the Developer ID identity or protect the temporary App Store Connect key"
 );
 assert.match(
   releaseWorkflow,
-  /name: Build Tauri bundles\n\s+if: matrix\.lane != 'macos-universal'[\s\S]*?name: Build signed and notarized macOS bundles\n\s+if: matrix\.lane == 'macos-universal'[\s\S]*?APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}[\s\S]*?APPLE_SIGNING_IDENTITY: \$\{\{ secrets\.APPLE_SIGNING_IDENTITY \}\}[\s\S]*?APPLE_API_ISSUER: \$\{\{ secrets\.APPLE_API_ISSUER \}\}/,
+  /name: Build Tauri bundles\n\s+if: matrix\.lane != 'macos-universal'[\s\S]*?name: Build signed and notarized macOS bundles\n\s+if: matrix\.lane == 'macos-universal'[\s\S]*?APPLE_SIGNING_IDENTITY: \$\{\{ secrets\.APPLE_SIGNING_IDENTITY \}\}[\s\S]*?APPLE_API_ISSUER: \$\{\{ secrets\.APPLE_API_ISSUER \}\}/,
   "Apple signing secrets are not isolated to the macOS release lane"
+);
+const macosBuildBlock = releaseWorkflow.match(
+  /name: Build signed and notarized macOS bundles[\s\S]*?run: npm run tauri build -- \$\{\{ matrix\.args \}\}/
+)?.[0] ?? "";
+assert.doesNotMatch(
+  macosBuildBlock,
+  /APPLE_CERTIFICATE(?:_PASSWORD)?:/,
+  "the macOS Tauri build must use the explicitly installed identity instead of re-importing the PKCS#12 file"
 );
 assert.match(
   releaseWorkflow,
@@ -239,7 +247,7 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
-  /name: Remove macOS signing material\n\s+if: always\(\) && matrix\.lane == 'macos-universal'[\s\S]*?app-store-connect-private-keys/,
+  /name: Remove macOS signing material\n\s+if: always\(\) && matrix\.lane == 'macos-universal'[\s\S]*?security delete-keychain[\s\S]*?app-store-connect-private-keys/,
   "temporary macOS signing material is not cleaned after failures"
 );
 
