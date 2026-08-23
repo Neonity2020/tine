@@ -6135,12 +6135,13 @@
         "tests": [
           "src/selectionExpand.test.ts",
           "src/components/Block.selectAll.test.tsx",
-          "src/store.test.ts"
+          "src/store.test.ts",
+          "src/components/SheetGrid.interact.test.tsx"
         ],
         "scenario": "editor.select-all-ladder-and-shift-up-subtree",
         "failBefore": "proven"
       },
-      "notes": "GH #262. First press stays native textarea select-all (jsdom test models it via explicit setSelectionRange). selectBlockSubtree selects the block's visible subtree in the active outline scope; expandBlockSelection climbs one ancestor per press, tops out at the whole scoped visible order and no-ops there. The ladder state (selectAllHead) resets on any other selection mutation (selectBlock/extendSelectionTo/moveSelection/clearSelection). Grid cell editors keep their own whole-grid mod+a (SHEET_CELL_BLOCKED_EDITOR_COMMANDS). Shift+Up: selectedIds completes the visible subtree of any selected ancestor of the anchor in reverse-direction selections only; forward Shift+Down shape unchanged. Store-level tests cover ladder, collapsed parents, scoped orders, reset, idempotence; component test covers the editing-mode escalation incl. empty blocks."
+      "notes": "GH #262. First press stays native textarea select-all (jsdom test models it via explicit setSelectionRange). selectBlockSubtree selects the block's visible subtree in the active outline scope; expandBlockSelection climbs one ancestor per press, tops out at the whole scoped visible order and no-ops there. The ladder state (selectAllHead) resets on any other selection mutation (selectBlock/extendSelectionTo/moveSelection/clearSelection). Grid cell editors keep their own whole-grid mod+a (SHEET_CELL_BLOCKED_EDITOR_COMMANDS). Shift+Up: selectedIds completes the visible subtree of any selected ancestor of the anchor in reverse-direction selections only; forward Shift+Down shape unchanged. Store-level tests cover ladder, collapsed parents, scoped orders, reset, idempotence; component test covers the editing-mode escalation incl. empty blocks. Boundary revalidation of the contradictory 2026-08-11 status comment: the controlling commit 0ca3488d (hierarchical Ctrl/Cmd+A ladder, symmetric Shift+Up) shipped in v0.6.91 and is an ancestor of the revalidated base, so 'not addressed at v0.6.92' was stale — the 'comment' predated rechecking actually-mentioned behaviors on the released code. The same suites stay green on this branch (8/8, 2/2, 227/227), and the grid-cell editor boundary asserted in that comment response is now itself pinned: a cell editor's Mod+A neither enters the outline ladder nor loses its own cell editing (SHEET_CELL_BLOCKED_EDITOR_COMMANDS covers select-all)."
     },
     {
       "id": "UI-BLOCK-BOUNDARY-NAV-213",
