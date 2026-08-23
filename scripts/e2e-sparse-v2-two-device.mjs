@@ -291,7 +291,7 @@ async function openPageThroughSwitcher(name = PAGE) {
 async function closeSettingsIfOpen() {
   const modal = await browser.$(".settings-modal");
   if (!(await modal.isExisting())) return;
-  const close = await browser.$(".settings-pane-head .icon-btn");
+  const close = await browser.$(".settings-pane-head .icon-btn:not(.settings-maximize)");
   await close.waitForClickable({ timeout: 15_000 });
   await close.click();
   await modal.waitForExist({ reverse: true, timeout: 15_000 });

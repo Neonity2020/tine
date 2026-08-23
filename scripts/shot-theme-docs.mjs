@@ -87,14 +87,14 @@ try {
   if (!(await page.locator('.theme-opt[title="Dark theme"][aria-checked="true"]').count()))
     await page.locator('.theme-opt[title="Dark theme"]').click();
   await page.locator('.theme-opt[title="Dark theme"][aria-checked="true"]').waitFor();
-  await page.locator(".settings-pane-head .icon-btn").click();
+  await page.locator(".settings-pane-head .icon-btn:not(.settings-maximize)").click();
   await navigate(page, "Jun 14th, 2026");
   await closeToasts(page);
   await page.screenshot({ path: `${DEV_SHOTS}/tine-dev-colors.png` });
 
   await openAppearance(page);
   await installAndUse(page, THINGS_ROOT);
-  await page.locator(".settings-pane-head .icon-btn").click();
+  await page.locator(".settings-pane-head .icon-btn:not(.settings-maximize)").click();
   await navigate(page, "Jun 14th, 2026");
   await closeToasts(page);
   await page.screenshot({ path: `${THINGS_SHOTS}/tine-things-colors.png` });

@@ -323,7 +323,7 @@ async function openStorageSettings() {
 }
 
 async function closeSettings() {
-  const close = await browser.$(".settings-pane-head .icon-btn");
+  const close = await browser.$(".settings-pane-head .icon-btn:not(.settings-maximize)");
   await close.waitForClickable({ timeout: 30_000 });
   await close.click();
   await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 30_000 });
