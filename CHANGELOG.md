@@ -10,9 +10,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **macOS release builds are now signed and notarized.** The universal direct-download app and DMG use Tine's Developer ID identity, authenticate notarization with a short-lived App Store Connect token, and must pass independent signature, team, stapled-ticket, Gatekeeper, and DMG-integrity checks before the release lane can be staged. Windows signing remains separate future work.
+
+- **Tine can now build a signed iOS beta for TestFlight.** A manual-only workflow creates and verifies a `TineOutline` IPA for the existing `page.tine.Tine` bundle ID, retains it as an immutable artifact by default, and only validates or uploads to TestFlight when that action is explicitly selected. It cannot submit or release a production App Store version. The iOS bundle includes its privacy manifest, export-compliance declaration, App Store provisioning proof, and a unique build number for each run.
+
+- **Tine now publishes a plain-language privacy policy and support contact.** The in-app About tab links to both, the website links to the policy, and the policy distinguishes local graph data from the limited update, plugin-catalogue, documentation, and voluntary-support traffic Tine can make.
+
 - **Sheets now render in the HTML export and print output for any graph.** Until now, publishing a page holding a Tine Sheet emitted only the sheet's plain-bullet twin plus the visible `tine.*` view configuration, so the presentation — columns, grouping, computed cells — disappeared. Block-powered sheets now publish as meaningful read-only views: tables with their title/declared/formula/observed columns, typed checkbox cells, aggregate footers, and arithmetic formula columns; boards grouped by state, priority, tags, or fields, including query-backed boards; and grids with their positional cells, header rows, and nested grids. Numbered list blocks (`logseq.order-list-type:: number`) keep their ordinal markers, and blocks with LOGBOOK clock rows keep an elapsed-time badge while the drawer stays hidden. This applies to both whole-graph publishing and single-page print/PDF export.
 
 ### Changed
+
+- **The first iOS beta keeps Wasm plugins disabled, as required by ADR 0052.** Installed guests are not loaded, the package/catalogue surface is absent from Settings, and plugin commands cannot register. Built-in and inert token themes remain available. Enabling iOS plugins later remains a separate product and App Review decision.
+
+- **The iOS About tab omits the external Ko-fi support link.** Website, desktop, and Android support links are unchanged; iOS keeps only non-purchase project, privacy, and email-support links while the initial App Store review surface is deliberately minimal.
 
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed

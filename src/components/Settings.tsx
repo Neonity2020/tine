@@ -268,6 +268,17 @@ function experimentalMatch(tab: Tab, query: string): boolean {
 export function Settings(): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("appearance");
   const [settingsQuery, setSettingsQuery] = createSignal("");
+  const [settingsPlatform] = createResource(async () => {
+    try {
+      return await platformKind();
+    } catch {
+      // Unknown native platforms fail closed: do not reveal a package host whose
+      // platform policy could not be established.
+      return undefined;
+    }
+  });
+  const pluginsAvailable = () => settingsPlatform() === "desktop" || settingsPlatform() === "android";
+  const availableTabs = createMemo(() => pluginsAvailable() ? TABS : TABS.filter((entry) => entry.id !== "plugins"));
   const matches = createMemo(() => {
     const query = settingsQuery();
     return query.trim() ? SETTING_SEARCH.filter((entry) => settingMatches(entry, query)) : [];
@@ -302,10 +313,15 @@ export function Settings(): JSX.Element {
   };
 
   createEffect(() => {
+    if (!settingsPlatform.loading && tab() === "plugins" && !pluginsAvailable()) setTab("appearance");
+  });
+
+  createEffect(() => {
     if (!settingsOpen()) return;
     const requested = settingsTabRequest();
     if (!requested) return;
-    setTab(requested);
+    if (requested === "plugins" && settingsPlatform.loading) return;
+    setTab(requested === "plugins" && !pluginsAvailable() ? "appearance" : requested);
     clearSettingsTabRequest();
   });
 
@@ -357,7 +373,7 @@ export function Settings(): JSX.Element {
         <div class="settings-modal" onClick={(e) => e.stopPropagation()}>
           <aside class="settings-nav">
             <div class="settings-nav-title">Settings</div>
-            <For each={TABS}>
+            <For each={availableTabs()}>
               {(t) => (
                 <button
                   class="settings-nav-item"
@@ -373,7 +389,7 @@ export function Settings(): JSX.Element {
 
           <div class="settings-pane">
             <div class="settings-pane-head">
-              <span>{TABS.find((t) => t.id === tab())?.label}</span>
+              <span>{availableTabs().find((t) => t.id === tab())?.label}</span>
               <input
                 class="settings-search-input"
                 type="search"
@@ -429,7 +445,7 @@ export function Settings(): JSX.Element {
               <Show when={tab() === "graph"}>
                 <GraphTab publishMsg={publishMsg()} doPublish={doPublish} />
               </Show>
-              <Show when={tab() === "plugins"}>
+              <Show when={tab() === "plugins" && pluginsAvailable()}>
                 <PluginsTab />
               </Show>
               <Show when={tab() === "improve"}>
