@@ -7756,6 +7756,10 @@ pub struct ShardedHotEngine {
     archive_fingerprints: BTreeMap<BatchId, ContentDigest>,
     persisted_staged: BTreeSet<BatchId>,
     statuses: BTreeMap<BatchId, ArchiveStatus>,
+    /// Exact live work set for the inline engine. Final statuses may remain in
+    /// `statuses` for point answers, so deriving staged work by scanning that
+    /// lifetime map makes every later admission grow with session history.
+    staged_batches: BTreeSet<BatchId>,
     // Authenticated point-validation evidence, never a live owner authority.
     // Store-backed engines retain only this root; the sole live owner remains
     // in the immutable home shard. The bounded map is a no-store test harness.
@@ -7974,6 +7978,7 @@ impl ShardedHotEngine {
             archive_fingerprints: BTreeMap::new(),
             persisted_staged: BTreeSet::new(),
             statuses: BTreeMap::new(),
+            staged_batches: BTreeSet::new(),
             block_claim_index: None,
             block_claim_root: BlockClaimIndexRoot::default(),
             ephemeral_block_claims: AHashMap::new(),
@@ -12593,7 +12598,7 @@ impl ShardedHotEngine {
 
         self.archive_fingerprints.insert(batch_id, fingerprint);
         self.archive.insert(batch_id, batch);
-        self.statuses.insert(batch_id, ArchiveStatus::Staged);
+        self.mark_staged(batch_id);
         if persisted {
             self.persisted_staged.insert(batch_id);
         }
@@ -13267,7 +13272,7 @@ impl ShardedHotEngine {
             self.archive.insert(batch_id, ready_batch);
             self.archive_fingerprints
                 .insert(batch_id, ready_fingerprint);
-            self.statuses.insert(batch_id, ArchiveStatus::Staged);
+            self.mark_staged(batch_id);
 
             let ready_record =
                 match super::dependency_queue::lookup(&store, &self.scratch_roots, batch_id) {
@@ -13349,7 +13354,7 @@ impl ShardedHotEngine {
                 } else {
                     roots_before_pop
                 };
-                self.statuses.remove(&batch_id);
+                self.remove_hot_status(batch_id);
                 self.archive_fingerprints.remove(&batch_id);
                 self.archive.remove(&batch_id);
                 return self.outcome(
@@ -13392,7 +13397,7 @@ impl ShardedHotEngine {
                 self.history_failure = Some(error);
                 break;
             }
-            self.statuses.remove(&batch_id);
+            self.remove_hot_status(batch_id);
             self.archive_fingerprints.remove(&batch_id);
             self.archive.remove(&batch_id);
         }
@@ -13591,7 +13596,7 @@ impl ShardedHotEngine {
         self.archive_fingerprints
             .insert(batch_id, manifest_fingerprint);
         self.archive.insert(batch_id, batch);
-        self.statuses.insert(batch_id, ArchiveStatus::Staged);
+        self.mark_staged(batch_id);
         let (no_op, evidence) = match self.validate_and_apply(
             batch_id,
             true,
@@ -13634,7 +13639,7 @@ impl ShardedHotEngine {
                 ));
             }
         };
-        self.statuses.remove(&batch_id);
+        self.remove_hot_status(batch_id);
         self.archive_fingerprints.remove(&batch_id);
         self.archive.remove(&batch_id);
         self.detached_accepted_manifests.insert(batch_id, manifest);
@@ -13715,7 +13720,7 @@ impl ShardedHotEngine {
         self.archive_fingerprints
             .insert(batch_id, manifest_fingerprint);
         self.archive.insert(batch_id, batch);
-        self.statuses.insert(batch_id, ArchiveStatus::Staged);
+        self.mark_staged(batch_id);
 
         let application_started = trace_enabled.then(Instant::now);
         let evidence = self.apply_authored_detached_bootstrap(
@@ -13755,7 +13760,7 @@ impl ShardedHotEngine {
                 started.elapsed().as_secs_f64() * 1_000.0
             );
         }
-        self.statuses.remove(&batch_id);
+        self.remove_hot_status(batch_id);
         self.archive_fingerprints.remove(&batch_id);
         let prepared = self
             .archive
@@ -20822,13 +20827,7 @@ impl ShardedHotEngine {
                 break;
             }
             let scan_started = trace.then(std::time::Instant::now);
-            let staged: Vec<BatchId> = self
-                .statuses
-                .iter()
-                .filter_map(|(batch_id, status)| {
-                    matches!(status, ArchiveStatus::Staged).then_some(*batch_id)
-                })
-                .collect();
+            let staged: Vec<BatchId> = self.staged_batches.iter().copied().collect();
             if let Some(started) = scan_started {
                 eprintln!(
                     "PHASE TIME Engine.drain_staged.status_scan statuses={} staged={} {:.3}ms",
@@ -20917,7 +20916,7 @@ impl ShardedHotEngine {
                         if let Some(publication_error) =
                             self.precommit_history_publication_failure.take()
                         {
-                            self.statuses.remove(&batch_id);
+                            self.remove_hot_status(batch_id);
                             self.archive_fingerprints.remove(&batch_id);
                             self.archive.remove(&batch_id);
                             self.persisted_staged.remove(&batch_id);
@@ -20954,13 +20953,7 @@ impl ShardedHotEngine {
             if self.history_failure.is_some() {
                 break;
             }
-            let staged: Vec<BatchId> = self
-                .statuses
-                .iter()
-                .filter_map(|(batch_id, status)| {
-                    matches!(status, ArchiveStatus::Staged).then_some(*batch_id)
-                })
-                .collect();
+            let staged: Vec<BatchId> = self.staged_batches.iter().copied().collect();
             let mut progressed = false;
             for batch_id in staged {
                 self.record_drain_candidate_visit();
@@ -21015,7 +21008,7 @@ impl ShardedHotEngine {
                         if let Some(publication_error) =
                             self.precommit_history_publication_failure.take()
                         {
-                            self.statuses.remove(&batch_id);
+                            self.remove_hot_status(batch_id);
                             self.archive_fingerprints.remove(&batch_id);
                             self.archive.remove(&batch_id);
                             self.persisted_staged.remove(&batch_id);
@@ -21105,6 +21098,16 @@ impl ShardedHotEngine {
         Ok(true)
     }
 
+    fn mark_staged(&mut self, batch_id: BatchId) {
+        self.statuses.insert(batch_id, ArchiveStatus::Staged);
+        self.staged_batches.insert(batch_id);
+    }
+
+    fn remove_hot_status(&mut self, batch_id: BatchId) {
+        self.statuses.remove(&batch_id);
+        self.staged_batches.remove(&batch_id);
+    }
+
     fn set_final_status(&mut self, batch_id: BatchId, status: ArchiveStatus) {
         if matches!(
             status,
@@ -21136,6 +21139,7 @@ impl ShardedHotEngine {
                 }
             }
         }
+        self.staged_batches.remove(&batch_id);
         self.statuses.insert(batch_id, status.clone());
         let Some(manifest_fingerprint) = self.archive_fingerprints.get(&batch_id).copied() else {
             return;
@@ -21150,7 +21154,7 @@ impl ShardedHotEngine {
             return;
         }
         self.persisted_staged.remove(&batch_id);
-        self.statuses.remove(&batch_id);
+        self.remove_hot_status(batch_id);
         self.archive_fingerprints.remove(&batch_id);
         self.archive.remove(&batch_id);
     }
@@ -33650,6 +33654,7 @@ mod validation_tests {
         archive_fingerprints: BTreeMap<BatchId, ContentDigest>,
         persisted_staged: BTreeSet<BatchId>,
         statuses: BTreeMap<BatchId, ArchiveStatus>,
+        staged_batches: BTreeSet<BatchId>,
         block_claim_root: BlockClaimIndexRoot,
         ephemeral_block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
         logseq_claim_root: LogseqClaimIndexRoot,
@@ -33707,6 +33712,7 @@ mod validation_tests {
             archive_fingerprints: engine.archive_fingerprints.clone(),
             persisted_staged: engine.persisted_staged.clone(),
             statuses: engine.statuses.clone(),
+            staged_batches: engine.staged_batches.clone(),
             block_claim_root: engine.block_claim_root,
             ephemeral_block_claims: engine.ephemeral_block_claims.clone(),
             logseq_claim_root: engine.logseq_claim_root,
@@ -37856,6 +37862,16 @@ mod validation_tests {
                 && !managed_authority.contains("entries.iter()"),
             "revalidating queued local authority must point-read its batch index"
         );
+        for drain in [
+            function("drain_staged", "drain_blocked_evidence"),
+            function("drain_blocked_evidence", "incomplete_staged_disposition"),
+        ] {
+            assert!(drain.contains("self.staged_batches.iter()"));
+            assert!(
+                !drain.contains("self.statuses.iter()"),
+                "ordinary admission must visit live staged work, not lifetime status history"
+            );
+        }
 
         let production = source
             .split("#[cfg(test)]\nmod validation_tests")
