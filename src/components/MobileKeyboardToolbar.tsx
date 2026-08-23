@@ -132,10 +132,12 @@ export function MobileKeyboardToolbar(): JSX.Element {
   // ("touch-through" onto the page). Stay mounted until the trailing click is
   // consumed here, with a short safety window for pointercancel/lost events.
   const [hideGesture, setHideGesture] = createSignal(false);
+  const [hideGestureDockTop, setHideGestureDockTop] = createSignal<number | null>(null);
   let hideGestureTimer: ReturnType<typeof setTimeout> | undefined;
   const cancelHideGesture = () => {
     if (hideGestureTimer !== undefined) clearTimeout(hideGestureTimer);
     hideGestureTimer = undefined;
+    setHideGestureDockTop(null);
     setHideGesture(false);
   };
   onCleanup(() => {
@@ -172,7 +174,10 @@ export function MobileKeyboardToolbar(): JSX.Element {
   });
 
   const style = () => ({
-    top: `calc(${Math.max(0, dockTop())}px - env(safe-area-inset-bottom))`,
+    // The viewport grows while the keyboard closes. Keep the button under the
+    // active pointer until its trailing click is consumed; otherwise a mounted
+    // toolbar can still move away and expose the note before pointer-up.
+    top: `calc(${Math.max(0, hideGestureDockTop() ?? dockTop())}px - env(safe-area-inset-bottom))`,
   });
   const keepEditorFocus = (e: Event) => e.preventDefault();
   const run = (action: ToolbarAction) => {
@@ -184,6 +189,8 @@ export function MobileKeyboardToolbar(): JSX.Element {
   };
   const beginHideGesture = (e: Event) => {
     e.preventDefault();
+    if (hideGestureTimer !== undefined) clearTimeout(hideGestureTimer);
+    setHideGestureDockTop(dockTop());
     hideGestureTimer = setTimeout(cancelHideGesture, 700);
     setHideGesture(true);
     blurFocusedEditor();

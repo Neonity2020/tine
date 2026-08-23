@@ -140,4 +140,18 @@ describe("goHome (GH #276 gh)", () => {
 
     expect(mainRoute()).toMatchObject({ kind: "journals" });
   });
+
+  it("does not override navigation made while the home page is resolving", async () => {
+    appStrings[`home.page.${ROOT}`] = "Home Page";
+    let resolveHome!: (page: unknown) => void;
+    pagesByName["Home Page"] = new Promise((resolve) => { resolveHome = resolve; });
+
+    goHome();
+    await flushMicrotasks(2);
+    resetPaneLayoutToSingle(plainPageSnapshot("User Chose This"));
+    resolveHome({ name: "Home Page", kind: "page" });
+    await flushMicrotasks();
+
+    expect(mainRoute()).toMatchObject({ kind: "page", name: "User Chose This", pageKind: "page" });
+  });
 });

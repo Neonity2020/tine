@@ -139,6 +139,7 @@ describe("MobileKeyboardToolbar", () => {
     });
     window.dispatchEvent(new Event("resize"));
     expect(toolbarOf()).not.toBeNull();
+    expect((toolbarOf() as HTMLElement).style.top).toContain("520px");
 
     // The gesture's trailing click lands on the still-mounted button and is
     // swallowed there; the page underneath never sees it.

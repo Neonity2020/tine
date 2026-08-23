@@ -4,11 +4,14 @@ let existing: string[] = [];
 const calls: string[][] = [];
 let epoch = 1;
 let inventory = 0;
+let queuedResponses: Promise<string[]>[] = [];
 
 vi.mock("./backend", () => ({
   backend: () => ({
     existingPageNames: async (names: string[]) => {
       calls.push([...names]);
+      const queued = queuedResponses.shift();
+      if (queued) return queued;
       return names.filter((name) => existing.includes(name));
     },
   }),
@@ -25,6 +28,7 @@ describe("pageExistsBatch", () => {
     existing = [];
     epoch = 1;
     inventory = 0;
+    queuedResponses = [];
     resetPageExistsBatch();
   });
 
@@ -124,6 +128,24 @@ describe("pageExistsBatch", () => {
       pageIsMissing("A");
       await settle();
       expect(calls).toEqual([["A"], ["A"]]);
+    });
+
+    it("ignores an older inventory response that arrives after creation", async () => {
+      let resolveOld!: (names: string[]) => void;
+      queuedResponses.push(new Promise<string[]>((resolve) => { resolveOld = resolve; }));
+      pageIsMissing("Racing Target");
+      await Promise.resolve();
+
+      inventory++;
+      existing = ["Racing Target"];
+      pageIsMissing("Racing Target");
+      await settle();
+      expect(pageIsMissing("Racing Target")).toBe(false);
+
+      resolveOld([]);
+      await settle();
+      expect(pageIsMissing("Racing Target")).toBe(false);
+      expect(calls).toEqual([["Racing Target"], ["Racing Target"]]);
     });
   });
 });

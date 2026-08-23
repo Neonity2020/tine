@@ -1138,15 +1138,13 @@ export function Editor(props: { id: string }): JSX.Element {
   // drives edit-focus arbitration when the same block renders in several surfaces.
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
-  // Ref/query surfaces are live editing surfaces for keyboard structural edits
-  // (GH #341): returning arrow navigation (Enter/merge/etc.) to the primary
-  // outline moved the caret into an editor that isn't rendered in the surface
-  // the user is looking at — the "cursor disappears" report. Same treatment
-  // embeds already had. Structural TOPOLOGY still consults page order for
-  // navOnly scopes (see store.mergeWithPrev/Next); only the edit DESTINATION
-  // changes here.
-  const editSurface = () =>
+  // Ref/query arrow navigation stays in the rendered result surface (GH #341),
+  // while structural edits still target the source outline: a split/merge
+  // destination need not remain a query or backlink result. Embeds are true
+  // transclusions, so both navigation and structural destinations stay there.
+  const navigationSurface = () =>
     surfaceKey.startsWith("ref:") || surfaceKey.startsWith("embed:") ? surfaceKey : null;
+  const structuralSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
   let pluginSlashInvocation = 0;
   let editorMounted = true;
@@ -3138,7 +3136,7 @@ export function Editor(props: { id: string }): JSX.Element {
             commit(trimmed);
             newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
           });
-          startEditing(newId, 0, null, editSurface());
+          startEditing(newId, 0, null, structuralSurface());
           return;
         }
       }
@@ -3192,10 +3190,10 @@ export function Editor(props: { id: string }): JSX.Element {
         // adds a new sibling bullet below, which the user can Tab to nest as a
         // note under the highlight.
         const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
-        startEditing(newId, 0, null, editSurface());
+        startEditing(newId, 0, null, structuralSurface());
       } else {
         const zoomRoot = outlineScope?.forceExpandedRoot === props.id;
-        splitBlock(props.id, start, zoomRoot, zoomRoot, editSurface());
+        splitBlock(props.id, start, zoomRoot, zoomRoot, structuralSurface());
       }
     } else if (e.key === "Backspace" && end === start) {
       // Auto-pair Backspace: caret between an empty pair (`(|)`) deletes both
@@ -3232,7 +3230,7 @@ export function Editor(props: { id: string }): JSX.Element {
           return;
         }
         commit(raw);
-        if (mergeWithPrev(props.id, structuralScope, editSurface())) {
+        if (mergeWithPrev(props.id, structuralScope, structuralSurface())) {
           e.preventDefault();
           return;
         }
@@ -3241,7 +3239,7 @@ export function Editor(props: { id: string }): JSX.Element {
         if (n && splitProps(n.raw, hideFn(), pageFmt()).visible.trim() === "" && n.children.length === 0 && next && doc.byId[next]?.page === n.page) {
           e.preventDefault();
           deleteBlock(props.id);
-          startEditing(next, 0, null, editSurface());
+          startEditing(next, 0, null, structuralSurface());
         }
       }
     } else if (e.key === "Delete" && end === start && start === raw.length) {
@@ -3255,7 +3253,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const nextRaw = doc.byId[next]?.raw ?? "";
         if (isAnnotationBlock(nextRaw) || calcSource(nextRaw) !== null) return;
         commit(raw);
-        if (mergeWithNext(props.id, structuralScope, editSurface())) {
+        if (mergeWithNext(props.id, structuralScope, structuralSurface())) {
           e.preventDefault();
           const caretAt = start; // join point = the block's pre-merge end
           queueMicrotask(() => {
@@ -3273,7 +3271,7 @@ export function Editor(props: { id: string }): JSX.Element {
           e.preventDefault();
           // "End of the previous block": a number caret clamps to the new editor's
           // full text length at mount (focusNow Math.min), whichever it is.
-          startEditing(prev, Number.MAX_SAFE_INTEGER, null, editSurface());
+          startEditing(prev, Number.MAX_SAFE_INTEGER, null, navigationSurface());
         }
       }
     } else if (e.key === "ArrowRight" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -3282,7 +3280,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const next = nextVisible(props.id, outlineScope);
         if (next) {
           e.preventDefault();
-          startEditing(next, 0, null, editSurface());
+          startEditing(next, 0, null, navigationSurface());
         }
       }
     } else if (e.key === "ArrowUp" && !e.shiftKey) {
@@ -3308,7 +3306,7 @@ export function Editor(props: { id: string }): JSX.Element {
           e.preventDefault();
           // Keep the caret's column on the previous block's bottom visual row.
           // Resolution happens after its textarea mounts, when wrapping is known.
-          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" }, null, editSurface());
+          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" }, null, navigationSurface());
         }
       }
     } else if (e.key === "ArrowDown" && !e.shiftKey) {
@@ -3323,7 +3321,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const next = nextVisible(props.id, outlineScope);
         if (next) {
           e.preventDefault();
-          startEditing(next, { col, edge: "first" }, null, editSurface());
+          startEditing(next, { col, edge: "first" }, null, navigationSurface());
         } else {
           // No next LOADED block. In the journal feed, pull in the next day so
           // Down-arrow keeps going past the loaded window (previously only a
@@ -3333,7 +3331,7 @@ export function Editor(props: { id: string }): JSX.Element {
             e.preventDefault();
             commit(raw);
             void nextVisibleOrExtend(props.id).then((n) =>
-              n && startEditing(n, { col, edge: "first" }, null, editSurface())
+              n && startEditing(n, { col, edge: "first" }, null, navigationSurface())
             );
           }
         }

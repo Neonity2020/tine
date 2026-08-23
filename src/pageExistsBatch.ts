@@ -44,10 +44,11 @@ function flush() {
   const batch = pending;
   pending = [];
   const batchRev = cacheRev;
+  const batchInventoryRev = cacheInventoryRev;
   void backend()
     .existingPageNames(batch)
     .then((existing) => {
-      if (graphEpoch() !== batchRev) return;
+      if (graphEpoch() !== batchRev || pageInventoryRev() !== batchInventoryRev) return;
       const alive = new Set(existing);
       // Only re-render when the batch actually found a MISSING page. A graph
       // whose links all resolve — the overwhelming majority — leaves the signal

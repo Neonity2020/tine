@@ -3503,6 +3503,10 @@ export function splitBlock(
     const emptyId = freshId();
     setDoc(
       produce((s) => {
+        // At offset zero the original block is untouched. At a later line
+        // boundary, however, the blank prefix and its separator become the new
+        // empty block, so the original must retain only the post-boundary text.
+        if (offset > 0) s.byId[id].raw = joinProps(after, hidden, fmt);
         s.byId[emptyId] = {
           id: emptyId,
           raw: orderedEmpty,

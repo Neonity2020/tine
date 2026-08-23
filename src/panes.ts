@@ -84,6 +84,10 @@ const [focusedPaneIdAccessor, writeFocusedPaneId] = createSignal("main");
 export const focusedPaneId = focusedPaneIdAccessor;
 
 export function setFocusedPaneId(paneId: string) {
+  // Every focus route, including history/session adapters, must reveal the pane
+  // it focuses. Keeping this at the state boundary prevents a hidden pane from
+  // becoming the logical target while another pane remains maximized.
+  if (maximizedPaneId() && maximizedPaneId() !== paneId) setMaximizedPaneId(null);
   if (focusedPaneId() !== paneId) {
     clearSelection();
     setCellSel(null);
@@ -350,8 +354,6 @@ export function closePane(paneId = focusedPaneId()): boolean {
 
 export function focusPane(paneId: string) {
   if (!layoutPaneIds().includes(paneId) || focusedPaneId() === paneId) return;
-  // Focusing a pane that maximize currently hides must reveal it (GH #285).
-  if (maximizedPaneId() && maximizedPaneId() !== paneId) setMaximizedPaneId(null);
   setFocusedPaneId(paneId);
   paneRouter(paneId).activateCurrentRoute();
 }

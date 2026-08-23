@@ -47,6 +47,7 @@ import {
   activatePrevTab,
   openPage,
   route,
+  sameRoute,
 } from "./router";
 import {
   undo,
@@ -172,8 +173,10 @@ function focusPaneInDirection(dir: PaneDirection) {
 // default) — the user-visible outcome, not a dead key.
 export function goHome() {
   const root = graphMeta()?.root;
-  void openConfiguredHomePage(root ?? "").then((navigated) => {
-    if (!navigated) openJournals();
+  const startingRoute = { ...route() };
+  const isCurrent = () => graphMeta()?.root === root && sameRoute(route(), startingRoute);
+  void openConfiguredHomePage(root ?? "", isCurrent).then((navigated) => {
+    if (!navigated && isCurrent()) openJournals();
   });
 }
 

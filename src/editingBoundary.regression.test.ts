@@ -235,6 +235,30 @@ describe("splitBlock at an in-block line boundary (GH #361)", () => {
     expect(doc.byId.b.raw).toBe("line1\nline2");
   });
 
+  it("consumes a blank prefix when the boundary is after the first newline", () => {
+    setDoc({
+      byId: { b: node("b", "\nline2", "M") },
+      pages: [page("M", ["b"])], feed: ["M"], loaded: true,
+    });
+    splitBlock("b", 1);
+    expect(doc.pages[0].roots).toHaveLength(2);
+    const emptyId = doc.pages[0].roots[0];
+    expect(emptyId).not.toBe("b");
+    expect(doc.byId[emptyId].raw).toBe("");
+    expect(doc.byId.b.raw).toBe("line2");
+  });
+
+  it("preserves hidden properties while consuming a whitespace-only prefix", () => {
+    setDoc({
+      byId: { b: node("b", "  \nline2\nid:: durable", "M") },
+      pages: [page("M", ["b"])], feed: ["M"], loaded: true,
+    });
+    splitBlock("b", 3);
+    expect(doc.pages[0].roots).toHaveLength(2);
+    expect(doc.byId[doc.pages[0].roots[0]].raw).toBe("");
+    expect(doc.byId.b.raw).toBe("line2\nid:: durable");
+  });
+
   it("behaves identically in Org pages", () => {
     setDoc({
       byId: { b: node("b", "line1\nline2", "Org") },

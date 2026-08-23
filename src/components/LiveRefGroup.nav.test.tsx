@@ -155,6 +155,21 @@ describe("arrow navigation inside ref/query/embed groups (GH #341)", () => {
     dispose();
   });
 
+  it("does not bind a structural destination to a result-only surface", async () => {
+    mockFiveCharacterVisualRows();
+    const { editor, dispose } = await mountAndEdit("rootB");
+    editor.setSelectionRange(2, 2);
+    editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await settle();
+
+    // Arrow destinations belong to this rendered list. A split destination is
+    // source-outline structure and may no longer be a result, so it must not be
+    // constrained to the ref surface where no matching editor may mount.
+    expect(editingId()).not.toBe("rootB");
+    expect(editingSurface()).toBeNull();
+    dispose();
+  });
+
   it("Backspace at the start of a first display root does not merge into the rendered neighbor", async () => {
     mockFiveCharacterVisualRows();
     const { root, editor, dispose } = await mountAndEdit("rootB");

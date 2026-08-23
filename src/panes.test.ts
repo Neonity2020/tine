@@ -16,6 +16,7 @@ import {
   visibleLayoutNode,
   paneRouter,
   resetPaneLayoutToSingle,
+  setFocusedPaneId,
   setSplitRatio,
   splitLayoutNode,
   splitPane,
@@ -559,6 +560,20 @@ describe("pane maximize (GH #285)", () => {
     focusPane(right);
 
     expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual(layoutRoot());
+    expect(focusedPaneId()).toBe(right);
+  });
+
+  it("restores the full layout through the shared focus-state boundary", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+    togglePaneMaximize("main");
+
+    // Session/history adapters use this lower-level boundary directly.
+    setFocusedPaneId(right);
+
+    expect(maximizedPaneId()).toBeNull();
     expect(visibleLayoutNode()).toEqual(layoutRoot());
     expect(focusedPaneId()).toBe(right);
   });
