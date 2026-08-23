@@ -7184,6 +7184,34 @@
         "failBefore": "proven"
       },
       "notes": "GH #288. The row's single onMouseDown handler now routes left-click modifiers exactly like the Enter-key ladder the switcher already had: Ctrl/Cmd+click is the middle-click action (openInBackground/origin pane/switcher stays open) expressible without a middle mouse button, Alt+click = chooseOther, Shift+click = chooseSidebar for page|block; create/command rows fall through to choose/chooseOther — the same 'safe existing actions' Enter/Alt+Enter give them. Embryo-mode gating mirrors the keyboard (Alt/Shift disabled; middle/Ctrl background fan deliberately kept as it already was). PRIMARY-selection paste is swallowed only for real middle clicks; Ctrl/Cmd+click is button 0 and triggers no PRIMARY paste. Ordinary left-click, Enter, and the existing keyboard equivalents are pinned by tests in the same file (5 pre-existing-behavior tests stayed green on HEAD). jsdom render-level evidence via solid-js/web events; focus preservation verified via preventDefault + activeElement assertions; native browser confirmation of the click matrix remains a manager smoke item."
+    },
+    {
+      "id": "UI-REFFILTER-INCLUDE-OR-273",
+      "title": "Linked References include chips union (OR): a backlink survives when ANY included page/tag facet is present; exclude chips remain cumulative, zero positive chips leave results unconstrained, and the text filter stays conjunctive with the facet result",
+      "family": "linked-references",
+      "sources": {
+        "issues": [
+          273
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/LinkedReferences.test.tsx::Linked References include chips OR (GH #273)::union-matches any included page/tag instead of requiring all of them",
+          "src/components/LinkedReferences.test.tsx::Linked References include chips OR (GH #273)::keeps exclude chips cumulative over the included union",
+          "src/components/LinkedReferences.test.tsx::Linked References include chips OR (GH #273)::treats zero positive chips as unconstrained, as before",
+          "src/components/LinkedReferences.test.tsx::Linked References include chips OR (GH #273)::folds case when matching included names",
+          "src/components/LinkedReferences.test.tsx::Linked References include chips OR (GH #273)::keeps the text filter conjunctive with the included union"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #273: the reporter filtered a Linked References view by two positive chips and got zero rows because includes ANDed (ins.every). Includes now OR (ins.some, with the zero-include case still vacuous), excludes stay cumulative (outs.every), and content matching stays conjunctive. One-line predicate change inside LinkedReferences.tsx shown(); facet matching already normalizes case via norm() on both sides (pinned by a case-fold test). The cycle include→exclude→off chip UX, per-page persisted filter state, counts, load-more/evidence tracking, and the 'N of M references' summary are unchanged; no copy claimed AND anywhere. jsdom render-level evidence with mocked getBacklinks/getBacklinkFilterContext; the two genuinely behavior-changing tests fail on HEAD, the three companions pin unchanged semantics."
     }
   ]
 }
