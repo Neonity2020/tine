@@ -6922,6 +6922,30 @@
         "failBefore": "proven"
       },
       "notes": "GH #340: a short title sized the tab near its 112px minimum but the close control sat directly after the text instead of at the tab's right edge, inviting accidental closes, and hovering it showed the inherited tab tooltip ('Double-click to pin (sticky)') instead of anything about closing. Both were layout/semantics only: the title now absorbs the tab's free space (flex: 1 1 auto with min-width: 0, so long titles still ellipsize) and the control is a real <button type=button> with an explicit title/aria-label 'Close tab'. Pointer-drag exemption, middle-click close, pinning and the last-tab guard are unchanged, and keyboard focus reveals the ✕ like hover does. jsdom cannot see the layout half, so that half was verified numerically in headless Chromium (closeRight == tabRight - 10px padding, titleRight == closeLeft - 6px gap, on both the Journals tab and a short-titled 'Tine' tab); screenshot eyeballing was unavailable in this worker session (no image input)."
+    },
+    {
+      "id": "UI-MAIN-CONTENT-FOCUS-FRAME-345",
+      "title": "Clicking empty main content then pressing a key paints no default focus frame around the page, while the deliberate pane-select ring survives",
+      "family": "keyboard-focus",
+      "sources": {
+        "issues": [
+          345
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/styles/mainContentFocus.test.ts::main-content default focus frame (GH #345)"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #345: the pane scroller `<main class=main-content tabindex=-1>` is a programmatic scroll/focus target; a click on empty page space focuses it, and the next keypress flips the UA's focus-visible heuristic so the browser paints its default frame (white on Windows WebView2/WebKitGTK) around the whole content area. Reproduced literally in headless Chromium pre-fix: click -> matchesFocus true, focusVisible false, outlineStyle none; keypress -> focusVisible true, outlineStyle auto 1px. Post-fix the same run leaves focus semantics intact (still focusable, still :matches(:focus-visible)) with outlineStyle none. The suppression is `.main-content:focus { outline: none }` only: the deliberate pane-select ring (`.pane-selected`, separate elements) is pinned by the style contract test, and actionable controls keep their own :focus-visible cues. The reporter's second repro (leaving pane-select with Esc after clicking the content) is the same focused-scroller mechanism and is covered by the same rule."
     }
   ]
 }

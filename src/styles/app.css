@@ -850,6 +850,17 @@ textarea {
   overflow-y: auto;
 }
 
+/* The pane scroller is tabindex="-1" purely as a programmatic focus target
+   (keybindings, scroll APIs); it is not an actionable control. A click on
+   empty space focuses it, and the next keypress flips the UA's focus-visible
+   heuristic, painting the default white focus frame around the whole content
+   area (GH #345). Only the UA-default frame is suppressed here: the deliberate
+   `.pane-selected` select ring and every actionable control's `:focus-visible`
+   cue live on other elements/rules and are unaffected. */
+.main-content:focus {
+  outline: none;
+}
+
 /* Solo-pane shell: a non-scrolling, positioned wrapper so the pane-select
    overlays (edge segment, tab-split preview) don't scroll with the content.
    Takes the flex slot .main-content used to occupy in .content-row. */

@@ -19,6 +19,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Tab close buttons always sit at the tab's right edge** (GH #340). With short titles the ✕ no longer drifts to just after the text — it stays pinned rightmost at any tab width — and it is now a real keyboard-focusable button with its own "Close tab" tooltip instead of showing the tab's "Double-click to pin" hint.
 
+- **No more white frame around the page after clicking empty space and pressing a key** (GH #345). Clicking an empty spot of the main content focused the page scroller, and the next keypress flipped the browser's focus heuristic, painting its default white frame around the whole content area. Only that default frame is suppressed — the pane-select ring and the usual focus cues on buttons and other controls are unchanged.
+
 ## [0.6.94] - 2026-08-22
 
 ### Added
