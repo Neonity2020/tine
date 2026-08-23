@@ -4520,7 +4520,7 @@
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs::tests::consecutive_foreground_saves_drain_without_rejecting_accepted_batches",
-          "crates/tine-core/src/sync_runtime.rs::tests::foreground_source_save_then_cross_page_move_drains_one_accepted_prefix",
+          "crates/tine-core/src/sync_runtime.rs::tests::foreground_source_and_destination_saves_then_cross_page_move_drain_causally",
           "crates/tine-core/src/sync_runtime.rs::tests::repeated_root_reorders_then_cross_page_move_drain_causally"
         ],
         "scenario": "managed.journal-reorder-reorder-cross-day-drain-shutdown",

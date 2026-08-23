@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.95] - 2026-08-23
+
 ### Added
 
 - **The iOS beta can use a TineOutline-owned graph in iCloud Drive.** The native folder picker recommends `iCloud Drive → TineOutline` when iCloud is available and also accepts `On My iPhone/iPad → TineOutline`, while clearly refusing arbitrary third-party Files providers. Before Rust opens the selected graph, the iOS bridge requests any ubiquitous files that are not yet local. Signed TestFlight builds install and verify the exact iCloud Documents entitlements in both the provisioning profile and app signature.
