@@ -45,6 +45,41 @@ export const [layoutRoot, setLayoutRoot] = createSignal<LayoutNode>({
   kind: "pane",
   paneId: "main",
 });
+
+// Transient maximize state (GH #285): the maximized pane borrows the whole
+// pane area while layoutRoot() keeps the complete split tree and its ratios,
+// so toggling back restores the exact arrangement and session/workspace
+// persistence never sees a maximized-looking layout.
+const [maximizedPaneId, setMaximizedPaneId] = createSignal<string | null>(null);
+export { maximizedPaneId };
+
+/**
+ * The subtree to render in the pane area: only the maximized leaf, falling
+ * back to the real tree when nothing (valid) is maximized.
+ */
+export function visibleLayoutNode(): LayoutNode {
+  const id = maximizedPaneId();
+  return id && layoutPaneIds().includes(id) ? { kind: "pane", paneId: id } : layoutRoot();
+}
+
+export function togglePaneMaximize(paneId = focusedPaneId()): boolean {
+  if (maximizedPaneId() === paneId) {
+    setMaximizedPaneId(null);
+    return true;
+  }
+  if (!layoutHasMultiplePanes() || !layoutPaneIds().includes(paneId)) return false;
+  setMaximizedPaneId(paneId);
+  return true;
+}
+
+// Single mutation choke point: a layout change that drops the maximized pane
+// clears the transient state instead of maximizing a stale id.
+function commitLayout(node: LayoutNode) {
+  const id = maximizedPaneId();
+  if (id && !layoutPaneIds(node).includes(id)) setMaximizedPaneId(null);
+  setLayoutRoot(node);
+}
+
 const [focusedPaneIdAccessor, writeFocusedPaneId] = createSignal("main");
 export const focusedPaneId = focusedPaneIdAccessor;
 
@@ -226,7 +261,7 @@ export function splitPane(
   const source = paneRouter(paneId);
   const router = paneRouter(newPaneId);
   router.restoreSnapshot(opts.snapshot ?? splitSnapshotForNewPane(source));
-  setLayoutRoot(splitLayoutNodeAt(layoutRoot(), paneId, dir, newPaneId, opts.position ?? "after"));
+  commitLayout(splitLayoutNodeAt(layoutRoot(), paneId, dir, newPaneId, opts.position ?? "after"));
   if (opts.focusNew !== false) focusPane(newPaneId);
   focusedRouter().scheduleSessionSave();
   return newPaneId;
@@ -286,7 +321,7 @@ export function splitRootAtEdge(
   const newLeaf: LayoutNode = { kind: "pane", paneId: newPaneId };
   const dir = side === "left" || side === "right" ? "row" : "col";
   const newFirst = side === "left" || side === "top";
-  setLayoutRoot({
+  commitLayout({
     kind: "split",
     dir,
     ratio: 0.5,
@@ -302,7 +337,7 @@ export function closePane(paneId = focusedPaneId()): boolean {
   const closingFocusedPane = focusedPaneId() === paneId;
   const res = closeLayoutPane(layoutRoot(), paneId);
   if (!res.closed) return false;
-  setLayoutRoot(res.node);
+  commitLayout(res.node);
   if (paneId !== "main") routers.delete(paneId);
   // Closing a background pane must not manufacture a foreground visit. When
   // the focused pane closes, however, its sibling becomes the page the user is
@@ -315,6 +350,8 @@ export function closePane(paneId = focusedPaneId()): boolean {
 
 export function focusPane(paneId: string) {
   if (!layoutPaneIds().includes(paneId) || focusedPaneId() === paneId) return;
+  // Focusing a pane that maximize currently hides must reveal it (GH #285).
+  if (maximizedPaneId() && maximizedPaneId() !== paneId) setMaximizedPaneId(null);
   setFocusedPaneId(paneId);
   paneRouter(paneId).activateCurrentRoute();
 }
@@ -447,7 +484,7 @@ export function setSplitRatio(path: number[], ratio: number) {
         : [node.children[0], update(node.children[1], depth + 1)],
     };
   };
-  setLayoutRoot(update(layoutRoot(), 0));
+  commitLayout(update(layoutRoot(), 0));
   focusedRouter().scheduleSessionSave();
 }
 
@@ -476,6 +513,7 @@ export function openRouteInOtherPane(route: Route, sourcePaneId = focusedPaneId(
 }
 
 export function resetPaneLayoutToSingle(snapshot?: PaneSnapshot) {
+  setMaximizedPaneId(null);
   setLayoutRoot({ kind: "pane", paneId: "main" });
   if (snapshot) mainRouter().restoreSnapshot(snapshot);
   for (const id of [...routers.keys()]) {
@@ -495,7 +533,7 @@ export function restorePaneLayout(
     if (snap) paneRouter(id).restoreSnapshot(snap);
     else paneRouter(id);
   }
-  setLayoutRoot(root);
+  commitLayout(root);
   for (const id of [...routers.keys()]) {
     if (id !== "main" && !ids.includes(id)) routers.delete(id);
   }

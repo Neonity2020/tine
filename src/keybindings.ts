@@ -82,6 +82,7 @@ import {
   moveActiveTabInDirection,
   paneRouter,
   splitPane,
+  togglePaneMaximize,
   splitPaneAtSeam,
   splitRootAtEdge,
 } from "./panes";
@@ -325,6 +326,9 @@ const COMMANDS: CommandDef[] = [
   { id: "pane/move-tab-right", binding: "mod+alt+shift+right", label: "Move tab to pane right", scope: "global", run: () => moveActiveTab("right"), global: true },
   { id: "pane/move-tab-up", binding: "mod+alt+shift+up", label: "Move tab to pane up", scope: "global", run: () => moveActiveTab("up"), global: true },
   { id: "pane/move-tab-down", binding: "mod+alt+shift+down", label: "Move tab to pane down", scope: "global", run: () => moveActiveTab("down"), global: true },
+  // GH #285: transient maximize — the pane borrows the whole pane area without
+  // touching the split tree/ratios, so toggling restores the exact layout.
+  { id: "pane/toggle-maximize", binding: "mod+alt+m", label: "Toggle maximize active pane", scope: "global", run: () => { togglePaneMaximize(); }, global: true },
   { id: "ui/toggle-theme", binding: "t t", label: "Toggle dark / light", scope: "global", run: toggleTheme },
   { id: "ui/toggle-brackets", binding: "mod+c mod+b", label: "Toggle reference brackets", scope: "global", run: () => changeShowBrackets(!showBrackets()), global: true },
   { id: "ui/toggle-left-sidebar", binding: "t l", label: "Toggle left sidebar", scope: "global", run: toggleSidebar },

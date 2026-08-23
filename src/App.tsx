@@ -141,6 +141,7 @@ import {
   paneRouter,
   layoutPaneIds,
   setSplitRatio,
+  visibleLayoutNode,
   type LayoutNode,
 } from "./panes";
 import { paneSel, samePaneTarget } from "./paneSelect";
@@ -1552,7 +1553,7 @@ export function App(): JSX.Element {
           <DrawerBackground class="drawer-workspace" blockedBy="right">
           <PaneEdgeHighlights />
           <PaneSelectHint />
-          <PaneTree node={layoutRoot()} path={[]} />
+          <PaneTree node={visibleLayoutNode()} path={[]} />
           <Show when={pdfTarget()}>
         <div
           class="pdf-pane"

@@ -7,9 +7,12 @@ import {
   layoutPaneIds,
   layoutRoot,
   focusedPaneId,
+  maximizedPaneId,
   moveActiveTabInDirection,
   moveActiveTabToPane,
   moveTabToSplitPane,
+  togglePaneMaximize,
+  visibleLayoutNode,
   paneRouter,
   resetPaneLayoutToSingle,
   splitLayoutNode,
@@ -449,6 +452,113 @@ describe("moveActiveTabInDirection (GH #282)", () => {
     expect(moveActiveTabInDirection("main", "right")).toBe(null);
     expect(layoutPaneIds(layoutRoot())).toEqual(["main", right]);
     expect(paneRouter("main").route()).toEqual({ kind: "journals" });
+  });
+});
+
+describe("pane maximize (GH #285)", () => {
+  it("is a no-op on a single-pane window", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+
+    expect(togglePaneMaximize("main")).toBe(false);
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+  });
+
+  it("shows only the maximized pane while keeping the real tree and ratios untouched", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+    const treeBefore = layoutRoot();
+
+    expect(togglePaneMaximize("main")).toBe(true);
+
+    expect(maximizedPaneId()).toBe("main");
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+    // Session/workspace persistence reads layoutRoot(): the full tree (with
+    // its ratio) survives maximization, so nothing transient is serialized.
+    expect(layoutRoot()).toEqual(treeBefore);
+    expect(layoutRoot()).toEqual({
+      kind: "split",
+      dir: "row",
+      ratio: 0.5,
+      children: [
+        { kind: "pane", paneId: "main" },
+        { kind: "pane", paneId: right },
+      ],
+    });
+
+    expect(togglePaneMaximize("main")).toBe(true);
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual(treeBefore);
+  });
+
+  it("keeps mutations made while maximized, restoring the evolved tree exactly", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row", { focusNew: false })!;
+    togglePaneMaximize("main");
+
+    const below = splitPane(right, "col", { focusNew: false })!;
+
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+    expect(togglePaneMaximize("main")).toBe(true);
+    expect(visibleLayoutNode()).toEqual({
+      kind: "split",
+      dir: "row",
+      ratio: 0.5,
+      children: [
+        { kind: "pane", paneId: "main" },
+        {
+          kind: "split",
+          dir: "col",
+          ratio: 0.5,
+          children: [
+            { kind: "pane", paneId: right },
+            { kind: "pane", paneId: below },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("clears when the maximized pane disappears, showing the surviving tree", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    togglePaneMaximize("main");
+
+    expect(closePane("main")).toBe(true);
+
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: right });
+    expect(layoutRoot()).toEqual({ kind: "pane", paneId: right });
+  });
+
+  it("stays engaged when a sibling pane closes, and collapses gracefully to one pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+    togglePaneMaximize("main");
+
+    expect(closePane(right)).toBe(true);
+
+    // Only the maximized pane is left; the visible surface is still just it.
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+    // Toggling again from this degenerate state still unmaximizes cleanly.
+    expect(togglePaneMaximize("main")).toBe(true);
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual({ kind: "pane", paneId: "main" });
+  });
+
+  it("restores the full layout when focus escapes to another pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const right = splitPane("main", "row")!;
+    focusPane("main");
+    togglePaneMaximize("main");
+
+    focusPane(right);
+
+    expect(maximizedPaneId()).toBe(null);
+    expect(visibleLayoutNode()).toEqual(layoutRoot());
+    expect(focusedPaneId()).toBe(right);
   });
 });
 

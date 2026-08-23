@@ -7102,6 +7102,33 @@
         "failBefore": "proven"
       },
       "notes": "GH #282 (VS Code-style 'Move Tab to pane {dir}' spawning the missing group). Previously the command no-op'ed whenever no pane lay in the direction — including the reporter's one-pane starting case, which needs it most. The new panes.ts moveActiveTabInDirection keeps the existing definite-move path when a neighbor exists (including the deliberate refusal to move a feed pane's lone journals tab), and otherwise splits the source in the requested direction: a multi-tab source donates only its active tab (moveTabToSplitPane), while a one-tab source — which Tine cannot empty — gets the same plain mirror split as pane-select Enter (splitSnapshotForNewPane semantics, including the journals-duplicate redirect to a selected feed day). New pane is focused, session save stays on the existing scheduleSessionSave boundary, and the mod+alt+shift+arrow bindings now call the shared function without the old layoutHasMultiplePanes() gate. Verified in vitest (7 new pane-layout cases across all four directions, one-tab/multi-tab/journals states, and the row-layout other-axis split); unit level only — not yet exercised in a native WebKit session."
+    },
+    {
+      "id": "UI-PANE-MAXIMIZE-285",
+      "title": "Toggle maximize active pane lends the focused pane the whole pane area transiently, restores the exact split tree and ratios on toggle, and falls back safely when the maximized pane closes or focus moves elsewhere",
+      "family": "tabs",
+      "sources": {
+        "issues": [
+          285
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/panes.test.ts::pane maximize (GH #285)::shows only the maximized pane while keeping the real tree and ratios untouched",
+          "src/panes.test.ts::pane maximize (GH #285)::keeps mutations made while maximized, restoring the evolved tree exactly",
+          "src/panes.test.ts::pane maximize (GH #285)::clears when the maximized pane disappears, showing the surviving tree",
+          "src/panes.test.ts::pane maximize (GH #285)::restores the full layout when focus escapes to another pane"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #285 minimal accepted design only: one remappable global command 'Toggle maximize active pane' (pane/toggle-maximize, default mod+alt+m, command-palette discoverable). Implementation is a pure view derivation, not a layout mutation: a transient maximizedPaneId signal makes visibleLayoutNode() return the single maximized leaf for the pane area (App.tsx PaneTree), while layoutRoot() — the input to session/workspace persistence — keeps the complete split tree and ratios, so nothing transient is serialized and toggling restores the exact arrangement including mutations made meanwhile. Safety: a single commitLayout() choke point clears the state when the maximized pane disappears from the tree; focusing another pane unmaximizes first so hidden panes are never focused invisibly; toggle is a no-op on a single-pane window; resetPaneLayoutToSingle clears it; split-tree mutations made while maximized remain and are restored on toggle. Deliberately out of scope per batch spec: hidden-pane stacks, per-pane 1-9 commands, a persistent chrome button (no obvious low-clutter home while maximized), and pane-select overlay rescaling while maximized. Sidebars/right sidebar/PDF pane are outside the pane area and unaffected. vitest-only evidence (6 cases); not yet exercised in a native session."
     }
   ]
 }
