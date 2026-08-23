@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Logseq navigation hotstrings `gh`, `gn`, `gp`** (GH #276). `g h` opens the graph's configured home page (falling back to the journals landing when none is set — Logseq's default home), `g n` / `g p` open the next and previous journal day relative to the journal you're in (or relative to today anywhere else), in the graph's configured journal title format. All three are remappable.
+
 - **Sheets now render in the HTML export and print output for any graph.** Until now, publishing a page holding a Tine Sheet emitted only the sheet's plain-bullet twin plus the visible `tine.*` view configuration, so the presentation — columns, grouping, computed cells — disappeared. Block-powered sheets now publish as meaningful read-only views: tables with their title/declared/formula/observed columns, typed checkbox cells, aggregate footers, and arithmetic formula columns; boards grouped by state, priority, tags, or fields, including query-backed boards; and grids with their positional cells, header rows, and nested grids. Numbered list blocks (`logseq.order-list-type:: number`) keep their ordinal markers, and blocks with LOGBOOK clock rows keep an elapsed-time badge while the drawer stays hidden. This applies to both whole-graph publishing and single-page print/PDF export.
 
 ### Changed

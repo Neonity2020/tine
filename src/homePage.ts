@@ -26,14 +26,17 @@ export async function setHomePageSetting(root: string, name: string | null): Pro
 
 /** Navigate the primary tab to the graph's configured home page. Falling back
  *  to the ordinary landing is silent: nothing is created, no toast, no retry —
- *  a deleted/renamed page just means the normal landing stays (GH #245). */
+ *  a deleted/renamed page just means the normal landing stays (GH #245).
+ *  Resolves true when it actually navigated, so callers (e.g. the `gh`
+ *  hotstring) can fall through to their own landing otherwise. */
 export async function openConfiguredHomePage(
   root: string,
   isCurrent: () => boolean = () => true,
-): Promise<void> {
+): Promise<boolean> {
   const name = (await getHomePageSetting(root)).trim();
-  if (!name || !isCurrent()) return;
+  if (!name || !isCurrent()) return false;
   const dto = await backend().getPage(name, "page").catch(() => null);
-  if (!dto || !isCurrent()) return;
+  if (!dto || !isCurrent()) return false;
   openPage(dto.name, "page", { inPlace: true });
+  return true;
 }

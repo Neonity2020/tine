@@ -7316,6 +7316,35 @@
         "failBefore": "proven"
       },
       "notes": "GH #358: shift-clicking a collapsed block's bullet parked it in the right sidebar but the body rendered through the plain durable collapse flag, so its children stayed hidden unless the user first expanded the block in the main page. The sidebar block body now reuses the zoomed view's exact outline-scope contract — OutlineScopeContext { roots: [id], forceExpandedRoot: id } plus Block's forceExpanded prop (both already proven by the main zoomed view in Page.tsx) — so the parked block is the root of its view and its children always render; descendant blocks keep their own collapse states (pinned in the same test), and nothing about the source outline's durable flags is mutated. The side effect of the scope is root-local arrow navigation within the sidebar item, consistent with 'root of that view' semantics. Platform note: reported on Windows/Direct files; the collapse contract is platform-independent frontend state (no Windows run in this lane). jsdom render-level evidence; not yet exercised natively (E2E skipped at Martin's instruction)."
+    },
+    {
+      "id": "UI-JOURNAL-HOTSTRINGS-276",
+      "title": "gh opens the configured graph home page (falling back to the journals landing when unset or unresolved), gn/gp open the next/previous calendar journal day relative to the current journal (or today elsewhere) in the graph's configured title format, with month/year/leap-day boundaries correct",
+      "family": "journals",
+      "sources": {
+        "issues": [
+          276
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/keybindings.goJournal.test.ts::goAdjacentJournal (GH #276 gn/gp)::crosses month and year boundaries by calendar day, not epoch arithmetic",
+          "src/keybindings.goJournal.test.ts::goAdjacentJournal (GH #276 gn/gp)::handles leap day in both directions",
+          "src/keybindings.goJournal.test.ts::goAdjacentJournal (GH #276 gn/gp)::anchors at today when invoked outside a journal",
+          "src/keybindings.goJournal.test.ts::goAdjacentJournal (GH #276 gn/gp)::uses the graph's configured journal title format for both parsing and emitting",
+          "src/keybindings.goJournal.test.ts::goHome (GH #276 gh)::opens the configured graph home page through the existing resolver",
+          "src/keybindings.goJournal.test.ts::goHome (GH #276 gh)::falls back to the journals landing when no home page is configured"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #276: only `g j` existed from Logseq's default home/journal hotstrings. Added `g h` go/home, `g n` go/journal-next, `g p` go/journal-prev as remappable global commands. gh reuses the existing graph home-page resolver (homePage.ts), which now reports whether it navigated (was void; graph.ts caller unaffected) so unconfigured-or-stale homes fall through to the journals landing — OG's default home, and a live outcome instead of a dead key; manager should verify the default-home=journals claim against OG source (I could not in this lane). gn/gp anchor at the current journal route's date via the SHARED parsejournalTitle parser (no second parser), step ±1 calendar day through the local Y/M/D Date constructor (correct across month, year, and leap-day edges — never millisecond arithmetic), and open via the same openPage(journalTitle(date), 'journal') route CalendarJump uses, honoring the graph's configured :journal/page-title-format in both directions. Anchoring outside a journal (ordinary pages, the journals feed, query views) uses today. Unit-level route assertions with mocked backend and fake timers."
     }
   ]
 }

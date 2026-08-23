@@ -28,12 +28,15 @@ import {
   pushToast,
   openPdfExport,
   pdfTarget,
+  graphMeta,
   dismissMobileDrawer,
 } from "./ui";
 import { restoreDrawerFocus } from "./mobileDrawers";
 import { followLinkUnderCaret, openLinkUnderCaretInSidebar } from "./followLink";
 import { dismissTopTransient } from "./transientLayers";
 import { carryDaysBack } from "./carry";
+import { openConfiguredHomePage } from "./homePage";
+import { journalTitle, parseJournalTitle } from "./journal";
 import {
   openJournals,
   goBack,
@@ -42,6 +45,7 @@ import {
   reopenClosedTab,
   activateNextTab,
   activatePrevTab,
+  openPage,
   route,
 } from "./router";
 import {
@@ -160,6 +164,31 @@ function focusPaneInDirection(dir: PaneDirection) {
   if (!layoutHasMultiplePanes()) return;
   const target = nearestPaneInDirection(layoutRoot(), focusedPaneId(), dir);
   if (target) focusPane(target);
+}
+
+// GH #276: the remaining Logseq journal/navigation hotstrings beside `g j`.
+// gh reuses the graph home-page resolver; when no home is configured or the
+// configured page no longer resolves, the journals landing is home (OG's
+// default) — the user-visible outcome, not a dead key.
+export function goHome() {
+  const root = graphMeta()?.root;
+  void openConfiguredHomePage(root ?? "").then((navigated) => {
+    if (!navigated) openJournals();
+  });
+}
+
+// gn/gp step calendar DAYS (local Y/M/D constructor, so month/year/leap-day
+// edges land correctly), never millisecond arithmetic. Inside a journal the
+// anchor is that journal's date via the shared title parser; anywhere else it
+// is today, per OG.
+export function goAdjacentJournal(dir: 1 | -1) {
+  const r = route();
+  const anchor =
+    r.kind === "page" && r.pageKind === "journal"
+      ? parseJournalTitle(r.name) ?? new Date()
+      : new Date();
+  const target = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + dir);
+  openPage(journalTitle(target), "journal");
 }
 
 // With no pane in the requested direction, the panes.ts implementation grows
@@ -289,6 +318,10 @@ const COMMANDS: CommandDef[] = [
   // mod-chord, so it fires even while editing; remap it in Settings if you like.
   { id: "ui/toggle-devtools", binding: "mod+shift+j", label: "Toggle developer tools", scope: "global", run: openDevtools, global: true },
   { id: "go/journals", binding: "g j", label: "Go to journals", scope: "global", run: openJournals },
+  // GH #276: Logseq's remaining default navigation hotstrings.
+  { id: "go/home", binding: "g h", label: "Go to home page", scope: "global", run: goHome },
+  { id: "go/journal-next", binding: "g n", label: "Go to next journal day", scope: "global", run: () => goAdjacentJournal(1) },
+  { id: "go/journal-prev", binding: "g p", label: "Go to previous journal day", scope: "global", run: () => goAdjacentJournal(-1) },
   { id: "go/keyboard-shortcuts", binding: "g s", label: "Go to keyboard shortcuts", scope: "global", run: () => openSettings("shortcuts") },
   // Browser-style history nav (per-tab back/forward). Special-cased in the
   // dispatcher so they fire even while editing a block; remappable like any other.
