@@ -7292,6 +7292,30 @@
         "failBefore": "proven"
       },
       "notes": "GH #355: pageExistsBatch cached each name's existence FOR THE WHOLE GRAPH SESSION (invalidated only on graphEpoch change), so a page created after [[refs]] already rendered kept them styled as missing until restart. The cache now keys on (graphEpoch × pageInventoryRev): every physical inventory transition already bumps pageInventoryRev (baseline-null saves creating pages, deletePage, external watcher adds/removes incl. sync tools, guide installs, conflict merges), so both directions restyle immediately — missing→existing on creation and never a stale positive after deletion. Batching semantics are unchanged: one tick = one IPC, request order preserved, each name asked at most once per (graph × inventory) state, and 'unknown means alive' still guards first paint. Layer is the logic seam with a mocked backend/ui; the style consumers (link dimming) were not the defect and are untouched. Reported on Windows/Direct-files — the cache is platform-independent frontend state; stated plainly because no Windows run is possible in this lane."
+    },
+    {
+      "id": "UI-SIDEBAR-COLLAPSED-ROOT-358",
+      "title": "A block opened/parked in the right sidebar is the root of that view: its children render regardless of the source outline's collapsed flag, while descendant collapse states stay respected",
+      "family": "right-sidebar",
+      "sources": {
+        "issues": [
+          358
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/RightSidebar.test.tsx::right sidebar collapsed-source block (GH #358)::renders the parked block's children despite its collapsed source state"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #358: shift-clicking a collapsed block's bullet parked it in the right sidebar but the body rendered through the plain durable collapse flag, so its children stayed hidden unless the user first expanded the block in the main page. The sidebar block body now reuses the zoomed view's exact outline-scope contract — OutlineScopeContext { roots: [id], forceExpandedRoot: id } plus Block's forceExpanded prop (both already proven by the main zoomed view in Page.tsx) — so the parked block is the root of its view and its children always render; descendant blocks keep their own collapse states (pinned in the same test), and nothing about the source outline's durable flags is mutated. The side effect of the scope is root-local arrow navigation within the sidebar item, consistent with 'root of that view' semantics. Platform note: reported on Windows/Direct files; the collapse contract is platform-independent frontend state (no Windows run in this lane). jsdom render-level evidence; not yet exercised natively (E2E skipped at Martin's instruction)."
     }
   ]
 }

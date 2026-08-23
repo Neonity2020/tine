@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **The public website "Demo" is now the Guide**, at `https://tine.page/guide/`: the read-only tour of workflows, reference pages, and rendered examples published by Tine's own HTML export, no longer described as a live or editable demo. Old `https://tine.page/demo/` links redirect there; the in-app Guide and the onboarding demo graph are unchanged.
 ### Fixed
 
+- **Blocks opened in the right sidebar always show their children** (GH #358). Shift-clicking the bullet of a collapsed block parked it in the sidebar but hid its child content until you first expanded it in the main page. The sidebar now treats the opened block as the root of its own view, exactly like zooming in the main page — children always render, and deeper collapsed blocks stay collapsed as expected.
+
 - **Page-reference styling updates as soon as a referenced page gains content** (GH #355). A `[[Page]]` link could stay in the "missing page" style after its target was created later in the same session, refreshing only on restart. The existence answers now invalidate whenever the graph's page inventory changes, so links restyle immediately — both when a page appears and when one is deleted.
 
 - **Block reference locations can be collapsed to a compact overview** (GH #344). The expanded view you get from a block's reference-count badge now offers Collapse all / Expand all: collapsed groups show only their source page title (click any to re-expand to its breadcrumb and referenced block), making heavily referenced blocks easy to scan. The state is local to that view — the page-level Linked References section keeps its own.
