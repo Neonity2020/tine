@@ -82,7 +82,8 @@ use crate::oplog::local_journal_drain::{
 use crate::oplog::local_journal_drain::{
     resume_clean_managed_local_journal_drain, ManagedLocalDerivativeAuthority,
     ManagedLocalDerivativePublisher, ManagedLocalDrainCheckpoint, ManagedLocalDrainContinuation,
-    ManagedLocalDrainOutcome, ManagedLocalPublicationState,
+    ManagedLocalDrainOutcome, ManagedLocalPublicationState, ManagedLocalSuccessorIndex,
+    ManagedLocalSuccessorObservation,
 };
 use crate::oplog::object_store::{
     ensure_directory_nofollow, open_dir_nofollow, ObjectStore, ObjectStoreManifestCursor,
@@ -151,11 +152,11 @@ use crate::oplog::{
     ContentDigest, CurrentPageAtPath, DeviceId, DocumentId, FrontierReferenceHit, LineageDigest,
     LogicalPageName, LogseqIdentityOrigin, LogseqUuid, ManagedLocalAppendError,
     ManagedLocalGenerationAnchorV2, ManagedLocalJournal, ManagedLocalJournalPayloadKind,
-    ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind, MaterializedBlock,
-    MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
-    MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
-    OperationBatch, OperationObject, OperationTransaction, PageId, PageState, PreparedBatch,
-    ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
+    ManagedLocalJournalProtocol, ManagedLocalRecord, ManagedPath, ManagedTextKind,
+    MaterializedBlock, MaterializedBlockRow, MaterializedEntityId, MaterializedPage,
+    MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow,
+    MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction, PageId, PageState,
+    PreparedBatch, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
     ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
     SessionId, SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
     MAX_MATERIALIZATION_QUERY_ROWS,
@@ -8694,10 +8695,168 @@ struct LatestTaskQueryOverlayEntry {
     state: LatestTaskQueryOverlayState,
 }
 
+/// Rebuildable point indexes over the uncheckpointed local journal. A record
+/// is decoded once when recovered/appended, then ordinary derivative turns
+/// answer batch and successor questions without rescanning or redecoding the
+/// queue prefix.
+#[derive(Default)]
+struct ManagedLocalPendingIndex {
+    records_by_batch: BTreeMap<BatchId, ManagedLocalRecord>,
+    projection_targets: BTreeMap<(String, PageId), BTreeMap<u64, Vec<u8>>>,
+    projection_sequences_by_digest: BTreeMap<(String, PageId, ContentDigest), BTreeSet<u64>>,
+}
+
+impl ManagedLocalPendingIndex {
+    fn insert(&mut self, record: ManagedLocalRecord) -> Result<(), String> {
+        let batch_id = record.prepared_batch().manifest().batch_id();
+        let sequence = record.sequence();
+        if self.records_by_batch.contains_key(&batch_id) {
+            return Err(format!("duplicate pending managed-local batch {batch_id}"));
+        }
+        let mut entries = Vec::with_capacity(record.projections().len());
+        let mut record_keys = BTreeSet::new();
+        for projection in record.projections() {
+            let intent = projection.intent();
+            let bytes = intent.target().bytes().ok_or_else(|| {
+                "pending managed-local projection has an absent target".to_owned()
+            })?;
+            let key = (intent.path().as_str().to_owned(), intent.page_id());
+            if !record_keys.insert(key.clone())
+                || self
+                    .projection_targets
+                    .get(&key)
+                    .is_some_and(|targets| targets.contains_key(&sequence))
+            {
+                return Err(format!(
+                    "duplicate pending managed-local projection at sequence {sequence}"
+                ));
+            }
+            entries.push((key, bytes.to_vec(), ContentDigest::of(bytes)));
+        }
+        for (key, bytes, digest) in entries {
+            self.projection_targets
+                .entry(key.clone())
+                .or_default()
+                .insert(sequence, bytes);
+            self.projection_sequences_by_digest
+                .entry((key.0, key.1, digest))
+                .or_default()
+                .insert(sequence);
+        }
+        self.records_by_batch.insert(batch_id, record);
+        Ok(())
+    }
+
+    fn remove(&mut self, record: &ManagedLocalRecord) -> Result<(), String> {
+        let batch_id = record.prepared_batch().manifest().batch_id();
+        let sequence = record.sequence();
+        let indexed = self
+            .records_by_batch
+            .get(&batch_id)
+            .ok_or_else(|| format!("pending managed-local batch {batch_id} is not indexed"))?;
+        if indexed != record {
+            return Err(format!(
+                "pending managed-local batch {batch_id} differs from its index"
+            ));
+        }
+        for projection in record.projections() {
+            let intent = projection.intent();
+            let bytes = intent.target().bytes().ok_or_else(|| {
+                "pending managed-local projection has an absent target".to_owned()
+            })?;
+            let key = (intent.path().as_str().to_owned(), intent.page_id());
+            if self
+                .projection_targets
+                .get(&key)
+                .and_then(|targets| targets.get(&sequence))
+                .is_none_or(|target| target.as_slice() != bytes)
+            {
+                return Err("pending projection target index differs from its record".into());
+            }
+            let digest_key = (key.0, key.1, ContentDigest::of(bytes));
+            if self
+                .projection_sequences_by_digest
+                .get(&digest_key)
+                .is_none_or(|sequences| !sequences.contains(&sequence))
+            {
+                return Err("pending projection digest index differs from its record".into());
+            }
+        }
+        self.records_by_batch.remove(&batch_id);
+        for projection in record.projections() {
+            let intent = projection.intent();
+            let bytes = intent.target().bytes().expect("validated above");
+            let key = (intent.path().as_str().to_owned(), intent.page_id());
+            let targets = self
+                .projection_targets
+                .get_mut(&key)
+                .expect("validated above");
+            targets.remove(&sequence);
+            if targets.is_empty() {
+                self.projection_targets.remove(&key);
+            }
+            let digest_key = (key.0, key.1, ContentDigest::of(bytes));
+            let sequences = self
+                .projection_sequences_by_digest
+                .get_mut(&digest_key)
+                .expect("validated above");
+            sequences.remove(&sequence);
+            if sequences.is_empty() {
+                self.projection_sequences_by_digest.remove(&digest_key);
+            }
+        }
+        Ok(())
+    }
+
+    fn record(&self, batch_id: BatchId) -> Option<&ManagedLocalRecord> {
+        self.records_by_batch.get(&batch_id)
+    }
+}
+
+impl ManagedLocalSuccessorIndex for ManagedLocalPendingIndex {
+    fn observe_successor(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+        after_sequence: u64,
+        current: &[u8],
+    ) -> ManagedLocalSuccessorObservation {
+        let key = (path.as_str().to_owned(), page_id);
+        let latest_sequence = self
+            .projection_targets
+            .get(&key)
+            .and_then(|targets| targets.keys().next_back().copied())
+            .filter(|sequence| *sequence > after_sequence);
+        let current_matches_target = self
+            .projection_sequences_by_digest
+            .get(&(key.0.clone(), key.1, ContentDigest::of(current)))
+            .and_then(|sequences| {
+                sequences
+                    .range((
+                        std::ops::Bound::Excluded(after_sequence),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next_back()
+                    .copied()
+            })
+            .and_then(|sequence| {
+                self.projection_targets
+                    .get(&key)
+                    .and_then(|targets| targets.get(&sequence))
+            })
+            .is_some_and(|target| target.as_slice() == current);
+        ManagedLocalSuccessorObservation {
+            latest_sequence,
+            current_matches_target,
+        }
+    }
+}
+
 struct ManagedLocalRuntimeState {
     directory: Dir,
     journal: ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
     frames: VecDeque<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    pending_index: ManagedLocalPendingIndex,
     latest_projection_frames: BTreeMap<String, LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     latest_task_query_overlay: BTreeMap<String, LatestTaskQueryOverlayEntry>,
     checkpoint: ManagedLocalDrainCheckpoint,
@@ -9391,6 +9550,7 @@ fn open_clean_foreground_journal(
 
     let mut latest_projection_frames = BTreeMap::new();
     let mut latest_task_query_overlay = BTreeMap::new();
+    let mut pending_index = ManagedLocalPendingIndex::default();
     for frame in &recovered_frames {
         let record = crate::oplog::decode_managed_local_record(frame).map_err(|error| {
             format!(
@@ -9412,6 +9572,7 @@ fn open_clean_foreground_journal(
                 },
             );
         }
+        pending_index.insert(record)?;
     }
     if checkpoint.next_sequence() != 0 || !recovered_frames.is_empty() {
         let mut session = runtime
@@ -9442,6 +9603,7 @@ fn open_clean_foreground_journal(
         directory,
         journal,
         frames: recovered_frames.into(),
+        pending_index,
         latest_projection_frames,
         latest_task_query_overlay,
         checkpoint,
@@ -14751,16 +14913,11 @@ impl RuntimeActor {
         episode: &ApplicationMoveEpisodeRecord,
         recovered: bool,
     ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
-        if let Some(frame) = self.managed_local.as_ref().and_then(|managed| {
-            managed.frames.iter().find(|frame| {
-                crate::oplog::decode_managed_local_record(frame).is_ok_and(|record| {
-                    record.prepared_batch().manifest().batch_id() == episode.batch_id
-                })
-            })
-        }) {
-            let record = crate::oplog::decode_managed_local_record(frame).map_err(|_| {
-                SyncApplicationPageRequestError::ActorRefusedAt("move_recovery_record_decode")
-            })?;
+        if let Some(record) = self
+            .managed_local
+            .as_ref()
+            .and_then(|managed| managed.pending_index.record(episode.batch_id))
+        {
             let application = |page_id: PageId| {
                 let page = self
                     .active_engine()
@@ -17245,6 +17402,11 @@ impl RuntimeActor {
         let record = crate::oplog::decode_managed_local_record(&frame).map_err(|_| {
             SyncEditorRequestError::ActorRefusedWithCode(SyncEditorRefusalCode::ManagedRecordDecode)
         })?;
+        managed.pending_index.insert(record.clone()).map_err(|_| {
+            SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedQueueMonotonicity,
+            )
+        })?;
         managed.note_latest_projection_frame(
             record.projection().intent().path().clone(),
             frame.clone(),
@@ -17376,6 +17538,9 @@ impl RuntimeActor {
         );
         let record = crate::oplog::decode_managed_local_record(&frame).map_err(|_| {
             SyncApplicationPageRequestError::ActorRefusedAt("move_managed_record_decode")
+        })?;
+        managed.pending_index.insert(record.clone()).map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("move_managed_queue_index")
         })?;
         for projection in record.projections() {
             managed.note_latest_projection_frame(projection.intent().path().clone(), frame.clone());
@@ -17593,28 +17758,7 @@ impl RuntimeActor {
         let superseding_projections = self
             .managed_local
             .as_ref()
-            .map(|managed| {
-                let mut successors = BTreeMap::<String, Vec<_>>::new();
-                for successor_frame in managed
-                    .frames
-                    .iter()
-                    .skip(1)
-                    .filter(|successor| successor.sequence() > frame.sequence())
-                {
-                    let Ok(successor) = crate::oplog::decode_managed_local_record(successor_frame)
-                    else {
-                        continue;
-                    };
-                    for projection in successor.projections() {
-                        successors
-                            .entry(projection.intent().path().as_str().to_owned())
-                            .or_default()
-                            .push(successor_frame.clone());
-                    }
-                }
-                successors
-            })
-            .filter(|successors| !successors.is_empty());
+            .map(|managed| &managed.pending_index as &dyn ManagedLocalSuccessorIndex);
         let batch_id = record.prepared_batch().manifest().batch_id();
         let mut publisher = ManagedLocalPublisherAttempt {
             batch_id,
@@ -17655,7 +17799,7 @@ impl RuntimeActor {
                 engine,
                 database,
                 &frame,
-                superseding_projections.as_ref(),
+                superseding_projections,
                 &checkpoint,
                 continuation.as_ref(),
                 &mut publisher,
@@ -17685,6 +17829,11 @@ impl RuntimeActor {
                     managed.checkpoint = completion.checkpoint;
                     managed.checkpoint_batch_id = Some(completion.batch_id);
                     managed.frames.pop_front();
+                    if let Err(error) = managed.pending_index.remove(&record) {
+                        return Some(SyncRuntimeTick::Terminal(format!(
+                            "clean foreground pending index is inconsistent: {error}"
+                        )));
+                    }
                     for projection in record.projections() {
                         if managed
                             .latest_projection_frames
@@ -23734,6 +23883,55 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn pending_foreground_derivative_and_move_retry_use_exact_queue_indexes() {
+        let source = include_str!("sync_runtime.rs");
+        let tick = source
+            .split_once("fn tick_clean_foreground_derivative")
+            .and_then(|(_, tail)| tail.split_once("\n    fn execute_clean_editor_transaction"))
+            .map(|(body, _)| body)
+            .expect("foreground derivative keeps a narrow source boundary");
+        let compact_tick = tick
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(compact_tick.contains("managed.pending_indexas&dynManagedLocalSuccessorIndex"));
+        assert!(
+            !compact_tick.contains("managed.frames.iter().skip(1)"),
+            "a derivative turn must not rescan every later journal frame"
+        );
+        assert_eq!(
+            tick.matches("decode_managed_local_record").count(),
+            1,
+            "only the queue-front record may be decoded by a derivative turn"
+        );
+
+        let retry = source
+            .split_once("fn application_move_committed_outcome")
+            .and_then(|(_, tail)| tail.split_once("\n    fn mutate_application_graph"))
+            .map(|(body, _)| body)
+            .expect("move retry keeps a narrow source boundary");
+        assert!(retry.contains("managed.pending_index.record(episode.batch_id)"));
+        assert!(
+            !retry.contains("managed.frames.iter()")
+                && !retry.contains("decode_managed_local_record"),
+            "move retry must point-read the pending batch index"
+        );
+
+        let drain_source = include_str!("oplog/local_journal_drain.rs");
+        let authentication = drain_source
+            .split_once("let mut projection_superseded")
+            .and_then(|(_, tail)| tail.split_once("\n    let archive ="))
+            .map(|(body, _)| body)
+            .expect("successor authentication keeps a narrow source boundary");
+        assert!(authentication.contains("observe_successor"));
+        assert!(
+            !authentication.contains("successor_frames")
+                && !authentication.contains("decode_managed_local_record"),
+            "successor authentication must point-query the decoded queue index"
+        );
     }
 
     /// The journal-feed route flushes a currently edited source page and then

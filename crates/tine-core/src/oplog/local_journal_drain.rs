@@ -19,15 +19,34 @@ use crate::oplog::local_active::{LocalRuntimeAdmission, WorkspaceAuthorityBounda
 use crate::oplog::object_store::{BatchInspection, StoreError};
 use crate::oplog::{
     decode_managed_local_record, AcceptedBatchEvent, BatchDisposition, BatchId, ContentDigest,
-    DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManifestObjectRef,
-    ManifestProjectionTarget, ObjectStore, ProjectionEndpointBinding, ProjectionReceiptStore,
-    ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine, SqliteFrontier,
-    TailOverlay, WorkspaceId,
+    DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath,
+    ManifestObjectRef, ManifestProjectionTarget, ObjectStore, PageId, ProjectionEndpointBinding,
+    ProjectionReceiptStore, ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine,
+    SqliteFrontier, TailOverlay, WorkspaceId,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const ENGINE_STAGE_WORK_PER_RESUME: usize = 8;
 const SQLITE_BATCHES_PER_RESUME: usize = 1;
+
+/// Exact point answer derived from the already decoded pending local journal.
+/// The index is rebuildable acceleration state; the journal and hot-prefix
+/// admission remain the authority checked by the drain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManagedLocalSuccessorObservation {
+    pub(crate) latest_sequence: Option<u64>,
+    pub(crate) current_matches_target: bool,
+}
+
+pub(crate) trait ManagedLocalSuccessorIndex {
+    fn observe_successor(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+        after_sequence: u64,
+        current: &[u8],
+    ) -> ManagedLocalSuccessorObservation;
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -541,9 +560,7 @@ pub(crate) fn resume_clean_managed_local_journal_drain(
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    superseding_projections: Option<
-        &BTreeMap<String, Vec<LocalJournalFrame<ManagedLocalJournalPayloadKind>>>,
-    >,
+    superseding_projections: Option<&dyn ManagedLocalSuccessorIndex>,
     checkpoint: &ManagedLocalDrainCheckpoint,
     continuation: Option<&ManagedLocalDrainContinuation>,
     publisher: &mut impl ManagedLocalDerivativePublisher,
@@ -577,9 +594,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     database: &mut SqliteFrontier,
     sqlite_mode: ManagedLocalSqliteMode<'_>,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    superseding_projections: Option<
-        &BTreeMap<String, Vec<LocalJournalFrame<ManagedLocalJournalPayloadKind>>>,
-    >,
+    superseding_projections: Option<&dyn ManagedLocalSuccessorIndex>,
     checkpoint: &ManagedLocalDrainCheckpoint,
     continuation: Option<&ManagedLocalDrainContinuation>,
     publisher: &mut impl ManagedLocalDerivativePublisher,
@@ -683,87 +698,43 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                 )
             }
         };
-        let superseding = superseding_projections
-            .and_then(|successors| successors.get(intent.path().as_str()))
-            .map(
-                |successor_frames| -> Result<Vec<Vec<u8>>, ManagedLocalDrainOutcome> {
-                    successor_frames
-                        .iter()
-                        .map(|successor_frame| {
-                            let successor =
-                                decode_managed_local_record(successor_frame).map_err(|error| {
-                                    conflict(
-                                        ManagedLocalDrainStage::Authenticate,
-                                        format!("superseding journal frame is invalid: {error}"),
-                                    )
-                                })?;
-                            let successor_manifest = successor.prepared_batch().manifest();
-                            let successor_intent = successor
-                                .projections()
-                                .iter()
-                                .find(|candidate| {
-                                    candidate.intent().path() == intent.path()
-                                        && candidate.intent().page_id() == intent.page_id()
-                                })
-                                .map(|projection| projection.intent())
-                                .ok_or_else(|| {
-                                    conflict(
-                                        ManagedLocalDrainStage::Authenticate,
-                                        "superseding journal frame has no matching projection",
-                                    )
-                                })?;
-                            let successor_target =
-                                successor_intent.target().bytes().ok_or_else(|| {
-                                    conflict(
-                                ManagedLocalDrainStage::Authenticate,
-                                "superseding journal frame is not a present-page projection",
-                            )
-                                })?;
-                            let successor_is_authoritative = successor_frame.device_id()
-                                == frame.device_id()
-                                && successor_frame.sequence() > frame.sequence()
-                                && successor.sequence() == successor_frame.sequence()
-                                && engine.managed_local_prefix_state().next_sequence
-                                    > successor_frame.sequence()
-                                && successor_manifest.workspace_id() == manifest.workspace_id()
-                                && successor_manifest.lineage_digest() == manifest.lineage_digest()
-                                && successor_manifest.author_device_id()
-                                    == manifest.author_device_id();
-                            if !successor_is_authoritative {
-                                return Err(conflict(
-                                ManagedLocalDrainStage::Authenticate,
-                                "superseding journal frame does not extend this local projection",
-                            ));
-                            }
-                            Ok(successor_target.to_vec())
-                        })
-                        .collect()
-                },
-            )
-            .transpose();
-        let successor_targets = match superseding {
-            Ok(targets) => targets,
-            Err(outcome) => return outcome,
-        };
         let superseded = match graph.read_projection_input(intent.path()) {
-            Ok(Some(current))
-                if successor_targets.as_ref().is_some_and(|targets| {
-                    targets.iter().any(|target| current == target.as_slice())
-                }) || (successor_targets.is_some()
-                    && (current == exact_target
-                        || current == projection.precondition_base().bytes())) =>
-            {
-                true
+            Ok(Some(current)) => {
+                let successor = superseding_projections
+                    .map(|index| {
+                        index.observe_successor(
+                            intent.path(),
+                            intent.page_id(),
+                            frame.sequence(),
+                            &current,
+                        )
+                    })
+                    .unwrap_or_default();
+                if successor.latest_sequence.is_some_and(|sequence| {
+                    sequence >= engine.managed_local_prefix_state().next_sequence
+                }) {
+                    return conflict(
+                        ManagedLocalDrainStage::Authenticate,
+                        "superseding journal index extends beyond the committed local prefix",
+                    );
+                }
+                if successor.latest_sequence.is_some()
+                    && (successor.current_matches_target
+                        || current == exact_target
+                        || current == projection.precondition_base().bytes())
+                {
+                    true
+                } else if current == exact_target
+                    || current == projection.precondition_base().bytes()
+                {
+                    false
+                } else {
+                    return conflict(
+                        ManagedLocalDrainStage::Authenticate,
+                        "graph target is neither the journal base, target, nor an authoritative successor",
+                    );
+                }
             }
-            Ok(Some(current))
-                if current == exact_target || current == projection.precondition_base().bytes() =>
-            {
-                false
-            }
-            Ok(Some(_)) => return conflict(
-                ManagedLocalDrainStage::Authenticate,
-                "graph target is neither the journal base, target, nor an authoritative successor",
-            ),
             Ok(None) => {
                 return conflict(
                     ManagedLocalDrainStage::Authenticate,
