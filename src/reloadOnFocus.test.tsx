@@ -8,6 +8,8 @@ import {
   resetFocusRescanThrottle,
 } from "./reloadOnFocus";
 import { onPageBecameReplaceable, resetStore, sweepReplaceable } from "./store";
+import { managedStorageRuntime } from "./managedStorageRuntime";
+import { setToasts, toasts } from "./ui";
 
 // Concord P5 (L0): when the OS or filesystem gave us no event — a network
 // mount, a sync client writing through a path the kernel doesn't report, an app
@@ -18,9 +20,12 @@ import { onPageBecameReplaceable, resetStore, sweepReplaceable } from "./store";
 
 beforeEach(() => {
   resetFocusRescanThrottle();
+  setToasts([]);
 });
 
 afterEach(() => {
+  managedStorageRuntime.clear();
+  setToasts([]);
   installFocusFreshnessVerifier(async () => {});
   vi.restoreAllMocks();
   resetStore();
@@ -57,6 +62,16 @@ describe("reload on focus", () => {
   it("survives a backend that refuses the rescan", async () => {
     vi.spyOn(backend(), "rescanGraphNow").mockRejectedValue(new Error("no watcher"));
     await expect(refreshOnReturnToWindow(100_000)).resolves.toBeUndefined();
+  });
+
+  it("leaves the terminal outcome to an active storage transition", async () => {
+    vi.spyOn(backend(), "rescanGraphNow").mockRejectedValue(
+      new Error("sync actor is unavailable"),
+    );
+    managedStorageRuntime.beginTransition();
+    await expect(refreshOnReturnToWindow(100_000)).resolves.toBeUndefined();
+    expect(toasts()).toEqual([]);
+    managedStorageRuntime.endTransition();
   });
 
   it("awaits the bounded visible-page verifier before completing", async () => {

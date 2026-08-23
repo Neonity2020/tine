@@ -278,6 +278,12 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     transitionDepth += 1;
   };
 
+  /** True only while this window owns a storage-mode/share/join command.
+   * Subordinate freshness probes use this to avoid independently announcing
+   * the expected retired-actor window. The owning command still reports its
+   * one authoritative terminal success or failure. */
+  const transitioning = () => transitionDepth > 0;
+
   /**
    * The transition finished. Anything an authoritative status or a healthy tick
    * has already cleared stays silent; a condition that is STILL live gets its
@@ -329,6 +335,7 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     receiveTick,
     receiveError,
     beginTransition,
+    transitioning,
     endTransition,
     refresh,
     listen,

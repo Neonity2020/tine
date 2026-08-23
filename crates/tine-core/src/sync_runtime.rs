@@ -16757,26 +16757,28 @@ impl RuntimeActor {
             });
         }
         if self.clean.is_some() {
-            return match self
+            // Foreground admission owns a finite prior continuation; the UI
+            // must not have to resubmit the same page operation once per
+            // internal projection step.  Drive the existing bounded,
+            // progress-aware settlement loop before admitting this request.
+            // It stops after two identical non-progress failures, so a real
+            // filesystem fault still defers instead of spinning or blocking
+            // the actor for the full turn budget.
+            let (_, settled) = self.advance_clean_retained_publication();
+            if settled {
+                return EditorTurnReadiness::Ready;
+            }
+            let pending = self
                 .clean
-                .as_mut()
-                .expect("clean editor turn retains clean runtime")
-                .retry_pending(&self.graph, &self.receipts)
-            {
-                None | Some(CleanActorMutationOutcome::Durable(_)) => EditorTurnReadiness::Ready,
-                Some(
-                    CleanActorMutationOutcome::DurablePending { batch_id, phase }
-                    | CleanActorMutationOutcome::RetainedPriorPending { batch_id, phase }
-                    | CleanActorMutationOutcome::DurableStuck {
-                        batch_id, phase, ..
-                    },
-                ) => EditorTurnReadiness::Deferred(
-                    SyncEditorDeferred::RetryableRetainedPublication {
-                        batch_id: batch_id.to_string(),
-                        phase: map_local_phase(phase),
-                    },
-                ),
-            };
+                .as_ref()
+                .and_then(|clean| clean.pending.as_ref())
+                .expect("unsettled clean work retains its continuation");
+            return EditorTurnReadiness::Deferred(
+                SyncEditorDeferred::RetryableRetainedPublication {
+                    batch_id: pending.batch_id().to_string(),
+                    phase: map_local_phase(pending.failure().phase()),
+                },
+            );
         }
         EditorTurnReadiness::Deferred(SyncEditorDeferred::Revoked {
             batch_id: None,
@@ -25324,6 +25326,76 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    /// A foreground page save must not depend on the frontend repeatedly
+    /// resubmitting it to advance an earlier, finite retained continuation.
+    /// The managed actor owns that continuation and can settle it before
+    /// admitting the new request.  GH #292 exposed the old one-turn contract:
+    /// the UI exhausted its two short retries while activation/watcher work
+    /// was still making progress, then stranded the page as dirty.
+    #[test]
+    fn application_save_settles_finite_prior_clean_work_before_admission() {
+        let fixture = ActivationFixture::nested_unicode("clean-prior-save", 0xa1782);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+
+        handle.install_repeated_projection_fault(2).unwrap();
+        let prior = handle
+            .submit_local_mutation(
+                OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa178_2001)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa178_2002)),
+                    name: LogicalPageName::parse("Prior retained page").unwrap(),
+                    path: ManagedPath::parse("Prior retained page.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            prior,
+            SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                batch_id: Some(_),
+                ..
+            }
+        ));
+
+        let name = "20260823105223";
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::New {
+                    name: name.into(),
+                    page_kind: SyncPageKind::Page,
+                },
+                page: new_application_page(
+                    name,
+                    SyncPageKind::Page,
+                    None,
+                    vec![BlockDto {
+                        raw: "created immediately after managed activation".into(),
+                        ..BlockDto::default()
+                    }],
+                ),
+            })
+            .unwrap();
+        let saved_path = match outcome {
+            SyncApplicationPageSaveOutcome::Saved { page, .. } => page.path,
+            other => panic!(
+                "finite prior managed work must settle inside foreground admission: {other:?}"
+            ),
+        };
+        assert!(fixture.graph_root.join(saved_path).is_file());
     }
 
     /// Android's shared storage does not uniformly provide the directory flush

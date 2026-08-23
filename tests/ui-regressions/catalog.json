@@ -6897,6 +6897,28 @@
         "failBefore": "unavailable"
       },
       "notes": "Reported internally by Martin: with the Settings modal open, the hardware Back gesture did not close it. The frontend rungs were never at fault - dispatchAndroidBack, the transient registry and Settings' three-rung dismiss all behave correctly in the real app composition, which is why the defect survived. androidx's OnBackPressedDispatcher hands a gesture to the LAST-ADDED enabled callback, and Tauri's core AppPlugin adds its own from its Kotlin constructor, which runs on the Rust startup thread tao spawns inside Rust.create() - after MainActivity.onCreate has already returned. AppPlugin therefore sat ABOVE Tine's SafeBack owner, took its no-listener branch (Tine registers android-safe-back on its own plugin, never back-button on Tauri's) and answered Back with WebView.goBack() whenever the WebView had history. The mobile router pushes one history entry per navigation, so after the user's first navigation every Back popped a route BEHIND whatever was on screen and no rung ever ran; before that first navigation canGoBack() is false, AppPlugin re-dispatches and Back works, which is why this read as intermittent. SafeBackPlugin now claims ownership from its own constructor and again from load(), both strictly later than every plugin registered so far. The frontend semantic regression is blocking and green. The native WebView instrumentation remains in the Android runtime job but is explicitly quarantined after the 2026-08-22 two-attempt stop-loss: on GitHub's software-graphics emulator the process aborts before any JUnit assertion with Android libc reporting pthread_mutex_lock on a destroyed mutex. Managed-storage activation/crash-recovery tests run in a separate instrumentation lifetime and remain fully blocking."
+    },
+    {
+      "id": "UI-MANAGED-SHARE-SINGLE-TERMINAL-OUTCOME-001",
+      "title": "Sync setup reports one terminal outcome instead of a transient red freshness failure followed by success",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "frontend-runtime",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/reloadOnFocus.test.tsx::leaves the terminal outcome to an active storage transition",
+          "src/managedStorageRuntime.test.ts::never reports the retired-actor window an enrollment cut opens on purpose",
+          "src/managedStorageRuntime.test.ts::reports a failure that outlives the transition exactly once"
+        ],
+        "scenario": "managed.share-focus-rescan-single-terminal-outcome",
+        "failBefore": "proven"
+      },
+      "notes": "Internal report after v0.6.94: enabling sync first showed the red focus-rescan toast `sync actor is unavailable`, then a green success toast. Share and join deliberately retire their actor and publish a reopened replacement before the owning command returns; managed runtime errors already respected that transition bracket, but reloadOnFocus independently treated its subordinate rescan as a terminal operation. A focus rescan that fails while this window owns a storage transition now releases the freshness/input barrier silently. The Settings command remains the sole owner and reports exactly one authoritative success or failure; ordinary rescan failures outside a transition are unchanged."
     }
   ]
 }

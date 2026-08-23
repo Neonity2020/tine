@@ -4477,6 +4477,28 @@
         "failBefore": "proven"
       },
       "notes": "GH #366 on v0.6.94 / Windows 11 / Direct Files: creating TINE版本更新提示词 failed three times with `external graph-text changes arrived before creation publication`, then the editor became stuck dirty. Commit 416be3cb correctly made the raw Windows watcher treat ReadDirectoryChangesW `Create(Any)` and `Modify(Any)` as exact file events, but Pending::add_event independently classified the same event as unknown and scheduled a whole-graph diff. On the reporter's 13k-page graph that kept the safe external-change admission frontier raised beyond the frontend's complete 100 ms + 300 ms retry window. The current projection temp producer also writes `.projection.tmp`, while its regression used a retired `.tmp` spelling, so real atomic renames could take the same full-scan path. The fix makes both Windows exact event shapes and the current staging rename incremental. Fail-before is the cross-layer pending-queue test; pass-after proves one Chinese-named exact event reconciles without the full branch, lowers the admission frontier, and permits a subsequent creation. Unicode itself is covered as an accepted page name while the existing case/NFC alias, external semantic-owner and exact-target race refusals remain intact."
+    },
+    {
+      "id": "REG-MANAGED-FOREGROUND-SETTLES-FINITE-PRIOR-WORK-292",
+      "title": "A managed page save depended on repeated frontend resubmission to advance finite prior actor work",
+      "family": "managed-storage-save-recovery",
+      "sources": {
+        "issues": [292],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "tine-core-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::tests::application_save_settles_finite_prior_clean_work_before_admission",
+          "crates/tine-core/src/sync_runtime.rs::tests::clean_runtime_application_save_never_enters_legacy_publication_settlement",
+          "crates/tine-core/src/sync_runtime.rs::tests::clean_actor_escalates_a_deterministic_retained_retry_to_a_named_stuck_state"
+        ],
+        "scenario": "managed.activate-retained-work-create-page-save",
+        "failBefore": "proven"
+      },
+      "notes": "GH #292 remained broken on v0.6.94 after activation became fast enough: creating page 20260823105223 returned `Tine-managed storage is updating this page`, exhausted the UI's 100 ms and 300 ms retries, left the draft dirty, and prevented clean close. Foreground admission advanced an earlier retained clean continuation exactly once and returned Deferred even when the continuation was finite and still making progress; every internal projection step therefore required another complete UI save request. The actor now drives the existing bounded, progress-aware retained-publication settlement before admitting the new page operation. Two identical non-progress failures still stop and defer, so a persistent filesystem error does not spin or get hidden. Fail-before injects two consecutive projection resumptions ahead of a new application page: the old contract defers the page, while the fixed actor settles its own prior work and saves it in the same request."
     }
   ]
 }
