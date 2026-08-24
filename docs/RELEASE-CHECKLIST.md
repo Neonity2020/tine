@@ -60,7 +60,9 @@ may tag, publish, comment, and close issues.
    release candidate while the slower platform workflows run. If using
    coordinator `stage-deploy`, pass `--release-build`; its ordinary-batch
    default is intentionally a faster nondeterministic local profile and does
-   not count as release evidence.
+   not count as release evidence. When an exact signed Android APK is available,
+   also copy it to `~/research/tine.apk` and verify its SHA-256 against the
+   versioned source artifact before asking Martin to test it.
 7. The Windows x64 real-app smoke suite is advisory when available. Separately,
    step 9's Windows CI evidence is blocking: it compiles all `tine-core` test
    targets against the exact certified `tine-storage` pin, then runs the

@@ -64,6 +64,22 @@ $ANDROID_HOME/build-tools/35.0.0/apksigner verify --print-certs \
 
 The printed certificate DN should be `CN=Tine, …`, not `CN=Android Debug`.
 
+## Delivering a test APK to Martin
+
+`~/research/tine.apk` is the stable Syncthing delivery path for the current
+Android test build, parallel to `~/research/tine` for the desktop binary. After
+the exact APK has passed the required checks and its release signature has been
+verified, retain the versioned artifact and copy it to the stable path:
+
+```sh
+cp -f /path/to/exact-signed.apk ~/research/tine.apk
+chmod 0644 ~/research/tine.apk
+sha256sum /path/to/exact-signed.apk ~/research/tine.apk
+```
+
+The two hashes must match. Do not deploy an unsigned, debug-signed, stale, or
+different-commit APK to this path.
+
 ## Signing in CI (the normal path — GitHub Actions builds signed APKs)
 
 The `release` workflow has an `android` job that builds a **signed** release APK
