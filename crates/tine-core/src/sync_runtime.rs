@@ -16091,7 +16091,12 @@ impl RuntimeActor {
             &current.page,
             crate::doc::Document {
                 pre_block,
-                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+                // No ledger base reaches this actor path, so a `"merged"`
+                // decision — which only a 3-way diff can offer — refuses here.
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions)
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt("sync_conflict_merge")
+                    })?,
             },
         )
         .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("sync_conflict_merge"))?;

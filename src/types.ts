@@ -702,6 +702,18 @@ export interface BlockView {
  *  Only present on 3-way diffs. */
 export type Diff3Verdict = "mine-only" | "theirs-only" | "both-changed";
 
+/** Where a proposed merged body came from. "artifact" is a reserved seam for a
+ *  merge tool's own suggestion region and is not produced yet. */
+export type MergedSource = "computed" | "artifact";
+
+/** A merged body offered for a `both-changed` row (two disjoint edits of one
+ *  base). Display only — the resolve recomputes the text from the same inputs
+ *  and never trusts this echo. */
+export interface MergedProposal {
+  text: string;
+  source: MergedSource;
+}
+
 /** One aligned position in the two block trees. `id` is a stable path ("2.1")
  *  that the resolve step reproduces, so a decision maps back to the same block. */
 export interface DiffRow {
@@ -712,9 +724,12 @@ export interface DiffRow {
   children: DiffRow[];
   /** 3-way classification against the base (absent on 2-way diffs). */
   verdict?: Diff3Verdict | null;
-  /** Pre-selected decision the base justifies ("mine"/"theirs"); the modal only
-   *  pre-selects it — nothing applies without the user's confirm. */
-  suggestion?: "mine" | "theirs" | null;
+  /** Pre-selected decision the base justifies ("mine"/"theirs"/"merged"); the
+   *  modal only pre-selects it — nothing applies without the user's confirm. */
+  suggestion?: MergeDecision | null;
+  /** Merged body proposed for a `both-changed` row whose two edits are
+   *  disjoint. Absent on 2-way diffs and wherever no merge may be offered. */
+  merged?: MergedProposal | null;
 }
 
 /** The full block-level diff of a conflict copy against its winner. */
@@ -731,7 +746,7 @@ export interface SyncConflictDiff {
 }
 
 /** A user's per-row merge decision. */
-export type MergeDecision = "mine" | "theirs" | "both";
+export type MergeDecision = "mine" | "theirs" | "both" | "merged";
 
 /** Where a conflict object came from (Concord L3). */
 export type ConflictSource = "sync-copy" | "vcs-markers" | "live-save";

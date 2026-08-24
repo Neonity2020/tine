@@ -4058,7 +4058,7 @@ pub(crate) async fn resolve_live_save_conflict(
 }
 
 /// Resolve a sync-conflict copy: merge it into its winner per the user's per-row
-/// `decisions` (row id → "mine"/"theirs"/"both") via the normal save path, then
+/// `decisions` (row id → "mine"/"theirs"/"both"/"merged") via the normal save path, then
 /// trash the conflict copy. `base_rev` guards against the winner changing under
 /// the merge; returns "conflict" if it did. `pre_choice`: "mine"/"theirs"/"union".
 #[tauri::command]

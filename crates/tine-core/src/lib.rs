@@ -32,6 +32,7 @@ pub mod render;
 pub mod search_query;
 pub mod sync_diff;
 pub mod sync_runtime;
+pub mod text_merge;
 #[cfg(test)]
 mod test_support;
 

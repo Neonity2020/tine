@@ -107,3 +107,16 @@ second *producer* that needs no ledger at all — the common ancestor a
 the in-page resolver. Where no base answers the question, ADR 0057 leads with
 keep-both rather than defaulting to "mine". See
 `0057-concord-conflict-objects-and-in-page-resolution.md`.
+
+## Addendum (2026-08-24) — fourth suggestion value
+
+The suggestion vocabulary this ADR introduced (`mine`/`theirs`, pre-selected
+and never auto-applied) gains a third value: `merged`. When both sides changed
+a block but the character-level hunks against the ledger base are disjoint
+(relaxed adjacency: touching delete/insert pairs compose; same-point double
+insertions and any overlapping ranges do not), the row carries the composed
+text as a suggested fourth outcome. Everything else in this ADR is unchanged —
+the base ledger is still the producer, the pre-selection stance is still
+"advice, never action", and the editing-device asymmetry recorded in the
+consequences applies to this suggestion too (it mostly fires on the receiving
+device). Design: `tine-agents/specs/concord-intrablock-merge.md`.

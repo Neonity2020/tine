@@ -3816,6 +3816,128 @@ mod concord_ledger_integration {
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&ledger_dir).ok();
     }
+#[test]
+fn resolve_sync_conflict_writes_a_confirmed_merged_body_and_refuses_a_forged_one() {
+    use std::collections::HashMap;
+    use tine_core::sync_diff::MergedSource;
+
+    // Disjoint edits of ONE block: the winner dropped the trailing " 5", the
+    // other device appended " kk" right after it.
+    let ancestor = "- shared intro line\n- Desktop 5\n  id:: aaaaaaaa-0000-0000-0000-0000000000d5\n";
+    let mine = "- shared intro line\n- Desktop\n  id:: aaaaaaaa-0000-0000-0000-0000000000d5\n";
+    let theirs =
+        "- shared intro line\n- Desktop 5 kk\n  id:: aaaaaaaa-0000-0000-0000-0000000000d5\n";
+    let conflict_name = "Note.sync-conflict-20260824-090000-DDDDDDD.md";
+    let conf_rel = format!("pages/{conflict_name}");
+
+    let root = std::env::temp_dir().join(format!("tine-concord-merged-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    let ledger_dir =
+        std::env::temp_dir().join(format!("tine-concord-merged-ledger-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ledger_dir);
+    std::fs::write(root.join("pages/Note.md"), mine).unwrap();
+    std::fs::write(root.join("pages").join(conflict_name), theirs).unwrap();
+
+    let graph = Graph::open(&root);
+    graph.attach_concord_ledger(ledger_dir.clone());
+    let ledger = graph.concord_ledger().unwrap().clone();
+    ledger.flush(); // drain the attach-time prune before the synchronous records
+    ledger.record_now("pages/Note.md", ancestor).unwrap();
+    ledger.pin_conflict_base_now(&conf_rel, "pages/Note.md").unwrap();
+    // Move the winner's own entry on, so only the PIN can still name the true
+    // ancestor — the diff and the apply must both read it through the pin.
+    ledger.record_now("pages/Note.md", mine).unwrap();
+    assert_eq!(
+        ledger.conflict_base(&conf_rel, "pages/Note.md").as_deref(),
+        Some(ancestor)
+    );
+
+    let diff = graph
+        .sync_conflict_diff("pages/Note.md", &conf_rel)
+        .unwrap()
+        .expect("diff");
+    assert!(diff.three_way);
+    let row = flatten(&diff.rows)
+        .into_iter()
+        .find(|r| r.merged.is_some())
+        .expect("a merged proposal");
+    assert_eq!(row.suggestion.as_deref(), Some("merged"));
+    let proposal = row.merged.as_ref().unwrap();
+    assert_eq!(proposal.source, MergedSource::Computed);
+    assert!(
+        proposal.text.starts_with("Desktop kk"),
+        "{:?}",
+        proposal.text
+    );
+
+    // A "merged" decision on a row that was never offered one refuses the WHOLE
+    // resolve — no side is silently substituted, and nothing is written.
+    let forged = HashMap::from([("0".to_string(), "merged".to_string())]);
+    let error = graph
+        .resolve_sync_conflict(
+            "pages/Note.md",
+            &conf_rel,
+            &forged,
+            &diff.base_rev,
+            &diff.conflict_rev,
+            "union",
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),
+        mine,
+        "a refused resolve must not write"
+    );
+    assert!(
+        root.join("pages").join(conflict_name).exists(),
+        "a refused resolve must not trash the copy"
+    );
+
+    // The confirmed merge writes the composed body through the normal path.
+    let decisions = HashMap::from([(row.id.clone(), "merged".to_string())]);
+    graph
+        .resolve_sync_conflict(
+            "pages/Note.md",
+            &conf_rel,
+            &decisions,
+            &diff.base_rev,
+            &diff.conflict_rev,
+            "union",
+        )
+        .expect("the confirmed merged body applies");
+    let written = std::fs::read_to_string(root.join("pages/Note.md")).unwrap();
+    assert!(written.contains("- Desktop kk"), "{written:?}");
+    assert!(
+        written.contains("id:: aaaaaaaa-0000-0000-0000-0000000000d5"),
+        "the block's id:: must survive the merge: {written:?}"
+    );
+    assert!(written.contains("- shared intro line"), "{written:?}");
+
+    // Trash staging and the ledger pin drop are untouched by the new outcome.
+    assert!(!root.join("pages").join(conflict_name).exists());
+    let trash = root.join("logseq").join(".tine-trash").join("conflicts");
+    assert!(
+        std::fs::read_dir(&trash)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains("sync-conflict")),
+        "conflict copy not staged in trash"
+    );
+    ledger.flush();
+    assert_ne!(
+        ledger.conflict_base(&conf_rel, "pages/Note.md").as_deref(),
+        Some(ancestor),
+        "the resolve must drop the pin"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&ledger_dir).ok();
+}
+
+
 }
 
 /// Manual measurement (Concord P3 deliverable): save-path overhead of the

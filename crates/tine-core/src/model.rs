@@ -237,6 +237,14 @@ fn bad_path() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid file path")
 }
 
+/// A confirmed `"merged"` row decision the resolve could not re-derive from the
+/// same base (see [`crate::sync_diff::MergeRefused`]). Refusing the whole
+/// resolve is the point: no side is silently substituted for the merged body
+/// the user approved, and nothing has been written when this is returned.
+fn merge_refused(refusal: crate::sync_diff::MergeRefused) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, refusal.to_string())
+}
+
 /// Capability-issued evidence that one exact projection target was durably
 /// published or recovered at one exact graph-relative path.
 #[derive(Debug)]
@@ -11875,8 +11883,18 @@ impl Graph {
         }
         let mine_doc = parse_doc(&path, &sides.mine);
         let theirs_doc = parse_doc(&path, &sides.theirs);
-        let merged_roots =
-            crate::sync_diff::merge_blocks(&mine_doc.roots, &theirs_doc.roots, decisions);
+        // Same ancestor the marker diff used: the reconstructed base side, which
+        // `parse_vcs_marker_sides` supplies only when EVERY region carried one.
+        // The `base_rev` guard above pins the whole marker file, so mine, theirs
+        // and this base are all still the exact bytes the UI decided against.
+        let base_doc = sides.base.as_deref().map(|base| parse_doc(&path, base));
+        let merged_roots = crate::sync_diff::merge_blocks3(
+            base_doc.as_ref().map(|doc| doc.roots.as_slice()),
+            &mine_doc.roots,
+            &theirs_doc.roots,
+            decisions,
+        )
+        .map_err(merge_refused)?;
         let pre_block = match pre_choice {
             "theirs" => theirs_doc.pre_block.clone(),
             "mine" => mine_doc.pre_block.clone(),
@@ -12064,7 +12082,8 @@ impl Graph {
             page,
             Document {
                 pre_block,
-                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions)
+                    .map_err(merge_refused)?,
             },
         )?;
         let cacheable = self.managed_path_is_cacheable(&write, &path)?;
@@ -12116,7 +12135,8 @@ impl Graph {
             page,
             Document {
                 pre_block,
-                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions)
+                    .map_err(merge_refused)?,
             },
         )?;
         let rev = self.force_save_page_at_revision(&resolved, base_rev, presented)?;
@@ -12258,9 +12278,10 @@ impl Graph {
     }
 
     /// Resolve a sync-conflict copy: build the merged winner from the user's
-    /// per-row `decisions` (row id → `"mine"`/`"theirs"`/`"both"`, see
-    /// [`crate::sync_diff::merge_blocks`]), write it through the NORMAL round-
-    /// tripping save path, and move the conflict copy to the recoverable trash.
+    /// per-row `decisions` (row id → `"mine"`/`"theirs"`/`"both"`/`"merged"`,
+    /// see [`crate::sync_diff::merge_blocks3`]), write it through the NORMAL
+    /// round-tripping save path, and move the conflict copy to the recoverable
+    /// trash.
     ///
     /// Data-safety invariants (ADR 0012 one-writer + ADR 0007 never-silently-
     /// overwrite), mirroring [`merge_pages`]:
@@ -12331,8 +12352,25 @@ impl Graph {
         }
         let mine_doc = parse_doc(&win, &win_content);
         let theirs_doc = parse_doc(&conf, &conf_content);
-        let merged_roots =
-            crate::sync_diff::merge_blocks(&mine_doc.roots, &theirs_doc.roots, decisions);
+        // Re-derive the SAME base `sync_conflict_diff` published suggestions
+        // against — ledger pin included, and the same "a base identical to the
+        // winner is the admission artifact" filter. Invariant: the pin is held
+        // for this conflict copy until the resolve below drops it, and the
+        // `base_rev`/`conflict_rev` guards pin mine/theirs, so all three inputs
+        // to a `"merged"` decision are byte-identical to the ones the user saw.
+        let base_doc = self
+            .concord_ledger
+            .get()
+            .and_then(|ledger| ledger.conflict_base(conflict_rel, winner_rel))
+            .filter(|base| base != &win_content)
+            .map(|base_content| parse_doc(&win, &base_content));
+        let merged_roots = crate::sync_diff::merge_blocks3(
+            base_doc.as_ref().map(|doc| doc.roots.as_slice()),
+            &mine_doc.roots,
+            &theirs_doc.roots,
+            decisions,
+        )
+        .map_err(merge_refused)?;
         let pre_block = match pre_choice {
             "theirs" => theirs_doc.pre_block.clone(),
             "mine" => mine_doc.pre_block.clone(),
@@ -35207,6 +35245,84 @@ mod tests {
         // The quarantine lifts by itself: the file simply has no markers now.
         assert!(Graph::open(&dir).list_vcs_marker_conflicts().is_empty());
         assert!(Graph::open(&dir).conflict_queue().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The marker resolver's ancestor is the SAME reconstructed base side the
+    /// marker diff used, so a `"merged"` row re-derives the body it offered.
+    #[test]
+    fn resolving_markers_can_apply_a_confirmed_merged_body() {
+        const DISJOINT: &str = concat!(
+            "- shared top\n",
+            "<<<<<<< HEAD\n- the shared desktop machine label\n",
+            "||||||| merged common ancestors\n- the shared desktop machine label 5\n",
+            "=======\n- the shared desktop machine label 5 kk\n",
+            ">>>>>>> feature\n",
+        );
+        let dir = scratch("concord-marker-merged");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, DISJOINT).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        assert!(diff.three_way);
+        let row = diff
+            .rows
+            .iter()
+            .find(|row| row.merged.is_some())
+            .expect("a merged proposal");
+        assert_eq!(row.suggestion.as_deref(), Some("merged"));
+        assert_eq!(
+            row.merged.as_ref().unwrap().text,
+            "the shared desktop machine label kk"
+        );
+
+        let decisions =
+            std::collections::HashMap::from([(row.id.clone(), "merged".to_string())]);
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("the confirmed merged body applies");
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(doc::vcs_conflict_markers(&after).is_empty(), "{after:?}");
+        assert_eq!(
+            doc::parse(&after)
+                .roots
+                .iter()
+                .map(|b| b.raw.trim().to_string())
+                .collect::<Vec<_>>(),
+            vec!["shared top", "the shared desktop machine label kk"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Without a reconstructed ancestor (a 2-marker conflict) the diff offers
+    /// nothing to merge, and a forged `"merged"` decision refuses the resolve.
+    #[test]
+    fn markers_without_an_ancestor_refuse_a_forged_merged_decision() {
+        const NO_BASE: &str = concat!(
+            "- shared top\n",
+            "<<<<<<< HEAD\n- the shared desktop machine label\n",
+            "=======\n- the shared desktop machine label 5 kk\n",
+            ">>>>>>> feature\n",
+        );
+        let dir = scratch("concord-marker-nobase");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, NO_BASE).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        assert!(!diff.three_way);
+        assert!(diff.rows.iter().all(|row| row.merged.is_none()));
+        let decidable = collect_decidable_ids(&diff.rows);
+        let decisions: std::collections::HashMap<String, String> = decidable
+            .iter()
+            .map(|id| (id.clone(), "merged".to_string()))
+            .collect();
+        let error = graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), NO_BASE);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -129,3 +129,17 @@ renderers).
 - The write exemption is one path in one mutex. It is the only way any Tine
   code can write a marker-bearing file, and it is enforced by
   `marker_resolution_is_guarded_and_never_leaves_the_file_writable`.
+
+## Addendum (2026-08-24) — the reserved fourth proposal, filled
+
+The seam left open above ("adopting it as a fourth, pre-selectable proposal")
+is now filled — by a *computed* proposal first: a `BothChanged` row whose edits
+are provably disjoint against the true ancestor offers the composed text as a
+suggested **Merged** outcome, rendered by the same shared row component and
+applied through the same guarded resolvers (recomputed at apply time, refused
+if recomputation fails). The proposal carries a provenance
+(`Computed`/`Artifact`); Fossil's `####### SUGGESTED CONFLICT RESOLUTION`
+section remains excluded from reconstructed sides and is QUEUED as the second,
+`Artifact`-provenance source filling the same slot, with computed proposals
+taking precedence. Design + Phase 2 spec:
+`tine-agents/specs/concord-intrablock-merge.md`.

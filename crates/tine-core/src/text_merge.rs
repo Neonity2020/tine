@@ -1,14 +1,15 @@
-//! Three-way classification of concurrent same-block text edits (GH #351).
+//! Character-level three-way machinery over one block body, shared by the two
+//! storage regimes. One bounded Myers diff, one hunk model, one composition —
+//! two collision rules, because the two regimes carry different authority:
 //!
-//! Given the common-ancestor text and the two authored after-states, classify
-//! whether the CRDT's character merge of the pair is a faithful union of two
-//! disjoint-region edits (ship it silently) or an overlap (keep both authored
-//! versions as sibling blocks; an interleave nobody typed is never shipped).
-//!
-//! The classifier is deliberately conservative: any doubt — overlapping or
-//! adjacent hunks, oversized inputs, a bounded diff search giving up, or a
-//! clean composition that disagrees with the CRDT merge (diff mis-anchoring
-//! on repetitive text) — resolves to `Conflict`.
+//! - [`classify_concurrent_edits`] (managed storage, GH #351) decides whether
+//!   the CRDT's merge may ship SILENTLY. It is deliberately conservative: any
+//!   doubt — overlapping OR merely adjacent hunks, oversized inputs, a bounded
+//!   diff search giving up, or a clean composition that disagrees with the CRDT
+//!   merge (diff mis-anchoring on repetitive text) — resolves to `Conflict`.
+//! - [`merge_disjoint`] (Direct Files / Concord) produces a merged body that is
+//!   only ever PRE-SELECTED for the user to confirm, never auto-applied, so it
+//!   uses the weaker rule of [`hunks_collide_relaxed`].
 
 /// Inputs larger than this (per text, in bytes) are classified `Conflict`
 /// without diffing; the bounded search below stays cheap.
@@ -98,6 +99,34 @@ pub fn classify_concurrent_edits(
     } else {
         TextMergeClassification::Conflict
     }
+}
+
+/// Three-way merge of two edits of `base` whose hunks are disjoint under the
+/// RELAXED rule (see [`hunks_collide_relaxed`]), for the Direct Files conflict
+/// resolver: the composition of both edits, or `None` when no merge may be
+/// offered at all — a nonempty-range overlap, two pure insertions at one
+/// position, oversized inputs, a bounded-diff give-up, or a side equal to
+/// `base` (a one-sided change needs no merge; the caller suggests that side).
+///
+/// The result is a PROPOSAL. It is recomputed from the same three texts at
+/// apply time and gated there again; nothing here is authority to write.
+pub fn merge_disjoint(base: &str, mine: &str, theirs: &str) -> Option<String> {
+    if base == mine || base == theirs {
+        return None;
+    }
+    if base.len() > MAX_CLASSIFIED_BYTES
+        || mine.len() > MAX_CLASSIFIED_BYTES
+        || theirs.len() > MAX_CLASSIFIED_BYTES
+    {
+        return None;
+    }
+    let base_chars: Vec<char> = base.chars().collect();
+    let my_hunks = diff_hunks(&base_chars, &mine.chars().collect::<Vec<_>>())?;
+    let their_hunks = diff_hunks(&base_chars, &theirs.chars().collect::<Vec<_>>())?;
+    if hunks_collide_relaxed(&my_hunks, &their_hunks) {
+        return None;
+    }
+    Some(compose(&base_chars, &my_hunks, &their_hunks))
 }
 
 /// Minimal character diff of `base -> target` as replaced base regions, via
@@ -222,6 +251,41 @@ fn hunks_collide(mine: &[Hunk], theirs: &[Hunk]) -> bool {
         for b in theirs {
             let disjoint = a.base_end < b.base_start || b.base_end < a.base_start;
             if !disjoint {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when any hunk of one side overlaps a hunk of the other in a NONEMPTY
+/// base interval, or both are pure insertions at the same position (their
+/// relative order is unknowable).
+///
+/// Deliberately weaker than [`hunks_collide`]: touching delete/insert pairs
+/// compose deterministically (see [`compose`]'s `(start, end)` order) and so
+/// merge here. The asymmetry is the authority difference — the strict rule
+/// gates a SILENT apply, this one gates a suggestion the user confirms.
+fn hunks_collide_relaxed(mine: &[Hunk], theirs: &[Hunk]) -> bool {
+    // A pure insertion strictly inside the other side's replaced range: the
+    // insertion's anchor no longer exists in the merged text, and `compose`
+    // (which walks base ranges in order) would see interleaved ranges.
+    fn inserts_strictly_inside(ins: &Hunk, other: &Hunk) -> bool {
+        ins.base_start == ins.base_end
+            && other.base_start < ins.base_start
+            && ins.base_start < other.base_end
+    }
+    for a in mine {
+        for b in theirs {
+            let overlaps = a.base_start.max(b.base_start) < a.base_end.min(b.base_end);
+            let same_point_insertions = a.base_start == a.base_end
+                && b.base_start == b.base_end
+                && a.base_start == b.base_start;
+            if overlaps
+                || same_point_insertions
+                || inserts_strictly_inside(a, b)
+                || inserts_strictly_inside(b, a)
+            {
                 return true;
             }
         }
@@ -356,5 +420,119 @@ mod tests {
             classify_concurrent_edits(&big, "a", "b", "ab"),
             TextMergeClassification::Conflict
         );
+    }
+
+    // --- merge_disjoint (Direct Files suggestion path) --------------------
+
+    /// The flagship case the relaxed rule exists for: a trailing deletion and
+    /// an append that merely TOUCH. Both argument orders compose identically,
+    /// because `compose` orders hunks by `(base_start, base_end)`.
+    #[test]
+    fn touching_delete_and_append_merge_in_either_order() {
+        assert_eq!(
+            merge_disjoint("Desktop 5", "Desktop", "Desktop 5 kk").as_deref(),
+            Some("Desktop kk")
+        );
+        assert_eq!(
+            merge_disjoint("Desktop 5", "Desktop 5 kk", "Desktop").as_deref(),
+            Some("Desktop kk")
+        );
+    }
+
+    #[test]
+    fn insertion_touching_a_following_deletion_merges() {
+        // base "ab": theirs inserts "X" at [0,0), mine deletes "a" at [0,1).
+        assert_eq!(merge_disjoint("ab", "b", "Xab").as_deref(), Some("Xb"));
+        assert_eq!(merge_disjoint("ab", "Xab", "b").as_deref(), Some("Xb"));
+    }
+
+    #[test]
+    fn disjoint_region_edits_merge() {
+        assert_eq!(
+            merge_disjoint("alpha beta gamma", "ALPHA beta gamma", "alpha beta GAMMA").as_deref(),
+            Some("ALPHA beta GAMMA")
+        );
+    }
+
+    #[test]
+    fn same_point_double_insertion_is_no_merge() {
+        assert_eq!(merge_disjoint("one two", "one extra two", "one other two"), None);
+    }
+
+    #[test]
+    fn nonempty_range_overlap_is_no_merge() {
+        assert_eq!(
+            merge_disjoint("alpha beta gamma", "ALPHA BETA gamma", "alpha BETA GAMMA"),
+            None
+        );
+    }
+
+    /// A side equal to the base is a one-sided change: the caller suggests that
+    /// side outright, so no merge is offered (and never one for both sides).
+    #[test]
+    fn a_side_equal_to_base_is_no_merge() {
+        assert_eq!(merge_disjoint("base", "base", "edited"), None);
+        assert_eq!(merge_disjoint("base", "edited", "base"), None);
+    }
+
+    /// Identical edits produce identical hunks, which collide with themselves.
+    #[test]
+    fn identical_edits_are_no_merge() {
+        assert_eq!(merge_disjoint("base", "same edit", "same edit"), None);
+    }
+
+    #[test]
+    fn oversized_inputs_are_no_merge() {
+        let big = "x".repeat(MAX_CLASSIFIED_BYTES + 1);
+        assert_eq!(merge_disjoint(&big, "a", "b"), None);
+    }
+
+    /// Two full replacements exceed `MAX_EDIT_DISTANCE`; the bounded search
+    /// gives up and no merge is offered.
+    #[test]
+    fn bounded_diff_give_up_is_no_merge() {
+        let base = "a".repeat(MAX_EDIT_DISTANCE);
+        let mine = "b".repeat(MAX_EDIT_DISTANCE);
+        let theirs = "c".repeat(MAX_EDIT_DISTANCE);
+        assert_eq!(merge_disjoint(&base, &mine, &theirs), None);
+    }
+
+    /// Repeated text: the diff anchors on the FIRST match, so an edit the human
+    /// made to the second "ab" is attributed to the first. The composition is
+    /// still deterministic and disjoint — documenting the accepted behavior,
+    /// which the user confirms before anything is written.
+    #[test]
+    fn repeated_text_merges_at_the_diffs_anchor() {
+        // Both sides append distinct suffixes to different "ab" occurrences.
+        assert_eq!(merge_disjoint("ab ab", "Xab ab", "ab abY").as_deref(), Some("Xab abY"));
+        // Deleting one of two identical words anchors on the first match.
+        assert_eq!(merge_disjoint("ab ab", "ab", "ab ab!").as_deref(), Some("ab!"));
+    }
+
+    /// Hunk boundaries are char-indexed, so multi-byte characters on either
+    /// side of a boundary survive the composition intact.
+    #[test]
+    fn multibyte_chars_across_a_hunk_boundary_merge() {
+        assert_eq!(
+            merge_disjoint("káva a čaj", "KÁVA a čaj", "káva a ČAJ").as_deref(),
+            Some("KÁVA a ČAJ")
+        );
+        // Touching pair around a multi-byte char: delete "čaj", append after it.
+        assert_eq!(
+            merge_disjoint("káva a čaj", "káva a ", "káva a čaj ♥").as_deref(),
+            Some("káva a  ♥")
+        );
+    }
+
+    #[test]
+    fn insertion_strictly_inside_the_others_deletion_is_no_merge() {
+        // mine deletes "bcde" (hunk [1,5)); theirs inserts X between c and d
+        // (pure insertion at 3, strictly inside). Must be None, not a panic
+        // or an interleave.
+        assert_eq!(merge_disjoint("abcdef", "af", "abcXdef"), None);
+    }
+    #[test]
+    fn whole_replacement_by_one_side_still_collides() {
+        assert_eq!(merge_disjoint("hello", "goodbye", "hello!"), None);
     }
 }

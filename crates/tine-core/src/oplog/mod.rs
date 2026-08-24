@@ -60,7 +60,11 @@ pub mod sqlite;
 mod sqlite_identity;
 pub mod sqlite_materialization;
 pub mod sync_layout;
-pub mod text_merge;
+/// The character-level three-way machinery now lives at the crate root
+/// (`crate::text_merge`) because Direct Files' conflict resolver shares it;
+/// this re-export keeps `oplog::text_merge::…` naming its managed-storage
+/// classifier.
+pub use crate::text_merge;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;

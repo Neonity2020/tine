@@ -239,8 +239,9 @@ page**, above the outline, block by block:
 - The two sides are named by whatever produced them — a git ref like `HEAD` and
   the incoming branch, or the Syncthing device/timestamp tag — and coloured
   consistently in the legend, the columns, and the buttons.
-- Each differing block gets its own choice: keep one side, keep the other, or
-  **keep both**.
+- Each differing block gets its own choice: keep one side, keep the other,
+  **keep both** — or, when both sides edited provably different parts of the
+  block's text, accept a **merged** version that combines the two edits.
 - `N conflicts` with ↑ / ↓ walks between the blocks that need a decision.
 
 **A suggested resolution is pre-selected.** Where a common ancestor is known
@@ -250,9 +251,16 @@ a block only one side changed arrives with that side already chosen and labeled
 hunt-and-compare. **Apply all suggested** re-applies that opening position after
 you have experimented.
 
-Where no ancestor answers the question — both sides changed the block, or no
-common version is known — the pre-selection is **keep both**, which loses
-nothing. Keeping both writes the two versions as **adjacent sibling blocks**:
+A block **both** sides changed can still arrive with a suggestion: when the
+two edits touch provably different parts of the text against the known
+ancestor — one device fixed the start of a sentence while the other appended
+to its end — Tine offers the combined text as a pre-selected **Merged** row.
+It is a suggestion like any other: shown, labeled, and applied only when you
+confirm. Edits that overlap (or whose combination Tine cannot vouch for) get
+no merged offer.
+
+Where no ancestor answers the question, or the edits genuinely collide, the
+pre-selection is **keep both**, which loses nothing. Keeping both writes the two versions as **adjacent sibling blocks**:
 ordinary outline Markdown that every other tool can read. Tine never invents a
 marker or a property to record that a block was contested.
 
@@ -342,8 +350,9 @@ When you review a conflict, Tine uses that ancestor when it has one:
 - A block only **you** changed arrives with *your* version pre-selected.
 - A block only the **other device** changed arrives with *its* version
   pre-selected.
-- A block **both** sides changed is a real conflict — no pre-selection; you
-  decide.
+- A block **both** sides changed is a real conflict. If the two edits touch
+  provably different parts of the text, a combined **Merged** version is
+  offered pre-selected; otherwise there is no pre-selection and you decide.
 
 Pre-selected rows are labeled *suggested*, and the toolbar says when
 suggestions are in play. Nothing is ever merged automatically — you review the
