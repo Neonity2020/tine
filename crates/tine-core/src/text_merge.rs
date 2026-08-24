@@ -158,6 +158,11 @@ fn diff_hunks(base: &[char], target: &[char]) -> Option<Vec<Hunk>> {
 /// Longest common subsequence as `(base_index, target_index)` match pairs,
 /// via Myers O(ND) with a bounded distance. `None` when the bound is hit.
 fn lcs_matches(base: &[char], target: &[char]) -> Option<Vec<(usize, usize)>> {
+    if base.is_empty() && target.is_empty() {
+        // With both sides empty the bound is 0, so `v` holds a single cell and
+        // step 0 indexes one past it. Every other shape gives bound >= 1.
+        return Some(Vec::new());
+    }
     let n = base.len();
     let m = target.len();
     let max = n + m;
@@ -543,5 +548,14 @@ mod tests {
     #[test]
     fn whole_replacement_by_one_side_still_collides() {
         assert_eq!(merge_disjoint("hello", "goodbye", "hello!"), None);
+    }
+
+    #[test]
+    fn lcs_of_two_empty_inputs_is_an_empty_match_list() {
+        // Latent: today's public entry points both return early on
+        // `base == mine`/`base == theirs`, so neither can reach this. The
+        // guard belongs to the module rather than to its callers, because a
+        // future caller of `diff_hunks` would inherit the panic silently.
+        assert_eq!(lcs_matches(&[], &[]), Some(Vec::new()));
     }
 }
