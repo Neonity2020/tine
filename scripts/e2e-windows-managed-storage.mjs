@@ -273,7 +273,7 @@ async function waitForActivation() {
   throw new Error(`managed activation timed out; last body=${last.slice(-1000)}`);
 }
 
-async function openPage(title) {
+async function openPage(title, { expectedMarker = nestedMarker } = {}) {
   // WebView2 attachment does not guarantee native keyboard focus. Fixture
   // navigation is not a shortcut assertion, so enter the switcher through its
   // visible application control.
@@ -295,7 +295,11 @@ async function openPage(title) {
     return false;
   }, { timeout: 30_000, timeoutMsg: `Ctrl+K did not find ${title}` });
   await row.click();
-  await waitForBody(nestedMarker, 30_000, "nested UTF page after activation");
+  const heading = await browser.$("h1.page-title");
+  await heading.waitForExist({ timeout: 30_000 });
+  if (expectedMarker) {
+    await waitForBody(expectedMarker, 30_000, "nested UTF page after activation");
+  }
 }
 
 async function createManagedPageAndAttemptEdit() {
@@ -429,8 +433,12 @@ try {
   receipt.milestones.activationMs = Date.now() - activationStarted;
   assertSameSource(before, "managed activation");
   await closeSettings();
-  await openPage(nestedTitle);
-  receipt.milestones.managedPageOpened = true;
+  // v0.6.94 may publish the managed page shell while leaving its body blank.
+  // That is predecessor evidence for #370, not a reason to abort before the
+  // candidate gets a chance to recover the same private state.  Require the
+  // candidate below to serve the actual marker.
+  await openPage(nestedTitle, { expectedMarker: null });
+  receipt.milestones.baselineManagedPageBodyVisible = (await bodyText()).includes(nestedMarker);
   receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
 
   // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the
