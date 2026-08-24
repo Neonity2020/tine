@@ -98,9 +98,11 @@ async function openPage(name) {
   // while the sidebar is still absent or intentionally collapsed, so use the
   // app's visible search control and wait for the exact indexed page instead
   // of treating one incidental startup surface as readiness proof.
-  const search = await browser.$('button[title^="Search (Ctrl+K)"]');
-  await search.waitForClickable({ timeout: 20_000 });
-  await search.click();
+  // The global shortcut is also the production route when compact/native
+  // chrome has the sidebar button outside the current viewport. Requiring that
+  // incidental button to be WebDriver-clickable made the Windows journey fail
+  // behind an otherwise ready journal at narrow/default window geometry.
+  await browser.keys(["Control", "k"]);
   const input = await browser.$(".switcher-input");
   await input.waitForExist({ timeout: 10_000 });
   await input.setValue(name);
