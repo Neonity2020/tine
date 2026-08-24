@@ -368,6 +368,8 @@ export interface Backend {
   existingPageNames(names: string[]): Promise<string[]>;
   /** Persist favorited page names to config.edn `:favorites`. */
   setFavorites(names: string[]): Promise<void>;
+  /** Persist (or clear) config.edn `:default-home {:page "..."}`. */
+  setDefaultHome(name: string | null): Promise<void>;
   /** Persist the task workflow to config.edn `:preferred-workflow`. */
   setPreferredWorkflow(workflow: "now" | "todo"): Promise<void>;
   /** Persist `:feature/enable-timetracking?` (default on when absent). */
@@ -770,6 +772,7 @@ export function isTauri(): boolean {
  * graph without adding it here reintroduces the round-15 blockers.
  */
 const REBINDING_COMMANDS = new Set([
+  "set_default_home",
   "set_journal_title_format",
   "set_preferred_format",
   "set_timetracking_enabled",
@@ -1114,6 +1117,9 @@ class TauriBackend implements Backend {
   }
   setFavorites(names: string[]) {
     return this.call<void>("set_favorites", { names });
+  }
+  setDefaultHome(name: string | null) {
+    return this.call<void>("set_default_home", { name });
   }
   setPreferredWorkflow(workflow: "now" | "todo") {
     return this.call<void>("set_preferred_workflow", { workflow });

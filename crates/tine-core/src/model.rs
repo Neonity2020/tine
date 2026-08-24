@@ -5066,6 +5066,9 @@ pub struct GraphMeta {
     pub block_hidden_properties: Vec<String>,
     /// Template name applied to a new, empty journal page (if configured).
     pub default_journal_template: Option<String>,
+    /// Graph-portable startup page from `:default-home {:page "..."}`.
+    #[serde(default)]
+    pub default_home: Option<String>,
     /// Favorited page names (read from config.edn `:favorites`).
     pub favorites: Vec<String>,
     /// Effective journal title format (`:journal/page-title-format`, default
@@ -10695,6 +10698,7 @@ impl Graph {
             start_of_week: self.config.start_of_week,
             block_hidden_properties: self.config.block_hidden_properties.clone(),
             default_journal_template: self.config.default_journal_template.clone(),
+            default_home: self.config.default_home.clone(),
             favorites: self.config.favorites.clone(),
             journal_page_title_format: self.journal_format.title_format().to_string(),
             journal_file_name_format: self.journal_format.file_format().to_string(),

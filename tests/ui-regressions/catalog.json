@@ -6249,7 +6249,8 @@
       "family": "graph-open",
       "sources": {
         "issues": [
-          245
+          245,
+          269
         ],
         "commits": []
       },
@@ -6261,12 +6262,13 @@
       "coverage": {
         "tests": [
           "src/graph.test.tsx",
-          "src/components/Settings.homePage.test.tsx"
+          "src/components/Settings.homePage.test.tsx",
+          "src/homePage.test.ts"
         ],
         "scenario": "graph.home-page-open-and-stale",
         "failBefore": "proven"
       },
-      "notes": "GH #245. homePage.ts stores the per-graph setting as an app-settings string keyed by graph root (frontend-only; adding a config.edn owner would have touched the prohibited Rust storage surface). graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads — never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before proven by manager mutation probe at integration (2026-08-06): disabling the loadGraphPath home-page call fails 2 of the 19 tests in graph.test.tsx. Tests were written after the implementation in the delegated lane; the probe supplies the causal evidence."
+      "notes": "GH #245 and #269. homePage.ts now uses graph metadata backed by Logseq's :default-home {:page ...} entry in logseq/config.edn, with a guarded one-time migration from the former per-device app-settings string. graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads — never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before for the navigation behavior was proven by manager mutation probe at integration (2026-08-06); fail-before for graph ownership was proven by src/homePage.test.ts returning the stale device-local value instead of graph metadata on the pre-fix source."
     },
     {
       "id": "UI-THEME-SYSTEM-MODE-193",

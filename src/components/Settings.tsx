@@ -1999,10 +1999,9 @@ function JournalsTab(props: { search: string }): JSX.Element {
   );
 }
 
-// Optional graph home page (GH #245): opened automatically in the primary tab
-// whenever this graph is opened. The value lives in the per-graph app-settings
-// string (see homePage.ts); picking only offers existing pages and a stale
-// value is surfaced with an explicit Clear.
+// Optional graph home page (GH #245/#269): opened automatically in the primary
+// tab whenever this graph is opened. Logseq-compatible config.edn owns it;
+// picking only offers existing pages and a stale value has an explicit Clear.
 function HomePageField(): JSX.Element {
   const root = () => graphMeta()?.root ?? "";
   const [value, setValue] = createSignal<string | null>(null);
@@ -2060,7 +2059,7 @@ function HomePageField(): JSX.Element {
   const commit = async (name: string) => {
     const r = root();
     if (!r) return;
-    await setHomePageSetting(r, name);
+    if (!(await setHomePageSetting(r, name))) return;
     setValue(name.trim());
     setPicking(false);
     setQ("");
@@ -2069,7 +2068,7 @@ function HomePageField(): JSX.Element {
   const clear = async () => {
     const r = root();
     if (!r) return;
-    await setHomePageSetting(r, null);
+    if (!(await setHomePageSetting(r, null))) return;
     setValue("");
     setQ("");
     setDq("");

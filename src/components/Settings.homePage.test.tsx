@@ -77,7 +77,7 @@ describe("Settings home page row (GH #245)", () => {
     const quickSwitch = vi.spyOn(backend(), "quickSwitch").mockResolvedValue([
       { name: "Directory", kind: "page", date_key: null, path: "pages/directory.md" },
     ]);
-    const setAppString = vi.spyOn(backend(), "setAppString");
+    const setDefaultHome = vi.spyOn(backend(), "setDefaultHome");
     setGraphMeta(META);
 
     const { root, dispose } = await mount();
@@ -95,7 +95,7 @@ describe("Settings home page row (GH #245)", () => {
     ) as HTMLButtonElement;
     suggestion.click();
     await vi.waitFor(() =>
-      expect(setAppString).toHaveBeenCalledWith(`home.page.${ROOT}`, "Directory")
+      expect(setDefaultHome).toHaveBeenCalledWith("Directory")
     );
     await vi.waitFor(() =>
       expect(field(root)!.querySelector("[data-home-page-value]")?.textContent).toBe("Directory")
@@ -106,7 +106,7 @@ describe("Settings home page row (GH #245)", () => {
   it("surfaces a stored value that no longer resolves, and clears it", async () => {
     await backend().setAppString(KEY, "Ghost");
     vi.spyOn(backend(), "getPage").mockResolvedValue(null);
-    const setAppString = vi.spyOn(backend(), "setAppString");
+    const setDefaultHome = vi.spyOn(backend(), "setDefaultHome");
     setGraphMeta(META);
 
     const { root, dispose } = await mount();
@@ -122,9 +122,11 @@ describe("Settings home page row (GH #245)", () => {
       (b) => b.textContent === "Clear"
     ) as HTMLButtonElement;
     clear.click();
-    await vi.waitFor(() => expect(setAppString).toHaveBeenCalledWith(KEY, ""));
+    await vi.waitFor(() => expect(setDefaultHome).toHaveBeenCalledWith(null));
     await vi.waitFor(() => expect(field(root)!.querySelector("[data-home-page-value]")).toBeNull());
-    expect(field(root)!.querySelector("input.settings-input")).not.toBeNull();
+    await vi.waitFor(() =>
+      expect(field(root)!.querySelector("input.settings-input")).not.toBeNull()
+    );
     dispose();
   });
 });

@@ -62,6 +62,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A graph's Home page setting now follows the graph between devices** (GH
+  #269). Tine reads and writes Logseq's `:default-home {:page "..."}` entry in
+  `logseq/config.edn`, preserves other keys in that map, and safely migrates an
+  older device-local setting after the graph opens.
+
 - **Resolving merge markers inside Tine now stages the pre-resolution file in
   the recoverable trash** (Settings → Backups & recovery), so the sides you
   did not choose stay recoverable — the same guarantee resolving a sync

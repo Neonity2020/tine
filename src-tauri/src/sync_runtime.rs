@@ -6075,6 +6075,7 @@ mod tests {
             start_of_week: 6,
             block_hidden_properties: Vec::new(),
             default_journal_template: None,
+            default_home: None,
             favorites: Vec::new(),
             journal_page_title_format: "MMM do, yyyy".into(),
             journal_file_name_format: "yyyy_MM_dd".into(),
