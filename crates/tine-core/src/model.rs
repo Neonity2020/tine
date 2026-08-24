@@ -5218,7 +5218,18 @@ impl Graph {
             validate_managed_dir(&graph.root, "assets", "assets")?;
             graph.assets_root = graph.root.join("assets");
         }
+        graph.recover_interrupted_publishes();
         Ok(graph)
+    }
+
+    /// Restore any small file left mid-publish by a crash.
+    ///
+    /// [`atomic_replace_expected`] vacates the target name for the length of one
+    /// rename, so a crash in that window leaves the content under a `.retired`
+    /// sibling and the file itself missing. Runs once per checked open, over the
+    /// registered directories only - never a whole-graph walk.
+    pub fn recover_interrupted_publishes(&self) -> usize {
+        restore_retired_files(&self.root, &[self.root.join("logseq")])
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
@@ -22787,13 +22798,231 @@ pub(crate) fn atomic_write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.sync_all()?;
         drop(file);
         move_file_noreplace(&tmp, path)?;
-        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
-        Ok(())
+        sync_dir(dir)
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     res
+}
+
+/// Suffix marking a file retired by [`atomic_replace_expected`] mid-publish.
+pub(crate) const RETIRED_SUFFIX: &str = ".retired";
+
+/// True for dir-fsync errors that mean "this filesystem does not offer it",
+/// as opposed to a real durability failure.
+///
+/// Directory fsync is genuinely unavailable in several places: Windows has no
+/// handle you can open this way, and some network filesystems reject it. Those
+/// must stay non-fatal — that is why the call was best-effort to begin with.
+/// A real `EIO`/`ENOSPC`, though, means the rename may not survive a crash, and
+/// reporting durable success there is a false ack.
+fn dir_fsync_is_unsupported(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Unsupported
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::NotFound
+    ) {
+        return true;
+    }
+    // EBADF / EACCES / EISDIR / EINVAL from an fsync on a directory handle: the
+    // filesystem (several NFS and FUSE implementations) is telling us the
+    // operation does not apply, not that data was lost.
+    const UNSUPPORTED_ERRNOS: [i32; 4] = [9, 13, 21, 22];
+    error
+        .raw_os_error()
+        .is_some_and(|errno| UNSUPPORTED_ERRNOS.contains(&errno))
+}
+
+/// fsync a directory so a rename into it survives a crash.
+///
+/// Errors that mean "unsupported here" are swallowed; everything else is
+/// propagated, because a caller told the durability succeeded when it did not
+/// will happily report a save as committed.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match fs::File::open(dir).and_then(|handle| handle.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(error) if dir_fsync_is_unsupported(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Outcome of a conditional publish.
+#[derive(Debug)]
+pub(crate) enum AtomicReplaceOutcome {
+    /// `next` is now the file's content.
+    Published,
+    /// Someone else wrote the file first; nothing was published. Carries the
+    /// bytes actually found, so the caller can retry, refuse, or preserve them.
+    ExternalChanged(Vec<u8>),
+}
+
+/// Publish `next` to `path` ONLY if `path` still holds `expected`.
+///
+/// A plain temp+rename publish silently clobbers whatever arrived after the
+/// caller's last read: Syncthing delivering a peer's `config.edn`, Logseq
+/// writing the same file, an external editor saving a sidecar. Those bytes
+/// vanish with no conflict copy and no refusal, which is exactly the class
+/// ADR 0007 forbids for pages.
+///
+/// Checking the file and then renaming over it cannot fix that — the check and
+/// the rename are two operations and the writer lands between them. So the
+/// capture IS the rename: `path` is renamed aside to a unique sibling first,
+/// which atomically takes whatever was current, and the comparison happens on
+/// a name nobody else is writing.
+///
+/// The threat model is honest concurrent writers (crash/power loss, sync
+/// delivery, external editors, a second instance), not an attacker forging
+/// bytes with local write access — see the 2026-08-07 trust decision.
+pub(crate) fn atomic_replace_expected(
+    path: &Path,
+    expected: &[u8],
+    next: &[u8],
+) -> io::Result<AtomicReplaceOutcome> {
+    atomic_replace_expected_with_hooks(path, expected, next, || Ok(()))
+}
+
+fn atomic_replace_expected_with_hooks(
+    path: &Path,
+    expected: &[u8],
+    next: &[u8],
+    after_retire: impl Fn() -> io::Result<()>,
+) -> io::Result<AtomicReplaceOutcome> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let pid = std::process::id();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{fname}.{pid}.{seq}.publish.tmp"));
+    let retired = dir.join(format!(".{fname}.{pid}.{seq}{RETIRED_SUFFIX}"));
+
+    let staged = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(next)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+
+    // RETIRE: atomically capture whatever `path` currently holds. A no-replace
+    // rename would be wrong here - we intend to vacate the slot.
+    if let Err(error) = fs::rename(path, &retired) {
+        let _ = fs::remove_file(&tmp);
+        if error.kind() == io::ErrorKind::NotFound {
+            // The file we meant to update is gone: an external delete. Not ours
+            // to recreate silently.
+            return Ok(AtomicReplaceOutcome::ExternalChanged(Vec::new()));
+        }
+        return Err(error);
+    }
+
+    // A crash between here and the publish leaves the content in `retired`;
+    // `restore_retired_files` puts it back on next open.
+    if let Err(error) = after_retire() {
+        let _ = move_file_noreplace(&retired, path);
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+
+    let found = match fs::read(&retired) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = move_file_noreplace(&retired, path);
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+    };
+    if found != expected {
+        // Someone wrote between the caller's read and now. Put their bytes back
+        // and publish nothing.
+        let restored = move_file_noreplace(&retired, path);
+        let _ = fs::remove_file(&tmp);
+        if restored.is_err() {
+            // An even newer external CREATE took the name. Leave `retired` for
+            // the recovery sweep rather than deleting anyone's data.
+            return Ok(AtomicReplaceOutcome::ExternalChanged(found));
+        }
+        return Ok(AtomicReplaceOutcome::ExternalChanged(found));
+    }
+
+    // PUBLISH into the slot we vacated. No-replace: an AlreadyExists here means
+    // an external CREATE won the window, and its bytes are not ours to replace.
+    if let Err(error) = move_file_noreplace(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            let current = fs::read(path).unwrap_or_default();
+            // Our retired bytes stay on disk for the sweep to triage.
+            return Ok(AtomicReplaceOutcome::ExternalChanged(current));
+        }
+        let _ = move_file_noreplace(&retired, path);
+        return Err(error);
+    }
+
+    sync_dir(dir)?;
+    let _ = fs::remove_file(&retired);
+    Ok(AtomicReplaceOutcome::Published)
+}
+
+/// Recover files stranded mid-publish by a crash.
+///
+/// [`atomic_replace_expected`] briefly leaves `path` non-existent while its
+/// content sits under a `.retired` sibling. A crash in that window would
+/// otherwise look like a deleted file. Restores the content when the target is
+/// missing; otherwise the publish completed (or an external writer recreated
+/// the file), so the retired copy goes to recoverable trash rather than being
+/// deleted outright.
+///
+/// Registered directories only - never a whole-graph walk.
+pub(crate) fn restore_retired_files(root: &Path, dirs: &[PathBuf]) -> usize {
+    let mut recovered = 0usize;
+    for dir in dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let retired = entry.path();
+            let Some(name) = retired.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(target_name) = retired_target_name(name) else {
+                continue;
+            };
+            let target = dir.join(target_name);
+            if target.exists() {
+                // The publish completed, or an external writer recreated the
+                // file. Either way the retired copy is superseded - keep it
+                // recoverable instead of deleting it.
+                let trash = typed_trash_dir(root, TrashEntryKind::Conflict);
+                if fs::create_dir_all(&trash).is_ok() {
+                    let _ = move_file_noreplace(&retired, &trash.join(name));
+                }
+                continue;
+            }
+            if move_file_noreplace(&retired, &target).is_ok() {
+                recovered += 1;
+            }
+        }
+    }
+    recovered
+}
+
+/// `.config.edn.1234.7.retired` -> `config.edn`.
+fn retired_target_name(retired: &str) -> Option<&str> {
+    let rest = retired.strip_prefix('.')?;
+    let rest = rest.strip_suffix(RETIRED_SUFFIX)?;
+    let (rest, _seq) = rest.rsplit_once('.')?;
+    let (name, _pid) = rest.rsplit_once('.')?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Atomic write: write to a temp file in the same directory, then rename. The
@@ -22820,13 +23049,13 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp); // never leave a temp behind on failure
-    } else {
-        // Persist the rename itself: fsync the directory so a crash right after the
-        // write can't lose the new directory entry (the rename) on some
-        // filesystems. Best-effort — not all platforms allow fsync on a dir.
-        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+        return res;
     }
-    res
+    // Persist the rename itself: fsync the directory so a crash right after the
+    // write can't lose the new directory entry (the rename) on some filesystems.
+    // Unsupported-here errors are tolerated; a real one is reported, because a
+    // caller told this succeeded will report the save as durably committed.
+    sync_dir(dir)
 }
 
 fn managed_root_components(root: &str) -> Option<Vec<&str>> {
@@ -30947,10 +31176,9 @@ pub fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
-    } else {
-        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+        return res;
     }
-    res
+    sync_dir(dir)
 }
 
 /// Copy into a newly-created destination without replacing a path that appeared
@@ -30978,8 +31206,7 @@ pub fn atomic_copy_new(src: &Path, dst: &Path) -> io::Result<()> {
         output.sync_all()?;
         drop(output);
         move_file_noreplace(&tmp, dst)?;
-        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
-        Ok(())
+        sync_dir(dir)
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -31018,8 +31245,7 @@ pub fn atomic_copy_file_new(input: &mut fs::File, dst: &Path, max_bytes: u64) ->
         output.sync_all()?;
         drop(output);
         move_file_noreplace(&tmp, dst)?;
-        let _ = fs::File::open(dir).and_then(|directory| directory.sync_all());
-        Ok(())
+        sync_dir(dir)
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -31077,17 +31303,22 @@ fn atomic_update_with_hooks(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let published = if baseline.is_none() {
-            atomic_write_new(path, next.as_bytes())
-        } else {
-            atomic_write(path, next.as_bytes())
-        };
-        match published {
-            Ok(()) => return Ok(()),
-            Err(error) if baseline.is_none() && error.kind() == io::ErrorKind::AlreadyExists => {
-                continue;
+        match baseline.as_deref() {
+            // Creation is already no-clobber: `create_new` + no-replace rename.
+            None => match atomic_write_new(path, next.as_bytes()) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            },
+            // Update: the recheck above narrows the race but cannot close it -
+            // an external writer can still land between it and the rename. Make
+            // the publish itself conditional so their bytes cannot be lost.
+            Some(current) => {
+                match atomic_replace_expected(path, current.as_bytes(), next.as_bytes())? {
+                    AtomicReplaceOutcome::Published => return Ok(()),
+                    AtomicReplaceOutcome::ExternalChanged(_) => continue,
+                }
             }
-            Err(error) => return Err(error),
         }
     }
     Err(io::Error::new(
@@ -45486,6 +45717,159 @@ mod tests {
         assert!(final_content.contains(":external 2"));
         assert!(final_content.contains(":mine 3"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn atomic_update_existing_publish_preserves_a_concurrent_external_write() {
+        // A2: the recheck narrows the clobber window but cannot close it. With a
+        // baseline already on disk, an external writer (Syncthing delivering a
+        // peer's config.edn, Logseq, an editor) landing AFTER the recheck and
+        // before the rename used to be overwritten silently - no conflict copy,
+        // no refusal, no trace. The publish must be conditional.
+        let dir = scratch("atomic-update-existing-race");
+        let path = dir.join("config.edn");
+        fs::write(&path, "{:base 1}\n").unwrap();
+        let lock = std::sync::Mutex::new(());
+        let injected = std::sync::atomic::AtomicBool::new(false);
+        atomic_update_with_hooks(
+            &path,
+            &lock,
+            |content| Ok(content.replace('}', " :mine 3}")),
+            |_| {},
+            |_| {
+                if !injected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    fs::write(&path, "{:base 1 :external 2}\n").unwrap();
+                }
+            },
+        )
+        .unwrap();
+        let final_content = fs::read_to_string(&path).unwrap();
+        assert!(
+            final_content.contains(":external 2"),
+            "external bytes were clobbered: {final_content:?}"
+        );
+        assert!(
+            final_content.contains(":mine 3"),
+            "our edit was dropped: {final_content:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conditional_publish_refuses_when_the_file_changed_underneath() {
+        let dir = scratch("conditional-publish-refuses");
+        let path = dir.join("sidecar.edn");
+        fs::write(&path, b"expected").unwrap();
+        fs::write(&path, b"external").unwrap();
+        let outcome = atomic_replace_expected(&path, b"expected", b"ours").unwrap();
+        match outcome {
+            AtomicReplaceOutcome::ExternalChanged(found) => assert_eq!(found, b"external"),
+            AtomicReplaceOutcome::Published => panic!("published over an external write"),
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"external", "their bytes stand");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conditional_publish_leaves_no_retired_file_behind_on_success() {
+        let dir = scratch("conditional-publish-clean");
+        let path = dir.join("sidecar.edn");
+        fs::write(&path, b"expected").unwrap();
+        let outcome = atomic_replace_expected(&path, b"expected", b"ours").unwrap();
+        assert!(matches!(outcome, AtomicReplaceOutcome::Published));
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".retired") || name.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left {leftovers:?} behind");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_crash_between_retire_and_publish_is_recovered_byte_identical() {
+        // The window the protocol opens deliberately: `path` does not exist and
+        // its content lives under a `.retired` sibling. A crash there must not
+        // look like a deleted file.
+        let dir = scratch("retired-crash-recovery");
+        let path = dir.join("config.edn");
+        fs::write(&path, b"{:base 1}\n").unwrap();
+        let crashed = atomic_replace_expected_with_hooks(&path, b"{:base 1}\n", b"{:next 2}\n", || {
+            Err(io::Error::other("simulated crash after retire"))
+        });
+        assert!(crashed.is_err());
+        // The unwind restores it; simulate the harder case - a real crash, where
+        // nothing runs - by retiring again and abandoning it.
+        let retired = dir.join(".config.edn.999.0.retired");
+        fs::rename(&path, &retired).unwrap();
+        assert!(!path.exists(), "the window is real");
+
+        let recovered = restore_retired_files(&dir, &[dir.clone()]);
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"{:base 1}\n",
+            "content must come back byte-identical"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_keeps_a_superseded_retired_copy_instead_of_deleting_it() {
+        // The publish completed (or an external writer recreated the file), so
+        // the retired copy is superseded - but it is still the only copy of
+        // those bytes, so it goes to recoverable trash, never to /dev/null.
+        let dir = scratch("retired-superseded");
+        let path = dir.join("config.edn");
+        fs::write(&path, b"current").unwrap();
+        fs::write(dir.join(".config.edn.999.0.retired"), b"older").unwrap();
+
+        let recovered = restore_retired_files(&dir, &[dir.clone()]);
+
+        assert_eq!(recovered, 0);
+        assert_eq!(fs::read(&path).unwrap(), b"current", "current file untouched");
+        let trashed = typed_trash_dir(&dir, TrashEntryKind::Conflict).join(".config.edn.999.0.retired");
+        assert_eq!(
+            fs::read(&trashed).unwrap(),
+            b"older",
+            "the superseded copy must be recoverable"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_dir_fsync_that_is_merely_unsupported_is_not_a_durability_failure() {
+        // The best-effort discard existed because dir fsync genuinely does not
+        // exist everywhere. Keep tolerating that, and only that.
+        for kind in [
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+        ] {
+            assert!(dir_fsync_is_unsupported(&io::Error::new(kind, "x")), "{kind:?}");
+        }
+        for errno in [9, 13, 21, 22] {
+            assert!(dir_fsync_is_unsupported(&io::Error::from_raw_os_error(errno)));
+        }
+        // A real durability failure must surface.
+        for errno in [5 /* EIO */, 28 /* ENOSPC */] {
+            assert!(
+                !dir_fsync_is_unsupported(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} must not be swallowed"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_names_round_trip_to_their_target() {
+        assert_eq!(retired_target_name(".config.edn.123.7.retired"), Some("config.edn"));
+        assert_eq!(retired_target_name(".a.b.c.md.1.2.retired"), Some("a.b.c.md"));
+        assert_eq!(retired_target_name("config.edn"), None);
+        assert_eq!(retired_target_name(".config.edn.tmp"), None);
     }
 
     #[test]

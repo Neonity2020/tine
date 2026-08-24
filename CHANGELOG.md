@@ -62,6 +62,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A settings change can no longer overwrite a `config.edn` that arrived while
+  it was being written.** Tine re-read the file before saving, but an external
+  writer — Syncthing delivering a peer's copy, Logseq, an editor — could still
+  land in the moment between that check and the write, and its changes vanished
+  with no warning. Tine now publishes the file only if it still holds what it
+  read, and otherwise re-applies your change on top of theirs. If a crash
+  interrupts a write, the file is restored on next open rather than left
+  missing.
+
+- **Renaming a page no longer edits pages that are mid-merge.** A page whose
+  file still contains unresolved merge-conflict markers is left exactly as it
+  is instead of having its links rewritten inside both sides of the conflict.
+  The rename still completes everywhere else, and a notice tells you how many
+  conflicted pages still point at the old name.
+
+
 - **Split panes whose content fits no longer show a useless vertical
   scrollbar** (GH #369 — the reporter's dashboard of short panes like "Lines"
   and "GRID" each carried a permanent bar). The end-of-page editing slack now
