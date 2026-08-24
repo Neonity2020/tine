@@ -9,7 +9,10 @@
         "issues": [
           337
         ],
-        "commits": []
+      "commits": [
+        "7c5bc054",
+        "f1b4cd04"
+      ]
       },
       "platforms": [
         "all"
@@ -7731,22 +7734,51 @@
         "issues": [
           370
         ],
-        "commits": []
+        "commits": [
+          "3ccd57c6",
+          "aa116f6a"
+        ]
       },
       "platforms": [
         "windows"
       ],
-      "layer": "real-app",
-      "status": "planned",
+      "layer": "native",
+      "status": "covered",
       "coverage": {
         "tests": [
           "scripts/e2e-windows-managed-storage.mjs",
           "src/startupRecovery.test.ts"
         ],
         "scenario": "managed.windows-previous-patch-upgrade-reopen",
-        "failBefore": "pending"
+        "failBefore": "proven"
       },
       "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files."
+    },
+    {
+      "id": "UI-E2E-WINDOWS-POST-RECEIPT-ROUTING-230",
+      "title": "Windows post-receipt journeys reach their named fixture through a deterministic application route before testing the actual outcome",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [
+          230
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "layer": "native",
+    "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-page-properties.mjs",
+          "scripts/e2e-print-security.mjs"
+        ],
+        "scenario": "e2e.windows-post-receipt-named-page-readiness",
+        "failBefore": "proven"
+      },
+    "notes": "The v0.6.95 release artifact passed windows-core and pdf-logseq but page-properties failed before its contract because ALL PAGES was absent at WebDriver attachment; print-security likewise failed before its safety assertion because the chosen startup page contained no .page-ref. Run 32690801901 and its retained exact-build capsules prove both setup failures. Fixture routing now uses the production Search command and an exact indexed page-result mousedown, while the page-property traversal and static script-disabled print-frame assertions remain unchanged. Both focused journeys pass locally against exact build receipts and print-security passed focused Windows run 32766862967. Page-properties remains fixing: Windows run 32766860600 found the sidebar Search button non-clickable at default geometry, and the one allowed retry 32769022952 showed that Ctrl-K did not open the switcher even though the graph had opened successfully. Both failures are before the page-property contract; the two-attempt platform stop-loss is exhausted."
     }
   ]
 }
