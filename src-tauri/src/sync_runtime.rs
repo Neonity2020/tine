@@ -611,19 +611,19 @@ impl SparseV2Binding {
     /// actor handle; collapsing those two facts into a GraphSlot used to hide
     /// the real OpenRefused/Retryable detail behind SPARSE_V2_NOT_ACTIVE.
     pub(crate) fn serving_failure_detail(&self) -> Option<String> {
-        if self.has_active_application_handle() {
-            return None;
-        }
         if let Some(handle) = &self.handle {
-            return Some(match handle.status() {
-                Ok(snapshot) => snapshot.detail.unwrap_or_else(|| {
+            return match handle.status() {
+                Ok(snapshot) if runtime_lifecycle_admits_application_pages(&snapshot.lifecycle) => {
+                    None
+                }
+                Ok(snapshot) => Some(snapshot.detail.unwrap_or_else(|| {
                     format!(
                         "managed storage runtime is not serving pages (lifecycle: {:?})",
                         snapshot.lifecycle
                     )
-                }),
-                Err(error) => format!("managed storage runtime status failed: {error}"),
-            });
+                })),
+                Err(error) => Some(format!("managed storage runtime status failed: {error}")),
+            };
         }
         Some(match &self.availability {
             SparseV2Availability::Retryable { detail, .. } => detail.clone(),

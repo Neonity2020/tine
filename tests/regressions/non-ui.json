@@ -4595,14 +4595,14 @@
         "all"
       ],
       "layer": "tauri-storage",
-      "status": "planned",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src-tauri/src/sync_runtime.rs",
           "src-tauri/src/graph.rs"
         ],
         "scenario": "managed.open-terminal-nonserving-binding",
-        "failBefore": "pending"
+        "failBefore": "proven"
       },
       "notes": "The v0.6.95 startup path converts a typed core OpenRefused/Retryable result into a SparseV2Binding with no actor, constructs a managed GraphSlot anyway, and only then fails the representative-page proof with the unrelated SPARSE_V2_NOT_ACTIVE text. The real failure class and remedy are lost. The graph registry remains unpublished, but the user cannot diagnose why the Windows reopen failed."
     }

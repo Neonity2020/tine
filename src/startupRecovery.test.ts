@@ -172,4 +172,21 @@ describe("native-supervised startup recovery", () => {
     expect(controller.snapshot().elapsedMs).toBe(terminalElapsed);
     controller.dispose();
   });
+
+  it("keeps the managed-open cause shareable instead of replacing it with readiness text", async () => {
+    const deps = dependencies({
+      openGraph: vi.fn(async () => {
+        throw new Error(
+          "Managed storage could not serve this workspace: clean managed runtime open failed: SQLite checkpoint is stale",
+        );
+      }),
+    });
+    const controller = createStartupRecoveryController(deps);
+    controller.start();
+    await settle();
+    expect(controller.snapshot().detail).toBe(
+      "Managed storage could not serve this workspace: clean managed runtime open failed: SQLite checkpoint is stale",
+    );
+    controller.dispose();
+  });
 });

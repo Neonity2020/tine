@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Managed-storage startup failures now keep their real recovery cause and stop looking active** (GH #370). A core reopen can return a typed retryable/refused result without a serving actor; startup previously wrapped that non-serving result in a managed graph slot and then replaced its useful cause with the generic “managed storage is not ready” page-readiness error. It now refuses before publication with the original redacted diagnostic, keeps the Direct Files escape available, and freezes the elapsed time when the operation reaches its terminal failure instead of counting upward indefinitely.
+
 ## [0.6.95] - 2026-08-23
 
 ### Added

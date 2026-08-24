@@ -175,6 +175,13 @@ function assertSameSource(before, label) {
   }
 }
 
+function assertOriginalSourcesUnchanged(before, label) {
+  const after = sourceSnapshot();
+  for (const [relative, digest] of before) {
+    if (after.get(relative) !== digest) throw new Error(`${label} changed original source bytes for ${relative}`);
+  }
+}
+
 async function bodyText() {
   return browser.$("body").getText();
 }
@@ -439,7 +446,6 @@ try {
   await openPage(nestedTitle);
   receipt.milestones.managedPageOpened = true;
   receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
-  const afterPreviousPatchUse = sourceSnapshot();
 
   // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the
   // actual baseline process without a graceful managed shutdown, then require
@@ -455,7 +461,9 @@ try {
   await openManagedSettings("Return to Direct files");
   await clickButtonAndConfirm("Return to Direct files");
   await waitForBody("Enable Tine-managed storage...", 120_000, "Direct Files status after rollback");
-  assertSameSource(afterPreviousPatchUse, "return to Direct Files");
+  // The attempted v0.6.94 creation may finish before or during recovery. Its
+  // new file is allowed; authority transitions may not alter any incumbent.
+  assertOriginalSourcesUnchanged(before, "return to Direct Files");
   await closeSettings();
   await openPage(nestedTitle);
   receipt.milestones.directFilesRestored = true;
