@@ -9,7 +9,10 @@
         "issues": [
           337
         ],
-        "commits": []
+      "commits": [
+        "7c5bc054",
+        "f1b4cd04"
+      ]
       },
       "platforms": [
         "all"
@@ -6251,7 +6254,8 @@
       "family": "graph-open",
       "sources": {
         "issues": [
-          245
+          245,
+          269
         ],
         "commits": []
       },
@@ -6263,12 +6267,14 @@
       "coverage": {
         "tests": [
           "src/graph.test.tsx",
-          "src/components/Settings.homePage.test.tsx"
+          "src/components/Settings.homePage.test.tsx",
+          "src/homePage.test.ts",
+          "scripts/e2e-compat-home-current-page.mjs"
         ],
         "scenario": "graph.home-page-open-and-stale",
         "failBefore": "proven"
       },
-      "notes": "GH #245. homePage.ts stores the per-graph setting as an app-settings string keyed by graph root (frontend-only; adding a config.edn owner would have touched the prohibited Rust storage surface). graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads — never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before proven by manager mutation probe at integration (2026-08-06): disabling the loadGraphPath home-page call fails 2 of the 19 tests in graph.test.tsx. Tests were written after the implementation in the delegated lane; the probe supplies the causal evidence."
+      "notes": "GH #245 and #269. homePage.ts now uses graph metadata backed by Logseq's :default-home {:page ...} entry in logseq/config.edn, with a guarded one-time migration from the former per-device app-settings string. graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads — never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before for the navigation behavior was proven by manager mutation probe at integration (2026-08-06); fail-before for graph ownership was proven by src/homePage.test.ts returning the stale device-local value instead of graph metadata on the pre-fix source."
     },
     {
       "id": "UI-THEME-SYSTEM-MODE-193",
@@ -7650,7 +7656,29 @@
         "scenario": "query.current-page-nav-dispatch",
         "failBefore": "proven"
       },
-      "notes": "Martin-approved semantics: the dyvar's page is the FOCUSED pane's route page (binding for rerun), while the owner-page binding passed to the engine (:query-page use) is untouched. QueryMacro now computes an execution-only form: the literal `<% current page %>` (whitespace- and case-tolerant, like templateVars) is replaced by [[focused page]] only in the text handed to runQuery/runAdvancedQuery/savedDslToFriendlySearch; the authored macro and every editing/display derivation keep the literal marker. The refetch key gains the focused page only when the marker is present — no global rerun on navigation, redundant same-page transitions are coalesced, and sharedQueryResult's per-key caching keeps the WeakRef hit for returning to a page. Stale async results can't overwrite: createResource re-issues per key and drops superseded resolutions. failBefore proven: 4/5 component cases red without the change (the marker-less no-rerun control was already green). The EDN `:inputs [:current-page]` form and the full datalog entity binding remain out of engine scope — see the report for the explicit boundary; no clause was run differently to fake it."
+      "notes": "Martin-approved semantics for the ordinary dyvar: the marker's page is the FOCUSED pane's route page, while the owner-page binding passed to an advanced engine form without typed :current-page input stays untouched. QueryMacro computes an execution-only form: the literal `<% current page %>` (whitespace- and case-tolerant, like templateVars) is replaced by [[focused page]] only in the text handed to runQuery/runAdvancedQuery/savedDslToFriendlySearch; authored text and every editing/display derivation keep the marker. The refetch key gains the focused page only for a marker or live typed current-page input — no global rerun on navigation. Stale async results cannot overwrite because createResource drops superseded resolutions. Full DataScript joins remain out of scope; the separately cataloged typed input supports only the standard current-page relationship."
+    },
+    {
+      "id": "UI-ADVANCED-QUERY-CURRENT-PAGE-INPUT-301",
+      "title": "An advanced query declaring :inputs [:current-page] receives the focused pane page and reruns only when that page changes",
+      "family": "query-execution",
+      "sources": {
+        "issues": [301],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryMacro.currentPage.test.tsx",
+          "src/components/BeginQuery.test.tsx",
+          "scripts/e2e-compat-home-current-page.mjs"
+        ],
+        "scenario": "query.advanced-current-page-input-nav",
+        "failBefore": "proven"
+      },
+      "notes": "QueryMacro recognizes a direct :current-page token only inside the live :inputs vector (ignoring strings and EDN comments), adds the focused pane page to the request/cache key, and passes that page to the native positional input. BEGIN_QUERY preserves its map's :inputs vector when it hands the advanced query to the bounded engine. Advanced queries without the live input keep the owner-page parameter and do not rerun on navigation; repeated same-page navigation is coalesced. Fail-before proved the pre-fix renderer continued to pass the owner page Sheet while Focus A was active."
     },
     {
       "id": "UI-EMBED-COLLAPSE-CONTRACT-360",
@@ -7708,22 +7736,51 @@
         "issues": [
           370
         ],
-        "commits": []
+        "commits": [
+          "3ccd57c6",
+          "aa116f6a"
+        ]
       },
       "platforms": [
         "windows"
       ],
-      "layer": "real-app",
-      "status": "planned",
+      "layer": "native",
+      "status": "covered",
       "coverage": {
         "tests": [
           "scripts/e2e-windows-managed-storage.mjs",
           "src/startupRecovery.test.ts"
         ],
         "scenario": "managed.windows-previous-patch-upgrade-reopen",
-        "failBefore": "pending"
+        "failBefore": "proven"
       },
       "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files."
+    },
+    {
+      "id": "UI-E2E-WINDOWS-POST-RECEIPT-ROUTING-230",
+      "title": "Windows post-receipt journeys reach their named fixture through a deterministic application route before testing the actual outcome",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [
+          230
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "layer": "native",
+    "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-page-properties.mjs",
+          "scripts/e2e-print-security.mjs"
+        ],
+        "scenario": "e2e.windows-post-receipt-named-page-readiness",
+        "failBefore": "proven"
+      },
+    "notes": "The v0.6.95 release artifact passed windows-core and pdf-logseq but page-properties failed before its contract because ALL PAGES was absent at WebDriver attachment; print-security likewise failed before its safety assertion because the chosen startup page contained no .page-ref. Run 32690801901 and its retained exact-build capsules prove both setup failures. Fixture routing now uses the production Search command and an exact indexed page-result mousedown, while the page-property traversal and static script-disabled print-frame assertions remain unchanged. Both focused journeys pass locally against exact build receipts and print-security passed focused Windows run 32766862967. Page-properties remains fixing: Windows run 32766860600 found the sidebar Search button non-clickable at default geometry, and the one allowed retry 32769022952 showed that Ctrl-K did not open the switcher even though the graph had opened successfully. Both failures are before the page-property contract; the two-attempt platform stop-loss is exhausted."
     }
   ]
 }

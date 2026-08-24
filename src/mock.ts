@@ -1229,6 +1229,9 @@ export function mockBackend(): Backend {
       // No exclude → same-page referrers included (matches the backend).
       return collect((b) => blockRefIds(b.raw).includes(uuid));
     },
+    async setDefaultHome(): Promise<void> {
+      // no-op in mock
+    },
     async deletePage(): Promise<void> {
       // no-op in mock
     },

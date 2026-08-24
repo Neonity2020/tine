@@ -165,6 +165,59 @@ describe("query `<% current page %>` dispatch to the focused pane (GH #301)", ()
     }
   });
 
+  it("binds an advanced :inputs [:current-page] query to the focused pane and reruns only for a new focused page", async () => {
+    loadQueryDoc("{{query [:find (pull ?b [*]) :in $ ?current-page :where [?p :block/name ?current-page] [?b :block/refs ?p]] :inputs [:current-page]}}");
+    const runAdvancedQuery = vi.spyOn(backend(), "runAdvancedQuery").mockResolvedValue({
+      groups: groupsFor("todo"),
+      ran: ["current-page-ref"],
+      ignored: [],
+      supported: true,
+    });
+    openPage("Focus A", "page");
+    const { dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() =>
+        expect(runAdvancedQuery.mock.calls.at(-1)?.[1]).toBe("Focus A")
+      );
+      const callsOnA = runAdvancedQuery.mock.calls.length;
+
+      openPage("Focus B", "page");
+      await vi.waitFor(() =>
+        expect(runAdvancedQuery.mock.calls.at(-1)?.[1]).toBe("Focus B")
+      );
+      expect(runAdvancedQuery.mock.calls.length).toBeGreaterThan(callsOnA);
+      const callsOnB = runAdvancedQuery.mock.calls.length;
+
+      openPage("Focus B", "page");
+      await settle();
+      expect(runAdvancedQuery).toHaveBeenCalledTimes(callsOnB);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps an advanced query without the live keyword owner-bound and navigation-independent", async () => {
+    loadQueryDoc('{{query {:query [:find (pull ?b [*]) :where (task ?b "TODO")] :inputs ["example :current-page"]}}}');
+    const runAdvancedQuery = vi.spyOn(backend(), "runAdvancedQuery").mockResolvedValue({
+      groups: groupsFor("todo"),
+      ran: ["task"],
+      ignored: [],
+      supported: true,
+    });
+    openPage("Focus A", "page");
+    const { dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(runAdvancedQuery).toHaveBeenCalled());
+      expect(runAdvancedQuery.mock.calls.every((call) => call[1] === "Sheet")).toBe(true);
+      const calls = runAdvancedQuery.mock.calls.length;
+      openPage("Focus B", "page");
+      await settle();
+      expect(runAdvancedQuery).toHaveBeenCalledTimes(calls);
+    } finally {
+      dispose();
+    }
+  });
+
   it("a stale async result from the previous page never overwrites the latest page's result", async () => {
     loadQueryDoc("{{query (and (page <% current page %>) (task TODO))}}");
     const deferred = new Map<string, (groups: RefGroup[]) => void>();

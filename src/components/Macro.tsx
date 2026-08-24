@@ -35,6 +35,76 @@ import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDe
 import { blockDtoExternalId } from "../blockIdentity";
 
 const ADVANCED_RE = /\[\s*:find|:where|:find/;
+
+// Recognize the typed Logseq input without treating an example in a string or
+// `;;` comment as live. Only a direct token in the :inputs vector makes query
+// execution depend on focused-pane navigation.
+function declaresCurrentPageInput(source: string): boolean {
+  const boundary = (ch: string | undefined) =>
+    ch === undefined || /[\s,\[\](){}]/.test(ch);
+  let i = 0;
+  while (i < source.length) {
+    if (source[i] === '"') {
+      i += 1;
+      while (i < source.length) {
+        if (source[i] === "\\") i += 2;
+        else if (source[i] === '"') {
+          i += 1;
+          break;
+        } else i += 1;
+      }
+      continue;
+    }
+    if (source[i] === ";") {
+      while (i < source.length && source[i] !== "\n") i += 1;
+      continue;
+    }
+    if (
+      source.startsWith(":inputs", i) &&
+      boundary(source[i - 1]) &&
+      boundary(source[i + ":inputs".length])
+    ) {
+      let cursor = i + ":inputs".length;
+      while (cursor < source.length && /[\s,]/.test(source[cursor])) cursor += 1;
+      if (source[cursor] !== "[") return false;
+      let depth = 1;
+      cursor += 1;
+      while (cursor < source.length && depth > 0) {
+        if (source[cursor] === '"') {
+          cursor += 1;
+          while (cursor < source.length) {
+            if (source[cursor] === "\\") cursor += 2;
+            else if (source[cursor] === '"') {
+              cursor += 1;
+              break;
+            } else cursor += 1;
+          }
+          continue;
+        }
+        if (source[cursor] === ";") {
+          while (cursor < source.length && source[cursor] !== "\n") cursor += 1;
+          continue;
+        }
+        if ("[({".includes(source[cursor])) depth += 1;
+        else if ("])}".includes(source[cursor])) depth -= 1;
+        else if (
+          depth === 1 &&
+          source.slice(cursor, cursor + ":current-page".length).toLowerCase() ===
+            ":current-page" &&
+          boundary(source[cursor - 1]) &&
+          boundary(source[cursor + ":current-page".length])
+        ) {
+          return true;
+        }
+        cursor += 1;
+      }
+      return false;
+    }
+    i += 1;
+  }
+  return false;
+}
+
 type QueryView = "search" | "list" | "table" | "board";
 const QUERY_VIEWS: QueryView[] = ["search", "list", "table", "board"];
 const QUERY_VIEW_LABEL: Record<QueryView, string> = {
@@ -216,6 +286,9 @@ export function QueryMacro(props: {
   };
 
   const isAdvanced = () => ADVANCED_RE.test(arg());
+  const currentPageInput = createMemo(() =>
+    isAdvanced() && declaresCurrentPageInput(form())
+  );
   const simpleBackDsl = createMemo<string | null>(() => {
     const blockId = props.blockId;
     if (!blockId || !isAdvanced()) return null;
@@ -282,7 +355,7 @@ export function QueryMacro(props: {
   // its count and doesn't re-run a whole-graph scan on every save while hidden;
   // expanding it (key flips to include dataRev) refreshes it.
   const queryRequestKey = () =>
-    `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
+    `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() || currentPageInput() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
   const [groups] = createResource(
     queryRequestKey,
     async (requestKey) => {
@@ -317,7 +390,9 @@ export function QueryMacro(props: {
       // Advanced (datalog) queries take a separate path that maps the supported
       // clause subset onto the engine and reports what ran vs was ignored.
       if (isAdvanced()) {
-        const page = currentPage();
+        // `:inputs [:current-page]` is a focused-pane binding. Advanced forms
+        // without it retain the owner page for :query-page compatibility.
+        const page = currentPageInput() ? focusedQueryPage() : currentPage();
         const r = await sharedQueryResult(
           scope,
           `advanced\0${page ?? ""}\0${requestKey}`,

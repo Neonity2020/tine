@@ -2862,6 +2862,50 @@
       "notes": "Martin reported \"Couldn't load references because the backend request failed.\" on every page of a managed graph. Root cause was authority, not references: GraphSlot exposed only legacy write authority, so with_graph refused all ~50 read-only commands under managed storage and only six page-path commands worked. Reads now go through with_read_graph, served for managed bindings by a Graph opened with open_derived_read_only over the projected tree. That view fails every graph-text write at admit_managed_text_writer and ensure_write_target, so a misrouted write command errors instead of writing behind the oplog; assets stay writable because assets/ is outside the oplog's document domain. Writes (rename, delete, merge, config setters, conflict resolution) remain refused under managed storage and still need real oplog implementations. 2026-08-17 catalog repair: the with_read_graph / derived-read-graph mechanism described above was later removed -- state.rs::tests::managed_slots_have_no_retained_parsed_graph_fallback now asserts by source scan that it cannot return -- so the two state.rs rows that named it (a_managed_binding_answers_whole_graph_reads_and_still_refuses_writes, a_legacy_binding_serves_reads_through_its_lease) named tests that no longer exist. The command-layer coverage moved to managed_command_surface.rs, which re-derives every graph command's managed routing from the sources themselves: every_graph_command_declares_what_managed_storage_can_do_with_it proves get_backlinks, get_unlinked_refs, list_pages, page_aliases, list_templates and the rest are ManagedRouted rather than legacy-only, and the_refused_surface_is_exactly_the_commands_still_on_the_legacy_authority pins the refused set. That is the same user outcome -- reads work under managed storage -- proved against the current architecture."
     },
     {
+      "id": "REG-ADVANCED-CURRENT-PAGE-INPUT-301",
+      "title": "Advanced Logseq queries bind :inputs [:current-page] positionally without weakening typed date inputs",
+      "family": "query-compatibility",
+      "sources": {
+        "issues": [301],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/query.rs::tests::advanced_current_page_input_lowers_the_standard_page_relationship",
+          "crates/tine-core/src/query.rs::tests::advanced_typed_inputs_keep_date_bounds_numeric",
+          "crates/tine-core/src/model.rs::tests::advanced_current_page_input_filters_real_graph_blocks",
+          "scripts/e2e-compat-home-current-page.mjs"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "OG source at 6e7afa8eb040686ff057156ee877193b581dd369 resolves the typed :current-page keyword positionally through current-page-fn and lowercases the page name before query execution. Tine now retains typed AdvancedInput::Date values while binding that one keyword as AdvancedInput::Page, then conservatively lowers only the exact standard [?p :block/name ?current-page] identity joined to one [?b :block/refs ?p] or [?b :block/page ?p] relationship. Ambiguous and unrelated patterns remain visibly unsupported; this does not claim full DataScript joins. Contract-doc delta: none; this is a bounded compatibility extension within the existing partial advanced-query contract."
+    },
+    {
+      "id": "REG-GRAPH-HOME-CONFIG-OWNER-269",
+      "title": "The graph home page round-trips through Logseq-compatible config.edn without replacing other default-home keys",
+      "family": "config-compatibility",
+      "sources": {
+        "issues": [269],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/config.rs::tests::default_home_reads_only_the_page_inside_the_logseq_map",
+          "crates/tine-core/src/config.rs::tests::default_home_writer_preserves_siblings_clears_only_page_and_refuses_malformed_owner",
+          "src/homePage.test.ts",
+          "src/components/Settings.homePage.test.tsx"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Config.default_home reads only the direct :page entry inside Logseq's :default-home map. Graph::set_default_home_page uses the existing guarded atomic config boundary, preserves sibling keys such as :sidebar, and refuses a malformed/non-map owner without changing its bytes. The frontend gives graph metadata precedence; when no valid graph-owned page exists it attempts to copy the old home.page.<root> app setting, deleting that legacy value only after the graph write succeeds. A refused migration remains usable for the current session and is retried later. Contract-doc delta: none; ADR 0004 and ADR 0049 already establish config.edn as the compatible graph owner outside the managed oplog domain."
+    },
+    {
       "id": "REG-MANAGED-SETTINGS-WRITES-REFUSED-001",
       "title": "Every Settings toggle persists while Tine-managed storage is active",
       "family": "managed-storage",

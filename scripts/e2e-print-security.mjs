@@ -51,6 +51,8 @@ const env = {
   XDG_DATA_HOME: path.join(TMP, "xdg", "data"),
   XDG_CONFIG_HOME: path.join(TMP, "xdg", "config"),
   XDG_CACHE_HOME: path.join(TMP, "xdg", "cache"),
+  APPDATA: path.join(TMP, "appdata"),
+  LOCALAPPDATA: path.join(TMP, "localappdata"),
   WEBKIT_DISABLE_DMABUF_RENDERER: "1",
   WEBKIT_DISABLE_COMPOSITING_MODE: "1",
   LIBGL_ALWAYS_SOFTWARE: "1",
@@ -75,21 +77,30 @@ try {
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
   });
-  await browser.$(".page-ref").waitForExist({ timeout: 20_000 });
-  const routed = await browser.execute(() => {
-    const ref = [...document.querySelectorAll(".page-ref")]
-      .find((element) => element.textContent?.includes("Print proof"));
-    if (!ref) return {
-      ok: false,
-      refs: [...document.querySelectorAll(".page-ref")].map((element) => element.textContent?.trim()),
-      title: document.querySelector("h1.page-title")?.textContent?.trim(),
-    };
-    for (const type of ["mousedown", "mouseup", "click"]) {
-      ref.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }));
-    }
-    return { ok: true, refs: [], title: "" };
+  // The contract starts at the named page's menu, not at today's journal.
+  // Route through the visible application search control so a different valid
+  // startup surface cannot fail the safety journey before it begins.
+  const search = await browser.$('button[title^="Search (Ctrl+K)"]');
+  await search.waitForClickable({ timeout: 20_000 });
+  await search.click();
+  const input = await browser.$(".switcher-input");
+  await input.waitForExist({ timeout: 10_000 });
+  await input.setValue("Print proof");
+  await browser.waitUntil(() => browser.execute(() =>
+    [...document.querySelectorAll(".switcher-row")].some((row) =>
+      row.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && row.querySelector(".switcher-name")?.textContent?.trim() === "Print proof")), {
+    timeout: 20_000,
+    timeoutMsg: "switcher did not expose the print fixture page",
   });
-  if (!routed.ok) throw new Error(`print fixture page-ref is missing: ${JSON.stringify(routed)}`);
+  const routed = await browser.execute(() => {
+    const row = [...document.querySelectorAll(".switcher-row")].find((candidate) =>
+      candidate.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && candidate.querySelector(".switcher-name")?.textContent?.trim() === "Print proof");
+    row?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+    return Boolean(row);
+  });
+  if (!routed) throw new Error("exact print fixture switcher result disappeared");
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Print proof", {
     timeout: 10_000, timeoutMsg: "could not route to print fixture",
   });
