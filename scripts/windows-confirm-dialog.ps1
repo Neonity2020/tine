@@ -26,6 +26,7 @@ $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
   [System.Windows.Automation.ControlType]::Button
 )
 $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+$observedButtons = @()
 
 while ([DateTime]::UtcNow -lt $deadline) {
   $windows = $root.FindAll(
@@ -47,13 +48,21 @@ while ([DateTime]::UtcNow -lt $deadline) {
     )
     $affirmative = $null
     foreach ($button in $buttons) {
-      if ($button.Current.Name -match '^(Yes|OK|&Yes)$') {
+      $name = $button.Current.Name
+      $automationId = $button.Current.AutomationId
+      $observedButtons += "name='$name' automation_id='$automationId'"
+      # Native Windows message boxes expose stable command IDs even when their
+      # visible labels are localized or include an accelerator marker:
+      # IDOK=1 and IDYES=6. Keep the label match for non-Win32 dialog hosts.
+      if ($automationId -in @('1', '6') -or $name -match '^(?i:&?Yes|OK)$') {
         $affirmative = $button
         break
       }
     }
     if ($null -eq $affirmative) {
-      throw "Tine confirmation dialog was found, but it had no affirmative button"
+      # UI Automation can expose the dialog window one tick before its child
+      # buttons. Keep polling instead of turning that race into a test failure.
+      continue
     }
     $invoke = $affirmative.GetCurrentPattern(
       [System.Windows.Automation.InvokePattern]::Pattern
@@ -65,4 +74,5 @@ while ([DateTime]::UtcNow -lt $deadline) {
   Start-Sleep -Milliseconds 100
 }
 
-throw "Tine confirmation dialog did not appear for process $ProcessId within $TimeoutSeconds seconds: $ExpectedText"
+$observed = ($observedButtons | Select-Object -Unique) -join '; '
+throw "Tine confirmation dialog did not expose an affirmative button for process $ProcessId within $TimeoutSeconds seconds: $ExpectedText; observed buttons: $observed"
