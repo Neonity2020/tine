@@ -4548,7 +4548,7 @@
       "coverage": {
         "tests": [
           "crates/tine-core/tests/issue186_surfaces.rs::literal_autocomplete_is_stable_across_character_swaps_and_dsl_tokens",
-          "crates/tine-core/tests/issue186_surfaces.rs::page_and_block_surfaces_share_candidates_within_designed_windows"
+          "crates/tine-core/tests/issue186_surfaces.rs::page_and_block_surfaces_share_candidates_within_designed_limits"
         ],
         "scenario": "search.autocomplete-surface-pool-contract",
         "failBefore": "inferred"

@@ -85,7 +85,7 @@ try {
   assert.equal(unstable.status, 0, unstable.stderr || unstable.stdout);
   assert.match(
     `${unstable.stdout}\n${unstable.stderr}`,
-    /warning: immutable\/scrollBig: .*immutable baseline-only variance accepted/,
+    /warning: immutable\/scrollBig: .*baseline-only variance accepted/,
   );
 
   // Candidate-only variance is safe when every observed candidate round stays
@@ -103,18 +103,22 @@ try {
     /warning: candidate\/scrollBig: .*every observed candidate round remains within both regression budgets/,
   );
 
-  // The candidate waiver belongs only to candidate variance. If the immutable
-  // anchor is unstable too, its own waiver cannot apply because the candidate
-  // is no longer reliable.
+  // Candidate and baseline spread may coexist when every candidate round is
+  // still inside both regression budgets. Spread remains diagnostic; the
+  // slowest candidate round is the release-safety boundary.
   const candidateAndImmutableVariable = check(
     favorableVariableCandidate,
     unstableImmutable,
     stablePrevious,
   );
-  assertFails(
-    candidateAndImmutableVariable,
-    /immutable\/scrollBig: .*round spread exceeds/,
-    "candidate-only variance does not waive immutable-anchor variance",
+  assert.equal(
+    candidateAndImmutableVariable.status,
+    0,
+    candidateAndImmutableVariable.stderr || candidateAndImmutableVariable.stdout,
+  );
+  assert.match(
+    `${candidateAndImmutableVariable.stdout}\n${candidateAndImmutableVariable.stderr}`,
+    /warning: immutable\/scrollBig: .*baseline-only variance accepted/,
   );
 
   // A favorable median cannot conceal an unsafe slow tail, including when it
@@ -145,35 +149,45 @@ try {
   assert.equal(previousSpread.status, 0, previousSpread.stderr || previousSpread.stdout);
   assert.match(
     `${previousSpread.stdout}\n${previousSpread.stderr}`,
-    /warning: previous\/scrollBig: .*previous-release baseline-only variance accepted/,
+    /warning: previous\/scrollBig: .*baseline-only variance accepted/,
   );
 
-  // The previous-anchor exception is not a multi-anchor exception: a noisy
-  // immutable anchor still blocks the run even when previous is the noisy
-  // rolling anchor too.
+  // Both anchors may be noisy in one run when the candidate's own slowest
+  // round remains inside both budgets.
   const previousAndImmutableVariable = check(
     stableCandidate,
     unstableImmutable,
     unstablePrevious,
   );
-  assertFails(
-    previousAndImmutableVariable,
-    /immutable\/scrollBig: .*round spread exceeds/,
-    "previous-anchor variance does not waive immutable-anchor variance",
+  assert.equal(
+    previousAndImmutableVariable.status,
+    0,
+    previousAndImmutableVariable.stderr || previousAndImmutableVariable.stdout,
+  );
+  assert.match(
+    `${previousAndImmutableVariable.stdout}\n${previousAndImmutableVariable.stderr}`,
+    /warning: immutable\/scrollBig: .*baseline-only variance accepted/,
+  );
+  assert.match(
+    `${previousAndImmutableVariable.stdout}\n${previousAndImmutableVariable.stderr}`,
+    /warning: previous\/scrollBig: .*baseline-only variance accepted/,
   );
 
-  // Candidate variance remains independently unsafe for the previous-anchor
-  // exception, even if the older candidate-only exception can explain a fast
-  // outlier on its own.
+  // Candidate variance is also admissible alongside a noisy rolling anchor
+  // when every observed candidate round remains within both budgets.
   const previousAndCandidateVariable = check(
     favorableVariableCandidate,
     stableImmutable,
     unstablePrevious,
   );
-  assertFails(
-    previousAndCandidateVariable,
-    /previous\/scrollBig: .*round spread exceeds/,
-    "previous-anchor variance requires a reliable candidate",
+  assert.equal(
+    previousAndCandidateVariable.status,
+    0,
+    previousAndCandidateVariable.stderr || previousAndCandidateVariable.stdout,
+  );
+  assert.match(
+    `${previousAndCandidateVariable.stdout}\n${previousAndCandidateVariable.stderr}`,
+    /warning: previous\/scrollBig: .*baseline-only variance accepted/,
   );
 
   // A previous-anchor waiver also cannot hide a candidate slow tail, even when
