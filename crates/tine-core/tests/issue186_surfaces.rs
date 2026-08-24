@@ -25,7 +25,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn page_and_block_surfaces_share_candidates_within_designed_windows() {
+fn page_and_block_surfaces_share_candidates_within_designed_limits() {
     let dir = scratch("yibao");
     // Pages: exact, prefix matches, middle matches, distractors sharing one char.
     fs::write(dir.join("pages").join("医保.md"), "- the exact page\n").unwrap();

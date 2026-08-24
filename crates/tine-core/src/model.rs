@@ -32767,10 +32767,13 @@ mod tests {
             has("linear ip", "Linear IP"),
             "bracketed tags:: value should appear"
         );
-        assert!(has("lp survey", "LP Survey"), "alias:: value should appear");
         assert!(
-            has("paper notes", "Paper Notes"),
-            "aliases:: value should appear"
+            has("lp survey", "paper"),
+            "alias:: query should navigate to its owning page"
+        );
+        assert!(
+            has("paper notes", "paper"),
+            "aliases:: query should navigate to its owning page"
         );
         assert!(
             !has("private", "Private"),
@@ -40171,7 +40174,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         // A same-inode alias introduced in the corresponding removal window
-        // likewise blocks retirement and preserves the exact inode at both names.
+        // does not expand exact-path authority into a directory-wide inode
+        // search. Retire the accepted target, preserve its bytes as recovery
+        // evidence, and leave the independently named alias untouched.
         let dir = scratch("projection-controllable-remove-window");
         let target = dir.join("pages/LateRemove.md");
         let alias = dir.join("pages/LateRemoveAlias.md");
@@ -40186,30 +40191,26 @@ mod tests {
             let alias = alias.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::hard_link(target, alias)));
         });
-        assert_eq!(
-            graph
-                .remove_projection_exact("pages/LateRemove.md", b"- base\n")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(fs::read(&target).unwrap(), b"- base\n");
+        graph
+            .remove_projection_exact("pages/LateRemove.md", b"- base\n")
+            .unwrap();
+        assert!(!target.exists());
         assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
         assert_eq!(
             canonical_projection_file_resource_id(&fs::File::open(&alias).unwrap()).unwrap(),
             identity
         );
-        assert_eq!(graph.cache_generation(), generation);
+        assert!(projection_recovery_bytes(alias.parent().unwrap())
+            .iter()
+            .any(|bytes| bytes == b"- base\n"));
+        assert!(graph.cache_generation() > generation);
         fs::remove_file(&alias).unwrap();
-        graph
-            .remove_projection_exact("pages/LateRemove.md", b"- base\n")
-            .unwrap();
-        assert!(!target.exists());
         let _ = fs::remove_dir_all(&dir);
 
         // Force an unwind after retirement, then introduce a hard-link alias
-        // only in the restoration window. Restoration must remain blocked and
-        // the exact retired inode must stay durable until disambiguation.
+        // only in the restoration window. Exact-path authority restores the
+        // accepted target without treating the independently named alias as a
+        // graph-wide collision.
         let dir = scratch("projection-controllable-restore-window");
         let target = dir.join("pages/LateRestore.md");
         let alias = dir.join("pages/LateRestoreAlias.md");
@@ -40248,28 +40249,21 @@ mod tests {
             .remove_projection_exact("pages/LateRestore.md", b"- base\n")
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
-        assert!(error
-            .to_string()
-            .contains("graph-aware projection restoration blocked"));
-        assert!(!target.exists());
+        assert_eq!(error.to_string(), "injected post-retirement unwind");
+        assert_eq!(fs::read(&target).unwrap(), b"- base\n");
         assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
-        let recovery = projection_recovery_paths(target.parent().unwrap())
-            .into_iter()
-            .find(|path| fs::read(path).unwrap() == b"- base\n")
-            .unwrap();
         assert_eq!(
             canonical_projection_file_resource_id(&fs::File::open(&alias).unwrap()).unwrap(),
             original_identity
         );
-        assert_eq!(
-            canonical_projection_file_resource_id(&fs::File::open(&recovery).unwrap()).unwrap(),
-            original_identity
-        );
+        assert!(projection_recovery_bytes(target.parent().unwrap())
+            .iter()
+            .any(|bytes| bytes == b"- base\n"));
         assert_eq!(graph.cache_generation(), generation);
         assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
         fs::remove_file(&alias).unwrap();
         graph
-            .recover_removed_projection_exact("pages/LateRestore.md", b"- base\n")
+            .recover_projection_exact("pages/LateRestore.md", b"- base\n")
             .unwrap();
         let _ = fs::remove_dir_all(&dir);
 
@@ -40775,7 +40769,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn exact_projection_authority_ignores_portable_losers_but_rejects_resource_aliases() {
+    fn exact_projection_authority_ignores_portable_losers_and_resource_aliases() {
         // Exact creation grants no authority over the portable loser.
         let dir = scratch("projection-late-collision-write");
         let graph = Graph::open(&dir);
@@ -40792,7 +40786,8 @@ mod tests {
         assert!(projection_recovery_bytes(alias.parent().unwrap()).is_empty());
         let _ = fs::remove_dir_all(&dir);
 
-        // Removal: a newly-created hard link is a late same-resource alias.
+        // Removal owns the exact accepted path. A newly-created hard link is a
+        // separately named survivor, not a reason to scan every graph sibling.
         let dir = scratch("projection-late-collision-remove");
         let target = dir.join("pages/ProjectionRemove.md");
         let alias = dir.join("pages/ProjectionRemoveAlias.md");
@@ -40801,21 +40796,16 @@ mod tests {
         graph.warm_cache();
         fs::hard_link(&target, &alias).unwrap();
         let generation = graph.cache_generation();
-        let disk_revs = graph.disk_revs.read().unwrap().clone();
-        let error = graph
-            .remove_projection_exact("pages/ProjectionRemove.md", b"- base\n")
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read(&target).unwrap(), b"- base\n");
-        assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
-        assert!(projection_recovery_bytes(target.parent().unwrap()).is_empty());
-        assert_eq!(graph.cache_generation(), generation);
-        assert_eq!(*graph.disk_revs.read().unwrap(), disk_revs);
-        fs::remove_file(&alias).unwrap();
         graph
             .remove_projection_exact("pages/ProjectionRemove.md", b"- base\n")
             .unwrap();
         assert!(!target.exists());
+        assert_eq!(fs::read(&alias).unwrap(), b"- base\n");
+        assert!(projection_recovery_bytes(alias.parent().unwrap())
+            .iter()
+            .any(|bytes| bytes == b"- base\n"));
+        assert!(graph.cache_generation() > generation);
+        fs::remove_file(&alias).unwrap();
         let _ = fs::remove_dir_all(&dir);
 
         // Present-target recovery proves only the accepted exact path.
@@ -44677,12 +44667,8 @@ mod tests {
             .unwrap();
         let without_siblings = PROJECTION_EXACT_OPEN_COUNT.with(std::cell::Cell::get);
         assert!(
-            with_siblings >= without_siblings + 10_000,
-            "current collision authority must inspect every physical owner"
-        );
-        assert!(
-            with_siblings <= without_siblings + 20_000,
-            "initial and final collision validation must stay bounded to two metadata passes: with_siblings={with_siblings}, without_siblings={without_siblings}"
+            with_siblings <= without_siblings + 16,
+            "exact-path collision authority must not scan unrelated siblings: with_siblings={with_siblings}, without_siblings={without_siblings}"
         );
 
         let _ = fs::remove_dir_all(&dir);

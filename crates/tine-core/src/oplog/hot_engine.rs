@@ -14158,7 +14158,7 @@ impl ShardedHotEngine {
                 &causal_roots,
                 batch_id,
                 manifest.causal_dot(),
-                frontier,
+                manifest.causal_dependency_heads(),
                 effect,
                 catalog_pages,
                 true,
@@ -15087,6 +15087,21 @@ impl ShardedHotEngine {
             causal_clock,
             projections: record.projections.clone(),
         });
+        // A journal-appended local record is already durable author history,
+        // even while accepted-history/SQLite expansion remains derivative
+        // actor work. Retain its per-device causal tip independently of the
+        // hot document overlay: the overlay may be collapsed immediately after
+        // expansion, and a rapid following create/move must still draft dot
+        // N+1 with dot N as its authenticated direct predecessor.
+        let dot = manifest.causal_dot();
+        let mut chain = self.ephemeral_causal_chain.borrow_mut();
+        let entry = chain
+            .entry(dot.peer_id())
+            .or_insert((0, manifest.batch_id()));
+        if dot.counter() >= entry.0 {
+            *entry = (dot.counter(), manifest.batch_id());
+        }
+        drop(chain);
         self.local_overlay
             .entry_by_batch
             .insert(manifest.batch_id(), entry_index);
@@ -17824,7 +17839,7 @@ impl ShardedHotEngine {
                     &self.scratch_roots,
                     author.batch_id,
                     manifest.causal_dot(),
-                    manifest.dependency_frontier(),
+                    manifest.causal_dependency_heads(),
                     &effect,
                     Some(&prospective_pages),
                     true,
@@ -23371,7 +23386,7 @@ impl ShardedHotEngine {
                 &starting_roots,
                 batch_id,
                 causal_dot,
-                &frontier,
+                &causal_dependency_heads,
                 &declared_effect,
                 validated_catalog_pages,
                 true,
@@ -25180,7 +25195,7 @@ impl ShardedHotEngine {
         scratch_roots: &ScratchRoots,
         batch_id: BatchId,
         causal_dot: BatchCausalDot,
-        frontier: &FrontierV2,
+        causal_dependency_heads: &[BatchId],
         effect: &SemanticEffect,
         prospective_pages: Option<&BTreeMap<PageId, PageState>>,
         publish_index: bool,
@@ -25237,13 +25252,9 @@ impl ShardedHotEngine {
         };
         let candidate_clock = match candidate_clock {
             Some(clock) => clock,
-            None => self.derive_inline_causal_clock(
-                scratch_roots,
-                causal_dot,
-                &declared_batch_heads(frontier)
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-            )?,
+            None => {
+                self.derive_inline_causal_clock(scratch_roots, causal_dot, causal_dependency_heads)?
+            }
         };
         let contains = |dot: BatchCausalDot, batch: BatchId| {
             candidate_clock
@@ -25592,7 +25603,7 @@ impl ShardedHotEngine {
             candidate_roots,
             batch_id,
             causal_dot,
-            frontier,
+            self.archive[&batch_id].manifest().causal_dependency_heads(),
             &declared_effect,
             derived_catalog_pages,
             true,

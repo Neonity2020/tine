@@ -6384,15 +6384,28 @@ mod tests {
             );
         }
 
-        let searched = handle
-            .query(SyncRuntimeQueryRequest::Search {
-                query: "Tauri boundary".into(),
-                limit: 10,
-            })
-            .unwrap();
+        // The legacy raw SQLite query surface is derivative by design; the
+        // application page/navigation surfaces carry the foreground overlay.
+        // Drive the actor until that durable local prefix reaches SQLite, then
+        // prove the lower-level query sees the same accepted page.
+        let mut searched = SyncRuntimeQueryReply::Search(Vec::new());
+        let mut last_tick = None;
+        for _ in 0..64 {
+            searched = handle
+                .query(SyncRuntimeQueryRequest::Search {
+                    query: "Tauri boundary".into(),
+                    limit: 10,
+                })
+                .unwrap();
+            if matches!(searched, SyncRuntimeQueryReply::Search(ref rows) if !rows.is_empty()) {
+                break;
+            }
+            last_tick = Some(handle.tick().unwrap());
+        }
         assert!(
             matches!(searched, SyncRuntimeQueryReply::Search(ref rows) if !rows.is_empty()),
-            "actor query must see the durable editor save: {searched:?}"
+            "actor query must see the durable editor save: {searched:?}; last_tick={last_tick:?}; status={:?}",
+            handle.status().unwrap()
         );
         std::fs::write(
             graph_root.join(relative),

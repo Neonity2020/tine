@@ -26759,6 +26759,26 @@ mod tests {
                 "finite prior managed work must settle inside foreground admission: {other:?}"
             ),
         };
+        let loaded = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: saved_path.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            loaded,
+            SyncApplicationPageLoadOutcome::Loaded { page, .. }
+                if page.blocks.first().is_some_and(|block| {
+                    block.raw == "created immediately after managed activation"
+                })
+        ));
+        for _ in 0..64 {
+            if fixture.graph_root.join(&saved_path).is_file() {
+                break;
+            }
+            let _ = handle.tick().unwrap();
+        }
         assert!(fixture.graph_root.join(saved_path).is_file());
     }
 
