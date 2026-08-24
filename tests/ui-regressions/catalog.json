@@ -7697,6 +7697,31 @@
         "failBefore": "proven"
       },
       "notes": "Martin's approved pointer contract, one decision table per surface: plain click navigates; Shift-click opens the right sidebar; Ctrl(Win/Linux)/Cmd(macOS)+click opens a BACKGROUND tab (this is the change — PageRef/BlockRefView ctrl-click previously opened the other pane); middle-click opens a background tab everywhere plain-aux semantics existed; context menus keep exposing explicit destinations; and combined modifiers (shift+ctrl) keep plain-click meaning so nothing novel shadows shortcuts. Decision lives once in src/linkGesture.ts (not per surface — surfaces pick only their destination API), applied to: rendered page refs incl. tags and alias chips, block refs ((uuid)) incl. added middle-click, namespace crumb + sidebar tree labels, Favorites rows, Recent rows, All-pages rows, query result group headers, reference-group headers. The QuickSwitcher already conformed and serves as the control suite; its rows keep their existing middle+ctrl background behavior. failBefore: neutralizing the decision helper makes the 5 ctrl/meta cases red while plain/shift/middle/combined stay green. Text-selection and editor-focus behavior unchanged: shift still suppresses range selection at mousedown, middle mousedown prevents autoscroll, touch long-press (GH #231) is unaffected on all the same anchors."
+    },
+    {
+      "id": "UI-MANAGED-WINDOWS-UPGRADE-REOPEN-370",
+      "title": "A Windows managed workspace upgraded from the preceding patch either reopens with usable pages or reports its real terminal refusal without a running timer",
+      "family": "managed-storage-startup-recovery",
+      "sources": {
+        "issues": [
+          370
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows"
+      ],
+      "layer": "real-app",
+      "status": "planned",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-windows-managed-storage.mjs",
+          "src/startupRecovery.test.ts"
+        ],
+        "scenario": "managed.windows-previous-patch-upgrade-reopen",
+        "failBefore": "pending"
+      },
+      "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files."
     }
   ]
 }

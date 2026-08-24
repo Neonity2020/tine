@@ -606,6 +606,54 @@ impl SparseV2Binding {
             .is_some_and(|snapshot| runtime_lifecycle_admits_application_pages(&snapshot.lifecycle))
     }
 
+    /// Explain why this binding cannot be published as the application's page
+    /// authority. Core open returns typed status separately from its optional
+    /// actor handle; collapsing those two facts into a GraphSlot used to hide
+    /// the real OpenRefused/Retryable detail behind SPARSE_V2_NOT_ACTIVE.
+    pub(crate) fn serving_failure_detail(&self) -> Option<String> {
+        if self.has_active_application_handle() {
+            return None;
+        }
+        if let Some(handle) = &self.handle {
+            return Some(match handle.status() {
+                Ok(snapshot) => snapshot.detail.unwrap_or_else(|| {
+                    format!(
+                        "managed storage runtime is not serving pages (lifecycle: {:?})",
+                        snapshot.lifecycle
+                    )
+                }),
+                Err(error) => format!("managed storage runtime status failed: {error}"),
+            });
+        }
+        Some(match &self.availability {
+            SparseV2Availability::Retryable { detail, .. } => detail.clone(),
+            SparseV2Availability::Blocked {
+                reason_code,
+                scenario_id,
+            } => format!(
+                "managed storage open was blocked (reason code: {reason_code}; scenario: {scenario_id})"
+            ),
+            SparseV2Availability::Refused {
+                reason_code,
+                scenario_id,
+                detail,
+            } => detail.clone().unwrap_or_else(|| {
+                format!(
+                    "managed storage open was refused (reason code: {reason_code}; scenario: {scenario_id})"
+                )
+            }),
+            SparseV2Availability::LegacyDefault => {
+                "managed storage setup is not present for this graph".into()
+            }
+            SparseV2Availability::Joinable { .. } => {
+                "managed storage must be joined before it can serve pages".into()
+            }
+            SparseV2Availability::Active => {
+                "managed storage open reported active without a serving actor".into()
+            }
+        })
+    }
+
     /// A managed binding with no live actor, for tests that only need the slot
     /// to *be* sparse -- e.g. proving that a read command is routed to the
     /// read-only view instead of being refused for lacking legacy authority.
@@ -5402,6 +5450,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(status).unwrap()["application_page_admission"]["authority"],
             "managed_unavailable"
+        );
+    }
+
+    #[test]
+    fn retryable_open_binding_preserves_its_real_failure_before_page_readiness() {
+        let binding = retryable_binding(
+            "local_active",
+            "clean managed runtime open failed: SQLite checkpoint is stale".into(),
+        );
+        assert_eq!(
+            binding.serving_failure_detail().as_deref(),
+            Some("clean managed runtime open failed: SQLite checkpoint is stale")
         );
     }
 

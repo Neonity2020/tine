@@ -21,6 +21,8 @@ import {
 if (process.platform !== "win32") throw new Error("Windows managed-storage smoke must run on Windows");
 const APP = process.env.TINE_APP;
 if (!APP || !fs.existsSync(APP)) throw new Error("HARNESS UNAVAILABLE: Windows managed-storage smoke requires TINE_APP");
+const BASELINE_APP = process.env.TINE_BASELINE_APP || APP;
+if (!fs.existsSync(BASELINE_APP)) throw new Error("HARNESS UNAVAILABLE: TINE_BASELINE_APP does not exist");
 
 const TD = process.env.TAURI_DRIVER || "tauri-driver";
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4444);
@@ -324,20 +326,53 @@ const env = {
   TINE_DEBUG: "1",
   TINE_DEBUG_LOG: debugLog,
   TINE_ACTIVATION_TRACE: "1",
-  TINE_E2E_APPLICATION_STDOUT_LOG: path.join(artifacts, "application-stdout.log"),
-  TINE_E2E_APPLICATION_STDERR_LOG: path.join(artifacts, "application-stderr.log"),
   APPDATA: path.join(root, "appdata"),
   LOCALAPPDATA: path.join(root, "localappdata"),
 };
-const webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT);
-const driverLog = fs.openSync(path.join(artifacts, "tauri-driver.log"), "w");
-const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT), {
-  env: webviewTarget.env,
-  stdio: ["ignore", driverLog, driverLog],
-});
-await sleep(3000);
-
 let browser;
+let webviewTarget;
+let driver;
+let driverLog;
+
+async function startJourney(application, label) {
+  const launchEnv = {
+    ...env,
+    TINE_E2E_APPLICATION_STDOUT_LOG: path.join(artifacts, `application-${label}-stdout.log`),
+    TINE_E2E_APPLICATION_STDERR_LOG: path.join(artifacts, `application-${label}-stderr.log`),
+  };
+  webviewTarget = await startWebdriverApplication(application, launchEnv, NATIVE_PORT);
+  driverLog = fs.openSync(path.join(artifacts, `tauri-driver-${label}.log`), "w");
+  driver = spawn(TD, webdriverServerArgs(DRIVER_PORT), {
+    env: webviewTarget.env,
+    stdio: ["ignore", driverLog, driverLog],
+  });
+  await sleep(3000);
+  browser = await remote({
+    hostname: "127.0.0.1",
+    port: DRIVER_PORT,
+    path: "/",
+    capabilities: tauriCapabilities(application, "default", process.platform, webviewTarget.debuggerAddress),
+    logLevel: "error",
+    connectionRetryCount: 1,
+    connectionRetryTimeout: 60_000,
+  });
+  await selectWebdriverWindowWithSelector(browser, 'button[title^="Search (Ctrl+K)"]');
+  await browser.$(".ls-block").waitForExist({ timeout: 180_000 });
+}
+
+async function stopJourney() {
+  try { await browser?.deleteSession(); } catch {}
+  browser = undefined;
+  if (driver?.pid) spawnSync("taskkill", ["/PID", String(driver.pid), "/T", "/F"], { stdio: "ignore" });
+  driver = undefined;
+  stopWebdriverApplication(webviewTarget);
+  webviewTarget = undefined;
+  if (driverLog !== undefined) {
+    try { fs.closeSync(driverLog); } catch {}
+    driverLog = undefined;
+  }
+}
+
 const receipt = {
   schemaVersion: 1,
   scenario: "windows-managed-storage",
@@ -348,17 +383,7 @@ const receipt = {
   milestones: {},
 };
 try {
-  browser = await remote({
-    hostname: "127.0.0.1",
-    port: DRIVER_PORT,
-    path: "/",
-    capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
-    logLevel: "error",
-    connectionRetryCount: 1,
-    connectionRetryTimeout: 60_000,
-  });
-  await selectWebdriverWindowWithSelector(browser, 'button[title^="Search (Ctrl+K)"]');
-  await browser.$(".ls-block").waitForExist({ timeout: 60_000 });
+  await startJourney(BASELINE_APP, "activation");
   await openPage(nestedTitle);
   receipt.milestones.directFilesOpened = true;
 
@@ -371,6 +396,17 @@ try {
   await closeSettings();
   await openPage(nestedTitle);
   receipt.milestones.managedPageOpened = true;
+
+  // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the
+  // actual baseline process without a graceful managed shutdown, then require
+  // the candidate to recover the same private state and serve an ordinary page.
+  await stopJourney();
+  receipt.milestones.baselineForceClosed = true;
+  const reopenStarted = Date.now();
+  await startJourney(APP, "candidate-reopen");
+  receipt.milestones.candidateReopenMs = Date.now() - reopenStarted;
+  await openPage(nestedTitle);
+  receipt.milestones.candidateManagedPageOpened = true;
 
   await openManagedSettings("Return to Direct files");
   await clickButtonAndConfirm("Return to Direct files");
@@ -411,9 +447,6 @@ try {
   fs.writeFileSync(path.join(artifacts, "failure-capsule.json"), `${JSON.stringify(failure, null, 2)}\n`);
   throw error;
 } finally {
-  try { await browser?.deleteSession(); } catch {}
-  spawnSync("taskkill", ["/PID", String(driver.pid), "/T", "/F"], { stdio: "ignore" });
-  stopWebdriverApplication(webviewTarget);
+  await stopJourney();
   if (process.env.CI === "true") spawnSync("taskkill", ["/IM", path.basename(APP), "/T", "/F"], { stdio: "ignore" });
-  fs.closeSync(driverLog);
 }

@@ -770,6 +770,18 @@ pub(crate) fn load_graph_for_label(
             )?;
             break 'managed;
         }
+        if let Some(detail) = binding.serving_failure_detail() {
+            let _ = state.storage_supervisor.finish_transition(
+                app,
+                managed_id,
+                StorageTransitionOutcome::Failed,
+                None,
+                Some("managed_open_not_serving".into()),
+            );
+            return Err(format!(
+                "Managed storage could not serve this workspace: {detail}"
+            ));
+        }
         let slot = Arc::new(GraphSlot::from_sparse_v2(
             binding,
             root_key.clone(),
@@ -1522,6 +1534,22 @@ mod tests {
             .find("commit_if_current(managed_id")
             .expect("managed registry publication");
         assert!(readiness < publication);
+    }
+
+    #[test]
+    fn managed_reopen_reports_nonserving_binding_before_page_readiness() {
+        let source = include_str!("graph.rs");
+        let start = source
+            .find("pub(crate) fn load_graph_for_label")
+            .expect("graph load function");
+        let managed = &source[start..];
+        let refusal = managed
+            .find("serving_failure_detail()")
+            .expect("typed managed-open refusal");
+        let readiness = managed
+            .find("prove_managed_application_ready(&slot, None)")
+            .expect("managed page readiness proof");
+        assert!(refusal < readiness);
     }
 
     #[test]

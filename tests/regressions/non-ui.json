@@ -4580,6 +4580,31 @@
         "failBefore": "proven"
       },
       "notes": "GH #364 reported that both title and page-menu rename failed intermittently on a roughly 13,000-page Windows Direct Files graph with `guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`. The rename transaction already held graph-text identity authority, completed one bounded no-follow inventory, rejected directory/file aliases and logical/twin destinations, locked every touched path, re-read exact bytes before each publication, and retained rollback copies. Its nested generic atomic-write and no-replace-move helpers nevertheless tried to construct a second whole-graph retained-shadow identity index. The causal fail-before injects the reporter's exact retained-shadow peak refusal and proves rename no longer consumes that builder. Transaction-local publication now repeats only exact-target, single-link, portable-path and no-clobber checks; it updates an already-warm optional index but never builds one. The hard-link witness preserves the physical-alias refusal, and the explicit release-gate probe creates 13,000 real page files, renames one page, rewrites its distant reference, preserves the file count and records elapsed time."
+    },
+    {
+      "id": "REG-MANAGED-OPEN-TERMINAL-DIAGNOSTIC-370",
+      "title": "Managed startup never publishes a non-serving binding or hides its terminal open refusal behind a generic readiness error",
+      "family": "managed-storage-startup-recovery",
+      "sources": {
+        "issues": [
+          370
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "tauri-storage",
+      "status": "planned",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/sync_runtime.rs",
+          "src-tauri/src/graph.rs"
+        ],
+        "scenario": "managed.open-terminal-nonserving-binding",
+        "failBefore": "pending"
+      },
+      "notes": "The v0.6.95 startup path converts a typed core OpenRefused/Retryable result into a SparseV2Binding with no actor, constructs a managed GraphSlot anyway, and only then fails the representative-page proof with the unrelated SPARSE_V2_NOT_ACTIVE text. The real failure class and remedy are lost. The graph registry remains unpublished, but the user cannot diagnose why the Windows reopen failed."
     }
   ]
 }

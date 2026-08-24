@@ -160,12 +160,16 @@ describe("native-supervised startup recovery", () => {
   });
 
   it("reports an actual command refusal and keeps recovery actions available", async () => {
+    vi.useFakeTimers();
     const deps = dependencies({ openGraph: vi.fn(async () => { throw new Error("missing graph"); }) });
     const controller = createStartupRecoveryController(deps);
     controller.start();
     await settle();
     expect(controller.snapshot()).toMatchObject({ mode: "recovery", phase: "graph.failed" });
     expect(controller.snapshot().detail).toBe("The command failed without a safe diagnostic detail.");
+    const terminalElapsed = controller.snapshot().elapsedMs;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(controller.snapshot().elapsedMs).toBe(terminalElapsed);
     controller.dispose();
   });
 });
