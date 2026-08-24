@@ -6,6 +6,7 @@ import {
   differingLineFlags,
   firstDifferingLine,
   firstLine,
+  mergedTitle,
   needsExpander,
   previewLine,
   seedSuggestedOrNoLoss,
@@ -42,6 +43,15 @@ const mergedRow: DiffRow = {
   verdict: "both-changed",
   suggestion: "merged",
   merged: { text: "Desktop kk", source: "computed" },
+};
+
+/** The same row filled from the merge tool's own suggested resolution instead
+ *  (Phase 2). The UI slot is identical; only the provenance differs. */
+const artifactRow: DiffRow = {
+  ...mergedRow,
+  mine: view("the quick brown fox jumped"),
+  theirs: view("the quick brown fox leaped"),
+  merged: { text: "the quick brown fox leapt", source: "artifact" },
 };
 
 function mountRow(row: DiffRow, seeded: Record<string, MergeDecision>): {
@@ -172,6 +182,40 @@ describe("the merged row in the resolver", () => {
       expect(strip.parentElement!.className).toBe("sync-merge-row");
       expect(host.querySelectorAll(".sync-merge-cols .sync-merge-cell").length).toBe(2);
       expect(strip.textContent).toContain("Desktop kk");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("names the merge tool as the source of an artifact proposal", async () => {
+    const { host, dispose } = mountRow(artifactRow, seedSuggestedOrNoLoss([artifactRow]));
+    try {
+      await flush();
+      // Same slot, same decision value — only the provenance wording differs.
+      const strip = host.querySelector(".sync-merge-cell.merged")!;
+      expect(strip.getAttribute("data-source")).toBe("artifact");
+      expect(strip.getAttribute("title")).toBe(mergedTitle("artifact"));
+      expect(strip.getAttribute("title")).not.toBe(mergedTitle("computed"));
+      expect(strip.querySelector(".sync-merge-mergedtag")!.textContent).toBe("Merged (tool)");
+      expect(strip.textContent).toContain("the quick brown fox leapt");
+      // It seeds "merged" exactly like a computed one, and applies nothing.
+      expect(seedSuggestedOrNoLoss([artifactRow])).toEqual({ "1": "merged" });
+      expect(
+        host.querySelector('.sync-merge-seg[data-decision="merged"]')!.classList.contains("active"),
+      ).toBe(true);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps today's wording for a computed proposal", async () => {
+    const { host, dispose } = mountRow(mergedRow, seedSuggestedOrNoLoss([mergedRow]));
+    try {
+      await flush();
+      const strip = host.querySelector(".sync-merge-cell.merged")!;
+      expect(strip.getAttribute("data-source")).toBe("computed");
+      expect(strip.getAttribute("title")).toBe(mergedTitle("computed"));
+      expect(strip.querySelector(".sync-merge-mergedtag")!.textContent).toBe("Merged");
     } finally {
       dispose();
     }

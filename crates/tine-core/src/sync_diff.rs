@@ -74,15 +74,19 @@ pub enum Diff3Verdict {
     BothChanged,
 }
 
-/// Where a proposed merged body came from. `Artifact` is a reserved seam for
-/// the VCS "suggested conflict resolution" region (ADR 0057, spec Phase 2) and
-/// is never produced yet.
+/// Where a proposed merged body came from. Both are confirmation-gated and both
+/// are re-derived at apply time; the distinction is provenance, which the UI
+/// shows because the two carry different guarantees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MergedSource {
-    /// Composed here from two disjoint edits of the base.
+    /// Composed here from two disjoint edits of the base — a stronger claim,
+    /// so it always wins when both sources can supply a body.
     Computed,
-    /// Lifted from a merge tool's own suggestion region (unused in v1).
+    /// Lifted from the merge tool's own `####### SUGGESTED CONFLICT RESOLUTION`
+    /// region (Fossil), which Tine reconstructs into a whole page and aligns
+    /// like any other document. Tine vouches for nothing about its content
+    /// beyond the same validity gate — hence "artifact", not "merge".
     Artifact,
 }
 
@@ -117,8 +121,9 @@ pub struct DiffRow {
     /// Never auto-applied — the UI only pre-selects it for the user to confirm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
-    /// A merged body proposed for a `BothChanged` row whose two edits touch
-    /// disjoint regions of one unambiguous base. Present only on 3-way diffs.
+    /// A merged body proposed for a `BothChanged` row: composed from two
+    /// disjoint edits of one unambiguous base, or lifted from a merge tool's
+    /// own suggestion region. Present only on 3-way diffs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged: Option<MergedProposal>,
 }
@@ -182,13 +187,38 @@ pub fn diff3_docs(
     mine: &crate::doc::Document,
     theirs: &crate::doc::Document,
 ) -> SyncConflictDiff {
+    diff3_docs_with_artifact(base, mine, theirs, None)
+}
+
+/// [`diff3_docs`] with a fourth, non-side document: the resolution a merge tool
+/// already proposed for this file (Fossil's `#######` region, reconstructed by
+/// `concord_queue::parse_vcs_marker_sides`). Rows where the computed merge
+/// declines may then offer the artifact's own body instead.
+///
+/// The artifact is aligned with the SAME machinery as the base, so an artifact
+/// block is located exactly the way a base block is; it never widens which rows
+/// may carry a proposal (still `BothChanged` under a real base) and never
+/// changes a verdict.
+pub fn diff3_docs_with_artifact(
+    base: &crate::doc::Document,
+    mine: &crate::doc::Document,
+    theirs: &crate::doc::Document,
+    artifact: Option<&crate::doc::Document>,
+) -> SyncConflictDiff {
     let nodes = align_nodes(&mine.roots, &theirs.roots, "");
     let mut rows = nodes_to_rows(&nodes);
     let mut base_of_mine = HashMap::new();
     collect_base_pairs(&base.roots, &mine.roots, &mut base_of_mine);
     let mut base_of_theirs = HashMap::new();
     collect_base_pairs(&base.roots, &theirs.roots, &mut base_of_theirs);
-    annotate_rows(&mut rows, &nodes, &base_of_mine, &base_of_theirs);
+    let mut art_of_mine = HashMap::new();
+    let mut art_of_theirs = HashMap::new();
+    if let Some(artifact) = artifact {
+        collect_base_pairs(&artifact.roots, &mine.roots, &mut art_of_mine);
+        collect_base_pairs(&artifact.roots, &theirs.roots, &mut art_of_theirs);
+    }
+    let artifacts = artifact.map(|_| (&art_of_mine, &art_of_theirs));
+    annotate_rows(&mut rows, &nodes, &base_of_mine, &base_of_theirs, artifacts);
     let blocks_identical = rows.iter().all(|r| r.kind == RowKind::Unchanged);
     let mine_pre = normalize_pre(mine.pre_block.as_deref());
     let theirs_pre = normalize_pre(theirs.pre_block.as_deref());
@@ -279,6 +309,7 @@ fn annotate_rows(
     nodes: &[Node],
     base_of_mine: &BasePairs,
     base_of_theirs: &BasePairs,
+    artifacts: Option<(&BasePairs, &BasePairs)>,
 ) {
     for (row, node) in rows.iter_mut().zip(nodes.iter()) {
         match node {
@@ -312,16 +343,32 @@ fn annotate_rows(
                     row.verdict = Some(verdict);
                     row.suggestion = suggestion.map(str::to_string);
                     if let (true, true) = (mine_changed, theirs_changed) {
+                        // PRECEDENCE: a composition of two disjoint edits is a
+                        // stronger claim than a third party's guess, so the
+                        // artifact is consulted only where the computation
+                        // declines. Same order in the apply path.
                         if let Some(text) = merged_body(base_mine, base_theirs, mine, theirs) {
                             row.suggestion = Some("merged".to_string());
                             row.merged = Some(MergedProposal {
                                 text,
                                 source: MergedSource::Computed,
                             });
+                        } else if let Some(text) = artifact_body_for(artifacts, mine, theirs) {
+                            row.suggestion = Some("merged".to_string());
+                            row.merged = Some(MergedProposal {
+                                text,
+                                source: MergedSource::Artifact,
+                            });
                         }
                     }
                 }
-                annotate_rows(&mut row.children, children, base_of_mine, base_of_theirs);
+                annotate_rows(
+                    &mut row.children,
+                    children,
+                    base_of_mine,
+                    base_of_theirs,
+                    artifacts,
+                );
             }
             // Added row (winner-only). Absent from base → mine added it (keep).
             // Present and unchanged → theirs deleted it (suggest the deletion).
@@ -371,6 +418,51 @@ fn merged_body(
     }
     let text = crate::text_merge::merge_disjoint(&base_mine.raw, &mine.raw, &theirs.raw)?;
     merged_body_is_valid(&text, mine.is_org).then_some(text)
+}
+
+/// [`artifact_body`] for a row, given the pair of artifact maps (or `None` when
+/// no artifact document reached this diff/merge at all). Kept next to the maps
+/// so the diff and the apply do the same two lookups.
+fn artifact_body_for(
+    artifacts: Option<(&BasePairs, &BasePairs)>,
+    mine: &DocBlock,
+    theirs: &DocBlock,
+) -> Option<String> {
+    let (art_of_mine, art_of_theirs) = artifacts?;
+    artifact_body(
+        art_of_mine.get(&(mine as *const DocBlock)).copied(),
+        art_of_theirs.get(&(theirs as *const DocBlock)).copied(),
+        mine,
+        theirs,
+    )
+}
+
+/// The merge tool's own proposed body for one aligned `BothChanged` pair, or
+/// `None` when it may not be offered. Mirrors [`merged_body`]: both the diff and
+/// the apply go through here, so the text the user confirmed and the text
+/// finally written are one lookup over the same inputs.
+///
+/// Requires ONE unambiguous artifact block — both sides must pair with one and
+/// the two bodies must agree (the two alignments can pair duplicate content with
+/// different blocks) — a body that differs from BOTH sides (a proposal equal to
+/// a side is just one of the three choices the user already has, so offering it
+/// as a fourth would be noise), and the same structural/org validity gate a
+/// computed body passes.
+fn artifact_body(
+    art_mine: Option<&DocBlock>,
+    art_theirs: Option<&DocBlock>,
+    mine: &DocBlock,
+    theirs: &DocBlock,
+) -> Option<String> {
+    let (art_mine, art_theirs) = (art_mine?, art_theirs?);
+    if art_mine.raw != art_theirs.raw {
+        return None;
+    }
+    let text = &art_mine.raw;
+    if *text == mine.raw || *text == theirs.raw {
+        return None;
+    }
+    merged_body_is_valid(text, mine.is_org).then(|| text.clone())
 }
 
 /// Whether a merged body still IS one block: serialized the way the page
@@ -699,9 +791,10 @@ enum Decision {
     Mine,
     Theirs,
     Both,
-    /// Take the body [`merged_body`] composes from both edits of the base. Only
-    /// ever valid on an aligned `Modified` row of a 3-way resolve; the text is
-    /// recomputed here, never carried in the decision.
+    /// Take the proposed merged body — [`merged_body`] composed from both edits
+    /// of the base, or failing that the merge tool's own [`artifact_body`].
+    /// Only ever valid on an aligned `Modified` row of a 3-way resolve; the text
+    /// is re-derived here, never carried in the decision.
     Merged,
 }
 
@@ -742,8 +835,9 @@ const NO_BASE: &str = "no common ancestor is available for this resolve";
 /// The decision names a row that carries no mergeable pair (an Added/Removed
 /// subtree, or an unchanged row).
 const NOT_A_MODIFIED_ROW: &str = "this row is not an aligned modified block";
-/// Recomputation declined: ambiguous base, overlapping edits, a bounded-diff
-/// give-up, or a body that would not re-parse as this one block.
+/// Re-derivation declined on BOTH sources: ambiguous base or artifact,
+/// overlapping edits, a bounded-diff give-up, or a body that would not re-parse
+/// as this one block.
 const NOT_MERGEABLE: &str = "the two edits no longer merge cleanly";
 
 /// Rebuild a merged sibling list from the two trees and the user's per-row
@@ -762,21 +856,27 @@ pub fn merge_blocks(
     theirs: &[DocBlock],
     decisions: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<DocBlock>, MergeRefused> {
-    merge_blocks3(None, mine, theirs, decisions)
+    merge_blocks3(None, mine, theirs, None, decisions)
 }
 
 /// 3-way form of [`merge_blocks`]: with `base` present, a row may also decide
 /// `"merged"`, and the merged body is RE-DERIVED here from `base`/`mine`/
-/// `theirs` — the decision map carries only the plain string. `base` must be
-/// the same ancestor the diff was computed against; the caller's staleness
-/// guards (and, for conflict copies, the ledger pin) are what make that true.
+/// `theirs` (or, failing that, from `artifact`) — the decision map carries only
+/// the plain string. `base` and `artifact` must be the same documents the diff
+/// was computed against; the caller's staleness guards (and, for conflict
+/// copies, the ledger pin) are what make that true. For a marker file both are
+/// re-derived from the guarded bytes of the one file, so "same inputs" is
+/// structural.
 ///
 /// With `base == None` the behavior is exactly the old 2-way merge, except that
-/// a `"merged"` decision — which no 2-way diff can have offered — refuses.
+/// a `"merged"` decision — which no 2-way diff can have offered — refuses. An
+/// `artifact` without a `base` can therefore never be reached, matching the
+/// diff, where a proposal needs a `BothChanged` verdict.
 pub fn merge_blocks3(
     base: Option<&[DocBlock]>,
     mine: &[DocBlock],
     theirs: &[DocBlock],
+    artifact: Option<&[DocBlock]>,
     decisions: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<DocBlock>, MergeRefused> {
     let mut base_of_mine = BasePairs::new();
@@ -785,14 +885,22 @@ pub fn merge_blocks3(
         collect_base_pairs(base, mine, &mut base_of_mine);
         collect_base_pairs(base, theirs, &mut base_of_theirs);
     }
+    let mut art_of_mine = BasePairs::new();
+    let mut art_of_theirs = BasePairs::new();
+    if let Some(artifact) = artifact {
+        collect_base_pairs(artifact, mine, &mut art_of_mine);
+        collect_base_pairs(artifact, theirs, &mut art_of_theirs);
+    }
     let bases = base.map(|_| (&base_of_mine, &base_of_theirs));
-    nodes_to_merged(&align_nodes(mine, theirs, ""), decisions, bases)
+    let artifacts = artifact.map(|_| (&art_of_mine, &art_of_theirs));
+    nodes_to_merged(&align_nodes(mine, theirs, ""), decisions, bases, artifacts)
 }
 
 fn nodes_to_merged(
     nodes: &[Node],
     decisions: &std::collections::HashMap<String, String>,
     bases: Option<(&BasePairs, &BasePairs)>,
+    artifacts: Option<(&BasePairs, &BasePairs)>,
 ) -> Result<Vec<DocBlock>, MergeRefused> {
     let mut out = Vec::new();
     for n in nodes {
@@ -812,12 +920,13 @@ fn nodes_to_merged(
                     continue;
                 }
                 match decision_for(decisions, id) {
-                    Decision::Mine => {
-                        out.push(rebuild(mine, nodes_to_merged(children, decisions, bases)?))
-                    }
+                    Decision::Mine => out.push(rebuild(
+                        mine,
+                        nodes_to_merged(children, decisions, bases, artifacts)?,
+                    )),
                     Decision::Theirs => out.push(rebuild(
                         theirs,
-                        nodes_to_merged(children, decisions, bases)?,
+                        nodes_to_merged(children, decisions, bases, artifacts)?,
                     )),
                     Decision::Both => {
                         out.push((*mine).clone());
@@ -828,19 +937,23 @@ fn nodes_to_merged(
                         let Some((base_of_mine, base_of_theirs)) = bases else {
                             return Err(refused(id, NO_BASE));
                         };
+                        // SAME precedence as the diff — computed first, the
+                        // merge tool's artifact only where it declines — so the
+                        // user is written the body they were shown.
                         let text = merged_body(
                             base_of_mine.get(&(*mine as *const DocBlock)).copied(),
                             base_of_theirs.get(&(*theirs as *const DocBlock)).copied(),
                             mine,
                             theirs,
                         )
+                        .or_else(|| artifact_body_for(artifacts, mine, theirs))
                         .ok_or_else(|| refused(id, NOT_MERGEABLE))?;
                         // Same shape as keep-mine/keep-theirs: one body, the
                         // children's own decisions.
                         out.push(rebuild_with_raw(
                             mine,
                             text,
-                            nodes_to_merged(children, decisions, bases)?,
+                            nodes_to_merged(children, decisions, bases, artifacts)?,
                         ));
                     }
                 }
@@ -1732,7 +1845,7 @@ mod tests {
             ("0".to_string(), "merged".to_string()),
             ("0.0".to_string(), "theirs".to_string()),
         ]);
-        let merged = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec)
+        let merged = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, None, &dec)
             .expect("the merged decision applies");
         assert_eq!(merged.len(), 1);
         assert!(
@@ -1765,7 +1878,7 @@ mod tests {
         let base = parse(&format!("- Desktop 5\n{ID}"));
         let mine = parse(&format!("- Desktop\n{ID}"));
         let dec = HashMap::from([("0".to_string(), "merged".to_string())]);
-        let error = merge_blocks3(Some(&base.roots), &mine.roots, &base.roots, &dec)
+        let error = merge_blocks3(Some(&base.roots), &mine.roots, &base.roots, None, &dec)
             .expect_err("theirs never moved");
         assert_eq!(error.reason, NOT_MERGEABLE);
     }
@@ -1777,7 +1890,7 @@ mod tests {
         let mine = parse("- alpha\n  beta gamma\n");
         let theirs = parse("- alpha\n  X- beta gamma\n");
         let dec = HashMap::from([("0".to_string(), "merged".to_string())]);
-        let error = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec)
+        let error = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, None, &dec)
             .expect_err("the gate refuses");
         assert_eq!(error.reason, NOT_MERGEABLE);
     }
@@ -1790,8 +1903,8 @@ mod tests {
         let d = diff3_docs(&base, &mine, &theirs);
         for row in d.rows.iter().filter(|r| r.kind != RowKind::Unchanged) {
             let dec = HashMap::from([(row.id.clone(), "merged".to_string())]);
-            let error =
-                merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec).unwrap_err();
+            let error = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, None, &dec)
+                .unwrap_err();
             assert_eq!(error.reason, NOT_A_MODIFIED_ROW, "row {}", row.id);
         }
     }
@@ -1804,7 +1917,228 @@ mod tests {
         let mine = parse("- alpha\n- the quick brown fox jumped\n");
         let theirs = parse("- alpha\n- the quick brown fox leaped\n");
         let dec = HashMap::from([("1".to_string(), "theirs".to_string())]);
-        let merged = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec).unwrap();
+        let merged =
+            merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, None, &dec).unwrap();
         assert_eq!(raws(&merged), vec!["alpha", "the quick brown fox leaped"]);
+    }
+
+    // --- the second source: the merge tool's own suggested resolution --------
+
+    /// The overlapping-edit case the computed merge refuses (see
+    /// `diff3_overlapping_edits_offer_no_merged_body`) — the only place an
+    /// artifact can ever show up.
+    fn overlapping() -> (
+        crate::doc::Document,
+        crate::doc::Document,
+        crate::doc::Document,
+    ) {
+        (
+            parse(&format!("- the quick brown fox jumps\n{ID}")),
+            parse(&format!("- the quick brown fox jumped\n{ID}")),
+            parse(&format!("- the quick brown fox leaped\n{ID}")),
+        )
+    }
+
+    #[test]
+    fn diff3_offers_the_artifact_where_the_computed_merge_declines() {
+        let (base, mine, theirs) = overlapping();
+        let artifact = parse(&format!("- the quick brown fox leapt\n{ID}"));
+        let d = diff3_docs_with_artifact(&base, &mine, &theirs, Some(&artifact));
+        assert_eq!(d.rows.len(), 1);
+        let row = &d.rows[0];
+        // The verdict is untouched — the artifact fills a conflict, it never
+        // reclassifies one.
+        assert_eq!(row.verdict, Some(Diff3Verdict::BothChanged));
+        assert_eq!(row.suggestion.as_deref(), Some("merged"));
+        let proposal = row.merged.as_ref().expect("an artifact proposal");
+        assert_eq!(proposal.source, MergedSource::Artifact);
+        assert!(proposal.text.starts_with("the quick brown fox leapt"));
+        // On the wire for `src/types.ts`.
+        let wire = serde_json::to_value(row).unwrap();
+        assert_eq!(wire["merged"]["source"], "artifact");
+        assert_eq!(wire["merged"]["text"], proposal.text.as_str());
+    }
+
+    /// PRECEDENCE: a composition of two disjoint edits is a stronger claim than
+    /// a third party's guess, so the artifact is never consulted when the
+    /// computation succeeds.
+    #[test]
+    fn diff3_computed_wins_over_an_available_artifact() {
+        let base = parse(&format!("- Desktop 5\n{ID}"));
+        let mine = parse(&format!("- Desktop\n{ID}"));
+        let theirs = parse(&format!("- Desktop 5 kk\n{ID}"));
+        let artifact = parse(&format!("- something the tool made up\n{ID}"));
+        let row = &diff3_docs_with_artifact(&base, &mine, &theirs, Some(&artifact)).rows[0];
+        let proposal = row.merged.as_ref().expect("a proposal");
+        assert_eq!(proposal.source, MergedSource::Computed);
+        assert!(
+            proposal.text.starts_with("Desktop kk"),
+            "{:?}",
+            proposal.text
+        );
+    }
+
+    /// A proposal equal to a side is one of the three choices the user already
+    /// has; offering it a fourth time is noise, not an outcome.
+    #[test]
+    fn an_artifact_equal_to_a_side_is_not_offered() {
+        let (base, mine, theirs) = overlapping();
+        for same_as in [&mine, &theirs] {
+            let d = diff3_docs_with_artifact(&base, &mine, &theirs, Some(same_as));
+            assert!(d.rows[0].merged.is_none(), "{:?}", d.rows[0].merged);
+            assert!(d.rows[0].suggestion.is_none());
+        }
+    }
+
+    /// The same structural gate a computed body passes: a body that would come
+    /// back as TWO blocks is never offered, whatever produced it.
+    #[test]
+    fn an_artifact_that_would_split_into_two_blocks_is_not_offered() {
+        let (base, mine, theirs) = overlapping();
+        let mut forged = parse(&format!("- the quick brown fox leapt\n{ID}"));
+        // A body that re-parses as a bullet of its own.
+        forged.roots[0].raw = "leapt\n- and a second bullet".to_string();
+        assert!(!merged_body_is_valid(&forged.roots[0].raw, false));
+        let d = diff3_docs_with_artifact(&base, &mine, &theirs, Some(&forged));
+        assert!(d.rows[0].merged.is_none());
+    }
+
+    /// Two artifact blocks that disagree mean the two alignments paired the row
+    /// with DIFFERENT suggestion blocks — an ambiguous artifact is no artifact.
+    #[test]
+    fn a_disagreeing_or_missing_artifact_pair_is_not_offered() {
+        let a = parse("- alpha\n");
+        let b = parse("- beta\n");
+        let mine = parse(&format!("- the quick brown fox jumped\n{ID}"));
+        let theirs = parse(&format!("- the quick brown fox leaped\n{ID}"));
+        let (m, t) = (&mine.roots[0], &theirs.roots[0]);
+        assert_eq!(
+            artifact_body(Some(&a.roots[0]), Some(&b.roots[0]), m, t),
+            None
+        );
+        // A missing block on either side is likewise no artifact.
+        assert_eq!(artifact_body(Some(&a.roots[0]), None, m, t), None);
+        assert_eq!(artifact_body(None, Some(&a.roots[0]), m, t), None);
+    }
+
+    /// A proposal needs a `BothChanged` verdict, which needs a base. A merge
+    /// tool that wrote a suggestion but no common-ancestor section therefore
+    /// surfaces nothing — no special case, just the 2-way path.
+    #[test]
+    fn an_artifact_without_a_base_never_surfaces() {
+        let mine = parse(&format!("- the quick brown fox jumped\n{ID}"));
+        let theirs = parse(&format!("- the quick brown fox leaped\n{ID}"));
+        let d = diff_docs(&mine, &theirs);
+        assert!(d.rows[0].merged.is_none());
+        // And the apply side refuses a forged decision for want of a base.
+        let dec = HashMap::from([("0".to_string(), "merged".to_string())]);
+        let error = merge_blocks(&mine.roots, &theirs.roots, &dec).expect_err("no base");
+        assert_eq!(error.reason, NO_BASE);
+    }
+
+    #[test]
+    fn applying_a_confirmed_artifact_writes_the_suggested_body() {
+        let (base, mine, theirs) = overlapping();
+        let artifact = parse(&format!("- the quick brown fox leapt\n{ID}"));
+        let offered = diff3_docs_with_artifact(&base, &mine, &theirs, Some(&artifact)).rows[0]
+            .merged
+            .as_ref()
+            .expect("an artifact proposal")
+            .text
+            .clone();
+        let dec = HashMap::from([("0".to_string(), "merged".to_string())]);
+        let merged = merge_blocks3(
+            Some(&base.roots),
+            &mine.roots,
+            &theirs.roots,
+            Some(&artifact.roots),
+            &dec,
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        // Byte-for-byte the body the user was shown, id:: and all.
+        assert_eq!(merged[0].raw, offered);
+        assert_eq!(merged[0].raw, artifact.roots[0].raw);
+    }
+
+    /// Determinism the other way round: with a computed body available the
+    /// apply writes THAT, never the artifact — the same precedence the diff
+    /// used to pick what the user saw.
+    #[test]
+    fn applying_prefers_the_computed_body_over_the_artifact() {
+        let base = parse(&format!("- Desktop 5\n{ID}"));
+        let mine = parse(&format!("- Desktop\n{ID}"));
+        let theirs = parse(&format!("- Desktop 5 kk\n{ID}"));
+        let artifact = parse(&format!("- something the tool made up\n{ID}"));
+        let dec = HashMap::from([("0".to_string(), "merged".to_string())]);
+        let merged = merge_blocks3(
+            Some(&base.roots),
+            &mine.roots,
+            &theirs.roots,
+            Some(&artifact.roots),
+            &dec,
+        )
+        .unwrap();
+        assert!(
+            merged[0].raw.starts_with("Desktop kk"),
+            "{:?}",
+            merged[0].raw
+        );
+    }
+
+    /// A forged `"merged"` where NEITHER source can supply a body refuses the
+    /// whole resolve — it never falls back to a side.
+    #[test]
+    fn a_forged_merged_decision_refuses_when_both_sources_decline() {
+        let (base, mine, theirs) = overlapping();
+        let dec = HashMap::from([("0".to_string(), "merged".to_string())]);
+        // No artifact at all.
+        let error = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, None, &dec)
+            .expect_err("nothing to merge");
+        assert_eq!(error.row, "0");
+        assert_eq!(error.reason, NOT_MERGEABLE);
+        // An artifact that duplicates a side is not a fourth outcome either.
+        let error = merge_blocks3(
+            Some(&base.roots),
+            &mine.roots,
+            &theirs.roots,
+            Some(&mine.roots),
+            &dec,
+        )
+        .expect_err("the artifact duplicates mine");
+        assert_eq!(error.reason, NOT_MERGEABLE);
+    }
+
+    /// Children of an artifact-merged row keep their own decisions, exactly as
+    /// for a computed one.
+    #[test]
+    fn an_artifact_merged_row_keeps_its_children_decisions() {
+        const KID: &str = "\t\tid:: aaaaaaaa-0000-0000-0000-0000000000cd\n";
+        let page = |body: &str, kid: &str| {
+            parse(&format!("- {body}\n{ID}\t- the child line {kid}\n{KID}"))
+        };
+        let base = page("the quick brown fox jumps", "here");
+        let mine = page("the quick brown fox jumped", "here");
+        let theirs = page("the quick brown fox leaped", "THERE");
+        let artifact = page("the quick brown fox leapt", "here");
+        let d = diff3_docs_with_artifact(&base, &mine, &theirs, Some(&artifact));
+        assert_eq!(
+            d.rows[0].merged.as_ref().map(|m| m.source),
+            Some(MergedSource::Artifact)
+        );
+        let dec = HashMap::from([
+            ("0".to_string(), "merged".to_string()),
+            ("0.0".to_string(), "theirs".to_string()),
+        ]);
+        let merged = merge_blocks3(
+            Some(&base.roots),
+            &mine.roots,
+            &theirs.roots,
+            Some(&artifact.roots),
+            &dec,
+        )
+        .unwrap();
+        assert!(merged[0].raw.starts_with("the quick brown fox leapt"));
+        assert_eq!(raws(&merged[0].children), vec!["the child line THERE"]);
     }
 }

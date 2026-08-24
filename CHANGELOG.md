@@ -15,7 +15,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   block's text (against the last version both sides agreed on), the in-page
   conflict review offers the combination as a fourth, pre-selected choice next
   to keep-mine/keep-theirs/keep-both — for sync-conflict copies and for
-  `diff3`/Fossil-style merge markers alike. Like every suggestion it is only
+  `diff3`/Fossil-style merge markers alike. Where the edits overlap but the
+  merge tool wrote its own `####### SUGGESTED CONFLICT RESOLUTION` sections
+  (Fossil), that suggestion is offered in the same place instead, clearly
+  labeled as the tool's proposal. Like every suggestion it is only
   pre-selected: nothing is applied until you confirm, the applied text is
   re-derived from the same three versions (never trusted from the UI), and
   edits that overlap — or whose combination would not survive as a single

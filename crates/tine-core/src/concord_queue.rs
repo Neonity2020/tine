@@ -118,6 +118,15 @@ pub struct MarkerSides {
     /// would make baseless regions look like both sides added text, so it is
     /// all-or-nothing.
     pub base: Option<String>,
+    /// The page as the merge tool's own `#######` SUGGESTED CONFLICT RESOLUTION
+    /// sections propose it (Fossil): the suggestion text inside every region,
+    /// the common text elsewhere. All-or-nothing exactly like [`MarkerSides::base`]
+    /// — a page where only SOME regions carried a suggestion would mix a
+    /// proposal with unresolved regions, so the whole artifact is dropped.
+    ///
+    /// It is not a side: nothing here is a version anyone wrote. It is only ever
+    /// offered as a `MergedSource::Artifact` proposal the user must confirm.
+    pub suggested: Option<String>,
     /// How many conflict regions the file contains.
     pub regions: usize,
     /// Label from the first `<<<<<<<` line (e.g. `HEAD`), best effort.
@@ -135,7 +144,8 @@ enum Section {
     Base,
     Theirs,
     /// Fossil's precomputed suggestion. It is a DERIVATION of the two sides,
-    /// not a side, so it contributes to none of the reconstructed texts.
+    /// not a side, so it contributes to none of the three reconstructed SIDES —
+    /// it feeds only [`MarkerSides::suggested`].
     Suggested,
 }
 
@@ -158,11 +168,15 @@ pub fn parse_vcs_marker_sides(content: &str) -> Option<MarkerSides> {
     let mut mine = String::new();
     let mut theirs = String::new();
     let mut base = String::new();
+    let mut suggested = String::new();
     let mut section = Section::Outside;
     let mut regions = 0usize;
     // A base section is only trustworthy if every region supplies one.
     let mut regions_with_base = 0usize;
     let mut region_had_base = false;
+    // Same all-or-nothing rule for the merge tool's suggestion.
+    let mut regions_with_suggestion = 0usize;
+    let mut region_had_suggestion = false;
     let mut mine_label = String::new();
     let mut theirs_label = String::new();
     for (index, line) in content.lines().enumerate() {
@@ -174,6 +188,7 @@ pub fn parse_vcs_marker_sides(content: &str) -> Option<MarkerSides> {
                 section = Section::Ours;
                 regions += 1;
                 region_had_base = false;
+                region_had_suggestion = false;
                 if mine_label.is_empty() {
                     mine_label = marker_label(line);
                 }
@@ -184,6 +199,7 @@ pub fn parse_vcs_marker_sides(content: &str) -> Option<MarkerSides> {
                     return None;
                 }
                 section = Section::Suggested;
+                region_had_suggestion = true;
                 continue;
             }
             Some(ConflictMarkerKind::Base) => {
@@ -212,6 +228,9 @@ pub fn parse_vcs_marker_sides(content: &str) -> Option<MarkerSides> {
                 if region_had_base {
                     regions_with_base += 1;
                 }
+                if region_had_suggestion {
+                    regions_with_suggestion += 1;
+                }
                 if theirs_label.is_empty() {
                     theirs_label = marker_label(line);
                 }
@@ -224,11 +243,13 @@ pub fn parse_vcs_marker_sides(content: &str) -> Option<MarkerSides> {
                 push_line(&mut mine, line);
                 push_line(&mut theirs, line);
                 push_line(&mut base, line);
+                push_line(&mut suggested, line);
             }
             Section::Ours => push_line(&mut mine, line),
             Section::Theirs => push_line(&mut theirs, line),
             Section::Base => push_line(&mut base, line),
-            Section::Suggested => {}
+            // Feeds the artifact proposal ONLY — never any reconstructed side.
+            Section::Suggested => push_line(&mut suggested, line),
         }
     }
     if section != Section::Outside || regions == 0 {
@@ -238,6 +259,7 @@ pub fn parse_vcs_marker_sides(content: &str) -> Option<MarkerSides> {
         mine,
         theirs,
         base: (regions_with_base == regions).then_some(base),
+        suggested: (regions_with_suggestion == regions).then_some(suggested),
         regions,
         mine_label,
         theirs_label,
@@ -333,6 +355,96 @@ mod tests {
                 "Fossil's suggestion is a derivation, not a side: {text:?}"
             );
         }
+        // It is not dropped on the floor either — it reconstructs a fourth,
+        // clearly-labelled document that only the merge PROPOSAL may use.
+        assert_eq!(
+            sides.suggested.as_deref(),
+            Some("- shared\n- a guess nobody asked for\n")
+        );
+    }
+
+    #[test]
+    fn a_fossil_region_reconstructs_all_four_documents() {
+        // Fossil writes the sections in this order (src/merge3.c): ours,
+        // suggestion, common ancestor, merged-in. Verbose marker lines, several
+        // lines per section, shared text on both sides of the region.
+        let fossil = concat!(
+            "- top shared\n",
+            "- second shared\n",
+            "<<<<<<< BEGIN MERGE CONFLICT: local copy shown first <<<<<<<<<<<<<<<\n",
+            "- alpha mine\n",
+            "- beta\n",
+            "####### SUGGESTED CONFLICT RESOLUTION follows ##################\n",
+            "- alpha mine\n",
+            "- beta theirs\n",
+            "||||||| COMMON ANCESTOR content follows |||||||||||||||||||||||||\n",
+            "- alpha\n",
+            "- beta\n",
+            "======= MERGED IN content follows ==============================\n",
+            "- alpha\n",
+            "- beta theirs\n",
+            ">>>>>>> END MERGE CONFLICT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n",
+            "- bottom shared\n",
+        );
+        let sides = parse_vcs_marker_sides(fossil).expect("conflicted");
+        let shared = |body: &str| format!("- top shared\n- second shared\n{body}- bottom shared\n");
+        assert_eq!(sides.mine, shared("- alpha mine\n- beta\n"));
+        assert_eq!(sides.theirs, shared("- alpha\n- beta theirs\n"));
+        assert_eq!(
+            sides.base.as_deref(),
+            Some(shared("- alpha\n- beta\n")).as_deref()
+        );
+        assert_eq!(
+            sides.suggested.as_deref(),
+            Some(shared("- alpha mine\n- beta theirs\n")).as_deref()
+        );
+        assert_eq!(sides.regions, 1);
+    }
+
+    #[test]
+    fn a_suggestion_in_only_some_regions_is_dropped_for_the_whole_page() {
+        // Same all-or-nothing rule as the ancestor: a partial artifact would
+        // propose a resolution for one region and leave the other conflicted.
+        let two = concat!(
+            "<<<<<<< HEAD\n- a1\n",
+            "####### SUGGESTED CONFLICT RESOLUTION follows ###\n- a merged\n",
+            "||||||| base\n- a0\n=======\n- a2\n>>>>>>> x\n",
+            "- middle\n",
+            "<<<<<<< HEAD\n- b1\n||||||| base\n- b0\n=======\n- b2\n>>>>>>> x\n",
+        );
+        let sides = parse_vcs_marker_sides(two).expect("conflicted");
+        assert_eq!(sides.regions, 2);
+        assert_eq!(sides.suggested, None);
+        // The sides and the ancestor are unaffected, and still carry no
+        // suggestion text.
+        assert_eq!(sides.mine, "- a1\n- middle\n- b1\n");
+        assert_eq!(sides.theirs, "- a2\n- middle\n- b2\n");
+        assert_eq!(sides.base.as_deref(), Some("- a0\n- middle\n- b0\n"));
+    }
+
+    #[test]
+    fn every_region_carrying_a_suggestion_reconstructs_the_whole_page() {
+        let two = concat!(
+            "<<<<<<< HEAD\n- a1\n",
+            "####### SUGGESTED CONFLICT RESOLUTION follows ###\n- a merged\n",
+            "||||||| base\n- a0\n=======\n- a2\n>>>>>>> x\n",
+            "- middle\n",
+            "<<<<<<< HEAD\n- b1\n",
+            "####### SUGGESTED CONFLICT RESOLUTION follows ###\n- b merged\n",
+            "||||||| base\n- b0\n=======\n- b2\n>>>>>>> x\n",
+        );
+        let sides = parse_vcs_marker_sides(two).expect("conflicted");
+        assert_eq!(
+            sides.suggested.as_deref(),
+            Some("- a merged\n- middle\n- b merged\n")
+        );
+    }
+
+    #[test]
+    fn a_git_conflict_offers_no_artifact() {
+        // Only Fossil writes the section; git's two styles never do.
+        assert_eq!(parse_vcs_marker_sides(GIT_2WAY).unwrap().suggested, None);
+        assert_eq!(parse_vcs_marker_sides(GIT_DIFF3).unwrap().suggested, None);
     }
 
     #[test]

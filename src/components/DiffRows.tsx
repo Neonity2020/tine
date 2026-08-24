@@ -9,7 +9,18 @@
 // default decision) are kept — they are what a second surface would have to use
 // instead of a second copy, should one ever be justified.
 import { For, Show, createMemo, createSignal, type JSX } from "solid-js";
-import type { DiffRow, MergeDecision, RowKind } from "../types";
+import type { DiffRow, MergeDecision, MergedSource, RowKind } from "../types";
+
+/** Why this body is on offer. The two sources carry different guarantees, so
+ *  the strip says which one produced the text: Tine composed it from two edits
+ *  that touch different parts of the body, or the merge tool that left the
+ *  markers proposed it and Tine only checked that it is still one block.
+ *  Neither is ever applied without the user's confirmation. */
+export function mergedTitle(source: MergedSource): string {
+  return source === "artifact"
+    ? "Proposed by your merge tool's suggested resolution — still applied only when you confirm."
+    : "Both edits combined — offered because they touch different parts of the same body";
+}
 
 /** The effective decision for a row, given the surface's own default. */
 export function decisionOf(
@@ -271,9 +282,12 @@ export function DiffRowView(props: {
               class="sync-merge-cell merged"
               classList={{ chosen: dec() === "merged" }}
               data-side="merged"
-              title="Both edits combined — offered because they touch different parts of the same body"
+              data-source={merged().source}
+              title={mergedTitle(merged().source)}
             >
-              <span class="sync-merge-mergedtag">Merged</span>
+              <span class="sync-merge-mergedtag">
+                {merged().source === "artifact" ? "Merged (tool)" : "Merged"}
+              </span>
               {preview(merged().text)}
             </div>
           )}

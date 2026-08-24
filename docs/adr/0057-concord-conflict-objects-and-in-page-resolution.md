@@ -138,8 +138,13 @@ are provably disjoint against the true ancestor offers the composed text as a
 suggested **Merged** outcome, rendered by the same shared row component and
 applied through the same guarded resolvers (recomputed at apply time, refused
 if recomputation fails). The proposal carries a provenance
-(`Computed`/`Artifact`); Fossil's `####### SUGGESTED CONFLICT RESOLUTION`
-section remains excluded from reconstructed sides and is QUEUED as the second,
-`Artifact`-provenance source filling the same slot, with computed proposals
-taking precedence. Design + Phase 2 spec:
+(`Computed`/`Artifact`). Phase 2 (same day) landed the second source: Fossil's
+`####### SUGGESTED CONFLICT RESOLUTION` sections — still excluded from every
+reconstructed SIDE — now reconstruct a fourth whole-page document
+(all-or-nothing across regions, like the ancestor), and a `BothChanged` row the
+disjoint-edit composition declines may offer the tool's own body as an
+`Artifact`-provenance proposal instead. Computed wins whenever both sources can
+supply a body; artifact bodies pass the same one-block/org validity gate, are
+labeled with their provenance in the UI, and are re-derived at apply time from
+the same `base_rev`-guarded bytes. Design + Phase 2 spec:
 `tine-agents/specs/concord-intrablock-merge.md`.

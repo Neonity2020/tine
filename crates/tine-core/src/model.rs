@@ -11799,6 +11799,12 @@ impl Graph {
     /// same `sync_diff` machinery the conflict-copy path uses, so the in-page
     /// resolution UI is one renderer, not two.
     ///
+    /// When the markers also carried the merge tool's own `#######` SUGGESTED
+    /// CONFLICT RESOLUTION sections, that fourth reconstruction rides along as
+    /// the diff's ARTIFACT: rows the disjoint-edit merge declines may offer the
+    /// tool's body instead (`MergedSource::Artifact`). It is still only a
+    /// proposal — the resolve re-derives it from the same guarded bytes.
+    ///
     /// Read-only. Both staleness tokens are the rev of the whole marker file, so
     /// [`Graph::resolve_vcs_marker_conflict`]'s guard rejects decisions made
     /// against a version the VCS has since changed. `Ok(None)` if the path is
@@ -11817,7 +11823,28 @@ impl Graph {
         };
         let org = matches!(Format::from_path(&self.root.join(rel)), Format::Org);
         let mut diff = match sides.base.as_deref() {
-            Some(base) => crate::sync_diff::diff3_texts(base, &sides.mine, &sides.theirs, org),
+            Some(base) => {
+                let full = self.root.join(rel);
+                let base_doc = parse_doc(&full, base);
+                let mine_doc = parse_doc(&full, &sides.mine);
+                let theirs_doc = parse_doc(&full, &sides.theirs);
+                // The merge tool's own proposed resolution, when EVERY region
+                // supplied one. It is not a side and never changes a verdict —
+                // it can only fill a `BothChanged` row the disjoint-edit merge
+                // declined, and the user still has to confirm it.
+                let art_doc = sides
+                    .suggested
+                    .as_deref()
+                    .map(|suggested| parse_doc(&full, suggested));
+                crate::sync_diff::diff3_docs_with_artifact(
+                    &base_doc,
+                    &mine_doc,
+                    &theirs_doc,
+                    art_doc.as_ref(),
+                )
+            }
+            // No ancestor → no `BothChanged` verdict → no proposal of either
+            // source; a suggestion region without a base never surfaces.
             None => crate::sync_diff::diff_texts(&sides.mine, &sides.theirs, org),
         };
         // Both revs address the ONE file the decisions will be applied to.
@@ -11888,10 +11915,18 @@ impl Graph {
         // The `base_rev` guard above pins the whole marker file, so mine, theirs
         // and this base are all still the exact bytes the UI decided against.
         let base_doc = sides.base.as_deref().map(|base| parse_doc(&path, base));
+        // Likewise the merge tool's proposal: re-derived from the very bytes the
+        // `base_rev` guard pinned, never taken from the frontend, so a confirmed
+        // artifact row applies exactly the body the diff offered.
+        let art_doc = sides
+            .suggested
+            .as_deref()
+            .map(|suggested| parse_doc(&path, suggested));
         let merged_roots = crate::sync_diff::merge_blocks3(
             base_doc.as_ref().map(|doc| doc.roots.as_slice()),
             &mine_doc.roots,
             &theirs_doc.roots,
+            art_doc.as_ref().map(|doc| doc.roots.as_slice()),
             decisions,
         )
         .map_err(merge_refused)?;
@@ -12368,6 +12403,8 @@ impl Graph {
             base_doc.as_ref().map(|doc| doc.roots.as_slice()),
             &mine_doc.roots,
             &theirs_doc.roots,
+            // A conflict copy carries no merge tool's suggestion: computed-only.
+            None,
             decisions,
         )
         .map_err(merge_refused)?;
@@ -35291,6 +35328,115 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["shared top", "the shared desktop machine label kk"]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Fossil's own `####### SUGGESTED CONFLICT RESOLUTION` is the second
+    /// source for the fourth outcome: the two edits here OVERLAP, so the
+    /// disjoint-edit merge declines and the artifact is what fills the row.
+    /// Resolving writes exactly the suggested body — re-derived from the
+    /// guarded file bytes, never echoed back from the client.
+    #[test]
+    fn resolving_fossil_markers_can_apply_the_suggested_resolution() {
+        const FOSSIL: &str = concat!(
+            "- shared top\n",
+            "<<<<<<< BEGIN MERGE CONFLICT: local copy shown first <<<<<<<<<<<<<<<\n",
+            "- the quick brown fox jumped over it\n",
+            "####### SUGGESTED CONFLICT RESOLUTION follows ##################\n",
+            "- the quick brown fox leapt over it\n",
+            "||||||| COMMON ANCESTOR content follows |||||||||||||||||||||||||\n",
+            "- the quick brown fox jumps over it\n",
+            "======= MERGED IN content follows ==============================\n",
+            "- the quick brown fox leaped over it\n",
+            ">>>>>>> END MERGE CONFLICT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n",
+        );
+        let dir = scratch("concord-marker-artifact");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, FOSSIL).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        assert!(diff.three_way);
+        let row = diff
+            .rows
+            .iter()
+            .find(|row| row.merged.is_some())
+            .expect("an artifact proposal");
+        let proposal = row.merged.as_ref().unwrap();
+        assert_eq!(
+            proposal.source,
+            crate::sync_diff::MergedSource::Artifact,
+            "the edits overlap, so nothing was computed"
+        );
+        assert_eq!(proposal.text, "the quick brown fox leapt over it");
+        assert_eq!(row.suggestion.as_deref(), Some("merged"));
+
+        let decisions = std::collections::HashMap::from([(row.id.clone(), "merged".to_string())]);
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("the confirmed artifact applies");
+        let after = fs::read_to_string(&file).unwrap();
+        assert!(doc::vcs_conflict_markers(&after).is_empty(), "{after:?}");
+        assert_eq!(
+            doc::parse(&after)
+                .roots
+                .iter()
+                .map(|b| b.raw.trim().to_string())
+                .collect::<Vec<_>>(),
+            vec!["shared top", "the quick brown fox leapt over it"]
+        );
+        // The suggestion text itself never leaked into a side.
+        assert!(!after.contains("jumped"), "{after:?}");
+        assert!(!after.contains("leaped"), "{after:?}");
+        // And the stale-rev guard still fires against the ORIGINAL rev.
+        fs::write(&file, FOSSIL).unwrap();
+        let graph = Graph::open(&dir);
+        let err = graph
+            .resolve_vcs_marker_conflict(rel, &decisions, "not-the-current-rev", "union")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&file).unwrap(), FOSSIL);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A suggestion region that merely repeats one side is not a fourth
+    /// outcome, so nothing is offered — and a forged `"merged"` refuses the
+    /// whole resolve, leaving the marker file byte-identical.
+    #[test]
+    fn a_fossil_suggestion_equal_to_a_side_offers_nothing_and_writes_nothing() {
+        const FOSSIL: &str = concat!(
+            "- shared top\n",
+            "<<<<<<< BEGIN MERGE CONFLICT: local copy shown first <<<<<<<<<<<<<<<\n",
+            "- the quick brown fox jumped over it\n",
+            "####### SUGGESTED CONFLICT RESOLUTION follows ##################\n",
+            "- the quick brown fox leaped over it\n",
+            "||||||| COMMON ANCESTOR content follows |||||||||||||||||||||||||\n",
+            "- the quick brown fox jumps over it\n",
+            "======= MERGED IN content follows ==============================\n",
+            "- the quick brown fox leaped over it\n",
+            ">>>>>>> END MERGE CONFLICT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n",
+        );
+        let dir = scratch("concord-marker-artifact-refused");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, FOSSIL).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph.vcs_marker_conflict_diff(rel).unwrap().unwrap().diff;
+        assert!(diff.three_way);
+        assert!(
+            diff.rows.iter().all(|row| row.merged.is_none()),
+            "a proposal equal to a side duplicates an existing choice"
+        );
+        let decisions: std::collections::HashMap<String, String> =
+            collect_decidable_ids(&diff.rows)
+                .into_iter()
+                .map(|id| (id, "merged".to_string()))
+                .collect();
+        let error = graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), FOSSIL);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -702,13 +702,13 @@ export interface BlockView {
  *  Only present on 3-way diffs. */
 export type Diff3Verdict = "mine-only" | "theirs-only" | "both-changed";
 
-/** Where a proposed merged body came from. "artifact" is a reserved seam for a
- *  merge tool's own suggestion region and is not produced yet. */
+/** Where a proposed merged body came from: "computed" = composed here from two
+ *  disjoint edits of the base; "artifact" = lifted from the merge tool's own
+ *  suggested-resolution region. Computed always wins when both exist. */
 export type MergedSource = "computed" | "artifact";
 
-/** A merged body offered for a `both-changed` row (two disjoint edits of one
- *  base). Display only — the resolve recomputes the text from the same inputs
- *  and never trusts this echo. */
+/** A merged body offered for a `both-changed` row. Display only — the resolve
+ *  re-derives the text from the same inputs and never trusts this echo. */
 export interface MergedProposal {
   text: string;
   source: MergedSource;
@@ -727,8 +727,9 @@ export interface DiffRow {
   /** Pre-selected decision the base justifies ("mine"/"theirs"/"merged"); the
    *  modal only pre-selects it — nothing applies without the user's confirm. */
   suggestion?: MergeDecision | null;
-  /** Merged body proposed for a `both-changed` row whose two edits are
-   *  disjoint. Absent on 2-way diffs and wherever no merge may be offered. */
+  /** Merged body proposed for a `both-changed` row — two disjoint edits
+   *  composed, or the merge tool's own suggestion. Absent on 2-way diffs and
+   *  wherever no proposal may be offered. */
   merged?: MergedProposal | null;
 }
 
