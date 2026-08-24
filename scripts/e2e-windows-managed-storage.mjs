@@ -273,7 +273,7 @@ async function waitForActivation() {
   throw new Error(`managed activation timed out; last body=${last.slice(-1000)}`);
 }
 
-async function openPage(title, { expectedMarker = nestedMarker } = {}) {
+async function openPage(title, { expectedMarker = nestedMarker, requireHeading = true } = {}) {
   // WebView2 attachment does not guarantee native keyboard focus. Fixture
   // navigation is not a shortcut assertion, so enter the switcher through its
   // visible application control.
@@ -295,8 +295,10 @@ async function openPage(title, { expectedMarker = nestedMarker } = {}) {
     return false;
   }, { timeout: 30_000, timeoutMsg: `Ctrl+K did not find ${title}` });
   await row.click();
-  const heading = await browser.$("h1.page-title");
-  await heading.waitForExist({ timeout: 30_000 });
+  if (requireHeading) {
+    const heading = await browser.$("h1.page-title");
+    await heading.waitForExist({ timeout: 30_000 });
+  }
   if (expectedMarker) {
     await waitForBody(expectedMarker, 30_000, "nested UTF page after activation");
   }
@@ -437,9 +439,16 @@ try {
   // That is predecessor evidence for #370, not a reason to abort before the
   // candidate gets a chance to recover the same private state.  Require the
   // candidate below to serve the actual marker.
-  await openPage(nestedTitle, { expectedMarker: null });
+  await openPage(nestedTitle, { expectedMarker: null, requireHeading: false });
   receipt.milestones.baselineManagedPageBodyVisible = (await bodyText()).includes(nestedMarker);
-  receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
+  if (receipt.milestones.baselineManagedPageBodyVisible) {
+    receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
+  } else {
+    receipt.milestones.previousPatchEdit = {
+      attempted: false,
+      reason: "v0.6.94 published a managed page shell without its body",
+    };
+  }
 
   // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the
   // actual baseline process without a graceful managed shutdown, then require
