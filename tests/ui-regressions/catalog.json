@@ -7722,6 +7722,31 @@
         "failBefore": "pending"
       },
       "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files."
+    },
+    {
+      "id": "UI-PANE-SCROLL-SLACK-369",
+      "title": "A split pane whose content fits shows no vertical scrollbar; a longer pane scrolls independently and keeps pane-proportional end-of-page editing slack",
+      "family": "scroll-layout",
+      "sources": {
+        "issues": [
+          369
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/shot-pane-slack.mjs",
+          "src/styles/paneSlack.test.ts"
+        ],
+        "scenario": "panes.fitting-content-no-scrollbar-and-pane-proportional-end-slack",
+        "failBefore": "proven"
+      },
+      "notes": "GH #369 (Windows): a dashboard of split panes shows a permanent vertical scrollbar in every pane even where the pane's content fits ('Lines', 'GRID'). Root cause: .main-content-inner carried padding-bottom: 40vh — 40% of the WINDOW — inside each pane's own .main-content scroller, so a pane only a fraction of the window tall overflowed on slack alone. Measured pre-fix at 1920x1050 in headless Chromium (scripts/shot-pane-slack.mjs): three fitting panes of 466px height carried 286–815px of phantom scroll range, and the long pane's tail scrolled into 111%-of-pane slack that pushed its last block off-screen. The slack is deliberate end-of-page editing breathing room — retained, but made pane-relative. Evidence-layer note: this sandbox's headless Chromium forces auto-hiding overlay scrollbars (bar width 0 even where the range is non-zero, unforceable by flag or CSS), so the harness asserts the cross-platform quantity that forces a PAINTED bar on the reporter's Windows classic bars and on WebKitGTK: scrollable range while content fits; full-window screenshots archived at /tmp/shot-pane-slack*.png. Fail-before proven on the same base: harness exit 1, and all four src/styles/paneSlack.test.ts assertions fail against the pre-fix app.css."
     }
   ]
 }
