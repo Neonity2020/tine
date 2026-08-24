@@ -229,7 +229,8 @@ async function clickButtonAndConfirm(text) {
   if (exitCode !== 0) throw new Error(`native confirmation helper failed for ${text}: exit ${exitCode}`);
 }
 
-async function openManagedSettings(expectedAction) {
+async function openManagedSettings(expectedActions) {
+  const actions = Array.isArray(expectedActions) ? expectedActions : [expectedActions];
   const settings = await browser.$('button[title^="Settings"]');
   await settings.waitForExist({ timeout: 15_000 });
   await settings.click();
@@ -241,15 +242,22 @@ async function openManagedSettings(expectedAction) {
     }
   }
   await waitForBody("Storage & sync", 15_000, "storage settings");
+  let availableAction;
   await browser.waitUntil(async () => {
-    const button = await buttonContaining(expectedAction);
-    if (button && await button.isDisplayed()) return true;
+    for (const action of actions) {
+      const button = await buttonContaining(action);
+      if (button && await button.isDisplayed()) {
+        availableAction = action;
+        return true;
+      }
+    }
     const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
     if (await experimental.isExisting() && await experimental.getAttribute("aria-expanded") !== "true") {
       await experimental.click();
     }
     return false;
-  }, { timeout: 15_000, timeoutMsg: `managed storage action did not expand: ${expectedAction}` });
+  }, { timeout: 15_000, timeoutMsg: `managed storage action did not expand: ${actions.join(" or ")}` });
+  return availableAction;
 }
 
 async function closeSettings() {
@@ -461,8 +469,11 @@ try {
   await openPage(nestedTitle);
   receipt.milestones.candidateManagedPageOpened = true;
 
-  await openManagedSettings("Return to Direct files");
-  await clickButtonAndConfirm("Return to Direct files");
+  const directFilesAction = await openManagedSettings([
+    "Return to Direct files",
+    "Open current files in Direct Files...",
+  ]);
+  await clickButtonAndConfirm(directFilesAction);
   await waitForBody("Enable Tine-managed storage...", 120_000, "Direct Files status after rollback");
   // The attempted v0.6.94 creation may finish before or during recovery. Its
   // new file is allowed; authority transitions may not alter any incumbent.
