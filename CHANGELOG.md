@@ -29,6 +29,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   multi-line blocks gain a per-row expander showing the full text of each
   version with the differing lines highlighted.
 
+### Changed
+
+- **"Apply all suggested" no longer sweeps up a merge tool's own proposed
+  text.** A Fossil `SUGGESTED CONFLICT RESOLUTION` body (labeled *Merged
+  (tool)*) keeps whatever you set on that row; only your per-row choice (or
+  the initial pre-selection you confirm) accepts text Tine did not compute
+  itself.
+
+### Fixed
+
+- **Resolving merge markers inside Tine now stages the pre-resolution file in
+  the recoverable trash** (Settings → Backups & recovery), so the sides you
+  did not choose stay recoverable — the same guarantee resolving a sync
+  conflict copy already had.
+- **Adding a highlight no longer rewrites a PDF notes page that carries
+  unresolved VCS merge markers.** The write is refused like any other save to
+  a quarantined page; previously it silently lifted the quarantine while the
+  merge was still unresolved in git/Fossil.
+- **Conflict review no longer freezes on blocks with extremely long single
+  lines.** Comparing candidate rows now caps at the first 512 characters per
+  line (a 64 KB one-line block previously stalled the conflict panel for
+  seconds to minutes), oversized flat pages avoid a slow exact-alignment
+  cliff, and all conflict-review reads moved off the UI's request thread.
+
 ## [0.6.95] - 2026-08-23
 
 ### Added

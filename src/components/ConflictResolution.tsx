@@ -49,7 +49,12 @@ import {
   pageInstanceGeneration,
   reloadPage,
 } from "../store";
-import { DiffRowView, collectRows, seedSuggestedOrNoLoss } from "./DiffRows";
+import {
+  DiffRowView,
+  collectRows,
+  seedSuggestedExceptArtifact,
+  seedSuggestedOrNoLoss,
+} from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
 
 /** The side labels the artifact itself supplied, shortened for a row segment. */
@@ -149,7 +154,12 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   };
   const applyAllSuggested = () => {
     const current = diff();
-    if (current) setDecisions(seedSuggestedOrNoLoss(current.rows));
+    if (!current) return;
+    // The sweep re-applies Tine's OWN suggestions. A merge tool's proposed
+    // text (an artifact-source merged row) keeps whatever the user set —
+    // Tine vouches for nothing about that text, so accepting it stays a
+    // per-row act (the initial pre-selection still stands until touched).
+    setDecisions((prev) => seedSuggestedExceptArtifact(current.rows, { ...prev }));
   };
 
   /** Move the highlight to the previous/next region that needs a decision. */
@@ -453,7 +463,11 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
                 </Show>
               </span>
               <span class="sync-merge-toolbar-actions">
-                <button class="settings-btn" onClick={applyAllSuggested}>
+                <button
+                  class="settings-btn"
+                  onClick={applyAllSuggested}
+                  title="Re-applies Tine's own suggestions. A merge tool's proposed text (Merged (tool)) keeps your current choice."
+                >
                   Apply all suggested
                 </button>
                 <button class="settings-btn" onClick={() => setAll("both")}>

@@ -259,6 +259,14 @@ It is a suggestion like any other: shown, labeled, and applied only when you
 confirm. Edits that overlap (or whose combination Tine cannot vouch for) get
 no merged offer.
 
+Where the edits overlap but the merge tool wrote its own `####### SUGGESTED
+CONFLICT RESOLUTION` sections (Fossil), that text is offered in the same
+Merged slot instead, labeled **Merged (tool)**. Because it is the tool's text
+rather than something Tine computed, **Apply all suggested** leaves such rows
+at your current choice — the pre-selection stands until you touch it, but
+only your per-row click (or the initial confirmation) accepts the tool's
+wording.
+
 Where no ancestor answers the question, or the edits genuinely collide, the
 pre-selection is **keep both**, which loses nothing. Keeping both writes the two versions as **adjacent sibling blocks**:
 ordinary outline Markdown that every other tool can read. Tine never invents a
@@ -279,6 +287,9 @@ Nothing is applied until you click **Apply resolution**.
   lifts by itself, because there is no longer anything to quarantine. This is
   the only circumstance in which Tine ever rewrites a file carrying merge
   markers, and only as the direct result of the resolution you just confirmed.
+  A byte-exact copy of the pre-resolution file (markers and all) goes to the
+  recoverable trash first, so the sides you did not choose stay recoverable
+  in Settings → Backups & recovery.
 - For a **retained live draft**: the merged result is revision-guarded against
   the exact disk version shown in the review and written through the ordinary
   Direct Files writer. A newer unseen disk edit refuses the apply and refreshes

@@ -9,6 +9,7 @@ import {
   mergedTitle,
   needsExpander,
   previewLine,
+  seedSuggestedExceptArtifact,
   seedSuggestedOrNoLoss,
 } from "./DiffRows";
 import type { DiffRow, MergeDecision } from "../types";
@@ -161,6 +162,24 @@ describe("seeding a merged suggestion", () => {
   it("still falls back to no-loss where the backend offered no merge", () => {
     const noOffer: DiffRow = { ...mergedRow, suggestion: null, merged: null };
     expect(seedSuggestedOrNoLoss([noOffer])).toEqual({ "1": "both" });
+  });
+});
+
+describe("the Apply-all-suggested sweep vs artifact proposals", () => {
+  it("re-applies a COMPUTED merged suggestion like any other", () => {
+    expect(seedSuggestedExceptArtifact([mergedRow], { "1": "mine" })).toEqual({ "1": "merged" });
+  });
+
+  it("never flips a row back to the merge tool's own text", () => {
+    // The user moved the artifact row to "mine"; the sweep leaves it there.
+    expect(seedSuggestedExceptArtifact([artifactRow], { "1": "mine" })).toEqual({ "1": "mine" });
+  });
+
+  it("leaves an untouched artifact pre-selection standing", () => {
+    // Initial seed picked "merged" (pre-selection is per-row consent, kept);
+    // the sweep neither clears nor re-asserts it.
+    const seeded = seedSuggestedOrNoLoss([artifactRow]);
+    expect(seedSuggestedExceptArtifact([artifactRow], { ...seeded })).toEqual({ "1": "merged" });
   });
 });
 

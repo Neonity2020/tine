@@ -57,6 +57,26 @@ export function seedSuggestedOrNoLoss(
   return out;
 }
 
+/** The "Apply all suggested" sweep: like [seedSuggestedOrNoLoss], except a row
+ *  whose suggestion is a merge TOOL's own text (artifact source) keeps its
+ *  current decision. The batch button vouches only for what Tine computed
+ *  itself; it never flips a row back to text Tine cannot vouch for — such rows
+ *  keep their initial pre-selection until the user touches them, and an
+ *  explicit per-row choice is never overridden by the sweep. */
+export function seedSuggestedExceptArtifact(
+  rows: DiffRow[],
+  out: Record<string, MergeDecision>
+): Record<string, MergeDecision> {
+  for (const r of rows) {
+    const artifactMerge = r.suggestion === "merged" && r.merged?.source === "artifact";
+    if (r.kind !== "unchanged" && !artifactMerge) {
+      out[r.id] = r.suggestion ?? noLossDecision(r.kind);
+    }
+    if (r.children.length) seedSuggestedExceptArtifact(r.children, out);
+  }
+  return out;
+}
+
 /** Every row that needs a decision (id + kind), flattened, depth-first. */
 export function collectRows(
   rows: DiffRow[],
