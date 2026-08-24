@@ -209,7 +209,7 @@ async function clickButton(text) {
   await button.click();
 }
 
-async function clickButtonAndConfirm(text) {
+async function clickButtonAndConfirm(text, expectedConfirmationText) {
   // WebDriver cannot address native Windows dialogs. Start a UI Automation
   // helper before the click because the click command itself waits while the
   // modal is open. The helper proves that it found Tine's dialog with the
@@ -227,7 +227,7 @@ async function clickButtonAndConfirm(text) {
     "-ProcessId",
     String(applicationPid),
     "-ExpectedText",
-    text.replace(/\.\.\.$/, ""),
+    expectedConfirmationText,
     "-TimeoutSeconds",
     "20",
   ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -442,7 +442,10 @@ try {
 
   await openManagedSettings("Enable Tine-managed storage...");
   const activationStarted = Date.now();
-  await clickButtonAndConfirm("Enable Tine-managed storage...");
+  await clickButtonAndConfirm(
+    "Enable Tine-managed storage...",
+    "Enable Tine-managed storage for this graph?",
+  );
   await waitForActivation();
   receipt.milestones.activationMs = Date.now() - activationStarted;
   assertSameSource(before, "managed activation");
@@ -463,7 +466,7 @@ try {
   receipt.milestones.candidateManagedPageOpened = true;
 
   await openManagedSettings("Return to Direct files");
-  await clickButtonAndConfirm("Return to Direct files");
+  await clickButtonAndConfirm("Return to Direct files", "Return to Direct files?");
   await waitForBody("Enable Tine-managed storage...", 120_000, "Direct Files status after rollback");
   // The attempted v0.6.94 creation may finish before or during recovery. Its
   // new file is allowed; authority transitions may not alter any incumbent.
