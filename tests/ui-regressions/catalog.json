@@ -9,7 +9,10 @@
         "issues": [
           337
         ],
-        "commits": []
+      "commits": [
+        "7c5bc054",
+        "f1b4cd04"
+      ]
       },
       "platforms": [
         "all"
@@ -7741,7 +7744,7 @@
         "linux"
       ],
       "layer": "native",
-      "status": "fixing",
+    "status": "covered",
       "coverage": {
         "tests": [
           "scripts/e2e-page-properties.mjs",
@@ -7750,7 +7753,7 @@
         "scenario": "e2e.windows-post-receipt-named-page-readiness",
         "failBefore": "proven"
       },
-      "notes": "The v0.6.95 release artifact passed windows-core and pdf-logseq but page-properties failed before its contract because ALL PAGES was absent at WebDriver attachment; print-security likewise failed before its safety assertion because the chosen startup page contained no .page-ref. Run 32690801901 and its retained exact-build capsules prove both setup failures. Fixture routing now uses the visible Search control and an exact indexed page result, while the page-property traversal and static script-disabled print-frame assertions remain unchanged."
+    "notes": "The v0.6.95 release artifact passed windows-core and pdf-logseq but page-properties failed before its contract because ALL PAGES was absent at WebDriver attachment; print-security likewise failed before its safety assertion because the chosen startup page contained no .page-ref. Run 32690801901 and its retained exact-build capsules prove both setup failures. Fixture routing now uses the visible Search control and an exact indexed page-result mousedown, while the page-property traversal and static script-disabled print-frame assertions remain unchanged. Both focused journeys pass locally against the exact f1b4cd04 build receipt; focused Windows workflow receipts remain the platform gate."
     }
   ]
 }
