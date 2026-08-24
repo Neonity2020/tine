@@ -309,6 +309,48 @@ async function openPage(title) {
   await waitForBody(nestedMarker, 30_000, "nested UTF page after activation");
 }
 
+async function createManagedPageAndAttemptEdit() {
+  const title = "升级恢复 中文页";
+  const marker = "WINDOWS_MANAGED_PREVIOUS_PATCH_EDIT";
+  const newPage = await browser.$("button.new-page-btn");
+  await newPage.waitForClickable({ timeout: 15_000 });
+  await newPage.click();
+  const input = await browser.$(".switcher-input");
+  await input.waitForExist({ timeout: 15_000 });
+  await input.setValue(title);
+  let createRow;
+  await browser.waitUntil(async () => {
+    for (const row of await browser.$$(".switcher-row")) {
+      if ((await row.getText()).includes(`Create page: ${title}`)) {
+        createRow = row;
+        return true;
+      }
+    }
+    return false;
+  }, { timeout: 30_000, timeoutMsg: `Create page result was not visible for ${title}` });
+  await createRow.click();
+  const heading = await browser.$("h1.page-title");
+  await heading.waitForExist({ timeout: 15_000 });
+  let editor = await browser.$(".page-blocks textarea.block-editor, textarea.block-editor");
+  if (!await editor.isExisting()) {
+    const target = await browser.$(".page-trailing-block-target");
+    await target.waitForExist({ timeout: 15_000 });
+    await target.click();
+    editor = await browser.$(".page-blocks textarea.block-editor, textarea.block-editor");
+    await editor.waitForExist({ timeout: 15_000 });
+  }
+  await editor.addValue(marker);
+  await heading.click();
+  // v0.6.94 could reject this save (#292/#366). That refusal is part of the
+  // reporter's predecessor state, not a reason to abort the upgrade fixture.
+  await sleep(3_000);
+  return {
+    title,
+    marker,
+    bodyAfterSaveAttempt: (await bodyText()).slice(-2_000),
+  };
+}
+
 const before = sourceSnapshot();
 const inventory = graphInventory();
 if (inventory.totalFiles !== TOTAL_FILE_COUNT) {
@@ -396,6 +438,8 @@ try {
   await closeSettings();
   await openPage(nestedTitle);
   receipt.milestones.managedPageOpened = true;
+  receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
+  const afterPreviousPatchUse = sourceSnapshot();
 
   // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the
   // actual baseline process without a graceful managed shutdown, then require
@@ -411,7 +455,7 @@ try {
   await openManagedSettings("Return to Direct files");
   await clickButtonAndConfirm("Return to Direct files");
   await waitForBody("Enable Tine-managed storage...", 120_000, "Direct Files status after rollback");
-  assertSameSource(before, "return to Direct Files");
+  assertSameSource(afterPreviousPatchUse, "return to Direct Files");
   await closeSettings();
   await openPage(nestedTitle);
   receipt.milestones.directFilesRestored = true;
