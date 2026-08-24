@@ -5969,10 +5969,12 @@
     },
     {
       "id": "UI-PDF-PANE-MOBILE",
-      "title": "On a phone the PDF reader can always be closed: the Close button stays on screen and the Android back gesture (or Escape) closes the reader",
+      "title": "On a phone the PDF reader can be closed and its text annotations can be created and managed with touch interactions",
       "family": "pdf",
       "sources": {
-        "issues": [],
+        "issues": [
+          191
+        ],
         "commits": []
       },
       "platforms": [
@@ -5989,7 +5991,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "Martin's report. The PDF pane was a fixed-width (min 320, default 560px) non-shrinking flex sibling clipped by .content-row overflow:hidden, and Close was the LAST toolbar button, so on a 390px phone it was off-screen while the pane covered everything; the pane was neither a route nor a transient layer, so Android Back walked past it. Now: mobile renders it as a deliberate full-width takeover, Close leads the control cluster, low-priority tools collapse into the existing More menu through a pdftoolbar container query, and the pane registers as a transient layer (inner Find/settings/outline/highlight popovers peel first) so Back and Escape both close it. Chromium proof at 390px with an Android UA: fail-before the Close button was outside the viewport, after it is reachable. Real-device Android verification is NOT done."
+      "notes": "GH #191. The shipped first half makes mobile a deliberate full-width takeover with an on-screen Close button and a transient layer so Android Back/Escape closes it after inner popovers. The remaining interaction contract is literal touch annotation: a completed native text selection opens the color chooser; tapping a color persists the same Logseq-compatible highlight as desktop; and a long press on an existing text or area highlight opens recolor, remove, Copy ref, and Linked references without invoking the browser menu. Desktop mouse/context-menu behavior remains unchanged. Component proof uses the mobile build-time branch and touch/contextmenu event paths; the phone-width Chromium journey covers the rendered interaction surface. An APK is produced, but physical Android 16 selection handles remain a tester boundary."
     },
     {
       "id": "UI-INPAGE-FIND-SELECTION-224",
