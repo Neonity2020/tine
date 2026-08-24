@@ -11946,6 +11946,18 @@ impl Graph {
         assign_doc_runtime_ids(&mut merged.roots, &entry.rel_path);
         let dto = page_dto_checked(&entry, &merged)?;
         let cacheable = self.managed_path_is_cacheable(&write, &path)?;
+        // Keep the pre-resolution marker bytes recoverable (ADR 0007), the way
+        // the sync-copy resolve already trashes its conflict copy. The marker
+        // file is rewritten IN PLACE, so a byte-exact copy staged here is the
+        // only place the not-chosen side survives once the clean merge lands —
+        // which is also what makes defaulting a missing row decision to Mine
+        // at apply time recoverable rather than lossy.
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+        self.ensure_trash_write_target(&trash)?;
+        fs::create_dir_all(&trash)?;
+        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+        let staged = trash.join(format!("{}__markers__{file_name}", trash_stamp()));
+        atomic_write_new(&staged, content.as_bytes())?;
         let authorized = self.authorize_marker_resolution(&path);
         let result = self.write_page(
             &write,
@@ -11959,6 +11971,11 @@ impl Graph {
             cacheable,
         );
         drop(authorized);
+        if result.is_err() {
+            // The write refused or failed — the file still carries its
+            // markers, so the staged recovery copy is redundant; withdraw it.
+            let _ = fs::remove_file(&staged);
+        }
         result.map(|_| ())
     }
 
@@ -16389,6 +16406,25 @@ impl Graph {
         let existing_raw = page_baseline
             .clone()
             .or_else(|| legacy_page_baseline.clone());
+        // VCS merge-conflict quarantine (Concord invariant 3) — the same
+        // refusal the ordinary save path enforces in `serialize_page_dto_for_path`.
+        // This path used to bypass it: one added highlight rewrote a
+        // conflicted `hls__` page, re-indented the markers off column 0, and
+        // thereby silently LIFTED the quarantine while the VCS still
+        // considered the merge unresolved. Refuse before the sidecar commit so
+        // the pair stays untouched.
+        if let Some(existing) = existing_raw.as_deref() {
+            let markers = doc::vcs_conflict_markers(existing);
+            if !markers.is_empty() {
+                return Err(projection_semantic_refusal(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "highlight page contains unresolved VCS merge conflict markers ({}) — resolve the merge first; Tine never rewrites a conflicted file",
+                        markers.join(", ")
+                    ),
+                ));
+            }
+        }
         // The sidecar and annotation page are one logical update. Reject a
         // non-round-trippable Org page before publishing the sidecar so a failed
         // page serialization cannot leave the pair half-updated.
@@ -35285,6 +35321,77 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A marker resolution rewrites the conflicted file IN PLACE, so the sides
+    /// the user did not choose survive nowhere else — the resolve must stage a
+    /// byte-exact copy of the pre-resolution file in the recoverable trash
+    /// (ADR 0007), like the sync-copy resolve trashes its conflict copy.
+    #[test]
+    fn resolving_markers_stages_the_preresolution_file_in_recoverable_trash() {
+        let dir = scratch("concord-marker-resolve-trash");
+        let rel = "pages/Merged.md";
+        let file = dir.join("pages").join("Merged.md");
+        fs::write(&file, P4_DIFF3_MARKERS).unwrap();
+        let graph = Graph::open(&dir);
+        let diff = graph
+            .vcs_marker_conflict_diff(rel)
+            .unwrap()
+            .expect("conflicted")
+            .diff;
+        // Keep-mine everywhere — the LOSSY choice: "theirs wins" survives only
+        // in the staged recovery copy.
+        let decisions: std::collections::HashMap<String, String> =
+            collect_decidable_ids(&diff.rows)
+                .into_iter()
+                .map(|id| (id, "mine".to_string()))
+                .collect();
+        graph
+            .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
+            .expect("resolution writes the merged result");
+        assert!(
+            !fs::read_to_string(&file).unwrap().contains("theirs wins"),
+            "keep-mine drops the other side from the page itself"
+        );
+        let trash = dir.join("logseq").join(".tine-trash").join("conflicts");
+        let staged: Vec<_> = fs::read_dir(&trash)
+            .expect("the resolve staged a recovery copy")
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("__markers__Merged.md")
+            })
+            .collect();
+        assert_eq!(staged.len(), 1, "exactly one recovery copy");
+        assert_eq!(
+            fs::read_to_string(staged[0].path()).unwrap(),
+            P4_DIFF3_MARKERS,
+            "the recovery copy is the byte-exact pre-resolution file"
+        );
+        // A stale resolve refuses BEFORE staging anything.
+        let dir2 = scratch("concord-marker-resolve-trash-stale");
+        fs::write(dir2.join("pages").join("Merged.md"), P4_DIFF3_MARKERS).unwrap();
+        let graph2 = Graph::open(&dir2);
+        let diff2 = graph2
+            .vcs_marker_conflict_diff(rel)
+            .unwrap()
+            .expect("conflicted")
+            .diff;
+        let decisions2: std::collections::HashMap<String, String> =
+            collect_decidable_ids(&diff2.rows)
+                .into_iter()
+                .map(|id| (id, "mine".to_string()))
+                .collect();
+        graph2
+            .resolve_vcs_marker_conflict(rel, &decisions2, "not-the-current-rev", "union")
+            .expect_err("stale rev refuses");
+        assert!(
+            !dir2.join("logseq").join(".tine-trash").exists(),
+            "a refused resolve must not materialize a trash directory"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
     /// The marker resolver's ancestor is the SAME reconstructed base side the
     /// marker diff used, so a `"merged"` row re-derives the body it offered.
     #[test]
@@ -39244,6 +39351,59 @@ mod tests {
         assert!(
             !dir.join("logseq").join(".tine-trash").exists(),
             "a highlight save must not materialize a trash directory it never uses"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Concord invariant 3: a marker-bearing page is quarantined from EVERY
+    /// writer. This path used to bypass the refusal — one added highlight
+    /// rewrote the conflicted `hls__` page, re-indented the markers off column
+    /// 0, and silently LIFTED the quarantine while the VCS still considered
+    /// the merge unresolved.
+    #[test]
+    fn write_highlights_refuses_a_marker_bearing_hls_page() {
+        let dir = scratch("highlights-marker-quarantine");
+        let g = Graph::open(&dir);
+        let key = crate::pdf::asset_key("paper.pdf");
+        let page_path = dir.join("pages").join(format!("hls__{key}.md"));
+        let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
+        g.write_highlights("paper.pdf", "Paper", &[h.clone()], &[])
+            .unwrap();
+        // A git merge left column-0 conflict markers in the hls page.
+        let conflicted = format!(
+            "<<<<<<< HEAD\n{}=======\n- the other merge side\n>>>>>>> feature\n",
+            fs::read_to_string(&page_path).unwrap()
+        );
+        fs::write(&page_path, &conflicted).unwrap();
+
+        let reopened = Graph::open(&dir);
+        assert!(
+            reopened
+                .list_vcs_marker_conflicts()
+                .iter()
+                .any(|c| c.path == format!("pages/hls__{key}.md")),
+            "the conflicted hls page is quarantined"
+        );
+        let before = graph_tree_snapshot(&dir);
+        let h2 = mkhl("22222222-2222-2222-2222-222222222222", 4, Some("more"));
+        let err = reopened
+            .write_highlights("paper.pdf", "Paper", &[h, h2], &[])
+            .expect_err("a highlight write to a conflicted page must refuse");
+        assert!(
+            err.to_string().contains("conflict markers"),
+            "the refusal names the markers: {err}"
+        );
+        assert_eq!(
+            graph_tree_snapshot(&dir),
+            before,
+            "the refusal leaves every file byte-identical (page AND sidecar)"
+        );
+        assert!(
+            Graph::open(&dir)
+                .list_vcs_marker_conflicts()
+                .iter()
+                .any(|c| c.path == format!("pages/hls__{key}.md")),
+            "the quarantine still stands"
         );
         let _ = fs::remove_dir_all(&dir);
     }
