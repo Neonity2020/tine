@@ -2913,6 +2913,7 @@ fn resolve_sync_conflict_merges_and_trashes() {
             &HashMap::new(),
             &diff.base_rev,
             &diff.conflict_rev,
+            diff.merge_base_rev.as_deref(),
             "union",
         )
         .unwrap_err();
@@ -2939,6 +2940,7 @@ fn resolve_sync_conflict_merges_and_trashes() {
             &HashMap::new(),
             &diff.base_rev,
             &diff.conflict_rev,
+            diff.merge_base_rev.as_deref(),
             "union",
         )
         .unwrap_err();
@@ -2967,6 +2969,7 @@ fn resolve_sync_conflict_merges_and_trashes() {
             &decisions,
             &base,
             &conflict_rev,
+            diff.merge_base_rev.as_deref(),
             "union",
         )
         .unwrap();
@@ -3885,6 +3888,7 @@ mod concord_ledger_integration {
                 &forged,
                 &diff.base_rev,
                 &diff.conflict_rev,
+                diff.merge_base_rev.as_deref(),
                 "union",
             )
             .unwrap_err();
@@ -3899,6 +3903,33 @@ mod concord_ledger_integration {
             "a refused resolve must not trash the copy"
         );
 
+        // The diff stamped the pinned base's own identity. The pin is MUTABLE
+        // state, so a resolve whose token no longer matches the current pin
+        // refuses before writing — a "merged" body is only ever computed from
+        // the exact three texts the user saw.
+        assert_eq!(
+            diff.merge_base_rev.as_deref(),
+            Some(tine_core::model::content_rev(ancestor).as_str())
+        );
+        let stale_decisions = HashMap::from([(row.id.clone(), "merged".to_string())]);
+        let error = graph
+            .resolve_sync_conflict(
+                "pages/Note.md",
+                &conf_rel,
+                &stale_decisions,
+                &diff.base_rev,
+                &diff.conflict_rev,
+                Some("not-the-pinned-base"),
+                "union",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),
+            mine,
+            "a stale merge-base token must not write"
+        );
+
         // The confirmed merge writes the composed body through the normal path.
         let decisions = HashMap::from([(row.id.clone(), "merged".to_string())]);
         graph
@@ -3908,6 +3939,7 @@ mod concord_ledger_integration {
                 &decisions,
                 &diff.base_rev,
                 &diff.conflict_rev,
+                diff.merge_base_rev.as_deref(),
                 "union",
             )
             .expect("the confirmed merged body applies");

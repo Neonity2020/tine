@@ -529,15 +529,18 @@ export interface Backend {
     preChoice?: "mine" | "theirs" | "union"
   ): Promise<void>;
   /** Merge a conflict copy into its winner per the user's per-row decisions
-   *  (row id → mine/theirs/both), via the normal save path, then trash the copy.
-   *  `baseRev` guards against the winner changing under the merge (throws
-   *  "conflict" if it did). `preChoice`: "mine" | "theirs" | "union". */
+   *  (row id → mine/theirs/both/merged), via the normal save path, then trash
+   *  the copy. `baseRev` guards against the winner changing under the merge
+   *  (throws "conflict" if it did); `mergeBaseRev` echoes the diff's
+   *  `merge_base_rev` so a repinned merge base refuses the same way.
+   *  `preChoice`: "mine" | "theirs" | "union". */
   resolveSyncConflict(
     winner: string,
     conflict: string,
     decisions: Record<string, MergeDecision>,
     baseRev: string,
     conflictRev: string,
+    mergeBaseRev?: string | null,
     preChoice?: "mine" | "theirs" | "union"
   ): Promise<PageDto>;
   /** Discard a conflict copy without merging (move it to the recoverable trash). */
@@ -1380,6 +1383,7 @@ class TauriBackend implements Backend {
     decisions: Record<string, MergeDecision>,
     baseRev: string,
     conflictRev: string,
+    mergeBaseRev?: string | null,
     preChoice?: "mine" | "theirs" | "union"
   ) {
     return this.call<PageDto>("resolve_sync_conflict", {
@@ -1388,6 +1392,7 @@ class TauriBackend implements Backend {
       decisions,
       baseRev,
       conflictRev,
+      mergeBaseRev: mergeBaseRev ?? null,
       preChoice: preChoice ?? "union",
     });
   }

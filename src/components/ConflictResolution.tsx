@@ -336,6 +336,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           decisions(),
           current.base_rev,
           current.conflict_rev,
+          current.merge_base_rev ?? null,
           preChoice()
         );
         if (

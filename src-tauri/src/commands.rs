@@ -4122,6 +4122,7 @@ pub(crate) async fn resolve_sync_conflict(
     decisions: std::collections::HashMap<String, String>,
     base_rev: String,
     conflict_rev: String,
+    merge_base_rev: Option<String>,
     pre_choice: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<PageDto, String> {
@@ -4160,6 +4161,7 @@ pub(crate) async fn resolve_sync_conflict(
                     &decisions,
                     &base_rev,
                     &conflict_rev,
+                    merge_base_rev.as_deref(),
                     pre_choice.as_deref().unwrap_or("union"),
                 )
                 .map_err(|error| {

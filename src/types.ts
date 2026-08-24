@@ -744,6 +744,10 @@ export interface SyncConflictDiff {
   blocks_identical: boolean;
   /** True when rows carry 3-way verdicts computed against a real base. */
   three_way?: boolean;
+  /** Revision of the pinned merge base this 3-way alignment (and its "merged"
+   *  proposals) were computed from; echoed back on resolve so a repinned base
+   *  refuses instead of substituting a body the user never saw. */
+  merge_base_rev?: string | null;
 }
 
 /** A user's per-row merge decision. */

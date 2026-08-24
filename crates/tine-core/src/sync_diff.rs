@@ -151,6 +151,14 @@ pub struct SyncConflictDiff {
     /// (so the UI can explain where its pre-selections come from).
     #[serde(default)]
     pub three_way: bool,
+    /// Revision of the PINNED merge base (Concord ledger) this 3-way alignment
+    /// and its `"merged"` proposals were computed from. The resolve requires it
+    /// back, so a base repinned between diff and apply can never silently
+    /// substitute a merged body the user was not shown. `None` on 2-way diffs
+    /// and on marker diffs, whose base is reconstructed from the same file
+    /// `base_rev` already pins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_base_rev: Option<String>,
 }
 
 /// Diff `theirs` (the conflict copy's blocks) against `mine` (the winner's).
@@ -173,6 +181,7 @@ pub fn diff_docs(mine: &crate::doc::Document, theirs: &crate::doc::Document) -> 
         rows,
         blocks_identical,
         three_way: false,
+        merge_base_rev: None,
     }
 }
 
@@ -231,6 +240,7 @@ pub fn diff3_docs_with_artifact(
         rows,
         blocks_identical,
         three_way: true,
+        merge_base_rev: None,
     }
 }
 
@@ -475,6 +485,12 @@ fn artifact_body(
 /// body that breaks its headline. Such a body is never offered and never
 /// applied; the org firewall at write time remains the final authority.
 fn merged_body_is_valid(merged: &str, is_org: bool) -> bool {
+    // Complementary disjoint deletions can compose to an empty body. Emptying
+    // the block is a deletion the user must choose deliberately — it is never
+    // offered (or applied) as a "merge" of the two sides.
+    if merged.trim().is_empty() {
+        return false;
+    }
     let mut block = DocBlock::new(merged.to_string());
     block.is_org = is_org;
     let doc = crate::doc::Document {
@@ -1865,9 +1881,34 @@ mod tests {
     /// Empty merged text: documented behavior, whatever the serializer does
     /// with an empty block — the gate is the single authority either way.
     #[test]
-    fn the_gate_decides_empty_merged_text_consistently() {
-        assert!(merged_body_is_valid("", false));
-        assert!(merged_body_is_valid("", true));
+    fn the_gate_refuses_an_empty_merged_body() {
+        // Complementary disjoint deletions compose to "" (audit 2026-08-24,
+        // A9); emptying the block is a decision, never a merge proposal.
+        assert!(!merged_body_is_valid("", false));
+        assert!(!merged_body_is_valid("", true));
+        assert!(!merged_body_is_valid("  ", false));
+    }
+
+    #[test]
+    fn complementary_deletions_offer_no_merged_body() {
+        // mine deletes "a" ([0,1) of the base), theirs deletes "b" ([1,2)) —
+        // touching, so the relaxed rule composes them, to an EMPTY body the
+        // gate must refuse.
+        let base = parse("- ab\n");
+        let mine = parse("- b\n");
+        let theirs = parse("- a\n");
+        assert_eq!(
+            crate::text_merge::merge_disjoint("ab", "b", "a").as_deref(),
+            Some(""),
+            "the merge itself composes, so the gate is what is under test"
+        );
+        assert!(merged_body(
+            Some(&base.roots[0]),
+            Some(&base.roots[0]),
+            &mine.roots[0],
+            &theirs.roots[0]
+        )
+        .is_none());
     }
 
     /// End to end: a char merge that produces a second bullet is never offered.

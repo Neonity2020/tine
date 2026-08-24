@@ -12231,15 +12231,20 @@ impl Graph {
             .get()
             .and_then(|ledger| ledger.conflict_base(conflict_rel, winner_rel))
             .filter(|base| base != &win_c);
-        let mut diff = match base_c {
+        let mut diff = match &base_c {
             Some(base_c) => {
-                let base = parse_doc(&win, &base_c);
+                let base = parse_doc(&win, base_c);
                 crate::sync_diff::diff3_docs(&base, &mine, &theirs)
             }
             None => crate::sync_diff::diff_docs(&mine, &theirs),
         };
         diff.base_rev = content_rev(&win_c);
         diff.conflict_rev = content_rev(&conf_c);
+        // Identity of the pinned base itself. `base_rev`/`conflict_rev` pin
+        // mine and theirs, but the pin is MUTABLE state — the resolve echoes
+        // this token back so a repin between diff and apply is a refusal, not
+        // a silent substitution of the third input to a `"merged"` body.
+        diff.merge_base_rev = base_c.as_deref().map(content_rev);
         Ok(Some(diff))
     }
 
@@ -12359,6 +12364,7 @@ impl Graph {
         decisions: &std::collections::HashMap<String, String>,
         base_rev: &str,
         conflict_rev: &str,
+        merge_base_rev: Option<&str>,
         pre_choice: &str,
     ) -> io::Result<PageDto> {
         let write = self.admit_managed_text_writer()?;
@@ -12406,16 +12412,31 @@ impl Graph {
         let theirs_doc = parse_doc(&conf, &conf_content);
         // Re-derive the SAME base `sync_conflict_diff` published suggestions
         // against — ledger pin included, and the same "a base identical to the
-        // winner is the admission artifact" filter. Invariant: the pin is held
-        // for this conflict copy until the resolve below drops it, and the
-        // `base_rev`/`conflict_rev` guards pin mine/theirs, so all three inputs
-        // to a `"merged"` decision are byte-identical to the ones the user saw.
-        let base_doc = self
+        // winner is the admission artifact" filter. The `base_rev`/
+        // `conflict_rev` guards pin mine and theirs; `merge_base_rev` pins the
+        // THIRD input: the ledger pin is mutable state, so the diff stamped
+        // the pinned base's own rev and this apply refuses if it no longer
+        // matches — a `"merged"` body is only ever computed from the exact
+        // three texts the user saw. A `None` token (the UI reviewed a 2-way
+        // diff) resolves without a base: mine/theirs/both decisions don't
+        // need one and `"merged"` then refuses in `merge_blocks3`.
+        let pinned_base = self
             .concord_ledger
             .get()
             .and_then(|ledger| ledger.conflict_base(conflict_rel, winner_rel))
-            .filter(|base| base != &win_content)
-            .map(|base_content| parse_doc(&win, &base_content));
+            .filter(|base| base != &win_content);
+        let base_doc = match (merge_base_rev, pinned_base) {
+            (None, _) => None,
+            (Some(rev), Some(base_content)) if content_rev(&base_content) == rev => {
+                Some(parse_doc(&win, &base_content))
+            }
+            (Some(_), _) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the pinned merge base changed since the diff",
+                ));
+            }
+        };
         let merged_roots = crate::sync_diff::merge_blocks3(
             base_doc.as_ref().map(|doc| doc.roots.as_slice()),
             &mine_doc.roots,
@@ -47581,6 +47602,7 @@ mod tests {
             &Default::default(),
             "",
             "",
+            None,
             "mine",
         ));
         assert_handoff_blocked(graph.merge_pages("pages/a.md", "pages/b.md"));
