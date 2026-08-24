@@ -815,9 +815,10 @@ fn nodes_to_merged(
                     Decision::Mine => {
                         out.push(rebuild(mine, nodes_to_merged(children, decisions, bases)?))
                     }
-                    Decision::Theirs => {
-                        out.push(rebuild(theirs, nodes_to_merged(children, decisions, bases)?))
-                    }
+                    Decision::Theirs => out.push(rebuild(
+                        theirs,
+                        nodes_to_merged(children, decisions, bases)?,
+                    )),
                     Decision::Both => {
                         out.push((*mine).clone());
                         // Fresh block — must not duplicate the winner's id:: on disk.
@@ -1683,8 +1684,12 @@ mod tests {
         assert_eq!(base.roots.len(), 1);
         assert_eq!(theirs.roots.len(), 1);
         assert_eq!(
-            crate::text_merge::merge_disjoint(&base.roots[0].raw, &mine.roots[0].raw, &theirs.roots[0].raw)
-                .as_deref(),
+            crate::text_merge::merge_disjoint(
+                &base.roots[0].raw,
+                &mine.roots[0].raw,
+                &theirs.roots[0].raw
+            )
+            .as_deref(),
             Some("alpha\n- beta gamma"),
             "the merge itself must succeed, so the gate is what is under test"
         );
@@ -1727,15 +1732,14 @@ mod tests {
             ("0".to_string(), "merged".to_string()),
             ("0.0".to_string(), "theirs".to_string()),
         ]);
-        let merged = merge_blocks3(
-            Some(&base.roots),
-            &mine.roots,
-            &theirs.roots,
-            &dec,
-        )
-        .expect("the merged decision applies");
+        let merged = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec)
+            .expect("the merged decision applies");
         assert_eq!(merged.len(), 1);
-        assert!(merged[0].raw.starts_with("Desktop kk"), "{:?}", merged[0].raw);
+        assert!(
+            merged[0].raw.starts_with("Desktop kk"),
+            "{:?}",
+            merged[0].raw
+        );
         assert_eq!(merged[0].children.len(), 1);
         assert!(
             merged[0].children[0].raw.contains("THERE"),
@@ -1786,8 +1790,8 @@ mod tests {
         let d = diff3_docs(&base, &mine, &theirs);
         for row in d.rows.iter().filter(|r| r.kind != RowKind::Unchanged) {
             let dec = HashMap::from([(row.id.clone(), "merged".to_string())]);
-            let error = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec)
-                .unwrap_err();
+            let error =
+                merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec).unwrap_err();
             assert_eq!(error.reason, NOT_A_MODIFIED_ROW, "row {}", row.id);
         }
     }
@@ -1800,11 +1804,7 @@ mod tests {
         let mine = parse("- alpha\n- the quick brown fox jumped\n");
         let theirs = parse("- alpha\n- the quick brown fox leaped\n");
         let dec = HashMap::from([("1".to_string(), "theirs".to_string())]);
-        let merged =
-            merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec).unwrap();
-        assert_eq!(
-            raws(&merged),
-            vec!["alpha", "the quick brown fox leaped"]
-        );
+        let merged = merge_blocks3(Some(&base.roots), &mine.roots, &theirs.roots, &dec).unwrap();
+        assert_eq!(raws(&merged), vec!["alpha", "the quick brown fox leaped"]);
     }
 }

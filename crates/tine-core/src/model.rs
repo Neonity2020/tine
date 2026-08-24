@@ -35277,8 +35277,7 @@ mod tests {
             "the shared desktop machine label kk"
         );
 
-        let decisions =
-            std::collections::HashMap::from([(row.id.clone(), "merged".to_string())]);
+        let decisions = std::collections::HashMap::from([(row.id.clone(), "merged".to_string())]);
         graph
             .resolve_vcs_marker_conflict(rel, &decisions, &diff.base_rev, "union")
             .expect("the confirmed merged body applies");

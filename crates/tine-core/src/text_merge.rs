@@ -456,7 +456,10 @@ mod tests {
 
     #[test]
     fn same_point_double_insertion_is_no_merge() {
-        assert_eq!(merge_disjoint("one two", "one extra two", "one other two"), None);
+        assert_eq!(
+            merge_disjoint("one two", "one extra two", "one other two"),
+            None
+        );
     }
 
     #[test]
@@ -504,9 +507,15 @@ mod tests {
     #[test]
     fn repeated_text_merges_at_the_diffs_anchor() {
         // Both sides append distinct suffixes to different "ab" occurrences.
-        assert_eq!(merge_disjoint("ab ab", "Xab ab", "ab abY").as_deref(), Some("Xab abY"));
+        assert_eq!(
+            merge_disjoint("ab ab", "Xab ab", "ab abY").as_deref(),
+            Some("Xab abY")
+        );
         // Deleting one of two identical words anchors on the first match.
-        assert_eq!(merge_disjoint("ab ab", "ab", "ab ab!").as_deref(), Some("ab!"));
+        assert_eq!(
+            merge_disjoint("ab ab", "ab", "ab ab!").as_deref(),
+            Some("ab!")
+        );
     }
 
     /// Hunk boundaries are char-indexed, so multi-byte characters on either

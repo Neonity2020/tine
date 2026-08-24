@@ -32,9 +32,9 @@ pub mod render;
 pub mod search_query;
 pub mod sync_diff;
 pub mod sync_runtime;
-pub mod text_merge;
 #[cfg(test)]
 mod test_support;
+pub mod text_merge;
 
 /// Re-export the lsdoc parser so the Tauri shell can name its AST types
 /// (`tine_core::lsdoc::ast::Block`) without depending on lsdoc directly.
