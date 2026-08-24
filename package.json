@@ -11,7 +11,7 @@
     "tauri": "tauri",
     "app": "tauri dev",
     "ios:prepare-project": "node scripts/prepare-ios-project.mjs",
-    "test": "vitest run && vitest run --config vitest.render.config.ts",
+    "test": "vitest run && vitest run --config vitest.render.config.ts && node scripts/test-deploy-profile.mjs",
     "test:render": "vitest run --config vitest.render.config.ts",
     "build:wasm": "node scripts/build-wasm.mjs",
     "check:lsdoc-oracle": "node scripts/check-lsdoc-oracle-sync.mjs && node scripts/check-lsdoc-oracle-behavior.mjs",

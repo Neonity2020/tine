@@ -31,6 +31,16 @@ set +u
 source "$ROOT/scripts/env.sh"
 set -u
 
+# Ordinary topic-batch deployments prioritize iteration speed while retaining
+# release optimization and the same target/release path expected by E2E. The
+# deterministic public release path deliberately leaves this unset and keeps
+# Cargo.toml's codegen-units=1 profile unchanged.
+if [ "${TINE_FAST_LOCAL_BUILD:-0}" = "1" ]; then
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-16}"
+  export CARGO_PROFILE_RELEASE_INCREMENTAL="${CARGO_PROFILE_RELEASE_INCREMENTAL:-true}"
+  echo "==> fast local release profile (16 codegen units + incremental)"
+fi
+
 # 2) Snapshot before either builder can mutate a source input. The receipt helper
 #    refuses an input or HEAD change and verifies the exact output binary later.
 node scripts/build-e2e-receipt.mjs before --snapshot "$SNAPSHOT"
