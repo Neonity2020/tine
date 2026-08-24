@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.96] - 2026-08-24
+
 ### Added
 
 - **Conflict review can now suggest a combined "Merged" version of a block both
