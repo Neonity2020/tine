@@ -2763,10 +2763,20 @@ fn advanced_pred(
     let mut ignored = Vec::new();
     let groups = where_groups(query_src);
     let (lowered_page_properties, consumed_patterns) = lower_page_property_patterns(&groups);
+    let (lowered_current_pages, current_page_patterns) =
+        lower_current_page_patterns(&groups, &inputs);
+    let consumed_patterns = consumed_patterns
+        .into_iter()
+        .chain(current_page_patterns)
+        .collect::<std::collections::HashSet<_>>();
     let preds: Vec<Pred> = groups
         .iter()
         .enumerate()
         .filter_map(|(index, group)| {
+            if let Some((pred, label)) = lowered_current_pages.get(&index) {
+                ran.push((*label).into());
+                return Some(pred.clone());
+            }
             if let Some(pred) = lowered_page_properties.get(&index) {
                 ran.push("page-property".into());
                 return Some(pred.clone());
@@ -2789,6 +2799,62 @@ fn advanced_pred(
         Pred::And(preds)
     };
     (Some(pred), ran, ignored)
+}
+
+/// Lower the exact DataScript relationship Logseq uses to connect the typed
+/// `:current-page` input to blocks. This is deliberately not a general join
+/// engine: one page-name identity pattern must feed one `:block/refs` or
+/// `:block/page` pattern, and every other shape remains visibly unsupported.
+fn lower_current_page_patterns(
+    groups: &[String],
+    inputs: &std::collections::HashMap<String, AdvancedInput>,
+) -> (
+    std::collections::HashMap<usize, (Pred, &'static str)>,
+    std::collections::HashSet<usize>,
+) {
+    let triples = groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, group)| {
+            let inner = group.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+            let tokens = inner.split_whitespace().collect::<Vec<_>>();
+            (tokens.len() == 3).then_some((index, tokens))
+        })
+        .collect::<Vec<_>>();
+
+    let mut candidates = Vec::new();
+    for (identity_index, identity) in &triples {
+        if identity[1] != ":block/name" || !identity[0].starts_with('?') {
+            continue;
+        }
+        let Some(AdvancedInput::Page(page)) = inputs.get(identity[2]) else {
+            continue;
+        };
+        for (relation_index, relation) in &triples {
+            if relation[0] == identity[0]
+                || !relation[0].starts_with('?')
+                || relation[2] != identity[0]
+            {
+                continue;
+            }
+            let lowered = match relation[1] {
+                ":block/refs" => Some((Pred::PageRef(page.clone()), "current-page-ref")),
+                ":block/page" => Some((Pred::Page(page.clone()), "current-page")),
+                _ => None,
+            };
+            if let Some(lowered) = lowered {
+                candidates.push((*identity_index, *relation_index, lowered));
+            }
+        }
+    }
+    if candidates.len() != 1 {
+        return Default::default();
+    }
+    let (identity_index, relation_index, lowered) = candidates.pop().unwrap();
+    (
+        std::collections::HashMap::from([(relation_index, lowered)]),
+        std::collections::HashSet::from([identity_index]),
+    )
 }
 
 /// Conservatively lower only the exact DataScript relationship used by the
@@ -2922,7 +2988,7 @@ fn where_groups(src: &str) -> Vec<String> {
 /// Map one `:where` group to a `Pred` (or None → ignored). Recurses for and/or/not.
 fn parse_adv_group(
     group: &str,
-    inputs: &std::collections::HashMap<String, i64>,
+    inputs: &std::collections::HashMap<String, AdvancedInput>,
     today: JournalDate,
     ran: &mut Vec<String>,
     ignored: &mut Vec<String>,
@@ -3081,27 +3147,35 @@ fn adv_strings(s: &str) -> Vec<String> {
 /// Resolve a `between` bound: an input `?var` (looked up) or a literal token.
 fn adv_bound(
     tok: &str,
-    inputs: &std::collections::HashMap<String, i64>,
+    inputs: &std::collections::HashMap<String, AdvancedInput>,
     today: JournalDate,
 ) -> Option<i64> {
     let t = tok.trim();
     if t.starts_with('?') {
-        return inputs.get(t).copied();
+        return match inputs.get(t) {
+            Some(AdvancedInput::Date(value)) => Some(*value),
+            _ => None,
+        };
     }
     // A literal bound may be written as a bare token (`2026-06-24`) or a quoted
     // string (`"2026-06-24"`); `split_whitespace` keeps the quotes, so strip them.
     resolve_date_token(t.trim_matches('"').trim_start_matches(':'), today)
 }
 
-/// Build a `?var → yyyymmdd` map by zipping `:in $ ?a ?b …` var names with the
-/// `:inputs [ … ]` values (Logseq's positional binding). Only date inputs resolve
-/// to an ordinal; others (e.g. `:current-page`) are skipped — their pattern
-/// clause is ignored anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdvancedInput {
+    Date(i64),
+    Page(String),
+}
+
+/// Build a typed positional input map by zipping `:in $ ?a ?b …` with
+/// `:inputs [ … ]`. Dates stay numeric; Logseq's typed `:current-page` keyword
+/// receives the caller's focused page. Unknown keywords remain unbound.
 fn resolve_inputs(
     src: &str,
-    _current_page: Option<&str>,
+    current_page: Option<&str>,
     today: JournalDate,
-) -> std::collections::HashMap<String, i64> {
+) -> std::collections::HashMap<String, AdvancedInput> {
     let mut map = std::collections::HashMap::new();
     let vars: Vec<String> = match src.find(":in") {
         Some(i) => {
@@ -3132,8 +3206,12 @@ fn resolve_inputs(
         None => Vec::new(),
     };
     for (v, val) in vars.iter().zip(vals.iter()) {
-        if let Some(ord) = resolve_date_token(val.trim_start_matches(':'), today) {
-            map.insert(v.clone(), ord);
+        if val.eq_ignore_ascii_case(":current-page") {
+            if let Some(page) = current_page.map(str::trim).filter(|page| !page.is_empty()) {
+                map.insert(v.clone(), AdvancedInput::Page(page.to_lowercase()));
+            }
+        } else if let Some(ord) = resolve_date_token(val.trim_start_matches(':'), today) {
+            map.insert(v.clone(), AdvancedInput::Date(ord));
         }
     }
     map
@@ -5432,6 +5510,50 @@ mod tests {
 
         assert_eq!(lowered, Some(pred("(page-property :class)")));
         assert_eq!(ran, vec!["page-property"]);
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn advanced_current_page_input_lowers_the_standard_page_relationship() {
+        // Logseq graph-parser revision 6e7afa8eb040686ff057156ee877193b581dd369
+        // resolves the typed :current-page keyword positionally through
+        // current-page-fn and lowercases it before DataScript execution.
+        let refs = r#"{:query [:find (pull ?b [*])
+                              :in $ ?current-page
+                              :where
+                              [?p :block/name ?current-page]
+                              [?b :block/refs ?p]]
+                      :inputs [:current-page]}"#;
+        let (lowered, ran, ignored) = advanced_pred(refs, Some("Focus A"), TODAY);
+
+        assert_eq!(lowered, Some(Pred::PageRef("focus a".into())));
+        assert_eq!(ran, vec!["current-page-ref"]);
+        assert!(ignored.is_empty());
+
+        let physical = refs.replace(":block/refs", ":block/page");
+        let (lowered, ran, ignored) = advanced_pred(&physical, Some("Focus A"), TODAY);
+        assert_eq!(lowered, Some(Pred::Page("focus a".into())));
+        assert_eq!(ran, vec!["current-page"]);
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn advanced_typed_inputs_keep_date_bounds_numeric() {
+        let source = r#"[:find (pull ?b [*])
+                         :in $ ?start ?end
+                         :where (between ?b ?start ?end)]
+                        :inputs [2026-06-01 2026-06-30]"#;
+        let (lowered, ran, ignored) = advanced_pred(source, Some("Not a date"), TODAY);
+
+        assert_eq!(
+            lowered,
+            Some(Pred::Between(
+                BetweenField::Journal,
+                Some(20260601),
+                Some(20260630)
+            ))
+        );
+        assert_eq!(ran, vec!["between"]);
         assert!(ignored.is_empty());
     }
 

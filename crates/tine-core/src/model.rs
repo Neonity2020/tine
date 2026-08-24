@@ -40044,6 +40044,40 @@ mod tests {
     }
 
     #[test]
+    fn advanced_current_page_input_filters_real_graph_blocks() {
+        let dir = scratch("advanced-current-page");
+        fs::write(dir.join("pages/Focus A.md"), "- own A\n").unwrap();
+        fs::write(dir.join("pages/Focus B.md"), "- own B\n").unwrap();
+        fs::write(
+            dir.join("pages/Source.md"),
+            "- TODO pinned [[Focus A]]\n- TODO pinned [[Focus B]]\n- DONE [[Focus A]]\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let query = r#"[:find (pull ?b [*])
+                        :in $ ?current-page
+                        :where
+                        [?p :block/name ?current-page]
+                        [?b :block/refs ?p]
+                        (task ?b #{"TODO"})]
+                       :inputs [:current-page]"#;
+
+        let result = graph.run_advanced_query(query, Some("Focus A"));
+        assert!(result.supported, "ignored={:?}", result.ignored);
+        assert!(result.ignored.is_empty(), "{:?}", result.ignored);
+        assert_eq!(result.ran, vec!["current-page-ref", "task"]);
+        let raws = result
+            .groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.raw.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(raws, vec!["TODO pinned [[Focus A]]"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn advanced_query_covers_widened_clause_subset() {
         // 1c: the advanced (datalog) parser maps the same heads the simple DSL
         // supports — page / namespace / page-tags / scheduled / deadline / journal

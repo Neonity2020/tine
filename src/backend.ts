@@ -355,7 +355,9 @@ export interface Backend {
   /** Resolve all Copy / Export query macros under one cumulative native budget. */
   exportQuerySubtrees(specs: QueryExportSpec[]): Promise<QueryExportBatch>;
   /** Advanced (datalog-subset) query: maps the supported clauses onto the engine
-   *  and reports what ran vs was ignored. `currentPage` resolves `:current-page`. */
+   *  and reports what ran vs was ignored. `currentPage` resolves the typed
+   *  `:current-page` input; callers without that input may use it as query-owner
+   *  context for compatibility. */
   runAdvancedQuery(query: string, currentPage?: string): Promise<AdvancedQueryResult>;
   /** Property keys (each with their distinct values) for query-builder
    *  autocomplete. */
