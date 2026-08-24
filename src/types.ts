@@ -218,6 +218,15 @@ export interface SyncConflict {
   preview: string;
 }
 
+/** What a rename deliberately left undone. A rename cascades reference
+ *  rewrites through every referring page, but files under VCS-marker
+ *  quarantine are skipped rather than rewritten, so they still point at the
+ *  old name and the user has to be told. */
+export interface RenameOutcome {
+  /** Paths of quarantined referrers left byte-identical, old refs intact. */
+  skippedConflictedReferrers: string[];
+}
+
 /** A page whose on-disk bytes carry unresolved VCS merge-conflict markers
  *  (git/Fossil). It stays readable, but saves to it are refused so Tine never
  *  rewrites (and thereby mangles) the markers — the user resolves the merge in

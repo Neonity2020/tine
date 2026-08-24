@@ -1067,6 +1067,19 @@ pub struct SyncConflict {
     pub preview: String,
 }
 
+/// What a rename deliberately left undone.
+///
+/// A rename cascades reference rewrites through every referring page. Files
+/// under VCS-marker quarantine are skipped rather than rewritten (see
+/// [`Graph::rename_page_reporting`]), so the caller needs to know which ones
+/// still point at the old name — otherwise the skip is invisible.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameOutcome {
+    /// Paths of quarantined referrers left byte-identical, old refs intact.
+    pub skipped_conflicted_referrers: Vec<String>,
+}
+
 /// A page whose ON-DISK bytes carry unresolved VCS merge-conflict markers
 /// (git/Fossil; see [`crate::doc::vcs_conflict_markers`]). The page stays
 /// readable, but saves to it are refused so Tine never mangles the markers —
@@ -14684,6 +14697,19 @@ impl Graph {
         new: &str,
         expected_path: Option<&str>,
     ) -> io::Result<()> {
+        self.rename_page_reporting(old, new, expected_path).map(|_| ())
+    }
+
+    /// `rename_page_expected`, plus what the rename deliberately did NOT do.
+    ///
+    /// Callers that can surface it to the user should prefer this: a silently
+    /// skipped referrer looks identical to a completed rename otherwise.
+    pub fn rename_page_reporting(
+        &self,
+        old: &str,
+        new: &str,
+        expected_path: Option<&str>,
+    ) -> io::Result<RenameOutcome> {
         let write = self.admit_managed_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let old = old.trim();
@@ -14693,7 +14719,7 @@ impl Graph {
         }
         if old.is_empty() || crate::refs::same_page(old, new) {
             self.finish_successful_rename_editor_lifecycle();
-            return Ok(()); // nothing to do (case-only rename is intentionally a no-op)
+            return Ok(RenameOutcome::default()); // nothing to do (case-only rename is intentionally a no-op)
         }
         self.block_external_scope_mutation(&write, old, PageKind::Page, expected_path, "rename")?;
         let mut content_budget = RetainedContentBudget::new(managed_text_inventory_limits());
@@ -14903,6 +14929,7 @@ impl Graph {
             .map(|(o, n)| (crate::refs::normalize(o), n.clone()))
             .collect();
         let mut edits: Vec<Edit> = Vec::new();
+        let mut skipped_conflicted_referrers: Vec<String> = Vec::new();
         let mut edits_charge =
             RetainedHeapCharge::new(Some(&content_budget), "managed rename edit vector")?;
         for entry in entries.iter() {
@@ -14944,6 +14971,21 @@ impl Graph {
             // file. Abort the whole rename (all-or-nothing) so the user resolves it
             // in Logseq first. A pure file move with no content change (updated ==
             // content) is still allowed — it preserves bytes exactly.
+            // A referrer carrying column-0 VCS conflict markers is quarantined: the
+            // user (or their merge tool) still owes it a resolution, and its bytes
+            // are not ours to touch. Threat: an external-editor / sync-service merge
+            // left the file mid-conflict; rewriting refs inside it edits one or both
+            // sides of a conflict the user has not adjudicated, behind their back.
+            // Leave it byte-identical and report it instead of refusing the whole
+            // rename, which would be harsher than the problem.
+            let quarantined =
+                updated != *content && !crate::doc::vcs_conflict_markers(&content).is_empty();
+            let updated = if quarantined {
+                skipped_conflicted_referrers.push(entry.path.display().to_string());
+                content.to_string()
+            } else {
+                updated
+            };
             let changed = updated != *content;
             if is_org && changed && !crate::org::org_editable(&content) {
                 return Err(io::Error::new(
@@ -15019,7 +15061,7 @@ impl Graph {
         }
         if edits.is_empty() {
             self.finish_successful_rename_editor_lifecycle();
-            return Ok(()); // page doesn't exist / nothing references it
+            return Ok(RenameOutcome::default()); // page doesn't exist / nothing references it
         }
 
         // Phase 1 — lock every touched path (src + move dst), sorted + deduped
@@ -15180,7 +15222,9 @@ impl Graph {
         }
         self.invalidate_cache_after_tine_mutation();
         self.finish_successful_rename_editor_lifecycle();
-        Ok(())
+        Ok(RenameOutcome {
+            skipped_conflicted_referrers,
+        })
     }
 
     /// An ordinary rename resets the frontend's entire working set because the
@@ -38440,6 +38484,86 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.join("pages").join("Weird.org")).unwrap(),
             ro
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_skips_marker_bearing_referrers_and_reports_them() {
+        // A11: a referrer whose file carries column-0 VCS conflict markers is
+        // quarantined - the user still owes it a merge resolution. The rename
+        // must not rewrite it behind their back; it must leave the bytes exactly
+        // as they are, still complete for every other referrer, and report the
+        // skipped path so the UI can say which pages still point at the old name.
+        let dir = scratch("rename-marker-referrer");
+        fs::write(dir.join("pages").join("Alpha.md"), "- alpha\n").unwrap();
+        let conflicted = "- intro\n<<<<<<< HEAD\n- mine sees [[Alpha]]\n=======\n- theirs sees [[Alpha]]\n>>>>>>> branch\n";
+        fs::write(dir.join("pages").join("Conflicted.md"), conflicted).unwrap();
+        fs::write(dir.join("pages").join("Clean.md"), "- clean sees [[Alpha]]\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        let outcome = g.rename_page_reporting("Alpha", "Beta", None).unwrap();
+
+        // The quarantined referrer is byte-identical and still quarantined.
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join("Conflicted.md")).unwrap(),
+            conflicted,
+            "a marker-bearing referrer must not be rewritten"
+        );
+        assert_eq!(
+            g.list_vcs_marker_conflicts().len(),
+            1,
+            "quarantine must survive the rename"
+        );
+        // Everything else completed.
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join("Clean.md")).unwrap(),
+            "- clean sees [[Beta]]\n",
+            "clean referrers must still be rewritten"
+        );
+        assert!(dir.join("pages").join("Beta.md").exists(), "page renamed");
+        assert!(!dir.join("pages").join("Alpha.md").exists());
+        // And the skip is reported, not silent.
+        assert_eq!(outcome.skipped_conflicted_referrers.len(), 1);
+        assert!(
+            outcome.skipped_conflicted_referrers[0].ends_with("Conflicted.md"),
+            "reported path was {:?}",
+            outcome.skipped_conflicted_referrers
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn namespace_rename_also_skips_marker_bearing_referrers() {
+        // The cascade variant: renaming a parent renames its descendants too, so
+        // one quarantined referrer can be hit by several (old, new) pairs in the
+        // same pass. It must still come out byte-identical, and be reported once
+        // rather than once per pair.
+        let dir = scratch("rename-marker-namespace");
+        fs::write(dir.join("pages").join("Parent.md"), "- parent\n").unwrap();
+        fs::write(
+            dir.join("pages").join("Parent%2FChild.md"),
+            "- child\n",
+        )
+        .unwrap();
+        let conflicted = "- intro\n<<<<<<< HEAD\n- [[Parent]] and [[Parent/Child]]\n=======\n- [[Parent/Child]] only\n>>>>>>> branch\n";
+        fs::write(dir.join("pages").join("Conflicted.md"), conflicted).unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        let outcome = g.rename_page_reporting("Parent", "Ancestor", None).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join("Conflicted.md")).unwrap(),
+            conflicted,
+            "namespace cascade must not rewrite a quarantined referrer either"
+        );
+        assert_eq!(
+            outcome.skipped_conflicted_referrers.len(),
+            1,
+            "reported once per file, not once per rename pair: {:?}",
+            outcome.skipped_conflicted_referrers
         );
         let _ = fs::remove_dir_all(&dir);
     }

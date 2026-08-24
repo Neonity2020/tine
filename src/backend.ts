@@ -16,6 +16,7 @@ import type {
   AssetInfo,
   EditorActivationHandle,
   SavePageResult,
+  RenameOutcome,
   PageKind,
   GraphMeta,
   GuideCopyResult,
@@ -345,7 +346,7 @@ export interface Backend {
   getBlockReferrers(uuid: string): Promise<RefGroup[]>;
   deletePage(name: string, kind: "journal" | "page", expectedPath?: string): Promise<void>;
   /** Rename a page and update all [[refs]]/#tags across the graph. */
-  renamePage(old: string, next: string, expectedPath?: string): Promise<void>;
+  renamePage(old: string, next: string, expectedPath?: string): Promise<RenameOutcome>;
   publishHtml(): Promise<[string, number]>;
   /** Render one page to a self-contained HTML document (assets inlined, no
    *  sidebar) for the print-to-PDF export, with the dialog's options. Rejects if
@@ -1085,7 +1086,7 @@ class TauriBackend implements Backend {
     return this.call<void>("delete_page", { name, kind, expectedPath });
   }
   renamePage(old: string, next: string, expectedPath?: string) {
-    return this.call<void>("rename_page", { old, new: next, expectedPath });
+    return this.call<RenameOutcome>("rename_page", { old, new: next, expectedPath });
   }
   publishHtml() {
     return this.call<[string, number]>("publish_html");

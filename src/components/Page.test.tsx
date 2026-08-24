@@ -1102,7 +1102,7 @@ describe("page actions entry point", () => {
     vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue([]);
     vi.spyOn(backend(), "getUnlinkedRefs").mockResolvedValue([]);
-    const rename = vi.spyOn(backend(), "renamePage").mockResolvedValue();
+    const rename = vi.spyOn(backend(), "renamePage").mockResolvedValue({ skippedConflictedReferrers: [] });
     mainPaneRouter.openFile(dto.path!, dto.name, "page", { inPlace: true });
 
     const { root, dispose } = mount(() => <PageView />);

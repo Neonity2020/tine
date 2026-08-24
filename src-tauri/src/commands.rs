@@ -1724,22 +1724,26 @@ pub(crate) async fn rename_page(
     new: String,
     expected_path: Option<String>,
     state: GraphContext<'_>,
-) -> Result<(), String> {
+) -> Result<tine_core::model::RenameOutcome, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
         match sparse_application_handle(&slot)? {
+            // Managed storage has no VCS-marker quarantine (markers are an
+            // on-disk Direct Files concept), so it never skips a referrer and
+            // the empty report is accurate rather than a stand-in.
             Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
                 SyncApplicationGraphMutationRequest::RenamePage {
                     old,
                     new,
                     expected_path,
                 },
-            )),
+            ))
+            .map(|()| tine_core::model::RenameOutcome::default()),
             None => slot
                 .legacy_graph()?
-                .rename_page_expected(&old, &new, expected_path.as_deref())
+                .rename_page_reporting(&old, &new, expected_path.as_deref())
                 .map_err(|e| e.to_string()),
         }
     })

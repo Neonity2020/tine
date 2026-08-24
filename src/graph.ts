@@ -395,7 +395,20 @@ export async function renameOrMergePage(
     await backend().mergePages(exactSourcePath, destination.path, { from, to });
     return "merged";
   }
-  await backend().renamePage(from, to, exactSourcePath);
+  const outcome = await backend().renamePage(from, to, exactSourcePath);
+  const skipped = outcome?.skippedConflictedReferrers ?? [];
+  if (skipped.length) {
+    // These files are mid-merge, so the rename deliberately left their refs
+    // pointing at the old name. Saying nothing would make a partial rename
+    // look complete.
+    pushToast(
+      skipped.length === 1
+        ? `1 page with unresolved merge conflicts still refers to “${from}”. Resolve its merge, then fix the link.`
+        : `${skipped.length} pages with unresolved merge conflicts still refer to “${from}”. Resolve their merges, then fix the links.`,
+      "warn",
+      { sticky: true },
+    );
+  }
   return "renamed";
 }
 
