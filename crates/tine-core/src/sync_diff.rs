@@ -514,30 +514,49 @@ fn anchor_eq(a: &DocBlock, b: &DocBlock) -> bool {
     }
 }
 
-/// First visible line of a block (property lines stripped), lowercased and
-/// trimmed — the key the L2 similarity pairing compares.
+/// Cap on the similarity key. A block's "first line" is its ENTIRE body for a
+/// single-line block, and the pairwise Levenshtein below is O(len²) — measured
+/// at 5.4 s per 64 KB pair (2-way) before this cap. Pairing is a heuristic;
+/// 512 chars decide "same edited line vs different line" just as well.
+const SIMILARITY_KEY_MAX_CHARS: usize = 512;
+
+/// First visible line of a block (property lines stripped), lowercased,
+/// trimmed, and capped at [`SIMILARITY_KEY_MAX_CHARS`] — the key the L2
+/// similarity pairing compares.
 fn first_line_key(b: &DocBlock) -> String {
     b.visible_text()
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim()
+        .chars()
+        .take(SIMILARITY_KEY_MAX_CHARS)
+        .collect::<String>()
         .to_lowercase()
 }
 
-/// Normalized similarity of two short strings in [0,1] (1 = identical). Bounded
-/// input (block first-lines), so the O(len²) Levenshtein is cheap.
+/// Normalized similarity of two capped strings in [0,1] (1 = identical).
+///
+/// When the length gap alone puts the pair under [`SIMILARITY_THRESHOLD`] the
+/// exact distance is skipped and the (correct) upper bound is returned —
+/// callers only test `>= SIMILARITY_THRESHOLD`, so a below-threshold value
+/// never needs to be exact.
 fn similarity(a: &str, b: &str) -> f32 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }
-    let d = levenshtein(a, b);
-    let max = a.chars().count().max(b.chars().count());
+    let (la, lb) = (a.chars().count(), b.chars().count());
+    let max = la.max(lb);
     if max == 0 {
-        1.0
-    } else {
-        1.0 - (d as f32 / max as f32)
+        return 1.0;
     }
+    // levenshtein(a, b) >= |la − lb|.
+    let bound = 1.0 - (la.abs_diff(lb) as f32 / max as f32);
+    if bound < SIMILARITY_THRESHOLD {
+        return bound;
+    }
+    let d = levenshtein(a, b);
+    1.0 - (d as f32 / max as f32)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -564,7 +583,11 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 const SIMILARITY_THRESHOLD: f32 = 0.8;
 const MAX_GAP_SIMILARITY_COMPARISONS: usize = 250_000;
-const MAX_LCS_COMPARISONS: usize = 1_000_000;
+/// Work budget for the exact (Hirschberg) LCS, in `n·m` products. At the old
+/// 1e6 budget an all-conflicted 1000×1000 pair spent ~0.95 s in the exact
+/// branch while 1001×1001 took 14 ms in the patience fallback — an inverted
+/// cliff. 250k keeps the exact branch's worst case around a quarter second.
+const MAX_LCS_COMPARISONS: usize = 250_000;
 
 /// One aligned position in the two trees — the SINGLE source of alignment truth
 /// that both the diff rows ([`nodes_to_rows`]) and the merged output
@@ -1211,6 +1234,68 @@ mod tests {
         assert!(d.blocks_identical);
         assert!(d.rows.iter().all(|r| r.kind == RowKind::Unchanged));
         assert!(!d.pre_differs);
+    }
+
+    #[test]
+    fn lcs_budget_stays_at_the_measured_ceiling() {
+        // Audit 2026-08-24: at a 1e6 budget the exact branch spent ~0.95 s on
+        // an all-conflicted 1000×1000 sibling pair while the patience fallback
+        // handled 1001×1001 in 14 ms. Raising the budget re-opens that cliff.
+        assert!(MAX_LCS_COMPARISONS <= 250_000);
+    }
+
+    #[test]
+    fn alignment_agrees_on_both_sides_of_the_lcs_budget() {
+        // 500×500 = 250_000 runs the exact branch, 501×501 the patience
+        // fallback; on a pair whose shared anchors are unique both must find
+        // the same alignment (shared rows unchanged, the rest added/removed).
+        for n in [500usize, 501] {
+            let mine: String = (0..n)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        format!("- shared anchor {i}\n")
+                    } else {
+                        format!("- winner only {i}\n")
+                    }
+                })
+                .collect();
+            let theirs: String = (0..n)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        format!("- shared anchor {i}\n")
+                    } else {
+                        format!("- conflict only {i}\n")
+                    }
+                })
+                .collect();
+            let d = diff_docs(&parse(&mine), &parse(&theirs));
+            let k = kinds(&d.rows);
+            let count = |kind: RowKind| k.iter().filter(|(_, x)| *x == kind).count();
+            let shared = n.div_ceil(2);
+            assert_eq!(count(RowKind::Unchanged), shared, "n = {n}");
+            assert_eq!(count(RowKind::Added), n - shared, "n = {n}");
+            assert_eq!(count(RowKind::Removed), n - shared, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn similarity_pairing_is_bounded_on_giant_single_line_blocks() {
+        // A single-line block's "first line" is its whole body. Before the
+        // similarity key cap this pair cost ~92 s (audit 2026-08-24, 256 KB);
+        // with the cap the equal capped prefixes still pair the rows.
+        let filler = "x".repeat(256 * 1024);
+        let mine = format!("- {filler} left\n");
+        let theirs = format!("- {filler} right\n");
+        let start = std::time::Instant::now();
+        let d = diff_docs(&parse(&mine), &parse(&theirs));
+        assert!(
+            d.rows.iter().any(|r| r.kind == RowKind::Modified),
+            "capped keys share a 512-char prefix and must still pair"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "similarity must not be quadratic in first-line length"
+        );
     }
 
     #[test]
