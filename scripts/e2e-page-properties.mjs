@@ -111,15 +111,13 @@ async function openPage(name) {
     timeout: 20_000,
     timeoutMsg: `switcher did not expose exact page ${name}`,
   });
-  let opened = false;
-  for (const row of await browser.$$(".switcher-row")) {
-    const kind = await row.$(".switcher-kind").getText().catch(() => "");
-    const rowName = await row.$(".switcher-name").getText().catch(() => "");
-    if (kind.trim() !== "page" || rowName.trim() !== name) continue;
-    await row.click();
-    opened = true;
-    break;
-  }
+  const opened = await browser.execute((target) => {
+    const row = [...document.querySelectorAll(".switcher-row")].find((candidate) =>
+      candidate.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && candidate.querySelector(".switcher-name")?.textContent?.trim() === target);
+    row?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+    return Boolean(row);
+  }, name);
   if (!opened) throw new Error(`exact switcher result disappeared for ${name}`);
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
     timeout: 10_000,

@@ -93,15 +93,13 @@ try {
     timeout: 20_000,
     timeoutMsg: "switcher did not expose the print fixture page",
   });
-  let routed = false;
-  for (const row of await browser.$$(".switcher-row")) {
-    const kind = await row.$(".switcher-kind").getText().catch(() => "");
-    const rowName = await row.$(".switcher-name").getText().catch(() => "");
-    if (kind.trim() !== "page" || rowName.trim() !== "Print proof") continue;
-    await row.click();
-    routed = true;
-    break;
-  }
+  const routed = await browser.execute(() => {
+    const row = [...document.querySelectorAll(".switcher-row")].find((candidate) =>
+      candidate.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && candidate.querySelector(".switcher-name")?.textContent?.trim() === "Print proof");
+    row?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+    return Boolean(row);
+  });
   if (!routed) throw new Error("exact print fixture switcher result disappeared");
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Print proof", {
     timeout: 10_000, timeoutMsg: "could not route to print fixture",
