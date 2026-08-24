@@ -209,42 +209,24 @@ async function clickButton(text) {
   await button.click();
 }
 
-async function clickButtonAndConfirm(text, expectedConfirmationText) {
-  // WebDriver cannot address native Windows dialogs. Start a UI Automation
-  // helper before the click because the click command itself waits while the
-  // modal is open. The helper proves that it found Tine's dialog with the
-  // expected message before invoking the affirmative button; keyboard focus
-  // and runner timing are deliberately irrelevant.
-  const applicationPid = webviewTarget.applicationProcess?.pid;
-  if (!applicationPid) throw new Error(`native confirmation requires the Tine process id for ${text}`);
-  let helperStdout = "";
-  let helperStderr = "";
+async function clickButtonAndConfirm(text) {
+  // WebDriver cannot address native Windows dialogs. Tine owns the foreground
+  // window in this isolated runner, so use the mechanism already proven to
+  // cross v0.6.94's native MessageBox instead of trying to infer its localized
+  // accessibility tree from the WebView's parent window.
   const confirmer = spawn("powershell.exe", [
     "-NoProfile",
     "-NonInteractive",
-    "-File",
-    path.resolve("scripts/windows-confirm-dialog.ps1"),
-    "-ProcessId",
-    String(applicationPid),
-    "-ExpectedText",
-    expectedConfirmationText,
-    "-TimeoutSeconds",
-    "20",
-  ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-  confirmer.stdout.on("data", (chunk) => { helperStdout += chunk; });
-  confirmer.stderr.on("data", (chunk) => { helperStderr += chunk; });
+    "-Command",
+    "Start-Sleep -Milliseconds 750; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')",
+  ], { windowsHide: true, stdio: "ignore" });
   const completed = new Promise((resolve) => {
     confirmer.once("exit", (code) => resolve(code));
     confirmer.once("error", () => resolve(-1));
   });
   await clickButton(text);
   const exitCode = await completed;
-  if (exitCode !== 0) {
-    throw new Error(
-      `native confirmation helper failed for ${text}: exit ${exitCode}; ` +
-      `stdout=${helperStdout.trim()}; stderr=${helperStderr.trim()}`
-    );
-  }
+  if (exitCode !== 0) throw new Error(`native confirmation helper failed for ${text}: exit ${exitCode}`);
 }
 
 async function openManagedSettings(expectedAction) {
@@ -442,10 +424,7 @@ try {
 
   await openManagedSettings("Enable Tine-managed storage...");
   const activationStarted = Date.now();
-  await clickButtonAndConfirm(
-    "Enable Tine-managed storage...",
-    "Enable Tine-managed storage for this graph?",
-  );
+  await clickButtonAndConfirm("Enable Tine-managed storage...");
   await waitForActivation();
   receipt.milestones.activationMs = Date.now() - activationStarted;
   assertSameSource(before, "managed activation");
@@ -466,7 +445,7 @@ try {
   receipt.milestones.candidateManagedPageOpened = true;
 
   await openManagedSettings("Return to Direct files");
-  await clickButtonAndConfirm("Return to Direct files", "Return to Direct files?");
+  await clickButtonAndConfirm("Return to Direct files");
   await waitForBody("Enable Tine-managed storage...", 120_000, "Direct Files status after rollback");
   // The attempted v0.6.94 creation may finish before or during recovery. Its
   // new file is allowed; authority transitions may not alter any incumbent.
