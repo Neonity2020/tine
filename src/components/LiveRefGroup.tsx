@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, onCleanup, onMount, untrack, useContext, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { collapseEpochOf, doc, ensurePageLoaded, formatForPage, pageByName } from "../store";
+import { blockProperty, collapseEpochOf, doc, ensurePageLoaded, formatForPage, pageByName, setBlockProperty } from "../store";
 import { Block, CollapseSurfaceContext, OutlineScopeContext, SurfaceContext, type CollapseSurfaceApi } from "./Block";
 import { RefBlocks } from "./RefBlocks";
 import { observeNear, unobserveNear } from "../lazyObserve";
@@ -38,6 +38,7 @@ export function LiveRefGroup(props: {
   path?: string;
   blocks: BlockDto[];
   embedId?: string;
+  hostBlockId?: string;
   showBreadcrumb?: boolean;
   surface: "ref" | "query" | "embed";
   evidence?: ReferenceBlockEvidence[];
@@ -136,14 +137,21 @@ export function LiveRefGroup(props: {
   const surface = `${props.surface === "embed" ? "embed" : "ref"}:` + createUniqueId();
   const resultRootIds = createMemo(() => new Set(props.blocks.map((block) => block.id)));
   const initialCollapsed = new Map<string, boolean>();
-  // Local fold rows. For EMBED occurrences the row is ephemeral (GH #360):
-  // `epoch` remembers the source's collapse write generation at fold time;
-  // once the source moves again (epoch advances) the row is stale and the
-  // occurrence follows the source. Ref/query surfaces keep the pre-existing
-  // "the result view owns its copy" semantics and ignore `epoch`.
+  // Local fold rows. The embedded ROOT has a durable occurrence-owned override
+  // on its macro host (GH #360); nested rows remain local presentation state.
+  // For those nested rows, `epoch` remembers the source collapse generation at
+  // fold time, so a later source move reclaims authority. Ref/query surfaces
+  // keep their pre-existing local-copy semantics and ignore `epoch`.
   interface LocalCollapseRow { v: boolean; epoch: number }
   const [localCollapsed, setLocalCollapsed] = createSignal<Record<string, LocalCollapseRow>>({});
   const isEmbed = () => props.surface === "embed";
+  const embedRootOverride = (id: string): boolean | null => {
+    if (!isEmbed() || id !== props.embedId || !props.hostBlockId) return null;
+    const value = blockProperty(props.hostBlockId, "collapsed")?.toLowerCase();
+    if (value === "true") return true;
+    if (value === "false") return false;
+    return null;
+  };
   const relativeDepth = (id: string): number | null => {
     const roots = resultRootIds();
     if (roots.has(id)) return 0;
@@ -176,18 +184,27 @@ export function LiveRefGroup(props: {
   const collapseSurface: CollapseSurfaceApi = {
     collapsed: (id, stored) => {
       if (isEmbed()) {
+        const override = embedRootOverride(id);
+        if (override !== null) return override;
         const local = localCollapsed()[id];
-        // The local fold governs only while the source hasn't written another
-        // collapse since — a source move reclaims authority immediately.
+        // Nested local folds govern only while the source hasn't written
+        // another collapse since. The root never enters this map: its explicit
+        // true/false host property survives remount and reload.
         return local && local.epoch === collapseEpochOf(id) ? local.v : stored;
       }
       const local = localCollapsed();
       return Object.prototype.hasOwnProperty.call(local, id) ? local[id].v : defaultCollapsed(id, stored);
     },
-    toggle: (id, current) => setLocalCollapsed((state) => ({
-      ...state,
-      [id]: { v: !current, epoch: collapseEpochOf(id) },
-    })),
+    toggle: (id, current) => {
+      if (isEmbed() && id === props.embedId && props.hostBlockId) {
+        setBlockProperty(props.hostBlockId, "collapsed", String(!current));
+        return;
+      }
+      setLocalCollapsed((state) => ({
+        ...state,
+        [id]: { v: !current, epoch: collapseEpochOf(id) },
+      }));
+    },
     setMany: (ids, collapsed) => setLocalCollapsed((state) => {
       const next = { ...state };
       for (const id of ids) next[id] = { v: collapsed, epoch: collapseEpochOf(id) };

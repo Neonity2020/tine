@@ -21,7 +21,7 @@
    "contracts": [
     {
      "class": "stateful-ux",
-     "userOutcome": "Embedded blocks keep local disclosure, keyboard navigation, deletion, and caret ownership in the visible embed.",
+     "userOutcome": "Embedded blocks persist each occurrence's root disclosure on its host across reload without changing the source, while keyboard navigation, deletion, and caret ownership stay in the visible embed.",
      "blocking": true
     }
    ],

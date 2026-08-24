@@ -7652,7 +7652,7 @@
     },
     {
       "id": "UI-EMBED-COLLAPSE-CONTRACT-360",
-      "title": "Embeds track their source block's collapse state live, while each embed occurrence's own folding is ephemeral, occurrence-local, and never persisted",
+      "title": "Embeds follow source collapse live until each occurrence records its own durable host-owned expanded or collapsed state",
       "family": "embed-collapse",
       "sources": {
         "issues": [
@@ -7669,10 +7669,10 @@
         "tests": [
           "src/components/Block.embedCollapse.test.tsx"
         ],
-        "scenario": "embed.collapse-source-live-plus-ephemeral-fold",
+        "scenario": "embed.collapse-source-live-plus-persistent-host-fold",
         "failBefore": "proven"
       },
-      "notes": "Martin's approved contract both ways: (1) embedded content is live and source-authoritative — a source collapse/expand updates every visible embed immediately (before the fix, LiveRefGroup captured the source state ONCE per instance into initialCollapsed, so an already-visible embed only refreshed after leaving/reopening the page); (2) folding the embed's own presentation is ephemeral per occurrence, never lands on the source block or another occurrence, never writes collapsed:: or any file-format extension, and resets when the occurrence remounts or the app reloads. Implementation: for embed surface groups the default collapse answer IS the live stored node state; an occurrence's own fold records the store's per-block collapse write epoch (bumped inside writeCollapsed and the descendants batch) — the next source collapse write anywhere on that block reclaims authority by invalidating the epoch, so a fold-unfold-fold round trip cannot leave a ghost override. Occurrence-locality is the LiveRefGroup component instance (two {{embed}}s of one uuid are independent instances; nothing is shared across occurrences). Ref and query surfaces' existing 'the result view owns its copy' semantics are deliberately unchanged (their snapshot defaults and local folds ignore the epoch). failBefore proven: 3/4 component cases red pre-fix (source-authoritative live update, local fold expiry on later source move, collapsed-source local expansion expiry), the remount-reset case already green and serves as the preserved-behavior control. Test suites of Block embed depth/hierarchy, Live references, store, Page all stay green."
+      "notes": "Martin's approved completed contract: (1) an embed with no local choice follows the source block's live collapse state; (2) the first local fold or unfold records an explicit true/false `collapsed` property on the block containing that embed, so two occurrences of one source remain independent and the choice survives remount, frontend reload, and disk reload; (3) the referenced source block is never mutated. The host property uses the established guarded block-property writer and the existing Logseq-compatible property syntax—no new file-format key or backend write path. Nested disclosure inside the transcluded subtree remains occurrence-local presentation state; the persistent per-embed contract is the embedded root represented by its host block. Ref/query surfaces are unchanged."
     },
     {
       "id": "UI-MODIFIED-CLICK-CONTRACT-283",

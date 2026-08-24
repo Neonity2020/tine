@@ -112,7 +112,7 @@ async function waitForEmbedContent(id, options) {
   throw new Error(`embed ${id} did not reach semantic content readiness: ${JSON.stringify(last)}`);
 }
 
-async function openTestPage() {
+async function openTestPageShell() {
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   for (const selector of ["a.page-ref=Block Embed Test", "span.page-ref=Block Embed Test", "*=Block Embed Test"]) {
     const link = await browser.$(selector);
@@ -121,6 +121,10 @@ async function openTestPage() {
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Block Embed Test", {
     timeout: 10_000, timeoutMsg: "Block Embed Test page did not open",
   });
+}
+
+async function openTestPage() {
+  await openTestPageShell();
   // Page readiness only proves that the macro hosts mounted. Cross-page embed
   // descendants resolve asynchronously, so wait for the exact semantic rows
   // each journey will operate on instead of racing the first host paint (#315).
@@ -131,6 +135,55 @@ async function openTestPage() {
     childMustHaveChildren: true,
   });
   await waitForEmbedContent(SAME, { childText: "Same-page child block" });
+}
+
+async function waitForEmbedRoot(id) {
+  await browser.waitUntil(async () => {
+    const state = await embedContentState(id);
+    return state.roots === 1 && Boolean(state.rootContent) && state.rootToggle;
+  }, { timeout: 15_000, timeoutMsg: `embed ${id} root did not hydrate` });
+}
+
+async function waitForHostProperty(value) {
+  const escaped = CROSS.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`\\{\\{embed \\(\\(${escaped}\\)\\)\\}\\}\\r?\\n\\s+collapsed:: ${value}`);
+  await browser.waitUntil(() => pattern.test(fs.readFileSync(TEST, "utf8")), {
+    timeout: 10_000,
+    timeoutMsg: `embed host did not persist collapsed:: ${value}: ${fs.readFileSync(TEST, "utf8")}`,
+  });
+}
+
+async function exercisePersistentDisclosureReload() {
+  const root = rootSelector(CROSS);
+  await browser.$(`${root} > .block-main .collapse-toggle.has-children`).click();
+  await browser.waitUntil(() => browser.execute((selector, text) =>
+    !(document.querySelector(selector)?.textContent ?? "").includes(text), root, "Cross-page child block"), {
+    timeout: 5000, timeoutMsg: "cross-page occurrence did not collapse",
+  });
+  await waitForHostProperty("true");
+  if (fs.readFileSync(SOURCE, "utf8").includes("collapsed::")) {
+    throw new Error("embed occurrence fold mutated the referenced source block");
+  }
+
+  // Reload the whole frontend from disk: component remount alone is not a
+  // persistence proof. The host's explicit true must still fold this occurrence.
+  await browser.refresh();
+  await openTestPageShell();
+  await waitForEmbedRoot(CROSS);
+  const afterTrueReload = await embedContentState(CROSS, { childText: "Cross-page child block" });
+  if (afterTrueReload.childFound) throw new Error(`collapsed host reopened expanded: ${JSON.stringify(afterTrueReload)}`);
+
+  await browser.$(`${root} > .block-main .collapse-toggle.has-children`).click();
+  await browser.waitUntil(() => browser.execute((selector, text) =>
+    (document.querySelector(selector)?.textContent ?? "").includes(text), root, "Cross-page child block"), {
+    timeout: 5000, timeoutMsg: "cross-page occurrence did not expand",
+  });
+  await waitForHostProperty("false");
+
+  // Explicit false is material: absence would fall back to a collapsed source.
+  // A second full reload proves the expanded choice also round-trips.
+  await browser.refresh();
+  await openTestPage();
 }
 
 async function exerciseDisclosure(id, childText) {
@@ -258,9 +311,9 @@ try {
     capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
   });
   await openTestPage();
-  await exerciseDisclosure(CROSS, "Cross-page child block");
+  await exercisePersistentDisclosureReload();
   await exerciseDisclosure(SAME, "Same-page child block");
-  if (fs.readFileSync(SOURCE, "utf8").includes("collapsed::") || fs.readFileSync(TEST, "utf8").includes("collapsed::")) {
+  if (fs.readFileSync(SOURCE, "utf8").includes("collapsed::")) {
     throw new Error("embed-local disclosure leaked collapsed:: into a source file");
   }
   await exerciseArrowAndDelete();
@@ -269,7 +322,7 @@ try {
   // focus routing and source persistence, not keyboard-repeat timing.
   await exerciseEnter(CROSS, "native child alpha", SOURCE);
   await exerciseEnter(SAME, "native child beta", TEST);
-  console.log("PASS: embed disclosure, Arrow navigation, deletion, and Enter focus stayed local and persisted safely");
+  console.log("PASS: embed disclosure persisted on its host across reload without touching the source; Arrow navigation, deletion, and Enter focus stayed local and persisted safely");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}
