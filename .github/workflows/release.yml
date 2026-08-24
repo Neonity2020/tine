@@ -213,7 +213,11 @@ jobs:
           keychain_password="$(openssl rand -hex 32)"
           printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$p12"
           security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 3600 "$keychain"
+          # App notarization is an external queue and has legitimately taken
+          # longer than an hour.  Keep the ephemeral keychain unlocked for the
+          # whole maximum job lifetime so the later DMG signature cannot block
+          # on an invisible password prompt after the app was accepted.
+          security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           security import "$p12" \
             -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 \

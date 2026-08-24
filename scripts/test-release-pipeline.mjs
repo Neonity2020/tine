@@ -224,7 +224,7 @@ assert.match(
 // iOS is manual-only and defaults to preserving a signed artifact without upload.
 assert.match(
   releaseWorkflow,
-  /name: Prepare macOS signing and notarization credentials[\s\S]*?if: matrix\.lane == 'macos-universal'[\s\S]*?APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}[\s\S]*?APPLE_API_PRIVATE_KEY: \$\{\{ secrets\.APPLE_API_PRIVATE_KEY \}\}[\s\S]*?security create-keychain[\s\S]*?security import "\$p12"[\s\S]*?-f pkcs12[\s\S]*?security find-identity[\s\S]*?chmod 600 "\$key_path"[\s\S]*?APPLE_API_KEY_PATH=\$key_path/,
+  /name: Prepare macOS signing and notarization credentials[\s\S]*?if: matrix\.lane == 'macos-universal'[\s\S]*?APPLE_CERTIFICATE: \$\{\{ secrets\.APPLE_CERTIFICATE \}\}[\s\S]*?APPLE_API_PRIVATE_KEY: \$\{\{ secrets\.APPLE_API_PRIVATE_KEY \}\}[\s\S]*?security create-keychain[\s\S]*?security set-keychain-settings -lut 21600[\s\S]*?security import "\$p12"[\s\S]*?-f pkcs12[\s\S]*?security find-identity[\s\S]*?chmod 600 "\$key_path"[\s\S]*?APPLE_API_KEY_PATH=\$key_path/,
   "macOS release signing does not explicitly install the Developer ID identity or protect the temporary App Store Connect key"
 );
 assert.match(
