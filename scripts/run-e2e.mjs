@@ -157,6 +157,7 @@ const suites = {
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
     ["print-security", "scripts/e2e-print-security.mjs", {}],
     ["block-embed", "scripts/e2e-block-embed.mjs", {}],
+    ["compat-home-current-page", "scripts/e2e-compat-home-current-page.mjs", {}],
     ["sidebar-sections", "scripts/e2e-sidebar-sections.mjs", {}],
     ["right-sidebar-collapse", "scripts/e2e-right-sidebar-collapse.mjs", {}],
     ["mobile-drawers", "scripts/e2e-mobile-drawers.mjs", { TINE_E2E_FORCE_MOBILE_DRAWERS: "1" }],

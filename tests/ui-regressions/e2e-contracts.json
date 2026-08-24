@@ -33,6 +33,23 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-compat-home-current-page.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A Logseq-compatible config.edn home page controls startup without losing sibling configuration, and an advanced :inputs [:current-page] query resolves against that focused page through the native query engine.",
+     "blocking": true,
+     "authority": "Logseq config.edn :default-home and advanced query input compatibility contract"
+    }
+   ],
+   "acceptableVariations": [
+    "Settings layout and query-result presentation may evolve while graph-owned home configuration and focused-page binding remain exact."
+   ],
+   "nonRequirements": [
+    "Exact control geometry, startup timing, or query result styling."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-block-ref-count.mjs": {
    "contracts": [
     {
