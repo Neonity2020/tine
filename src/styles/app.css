@@ -848,6 +848,13 @@ textarea {
   flex: 1;
   min-width: 0; /* shrink horizontally when the right sidebar/PDF pane is open */
   overflow-y: auto;
+  /* Column flex context so the end-of-page slack (the ::after below) sizes
+     itself against THIS pane's height. GH #369: the slack used to live on the
+     inner column as padding-bottom: 40vh — 40% of the WINDOW — so a split
+     pane a fraction of the window tall overflowed on slack alone and showed a
+     useless scrollbar even when its content fit. */
+  display: flex;
+  flex-direction: column;
 }
 
 /* The pane scroller is tabindex="-1" purely as a programmatic focus target
@@ -859,6 +866,18 @@ textarea {
    cue live on other elements/rules and are unaffected. */
 .main-content:focus {
   outline: none;
+}
+
+/* End-of-page editing slack (GH #369): grows to absorb whatever free space the
+   pane has left — a fitting pane ends exactly flush, with no useless
+   scrollbar — and never shrinks below 40% of the PANE's own height, so a long
+   page keeps the breathing room (scroll the tail up off the bottom edge) that
+   the old window-relative padding gave the solo pane. Flex percentages in this
+   column resolve against the scroller, which is what makes the slack
+   pane-relative instead of window-relative. */
+.main-content::after {
+  content: "";
+  flex: 1 0 40%;
 }
 
 /* Solo-pane shell: a non-scrolling, positioned wrapper so the pane-select
@@ -1133,9 +1152,12 @@ textarea {
 }
 
 .main-content-inner {
+  /* Flex item of the pane scroller: keep the page column at natural height so
+     only real content overflow (never a compressed column) drives scrolling. */
+  flex: 0 0 auto;
   max-width: var(--ls-main-content-max-width);
   margin: 0 auto;
-  padding: 12px 48px 40vh;
+  padding: 12px 48px 0;
 }
 
 /* Wide mode: drop the reading-width cap. */
@@ -3247,7 +3269,7 @@ textarea {
 }
 @media (max-width: 640px) {
   .main-content-inner {
-    padding: 8px 12px 40vh;
+    padding: 8px 12px 0;
   }
   .page-title-row {
     gap: 6px;

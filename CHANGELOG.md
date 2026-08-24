@@ -62,6 +62,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Split panes whose content fits no longer show a useless vertical
+  scrollbar** (GH #369 — the reporter's dashboard of short panes like "Lines"
+  and "GRID" each carried a permanent bar). The end-of-page editing slack now
+  measures against each pane's own height (flex spacer in the pane scroller)
+  instead of the window (`40vh`): a pane up to ~60% full shows no bar at all,
+  a near-full pane keeps at most 40%-of-pane of breathing-room range, and a
+  long pane still scrolls independently and its tail can scroll ~40% of the
+  pane up off the bottom edge while editing.
 - **Resolving merge markers inside Tine now stages the pre-resolution file in
   the recoverable trash** (Settings → Backups & recovery), so the sides you
   did not choose stay recoverable — the same guarantee resolving a sync

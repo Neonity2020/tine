@@ -57,11 +57,12 @@ async function measurePanes(page) {
       const scroller = leaf.querySelector(".main-content");
       if (!scroller) continue;
       scroller.scrollTop = 0;
+      const inner = scroller.querySelector(".main-content-inner");
       const sr = scroller.getBoundingClientRect();
-      let contentBottom = 0;
+      let blockBottom = 0;
       for (const block of leaf.querySelectorAll(".ls-block")) {
         const br = block.getBoundingClientRect();
-        if (br.bottom > contentBottom) contentBottom = br.bottom;
+        if (br.bottom > blockBottom) blockBottom = br.bottom;
       }
       out.push({
         title:
@@ -74,9 +75,14 @@ async function measurePanes(page) {
         range: scroller.scrollHeight - scroller.clientHeight,
         // A visible classic scrollbar consumes layout width on this axis.
         scrollbarW: scroller.offsetWidth - scroller.clientWidth,
-        // Bottom of the deepest block measured from the scroller's top edge
-        // (scroller is at scrollTop 0), i.e. the real content extent.
-        contentEnd: contentBottom - sr.top,
+        // The full page column (title, blocks, reference panels) at natural
+        // height WITHOUT its bottom slack: pre-fix the slack was the inner's
+        // own vh bottom padding (counted in scrollHeight); post-fix it lives
+        // in the scroller as a sibling spacer. Subtracting the computed bottom
+        // padding makes "content" comparable on both sides of the fix.
+        slackPad: inner ? parseFloat(getComputedStyle(inner).paddingBottom) || 0 : 0,
+        contentH: inner ? inner.scrollHeight - (parseFloat(getComputedStyle(inner).paddingBottom) || 0) : 0,
+        blockEnd: blockBottom - sr.top,
       });
     }
     return out;
@@ -90,6 +96,7 @@ async function measureEndSlack(page, leafRect) {
       if (!scroller) continue;
       const sr = scroller.getBoundingClientRect();
       if (Math.abs(sr.x - want.x) > 2 || Math.abs(sr.y - want.y) > 2) continue;
+      const inner = scroller.querySelector(".main-content-inner");
       let last = null;
       let maxBottom = -Infinity;
       for (const block of leaf.querySelectorAll(".ls-block")) {
@@ -99,11 +106,13 @@ async function measureEndSlack(page, leafRect) {
           last = br;
         }
       }
-      if (!last) return null;
+      if (!last || !inner) return null;
+      const innerRect = inner.getBoundingClientRect();
       return {
-        lastBlockBottomVisible:
-          last.bottom <= sr.bottom + 1 && last.bottom >= sr.top,
-        endGap: sr.bottom - last.bottom, // px of empty space below the final block
+        lastBlockBottomVisible: last.bottom <= sr.bottom + 1 && last.bottom >= sr.top,
+        // Space between the page column's own end and the pane bottom — this is
+        // the editing slack itself, not whatever follows the last block.
+        slackH: sr.bottom - innerRect.bottom,
         clientHeight: scroller.clientHeight,
       };
     }
@@ -187,12 +196,14 @@ try {
     }
     throw new Error(`could not focus quadrant at (${want.x}, ${want.y}) via Ctrl+1..4`);
   }
-  // Tine stays from the initial mirror splits in TL; give the other quadrants
-  // distinct pages so the screenshot reads like the reporter's dashboard, and
-  // the bottom-right pane becomes the long one that must keep scrolling.
+  // TL keeps "Tine" from the initial mirror splits (a real page tall enough to
+  // overflow — its scroll range must be legit content, not slack). TR/BL get
+  // fresh one-block pages named after the reporter's own panes: those are the
+  // short dashboard cards whose scrollbar must vanish. BR is the long pane
+  // that must keep scrolling independently with breathing room at the end.
   const targets = [
-    { quad: "TR", rect: TRr, name: "Formula1" },
-    { quad: "BL", rect: BLr, name: "Formula1/2026" },
+    { quad: "TR", rect: TRr, name: "Lines" },
+    { quad: "BL", rect: BLr, name: "GRID" },
     { quad: "BR", rect: BRr, name: "Project Plan" }, // 64+ blocks: the long pane
   ];
   for (const t of targets) {
@@ -212,23 +223,41 @@ try {
   const failures = [];
   console.log("pane geometry (viewport 1920x1050):");
   for (const p of panes) {
-    const fits = p.contentEnd <= p.clientHeight;
+    const P = p.clientHeight;
+    const fitsClearly = p.contentH <= 0.6 * P;
+    const fitsExactly = p.contentH <= P;
+    const klass = fitsClearly ? "fits" : fitsExactly ? "fits band" : "overflows";
     console.log(
       `  ${p.title.padEnd(16)} pane ${Math.round(p.rect.w)}x${Math.round(p.rect.h)} @(${Math.round(p.rect.x)},${Math.round(p.rect.y)})` +
-        `  content ${Math.round(p.contentEnd)}px  client ${p.clientHeight}px  range ${p.range}px  scrollbarW ${p.scrollbarW}px  ${fits ? "FITS" : "overflows"}`,
+        `  column ${p.contentH}px of ${P}px (${Math.round((100 * p.contentH) / P)}%)  range ${p.range}px  scrollbarW ${p.scrollbarW}px  ${klass}`,
     );
-    if (fits && (p.range > 0 || p.scrollbarW > 0)) {
+    // The slack contract: a pane whose whole column fits inside 60% of its
+    // height must not scroll at all; the editing slack may then reserve up to
+    // 40% of the pane for near-full pages; an overflowing pane gets exactly
+    // content + 40%-of-pane slack as its range.
+    const expected = Math.max(0, p.contentH + Math.round(0.4 * P) - P);
+    if (fitsClearly && (p.range > 0 || p.scrollbarW > 0)) {
       failures.push(
-        `${p.title}: content fits (${Math.round(p.contentEnd)}px <= ${p.clientHeight}px) but the pane still scrolls ` +
+        `${p.title}: column fits clearly (${p.contentH}px <= 60% of ${P}px) but the pane still scrolls ` +
           `(range ${p.range}px, scrollbarW ${p.scrollbarW}px) — the useless GH #369 scrollbar`,
       );
     }
-    if (!fits && p.range <= 0) failures.push(`${p.title}: content overflows but the pane does not scroll`);
+    if (fitsExactly && !fitsClearly && p.range > 0.4 * P + 2) {
+      failures.push(
+        `${p.title}: near-full column (${p.contentH}px of ${P}px) scrolls ${p.range}px — more than the 40%-of-pane slack it should reserve while editing`,
+      );
+    }
+    if (!fitsExactly && p.range <= 0) failures.push(`${p.title}: content overflows (${p.contentH}px > ${P}px) but the pane does not scroll`);
+    if (Math.abs(p.range - expected) > 3) {
+      failures.push(
+        `${p.title}: range ${p.range}px does not match the pane-proportional slack model (column ${p.contentH}px + 40% of ${P}px pane − pane = ${expected}px)`,
+      );
+    }
   }
 
   // Long pane: must still scroll independently, end block stays reachable, and
-  // end-of-page slack stays useful — proportional to the pane, not the window.
-  const longPane = panes.find((p) => p.contentEnd > p.clientHeight);
+  // proof — proportional to the pane, not the window.
+  const longPane = panes.reduce((best, p) => (p.contentH > (best?.contentH ?? 0) ? p : best), null);
   if (!longPane) {
     failures.push("no overflowing pane found — the Project Plan (long) pane did not overflow");
   } else {
@@ -247,12 +276,12 @@ try {
     const end = await measureEndSlack(page, longPane.rect);
     if (!end) failures.push("could not measure the long pane's end-of-page slack");
     else {
-      const slackPct = Math.round((100 * end.endGap) / end.clientHeight);
+      const slackPct = Math.round((100 * end.slackH) / end.clientHeight);
       console.log(
-        `  ${longPane.title}: scrolled to end — last block visible: ${end.lastBlockBottomVisible}, end slack ${Math.round(end.endGap)}px (${slackPct}% of pane)`,
+        `  ${longPane.title}: scrolled to end — last block visible: ${end.lastBlockBottomVisible}, end slack ${Math.round(end.slackH)}px (${slackPct}% of pane)`,
       );
       if (!end.lastBlockBottomVisible) failures.push(`${longPane.title}: last block is NOT reachable/visible at max scroll`);
-      if (end.endGap < 0.25 * end.clientHeight || end.endGap > 0.6 * end.clientHeight) {
+      if (end.slackH < 0.25 * end.clientHeight || end.slackH > 0.6 * end.clientHeight) {
         failures.push(
           `${longPane.title}: end-of-page editing slack ${slackPct}% of pane height — expected between 25% and 60% (pane-proportional)`,
         );
