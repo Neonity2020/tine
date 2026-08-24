@@ -242,8 +242,8 @@ assert.doesNotMatch(
 );
 assert.match(
   releaseWorkflow,
-  /name: Verify macOS signature and stapled notarization ticket[\s\S]*?codesign --verify --deep --strict[\s\S]*?Authority=Developer ID Application:[\s\S]*?TeamIdentifier=\$APPLE_TEAM_ID[\s\S]*?xcrun stapler validate[\s\S]*?spctl --assess[\s\S]*?hdiutil verify/,
-  "the macOS lane does not independently prove signing, notarization, Gatekeeper acceptance, and DMG integrity"
+  /name: Verify macOS signature and stapled notarization ticket[\s\S]*?hdiutil verify[\s\S]*?hdiutil attach[\s\S]*?find "\$mount"[\s\S]*?codesign --verify --deep --strict[\s\S]*?Authority=Developer ID Application:[\s\S]*?TeamIdentifier=\$APPLE_TEAM_ID[\s\S]*?xcrun stapler validate[\s\S]*?spctl --assess/,
+  "the macOS lane must mount the shipped DMG and prove its app signing, notarization, and Gatekeeper acceptance"
 );
 assert.match(
   releaseWorkflow,

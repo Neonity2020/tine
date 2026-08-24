@@ -283,10 +283,30 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          app=$(find target -type d -path '*/bundle/macos/*.app' -print -quit)
           dmg=$(find target -type f -path '*/bundle/dmg/*.dmg' -print -quit)
-          if [ -z "$app" ] || [ -z "$dmg" ]; then
-            echo "::error::signed macOS app or DMG is missing"
+          if [ -z "$dmg" ]; then
+            echo "::error::signed macOS DMG is missing"
+            exit 1
+          fi
+
+          # Tauri's DMG bundler deliberately removes its temporary standalone
+          # .app after embedding it. Verify the actual shipped application,
+          # not that transient build path.
+          hdiutil verify "$dmg"
+          mount="$RUNNER_TEMP/tine-release-dmg"
+          mkdir -p "$mount"
+          mounted=0
+          cleanup_dmg() {
+            if [ "$mounted" -eq 1 ]; then
+              hdiutil detach "$mount" || true
+            fi
+          }
+          trap cleanup_dmg EXIT
+          hdiutil attach "$dmg" -mountpoint "$mount" -nobrowse -readonly
+          mounted=1
+          app=$(find "$mount" -maxdepth 2 -type d -name '*.app' -print -quit)
+          if [ -z "$app" ]; then
+            echo "::error::signed macOS app is missing from the release DMG"
             exit 1
           fi
 
@@ -296,7 +316,6 @@ jobs:
           grep -Fq "TeamIdentifier=$APPLE_TEAM_ID" "$RUNNER_TEMP/tine-codesign.txt"
           xcrun stapler validate "$app"
           spctl --assess --type execute --verbose=2 "$app"
-          hdiutil verify "$dmg"
 
       - name: Verify Linux AppImage update information
         if: startsWith(matrix.platform, 'ubuntu-')
