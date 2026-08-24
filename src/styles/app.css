@@ -2931,6 +2931,91 @@ textarea {
   border-radius: 6px;
   background: var(--bg-secondary);
 }
+/* Concord dock (spec: tine-agents/specs/concord-conflict-dock.md): when the
+   panel is scrolled entirely out of view, a slim bar pins to the top of this
+   pane's scroller; tapping it unrolls the SAME panel node as a pinned sheet.
+   position: fixed, not sticky — WebKitGTK has no scroll anchoring, so an
+   in-flow height swap would visibly jump the content below. */
+.page-conflict-sentinel {
+  height: 0;
+}
+.page-conflict-dock {
+  position: fixed;
+  z-index: 250;
+  display: flex;
+  flex-direction: column;
+  max-height: 78vh;
+  padding: 0 8px;
+  box-sizing: border-box;
+  /* the bar and sheet re-enable their own hits; the gutters stay clickable */
+  pointer-events: none;
+}
+.page-conflict-dockbar {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-left: 3px solid #b45309;
+  border-top: none;
+  border-radius: 0 0 6px 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.page-conflict-dockbar-icon {
+  flex: none;
+  color: #b45309;
+}
+.page-conflict-dockbar-title {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.page-conflict-dockbar-count {
+  flex: none;
+  font-weight: 600;
+  color: #b45309;
+}
+.page-conflict-dockbar-chevron {
+  flex: none;
+  margin-left: auto;
+  opacity: 0.7;
+}
+.page-conflict-sheet {
+  pointer-events: auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+.page-conflict-sheet .page-conflict {
+  margin: 0;
+}
+@media (max-width: 640px) {
+  .page-conflict-dock {
+    padding: 0 4px;
+  }
+  .page-conflict-dockbar {
+    font-size: 12px;
+    padding: 6px 8px;
+  }
+  .page-conflict-sheet {
+    padding: 6px;
+  }
+}
 .page-conflict-head {
   display: flex;
   align-items: center;

@@ -244,6 +244,12 @@ page**, above the outline, block by block:
   block's text, accept a **merged** version that combines the two edits.
 - `N conflicts` with ↑ / ↓ walks between the blocks that need a decision.
 
+The review lives at the top of the page, but it cannot scroll out of sight:
+once it leaves the view, a slim one-line notice stays pinned to the top of
+the pane — ignorable, never invisible. Tapping it unrolls the same review in
+place, without losing your reading position or any choices already made;
+tapping again (or Escape, or scrolling back up) folds it away.
+
 **A suggested resolution is pre-selected.** Where a common ancestor is known
 (the base ledger, or the ancestor a `diff3`/Fossil marker block carries with it),
 a block only one side changed arrives with that side already chosen and labeled

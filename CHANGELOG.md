@@ -29,6 +29,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   multi-line blocks gain a per-row expander showing the full text of each
   version with the differing lines highlighted.
 
+- **A conflict can no longer scroll out of sight.** The in-page conflict
+  review lives at the top of the page; once it scrolls out of view a slim
+  one-line notice stays pinned to the top of the pane — especially on a
+  phone, where the review was previously invisible until you scrolled up.
+  Tapping the notice unrolls the same review in place (your reading position
+  and any choices you already made are kept); tapping again, pressing
+  Escape, or scrolling back to the top folds it away.
+
 ### Changed
 
 - **"Apply all suggested" no longer sweeps up a merge tool's own proposed

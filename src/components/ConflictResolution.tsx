@@ -20,6 +20,7 @@ import {
   createResource,
   createSignal,
   onCleanup,
+  onMount,
   type JSX,
 } from "solid-js";
 import { backend } from "../backend";
@@ -95,6 +96,94 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   const [busy, setBusy] = createSignal(false);
   const [cursor, setCursor] = createSignal(0);
   let root: HTMLDivElement | undefined;
+
+  // --- Dock: slim pinned bar + unroll-in-place sheet ---------------------
+  // (Design + argued decisions: tine-agents/specs/concord-conflict-dock.md.)
+  // The panel lives at the top of the page and scrolls away with it; on a
+  // phone that made a conflict invisible until the user happened to scroll
+  // up. When the panel is ENTIRELY above the viewport, a slim bar pins to
+  // the top of this pane's scroller; tapping it unrolls the SAME panel node
+  // (physically reparented, so decisions/diff/DOM state survive) as a pinned
+  // sheet. Fixed positioning, not sticky: WebKitGTK has no scroll anchoring,
+  // so an in-flow height swap would visibly jump the content.
+  const [docked, setDocked] = createSignal(false);
+  const [expanded, setExpanded] = createSignal(false);
+  const [dockRect, setDockRect] = createSignal<{
+    left: number;
+    top: number;
+    width: number;
+  } | null>(null);
+  let inlineSlot: HTMLDivElement | undefined;
+  let sentinel: HTMLDivElement | undefined;
+  let sheetEl: HTMLDivElement | undefined;
+
+  const paneScroller = () => inlineSlot?.closest(".main-content") ?? null;
+  const measureDock = () => {
+    const scroller = paneScroller();
+    if (!scroller) {
+      setDockRect(null);
+      return;
+    }
+    const r = scroller.getBoundingClientRect();
+    setDockRect({ left: r.left, top: r.top, width: r.width });
+  };
+
+  onMount(() => {
+    // The sentinel sits directly BELOW the inline panel: dock only when it is
+    // entirely above the viewport (a tall, half-visible panel must not dock;
+    // neither must a sentinel still below the fold on a short window).
+    if (!sentinel || typeof IntersectionObserver === "undefined") return;
+    const io = new IntersectionObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (!entry) return;
+      const above = !entry.isIntersecting && entry.boundingClientRect.top < 0;
+      setDocked(above);
+      if (!above) setExpanded(false); // panel back in view: the bar yields
+    });
+    io.observe(sentinel);
+    onCleanup(() => io.disconnect());
+  });
+
+  // Keep the fixed dock aligned with THIS pane's scroller (split panes each
+  // dock over their own content column).
+  createEffect(() => {
+    if (!docked()) return;
+    measureDock();
+    const onResize = () => measureDock();
+    window.addEventListener("resize", onResize);
+    let ro: ResizeObserver | undefined;
+    const scroller = paneScroller();
+    if (typeof ResizeObserver !== "undefined" && scroller) {
+      ro = new ResizeObserver(onResize);
+      ro.observe(scroller);
+    }
+    onCleanup(() => {
+      window.removeEventListener("resize", onResize);
+      ro?.disconnect();
+    });
+  });
+
+  // ONE panel node, moved — never a second render of the rows. While the
+  // panel is in the sheet, its inline slot keeps the vacated height so the
+  // content below does not jump (same no-anchoring reason as above).
+  createEffect(() => {
+    const panel = root;
+    if (!panel || !inlineSlot) return;
+    if (docked() && expanded() && sheetEl) {
+      inlineSlot.style.minHeight = `${panel.offsetHeight}px`;
+      sheetEl.appendChild(panel);
+    } else if (panel.parentElement !== inlineSlot) {
+      inlineSlot.appendChild(panel);
+      inlineSlot.style.minHeight = "";
+    }
+  });
+
+  const conflictTitle = () =>
+    conflict().source === "vcs-markers"
+      ? "Unresolved merge from your version-control tool"
+      : conflict().source === "live-save"
+        ? "Your draft and the current file both changed"
+        : "Two versions of this page arrived";
 
   // Load the diff from whichever source this object came from. Both return the
   // same `SyncConflictDiff`, so everything downstream is source-agnostic.
@@ -400,15 +489,11 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
   });
 
   return (
+    <>
+    <div class="page-conflict-slot" ref={inlineSlot}>
     <div class="page-conflict" ref={root}>
       <div class="page-conflict-head">
-        <span class="page-conflict-title">
-          {conflict().source === "vcs-markers"
-            ? "Unresolved merge from your version-control tool"
-            : conflict().source === "live-save"
-              ? "Your draft and the current file both changed"
-            : "Two versions of this page arrived"}
-        </span>
+        <span class="page-conflict-title">{conflictTitle()}</span>
         <span class="page-conflict-nav">
           <Show when={pending().length}>
             <span class="page-conflict-count">
@@ -555,5 +640,49 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         )}
       </Show>
     </div>
+    </div>
+    <div class="page-conflict-sentinel" ref={sentinel} aria-hidden="true" />
+    <Show when={docked()}>
+      <div
+        class="page-conflict-dock"
+        classList={{ expanded: expanded() }}
+        style={
+          dockRect()
+            ? {
+                left: `${dockRect()!.left}px`,
+                top: `${dockRect()!.top}px`,
+                width: `${dockRect()!.width}px`,
+              }
+            : undefined
+        }
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && expanded()) {
+            e.stopPropagation();
+            setExpanded(false);
+          }
+        }}
+      >
+        <button
+          class="page-conflict-dockbar"
+          aria-expanded={expanded()}
+          onClick={() => setExpanded(!expanded())}
+        >
+          <span class="page-conflict-dockbar-icon" aria-hidden="true">⚠</span>
+          <span class="page-conflict-dockbar-title">{conflictTitle()}</span>
+          <Show when={pending().length}>
+            <span class="page-conflict-dockbar-count">
+              {pending().length} to review
+            </span>
+          </Show>
+          <span class="page-conflict-dockbar-chevron" aria-hidden="true">
+            {expanded() ? "▴" : "▾"}
+          </span>
+        </button>
+        <Show when={expanded()}>
+          <div class="page-conflict-sheet" ref={(el) => (sheetEl = el)} />
+        </Show>
+      </div>
+    </Show>
+    </>
   );
 }

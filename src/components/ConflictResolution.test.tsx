@@ -776,3 +776,127 @@ describe("in-page conflict resolution", () => {
     expect(conflictQueue()).toHaveLength(1);
   });
 });
+
+// The conflict dock (spec: tine-agents/specs/concord-conflict-dock.md).
+// Fail-before: the panel rendered only at the top of the page and scrolled
+// away with it — on a phone a conflict was invisible until the user happened
+// to scroll up. These assert the dock's state machine with a hand-fired
+// IntersectionObserver (jsdom has none): bar when the panel is entirely above
+// the viewport, unroll-in-place of the SAME panel node, Escape/scroll-back
+// collapse, and decision state surviving the moves.
+class ManualIO {
+  static instances: ManualIO[] = [];
+  callback: IntersectionObserverCallback;
+  constructor(cb: IntersectionObserverCallback) {
+    this.callback = cb;
+    ManualIO.instances.push(this);
+  }
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+  fire(isIntersecting: boolean, top: number): void {
+    this.callback(
+      [{ isIntersecting, boundingClientRect: { top } } as unknown as IntersectionObserverEntry],
+      this as unknown as IntersectionObserver,
+    );
+  }
+}
+
+describe("the conflict dock", () => {
+  const realIO = globalThis.IntersectionObserver;
+  const withIO = async (run: (io: ManualIO, host: HTMLElement) => Promise<void>) => {
+    (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver =
+      ManualIO as unknown as typeof IntersectionObserver;
+    stubBackend({});
+    const { host, dispose } = mount(markerObject);
+    try {
+      await flush();
+      await flush();
+      const io = ManualIO.instances.at(-1)!;
+      expect(io).toBeDefined();
+      await run(io, host);
+    } finally {
+      dispose();
+      ManualIO.instances = [];
+      (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver = realIO;
+    }
+  };
+
+  it("shows no bar while the panel is in view", async () => {
+    await withIO(async (io, host) => {
+      io.fire(true, 120);
+      await flush();
+      expect(host.querySelector(".page-conflict-dock")).toBeNull();
+      expect(host.querySelector(".page-conflict-slot .page-conflict")).not.toBeNull();
+    });
+  });
+
+  it("docks a slim bar carrying the title and count when the panel scrolls above the viewport", async () => {
+    await withIO(async (io, host) => {
+      io.fire(false, -40);
+      await flush();
+      const bar = host.querySelector(".page-conflict-dockbar")!;
+      expect(bar).not.toBeNull();
+      expect(bar.getAttribute("aria-expanded")).toBe("false");
+      expect(bar.textContent).toContain("Unresolved merge from your version-control tool");
+      expect(bar.textContent).toContain("3 to review");
+      // Collapsed bar renders no second panel; the inline one keeps its slot.
+      expect(host.querySelector(".page-conflict-sheet")).toBeNull();
+      expect(host.querySelector(".page-conflict-slot .page-conflict")).not.toBeNull();
+    });
+  });
+
+  it("does NOT dock for a sentinel below the fold (short window at page top)", async () => {
+    await withIO(async (io, host) => {
+      io.fire(false, 900);
+      await flush();
+      expect(host.querySelector(".page-conflict-dock")).toBeNull();
+    });
+  });
+
+  it("unrolls the SAME panel node into the sheet and returns it on Escape", async () => {
+    await withIO(async (io, host) => {
+      const panel = host.querySelector(".page-conflict")!;
+      io.fire(false, -40);
+      await flush();
+      (host.querySelector(".page-conflict-dockbar") as HTMLButtonElement).click();
+      await flush();
+      const sheet = host.querySelector(".page-conflict-sheet")!;
+      expect(sheet.querySelector(".page-conflict")).toBe(panel);
+      expect(host.querySelector(".page-conflict-slot .page-conflict")).toBeNull();
+      expect(
+        host.querySelector(".page-conflict-dockbar")!.getAttribute("aria-expanded"),
+      ).toBe("true");
+      sheet.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      );
+      await flush();
+      expect(host.querySelector(".page-conflict-sheet")).toBeNull();
+      expect(host.querySelector(".page-conflict-slot .page-conflict")).toBe(panel);
+    });
+  });
+
+  it("keeps decisions made inside the sheet after collapsing and undocking", async () => {
+    await withIO(async (io, host) => {
+      io.fire(false, -40);
+      await flush();
+      (host.querySelector(".page-conflict-dockbar") as HTMLButtonElement).click();
+      await flush();
+      const seg = host.querySelector(
+        '[data-row-id="1"] .sync-merge-seg[data-decision="theirs"]',
+      ) as HTMLButtonElement;
+      seg.click();
+      await flush();
+      io.fire(true, 60); // scrolled back to top: undock + collapse
+      await flush();
+      expect(host.querySelector(".page-conflict-dock")).toBeNull();
+      const active = host
+        .querySelector('[data-row-id="1"]')!
+        .querySelector(".sync-merge-seg.active")!;
+      expect(active.getAttribute("data-decision")).toBe("theirs");
+    });
+  });
+});

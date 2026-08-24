@@ -390,6 +390,12 @@ const NAMED: PageDto[] = [
       b("TODO ship the beta by Friday"),
       b("write the release notes"),
       b("DOING draft the announcement\ncollapsed:: false\nowner:: me"),
+      // Filler so the page actually SCROLLS: the conflict dock (slim pinned
+      // bar once the panel scrolls out of view) needs a long page to be
+      // demonstrable in demos and the screenshot harness.
+      ...Array.from({ length: 60 }, (_, i) =>
+        b(`launch checklist item ${i + 1} — status notes and follow-ups`),
+      ),
     ],
   },
   {
