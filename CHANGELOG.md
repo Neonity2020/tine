@@ -8,6 +8,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Conflict review can now suggest a combined "Merged" version of a block both
+  sides edited.** When two devices changed provably different parts of the same
+  block's text (against the last version both sides agreed on), the in-page
+  conflict review offers the combination as a fourth, pre-selected choice next
+  to keep-mine/keep-theirs/keep-both — for sync-conflict copies and for
+  `diff3`/Fossil-style merge markers alike. Like every suggestion it is only
+  pre-selected: nothing is applied until you confirm, the applied text is
+  re-derived from the same three versions (never trusted from the UI), and
+  edits that overlap — or whose combination would not survive as a single
+  block — simply get no offer.
+
+- **Conflict rows now preview the first line that actually differs**, not
+  blindly the first line, with an `…` marker when earlier lines agree — and
+  multi-line blocks gain a per-row expander showing the full text of each
+  version with the differing lines highlighted.
+
 ## [0.6.95] - 2026-08-23
 
 ### Added

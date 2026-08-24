@@ -8,7 +8,7 @@
 // surface and this is its renderer. The surface-shaped props (column labels, the
 // default decision) are kept — they are what a second surface would have to use
 // instead of a second copy, should one ever be justified.
-import { For, Show, type JSX } from "solid-js";
+import { For, Show, createMemo, createSignal, type JSX } from "solid-js";
 import type { DiffRow, MergeDecision, RowKind } from "../types";
 
 /** The effective decision for a row, given the surface's own default. */
@@ -31,7 +31,10 @@ export function noLossDecision(kind: RowKind): MergeDecision {
 
 /** The in-page resolver's opening position: the SUGGESTED resolution wherever the
  *  base justifies one (so the normal gesture is glance-and-confirm), and the
- *  no-loss choice everywhere else. Still just a pre-selection. */
+ *  no-loss choice everywhere else. Still just a pre-selection.
+ *
+ *  A row whose two edits were disjoint suggests `"merged"` and seeds like any
+ *  other suggestion — the fourth outcome is a suggestion, never an auto-apply. */
 export function seedSuggestedOrNoLoss(
   rows: DiffRow[],
   out: Record<string, MergeDecision> = {}
@@ -60,6 +63,67 @@ export function firstLine(text: string): string {
   return l.trim();
 }
 
+/** The line index a collapsed row previews.
+ *
+ *  A block body can be many lines (a logbook, a multi-line quote) while the two
+ *  sides differ far down it; previewing line 0 then showed two identical strings
+ *  next to a decision the user could not make. So: preview the first line that
+ *  actually differs.
+ *
+ *  INVARIANT (zero regression on the common case): when the two first non-blank
+ *  lines already differ this returns 0, and 0 renders exactly `firstLine` — the
+ *  single-line row every conflict used to be is byte-identical to before. Only
+ *  once those agree do we walk raw lines, so the index is an index into
+ *  `split("\n")`, not into the non-blank subsequence. Identical bodies have no
+ *  differing line and also return 0. */
+export function firstDifferingLine(mine: string, theirs: string): number {
+  if (firstLine(mine) !== firstLine(theirs)) return 0;
+  const a = mine.split("\n");
+  const b = theirs.split("\n");
+  const max = Math.max(a.length, b.length);
+  for (let i = 0; i < max; i++) {
+    if (a[i] !== b[i]) return i;
+  }
+  return 0;
+}
+
+/** What one column shows for a collapsed row: its own line `k`, trimmed, or
+ *  `null` when this side has no such line (shorter body → the absent marker).
+ *  `k === 0` is `firstLine` verbatim, per the invariant above. */
+export function previewLine(text: string, k: number): string | null {
+  if (k === 0) return firstLine(text);
+  const lines = text.split("\n");
+  return k < lines.length ? lines[k].trim() : null;
+}
+
+/** Whether the collapsed preview can be the whole story. It cannot when some
+ *  involved body has more than one line, or when the bodies disagree on a line
+ *  other than the previewed one — either way the user needs the expander to see
+ *  what a decision actually costs. */
+export function needsExpander(texts: (string | null | undefined)[], previewIndex: number): boolean {
+  const bodies = texts.filter((t): t is string => t != null).map((t) => t.split("\n"));
+  if (bodies.length < 2) return false;
+  if (bodies.some((b) => b.length > 1)) return true;
+  const max = bodies.reduce((n, b) => Math.max(n, b.length), 0);
+  for (let i = 0; i < max; i++) {
+    if (i === previewIndex) continue;
+    if (bodies.some((b) => b[i] !== bodies[0][i])) return true;
+  }
+  return false;
+}
+
+/** Per body, which of its lines are NOT identical across every displayed body at
+ *  the same index. Plain per-line equality — v1 has no intraline spans, and for
+ *  the two-body case this is exactly "differs from the other side". */
+export function differingLineFlags(bodies: string[][]): boolean[][] {
+  const max = bodies.reduce((n, b) => Math.max(n, b.length), 0);
+  const shared: boolean[] = [];
+  for (let i = 0; i < max; i++) {
+    shared.push(bodies.every((b) => b[i] === bodies[0][i]));
+  }
+  return bodies.map((b) => b.map((_, i) => !shared[i]));
+}
+
 /** Column/segment wording for one surface. The Settings modal talks about a
  *  "conflict copy"; the in-page resolver names the two sides the artifact itself
  *  named (a git ref, a Syncthing device tag). */
@@ -83,7 +147,10 @@ export function DiffRowView(props: {
   const row = () => props.row;
   const dec = () => decisionOf(props.decisions, row().id, props.fallback ?? "mine");
   const labels = () => props.labels ?? { mine: "Current", theirs: "Copy" };
-  const seg = (value: MergeDecision, label: string, side: "mine" | "theirs") => (
+  // Expansion is per-row and opt-in: collapsed stays one line per column, so a
+  // logbook-heavy block cannot claim a phone screen until the user asks it to.
+  const [expanded, setExpanded] = createSignal(false);
+  const seg = (value: MergeDecision, label: string, side: "mine" | "theirs" | "merged") => (
     <button
       class="sync-merge-seg"
       classList={{ active: dec() === value }}
@@ -94,6 +161,49 @@ export function DiffRowView(props: {
       {label}
     </button>
   );
+  // One index for the whole row: both columns and the merged strip preview the
+  // SAME line, so they stay comparable side by side.
+  const previewIndex = createMemo(() => {
+    const r = row();
+    return r.mine && r.theirs ? firstDifferingLine(r.mine.text, r.theirs.text) : 0;
+  });
+  const preview = (text: string) => {
+    const k = previewIndex();
+    const line = previewLine(text, k);
+    return (
+      <>
+        <Show when={k > 0}>
+          <span class="sync-merge-elided" title="Earlier lines are the same on both sides">
+            …
+          </span>
+        </Show>
+        {line === null ? <span class="sync-merge-absent">—</span> : line}
+      </>
+    );
+  };
+  const bodies = createMemo(() => {
+    const r = row();
+    const out: { side: "mine" | "theirs" | "merged"; label: string; lines: string[] }[] = [];
+    if (r.mine) out.push({ side: "mine", label: labels().mine, lines: r.mine.text.split("\n") });
+    if (r.theirs) out.push({ side: "theirs", label: labels().theirs, lines: r.theirs.text.split("\n") });
+    if (r.merged) out.push({ side: "merged", label: "Merged", lines: r.merged.text.split("\n") });
+    return out;
+  });
+  const expandable = createMemo(
+    () =>
+      row().kind === "modified"
+      && needsExpander(
+        [row().mine?.text, row().theirs?.text, row().merged?.text],
+        previewIndex()
+      )
+  );
+  const lineCount = createMemo(() => bodies().reduce((n, b) => Math.max(n, b.lines.length), 0));
+  const expandedBodies = createMemo(() => {
+    if (!expanded()) return [];
+    const bs = bodies();
+    const flags = differingLineFlags(bs.map((b) => b.lines));
+    return bs.map((b, i) => ({ ...b, flags: flags[i] }));
+  });
   return (
     <Show when={props.showUnchanged || row().kind !== "unchanged"}>
       <div
@@ -104,13 +214,13 @@ export function DiffRowView(props: {
       >
         <div class="sync-merge-cols">
           <div class="sync-merge-cell mine" classList={{ chosen: row().kind !== "removed" && dec() !== "theirs" }}>
-            {row().mine ? firstLine(row().mine!.text) : <span class="sync-merge-absent">—</span>}
+            {row().mine ? preview(row().mine!.text) : <span class="sync-merge-absent">—</span>}
             <Show when={(row().mine?.child_count ?? 0) > 0}>
               <span class="sync-merge-kids"> +{row().mine!.child_count}</span>
             </Show>
           </div>
           <div class="sync-merge-cell theirs" classList={{ chosen: dec() === "theirs" || dec() === "both" }}>
-            {row().theirs ? firstLine(row().theirs!.text) : <span class="sync-merge-absent">—</span>}
+            {row().theirs ? preview(row().theirs!.text) : <span class="sync-merge-absent">—</span>}
             <Show when={(row().theirs?.child_count ?? 0) > 0}>
               <span class="sync-merge-kids"> +{row().theirs!.child_count}</span>
             </Show>
@@ -121,6 +231,7 @@ export function DiffRowView(props: {
             {seg("mine", labels().mine, "mine")}
             {seg("theirs", labels().theirs, "theirs")}
             {seg("both", "Both", "theirs")}
+            <Show when={row().merged}>{seg("merged", "Merged", "merged")}</Show>
           </Show>
           <Show when={row().kind === "added"}>
             {seg("mine", "Keep", "mine")}
@@ -141,7 +252,52 @@ export function DiffRowView(props: {
               suggested
             </span>
           </Show>
+          <Show when={expandable()}>
+            <button
+              class="sync-merge-expand"
+              title={expanded() ? "Hide the full bodies" : `Show all ${lineCount()} lines`}
+              aria-expanded={expanded()}
+              onClick={() => setExpanded(!expanded())}
+            >
+              {expanded() ? "⌃" : `⌄ ${lineCount()}`}
+            </button>
+          </Show>
         </div>
+        {/* The merged proposal is a FULL-WIDTH strip under the two columns, not a
+            third column: three columns do not survive a phone. */}
+        <Show when={row().kind === "modified" ? row().merged : null}>
+          {(merged) => (
+            <div
+              class="sync-merge-cell merged"
+              classList={{ chosen: dec() === "merged" }}
+              data-side="merged"
+              title="Both edits combined — offered because they touch different parts of the same body"
+            >
+              <span class="sync-merge-mergedtag">Merged</span>
+              {preview(merged().text)}
+            </div>
+          )}
+        </Show>
+        <Show when={expanded()}>
+          <div class="sync-merge-expanded">
+            <For each={expandedBodies()}>
+              {(body) => (
+                <div class="sync-merge-fulltext" data-side={body.side}>
+                  <div class="sync-merge-fulltext-label">{body.label}</div>
+                  <div class="sync-merge-fulltext-body">
+                    <For each={body.lines}>
+                      {(line, i) => (
+                        <div class="sync-merge-fulltext-line" classList={{ differs: body.flags[i()] }}>
+                          {line}
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
       </div>
       <For each={row().children}>
         {(child) => (

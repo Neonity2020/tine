@@ -661,6 +661,107 @@ describe("in-page conflict resolution", () => {
     }
   });
 
+  // Concord's fourth outcome. The surface treats a suggested MERGED body like
+  // any other suggestion — it is counted, "Apply all suggested" restores it, and
+  // the decision reaches the guarded resolver as the plain string the backend
+  // re-derives from. Nothing about the merged text itself is ever sent.
+  it("counts a merged suggestion and sends it through the guarded copy resolver", async () => {
+    const copyDiff: SyncConflictDiff = {
+      base_rev: "winner-rev",
+      conflict_rev: "copy-rev",
+      rows: [{
+        id: "0",
+        kind: "modified",
+        mine: view("Desktop"),
+        theirs: view("Desktop 5 kk"),
+        children: [],
+        verdict: "both-changed",
+        suggestion: "merged",
+        merged: { text: "Desktop kk", source: "computed" },
+      }],
+      mine_pre: null,
+      theirs_pre: null,
+      pre_differs: false,
+      blocks_identical: false,
+      three_way: true,
+    };
+    const resolveCopy = vi.fn(async (): Promise<PageDto> => ({
+      name: "Note",
+      kind: "page",
+      title: "Note",
+      pre_block: null,
+      path: "pages/Note.md",
+      rev: "merged-rev",
+      blocks: [{ id: "note", raw: "Desktop kk", collapsed: false, children: [] }],
+    }));
+    stubBackend({
+      syncConflictDiff: (async () => copyDiff) as unknown as Backend["syncConflictDiff"],
+      resolveSyncConflict: resolveCopy as unknown as Backend["resolveSyncConflict"],
+    });
+    const copyObject: ConflictObject = {
+      id: "copy:pages/Note.sync-conflict-20260824-090000-MERGED1.md",
+      source: "sync-copy",
+      page_name: "Note",
+      page_path: "pages/Note.md",
+      kind: "page",
+      sides: [
+        { role: "mine", label: "This device", path: "pages/Note.md" },
+        { role: "theirs", label: "Phone", path: "pages/Note.sync-conflict-20260824-090000-MERGED1.md" },
+      ],
+      block_conflicts: 1,
+    };
+    setDoc({
+      byId: {
+        note: { id: "note", raw: "Desktop", collapsed: false, parent: null, page: "Note", children: [] },
+      },
+      pages: [{
+        name: "Note",
+        kind: "page",
+        title: "Note",
+        preBlock: null,
+        roots: ["note"],
+        format: "md",
+        readOnly: false,
+        guide: false,
+        path: "pages/Note.md",
+      }],
+      feed: ["Note"],
+      loaded: true,
+    });
+    const { host, dispose } = mount(copyObject);
+    try {
+      await flush();
+      await flush();
+      expect(host.querySelector(".sync-merge-toolbar")!.textContent).toContain("1 of 1 pre-selected");
+      expect(
+        host.querySelector(".sync-merge-seg.active")!.getAttribute("data-decision"),
+      ).toBe("merged");
+      // Overriding and then restoring goes through the same suggestion path.
+      (host.querySelector('.sync-merge-seg[data-decision="both"]') as HTMLElement).click();
+      await flush();
+      [...host.querySelectorAll("button")]
+        .find((b) => b.textContent?.includes("Apply all suggested"))!
+        .click();
+      await flush();
+      expect(
+        host.querySelector(".sync-merge-seg.active")!.getAttribute("data-decision"),
+      ).toBe("merged");
+      [...host.querySelectorAll("button")]
+        .find((b) => b.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      await flush();
+      const [, , decisions] = resolveCopy.mock.calls[0] as unknown as [
+        string,
+        string,
+        Record<string, MergeDecision>,
+      ];
+      expect(decisions).toEqual({ "0": "merged" });
+    } finally {
+      dispose();
+    }
+  });
+
   it("warns quietly — never blocks — when the page is left unresolved", async () => {
     stubBackend({});
     setConflictQueue([markerObject]);

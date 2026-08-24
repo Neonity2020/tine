@@ -378,6 +378,21 @@ const NAMED: PageDto[] = [
   // Namespace + page-icon demo: {{namespace}} renders the nested descendant tree,
   // each page showing its `icon::`.
   {
+    // The page the mock's sync-conflict copy belongs to (the conflict queue
+    // points here); its body matches the diff's "mine" side so the in-page
+    // resolver reads coherently in demos/screenshots.
+    name: "Project Plan",
+    kind: "page",
+    title: "Project Plan",
+    pre_block: "title:: Project Plan\ntags:: launch",
+    blocks: [
+      b("Milestones for the launch"),
+      b("TODO ship the beta by Friday"),
+      b("write the release notes"),
+      b("DOING draft the announcement\ncollapsed:: false\nowner:: me"),
+    ],
+  },
+  {
     name: "Formula1",
     kind: "page",
     title: "Formula1",
@@ -1788,6 +1803,20 @@ export function mockBackend(): Backend {
           { id: "1", kind: "modified" as const, mine: v("TODO ship the beta by Friday"), theirs: v("TODO ship the beta by Thursday"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
           { id: "2", kind: "added" as const, mine: v("write the release notes"), theirs: null, children: [], verdict: "mine-only" as const, suggestion: "mine" as const },
           { id: "3", kind: "removed" as const, mine: null, theirs: v("ask marketing for the banner"), children: [], verdict: "theirs-only" as const, suggestion: "theirs" as const },
+          // Row 4 is the fourth outcome: both sides edited ONE block, but in
+          // different places, so a merged body is offered (suggestion only).
+          // Its bodies are multi-line and agree on line 0, which is also what
+          // exercises the differing-line preview and the expander.
+          {
+            id: "4",
+            kind: "modified" as const,
+            mine: v("DOING draft the announcement\ncollapsed:: false\nowner:: me"),
+            theirs: v("DOING draft the announcement\ncollapsed:: false\ndue:: Friday"),
+            children: [],
+            verdict: "both-changed" as const,
+            suggestion: "merged" as const,
+            merged: { text: "DOING draft the announcement\ncollapsed:: false\nowner:: me\ndue:: Friday", source: "computed" as const },
+          },
         ],
         // The page's OWN properties differ too, so the resolver shows its
         // pre-block choice — the one thing the retired Settings modal used to
@@ -1876,7 +1905,7 @@ export function mockBackend(): Backend {
             },
             { role: "base" as const, label: "Last agreed version" },
           ],
-          block_conflicts: 3,
+          block_conflicts: 4,
         },
         {
           id: "markers:pages/Tine.md",

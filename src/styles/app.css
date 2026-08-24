@@ -2747,6 +2747,10 @@ textarea {
 .sync-merge-row {
   display: flex;
   align-items: center;
+  /* The merged strip and the expanded bodies are full-width children of the
+     row. Nothing else in a row can wrap — every column already has
+     `min-width: 0` — so a row without them keeps its exact one-line layout. */
+  flex-wrap: wrap;
   gap: 10px;
   padding: 4px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border-color) 55%, transparent);
@@ -2815,6 +2819,79 @@ textarea {
 .sync-merge-suggested-tag {
   font-size: 11px;
   color: var(--link-color);
+}
+
+/* --- The fourth outcome (a suggested merged body) and the per-row expander. ---
+
+   The proposal is a full-width strip UNDER the two columns, never a third
+   column: three columns do not survive a phone. Collapsed rows stay one line
+   per column, so the panel's mobile footprint is unchanged until the user
+   expands a row. */
+.sync-merge-cell.merged {
+  flex: 0 0 100%;
+}
+.sync-merge-mergedtag {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-right: 6px;
+}
+/* Marks a preview that starts below line 0. Deliberately its own element: the
+   marker is never part of the previewed text. */
+.sync-merge-elided {
+  color: var(--text-muted);
+  margin-right: 4px;
+}
+.sync-merge-expand {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-color);
+  background: none;
+  color: var(--text-muted);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.sync-merge-expand:hover {
+  color: var(--text-primary);
+}
+.sync-merge-expanded {
+  flex: 0 0 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 2px 0 4px;
+}
+.sync-merge-fulltext-label {
+  margin-bottom: 2px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+/* Capped and independently scrollable: an expanded logbook must not push the
+   Apply button off the screen. */
+.sync-merge-fulltext-body {
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 6px 8px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+.sync-merge-fulltext-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 1.35em;
+}
+.sync-merge-fulltext-line.differs {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--link-color) 14%, transparent);
+  color: var(--text-primary);
 }
 /* --- Concord L3/L4: the calm queue badge and the in-page resolver. --- */
 
@@ -2910,6 +2987,20 @@ textarea {
 }
 .page-conflict .sync-merge-cell.theirs {
   border-left: 3px solid color-mix(in srgb, #1565c0 55%, transparent);
+}
+/* The merged proposal is neither side, so it gets its own hue rather than
+   borrowing one of theirs. */
+.page-conflict .sync-merge-cell.merged {
+  border-left: 3px solid color-mix(in srgb, #6f42c1 55%, transparent);
+}
+.page-conflict .sync-merge-fulltext[data-side="mine"] .sync-merge-fulltext-body {
+  border-left: 3px solid color-mix(in srgb, #2e7d32 55%, transparent);
+}
+.page-conflict .sync-merge-fulltext[data-side="theirs"] .sync-merge-fulltext-body {
+  border-left: 3px solid color-mix(in srgb, #1565c0 55%, transparent);
+}
+.page-conflict .sync-merge-fulltext[data-side="merged"] .sync-merge-fulltext-body {
+  border-left: 3px solid color-mix(in srgb, #6f42c1 55%, transparent);
 }
 .page-conflict-rows {
   padding: 2px 14px 8px;
