@@ -9426,6 +9426,21 @@ img.emoji {
   border-color: #e44;
 }
 
+/* Touch annotation actions share the desktop command set, but need a bounded
+   full-width target instead of a pointer-sized popup that can overflow a phone. */
+.pdf-pane-mobile .pdf-color-menu {
+  left: 12px !important;
+  right: 12px;
+  max-width: calc(100vw - 24px);
+}
+.pdf-pane-mobile .pdf-color-menu :is(.pdf-color-swatch, .pdf-hl-remove) {
+  width: 36px;
+  height: 36px;
+}
+.pdf-pane-mobile .pdf-hl-action {
+  min-height: 36px;
+}
+
 /* ── Onboarding Welcome screen ────────────────────────────────────────────
    First run with no graph configured: a full-cover layer offering "open an
    existing graph" or "create a new (demo) graph". Below toasts (z 9999) so a

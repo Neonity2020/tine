@@ -215,6 +215,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("set_app_string", NoGraphSlot),
     ("set_backup_keep", LegacyOnly),
     ("set_capture_enter_files", NoGraphSlot),
+    ("set_default_home", ConfigWrite),
     ("set_default_journal_template", ConfigWrite),
     ("set_doc_mode_enter_for_new_block", ConfigWrite),
     ("set_favorites", ConfigWrite),
@@ -503,6 +504,7 @@ mod tests {
             "set_doc_mode_enter_for_new_block",
             "set_timetracking_enabled",
             "set_default_journal_template",
+            "set_default_home",
             "set_guide_announced",
         ] {
             assert_eq!(

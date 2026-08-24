@@ -92,34 +92,35 @@ await sleep(2500);
 let browser;
 
 async function openPage(name) {
-  if ((await browser.$$(".nav-page")).length === 0) {
-    const toggled = await browser.execute(() => {
-      const header = [...document.querySelectorAll(".nav-section-header")]
-        .find((element) => element.textContent?.includes("ALL PAGES"));
-      if (!header) return false;
-      header.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
-      return true;
-    });
-    if (!toggled) throw new Error("missing ALL PAGES sidebar section");
-    await browser.waitUntil(async () => (await browser.$$(".nav-page")).length >= 2, {
-      timeout: 5_000,
-      timeoutMsg: "ALL PAGES did not reveal fixture pages",
-    });
-  }
+  const current = await browser.$("h1.page-title").getText().catch(() => "");
+  if (current.trim() === name) return;
+  // Fixture routing is not a sidebar contract. Windows can attach WebDriver
+  // while the sidebar is still absent or intentionally collapsed, so use the
+  // app's visible search control and wait for the exact indexed page instead
+  // of treating one incidental startup surface as readiness proof.
+  // The global shortcut is also the production route when compact/native
+  // chrome has the sidebar button outside the current viewport. Requiring that
+  // incidental button to be WebDriver-clickable made the Windows journey fail
+  // behind an otherwise ready journal at narrow/default window geometry.
+  await browser.keys(["Control", "k"]);
+  const input = await browser.$(".switcher-input");
+  await input.waitForExist({ timeout: 10_000 });
+  await input.setValue(name);
+  await browser.waitUntil(() => browser.execute((target) =>
+    [...document.querySelectorAll(".switcher-row")].some((row) =>
+      row.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && row.querySelector(".switcher-name")?.textContent?.trim() === target), name), {
+    timeout: 20_000,
+    timeoutMsg: `switcher did not expose exact page ${name}`,
+  });
   const opened = await browser.execute((target) => {
-    const rows = [...document.querySelectorAll(".nav-page")];
-    const row = rows.find((element) => element.textContent?.trim() === target);
-    if (!row) return { ok: false, rows: rows.map((element) => element.textContent?.trim()) };
-    row.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
-    return { ok: true, rows: [] };
+    const row = [...document.querySelectorAll(".switcher-row")].find((candidate) =>
+      candidate.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && candidate.querySelector(".switcher-name")?.textContent?.trim() === target);
+    row?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+    return Boolean(row);
   }, name);
-  if (!opened.ok) {
-    const context = await browser.execute(() => ({
-      title: document.querySelector("h1.page-title")?.textContent?.trim(),
-      body: document.body.textContent?.trim().slice(0, 1_000),
-    }));
-    throw new Error(`missing ALL PAGES result ${name}: ${JSON.stringify({ rows: opened.rows, context })}`);
-  }
+  if (!opened) throw new Error(`exact switcher result disappeared for ${name}`);
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
     timeout: 10_000,
     timeoutMsg: `could not open ${name}`,
@@ -462,11 +463,6 @@ try {
   // not a named-page `.page-title`; waiting for the latter prevented openPage()
   // from ever exercising the routed page-properties journey on WebView2.
   await browser.$(".ls-block, .journal-title, .page-title").waitForExist({ timeout: 20_000 });
-  // The graph page index warms asynchronously after first paint. Wait for the
-  // complete list before using Ctrl+K, otherwise a cold run offers only the
-  // misleading "Create page" row for an already-existing file.
-  await sleep(3500);
-
   await openPage("Property detailed");
   await exerciseNativeFormTabTraversal("Test Record, Alternate");
   const customRow = await browser.execute(() => {

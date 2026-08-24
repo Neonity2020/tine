@@ -1147,7 +1147,7 @@ export function PdfViewer(props: {
         div.style.background = `rgba(${rgb}, 0.18)`; // translucent fill over the captured region
         div.style.cursor = "pointer";
         div.onclick = openEdit(h.id);
-        if (!isMobilePlatform) div.oncontextmenu = openEdit(h.id);
+        div.oncontextmenu = openEdit(h.id);
         layer.appendChild(div);
         continue;
       }
@@ -1164,7 +1164,7 @@ export function PdfViewer(props: {
         div.style.background = COLOR_RGBA[h.color] ?? COLOR_RGBA.yellow;
         div.style.cursor = "pointer";
         div.onclick = openEdit(h.id);
-        if (!isMobilePlatform) div.oncontextmenu = openEdit(h.id);
+        div.oncontextmenu = openEdit(h.id);
         layer.appendChild(div);
       }
     }
@@ -1213,7 +1213,10 @@ export function PdfViewer(props: {
     onCleanup(() => window.removeEventListener("keydown", onKeyZoom));
   });
 
-  const onMouseUp = (e: MouseEvent) => {
+  const captureTextSelection = (
+    target: EventTarget | null,
+    anchor?: { x: number; y: number },
+  ) => {
     // An area drag (toggle or platform modifier) owns the mouse; don't also make a text
     // highlight. `areaDrag` is still set here — onMouseUp (on .pdf-scroll) runs
     // before the window-level onAreaUp that clears it.
@@ -1229,11 +1232,16 @@ export function PdfViewer(props: {
     if (!clientRects.length) return;
 
     const first = clientRects[0];
-    const wrap = (e.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
+    const common = range.commonAncestorContainer;
+    const commonElement = common instanceof Element ? common : common?.parentElement;
+    const targetElement = target instanceof Element ? target : null;
+    const wrap = commonElement?.closest(".pdf-page") as HTMLElement | null
+      ?? targetElement?.closest(".pdf-page") as HTMLElement | null;
     const pageWrap =
       wrap ?? document.elementFromPoint(first.left, first.top)?.closest(".pdf-page") as HTMLElement | null;
     if (!pageWrap) return;
     const pageNum = Number(pageWrap.dataset.page);
+    if (!Number.isSafeInteger(pageNum) || !dims[pageNum]) return;
     const base = pageWrap.getBoundingClientRect();
     const s = scale();
 
@@ -1262,8 +1270,40 @@ export function PdfViewer(props: {
       },
       text: sel.toString(),
     };
-    setMenu({ x: e.clientX, y: e.clientY });
+    const last = clientRects[clientRects.length - 1];
+    setMenu({ x: anchor?.x ?? last.right, y: anchor?.y ?? last.bottom });
   };
+
+  const onMouseUp = (e: MouseEvent) => {
+    captureTextSelection(e.target, { x: e.clientX, y: e.clientY });
+  };
+
+  // Native mobile text handles do not reliably synthesize a mouseup. Touchend
+  // owns the direct completion path; selectionchange catches later handle
+  // adjustments after the platform selection UI settles.
+  const onTouchSelectionEnd = (e: TouchEvent) => {
+    if (!isMobilePlatform) return;
+    const touch = e.changedTouches?.[0];
+    queueMicrotask(() => captureTextSelection(
+      e.target,
+      touch ? { x: touch.clientX, y: touch.clientY } : undefined,
+    ));
+  };
+  onMount(() => {
+    if (!isMobilePlatform) return;
+    let timer: number | undefined;
+    const selectionChanged = () => {
+      clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        if (!findOpen()) captureTextSelection(viewerRootEl ?? null);
+      }, 120);
+    };
+    document.addEventListener("selectionchange", selectionChanged);
+    onCleanup(() => {
+      clearTimeout(timer);
+      document.removeEventListener("selectionchange", selectionChanged);
+    });
+  });
 
   const createHighlight = async (color: string) => {
     if (!pending) return;
@@ -1980,6 +2020,7 @@ export function PdfViewer(props: {
           ref={scrollRef}
           onMouseDown={onAreaDown}
           onMouseUp={onMouseUp}
+          onTouchEnd={onTouchSelectionEnd}
           onWheel={onWheel}
           onScroll={onScroll}
         />
@@ -1995,7 +2036,7 @@ export function PdfViewer(props: {
               <button
                 class="pdf-color-swatch"
                 style={{ background: COLOR_RGBA[c] }}
-                onMouseDown={(e) => {
+                onPointerDown={(e) => {
                   e.preventDefault();
                   const m = menu()!;
                   if (m.id) void recolorHighlight(m.id, c); // recolor existing
@@ -2005,10 +2046,10 @@ export function PdfViewer(props: {
               />
             )}
           </For>
-          <Show when={menu()!.id && !isMobilePlatform}>
+          <Show when={menu()!.id}>
             <button
               class="pdf-hl-action"
-              onMouseDown={(e) => {
+              onPointerDown={(e) => {
                 e.preventDefault();
                 void copyExistingHighlightRef(menu()!.id!);
               }}
@@ -2017,7 +2058,7 @@ export function PdfViewer(props: {
             </button>
             <button
               class="pdf-hl-action"
-              onMouseDown={(e) => {
+              onPointerDown={(e) => {
                 e.preventDefault();
                 void openExistingHighlightReferences(menu()!.id!);
               }}
@@ -2029,7 +2070,7 @@ export function PdfViewer(props: {
             <button
               class="pdf-hl-remove"
               title="Remove highlight"
-              onMouseDown={(e) => {
+              onPointerDown={(e) => {
                 e.preventDefault();
                 void deleteHighlight(menu()!.id!);
               }}

@@ -70,6 +70,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a near-full pane keeps at most 40%-of-pane of breathing-room range, and a
   long pane still scrolls independently and its tail can scroll ~40% of the
   pane up off the bottom edge while editing.
+
+- **Advanced queries using `:inputs [:current-page]` now follow the focused
+  pane** (GH #301). Tine binds Logseq's standard current-page page/ref
+  relationship, reruns it on focused-page navigation, and keeps ordinary date
+  inputs typed and unchanged.
+
+- **A graph's Home page setting now follows the graph between devices** (GH
+  #269). Tine reads and writes Logseq's `:default-home {:page "..."}` entry in
+  `logseq/config.edn`, preserves other keys in that map, and safely migrates an
+  older device-local setting after the graph opens.
 - **Resolving merge markers inside Tine now stages the pre-resolution file in
   the recoverable trash** (Settings → Backups & recovery), so the sides you
   did not choose stay recoverable — the same guarantee resolving a sync
@@ -119,7 +129,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Ctrl/Cmd+click on an internal link now opens a background tab everywhere** (GH #283). One standard pointer contract now covers page links, block refs, references, search results, Favorites, Recent, namespace crumbs and query group headers alike: plain click navigates, Shift+click opens the right sidebar, Ctrl(Win/Linux)/Cmd(macOS)+click opens a background tab — as does middle-click — and right-click keeps the explicit destination menu. (Behavior change note: Ctrl+click on a rendered `[[page]]` or `((block))` link previously opened the other pane; pane opening remains available through context menus and the window/pane gestures.)
 
-- **Block embeds now track their source block's collapse state live** (GH #360). Folding or unfolding a source block updates every visible embedding of it immediately — no page leave/re-open needed. Folding a block inside one embed remains yours alone: it never touches the source block or another embed of it, is never written to `collapsed::`/disk, and resets when that embed remounts or the app reloads; the next collapse change on the source reclaims authority everywhere.
+- **Block embeds now track their source block's collapse state live and keep each occurrence's own fold** (GH #360). Before you change an embed locally it follows source folding immediately. Folding or unfolding that embedded root then stores an explicit `collapsed:: true` or `collapsed:: false` on the block containing the embed, so the choice survives reload independently of the source and other occurrences; the referenced source block is never changed.
+
+- **PDF annotations are usable on mobile** (GH #191). Finishing a native touch text selection now opens the highlight color chooser, and long-pressing an existing text or area highlight opens the same recolor, remove, Copy ref, and Linked references actions as desktop. Touch-sized controls stay inside the phone viewport; desktop mouse and context-menu behavior is unchanged. The earlier mobile Close/Back escape fix remains intact.
 
 - **Queries with `<% current page %>` rerun when you navigate** (GH #301). A query that explicitly carries the `<% current page %>` dyvar now binds it to the page in the focused pane — so a sidebar (or any open) query like "everything on #current page tagged #pin" updates as you move between pages. The authored query text is untouched, queries without the dyvar don't rerun on navigation, and a delayed result from the previous page can never leak into the new page's view. (`:query-page` remains bound to the block owning the query; the EDN `:inputs [:current-page]` advanced form is still outside the engine's entity binding and is documented in the issue thread.)
 

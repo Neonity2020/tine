@@ -5066,6 +5066,9 @@ pub struct GraphMeta {
     pub block_hidden_properties: Vec<String>,
     /// Template name applied to a new, empty journal page (if configured).
     pub default_journal_template: Option<String>,
+    /// Graph-portable startup page from `:default-home {:page "..."}`.
+    #[serde(default)]
+    pub default_home: Option<String>,
     /// Favorited page names (read from config.edn `:favorites`).
     pub favorites: Vec<String>,
     /// Effective journal title format (`:journal/page-title-format`, default
@@ -10695,6 +10698,7 @@ impl Graph {
             start_of_week: self.config.start_of_week,
             block_hidden_properties: self.config.block_hidden_properties.clone(),
             default_journal_template: self.config.default_journal_template.clone(),
+            default_home: self.config.default_home.clone(),
             favorites: self.config.favorites.clone(),
             journal_page_title_format: self.journal_format.title_format().to_string(),
             journal_file_name_format: self.journal_format.file_format().to_string(),
@@ -40036,6 +40040,40 @@ mod tests {
         let u = g.run_advanced_query("[:find ?b :where [?b :block/foo ?v]]", None);
         assert!(!u.supported);
         assert!(u.groups.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advanced_current_page_input_filters_real_graph_blocks() {
+        let dir = scratch("advanced-current-page");
+        fs::write(dir.join("pages/Focus A.md"), "- own A\n").unwrap();
+        fs::write(dir.join("pages/Focus B.md"), "- own B\n").unwrap();
+        fs::write(
+            dir.join("pages/Source.md"),
+            "- TODO pinned [[Focus A]]\n- TODO pinned [[Focus B]]\n- DONE [[Focus A]]\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let query = r#"[:find (pull ?b [*])
+                        :in $ ?current-page
+                        :where
+                        [?p :block/name ?current-page]
+                        [?b :block/refs ?p]
+                        (task ?b #{"TODO"})]
+                       :inputs [:current-page]"#;
+
+        let result = graph.run_advanced_query(query, Some("Focus A"));
+        assert!(result.supported, "ignored={:?}", result.ignored);
+        assert!(result.ignored.is_empty(), "{:?}", result.ignored);
+        assert_eq!(result.ran, vec!["current-page-ref", "task"]);
+        let raws = result
+            .groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.raw.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(raws, vec!["TODO pinned [[Focus A]]"]);
+
         let _ = fs::remove_dir_all(&dir);
     }
 

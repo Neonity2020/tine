@@ -52,6 +52,9 @@ pub struct Config {
     /// `:default-templates {:journals "Name"}` — template applied to a new,
     /// empty journal page.
     pub default_journal_template: Option<String>,
+    /// `:default-home {:page "Name"}` — graph-portable startup page. Other
+    /// keys in the map belong to Logseq and are preserved by the writer.
+    pub default_home: Option<String>,
     /// `:favorites ["Page" …]` — favorited page names (on-disk, graph-portable).
     pub favorites: Vec<String>,
     /// `:journal/file-name-format` — Logseq's journal FILENAME format (cljs-time /
@@ -147,6 +150,7 @@ impl Default for Config {
             property_pages_enabled: true,
             property_pages_excludelist: Vec::new(),
             default_journal_template: None,
+            default_home: None,
             favorites: Vec::new(),
             journal_file_name_format: None,
             journal_page_title_format: None,
@@ -208,6 +212,8 @@ impl Config {
         cfg.property_pages_excludelist = parse_keyword_set(edn, ":property-pages/excludelist");
         cfg.default_journal_template =
             nested_string(edn, ":default-templates", ":journals").filter(|s| !s.is_empty());
+        cfg.default_home = nested_string_in_balanced_map(edn, ":default-home", ":page")
+            .filter(|s| !s.trim().is_empty());
         cfg.favorites = parse_string_vector(edn, ":favorites");
         cfg.journal_file_name_format =
             string_value(edn, ":journal/file-name-format").filter(|s| !s.is_empty());
@@ -603,6 +609,101 @@ impl Graph {
         })
     }
 
+    /// Persist the graph's startup page in Logseq's `:default-home {:page
+    /// "Name"}` map. Sibling keys (notably OG's `:sidebar`) and the rest of the
+    /// file remain byte-for-byte untouched. A malformed/non-map `:default-home`
+    /// is refused rather than replaced, so an automatic legacy migration can
+    /// never destroy graph-owned configuration it does not understand.
+    pub fn set_default_home_page(&self, name: Option<&str>) -> io::Result<()> {
+        let path = config_path_for_write(self)?;
+        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+            let mut content = content.to_string();
+            let (root_open, root_close) = root_map_bounds(&content).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "config.edn is not a balanced root map",
+                )
+            })?;
+            let existing =
+                find_keyword_at_map_level(&content[root_open + 1..root_close], ":default-home")
+                    .map(|relative| {
+                        let start = root_open + 1 + relative;
+                        let after = start + ":default-home".len();
+                        let open = skip_blank(&content, after);
+                        if content.as_bytes().get(open) != Some(&b'{') {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                ":default-home exists but is not a map",
+                            ));
+                        }
+                        let close = match_close_brace(&content, open);
+                        if close >= content.len() || content.as_bytes().get(close) != Some(&b'}') {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                ":default-home map is not balanced",
+                            ));
+                        }
+                        Ok((open, close))
+                    });
+            let existing = match existing {
+                Some(result) => Some(result?),
+                None => None,
+            };
+
+            match name.map(str::trim).filter(|name| !name.is_empty()) {
+                Some(name) => {
+                    let value = format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""));
+                    match existing {
+                        Some((open, close)) => {
+                            if let Some(relative) =
+                                find_keyword_at_map_level(&content[open + 1..close], ":page")
+                            {
+                                let after = open + 1 + relative + ":page".len();
+                                match next_value_span(&content, after, close) {
+                                    Some((value_start, value_end, _)) => {
+                                        content.replace_range(value_start..value_end, &value)
+                                    }
+                                    None => content.insert_str(after, &format!(" {value}")),
+                                }
+                            } else {
+                                let separator = if content[open + 1..close].trim().is_empty() {
+                                    ""
+                                } else {
+                                    " "
+                                };
+                                content.insert_str(open + 1, &format!(":page {value}{separator}"));
+                            }
+                        }
+                        None => {
+                            let entry = format!("\n :default-home {{:page {value}}}\n");
+                            content.insert_str(root_open + 1, &entry);
+                        }
+                    }
+                }
+                None => {
+                    if let Some((open, close)) = existing {
+                        if let Some(relative) =
+                            find_keyword_at_map_level(&content[open + 1..close], ":page")
+                        {
+                            let start = open + 1 + relative;
+                            let after = start + ":page".len();
+                            let end = next_value_span(&content, after, close)
+                                .map(|(_, value_end, _)| value_end)
+                                .unwrap_or(after);
+                            let tail: usize = content[end..close]
+                                .chars()
+                                .take_while(|c| c.is_whitespace() || *c == ',')
+                                .map(char::len_utf8)
+                                .sum();
+                            content.replace_range(start..end + tail, "");
+                        }
+                    }
+                }
+            }
+            Ok(content)
+        })
+    }
+
     /// Persist the first day of week to `:start-of-week N` (Logseq convention:
     /// 0=Monday … 6=Sunday), replacing the numeric value or inserting the key.
     /// `find_keyword` is comment/string-aware, so a commented `:start-of-week` is
@@ -745,6 +846,68 @@ fn find_keyword(s: &str, key: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Find a keyword only among the direct entries of an already-sliced map body.
+/// Nested maps/vectors/lists may legally contain the same keyword and are not
+/// the setting being read or edited.
+fn find_keyword_at_map_level(s: &str, key: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index = edn_str_end(s, index);
+                continue;
+            }
+            b';' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && s[index..].starts_with(key) => {
+                let after = index + key.len();
+                let boundary = after >= bytes.len()
+                    || matches!(
+                        bytes[after],
+                        b' ' | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'"'
+                            | b'{'
+                            | b'}'
+                            | b'['
+                            | b']'
+                            | b'('
+                            | b')'
+                            | b'#'
+                            | b','
+                    );
+                if boundary {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Bounds of the root EDN map. Config writers may create entries in the empty
+/// `{}` supplied for a missing file, but must not replace non-map or unbalanced
+/// bytes that may belong to a newer/partially-written configuration shape.
+fn root_map_bounds(s: &str) -> Option<(usize, usize)> {
+    let open = skip_blank(s, 0);
+    if s.as_bytes().get(open) != Some(&b'{') {
+        return None;
+    }
+    let close = match_close_brace(s, open);
+    (close < s.len() && s.as_bytes().get(close) == Some(&b'}')).then_some((open, close))
 }
 
 /// Span `[start, end)` of the value token following byte `from` (skipping leading
@@ -1301,6 +1464,26 @@ fn nested_string(edn: &str, outer: &str, inner: &str) -> Option<String> {
     (edn.as_bytes().get(vfrom) == Some(&b'"')).then(|| read_string_at(edn, vfrom))
 }
 
+/// Like `nested_string`, but rejects an unbalanced outer map. Preferences may
+/// fall back when malformed; a graph-owner migration must not mistake a partial
+/// form for authority and then rewrite it.
+fn nested_string_in_balanced_map(edn: &str, outer: &str, inner: &str) -> Option<String> {
+    let (root_open, root_close) = root_map_bounds(edn)?;
+    let relative = find_keyword_at_map_level(&edn[root_open + 1..root_close], outer)?;
+    let start = root_open + 1 + relative;
+    let from = skip_blank(edn, start + outer.len());
+    if edn.as_bytes().get(from) != Some(&b'{') {
+        return None;
+    }
+    let close = match_close_brace(edn, from);
+    if close >= edn.len() || edn.as_bytes().get(close) != Some(&b'}') {
+        return None;
+    }
+    let inner_relative = find_keyword_at_map_level(&edn[from + 1..close], inner)?;
+    let value_start = skip_blank(edn, from + 1 + inner_relative + inner.len());
+    (edn.as_bytes().get(value_start) == Some(&b'"')).then(|| read_string_at(edn, value_start))
+}
+
 /// Boolean value for `inner` inside the map following `outer`, e.g.
 /// `:logbook/settings {:with-second-support? false}`.
 fn nested_bool(edn: &str, outer: &str, inner: &str) -> Option<bool> {
@@ -1450,6 +1633,98 @@ fn parse_macros(edn: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_home_reads_only_the_page_inside_the_logseq_map() {
+        assert_eq!(
+            Config::parse(r#"{:default-home {:page "Directory" :sidebar ["Contents"]}}"#)
+                .default_home
+                .as_deref(),
+            Some("Directory")
+        );
+        assert_eq!(
+            Config::parse(r#"{:default-home "Wrong shape"}"#).default_home,
+            None
+        );
+        assert_eq!(Config::parse("{}").default_home, None);
+        assert_eq!(
+            Config::parse(r#"{:nested {:default-home {:page "Not home"}}}"#).default_home,
+            None
+        );
+        assert_eq!(
+            Config::parse(r#"{:default-home {:sidebar {:page "Not home"} :page "Actual home"}}"#)
+                .default_home
+                .as_deref(),
+            Some("Actual home")
+        );
+    }
+
+    #[test]
+    fn default_home_writer_preserves_siblings_clears_only_page_and_refuses_malformed_owner() {
+        use crate::model::Graph;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tine-default-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        let path = dir.join("logseq/config.edn");
+        fs::write(
+            &path,
+            "{:default-home {:sidebar [\"Contents\"] :page \"Old\"}\n ;; keep me\n :start-of-week 2}\n",
+        )
+        .unwrap();
+
+        Graph::open(&dir)
+            .set_default_home_page(Some("New \"Home\""))
+            .unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains(":page \"New \\\"Home\\\"\""), "{written}");
+        assert!(written.contains(":sidebar [\"Contents\"]"), "{written}");
+        assert!(written.contains(";; keep me"), "{written}");
+        assert!(written.contains(":start-of-week 2"), "{written}");
+        assert_eq!(
+            Graph::open(&dir).config.default_home.as_deref(),
+            Some("New \"Home\"")
+        );
+
+        Graph::open(&dir).set_default_home_page(None).unwrap();
+        let cleared = fs::read_to_string(&path).unwrap();
+        assert!(!cleared.contains(":page \"New"), "{cleared}");
+        assert!(cleared.contains(":sidebar [\"Contents\"]"), "{cleared}");
+        assert_eq!(Graph::open(&dir).config.default_home, None);
+
+        fs::write(&path, "{:start-of-week 2}\n").unwrap();
+        Graph::open(&dir)
+            .set_default_home_page(Some("Inserted"))
+            .unwrap();
+        let inserted = fs::read_to_string(&path).unwrap();
+        assert!(
+            inserted.contains(":default-home {:page \"Inserted\"}"),
+            "{inserted}"
+        );
+        assert!(inserted.contains(":start-of-week 2"), "{inserted}");
+
+        let malformed = "{:default-home \"do not replace\" :start-of-week 2}\n";
+        fs::write(&path, malformed).unwrap();
+        let error = Graph::open(&dir)
+            .set_default_home_page(Some("Migration"))
+            .expect_err("a non-map owner must be left untouched");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+
+        fs::write(&path, "[:not-a-config-map]\n").unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = Graph::open(&dir)
+            .set_default_home_page(Some("Never replace the file"))
+            .expect_err("a non-map config must be left untouched");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_macros_map() {

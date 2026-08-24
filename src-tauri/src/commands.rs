@@ -2343,6 +2343,20 @@ pub(crate) fn set_favorites(names: Vec<String>, state: GraphContext<'_>) -> Resu
 }
 
 #[tauri::command]
+pub(crate) fn set_default_home(
+    name: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    with_config_graph(&state, |graph| {
+        graph
+            .set_default_home_page(name.as_deref())
+            .map_err(|error| error.to_string())
+    })?;
+    refresh_graph(&state)?;
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) fn set_preferred_workflow(
     workflow: String,
     state: GraphContext<'_>,

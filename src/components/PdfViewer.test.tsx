@@ -524,7 +524,7 @@ describe("PdfViewer OG area-highlight selection", () => {
       dragArea(wrap, { x: 45, y: 55 });
       await flush();
       const blue = host.querySelectorAll<HTMLButtonElement>(".pdf-color-swatch")[2];
-      blue.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      blue.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true }));
       await flush();
       await expect(drainPdfWork()).resolves.toBe(true);
 
@@ -686,7 +686,7 @@ describe("PdfViewer OG state and reference behavior", () => {
       }));
       await flush();
       (host.querySelector(".pdf-color-swatch") as HTMLButtonElement).dispatchEvent(
-        new MouseEvent("mousedown", { bubbles: true })
+        new MouseEvent("pointerdown", { bubbles: true })
       );
       await flush();
 
@@ -747,7 +747,7 @@ describe("PdfViewer OG state and reference behavior", () => {
 
       const copy = [...host.querySelectorAll<HTMLButtonElement>(".pdf-color-menu button")]
         .find((button) => button.textContent?.trim() === "Copy ref")!;
-      copy.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      copy.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true }));
       await flush();
       expect(writeHighlights).toHaveBeenCalledOnce();
       expect(writeHighlights.mock.calls[0][2].map((highlight) => highlight.id)).toEqual([textId, areaId]);

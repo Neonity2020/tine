@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { render } from "solid-js/web";
 import { backend } from "../backend";
 import { initParser } from "../render/parse";
-import { doc, loadSingle, pageByName, resetStore, setCollapsed } from "../store";
+import { blockProperty, doc, loadSingle, pageByName, resetStore, setCollapsed } from "../store";
 import type { BlockDto, PageDto, RefGroup } from "../types";
 import { Block } from "./Block";
 import { For } from "solid-js";
@@ -11,11 +11,10 @@ import { For } from "solid-js";
 //   1. Embedded content is live and source-authoritative: a source fold or
 //      unfold updates every visible embed immediately (no page-leave refresh
 //      needed).
-//   2. Folding the embed's own presentation is ephemeral per embed OCCURRENCE:
-//      it must not change the source block or another occurrence, is never
-//      written to `collapsed::`/disk, and resets when the occurrence remounts
-//      or the app reloads. When the source moves again, the occurrence follows
-//      the source (the stale local fold expires).
+//   2. Before an occurrence is changed locally it follows the source. Once the
+//      occurrence is folded or unfolded, the HOST block owns an explicit
+//      `collapsed:: true|false` override. It survives remount/reload without
+//      changing the source block or another occurrence.
 
 class AllNearObserver implements IntersectionObserver {
   readonly root = null;
@@ -136,7 +135,7 @@ describe("embed collapse contract (GH #360)", () => {
     }
   });
 
-  it("ephemeral local fold: occurrence-1 folds alone — occurrence-2 and the source are untouched, and nothing is persisted", async () => {
+  it("persists a local fold on occurrence-1's host without touching occurrence-2 or the source", async () => {
     loadEmbedFixture();
     const { root, dispose } = mountPageBlocks();
     try {
@@ -148,22 +147,25 @@ describe("embed collapse contract (GH #360)", () => {
       expect(occurrenceChildrenVisible(hosts[1])).toContain("child one");
       expect(doc.byId.target.collapsed).toBe(false);
       expect(doc.byId.target.raw).not.toContain("collapsed::");
+      expect(blockProperty("host-1", "collapsed")).toBe("true");
+      expect(blockProperty("host-2", "collapsed")).toBeNull();
 
-      // Source moves again → the expired local fold yields to the source.
+      // A host-owned choice remains independent when the source moves. The
+      // untouched sibling continues to follow the source live.
       setCollapsed("target", true);
       await tick();
       expect(occurrenceChildrenVisible(hosts[0])).not.toContain("child one");
       expect(occurrenceChildrenVisible(hosts[1])).not.toContain("child one");
       setCollapsed("target", false);
       await tick();
-      expect(occurrenceChildrenVisible(hosts[0])).toContain("child one");
+      expect(occurrenceChildrenVisible(hosts[0])).not.toContain("child one");
       expect(occurrenceChildrenVisible(hosts[1])).toContain("child one");
     } finally {
       dispose();
     }
   });
 
-  it("a local fold resets when the occurrence remounts (follows the source again) and never lands in the block raw", async () => {
+  it("a host-owned fold survives an occurrence remount and remains out of the source raw", async () => {
     loadEmbedFixture();
     const first = mountPageBlocks();
     try {
@@ -180,15 +182,17 @@ describe("embed collapse contract (GH #360)", () => {
     try {
       const hosts = occurrenceHosts(second.root);
       await tick(5);
-      expect(occurrenceChildrenVisible(hosts[0])).toContain("child one");
+      expect(occurrenceChildrenVisible(hosts[0])).not.toContain("child one");
+      expect(occurrenceChildrenVisible(hosts[1])).toContain("child one");
       expect(doc.byId.target.raw).not.toContain("collapsed::");
       expect(doc.byId.target.collapsed).toBe(false);
+      expect(blockProperty("host-1", "collapsed")).toBe("true");
     } finally {
       second.dispose();
     }
   });
 
-  it("a local EXPANSION of a collapsed source is also ephemeral and yields to later source moves", async () => {
+  it("persists an explicit false override when one occurrence expands a collapsed source", async () => {
     loadEmbedFixture();
     setCollapsed("target", true); // source starts collapsed
     const { root, dispose } = mountPageBlocks();
@@ -202,11 +206,18 @@ describe("embed collapse contract (GH #360)", () => {
       expect(occurrenceChildrenVisible(hosts[0])).toContain("child one");
       expect(occurrenceChildrenVisible(hosts[1])).not.toContain("child one");
       expect(doc.byId.target.collapsed).toBe(true); // source untouched
-      // Source moves again (unfolds): the override expires and both follow.
+      expect(blockProperty("host-1", "collapsed")).toBe("false");
+      expect(blockProperty("host-2", "collapsed")).toBeNull();
+      // The untouched sibling keeps following later source moves, while the
+      // explicit false override stays expanded when the source folds again.
       setCollapsed("target", false);
       await tick();
       expect(occurrenceChildrenVisible(hosts[0])).toContain("child one");
       expect(occurrenceChildrenVisible(hosts[1])).toContain("child one");
+      setCollapsed("target", true);
+      await tick();
+      expect(occurrenceChildrenVisible(hosts[0])).toContain("child one");
+      expect(occurrenceChildrenVisible(hosts[1])).not.toContain("child one");
     } finally {
       dispose();
     }

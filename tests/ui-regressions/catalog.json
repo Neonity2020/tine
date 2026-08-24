@@ -9,7 +9,10 @@
         "issues": [
           337
         ],
-        "commits": []
+      "commits": [
+        "7c5bc054",
+        "f1b4cd04"
+      ]
       },
       "platforms": [
         "all"
@@ -5969,10 +5972,12 @@
     },
     {
       "id": "UI-PDF-PANE-MOBILE",
-      "title": "On a phone the PDF reader can always be closed: the Close button stays on screen and the Android back gesture (or Escape) closes the reader",
+      "title": "On a phone the PDF reader can be closed and its text annotations can be created and managed with touch interactions",
       "family": "pdf",
       "sources": {
-        "issues": [],
+        "issues": [
+          191
+        ],
         "commits": []
       },
       "platforms": [
@@ -5989,7 +5994,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "Martin's report. The PDF pane was a fixed-width (min 320, default 560px) non-shrinking flex sibling clipped by .content-row overflow:hidden, and Close was the LAST toolbar button, so on a 390px phone it was off-screen while the pane covered everything; the pane was neither a route nor a transient layer, so Android Back walked past it. Now: mobile renders it as a deliberate full-width takeover, Close leads the control cluster, low-priority tools collapse into the existing More menu through a pdftoolbar container query, and the pane registers as a transient layer (inner Find/settings/outline/highlight popovers peel first) so Back and Escape both close it. Chromium proof at 390px with an Android UA: fail-before the Close button was outside the viewport, after it is reachable. Real-device Android verification is NOT done."
+      "notes": "GH #191. The shipped first half makes mobile a deliberate full-width takeover with an on-screen Close button and a transient layer so Android Back/Escape closes it after inner popovers. The remaining interaction contract is literal touch annotation: a completed native text selection opens the color chooser; tapping a color persists the same Logseq-compatible highlight as desktop; and a long press on an existing text or area highlight opens recolor, remove, Copy ref, and Linked references without invoking the browser menu. Desktop mouse/context-menu behavior remains unchanged. Component proof uses the mobile build-time branch and touch/contextmenu event paths; the phone-width Chromium journey covers the rendered interaction surface. An APK is produced, but physical Android 16 selection handles remain a tester boundary."
     },
     {
       "id": "UI-INPAGE-FIND-SELECTION-224",
@@ -6249,7 +6254,8 @@
       "family": "graph-open",
       "sources": {
         "issues": [
-          245
+          245,
+          269
         ],
         "commits": []
       },
@@ -6261,12 +6267,14 @@
       "coverage": {
         "tests": [
           "src/graph.test.tsx",
-          "src/components/Settings.homePage.test.tsx"
+          "src/components/Settings.homePage.test.tsx",
+          "src/homePage.test.ts",
+          "scripts/e2e-compat-home-current-page.mjs"
         ],
         "scenario": "graph.home-page-open-and-stale",
         "failBefore": "proven"
       },
-      "notes": "GH #245. homePage.ts stores the per-graph setting as an app-settings string keyed by graph root (frontend-only; adding a config.edn owner would have touched the prohibited Rust storage surface). graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads — never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before proven by manager mutation probe at integration (2026-08-06): disabling the loadGraphPath home-page call fails 2 of the 19 tests in graph.test.tsx. Tests were written after the implementation in the delegated lane; the probe supplies the causal evidence."
+      "notes": "GH #245 and #269. homePage.ts now uses graph metadata backed by Logseq's :default-home {:page ...} entry in logseq/config.edn, with a guarded one-time migration from the former per-device app-settings string. graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads — never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before for the navigation behavior was proven by manager mutation probe at integration (2026-08-06); fail-before for graph ownership was proven by src/homePage.test.ts returning the stale device-local value instead of graph metadata on the pre-fix source."
     },
     {
       "id": "UI-THEME-SYSTEM-MODE-193",
@@ -7648,11 +7656,33 @@
         "scenario": "query.current-page-nav-dispatch",
         "failBefore": "proven"
       },
-      "notes": "Martin-approved semantics: the dyvar's page is the FOCUSED pane's route page (binding for rerun), while the owner-page binding passed to the engine (:query-page use) is untouched. QueryMacro now computes an execution-only form: the literal `<% current page %>` (whitespace- and case-tolerant, like templateVars) is replaced by [[focused page]] only in the text handed to runQuery/runAdvancedQuery/savedDslToFriendlySearch; the authored macro and every editing/display derivation keep the literal marker. The refetch key gains the focused page only when the marker is present — no global rerun on navigation, redundant same-page transitions are coalesced, and sharedQueryResult's per-key caching keeps the WeakRef hit for returning to a page. Stale async results can't overwrite: createResource re-issues per key and drops superseded resolutions. failBefore proven: 4/5 component cases red without the change (the marker-less no-rerun control was already green). The EDN `:inputs [:current-page]` form and the full datalog entity binding remain out of engine scope — see the report for the explicit boundary; no clause was run differently to fake it."
+      "notes": "Martin-approved semantics for the ordinary dyvar: the marker's page is the FOCUSED pane's route page, while the owner-page binding passed to an advanced engine form without typed :current-page input stays untouched. QueryMacro computes an execution-only form: the literal `<% current page %>` (whitespace- and case-tolerant, like templateVars) is replaced by [[focused page]] only in the text handed to runQuery/runAdvancedQuery/savedDslToFriendlySearch; authored text and every editing/display derivation keep the marker. The refetch key gains the focused page only for a marker or live typed current-page input — no global rerun on navigation. Stale async results cannot overwrite because createResource drops superseded resolutions. Full DataScript joins remain out of scope; the separately cataloged typed input supports only the standard current-page relationship."
+    },
+    {
+      "id": "UI-ADVANCED-QUERY-CURRENT-PAGE-INPUT-301",
+      "title": "An advanced query declaring :inputs [:current-page] receives the focused pane page and reruns only when that page changes",
+      "family": "query-execution",
+      "sources": {
+        "issues": [301],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryMacro.currentPage.test.tsx",
+          "src/components/BeginQuery.test.tsx",
+          "scripts/e2e-compat-home-current-page.mjs"
+        ],
+        "scenario": "query.advanced-current-page-input-nav",
+        "failBefore": "proven"
+      },
+      "notes": "QueryMacro recognizes a direct :current-page token only inside the live :inputs vector (ignoring strings and EDN comments), adds the focused pane page to the request/cache key, and passes that page to the native positional input. BEGIN_QUERY preserves its map's :inputs vector when it hands the advanced query to the bounded engine. Advanced queries without the live input keep the owner-page parameter and do not rerun on navigation; repeated same-page navigation is coalesced. Fail-before proved the pre-fix renderer continued to pass the owner page Sheet while Focus A was active."
     },
     {
       "id": "UI-EMBED-COLLAPSE-CONTRACT-360",
-      "title": "Embeds track their source block's collapse state live, while each embed occurrence's own folding is ephemeral, occurrence-local, and never persisted",
+      "title": "Embeds follow source collapse live until each occurrence records its own durable host-owned expanded or collapsed state",
       "family": "embed-collapse",
       "sources": {
         "issues": [
@@ -7669,10 +7699,10 @@
         "tests": [
           "src/components/Block.embedCollapse.test.tsx"
         ],
-        "scenario": "embed.collapse-source-live-plus-ephemeral-fold",
+        "scenario": "embed.collapse-source-live-plus-persistent-host-fold",
         "failBefore": "proven"
       },
-      "notes": "Martin's approved contract both ways: (1) embedded content is live and source-authoritative — a source collapse/expand updates every visible embed immediately (before the fix, LiveRefGroup captured the source state ONCE per instance into initialCollapsed, so an already-visible embed only refreshed after leaving/reopening the page); (2) folding the embed's own presentation is ephemeral per occurrence, never lands on the source block or another occurrence, never writes collapsed:: or any file-format extension, and resets when the occurrence remounts or the app reloads. Implementation: for embed surface groups the default collapse answer IS the live stored node state; an occurrence's own fold records the store's per-block collapse write epoch (bumped inside writeCollapsed and the descendants batch) — the next source collapse write anywhere on that block reclaims authority by invalidating the epoch, so a fold-unfold-fold round trip cannot leave a ghost override. Occurrence-locality is the LiveRefGroup component instance (two {{embed}}s of one uuid are independent instances; nothing is shared across occurrences). Ref and query surfaces' existing 'the result view owns its copy' semantics are deliberately unchanged (their snapshot defaults and local folds ignore the epoch). failBefore proven: 3/4 component cases red pre-fix (source-authoritative live update, local fold expiry on later source move, collapsed-source local expansion expiry), the remount-reset case already green and serves as the preserved-behavior control. Test suites of Block embed depth/hierarchy, Live references, store, Page all stay green."
+      "notes": "Martin's approved completed contract: (1) an embed with no local choice follows the source block's live collapse state; (2) the first local fold or unfold records an explicit true/false `collapsed` property on the block containing that embed, so two occurrences of one source remain independent and the choice survives remount, frontend reload, and disk reload; (3) the referenced source block is never mutated. The host property uses the established guarded block-property writer and the existing Logseq-compatible property syntax—no new file-format key or backend write path. Nested disclosure inside the transcluded subtree remains occurrence-local presentation state; the persistent per-embed contract is the embedded root represented by its host block. Ref/query surfaces are unchanged."
     },
     {
       "id": "UI-MODIFIED-CLICK-CONTRACT-283",
@@ -7706,20 +7736,23 @@
         "issues": [
           370
         ],
-        "commits": []
+        "commits": [
+          "3ccd57c6",
+          "aa116f6a"
+        ]
       },
       "platforms": [
         "windows"
       ],
-      "layer": "real-app",
-      "status": "planned",
+      "layer": "native",
+      "status": "covered",
       "coverage": {
         "tests": [
           "scripts/e2e-windows-managed-storage.mjs",
           "src/startupRecovery.test.ts"
         ],
         "scenario": "managed.windows-previous-patch-upgrade-reopen",
-        "failBefore": "pending"
+        "failBefore": "proven"
       },
       "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files."
     },
@@ -7747,6 +7780,32 @@
         "failBefore": "proven"
       },
       "notes": "GH #369 (Windows): a dashboard of split panes shows a permanent vertical scrollbar in every pane even where the pane's content fits ('Lines', 'GRID'). Root cause: .main-content-inner carried padding-bottom: 40vh — 40% of the WINDOW — inside each pane's own .main-content scroller, so a pane only a fraction of the window tall overflowed on slack alone. The slack is deliberate end-of-page editing breathing room; it is now a flex spacer inside the pane's own scroller (40% of the PANE, growing to absorb free space), so geometry decides panely. Measured at 1920x1050 in headless Chromium (scripts/shot-pane-slack.mjs): pre-fix, the short 'Lines'/'GRID' panes (191px columns in 466px panes) carried 145px of purely phantom scroll range each — fail, exit 1; post-fix their range is 0, a content-overflowing pane's range is exactly column + 40%-of-pane (581px for an 861px column), and the 2305px long pane scrolls to a last block left fully visible with 186px = 40%-of-pane breathing room below it — pass, exit 0. A pane 60–100% full keeps at most the 40% range: that range IS the slack doing its editing-comfort job, not phantom. Fail-before also proven for the style guard: all four src/styles/paneSlack.test.ts assertions fail against the pre-fix app.css. Evidence-layer note: this sandbox's headless Chromium forces auto-hiding overlay scrollbars (bar width 0 even where the range is non-zero, unforceable by flag or CSS), so the harness asserts the cross-platform quantity that forces a PAINTED bar on the reporter's Windows classic bars and on WebKitGTK — scrollable range relative to real column height; screenshots archived at /tmp/shot-pane-slack*.png. The mobile 640px inner-padding override lost its vh slack the same way; solo pane behavior is unchanged to the eye (~40% of a near-full-window pane)."
+    },
+    {
+      "id": "UI-E2E-WINDOWS-POST-RECEIPT-ROUTING-230",
+      "title": "Windows post-receipt journeys reach their named fixture through a deterministic application route before testing the actual outcome",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [
+          230
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "layer": "native",
+    "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-page-properties.mjs",
+          "scripts/e2e-print-security.mjs"
+        ],
+        "scenario": "e2e.windows-post-receipt-named-page-readiness",
+        "failBefore": "proven"
+      },
+      "notes": "The v0.6.95 release artifact passed windows-core and pdf-logseq but page-properties failed before its contract because ALL PAGES was absent at WebDriver attachment; print-security likewise failed before its safety assertion because the chosen startup page contained no .page-ref. Run 32690801901 and its retained exact-build capsules prove both setup failures. Fixture routing now uses the production Search command and an exact indexed page-result mousedown, while the page-property traversal and static script-disabled print-frame assertions remain unchanged. Both focused journeys pass locally against exact build receipts and print-security passed focused Windows run 32766862967. Page-properties remains fixing: Windows run 32766860600 found the sidebar Search button non-clickable at default geometry, and the one allowed retry 32769022952 showed that Ctrl-K did not open the switcher even though the graph had opened successfully. Both failures are before the page-property contract; the two-attempt platform stop-loss is exhausted."
     }
   ]
 }
