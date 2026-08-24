@@ -7,6 +7,11 @@ may tag, publish, comment, and close issues.
 ## Every release
 
 1. Freeze the candidate and finish the version/changelog update.
+   Use the dedicated coordinator `release-freeze` on the current full SHA and
+   `release-heartbeat` whenever the candidate SHA or hosted Actions run changes;
+   never use an ordinary batch lease. Other agents may keep working in topic
+   branches, but no branch may integrate into `master` while the freeze is
+   active.
    `node scripts/check-storage-pin.mjs` must bind Cargo's exact
    `tine-storage` tag/commit to the checked-in upstream certification receipt
    and persistent-format manifest, with no path, patch, branch, or rev override.
@@ -52,7 +57,10 @@ may tag, publish, comment, and close issues.
 6. As soon as that frozen candidate passes its local exact-commit gates, deploy
    that exact tested artifact to `~/research/tine` without waiting to be asked.
    Record and compare the staged/deployed SHA-256 so Martin can test the actual
-   release candidate while the slower platform workflows run.
+   release candidate while the slower platform workflows run. If using
+   coordinator `stage-deploy`, pass `--release-build`; its ordinary-batch
+   default is intentionally a faster nondeterministic local profile and does
+   not count as release evidence.
 7. The Windows x64 real-app smoke suite is advisory when available. Separately,
    step 9's Windows CI evidence is blocking: it compiles all `tine-core` test
    targets against the exact certified `tine-storage` pin, then runs the
@@ -110,6 +118,11 @@ may tag, publish, comment, and close issues.
     change to `master`. Tagged-candidate preflight deliberately compares with
     the release before the candidate; ordinary post-release `master` must point
     at the newly published tag so cumulative patch-cycle drift stays visible.
+13. On every successful publication **and every aborted release**, run
+    `tine-coordination release-unfreeze --owner <release-owner>`, followed by
+    `tine-coordination status`. The release cycle is not operationally complete
+    until status prints `IDLE master integration is available`. The bounded
+    freeze expiry is crash recovery, not a substitute for this checklist step.
 
 ## Additional `0.x.0` minor-release gates
 
@@ -147,3 +160,6 @@ may tag, publish, comment, and close issues.
 - If documentation or website impact needs a product decision, stop with a
   concrete proposal; do not tag or publish.
 - No release command may weaken these gates to make a deadline.
+- A release manager must never leave `master` FROZEN after success, failure, or
+  abort. Conversely, do not force-unfreeze a live release merely to land another
+  branch; continue in that branch and integrate after the release disposition.
