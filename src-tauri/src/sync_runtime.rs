@@ -5455,10 +5455,12 @@ mod tests {
 
     #[test]
     fn retryable_open_binding_preserves_its_real_failure_before_page_readiness() {
-        let binding = retryable_binding(
-            "local_active",
-            "clean managed runtime open failed: SQLite checkpoint is stale".into(),
-        );
+        let binding = SparseV2Binding::from_open(SyncRuntimeOpenResult {
+            status: SyncRuntimeOpenStatus::OpenRefused {
+                detail: "clean managed runtime open failed: SQLite checkpoint is stale".into(),
+            },
+            handle: None,
+        });
         assert_eq!(
             binding.serving_failure_detail().as_deref(),
             Some("clean managed runtime open failed: SQLite checkpoint is stale")

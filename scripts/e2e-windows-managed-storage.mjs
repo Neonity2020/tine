@@ -409,7 +409,11 @@ async function startJourney(application, label) {
   await browser.$(".ls-block").waitForExist({ timeout: 180_000 });
 }
 
-async function stopJourney() {
+async function stopJourney(forceApplicationFirst = false) {
+  if (forceApplicationFirst) {
+    stopWebdriverApplication(webviewTarget);
+    webviewTarget = undefined;
+  }
   try { await browser?.deleteSession(); } catch {}
   browser = undefined;
   if (driver?.pid) spawnSync("taskkill", ["/PID", String(driver.pid), "/T", "/F"], { stdio: "ignore" });
@@ -450,7 +454,7 @@ try {
   // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the
   // actual baseline process without a graceful managed shutdown, then require
   // the candidate to recover the same private state and serve an ordinary page.
-  await stopJourney();
+  await stopJourney(true);
   receipt.milestones.baselineForceClosed = true;
   const reopenStarted = Date.now();
   await startJourney(APP, "candidate-reopen");
