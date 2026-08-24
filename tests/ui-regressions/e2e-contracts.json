@@ -914,7 +914,7 @@
     },
     {
      "class": "core-operation",
-     "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after managed-storage activation and after returning to Direct Files.",
+     "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after v0.6.94 managed activation, forced process death, candidate upgrade/reopen, and return to Direct Files; when the old release serves pages, the predecessor journey also attempts a real managed edit.",
      "blocking": true
     }
    ],

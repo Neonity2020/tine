@@ -121,6 +121,24 @@ jobs:
       - name: Install Edge WebDriver matching the WebView2 runtime
         shell: pwsh
         run: ./scripts/install-windows-webview2-driver.ps1
+      - name: Restore v0.6.94 Windows baseline for managed upgrade/reopen
+        if: ${{ inputs.windows_scenario == 'windows-managed-storage' }}
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "Tine_0.6.94_x64-portable.zip"
+          $baseline = Join-Path $env:RUNNER_TEMP "tine-v0.6.94"
+          Invoke-WebRequest `
+            -Uri "https://github.com/martinkoutecky/tine/releases/download/v0.6.94/Tine_0.6.94_x64-portable.zip" `
+            -OutFile $archive
+          $digest = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($digest -ne "8dff47e5cd0ca3b4e967040c94e09efc2fb3c65b4fe1d6a2952fef73b9c997c7") {
+            throw "v0.6.94 portable baseline digest mismatch: $digest"
+          }
+          Expand-Archive -Path $archive -DestinationPath $baseline
+          $application = Get-ChildItem -Path $baseline -Recurse -Filter "Tine.exe" |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $application) { throw "v0.6.94 portable baseline did not contain Tine.exe" }
+          "TINE_BASELINE_APP=$application" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Run Windows WebView2 smoke
         env:
           TINE_APP: ${{ github.workspace }}\target\release\tine.exe

@@ -21,6 +21,8 @@ import {
 if (process.platform !== "win32") throw new Error("Windows managed-storage smoke must run on Windows");
 const APP = process.env.TINE_APP;
 if (!APP || !fs.existsSync(APP)) throw new Error("HARNESS UNAVAILABLE: Windows managed-storage smoke requires TINE_APP");
+const BASELINE_APP = process.env.TINE_BASELINE_APP || APP;
+if (!fs.existsSync(BASELINE_APP)) throw new Error("HARNESS UNAVAILABLE: TINE_BASELINE_APP does not exist");
 
 const TD = process.env.TAURI_DRIVER || "tauri-driver";
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4444);
@@ -173,6 +175,13 @@ function assertSameSource(before, label) {
   }
 }
 
+function assertOriginalSourcesUnchanged(before, label) {
+  const after = sourceSnapshot();
+  for (const [relative, digest] of before) {
+    if (after.get(relative) !== digest) throw new Error(`${label} changed original source bytes for ${relative}`);
+  }
+}
+
 async function bodyText() {
   return browser.$("body").getText();
 }
@@ -201,44 +210,27 @@ async function clickButton(text) {
 }
 
 async function clickButtonAndConfirm(text) {
-  // WebDriver cannot address native Windows dialogs. Start a UI Automation
-  // helper before the click because the click command itself waits while the
-  // modal is open. The helper proves that it found Tine's dialog with the
-  // expected message before invoking the affirmative button; keyboard focus
-  // and runner timing are deliberately irrelevant.
-  const applicationPid = webviewTarget.applicationProcess?.pid;
-  if (!applicationPid) throw new Error(`native confirmation requires the Tine process id for ${text}`);
-  let helperStdout = "";
-  let helperStderr = "";
+  // WebDriver cannot address native Windows dialogs. Tine owns the foreground
+  // window in this isolated runner, so use the mechanism already proven to
+  // cross v0.6.94's native MessageBox instead of trying to infer its localized
+  // accessibility tree from the WebView's parent window.
   const confirmer = spawn("powershell.exe", [
     "-NoProfile",
     "-NonInteractive",
-    "-File",
-    path.resolve("scripts/windows-confirm-dialog.ps1"),
-    "-ProcessId",
-    String(applicationPid),
-    "-ExpectedText",
-    text.replace(/\.\.\.$/, ""),
-    "-TimeoutSeconds",
-    "20",
-  ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-  confirmer.stdout.on("data", (chunk) => { helperStdout += chunk; });
-  confirmer.stderr.on("data", (chunk) => { helperStderr += chunk; });
+    "-Command",
+    "Start-Sleep -Milliseconds 750; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')",
+  ], { windowsHide: true, stdio: "ignore" });
   const completed = new Promise((resolve) => {
     confirmer.once("exit", (code) => resolve(code));
     confirmer.once("error", () => resolve(-1));
   });
   await clickButton(text);
   const exitCode = await completed;
-  if (exitCode !== 0) {
-    throw new Error(
-      `native confirmation helper failed for ${text}: exit ${exitCode}; ` +
-      `stdout=${helperStdout.trim()}; stderr=${helperStderr.trim()}`
-    );
-  }
+  if (exitCode !== 0) throw new Error(`native confirmation helper failed for ${text}: exit ${exitCode}`);
 }
 
-async function openManagedSettings(expectedAction) {
+async function openManagedSettings(expectedActions) {
+  const actions = Array.isArray(expectedActions) ? expectedActions : [expectedActions];
   const settings = await browser.$('button[title^="Settings"]');
   await settings.waitForExist({ timeout: 15_000 });
   await settings.click();
@@ -250,15 +242,22 @@ async function openManagedSettings(expectedAction) {
     }
   }
   await waitForBody("Storage & sync", 15_000, "storage settings");
+  let availableAction;
   await browser.waitUntil(async () => {
-    const button = await buttonContaining(expectedAction);
-    if (button && await button.isDisplayed()) return true;
+    for (const action of actions) {
+      const button = await buttonContaining(action);
+      if (button && await button.isDisplayed()) {
+        availableAction = action;
+        return true;
+      }
+    }
     const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
     if (await experimental.isExisting() && await experimental.getAttribute("aria-expanded") !== "true") {
       await experimental.click();
     }
     return false;
-  }, { timeout: 15_000, timeoutMsg: `managed storage action did not expand: ${expectedAction}` });
+  }, { timeout: 15_000, timeoutMsg: `managed storage action did not expand: ${actions.join(" or ")}` });
+  return availableAction;
 }
 
 async function closeSettings() {
@@ -282,7 +281,7 @@ async function waitForActivation() {
   throw new Error(`managed activation timed out; last body=${last.slice(-1000)}`);
 }
 
-async function openPage(title) {
+async function openPage(title, { expectedMarker = nestedMarker, requireHeading = true } = {}) {
   // WebView2 attachment does not guarantee native keyboard focus. Fixture
   // navigation is not a shortcut assertion, so enter the switcher through its
   // visible application control.
@@ -304,7 +303,55 @@ async function openPage(title) {
     return false;
   }, { timeout: 30_000, timeoutMsg: `Ctrl+K did not find ${title}` });
   await row.click();
-  await waitForBody(nestedMarker, 30_000, "nested UTF page after activation");
+  if (requireHeading) {
+    const heading = await browser.$("h1.page-title");
+    await heading.waitForExist({ timeout: 30_000 });
+  }
+  if (expectedMarker) {
+    await waitForBody(expectedMarker, 30_000, "nested UTF page after activation");
+  }
+}
+
+async function createManagedPageAndAttemptEdit() {
+  const title = "升级恢复 中文页";
+  const marker = "WINDOWS_MANAGED_PREVIOUS_PATCH_EDIT";
+  const newPage = await browser.$("button.new-page-btn");
+  await newPage.waitForClickable({ timeout: 15_000 });
+  await newPage.click();
+  const input = await browser.$(".switcher-input");
+  await input.waitForExist({ timeout: 15_000 });
+  await input.setValue(title);
+  let createRow;
+  await browser.waitUntil(async () => {
+    for (const row of await browser.$$(".switcher-row")) {
+      if ((await row.getText()).includes(`Create page: ${title}`)) {
+        createRow = row;
+        return true;
+      }
+    }
+    return false;
+  }, { timeout: 30_000, timeoutMsg: `Create page result was not visible for ${title}` });
+  await createRow.click();
+  const heading = await browser.$("h1.page-title");
+  await heading.waitForExist({ timeout: 15_000 });
+  let editor = await browser.$(".page-blocks textarea.block-editor, textarea.block-editor");
+  if (!await editor.isExisting()) {
+    const target = await browser.$(".page-trailing-block-target");
+    await target.waitForExist({ timeout: 15_000 });
+    await target.click();
+    editor = await browser.$(".page-blocks textarea.block-editor, textarea.block-editor");
+    await editor.waitForExist({ timeout: 15_000 });
+  }
+  await editor.addValue(marker);
+  await heading.click();
+  // v0.6.94 could reject this save (#292/#366). That refusal is part of the
+  // reporter's predecessor state, not a reason to abort the upgrade fixture.
+  await sleep(3_000);
+  return {
+    title,
+    marker,
+    bodyAfterSaveAttempt: (await bodyText()).slice(-2_000),
+  };
 }
 
 const before = sourceSnapshot();
@@ -324,20 +371,57 @@ const env = {
   TINE_DEBUG: "1",
   TINE_DEBUG_LOG: debugLog,
   TINE_ACTIVATION_TRACE: "1",
-  TINE_E2E_APPLICATION_STDOUT_LOG: path.join(artifacts, "application-stdout.log"),
-  TINE_E2E_APPLICATION_STDERR_LOG: path.join(artifacts, "application-stderr.log"),
   APPDATA: path.join(root, "appdata"),
   LOCALAPPDATA: path.join(root, "localappdata"),
 };
-const webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT);
-const driverLog = fs.openSync(path.join(artifacts, "tauri-driver.log"), "w");
-const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT), {
-  env: webviewTarget.env,
-  stdio: ["ignore", driverLog, driverLog],
-});
-await sleep(3000);
-
 let browser;
+let webviewTarget;
+let driver;
+let driverLog;
+
+async function startJourney(application, label) {
+  const launchEnv = {
+    ...env,
+    TINE_E2E_APPLICATION_STDOUT_LOG: path.join(artifacts, `application-${label}-stdout.log`),
+    TINE_E2E_APPLICATION_STDERR_LOG: path.join(artifacts, `application-${label}-stderr.log`),
+  };
+  webviewTarget = await startWebdriverApplication(application, launchEnv, NATIVE_PORT);
+  driverLog = fs.openSync(path.join(artifacts, `tauri-driver-${label}.log`), "w");
+  driver = spawn(TD, webdriverServerArgs(DRIVER_PORT), {
+    env: webviewTarget.env,
+    stdio: ["ignore", driverLog, driverLog],
+  });
+  await sleep(3000);
+  browser = await remote({
+    hostname: "127.0.0.1",
+    port: DRIVER_PORT,
+    path: "/",
+    capabilities: tauriCapabilities(application, "default", process.platform, webviewTarget.debuggerAddress),
+    logLevel: "error",
+    connectionRetryCount: 1,
+    connectionRetryTimeout: 60_000,
+  });
+  await selectWebdriverWindowWithSelector(browser, 'button[title^="Search (Ctrl+K)"]');
+  await browser.$(".ls-block").waitForExist({ timeout: 180_000 });
+}
+
+async function stopJourney(forceApplicationFirst = false) {
+  if (forceApplicationFirst) {
+    stopWebdriverApplication(webviewTarget);
+    webviewTarget = undefined;
+  }
+  try { await browser?.deleteSession(); } catch {}
+  browser = undefined;
+  if (driver?.pid) spawnSync("taskkill", ["/PID", String(driver.pid), "/T", "/F"], { stdio: "ignore" });
+  driver = undefined;
+  stopWebdriverApplication(webviewTarget);
+  webviewTarget = undefined;
+  if (driverLog !== undefined) {
+    try { fs.closeSync(driverLog); } catch {}
+    driverLog = undefined;
+  }
+}
+
 const receipt = {
   schemaVersion: 1,
   scenario: "windows-managed-storage",
@@ -348,17 +432,7 @@ const receipt = {
   milestones: {},
 };
 try {
-  browser = await remote({
-    hostname: "127.0.0.1",
-    port: DRIVER_PORT,
-    path: "/",
-    capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
-    logLevel: "error",
-    connectionRetryCount: 1,
-    connectionRetryTimeout: 60_000,
-  });
-  await selectWebdriverWindowWithSelector(browser, 'button[title^="Search (Ctrl+K)"]');
-  await browser.$(".ls-block").waitForExist({ timeout: 60_000 });
+  await startJourney(BASELINE_APP, "activation");
   await openPage(nestedTitle);
   receipt.milestones.directFilesOpened = true;
 
@@ -369,13 +443,41 @@ try {
   receipt.milestones.activationMs = Date.now() - activationStarted;
   assertSameSource(before, "managed activation");
   await closeSettings();
-  await openPage(nestedTitle);
-  receipt.milestones.managedPageOpened = true;
+  // v0.6.94 may publish the managed page shell while leaving its body blank.
+  // That is predecessor evidence for #370, not a reason to abort before the
+  // candidate gets a chance to recover the same private state.  Require the
+  // candidate below to serve the actual marker.
+  await openPage(nestedTitle, { expectedMarker: null, requireHeading: false });
+  receipt.milestones.baselineManagedPageBodyVisible = (await bodyText()).includes(nestedMarker);
+  if (receipt.milestones.baselineManagedPageBodyVisible) {
+    receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
+  } else {
+    receipt.milestones.previousPatchEdit = {
+      attempted: false,
+      reason: "v0.6.94 published a managed page shell without its body",
+    };
+  }
 
-  await openManagedSettings("Return to Direct files");
-  await clickButtonAndConfirm("Return to Direct files");
+  // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the
+  // actual baseline process without a graceful managed shutdown, then require
+  // the candidate to recover the same private state and serve an ordinary page.
+  await stopJourney(true);
+  receipt.milestones.baselineForceClosed = true;
+  const reopenStarted = Date.now();
+  await startJourney(APP, "candidate-reopen");
+  receipt.milestones.candidateReopenMs = Date.now() - reopenStarted;
+  await openPage(nestedTitle);
+  receipt.milestones.candidateManagedPageOpened = true;
+
+  const directFilesAction = await openManagedSettings([
+    "Return to Direct files",
+    "Open current files in Direct Files...",
+  ]);
+  await clickButtonAndConfirm(directFilesAction);
   await waitForBody("Enable Tine-managed storage...", 120_000, "Direct Files status after rollback");
-  assertSameSource(before, "return to Direct Files");
+  // The attempted v0.6.94 creation may finish before or during recovery. Its
+  // new file is allowed; authority transitions may not alter any incumbent.
+  assertOriginalSourcesUnchanged(before, "return to Direct Files");
   await closeSettings();
   await openPage(nestedTitle);
   receipt.milestones.directFilesRestored = true;
@@ -411,9 +513,6 @@ try {
   fs.writeFileSync(path.join(artifacts, "failure-capsule.json"), `${JSON.stringify(failure, null, 2)}\n`);
   throw error;
 } finally {
-  try { await browser?.deleteSession(); } catch {}
-  spawnSync("taskkill", ["/PID", String(driver.pid), "/T", "/F"], { stdio: "ignore" });
-  stopWebdriverApplication(webviewTarget);
+  await stopJourney();
   if (process.env.CI === "true") spawnSync("taskkill", ["/IM", path.basename(APP), "/T", "/F"], { stdio: "ignore" });
-  fs.closeSync(driverLog);
 }

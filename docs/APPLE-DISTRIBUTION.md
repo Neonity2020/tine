@@ -102,6 +102,18 @@ beta-review information, select internal or external testers, and submit an
 external beta for Beta App Review when Apple requires it. Production App Store
 submission and release remain separate manual decisions.
 
+The manual **iOS TestFlight administration** workflow handles the repeatable
+App Store Connect work after upload. Run `inspect` first. `prepare` waits for
+the selected build to finish processing, installs the English beta metadata and
+“What to Test” text, creates or reuses the external `Tine iOS Public Beta`
+group, associates the build, and completes the non-secret review details.
+`submit` sends the build to Beta App Review once the required contact fields
+are complete. After Apple reports the review as approved, `publish-link`
+enables a public link capped at 100 testers and writes it to the workflow
+summary. The optional `APPLE_REVIEW_CONTACT_PHONE` secret supplies Apple's
+required private review telephone number when it is not already recorded in
+App Store Connect.
+
 ## Integration gates
 
 Before this branch is merged:

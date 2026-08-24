@@ -149,6 +149,7 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
 
   const recover = (attempt: number, target: string, detail: unknown) => {
     if (attempt !== sequence || disposed) return;
+    clearTicker();
     setSnapshot((current) => ({
       ...current,
       mode: "recovery",
