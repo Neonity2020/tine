@@ -208,7 +208,9 @@ export async function loadGraphPath(
   setJournalTitleFormat(meta?.journal_page_title_format); // match this graph's journal titles
   seedFavorites(meta?.favorites ?? []);
   void refreshJournalConflicts(true); // tell the user if any day has duplicate journal files
-  void refreshSyncConflicts(true); // and flag any Syncthing/Dropbox conflict copies
+  // Standing conflicts surface through the calm badge + in-page resolver, not
+  // a startup toast (removed 2026-08-24); this just derives the inventory.
+  void refreshSyncConflicts();
   if (path) {
     try {
       localStorage.setItem(GRAPH_KEY, path);

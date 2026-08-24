@@ -39,6 +39,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **The conflict review is now usable on a phone (and in a skinny split
+  pane).** When the panel is narrow, the two versions stack full-width instead
+  of being squeezed into unreadable columns, and the per-row choices become a
+  compact strip — a color dot plus a short word, with the legend mapping each
+  color to the real side name. Sync-copy names like
+  `sync-conflict-20260705-141233-A2B2C3D` now read "Sync copy · Jul 5"
+  everywhere (the exact file tag stays as a tooltip).
+
+- **The startup conflict notices are gone.** The two toasts that appeared on
+  every graph open while conflict copies or merge-marker files existed
+  duplicated what the conflicts badge, the in-page review, and its pinned
+  notice already say — and pointed at Settings instead of the in-page
+  resolver. A toast still appears when a *new* conflict arrives mid-session,
+  and for duplicate journal days (which have no other surface).
+
 - **"Apply all suggested" no longer sweeps up a merge tool's own proposed
   text.** A Fossil `SUGGESTED CONFLICT RESOLUTION` body (labeled *Merged
   (tool)*) keeps whatever you set on that row; only your per-row choice (or

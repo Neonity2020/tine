@@ -53,6 +53,7 @@ import {
 import {
   DiffRowView,
   collectRows,
+  humanizeSideLabel,
   seedSuggestedExceptArtifact,
   seedSuggestedOrNoLoss,
 } from "./DiffRows";
@@ -65,13 +66,24 @@ function segLabel(text: string, fallback: string): string {
   return trimmed.length > 18 ? `${trimmed.slice(0, 17)}…` : trimmed;
 }
 
-/** What the two sides of this conflict are called, from the queue object. */
-function sideLabels(conflict: ConflictObject): { mine: string; theirs: string; base?: string } {
+/** What the two sides of this conflict are called, from the queue object.
+ *  A sync tool's raw copy tag is humanized for display ("Sync copy · Jul 5");
+ *  the exact tag survives as `theirsTitle` for the legend's tooltip. */
+function sideLabels(conflict: ConflictObject): {
+  mine: string;
+  theirs: string;
+  theirsTitle?: string;
+  base?: string;
+} {
   const of = (role: "mine" | "theirs" | "base") =>
     conflict.sides.find((s) => s.role === role)?.label ?? "";
+  const theirs = humanizeSideLabel(
+    of("theirs") || (conflict.source === "vcs-markers" ? "Merged-in side" : "Conflict copy")
+  );
   return {
     mine: of("mine") || (conflict.source === "vcs-markers" ? "Local side" : "This device"),
-    theirs: of("theirs") || (conflict.source === "vcs-markers" ? "Merged-in side" : "Conflict copy"),
+    theirs: theirs.text,
+    theirsTitle: theirs.title,
     base: of("base") || undefined,
   };
 }
@@ -510,7 +522,9 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       </div>
       <div class="page-conflict-legend">
         <span class="page-conflict-side mine">{labels().mine}</span>
-        <span class="page-conflict-side theirs">{labels().theirs}</span>
+        <span class="page-conflict-side theirs" title={labels().theirsTitle}>
+          {labels().theirs}
+        </span>
         <Show when={labels().base}>
           {(base) => <span class="page-conflict-side base">{base()} (used for the suggestions)</span>}
         </Show>
@@ -553,16 +567,34 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
                   onClick={applyAllSuggested}
                   title="Re-applies Tine's own suggestions. A merge tool's proposed text (Merged (tool)) keeps your current choice."
                 >
-                  Apply all suggested
+                  <span class="conflict-wide">Apply all suggested</span>
+                  <span class="conflict-narrow">All suggested</span>
                 </button>
                 <button class="settings-btn" onClick={() => setAll("both")}>
-                  Keep both everywhere
+                  <span class="conflict-wide">Keep both everywhere</span>
+                  <span class="conflict-narrow">All both</span>
                 </button>
-                <button class="settings-btn" onClick={() => setAll("mine")}>
-                  Keep {segLabel(labels().mine, "mine")}
+                <button
+                  class="settings-btn"
+                  onClick={() => setAll("mine")}
+                  title={labels().mine}
+                >
+                  <span class="conflict-wide">Keep {segLabel(labels().mine, "mine")}</span>
+                  <span class="conflict-narrow">
+                    <span class="sync-merge-seg-dot" data-side="mine" aria-hidden="true" />
+                    All mine
+                  </span>
                 </button>
-                <button class="settings-btn" onClick={() => setAll("theirs")}>
-                  Keep {segLabel(labels().theirs, "theirs")}
+                <button
+                  class="settings-btn"
+                  onClick={() => setAll("theirs")}
+                  title={labels().theirsTitle ?? labels().theirs}
+                >
+                  <span class="conflict-wide">Keep {segLabel(labels().theirs, "theirs")}</span>
+                  <span class="conflict-narrow">
+                    <span class="sync-merge-seg-dot" data-side="theirs" aria-hidden="true" />
+                    All theirs
+                  </span>
                 </button>
                 <label class="sync-merge-showunchanged">
                   <input

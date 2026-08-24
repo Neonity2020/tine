@@ -94,6 +94,25 @@ export function firstLine(text: string): string {
   return l.trim();
 }
 
+/** Human wording for a sync tool's conflict-copy tag.
+ *
+ *  The raw tag ("sync-conflict-20260705-141233-A2B2C3D", "Martin's conflicted
+ *  copy 2026-07-05") identifies the FILE, but as a side label it drowns every
+ *  layout it appears in — the legend, the bulk buttons, and (fatally, on a
+ *  phone) the per-row segments. Display "Sync copy · Jul 5" instead and keep
+ *  the raw tag as the tooltip. Non-matching labels pass through untouched. */
+export function humanizeSideLabel(label: string): { text: string; title?: string } {
+  const syncthing = label.match(/^sync-conflict-(\d{4})(\d{2})(\d{2})-\d{6}-[A-Za-z0-9]+$/);
+  const dropbox = label.match(/conflicted copy (\d{4})-(\d{2})-(\d{2})/i);
+  const m = syncthing ?? dropbox;
+  if (!m) return { text: label };
+  const [, y, mo, d] = m;
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const month = months[Number(mo) - 1] ?? mo;
+  const year = new Date().getFullYear() === Number(y) ? "" : ` ${y}`;
+  return { text: `Sync copy · ${month} ${Number(d)}${year}`, title: label };
+}
+
 /** The line index a collapsed row previews.
  *
  *  A block body can be many lines (a logbook, a multi-line quote) while the two
@@ -181,15 +200,30 @@ export function DiffRowView(props: {
   // Expansion is per-row and opt-in: collapsed stays one line per column, so a
   // logbook-heavy block cannot claim a phone screen until the user asks it to.
   const [expanded, setExpanded] = createSignal(false);
-  const seg = (value: MergeDecision, label: string, side: "mine" | "theirs" | "merged") => (
+  // `short` is the narrow-container variant: a color dot (tying the option to
+  // its side's hue, which the legend maps to the real name once) plus a fixed
+  // short word — because a side LABEL repeated on every row is exactly what
+  // starved the text cells of width on a phone. CSS container queries switch
+  // between the two spans; only side-labeled segments carry a short form.
+  const seg = (
+    value: MergeDecision,
+    label: string,
+    side: "mine" | "theirs" | "merged",
+    short?: string
+  ) => (
     <button
       class="sync-merge-seg"
       classList={{ active: dec() === value }}
       data-side={side}
       data-decision={value}
+      title={short && short !== label ? label : undefined}
       onClick={() => props.setDecision(row().id, value)}
     >
-      {label}
+      <Show when={short} fallback={label}>
+        <span class="sync-merge-seg-dot" data-side={side} aria-hidden="true" />
+        <span class="sync-merge-seg-long">{label}</span>
+        <span class="sync-merge-seg-short">{short}</span>
+      </Show>
     </button>
   );
   // One index for the whole row: both columns and the merged strip preview the
@@ -259,8 +293,8 @@ export function DiffRowView(props: {
         </div>
         <div class="sync-merge-controls">
           <Show when={row().kind === "modified"}>
-            {seg("mine", labels().mine, "mine")}
-            {seg("theirs", labels().theirs, "theirs")}
+            {seg("mine", labels().mine, "mine", "Mine")}
+            {seg("theirs", labels().theirs, "theirs", "Theirs")}
             {seg("both", "Both", "theirs")}
             <Show when={row().merged}>{seg("merged", "Merged", "merged")}</Show>
           </Show>

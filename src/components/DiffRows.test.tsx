@@ -7,6 +7,7 @@ import {
   firstDifferingLine,
   firstLine,
   mergedTitle,
+  humanizeSideLabel,
   needsExpander,
   previewLine,
   seedSuggestedExceptArtifact,
@@ -162,6 +163,57 @@ describe("seeding a merged suggestion", () => {
   it("still falls back to no-loss where the backend offered no merge", () => {
     const noOffer: DiffRow = { ...mergedRow, suggestion: null, merged: null };
     expect(seedSuggestedOrNoLoss([noOffer])).toEqual({ "1": "both" });
+  });
+});
+
+describe("humanizing sync-copy side labels", () => {
+  it("renders a Syncthing tag as a dated 'Sync copy', keeping the tag as tooltip", () => {
+    const y = new Date().getFullYear();
+    const tag = `sync-conflict-${y}0705-141233-A2B2C3D`;
+    expect(humanizeSideLabel(tag)).toEqual({ text: "Sync copy · Jul 5", title: tag });
+  });
+
+  it("appends the year only when it is not the current one", () => {
+    expect(humanizeSideLabel("sync-conflict-20190705-141233-A2B2C3D").text).toBe(
+      "Sync copy · Jul 5 2019",
+    );
+  });
+
+  it("recognizes the Dropbox 'conflicted copy' wording", () => {
+    const y = new Date().getFullYear();
+    expect(humanizeSideLabel(`Martin's conflicted copy ${y}-12-31`).text).toBe(
+      "Sync copy · Dec 31",
+    );
+  });
+
+  it("passes every other label through untouched (git refs, device names)", () => {
+    expect(humanizeSideLabel("HEAD")).toEqual({ text: "HEAD" });
+    expect(humanizeSideLabel("Phone")).toEqual({ text: "Phone" });
+  });
+});
+
+describe("narrow-container segment variants", () => {
+  it("side-labeled segments carry a dot + generic short word; Both/Merged do not", async () => {
+    const { host, dispose } = mountRow(mergedRow, seedSuggestedOrNoLoss([mergedRow]));
+    try {
+      await flush();
+      const mine = host.querySelector('.sync-merge-seg[data-decision="mine"]')!;
+      expect(mine.querySelector('.sync-merge-seg-dot[data-side="mine"]')).not.toBeNull();
+      expect(mine.querySelector(".sync-merge-seg-long")!.textContent).toBe("This device");
+      expect(mine.querySelector(".sync-merge-seg-short")!.textContent).toBe("Mine");
+      expect(mine.getAttribute("title")).toBe("This device");
+      const theirs = host.querySelector('.sync-merge-seg[data-decision="theirs"]')!;
+      expect(theirs.querySelector(".sync-merge-seg-short")!.textContent).toBe("Theirs");
+      // Both/Merged are already short: single-span content, no dot.
+      const both = host.querySelector('.sync-merge-seg[data-decision="both"]')!;
+      expect(both.textContent).toBe("Both");
+      expect(both.querySelector(".sync-merge-seg-dot")).toBeNull();
+      expect(
+        host.querySelector('.sync-merge-seg[data-decision="merged"]')!.textContent,
+      ).toBe("Merged");
+    } finally {
+      dispose();
+    }
   });
 });
 

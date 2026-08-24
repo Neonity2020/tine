@@ -512,18 +512,12 @@ export function conflictObjectFor(
 // Where the badge left off, so repeated clicks WALK the queue instead of parking
 // on its first item. Transient session state: the queue itself is derived.
 let conflictCursor = 0;
-let syncConflictInventoryToast: number | undefined;
-let vcsConflictInventoryToast: number | undefined;
 const artifactArrivalToasts = new Map<number, Set<string>>();
 // Inventory calls include several awaited filesystem walks. Only the newest
 // refresh episode may publish: a conflicts-changed scan begun before Apply can
 // otherwise finish after the guarded native resolution and resurrect the exact
 // conflict object the user just settled.
 let artifactConflictRefreshGeneration = 0;
-
-function retireToast(id: number | undefined): void {
-  if (id !== undefined) dismissToast(id);
-}
 
 /** Sticky conflict notices describe live derived objects, not history. Retire
  * them when the objects disappear so a successful resolution cannot leave a
@@ -551,16 +545,8 @@ export function settleArtifactConflict(id: string): void {
   if (settled.source === "sync-copy") {
     const copy = settled.sides.find((side) => side.role === "theirs")?.path;
     if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
-    if (!syncConflicts().length) {
-      retireToast(syncConflictInventoryToast);
-      syncConflictInventoryToast = undefined;
-    }
   } else if (settled.source === "vcs-markers") {
     setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
-    if (!vcsMarkerConflicts().length) {
-      retireToast(vcsConflictInventoryToast);
-      vcsConflictInventoryToast = undefined;
-    }
   }
   retireSettledArtifactArrivalToasts(artifactConflictQueue);
 }
@@ -596,30 +582,21 @@ export async function refreshConflictQueueIfTouched(
   if (touched) await refreshSyncConflicts();
 }
 
-/** Re-fetch the sync-conflict + VCS-marker lists; with `notify`, toast if any exist. */
-export async function refreshSyncConflicts(notify: boolean | "new" = false): Promise<void> {
+/** Re-fetch the sync-conflict + VCS-marker lists (and the Concord queue below).
+ *
+ *  With `notify === "new"`, toast for conflict copies that newly ARRIVED
+ *  mid-session — the one moment nothing else announces (the badge just ticks,
+ *  and on a phone the sidebar is hidden). There is deliberately no toast for
+ *  the standing inventory: the calm badge, the in-page panel, its pinned dock
+ *  bar, and the marker banner already carry it, and the pre-Concord startup
+ *  toasts routed to the Settings FALLBACK surface while demanding a dismissal
+ *  on every graph open (removed 2026-08-24, Martin's call). */
+export async function refreshSyncConflicts(notify: "new" | false = false): Promise<void> {
   const generation = ++artifactConflictRefreshGeneration;
   try {
     const c = await backend().listSyncConflicts();
     if (generation !== artifactConflictRefreshGeneration) return;
     setSyncConflicts(c);
-    if (!c.length) {
-      retireToast(syncConflictInventoryToast);
-      syncConflictInventoryToast = undefined;
-    } else if (notify === true && syncConflictInventoryToast === undefined) {
-      const id = pushToast(
-        `${c.length} sync-conflict file${c.length === 1 ? "" : "s"} in your graph — review + merge them in Settings → Backups & recovery`,
-        "info",
-        {
-          sticky: true,
-          action: { label: "Open", run: () => openSettings("backups") },
-          onDismiss: () => {
-            if (syncConflictInventoryToast === id) syncConflictInventoryToast = undefined;
-          },
-        }
-      );
-      syncConflictInventoryToast = id;
-    }
   } catch {
     /* best-effort */
   }
@@ -627,23 +604,6 @@ export async function refreshSyncConflicts(notify: boolean | "new" = false): Pro
     const m = await backend().listVcsMarkerConflicts();
     if (generation !== artifactConflictRefreshGeneration) return;
     setVcsMarkerConflicts(m);
-    if (!m.length) {
-      retireToast(vcsConflictInventoryToast);
-      vcsConflictInventoryToast = undefined;
-    } else if (notify === true && vcsConflictInventoryToast === undefined) {
-      const id = pushToast(
-        `${m.length} file${m.length === 1 ? " contains" : "s contain"} unresolved VCS merge markers — Tine won't overwrite them; open the page to resolve the merge block by block`,
-        "info",
-        {
-          sticky: true,
-          action: { label: "Open", run: () => openSettings("backups") },
-          onDismiss: () => {
-            if (vcsConflictInventoryToast === id) vcsConflictInventoryToast = undefined;
-          },
-        }
-      );
-      vcsConflictInventoryToast = id;
-    }
   } catch {
     /* best-effort */
   }

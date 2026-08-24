@@ -2930,6 +2930,98 @@ textarea {
   border-left: 3px solid #b45309;
   border-radius: 6px;
   background: var(--bg-secondary);
+  /* Narrow layout is driven by the PANEL's own width (container query), not
+     the viewport: a phone and a skinny desktop split-pane need the same fix. */
+  container: conflict / inline-size;
+}
+/* Side dots: tie a control to its side's hue where there is no room for the
+   side's name (the legend maps hue → name once). Hidden in row segments at
+   comfortable widths; the narrow rules below reveal them. */
+.sync-merge-seg-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+.sync-merge-seg-dot[data-side="mine"] {
+  background: #2e7d32;
+}
+.sync-merge-seg-dot[data-side="theirs"] {
+  background: #1565c0;
+}
+.sync-merge-seg .sync-merge-seg-dot {
+  display: none;
+  margin-right: 5px;
+}
+/* On the active segment's filled background the bare hue almost vanishes;
+   a thin light ring keeps the side color legible. */
+.sync-merge-seg.active .sync-merge-seg-dot {
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.85);
+}
+.sync-merge-seg-short {
+  display: none;
+}
+.conflict-narrow {
+  display: none;
+}
+/* Narrow panel (phone sheet, skinny pane): the two-column row starved the
+   TEXT — the one thing the user must read to decide — because the per-row
+   segments carry side labels and don't shrink. Stack the cells full-width and
+   turn the segments into one compact equal-width strip: dot + short word. */
+@container conflict (max-width: 560px) {
+  .conflict-wide {
+    display: none;
+  }
+  .conflict-narrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .page-conflict-legend {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  /* Two-COLUMN headers make no sense over stacked cells; the color edges +
+     the legend carry side identity instead. */
+  .page-conflict .sync-merge-collabels {
+    display: none;
+  }
+  .page-conflict .sync-merge-cols {
+    flex: 1 1 100%;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .page-conflict .sync-merge-cell {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .page-conflict .sync-merge-controls {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .page-conflict .sync-merge-controls .sync-merge-seg {
+    flex: 1 1 0;
+    text-align: center;
+    padding: 4px 4px;
+    white-space: nowrap;
+  }
+  .page-conflict .sync-merge-controls .sync-merge-suggested-tag,
+  .page-conflict .sync-merge-controls .sync-merge-unchanged-tag,
+  .page-conflict .sync-merge-controls .sync-merge-expand {
+    flex: none;
+    align-self: center;
+  }
+  .sync-merge-seg .sync-merge-seg-dot {
+    display: inline-block;
+  }
+  .sync-merge-seg-long {
+    display: none;
+  }
+  .sync-merge-seg-short {
+    display: inline;
+  }
 }
 /* Concord dock (spec: tine-agents/specs/concord-conflict-dock.md): when the
    panel is scrolled entirely out of view, a slim bar pins to the top of this
