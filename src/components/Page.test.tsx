@@ -30,7 +30,7 @@ import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setGraphMeta, setRightSidebar } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
 
 beforeAll(async () => {
   await initParser();
@@ -825,6 +825,54 @@ describe("tag-page table", () => {
 });
 
 describe("zoomed block view", () => {
+  it("reuses the exact loaded owner when a bullet click stamps its durable id (GH #354)", async () => {
+    const uuid = "12345678-1234-4234-8234-123456789abc";
+    const path = "pages/Zoom race.md";
+    const dto: PageDto = {
+      name: "Zoom race",
+      kind: "page",
+      title: "Zoom race",
+      path,
+      pre_block: null,
+      rev: "disk-rev",
+      blocks: [{ id: uuid, raw: "Click my bullet", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { [uuid]: node(uuid, dto.blocks[0].raw, dto.name) },
+      pages: [{ ...page(dto.name, "page", [uuid]), path }],
+      feed: [],
+      loaded: true,
+    });
+    setBaseRev(dto.name, dto.rev!);
+    const read = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    let finishSave = () => {};
+    vi.spyOn(backend(), "savePage").mockImplementation(() => new Promise((resolve) => {
+      finishSave = () => resolve("saved-rev");
+    }));
+    mainPaneRouter.openFile(path, dto.name, dto.kind, { inPlace: true });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      expect(root.querySelector(".page-blocks")).not.toBeNull();
+      read.mockClear();
+      setToasts([]);
+
+      root.querySelector<HTMLElement>(".bullet-container")!.click();
+      await flushMicrotasks();
+
+      expect(read).not.toHaveBeenCalled();
+      expect(root.querySelector(".zoomed-page")).not.toBeNull();
+      expect(root.textContent).toContain("Click my bullet");
+      expect(toasts()).toEqual([]);
+      finishSave();
+      await flushMicrotasks();
+    } finally {
+      finishSave();
+      dispose();
+    }
+  });
+
   it("resolves a durable zoom route to the current transient live node", async () => {
     const uuid = "12345678-1234-4234-8234-123456789abc";
     const transient = "bfresh-zoom";
@@ -843,7 +891,7 @@ describe("zoomed block view", () => {
       feed: [dto.name],
       loaded: true,
     });
-    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    const read = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
     mainPaneRouter.replaceActiveRoute({
       kind: "page",
       name: dto.name,
@@ -855,9 +903,85 @@ describe("zoomed block view", () => {
     const { root, dispose } = mount(() => <PageView />);
     try {
       await flushMicrotasks();
+      expect(read).not.toHaveBeenCalled();
       expect(root.querySelector(".zoomed-page")).not.toBeNull();
       expect(root.querySelector(`[data-block-id="${transient}"]`)).not.toBeNull();
       expect(root.textContent).toContain("Fresh zoom target");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("loads a restored durable zoom route when its owner is absent", async () => {
+    const uuid = "87654321-4321-4321-8321-cba987654321";
+    const dto: PageDto = {
+      name: "Restored zoom",
+      kind: "page",
+      title: "Restored zoom",
+      path: "pages/Restored zoom.md",
+      pre_block: null,
+      rev: "restored-rev",
+      blocks: [{ id: uuid, raw: `Restored target\nid:: ${uuid}`, collapsed: false, children: [] }],
+    };
+    const read = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    mainPaneRouter.replaceActiveRoute({
+      kind: "page",
+      name: dto.name,
+      pageKind: dto.kind,
+      path: dto.path,
+      block: uuid,
+    });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      expect(read).toHaveBeenCalledOnce();
+      expect(root.querySelector(".zoomed-page")).not.toBeNull();
+      expect(root.textContent).toContain("Restored target");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("does not reuse a different same-name physical owner for a pinned zoom route", async () => {
+    const uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const name = "Duplicate zoom";
+    const pathA = "pages/client-a/Duplicate zoom.md";
+    const pathB = "pages/client-b/Duplicate zoom.md";
+    const dtoB: PageDto = {
+      name,
+      kind: "page",
+      title: name,
+      path: pathB,
+      pre_block: null,
+      rev: "b-rev",
+      blocks: [{ id: uuid, raw: `Owner B\nid:: ${uuid}`, collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { [uuid]: node(uuid, `Owner A dirty\nid:: ${uuid}`, name) },
+      pages: [{ ...page(name, "page", [uuid]), path: pathA }],
+      feed: [],
+      loaded: true,
+    });
+    setBaseRev(name, "a-rev");
+    setRaw(uuid, `Owner A still dirty\nid:: ${uuid}`);
+    const read = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dtoB);
+    setToasts([]);
+    mainPaneRouter.replaceActiveRoute({
+      kind: "page",
+      name,
+      pageKind: "page",
+      path: pathB,
+      block: uuid,
+    });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      expect(read).toHaveBeenCalledOnce();
+      expect(root.querySelector(".zoomed-page")).toBeNull();
+      expect(pageByName(name)?.path).toBe(pathA);
+      expect(toasts().at(-1)?.message).toContain("has unsaved changes");
     } finally {
       dispose();
     }
