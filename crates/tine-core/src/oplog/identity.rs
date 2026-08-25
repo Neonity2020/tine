@@ -959,6 +959,25 @@ impl BlockId {
             &[import_id.as_bytes(), locator],
         ))
     }
+
+    /// Derive the sibling created to preserve the second authored text of one
+    /// concurrent edit pair. Stable identity lets a later causal descendant
+    /// retire that machine-created sibling when both branches converge.
+    pub(crate) fn for_conflict_sibling(
+        original: BlockId,
+        min_batch: BatchId,
+        max_batch: BatchId,
+    ) -> Self {
+        debug_assert!(min_batch < max_batch);
+        Self(derived_uuid(
+            b"tine/conflict-resolution/sibling-block-id/v1\0",
+            &[
+                original.as_uuid().as_bytes(),
+                min_batch.as_uuid().as_bytes(),
+                max_batch.as_uuid().as_bytes(),
+            ],
+        ))
+    }
 }
 
 fn derived_uuid(domain: &[u8], parts: &[&[u8]]) -> Uuid {

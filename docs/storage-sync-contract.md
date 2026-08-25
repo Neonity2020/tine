@@ -698,6 +698,19 @@ belongs to a superseded source batch remains durable historical receipt evidence
 but is not required to replay as the later merged point authority merely to
 perform a nonexistent index update.
 
+File synchronizers deliver the visible Markdown/Org projection and the hidden
+provider history independently. Before classifying concurrent semantic edits,
+the runtime drains every provider operation already visible in the current
+provider observation; an intermediate operation must not be resolved while its
+causal descendant is waiting in the same delivered cut. If a projection-first
+external admission and provider history reach the same authored block text,
+they are one semantic edit and collapse to one block. The same applies when a
+later operation on one branch reaches the other branch's exact authored text.
+Only genuinely different final authored texts use keep-both siblings. Such a
+sibling has deterministic conflict-pair identity so later convergence can
+retire it, but retirement is permitted only while its text is unchanged and it
+has no children; any user-touched sibling remains user data.
+
 **An applied provider batch always owes a Markdown projection.** The same rule
 holds on the receiving side, and there it is a durability rule rather than a
 planning optimization. A receiver decides whether an inbound foreign projection

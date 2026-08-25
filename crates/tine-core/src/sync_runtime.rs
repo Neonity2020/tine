@@ -18848,6 +18848,14 @@ impl RuntimeActor {
                 self.note_provider_batch_needs_conflict_check(batch_id);
             }
         }
+        // Provider delivery and the visible Markdown projection travel through
+        // file synchronizers independently. Drain every provider batch already
+        // visible in this observation before classifying races, or an
+        // intermediate operation can be mistaken for a final offline edit
+        // while its causal descendant is waiting in this same queue.
+        if self.provider_transport_has_work() {
+            return self.tick_clean_provider();
+        }
         if let Some(tick) = self.resolve_pending_conflict() {
             return tick;
         }
@@ -18970,8 +18978,8 @@ impl RuntimeActor {
         SyncRuntimeTick::Terminal("pre-0.7 managed runtime is no longer supported".into())
     }
 
-    fn provider_has_work(&self) -> bool {
-        let has_work = !self.provider_exact.is_empty()
+    fn provider_transport_has_work(&self) -> bool {
+        !self.provider_exact.is_empty()
             || self.provider_rescan_requested
             || self.provider_full_scan_requested
             || self.provider_observation_cursor.is_some()
@@ -18992,8 +19000,10 @@ impl RuntimeActor {
             || self.provider_recovery_backfill_cursor.is_some()
             || self.provider_head_dirty
             || !self.provider_head_retirement.is_empty()
-            || !self.pending_conflict_resolutions.is_empty();
-        has_work
+    }
+
+    fn provider_has_work(&self) -> bool {
+        self.provider_transport_has_work() || !self.pending_conflict_resolutions.is_empty()
     }
 
     /// Clone only the archive capability retained by this authenticated active
@@ -19168,7 +19178,11 @@ impl RuntimeActor {
                             },
                             SemanticOperation::CreateBlock {
                                 block: BlockLocation {
-                                    block_id: BlockId::new(),
+                                    block_id: BlockId::for_conflict_sibling(
+                                        block.block_id,
+                                        pair.min_batch,
+                                        pair.max_batch,
+                                    ),
                                     home_document_id: page.home_document_id,
                                 },
                                 page_id,
@@ -19179,6 +19193,57 @@ impl RuntimeActor {
                         ])
                         .ok()
                         .map(|transaction| (transaction, page.path.clone()));
+                        if resolution.is_none() {
+                            derivation_incomplete = true;
+                        }
+                    }
+                    crate::oplog::ConflictResolutionIntent::ConvergeText {
+                        page_id,
+                        block,
+                        content,
+                        retire_siblings,
+                        pair,
+                    } => {
+                        if pair.min_author_device != my_device {
+                            continue;
+                        }
+                        let page = match engine.materialize_page(page_id) {
+                            Ok(page) => page,
+                            Err(crate::oplog::EngineError::PageDeleted(_)) => continue,
+                            Err(_) => {
+                                derivation_incomplete = true;
+                                continue;
+                            }
+                        };
+                        if !page
+                            .blocks
+                            .iter()
+                            .any(|candidate| candidate.block_id == block.block_id)
+                        {
+                            derivation_incomplete = true;
+                            continue;
+                        }
+                        let mut operations =
+                            vec![SemanticOperation::EditBlockContent { block, content }];
+                        for retirement in retire_siblings {
+                            let untouched = page.blocks.iter().any(|candidate| {
+                                candidate.block_id == retirement.block_id
+                                    && candidate.content == retirement.expected_content
+                            });
+                            let childless = !page
+                                .blocks
+                                .iter()
+                                .any(|candidate| candidate.parent == Some(retirement.block_id));
+                            if untouched && childless {
+                                operations.push(SemanticOperation::DeleteSubtree {
+                                    root_block_id: retirement.block_id,
+                                    page_id,
+                                });
+                            }
+                        }
+                        resolution = OperationTransaction::new(operations)
+                            .ok()
+                            .map(|transaction| (transaction, page.path));
                         if resolution.is_none() {
                             derivation_incomplete = true;
                         }
@@ -31041,6 +31106,317 @@ mod tests {
         settle_shared_provider(&initiator_handle);
         settle_shared_provider(&receiver_handle);
         (initiator, receiver, initiator_handle, receiver_handle)
+    }
+
+    /// Two saves accepted consecutively by one foreground actor are ordinary
+    /// causal history, not offline edits racing from independent devices. The
+    /// distinction becomes visible only after publication: if the second
+    /// manifest omits its first-save predecessor, provider reconciliation
+    /// treats the overlapping text replacements as concurrent, briefly forms
+    /// an un-authored CRDT interleave, and the keep-both resolver duplicates the
+    /// task block. This is the field shape that produced DOING plus malformed
+    /// DOENE after rapid task-marker clicks on Android.
+    #[test]
+    fn consecutive_application_saves_publish_as_one_causal_task_history() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("consecutive-task-history", 0xa181_0000);
+
+        let (root, revision) = load_application_exact(&receiver_handle, "Root.md");
+        let (root, revision) =
+            save_application_block_text(&receiver_handle, root, revision, "TODO field task");
+        settle_shared_provider(&receiver_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        let (doing, doing_revision) =
+            save_application_block_text(&receiver_handle, root, revision, "DOING field task");
+        let (_done, _done_revision) =
+            save_application_block_text(&receiver_handle, doing, doing_revision, "DONE field task");
+        assert_eq!(
+            receiver_handle.status().unwrap().managed_local_pending,
+            2,
+            "the fixture must publish two foreground saves from one undrained prefix",
+        );
+
+        settle_shared_provider(&receiver_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+
+        for (label, handle) in [("author", &receiver_handle), ("peer", &initiator_handle)] {
+            let (page, _) = load_application_exact(handle, "Root.md");
+            assert_eq!(
+                page.blocks.len(),
+                1,
+                "{label} treated one device's consecutive clicks as a keep-both conflict: {page:?}",
+            );
+            assert_eq!(page.blocks[0].raw, "DONE field task", "{label}");
+        }
+    }
+
+    /// File synchronizers carry the user-visible Markdown projection and the
+    /// provider oplog independently. If Markdown arrives first, this device's
+    /// external-edit lane authors the semantic change before it can know that
+    /// an equivalent peer operation is in flight. Later provider delivery must
+    /// collapse that duplicate observation to the one text both authors chose;
+    /// it must not expose the CRDT's intermediate character interleave or the
+    /// generic keep-both sibling used for genuinely different offline edits.
+    #[test]
+    fn projection_first_then_equivalent_provider_edit_keeps_one_task_block() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("projection-before-equivalent-provider", 0xa182_0000);
+
+        let (root, revision) = load_application_exact(&receiver_handle, "Root.md");
+        let (root, revision) =
+            save_application_block_text(&receiver_handle, root, revision, "TODO field task");
+        settle_shared_provider(&receiver_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        let (_doing, _doing_revision) =
+            save_application_block_text(&receiver_handle, root, revision, "DOING field task");
+        settle_shared_provider(&receiver_handle);
+
+        // Syncthing may deliver the projection before the corresponding oplog
+        // objects and head. Capture that byte-identical observation locally.
+        fs::copy(
+            receiver.graph_root.join("Root.md"),
+            initiator.graph_root.join("Root.md"),
+        )
+        .unwrap();
+        initiator_handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        // The original author history arrives afterwards.
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        // Exchange any deterministic reconciliation authored by either side.
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        for (label, handle) in [
+            ("projection-first receiver", &initiator_handle),
+            ("original author", &receiver_handle),
+        ] {
+            let (page, _) = load_application_exact(handle, "Root.md");
+            assert_eq!(
+                page.blocks.len(),
+                1,
+                "{label} duplicated one semantic task edit: {page:?}",
+            );
+            assert_eq!(page.blocks[0].raw, "DOING field task", "{label}");
+        }
+    }
+
+    #[test]
+    fn final_projection_first_then_two_provider_task_edits_keep_one_final_block() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("final-projection-before-provider-chain", 0xa183_0000);
+
+        let (root, revision) = load_application_exact(&receiver_handle, "Root.md");
+        let (root, revision) =
+            save_application_block_text(&receiver_handle, root, revision, "TODO field task");
+        settle_shared_provider(&receiver_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        let (doing, doing_revision) =
+            save_application_block_text(&receiver_handle, root, revision, "DOING field task");
+        let (_done, _done_revision) =
+            save_application_block_text(&receiver_handle, doing, doing_revision, "DONE field task");
+        settle_shared_provider(&receiver_handle);
+
+        fs::copy(
+            receiver.graph_root.join("Root.md"),
+            initiator.graph_root.join("Root.md"),
+        )
+        .unwrap();
+        initiator_handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        for (label, handle) in [
+            ("projection-first receiver", &initiator_handle),
+            ("original author", &receiver_handle),
+        ] {
+            let (page, _) = load_application_exact(handle, "Root.md");
+            assert_eq!(
+                page.blocks.len(),
+                1,
+                "{label} duplicated a task while reconciling its projection echo: {page:?}",
+            );
+            assert_eq!(page.blocks[0].raw, "DONE field task", "{label}");
+        }
+    }
+
+    #[test]
+    fn final_projection_then_split_provider_task_chain_heals_intermediate_conflict() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("final-projection-split-provider-chain", 0xa184_0000);
+
+        let (root, revision) = load_application_exact(&receiver_handle, "Root.md");
+        let (root, revision) =
+            save_application_block_text(&receiver_handle, root, revision, "TODO field task");
+        settle_shared_provider(&receiver_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        let (doing, doing_revision) =
+            save_application_block_text(&receiver_handle, root, revision, "DOING field task");
+        settle_shared_provider(&receiver_handle);
+        let intermediate_provider = receiver.root.join("intermediate-provider");
+        copy_provider_tree(&receiver.request.provider_root, &intermediate_provider);
+
+        let (_done, _done_revision) =
+            save_application_block_text(&receiver_handle, doing, doing_revision, "DONE field task");
+        settle_shared_provider(&receiver_handle);
+
+        fs::copy(
+            receiver.graph_root.join("Root.md"),
+            initiator.graph_root.join("Root.md"),
+        )
+        .unwrap();
+        initiator_handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        // Only the intermediate provider frontier is visible during this
+        // observation window. A later delivery of the final descendant must
+        // heal any provisional conflict outcome rather than retain it forever.
+        copy_provider_tree(&intermediate_provider, &initiator.request.provider_root);
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+
+        for (label, handle) in [
+            ("split-delivery receiver", &initiator_handle),
+            ("original author", &receiver_handle),
+        ] {
+            let (page, _) = load_application_exact(handle, "Root.md");
+            assert_eq!(
+                page.blocks.len(),
+                1,
+                "{label} retained a provisional intermediate conflict: {page:?}",
+            );
+            assert_eq!(page.blocks[0].raw, "DONE field task", "{label}");
+        }
+
+        let initiator_projection = fs::read(initiator.graph_root.join("Root.md")).unwrap();
+        let receiver_projection = fs::read(receiver.graph_root.join("Root.md")).unwrap();
+        assert_eq!(
+            initiator_projection, receiver_projection,
+            "managed replicas agreed in memory but left different Direct Files projections",
+        );
+        for fixture in [&initiator, &receiver] {
+            assert!(
+                relative_files(&fixture.graph_root).iter().all(|path| {
+                    !path.contains(".sync-conflict-") && !path.ends_with(".projection-conflict")
+                }),
+                "managed convergence retained a transport or projection conflict artifact",
+            );
+        }
+
+        assert!(matches!(
+            initiator_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        for fixture in [&initiator, &receiver] {
+            assert!(
+                Graph::open(&fixture.graph_root).conflict_queue().is_empty(),
+                "returning the converged projection to Direct Files exposed a Concord conflict",
+            );
+        }
     }
 
     fn joined_shared_pair_from_graph_copy(

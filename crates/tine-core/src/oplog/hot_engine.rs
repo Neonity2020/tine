@@ -1521,6 +1521,12 @@ pub struct ConflictPair {
     pub max_author_device: DeviceId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictSiblingRetirement {
+    pub block_id: BlockId,
+    pub expected_content: String,
+}
+
 impl ConflictPair {
     fn from_manifests(left: &OperationBatch, right: &OperationBatch) -> Self {
         let (min, max) = if left.batch_id() <= right.batch_id() {
@@ -1572,6 +1578,17 @@ pub enum ConflictResolutionIntent {
         keep_text: String,
         sibling_text: String,
         merged_text: String,
+        pair: ConflictPair,
+    },
+    /// Two concurrent observations represent one semantic edit, or a later
+    /// operation on one branch reaches the other branch's exact authored
+    /// state. Replace the unauthored CRDT interleave with that one converged
+    /// text; creating a sibling here would turn a projection echo into data.
+    ConvergeText {
+        page_id: PageId,
+        block: BlockLocation,
+        content: String,
+        retire_siblings: Vec<ConflictSiblingRetirement>,
         pair: ConflictPair,
     },
 }
@@ -24478,6 +24495,121 @@ impl ShardedHotEngine {
         Ok(false)
     }
 
+    /// Find a later one-sided operation which proves that the two racing text
+    /// branches converged. This is the projection-first file-sync shape: the
+    /// projection imports the final text concurrently with an intermediate
+    /// provider operation, then the provider branch's descendant reaches that
+    /// same final state. A descendant of both sides is handled by
+    /// `pair_superseded_by_descendant_touch`; two different crossing results
+    /// remain a genuine conflict.
+    fn converged_text_by_one_sided_descendant(
+        &self,
+        block_id: BlockId,
+        pair: &ConflictPair,
+        x_batch_id: BatchId,
+        x_after: &BlockState,
+        z_after: &BlockState,
+    ) -> Result<Option<String>, EngineError> {
+        let z_batch_id = if pair.min_batch == x_batch_id {
+            pair.max_batch
+        } else {
+            pair.min_batch
+        };
+        let mut converged = BTreeSet::new();
+        for candidate in self.status().accepted_batches()?.to_vec() {
+            let w_id = candidate.batch_id;
+            if w_id == x_batch_id || w_id == z_batch_id {
+                continue;
+            }
+            let w_batch = self.load_accepted_validated_batch(w_id)?;
+            let w_heads = declared_batch_heads(w_batch.manifest().dependency_frontier());
+            let w_ancestry = self.collect_batch_ancestry(&w_heads, false)?;
+            let descends_x = w_ancestry.contains_key(&x_batch_id);
+            let descends_z = w_ancestry.contains_key(&z_batch_id);
+            if descends_x == descends_z {
+                continue;
+            }
+            let target = if descends_x { z_after } else { x_after };
+            let w_effect = self.accepted_semantic_effect(&w_batch)?;
+            let matches_other_branch = w_effect.blocks().iter().any(|delta| {
+                delta.block_id == block_id
+                    && delta.after.as_ref().is_some_and(|after| {
+                        after.owner == target.owner && after.content == target.content
+                    })
+            });
+            if matches_other_branch {
+                converged.insert(target.content.clone());
+            }
+        }
+        if converged.len() == 1 {
+            Ok(converged.into_iter().next())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Machine-created keep-both siblings on the branches leading to a
+    /// converged pair. The expected text is part of the retirement proof: the
+    /// runtime removes only an untouched, childless synthetic sibling.
+    fn converged_conflict_sibling_retirements(
+        &self,
+        block_id: BlockId,
+        pair: &ConflictPair,
+        x_batch_id: BatchId,
+    ) -> Result<Vec<ConflictSiblingRetirement>, EngineError> {
+        let z_batch_id = if pair.min_batch == x_batch_id {
+            pair.max_batch
+        } else {
+            pair.min_batch
+        };
+        let x_batch = self.load_accepted_validated_batch(x_batch_id)?;
+        let z_batch = self.load_accepted_validated_batch(z_batch_id)?;
+        let x_heads = declared_batch_heads(x_batch.manifest().dependency_frontier());
+        let z_heads = declared_batch_heads(z_batch.manifest().dependency_frontier());
+        let x_ancestry = self.collect_batch_ancestry(&x_heads, false)?;
+        let z_ancestry = self.collect_batch_ancestry(&z_heads, false)?;
+
+        let mut pairs = BTreeSet::from([(pair.min_batch, pair.max_batch)]);
+        for ancestor in x_ancestry.keys() {
+            if !z_ancestry.contains_key(ancestor) {
+                pairs.insert(if *ancestor < z_batch_id {
+                    (*ancestor, z_batch_id)
+                } else {
+                    (z_batch_id, *ancestor)
+                });
+            }
+        }
+        for ancestor in z_ancestry.keys() {
+            if !x_ancestry.contains_key(ancestor) {
+                pairs.insert(if x_batch_id < *ancestor {
+                    (x_batch_id, *ancestor)
+                } else {
+                    (*ancestor, x_batch_id)
+                });
+            }
+        }
+
+        let mut retirements = Vec::new();
+        for (min_batch, max_batch) in pairs {
+            let max = self.load_accepted_validated_batch(max_batch)?;
+            let effect = self.accepted_semantic_effect(&max)?;
+            let Some(expected_content) = effect
+                .blocks()
+                .iter()
+                .find(|delta| delta.block_id == block_id)
+                .and_then(|delta| delta.after.as_ref())
+                .map(|after| after.content.clone())
+            else {
+                continue;
+            };
+            retirements.push(ConflictSiblingRetirement {
+                block_id: BlockId::for_conflict_sibling(block_id, min_batch, max_batch),
+                expected_content,
+            });
+        }
+        Ok(retirements)
+    }
+
     fn classify_block_race(
         &self,
         x_delta: &BlockDelta,
@@ -24607,6 +24739,29 @@ impl ShardedHotEngine {
                 let z_before = z_delta.before.as_ref().expect("edit delta has before");
                 let x_after = x_delta.after.as_ref().expect("edit delta has after");
                 let z_after = z_delta.after.as_ref().expect("edit delta has after");
+                let converged_text =
+                    if x_after.owner == z_after.owner && x_after.content == z_after.content {
+                        Some(x_after.content.clone())
+                    } else {
+                        self.converged_text_by_one_sided_descendant(
+                            block_id, pair, x_batch_id, x_after, z_after,
+                        )?
+                    };
+                if let Some(content) = converged_text {
+                    let retire_siblings =
+                        self.converged_conflict_sibling_retirements(block_id, pair, x_batch_id)?;
+                    let intent = ConflictResolutionIntent::ConvergeText {
+                        page_id: current_page,
+                        block,
+                        content,
+                        retire_siblings,
+                        pair: pair.clone(),
+                    };
+                    if !intents.contains(&intent) {
+                        intents.push(intent);
+                    }
+                    return Ok(());
+                }
                 let classification = if x_before.content == z_before.content {
                     super::text_merge::classify_concurrent_edits(
                         &x_before.content,

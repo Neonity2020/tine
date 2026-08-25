@@ -6452,6 +6452,7 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
             sibling_text,
             merged_text,
             pair,
+            ..
         } => {
             assert_eq!(*page_id, ids.page_a);
             assert_eq!(block.block_id, ids.block_a);
