@@ -4865,6 +4865,73 @@
     "scenario": null,
     "failBefore": "source-traced (flag was provably never set on that branch; both audits confirmed independently)"
    }
+  },
+  {
+   "id": "REG-DUP1-MANAGED-RENAME-FOLD",
+   "title": "A managed rename of a page whose name folds differently under the refs and canonical folds (Greek final sigma) actually renames the page instead of silently reporting Applied while doing nothing",
+   "family": "managed-page-identity",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "duplication-audit-2026-08-25 DUP-1"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_rename_uses_the_canonical_fold_for_final_sigma_names",
+     "crates/tine-core/src/oplog/semantic.rs::tests::logical_page_name_key_v1_golden_vectors_preserve_exact_spelling"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   }
+  },
+  {
+   "id": "REG-DUP3-CONFIG-NESTED-SHADOW",
+   "title": "config.edn setters edit only the real top-level key: a same-named keyword nested inside another map is never spliced over (which corrupted the nested map) and survives byte-for-byte",
+   "family": "graph-configuration",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "duplication-audit-2026-08-25 DUP-3"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/config.rs::tests::setters_edit_the_top_level_key_never_a_nested_shadow"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   }
+  },
+  {
+   "id": "REG-DUP5-ATOMIC-WRITE-POLICY",
+   "title": "Every Tine writer that renames into a watched or durable location uses the audited publish shape: unique create_new temps, a recognized temp name (including the backup-restore shape), and dir-fsync errors reported rather than swallowed",
+   "family": "atomic-write",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "duplication-audit-2026-08-25 DUP-5"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/watcher.rs::tests::recognizes_every_tine_temp_shape_that_lands_in_the_live_graph"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   }
   }
  ]
 }

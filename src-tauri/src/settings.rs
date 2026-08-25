@@ -475,7 +475,11 @@ fn atomic_write_workspaces(path: &std::path::Path, data: &str) -> Result<(), Str
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, path)?;
-        let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+        // Same policy as the save path (DUP-5): "unsupported here" dir-fsync
+        // outcomes are tolerated, a real EIO/ENOSPC is REPORTED — the
+        // workspaces registry is durable user state, and swallowing the error
+        // is a false ack under the in-scope crash/power-loss threat.
+        tine_core::model::sync_dir_for_rename(parent)?;
         Ok(())
     })();
     if result.is_err() {

@@ -18,6 +18,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Backlink filter truncation is reported consistently.** A page-property
   root entry that hit its text/facet budget marked the context truncated on
   Managed Storage but not on Direct Files; the two now agree.
+- **Managed rename works for every page name.** The managed rename planner
+  keyed its index lookups with a different Unicode fold than the index itself
+  (the two disagree on Greek final sigma), so renaming such a page reported
+  success while doing nothing. Rename lookups now use the index's own fold.
+- **config.edn settings can no longer clobber a nested map.** Every setting
+  writer now edits only the root map's direct entries; a same-named keyword
+  nested inside another map (e.g. under `:default-templates`) survives
+  byte-for-byte instead of being spliced over.
+- **Write-durability errors are reported, not swallowed.** The workspaces
+  registry, backup restore, and Linux window-identity writers follow the save
+  path's directory-fsync policy (tolerate "unsupported here", report real
+  errors), the window-identity writer uses unique create-only temp files, and
+  the file watcher recognizes backup-restore temp files directly.
+
+- **One spelling of a page is one favorite.** Starring a page under one
+  spelling (different case, an alias, NFC/NFD accents, boundary slashes) now
+  fills the star and toggles off under every other spelling instead of
+  appending a duplicate; the sidebar arrangement, membership, page delete, and
+  rename all use the same kind-scoped identity, so deleting a page no longer
+  silently drops a journal favorite that merely shares its name. Backlink
+  filter chips key by the same identity, so two spellings of one co-referenced
+  page no longer produce two chips that miss each other's filters.
 
 ### Added
 

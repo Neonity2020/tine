@@ -89,16 +89,24 @@ fn atomic_write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("tine-identity");
-    let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    // Standard atomic-publish shape (DUP-5): a per-write unique temp
+    // (pid + sequence, create_new) so two concurrent installs in one process
+    // can't truncate each other's temp mid-write, and a directory fsync so the
+    // rename survives a crash (unsupported-here outcomes tolerated, real
+    // errors reported — same policy as the save path).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
     let result = (|| {
         let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)
+        fs::rename(&temporary, path)?;
+        tine_core::model::sync_dir_for_rename(parent)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
