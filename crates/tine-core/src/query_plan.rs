@@ -1656,7 +1656,10 @@ where
                             index: candidate_index,
                             page: entry,
                             block,
-                            breadcrumb: path.iter().map(|ancestor| crate::doc::crumb_line(ancestor)).collect(),
+                            breadcrumb: path
+                                .iter()
+                                .map(|ancestor| crate::doc::crumb_line(ancestor))
+                                .collect(),
                         },
                     );
                 }
