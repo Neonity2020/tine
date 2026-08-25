@@ -3476,6 +3476,33 @@
       }
     },
     {
+      "id": "UI-THEMED-STARTUP-PAGE-READINESS-299",
+      "title": "Android startup and page navigation paint a themed readiness surface instead of an unpainted black or invisible blank state",
+      "family": "startup",
+      "sources": {
+        "issues": [
+          299
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "android",
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/startupReveal.test.ts",
+          "src/systemBars.test.ts",
+          "src/components/Page.test.tsx"
+        ],
+        "scenario": "startup.themed-shell-and-page-readiness",
+        "failBefore": "proven"
+      },
+      "notes": "GH #299. Android's native window had no Tine-colored backing resource before the WebView painted, index.html had an empty root until startup dependencies completed, and Page rendered a 50vh placeholder with no visible content while a route load was pending. The contract preserves cached plugin-revocation verification before activation and keeps actual page-load errors visible."
+    },
+    {
       "id": "UI-LSDOC-ARTIFACT-CANONICALIZATION-001",
       "title": "Help improve Tine rejects oracle-artifact reports after canonical JSON normalization",
       "family": "diagnostics",

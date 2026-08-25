@@ -1426,6 +1426,37 @@ describe("page actions entry point", () => {
 });
 
 describe("page route loading", () => {
+  it("keeps a visible readiness status while the requested page is still loading", async () => {
+    const dto: PageDto = {
+      name: "Patient page",
+      kind: "page",
+      title: "Patient page",
+      pre_block: null,
+      blocks: [{ id: "patient-page", raw: "Loaded body", collapsed: false, children: [] }],
+    };
+    let resolvePage!: (value: PageDto) => void;
+    vi.spyOn(backend(), "getPage").mockImplementation(() => new Promise((resolve) => {
+      resolvePage = resolve;
+    }));
+    mainPaneRouter.openPage(dto.name, dto.kind, { inPlace: true });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick();
+      const loading = root.querySelector<HTMLElement>(".page-loading");
+      expect(loading?.getAttribute("role")).toBe("status");
+      expect(loading?.getAttribute("aria-live")).toBe("polite");
+      expect(loading?.textContent).toContain("Loading page");
+
+      resolvePage(dto);
+      await flushMicrotasks();
+      expect(root.querySelector(".page-loading")).toBeNull();
+      expect(root.textContent).toContain("Loaded body");
+    } finally {
+      dispose();
+    }
+  });
+
   it("fails closed when a shared zoom UUID is loaded from a different exact owner", async () => {
     const sharedId = "77777777-7777-4777-8777-777777777777";
     const sharedRaw = "Same copied UUID and content";
