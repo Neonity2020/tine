@@ -7790,20 +7790,23 @@ mod tests {
         recency: i64,
         blocks: Vec<BlockDto>,
     ) -> ApplicationQueryPage {
+        let page = PageDto {
+            name: name.into(),
+            kind,
+            title: name.into(),
+            pre_block: None,
+            blocks,
+            rev: None,
+            format,
+            read_only: false,
+            path: path.into(),
+            activation: None,
+            guide: false,
+        };
+        let roots = ApplicationProjectionCache::default().roots(&page.path, &page);
         ApplicationQueryPage {
-            page: PageDto {
-                name: name.into(),
-                kind,
-                title: name.into(),
-                pre_block: None,
-                blocks,
-                rev: None,
-                format,
-                read_only: false,
-                path: path.into(),
-                activation: None,
-                guide: false,
-            },
+            page,
+            roots,
             recency,
         }
     }

@@ -4932,6 +4932,51 @@
     "scenario": null,
     "failBefore": "proven"
    }
+  },
+  {
+   "id": "REG-DUP6-MANAGED-QUERY-PROJECTION-REUSE",
+   "title": "A repeated Managed Storage query over unchanged pages does not re-parse them: `{{query}}` re-render and search-as-you-type reuse each page's converted block tree instead of rebuilding one lsdoc projection per block per query, and a saved page is reconverted on the very next query",
+   "family": "managed-query",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "duplication-audit-2026-08-25 DUP-6 / F4"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   }
+  },
+  {
+   "id": "REG-DUP6-QUERY-EVALUATOR-MODE-PARITY",
+   "title": "Managed Storage and Direct Files answer a block query identically -- plain text, literal fuzzy `((` picker, limit-bounded search, and byte-budget-bounded block referrers all return the same rows, order and truncation flag -- and evidence plus result DTOs are built once per winner rather than once per retained candidate",
+   "family": "managed-query",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "duplication-audit-2026-08-25 DUP-6 / F4, codex rank 4"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_query_evaluator_matches_direct_files_across_shapes_and_budgets",
+     "crates/tine-core/src/query_plan.rs::tests::application_block_evaluator_matches_direct_and_evaluates_evidence_per_winner"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   }
   }
  ]
 }

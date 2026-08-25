@@ -11254,7 +11254,9 @@ impl RuntimeActor {
     fn note_managed_application_query_fuzzy_narrowing(&self, candidate_pages: usize) {
         let mut current = self.managed_application_query_instrumentation.get();
         current.fuzzy_narrowing_passes = current.fuzzy_narrowing_passes.saturating_add(1);
-        current.fuzzy_candidate_pages = current.fuzzy_candidate_pages.saturating_add(candidate_pages);
+        current.fuzzy_candidate_pages = current
+            .fuzzy_candidate_pages
+            .saturating_add(candidate_pages);
         self.managed_application_query_instrumentation.set(current);
     }
 
@@ -12275,10 +12277,9 @@ impl RuntimeActor {
                     budget.deny_match();
                     continue;
                 }
-                if !budget.admit_estimated(
-                    &group.page,
-                    crate::model::block_dto_estimated_bytes(&block),
-                ) {
+                if !budget
+                    .admit_estimated(&group.page, crate::model::block_dto_estimated_bytes(&block))
+                {
                     continue;
                 }
                 admitted.push(block);
@@ -42870,6 +42871,521 @@ mod tests {
             "query after an accepted batch",
             after_save,
             Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
+        );
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// A Direct/managed differential corpus: fixed content, no journals, one
+    /// addressable block identity for the referrer surfaces, one rare token
+    /// that the ordered-subsequence index can genuinely narrow to a single
+    /// page, and enough repeated rows for a byte budget to cut both inside a
+    /// page and between pages.
+    fn mode_differential_fixture(label: &str, seed: u128) -> ActivationFixture {
+        let fixture = ActivationFixture::empty(label, seed);
+        let directory = fixture.graph_root.join("notes/differential");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("Anchor.md"),
+            format!(
+                "title:: Differential anchor\n\n- anchor block for referrers\n  id:: {MODE_DIFFERENTIAL_ANCHOR}\n"
+            ),
+        )
+        .unwrap();
+        for page in 0..MODE_DIFFERENTIAL_PAGES {
+            let mut content = format!("title:: Differential {page}\n\n");
+            if page == 2 {
+                content.push_str("- zqx sentinel lives on exactly one page\n");
+            }
+            for block in 0..4 {
+                content.push_str(&format!(
+                    "- differential needle {page}-{block} {}\n",
+                    "padding ".repeat(6)
+                ));
+                content.push_str(&format!(
+                    "\t- referring child {page}-{block} to (({MODE_DIFFERENTIAL_ANCHOR}))\n"
+                ));
+            }
+            fs::write(
+                directory.join(format!("Differential-{page}.md")),
+                content.as_bytes(),
+            )
+            .unwrap();
+        }
+        fixture
+    }
+
+    const MODE_DIFFERENTIAL_ANCHOR: &str = "5f0a1c2e-3b4d-4e5f-8a9b-0c1d2e3f4a5b";
+    const MODE_DIFFERENTIAL_PAGES: usize = 6;
+
+    fn open_reopened_managed_actor(fixture: &ActivationFixture) -> SyncRuntimeHandle {
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("managed reopen retains its actor");
+        assert_eq!(
+            handle.status().unwrap().managed_local_pending,
+            0,
+            "the differential corpus must reopen with no pending managed-local suffix"
+        );
+        handle
+    }
+
+    fn managed_graph_search(
+        handle: &SyncRuntimeHandle,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+    ) -> crate::query_plan::QueryExecution {
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::GraphSearch {
+                source: source.into(),
+                page_limit,
+                block_limit,
+                lane: None,
+                explain: false,
+                scope: None,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::GraphSearch(execution),
+        } = outcome
+        else {
+            panic!("managed graph search returned the wrong outcome: {outcome:?}")
+        };
+        execution
+    }
+
+    fn managed_block_search(
+        handle: &SyncRuntimeHandle,
+        query: &str,
+        limit: usize,
+    ) -> Vec<RefGroup> {
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::BlockSearch {
+                query: query.into(),
+                limit,
+                lane: None,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::BlockSearch(groups),
+        } = outcome
+        else {
+            panic!("managed block search returned the wrong outcome: {outcome:?}")
+        };
+        groups
+    }
+
+    fn managed_block_referrers(
+        handle: &SyncRuntimeHandle,
+        uuid: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> SyncApplicationBoundedRefGroups {
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::BlockReferrers {
+                uuid: uuid.into(),
+                max_rows,
+                max_bytes,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::BlockReferrers(result),
+        } = outcome
+        else {
+            panic!("managed block referrers returned the wrong outcome: {outcome:?}")
+        };
+        result
+    }
+
+    fn assert_managed_graph_search_matches_direct(
+        label: &str,
+        mut managed: crate::query_plan::QueryExecution,
+        mut direct: crate::query_plan::QueryExecution,
+    ) {
+        canonicalize_graph_search_for_mode_differential(&mut managed);
+        canonicalize_graph_search_for_mode_differential(&mut direct);
+        assert_eq!(
+            serde_json::to_value(&managed).unwrap(),
+            serde_json::to_value(&direct).unwrap(),
+            "managed graph search diverged from parser-owned Direct Files semantics: {label}"
+        );
+    }
+
+    fn assert_managed_block_groups_match_direct(
+        label: &str,
+        mut managed: Vec<RefGroup>,
+        mut direct: Vec<RefGroup>,
+    ) {
+        canonicalize_query_groups_for_mode_differential(&mut managed);
+        canonicalize_query_groups_for_mode_differential(&mut direct);
+        assert_eq!(
+            serde_json::to_value(&managed).unwrap(),
+            serde_json::to_value(&direct).unwrap(),
+            "managed block groups diverged from parser-owned Direct Files semantics: {label}"
+        );
+    }
+
+    /// The Direct/managed differential for the shared block evaluator.
+    ///
+    /// One corpus, four evaluator shapes, both storage modes: a plain-text
+    /// whole-graph search, the literal fuzzy `((` block picker, the same search
+    /// under a small `limit` (which is what makes evidence and DTO construction
+    /// happen per winner rather than per retained candidate), and byte- and
+    /// row-bounded block referrers swept ACROSS their truncation boundary.
+    ///
+    /// The budget sweep is the necessity gate for the accounting fix: Direct
+    /// charges payload + page name + 256 per admitted row and latches
+    /// `exceeded`, and the managed referrer loop used to probe a per-group
+    /// overhead per row while accumulating it once per emitted group -- so the
+    /// same `max_bytes` admitted a different number of rows on the two paths.
+    #[test]
+    fn managed_query_evaluator_matches_direct_files_across_shapes_and_budgets() {
+        let fixture = mode_differential_fixture("mode-differential-evaluator", 0xa3f8);
+        let direct = Graph::open(&fixture.graph_root);
+        let handle = open_reopened_managed_actor(&fixture);
+
+        // 1. Plain-text whole-graph search: page branch plus block branch.
+        assert_managed_graph_search_matches_direct(
+            "plain text graph search",
+            managed_graph_search(&handle, "differential needle", 5, 50),
+            direct.run_graph_search("differential needle", 5, 50, false),
+        );
+
+        // 2. Literal fuzzy search -- the `((` block picker. `zqx` occurs on
+        // exactly one page, so this also proves the managed narrowing returns
+        // the same answer the unnarrowed Direct scan does.
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        assert_managed_block_groups_match_direct(
+            "literal fuzzy block search",
+            managed_block_search(&handle, "zqx sentinel", 10),
+            direct.search("zqx sentinel", 10),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(
+            counters.fuzzy_narrowing_passes, 1,
+            "a literal fuzzy block search must consult the managed candidate index: {counters:?}"
+        );
+        assert_eq!(
+            counters.fuzzy_candidate_pages, 1,
+            "`zqx` occurs on one page, so narrowing must select one page: {counters:?}"
+        );
+        assert_eq!(
+            counters.result_page_hydrations, 1,
+            "a narrowed fuzzy search must hydrate only its candidate pages: {counters:?}"
+        );
+
+        // A needle that is nowhere in the graph narrows to nothing, and both
+        // modes answer empty rather than one of them scanning everything.
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        assert_managed_block_groups_match_direct(
+            "literal fuzzy block search with no candidates",
+            managed_block_search(&handle, "zzqqxxjj", 10),
+            direct.search("zzqqxxjj", 10),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.fuzzy_candidate_pages, 0, "{counters:?}");
+        assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
+
+        // 3. Limit-bounded search: the heap keeps `limit` winners and the tie
+        // break decides which. Sweep the limit across the result size so an
+        // off-by-one in the retention rule cannot hide.
+        for limit in [1_usize, 2, 3, 7, 11] {
+            assert_managed_graph_search_matches_direct(
+                &format!("limit-bounded graph search limit={limit}"),
+                managed_graph_search(&handle, "differential needle", 0, limit),
+                direct.run_graph_search("differential needle", 0, limit, false),
+            );
+        }
+
+        // 4. Bounded block referrers, swept across the truncation boundary.
+        // The managed request surface caps both bounds, so "unbounded" here is
+        // the largest request a caller can actually make.
+        const MAX_ROWS: usize = MAX_SYNC_APPLICATION_RESULT_ROWS;
+        const MAX_BYTES: usize = MAX_SYNC_APPLICATION_RESULT_BYTES;
+        let unbounded_direct =
+            direct.block_referrers_bounded(MODE_DIFFERENTIAL_ANCHOR, MAX_ROWS, MAX_BYTES);
+        let unbounded_managed =
+            managed_block_referrers(&handle, MODE_DIFFERENTIAL_ANCHOR, MAX_ROWS, MAX_BYTES);
+        assert_eq!(
+            unbounded_direct.total,
+            MODE_DIFFERENTIAL_PAGES * 4,
+            "the differential corpus must produce one referrer per referring child"
+        );
+        assert_managed_simple_query_matches_direct(
+            "block referrers unbounded",
+            unbounded_managed.clone(),
+            unbounded_direct.clone(),
+        );
+
+        // The two modes charge the SAME rule -- payload + page name + 256 per
+        // admitted row, `exceeded` latched -- to inputs that legitimately
+        // differ: a managed block carries frontend identity (a Logseq UUID or
+        // its managed internal fallback) where a Direct block carries its
+        // structural runtime id, and the payload estimate counts that identity.
+        // So the meaningful parity claim is not "the same integer admits the
+        // same rows" but "the budget that admits k rows admits the SAME k rows,
+        // and admits exactly k". Predicting each mode's boundary from the
+        // shared rule and then checking it is what makes this a real gate: the
+        // superseded managed accounting, which probed a per-group overhead per
+        // row and accumulated it once per emitted group, admits a different
+        // count than the rule predicts as soon as more than one group is
+        // involved.
+        let row_costs = |result: &[RefGroup]| {
+            result
+                .iter()
+                .flat_map(|group| {
+                    group.blocks.iter().map(|block| {
+                        crate::model::block_dto_estimated_bytes(block)
+                            .saturating_add(group.page.len())
+                            .saturating_add(256)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let direct_costs = row_costs(&unbounded_direct.groups);
+        let managed_costs = row_costs(&unbounded_managed.groups);
+        assert_eq!(direct_costs.len(), managed_costs.len());
+        let prefix_sums = |costs: &[usize]| {
+            costs
+                .iter()
+                .scan(0_usize, |running, cost| {
+                    *running = running.saturating_add(*cost);
+                    Some(*running)
+                })
+                .collect::<Vec<_>>()
+        };
+        let direct_boundaries = prefix_sums(&direct_costs);
+        let managed_boundaries = prefix_sums(&managed_costs);
+        for admitted in 1..=direct_boundaries.len() {
+            let managed = managed_block_referrers(
+                &handle,
+                MODE_DIFFERENTIAL_ANCHOR,
+                MAX_ROWS,
+                managed_boundaries[admitted - 1],
+            );
+            let direct_bounded = direct.block_referrers_bounded(
+                MODE_DIFFERENTIAL_ANCHOR,
+                MAX_ROWS,
+                direct_boundaries[admitted - 1],
+            );
+            let rows =
+                |groups: &[RefGroup]| groups.iter().map(|group| group.blocks.len()).sum::<usize>();
+            assert_eq!(
+                rows(&direct_bounded.groups),
+                admitted,
+                "the shared rule must admit exactly the rows its own prefix sum pays for (Direct, admitted={admitted})"
+            );
+            assert_eq!(
+                rows(&managed.groups),
+                admitted,
+                "the shared rule must admit exactly the rows its own prefix sum pays for (managed, admitted={admitted})"
+            );
+            assert_managed_simple_query_matches_direct(
+                &format!("block referrers admitting {admitted} rows"),
+                managed,
+                direct_bounded,
+            );
+        }
+        // Row bounds. A bound at or above the candidate count must agree
+        // exactly, and does.
+        //
+        // BELOW that, the two modes are known to disagree for a reason this
+        // work does not own and did not introduce: the managed candidate scan
+        // stops reading index rows the moment it knows the row bound is
+        // exceeded (`candidate_count > max_rows`), which is why a bounded
+        // managed panel does not walk the graph -- but its index rows arrive in
+        // `(page_id, block_id)` order, so the candidates it keeps are an
+        // arbitrary subset rather than Direct's document-order prefix, and it
+        // reports the bound plus one as `total` rather than the whole candidate
+        // count. Closing that would mean giving up the early-out, which is a
+        // performance/product decision, not an accounting one. What the shared
+        // accounting rule owns -- how many rows survive and whether truncation
+        // is reported -- must still agree, and every retained managed row must
+        // be a genuine referrer.
+        let unbounded_rows = unbounded_direct
+            .groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
+            .collect::<HashSet<_>>();
+        for max_rows in 1..=(MODE_DIFFERENTIAL_PAGES * 4 + 1) {
+            let mut managed =
+                managed_block_referrers(&handle, MODE_DIFFERENTIAL_ANCHOR, max_rows, MAX_BYTES);
+            let direct_bounded =
+                direct.block_referrers_bounded(MODE_DIFFERENTIAL_ANCHOR, max_rows, MAX_BYTES);
+            let label = format!("block referrers max_rows={max_rows}");
+            assert_eq!(managed.exceeded, direct_bounded.exceeded, "{label}");
+            let rows =
+                |groups: &[RefGroup]| groups.iter().map(|group| group.blocks.len()).sum::<usize>();
+            assert_eq!(
+                rows(&managed.groups),
+                rows(&direct_bounded.groups),
+                "{label}: the shared rule must retain the same number of rows"
+            );
+            for group in &managed.groups {
+                for block in &group.blocks {
+                    assert!(
+                        unbounded_rows.contains(&block.raw),
+                        "{label}: managed retained a row Direct does not consider a referrer"
+                    );
+                }
+            }
+            if max_rows >= unbounded_direct.total {
+                let mut direct_groups = (*direct_bounded.groups).clone();
+                canonicalize_query_groups_for_mode_differential(&mut managed.groups);
+                canonicalize_query_groups_for_mode_differential(&mut direct_groups);
+                assert_eq!(managed.total, direct_bounded.total, "{label}");
+                assert_eq!(
+                    serde_json::to_value(managed.groups).unwrap(),
+                    serde_json::to_value(direct_groups).unwrap(),
+                    "managed row-bounded referrers diverged from Direct Files: {label}"
+                );
+            }
+        }
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The managed projection cache: what it saves and that it cannot go stale.
+    ///
+    /// Graph search is deliberately the vehicle -- unlike the simple-query
+    /// evaluator it holds no answer memo, so a repeated evaluation really does
+    /// re-walk every page and the only thing that can have become cheaper is
+    /// the per-block lsdoc projection.
+    ///
+    /// The counters are the architectural claim and hold in any build profile.
+    /// The wall-clock ratio is printed rather than asserted, because a debug
+    /// number cannot be compared against a release ceiling and widening a
+    /// ceiling to fit debug would retire it rather than move it.
+    #[test]
+    fn managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones() {
+        // Block-DENSE on purpose. A one-block-per-page corpus measures the
+        // managed page LOAD, which this cache does not touch; the cost it
+        // removes is one lsdoc parse per block per query, so the fixture has to
+        // put enough blocks behind each page load for that to be the term that
+        // moves.
+        const SYNTHETIC_PAGES: usize = 16;
+        const BLOCKS_PER_PAGE: usize = 128;
+        let fixture = ActivationFixture::scaled_with_blocks(
+            "managed-projection-cache",
+            0xa3fa,
+            SYNTHETIC_PAGES,
+            BLOCKS_PER_PAGE,
+        );
+        let direct = Graph::open(&fixture.graph_root);
+        let pages = direct.list_pages().len();
+        assert!(pages > SYNTHETIC_PAGES, "fixture did not activate at scale");
+        let handle = open_reopened_managed_actor(&fixture);
+        let source = "references";
+
+        let run = || {
+            handle
+                .reset_managed_application_query_instrumentation()
+                .unwrap();
+            let started = Instant::now();
+            let execution = managed_graph_search(&handle, source, 0, 20_000);
+            let elapsed = started.elapsed();
+            (
+                elapsed,
+                execution,
+                handle.managed_application_query_instrumentation().unwrap(),
+            )
+        };
+
+        let (cold_elapsed, cold, cold_counters) = run();
+        assert_eq!(
+            cold_counters.projection_cache_misses, pages,
+            "the first managed evaluation must convert every page exactly once: {cold_counters:?}"
+        );
+        assert_eq!(cold_counters.projection_cache_hits, 0, "{cold_counters:?}");
+        assert_managed_graph_search_matches_direct(
+            "cold managed graph search",
+            cold,
+            direct.run_graph_search(source, 0, 20_000, false),
+        );
+
+        let (warm_elapsed, warm, warm_counters) = run();
+        assert_eq!(
+            warm_counters.projection_cache_hits, pages,
+            "a repeated evaluation over unchanged pages must reuse every converted tree: {warm_counters:?}"
+        );
+        assert_eq!(
+            warm_counters.projection_cache_misses, 0,
+            "a repeated evaluation must not re-parse a single unchanged page: {warm_counters:?}"
+        );
+        assert_managed_graph_search_matches_direct(
+            "warm managed graph search",
+            warm,
+            direct.run_graph_search(source, 0, 20_000, false),
+        );
+        eprintln!(
+            "managed_projection_cache cold_ms={:.3} warm_ms={:.3} pages={pages} blocks_per_synthetic_page={BLOCKS_PER_PAGE}",
+            cold_elapsed.as_secs_f64() * 1_000.0,
+            warm_elapsed.as_secs_f64() * 1_000.0,
+        );
+
+        // The leg that matters. A retained tree is reused only after it is
+        // proved equal to the incoming DTO tree, so a saved page must MISS on
+        // the very next query and answer from its new content -- with no
+        // invalidation hook for the save path to have forgotten to call.
+        let witness_path = direct
+            .list_pages()
+            .into_iter()
+            .next()
+            .expect("the projection-cache fixture must contain pages")
+            .rel_path;
+        let (mut page, revision) = load_application_exact(&handle, &witness_path);
+        page.blocks[0].raw = format!("{} projection-cache-witness", page.blocks[0].raw);
+        let save = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        assert!(
+            matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+            "the projection-cache fixture edit was not accepted: {save:?}"
+        );
+
+        let (_, _, after_save) = run();
+        assert_eq!(
+            after_save.projection_cache_misses, 1,
+            "exactly the saved page must be reconverted: {after_save:?}"
+        );
+        assert_eq!(
+            after_save.projection_cache_hits,
+            pages - 1,
+            "every page the save did not touch must still be reused: {after_save:?}"
+        );
+
+        let reopened_direct = Graph::open(&fixture.graph_root);
+        let (_, after_save_execution, _) = run();
+        assert_managed_graph_search_matches_direct(
+            "managed graph search after an accepted save",
+            after_save_execution,
+            reopened_direct.run_graph_search(source, 0, 20_000, false),
         );
 
         assert!(matches!(

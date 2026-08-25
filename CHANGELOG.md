@@ -8,8 +8,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Queries and search are much faster on Managed Storage.** Every managed
+  query used to re-parse every block of every candidate page, every time -- so
+  a page full of `{{query}}` re-parsed the graph on each open, and search
+  re-parsed it on each keystroke. Unchanged pages are now parsed once and
+  reused; an edited page is re-read on the very next query. Searching for a
+  literal phrase also consults the stored text index first instead of reading
+  every page, and a result-limited search now does its work only for the
+  results it keeps.
+
 ### Fixed
 
+- **Managed Storage and Direct Files answer the same query the same way.** The
+  two storage modes evaluated block queries through separate copies of the same
+  logic, and the copies had drifted: a byte-budgeted block-referrers panel
+  admitted a different number of rows, and kept a different set of them, on the
+  two modes for identical content. Both now use one evaluator and one
+  result-budget rule.
 - **Journal recency respects the configured title format.** On graphs with a
   custom `:journal/page-title-format`, `(sort-by modified)` ranked every
   journal last on three of the four query paths (they parsed titles with the

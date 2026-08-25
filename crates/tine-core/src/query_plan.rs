@@ -19,6 +19,21 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_EVIDENCE_SPANS: usize = 32;
 
+/// How many times the shared block evaluator has produced match evidence and a
+/// result DTO. The architectural claim is that this is once per WINNER, not
+/// once per retained candidate -- O(limit), not O(retained) -- and a counter is
+/// the only way to state that as a test rather than as a comment.
+#[cfg(test)]
+thread_local! {
+    static BLOCK_EVIDENCE_EVALUATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_block_evidence_evaluations() -> usize {
+    BLOCK_EVIDENCE_EVALUATIONS.with(|count| count.replace(0))
+}
+
 /// The entity kind a query-plan branch selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1678,6 +1693,8 @@ where
             .into_iter()
             .map(|winner| {
                 let projection = winner.block.projection();
+                #[cfg(test)]
+                BLOCK_EVIDENCE_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
                 let matched = eval_ranked_block_expr(
                     plan,
                     &branch.predicate,
@@ -1841,6 +1858,93 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         (dir, graph)
+    }
+
+    /// The shared block evaluator, driven on both storage modes over literally
+    /// the same content: identical results, and evidence plus result DTOs
+    /// produced once per WINNER rather than once per retained candidate.
+    ///
+    /// The evaluation count is the point. The managed twin used to call
+    /// `eval_ranked_block_expr` and build a `BlockDto` inside the walk for
+    /// every candidate the heap retained, so a `limit`-bounded search over a
+    /// large page set did O(retained) work where Direct did O(limit). Asserting
+    /// the count is what turns "they share an evaluator now" from a comment
+    /// into a test.
+    #[test]
+    fn application_block_evaluator_matches_direct_and_evaluates_evidence_per_winner() {
+        const PAGES: usize = 5;
+        const BLOCKS: usize = 20;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tine-query-plan-modes-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        for page in 0..PAGES {
+            let mut content = String::new();
+            for block in 0..BLOCKS {
+                content.push_str(&format!(
+                    "- parent {page}-{block} needle here
+"
+                ));
+                content.push_str(&format!(
+                    "	- child {page}-{block} needle nested
+"
+                ));
+            }
+            fs::write(dir.join("pages").join(format!("Mode-{page}.md")), content).unwrap();
+        }
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let entries = graph.list_pages();
+        let pages = graph.with_pages(|pages| {
+            pages
+                .iter()
+                .map(|(entry, doc)| ApplicationQueryPlanPage {
+                    entry: entry.clone(),
+                    // Cloning a `DocBlock` resets its memoized projection, so
+                    // the managed side genuinely starts cold here rather than
+                    // borrowing Direct's warm cache.
+                    roots: std::sync::Arc::new(doc.roots.clone()),
+                })
+                .collect::<Vec<_>>()
+        });
+        let matching = PAGES * BLOCKS * 2;
+        for limit in [1_usize, 3, 7, 50, 1_000] {
+            let plan = QueryPlan::block_search("needle", limit);
+            let _ = take_block_evidence_evaluations();
+            let direct = plan.execute(&graph, || false);
+            let direct_evaluations = take_block_evidence_evaluations();
+            let managed = plan.execute_application_with_explain(
+                entries.clone(),
+                &pages,
+                Vec::new(),
+                Vec::new(),
+                || false,
+                true,
+            );
+            let managed_evaluations = take_block_evidence_evaluations();
+            assert_eq!(
+                serde_json::to_value(&managed).unwrap(),
+                serde_json::to_value(&direct).unwrap(),
+                "managed block evaluation diverged from Direct Files at limit={limit}"
+            );
+            assert_eq!(
+                direct_evaluations, managed_evaluations,
+                "the two modes must do the same amount of evidence work at limit={limit}"
+            );
+            assert_eq!(
+                managed_evaluations,
+                limit.min(matching),
+                "evidence and DTOs must be produced once per winner, not once per retained candidate, at limit={limit}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn block_fingerprint(groups: Vec<crate::model::RefGroup>) -> Vec<(String, String)> {
