@@ -3,7 +3,7 @@
 
 import { backend } from "./backend";
 import { managedStorageRuntime } from "./managedStorageRuntime";
-import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
+import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
@@ -691,13 +691,25 @@ export function applyConfigDerivedState(meta: GraphMeta, previous: GraphMeta | n
     // Match this graph's journal titles.
     setJournalTitleFormat(meta?.journal_page_title_format);
   }
-  if (moved((m) => [m.favorites, m.favorites_page])) {
-    seedFavorites(meta?.favorites ?? []);
+  // Comparing the FILE is not enough for favorites. A managed graph has no
+  // retained `Graph` for the watcher to ask, so it re-reads configuration after
+  // every settings write including Tine's own — and re-seeding would drop the
+  // arrangement and re-fetch its page on every star toggled in the sidebar.
+  // Compare what the user is actually being shown instead.
+  const incoming = meta?.favorites ?? [];
+  const shown = favorites().map((f) => f.name);
+  const alreadyShowing =
+    previous !== null &&
+    previous.favorites_page === meta?.favorites_page &&
+    shown.length === incoming.length &&
+    shown.every((name, i) => name === incoming[i]);
+  if (moved((m) => [m.favorites, m.favorites_page]) && !alreadyShowing) {
+    seedFavorites(incoming);
     // The arrangement (nesting and order) lives in a page named by
     // `:tine/favorites-page`; config.edn stays the authority on WHICH pages are
     // favorited, so a change made in Logseq is honoured whether Tine was
     // running at the time or not.
-    void loadFavoritesLayout(meta?.favorites ?? [], meta?.favorites_page ?? null);
+    void loadFavoritesLayout(incoming, meta?.favorites_page ?? null);
   }
 }
 
