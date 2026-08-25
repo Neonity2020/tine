@@ -410,6 +410,29 @@
    }
   },
   {
+   "id": "REG-IOS-GUIDE-COPY-ATOMIC-PUBLICATION-001",
+   "title": "Copying the bundled Guide can atomically create pages on iOS",
+   "family": "platform-compatibility",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "ios"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/iosAtomicPublicationContract.test.ts",
+     "crates/tine-core/src/onboarding.rs"
+    ],
+    "scenario": "ios.guide-copy-atomic-publication",
+    "failBefore": "proven"
+   },
+   "notes": "A physical iPhone running the first public TestFlight beta reached the bundled Guide but Copy the guide into your graph failed because model.rs selected renameatx_np(RENAME_EXCL) only for macOS and compiled iOS into the unsupported fallback. The correction applies the Darwin primitive to iOS across graph projection, managed no-clobber moves, enrollment publication, and cleanup-marker rotation; the contract test fails if a macOS-only atomic-publication branch returns."
+  },
+  {
    "id": "REG-WATCHER-ATOMIC-SAVE-SCOPE-001",
    "title": "Atomic page-save events reconcile incrementally and never rescan unrelated graphs",
    "family": "performance",
