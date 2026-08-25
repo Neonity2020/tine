@@ -125,6 +125,8 @@ const coreWindowsTests = [
   "model::tests::windows_handle_relative_noreplace_preserves_occupied_destination",
   "model::tests::windows_first_save_and_ordinary_rename_preserve_exact_projection",
   "model::tests::windows_directory_durability_limit_does_not_block_save_or_rename",
+  "model::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt",
+  "model::tests::windows_direct_publication_receipt_requires_revision_and_file_identity",
   "model::tests::checked_open_accepts_an_approved_windows_assets_junction",
   "model::tests::projection_windows_held_handle_link_count_tracks_one_and_two_links",
   "model::tests::windows_live_graph_root_move_is_denied_without_rebinding",
@@ -164,9 +166,9 @@ assert.deepEqual(
     listedInventory("tine-core", coreSmokeTests)
   ),
   {
-    coreTestCount: 28,
-    coreSmokeTestCount: 27,
-    windowsNamedCount: 12,
+    coreTestCount: 30,
+    coreSmokeTestCount: 29,
+    windowsNamedCount: 14,
     bootstrapWitnessCount: 8,
   }
 );
@@ -185,6 +187,7 @@ assert.throws(
   /Windows core smoke selection omitted required test/
 );
 assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_live_graph_root_move_is_denied_without_rebinding\)/);
+assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt\)/);
 assert.doesNotMatch(WINDOWS_CORE_SMOKE_FILTERSET, /all\(\)|fast_commit/);
 assert.equal(LINUX_TINE_CORE_SHARD_COUNT, 4);
 
