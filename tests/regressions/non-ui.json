@@ -5064,7 +5064,7 @@
     "android"
    ],
    "layer": "rust-integration",
-   "status": "fixed",
+   "status": "covered",
    "coverage": {
     "tests": [
      "crates/tine-core/src/sync_runtime.rs::tests::rapid_task_edits_with_deleted_continuation_lines_remain_saveable_and_reopen",
