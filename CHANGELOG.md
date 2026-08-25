@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Direct Files delete, rename, trash, and conflict-copy moves no longer read
+  every document in the graph.** These exact no-clobber moves now validate the
+  source and destination through retained metadata and portable path checks;
+  document contents remain untouched and unrelated files are never opened.
+
 ## [0.6.96] - 2026-08-24
 
 ### Added

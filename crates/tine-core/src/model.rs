@@ -501,6 +501,10 @@ enum EditorPublicationAuthority {
 enum GraphTextPublicationValidation {
     /// Standalone callers have not established graph-wide collision evidence.
     CompleteIndex,
+    /// One exact source/destination transition proves portable aliases,
+    /// retained parent ownership, the source's single-link identity, and the
+    /// destination's absence directly. No document contents are relevant.
+    PathLocal,
     /// A surrounding transaction owns graph-text identity authority and has
     /// already completed a bounded no-follow inventory. Publication still
     /// repeats exact target, single-link, portable-path, and no-clobber checks.
@@ -8836,7 +8840,8 @@ impl Graph {
                     self.managed_optional_file_identity(permit, path)?,
                 )
                 .map(|_| ()),
-            GraphTextPublicationValidation::TransactionInventory => (|| {
+            GraphTextPublicationValidation::PathLocal
+            | GraphTextPublicationValidation::TransactionInventory => (|| {
                 self.validate_graph_text_portable_aliases_path_local(
                     permit,
                     &managed_path,
@@ -9173,7 +9178,7 @@ impl Graph {
             permit,
             source,
             destination,
-            GraphTextPublicationValidation::CompleteIndex,
+            GraphTextPublicationValidation::PathLocal,
         )
     }
 
@@ -9217,7 +9222,7 @@ impl Graph {
                     format!("guarded graph-text destination is not portable: {error}"),
                 )
             })?;
-        if validation == GraphTextPublicationValidation::TransactionInventory {
+        if validation != GraphTextPublicationValidation::CompleteIndex {
             self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
             self.validate_graph_text_portable_aliases_path_local(
                 permit,
@@ -9234,7 +9239,7 @@ impl Graph {
             Err(error) => return Err(error),
         }
         managed_write_before_mutation_hook()?;
-        if validation == GraphTextPublicationValidation::TransactionInventory {
+        if validation != GraphTextPublicationValidation::CompleteIndex {
             self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
             self.validate_existing_graph_text_target_exact(&source, &source_managed, None)?;
             self.validate_graph_text_portable_aliases_path_local(
@@ -38563,6 +38568,43 @@ mod tests {
         assert_eq!(stats.count, 0, "asset trash should be empty");
         assert_eq!(stats.pages, 1, "page trash should still be counted");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Moving one exact Direct Files document to typed trash needs names and
+    /// retained file identities, never the contents of unrelated documents.
+    #[test]
+    fn direct_trash_move_does_not_capture_unrelated_graph_text_bytes() {
+        let dir = scratch("direct-trash-metadata-only");
+        fs::write(dir.join("journals/2026_08_25.md"), b"- discard me\n").unwrap();
+        for index in 0..24 {
+            fs::write(
+                dir.join(format!("pages/Unrelated {index}.md")),
+                format!("- unrelated {index}\n"),
+            )
+            .unwrap();
+        }
+        let graph = Graph::open(&dir);
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        let before_reads = managed_text_capture_reads();
+        let before_builds = graph.guarded_graph_text_identity_report().complete_builds;
+
+        graph.trash_journal_file("2026_08_25.md").unwrap();
+
+        assert_eq!(managed_text_capture_reads(), before_reads);
+        assert_eq!(
+            graph.guarded_graph_text_identity_report().complete_builds,
+            before_builds
+        );
+        assert!(!dir.join("journals/2026_08_25.md").exists());
+        for index in 0..24 {
+            assert_eq!(
+                fs::read(dir.join(format!("pages/Unrelated {index}.md"))).unwrap(),
+                format!("- unrelated {index}\n").as_bytes()
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
