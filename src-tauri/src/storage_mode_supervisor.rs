@@ -94,6 +94,18 @@ pub(crate) struct StorageTransitionEvent {
     pub(crate) outcome_code: Option<String>,
 }
 
+/// Content-free snapshot used by the user-created diagnostic report. It omits
+/// the canonical root and the actual window label by construction.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StorageTransitionDiagnostic {
+    operation_id: StorageOperationId,
+    window_kind: &'static str,
+    kind: StorageTransitionKind,
+    phase: StorageTransitionPhase,
+    elapsed_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BegunStorageTransition {
     pub(crate) operation: StorageTransitionOperation,
@@ -906,6 +918,7 @@ impl StorageModeSupervisor {
     }
 
     fn emit(&self, app: &tauri::AppHandle, event: StorageTransitionEvent) {
+        crate::debug::record_storage_transition(&event);
         crate::debug::diag(format!(
             "storage transition: id={}; window={}; kind={:?}; phase={:?}; elapsed_ms={}; terminal={}; outcome={:?}",
             event.operation_id,
@@ -918,6 +931,32 @@ impl StorageModeSupervisor {
         ));
         let window = event.window.clone();
         let _ = app.emit_to(&window, STORAGE_TRANSITION_EVENT, event);
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> Vec<StorageTransitionDiagnostic> {
+        let now_ms = self.now_ms();
+        self.model
+            .lock()
+            .map(|model| {
+                model
+                    .active_by_window
+                    .iter()
+                    .map(|(window, active)| StorageTransitionDiagnostic {
+                        operation_id: active.operation.operation_id,
+                        window_kind: if window == "main" {
+                            "main"
+                        } else if window.starts_with("graph-") {
+                            "graph"
+                        } else {
+                            "other"
+                        },
+                        kind: active.operation.kind,
+                        phase: active.operation.phase,
+                        elapsed_ms: now_ms.saturating_sub(active.started_ms),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 

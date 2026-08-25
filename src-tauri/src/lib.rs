@@ -17,9 +17,8 @@ mod graph;
 mod ios_folder_picker;
 #[cfg(target_os = "linux")]
 mod linux_window_identity;
-/// Test-only: the enumeration of what every command can do under Tine-managed
-/// storage. Nothing in the shipped app reads it.
-#[cfg(test)]
+/// Enumeration of what every command can do under Tine-managed storage. The
+/// diagnostics boundary also uses it to reject invented/free-form IPC names.
 mod managed_command_surface;
 mod media_protocol;
 mod migrate_identifier;
@@ -61,7 +60,11 @@ use commands::{
     trash_asset, trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff,
     write_highlights, write_pdf_view_state,
 };
-use debug::{debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger};
+use debug::{
+    clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
+    diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, flight_init,
+    install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
+};
 use graph::{
     app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph,
     default_graph_parent, inspect_graph_access, load_graph, open_graph_window, startup_graph_path,
@@ -418,7 +421,6 @@ pub fn run() {
     // milestone — and any panic — is captured to the log file from the very start.
     debug_init();
     install_panic_logger();
-    debug_header();
     diag("main() entered");
 
     // AppImages bundle their own libwayland-client.so; on a Wayland session it can
@@ -498,6 +500,7 @@ pub fn run() {
     data_home::ensure_usable(migrate_identifier::CURRENT_IDENTIFIER);
 
     migrate_identifier::run_early();
+    debug_header();
 
     // Wayland resolves the shell/titlebar icon by matching a window app ID to a
     // desktop-entry basename. Packages ship that identity themselves; the raw
@@ -616,7 +619,7 @@ pub fn run() {
     #[cfg(any(mobile, target_os = "windows"))]
     let builder = builder.plugin(tauri_plugin_opener::init());
 
-    builder
+    let result = builder
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
@@ -663,6 +666,12 @@ pub fn run() {
             next_window: AtomicU64::new(1),
         })
         .setup(|app| {
+            // Resolve through Tauri rather than desktop path conventions: this
+            // is the exact sandbox-private app-data home on Android and iOS too.
+            match app.path().app_data_dir() {
+                Ok(path) => flight_init(path.join("diagnostics")),
+                Err(error) => diag(format!("diagnostic app-data path unavailable: {error}")),
+            }
             diag("setup() begin");
             #[cfg(target_os = "linux")]
             {
@@ -888,13 +897,21 @@ pub fn run() {
             list_spellcheck_dictionaries,
             debug_info,
             debug_log,
+            diagnostic_ipc_event,
+            diagnostic_frontend_event,
+            diagnostic_report,
+            save_diagnostic_report,
+            clear_diagnostics,
             prepare_tine_quit,
             tine_quit,
             close_graph_window,
             tine_open_devtools
         ])
-        .run(context)
-        .expect("error while running tauri application");
+        .run(context);
+    if result.is_ok() {
+        mark_clean_shutdown();
+    }
+    result.expect("error while running tauri application");
 }
 
 #[cfg(test)]

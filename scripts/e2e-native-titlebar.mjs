@@ -165,6 +165,28 @@ try {
     throw new Error("Settings did not reflect the native frame applied at startup");
   }
 
+  // The same real production binary must expose its safe report through native
+  // IPC. This catches command-registration, app-data, report-schema and Settings
+  // wiring failures that a browser render test cannot see.
+  await browser.$("button=Diagnostics").click();
+  const createReport = await browser.$("button=Create diagnostic report");
+  await createReport.waitForExist({ timeout: 5_000 });
+  await createReport.click();
+  const reportPreview = await browser.$(".diagnostics-preview textarea");
+  await reportPreview.waitForExist({ timeout: 5_000 });
+  const reportText = await reportPreview.getValue();
+  const report = JSON.parse(reportText);
+  if (report.schemaVersion !== 1 || report.privacy?.automaticUpload !== false) {
+    throw new Error(`diagnostic report has the wrong safety schema: ${reportText}`);
+  }
+  if (report.privacy?.containsGraphContent !== false || report.runtime?.recorderActive !== true) {
+    throw new Error(`diagnostic report did not preserve its privacy/runtime contract: ${reportText}`);
+  }
+  if (reportText.includes(GRAPH) || reportText.includes("native titlebar fixture")) {
+    throw new Error("diagnostic report exposed the fixture graph path or content");
+  }
+  await browser.saveScreenshot(path.join(ARTIFACTS, "diagnostics-report.png"));
+
   // Allow the close-request handler to be installed before driving the actual
   // window-manager widget rather than synthesizing WM_DELETE_WINDOW directly.
   await sleep(500);
@@ -202,7 +224,7 @@ try {
   }
   await waitFor(() => windowIds().length === 0, 12_000,
     `native close control did not close Tine; geometry=${JSON.stringify(g)} extents=${JSON.stringify(decorated.extents)} click=${closeX},${closeY} state=${JSON.stringify(clickState)}`);
-  console.log(`PASS: Linux native close control closed Tine safely; extents=${JSON.stringify(decorated.extents)} click=${closeX},${closeY}`);
+  console.log(`PASS: privacy-safe diagnostics and Linux native close control; extents=${JSON.stringify(decorated.extents)} click=${closeX},${closeY}`);
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}

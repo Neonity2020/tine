@@ -3,7 +3,7 @@
 // backend's shape so the UI behaves identically.
 
 import { notifyGraphRebound } from "./modeHooks";
-import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
+import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
 import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
@@ -2182,9 +2182,24 @@ export function mockBackend(): Backend {
       return ["cs_CZ", "de_DE", "en_GB", "en_US", "fr_FR", "sk_SK"];
     },
     async debugInfo(): Promise<DebugInfo> {
-      return { enabled: false, path: "" };
+      return { enabled: false, path: "", recorderActive: false, previousExitUnclean: false };
     },
     async debugLog(_line: string): Promise<void> {
+      // no-op in the browser mock
+    },
+    async diagnosticReport(): Promise<DiagnosticReport> {
+      return {
+        text: JSON.stringify({ schemaVersion: 1, mock: true }, null, 2),
+        suggestedFileName: "tine-diagnostics-mock.json",
+      };
+    },
+    async saveDiagnosticReport(): Promise<boolean> {
+      return false;
+    },
+    async clearDiagnostics(): Promise<void> {
+      // no-op in the browser mock
+    },
+    async diagnosticFrontendEvent(): Promise<void> {
       // no-op in the browser mock
     },
     async readHighlights(pdf: string): Promise<Highlight[]> {

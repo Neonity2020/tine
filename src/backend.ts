@@ -733,11 +733,22 @@ export interface Backend {
   debugInfo(): Promise<DebugInfo>;
   /** Forward a frontend milestone / error into the backend debug log. */
   debugLog(line: string): Promise<void>;
+  diagnosticReport(buildCommit: string, buildTime: string): Promise<DiagnosticReport>;
+  saveDiagnosticReport(buildCommit: string, buildTime: string): Promise<boolean>;
+  clearDiagnostics(): Promise<void>;
+  diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number): Promise<void>;
 }
 
 export interface DebugInfo {
   enabled: boolean;
   path: string;
+  recorderActive: boolean;
+  previousExitUnclean: boolean;
+}
+
+export interface DiagnosticReport {
+  text: string;
+  suggestedFileName: string;
 }
 
 /** Backend-visible rendering-environment facts (Linux-relevant; all false on
@@ -797,6 +808,17 @@ const REBINDING_COMMANDS = new Set([
   "restore_backup",
 ]);
 
+const DIAGNOSTIC_COMMANDS = new Set([
+  "debug_info",
+  "debug_log",
+  "diagnostic_ipc_event",
+  "diagnostic_frontend_event",
+  "diagnostic_report",
+  "save_diagnostic_report",
+  "clear_diagnostics",
+]);
+const SLOW_IPC_MS = 500;
+
 class TauriBackend implements Backend {
   private invoke!: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   private convertFileSrc!: (path: string, protocol?: string) => string;
@@ -819,7 +841,33 @@ class TauriBackend implements Backend {
     const leasedArgs = bindingGeneration
       ? { ...(args ?? {}), bindingGeneration }
       : args;
-    const result = await this.invoke<T>(cmd, leasedArgs);
+    const started = performance.now();
+    let slow = false;
+    let slowTimer: ReturnType<typeof setTimeout> | undefined;
+    const reportPhase = (phase: "slow" | "completed" | "failed", elapsedMs: number) => {
+      if (DIAGNOSTIC_COMMANDS.has(cmd)) return;
+      void this.invoke<void>("diagnostic_ipc_event", {
+        command: cmd,
+        phase,
+        elapsedMs: Math.max(0, Math.round(elapsedMs)),
+      }).catch(() => {});
+    };
+    if (!DIAGNOSTIC_COMMANDS.has(cmd)) {
+      slowTimer = setTimeout(() => {
+        slow = true;
+        reportPhase("slow", performance.now() - started);
+      }, SLOW_IPC_MS);
+    }
+    let result: T;
+    try {
+      result = await this.invoke<T>(cmd, leasedArgs);
+    } catch (error) {
+      if (slowTimer !== undefined) clearTimeout(slowTimer);
+      reportPhase("failed", performance.now() - started);
+      throw error;
+    }
+    if (slowTimer !== undefined) clearTimeout(slowTimer);
+    if (slow) reportPhase("completed", performance.now() - started);
     // A command that makes the core REBIND — `refresh_graph` installs a fresh
     // `Graph`, with a fresh (empty) editor-activation registry — must announce
     // it, or this side keeps tokens naming editors the core has never heard of
@@ -1627,6 +1675,18 @@ class TauriBackend implements Backend {
   }
   debugLog(line: string) {
     return this.call<void>("debug_log", { line });
+  }
+  diagnosticReport(buildCommit: string, buildTime: string) {
+    return this.call<DiagnosticReport>("diagnostic_report", { buildCommit, buildTime });
+  }
+  saveDiagnosticReport(buildCommit: string, buildTime: string) {
+    return this.call<boolean>("save_diagnostic_report", { buildCommit, buildTime });
+  }
+  clearDiagnostics() {
+    return this.call<void>("clear_diagnostics");
+  }
+  diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number) {
+    return this.call<void>("diagnostic_frontend_event", { kind, line, column, delayMs });
   }
   getSmoothScroll() {
     return this.call<boolean>("get_smooth_scroll");

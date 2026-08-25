@@ -24,6 +24,14 @@ describe("managed-storage diagnostics", () => {
     );
   });
 
+  it("keeps the content-free join summary and drops private path detail lines", () => {
+    expect(safeManagedErrorDetail(
+      "managed sync join failed at provider scan: sync actor refused request: sync join refused: notes not in the shared provider frontier; local-pages=1045 shared-pages=1045 local-only=0 shared-only=0 changed=1 (kind=0 preamble=0 outline=0 explicit-ids=1); authorities unchanged\nclean join mismatch detail: changed path=\"pages/Private Page.md\" categories=explicit-ids",
+    )).toBe(
+      "managed sync join failed at provider scan: sync actor refused request: sync join refused: notes not in the shared provider frontier; local-pages=1045 shared-pages=1045 local-only=0 shared-only=0 changed=1 (kind=0 preamble=0 outline=0 explicit-ids=1); authorities unchanged",
+    );
+  });
+
   it("preserves a disappeared manifest diagnosis without exposing its identifier", () => {
     expect(safeManagedErrorDetail(
       "managed sync join failed at provider scan: provider evidence disappeared during join at manifests/private-id.manifest",

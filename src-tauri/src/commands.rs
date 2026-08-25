@@ -1262,6 +1262,21 @@ fn report_direct_save_diagnostics(
         Some(error) => tine_core::model::direct_save_failure_code(error),
         None => "ok",
     };
+    crate::debug::record_direct_save(
+        outcome,
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        u64::try_from(report.complete_builds).unwrap_or(u64::MAX),
+        u64::try_from(report.exact_updates).unwrap_or(u64::MAX),
+        report.invalidated,
+        report
+            .last_build
+            .as_ref()
+            .map(|build| u64::try_from(build.captured_entries).unwrap_or(u64::MAX)),
+        report
+            .last_build
+            .as_ref()
+            .map(|build| u64::try_from(build.captured_bytes).unwrap_or(u64::MAX)),
+    );
     let build = report.last_build.map_or_else(
         || " last_build=none".to_string(),
         |build| {

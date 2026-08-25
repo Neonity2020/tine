@@ -446,7 +446,12 @@ fallback.
    the complete disk-expressible page/outline semantics with the currently
    synchronized Markdown/Org graph. A mismatch leaves both authorities
    unchanged; equality installs the provider history without rewriting graph
-   bytes. Local-only endpoint and device identities remain local.
+   bytes. A refusal's shareable first line reports complete page and mismatch
+   category counts. Local diagnostics additionally name at most 32 differing
+   relative paths and whether each is local-only, shared-only, or differs in
+   kind, preamble, outline, or externally supplied block IDs; they never print
+   note content or UUID values. Local-only endpoint and device identities
+   remain local.
 3. **SharePrepared/Joining → SharedActive.** Each device records its role
    (`Initiator` or `Joiner`) in its own enrollment. The descriptor remains the
    shared identity; local endpoint/device IDs remain local.
@@ -578,9 +583,11 @@ first durable step:
 | This device is itself sharing, joining, or holding an unfinished cut | Adopting would abandon devices joined to this one; finish or return to Direct Files first. |
 | This device is already in Direct Files | There is no managed history to set aside; use the ordinary join. |
 
-Every one of those strings is a single line and carries a diagnostic-class word,
-because the panel keeps only a native message's first line and drops lines with
-no recognised class.
+Every user-facing first line carries a diagnostic-class word, because the panel
+keeps only that first line and drops lines with no recognised class. A refusal
+may append the bounded local-only diagnostic continuation defined in §2.3; it
+is written to the detailed local trace and is not copied into the panel or the
+privacy-safe flight recorder.
 
 ### 2.4 Lazy activation and clean runtime boundary
 
