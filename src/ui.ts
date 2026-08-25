@@ -1,5 +1,5 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
-import { createSignal, useContext } from "solid-js";
+import { createMemo, createSignal, useContext } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
 import type {
   ConflictObject,
@@ -12,6 +12,8 @@ import type {
 } from "./types";
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
+import { membershipChanged, resetFavoritesLayout, setMembershipSink, storedFavoritesLayout } from "./favoritesStore";
+import { reconcileLayout } from "./favoritesLayout";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
 import { route, focusBlock, openPageTarget, scheduleSessionSave, type PageTarget } from "./router";
 import { PaneContext } from "./paneContext";
@@ -1089,8 +1091,25 @@ export function isFavorite(name: string): boolean {
 function persistFavorites(next: FavItem[]) {
   // Persist to config.edn :favorites so favorites travel with the graph and stay
   // scoped to it. config.edn stores names only; kind is re-derived on seed.
-  void backend().setFavorites(next.map((f) => f.name)).catch(() => {});
+  const names = next.map((f) => f.name);
+  void backend().setFavorites(names).catch(() => {});
+  // Keep the arrangement (groups and order) in step. On a graph that has never
+  // grouped anything this only updates the in-memory layout — no page is
+  // created, and behaviour is exactly what it was before groups existed.
+  membershipChanged(names);
 }
+// Arrangement changes (reorder, move between groups) project their display
+// order back into the flat list every other consumer reads.
+setMembershipSink((names) =>
+  setFavorites(names.map((name): FavItem => ({ name, kind: isJournalTitle(name) ? "journal" : "page" })))
+);
+/** The arrangement AS RENDERED: the stored groups reconciled against live
+ *  membership on every read. Deriving it rather than storing it is what makes
+ *  it impossible for the sidebar to show a favorite that is no longer favorited,
+ *  or to miss one that is. */
+export const favoritesLayout = createMemo(() =>
+  reconcileLayout(storedFavoritesLayout(), favorites().map((f) => f.name))
+);
 export function toggleFavorite(name: string, kind: "page" | "journal" = "page") {
   const f = favorites();
   const target = kind === "page" ? resolveAlias(name) : name;
@@ -1215,6 +1234,10 @@ export function renamePageInNavigation(fromOrName: PageTarget | string, toOrName
  *  stores names only; kind is re-derived so a favorited journal still routes as a
  *  journal (not a would-be-empty page). */
 export function seedFavorites(names: string[]) {
+  // A seeded membership list always implies a fresh arrangement: an
+  // arrangement built for one graph must never outlive it and re-order
+  // another's favorites. `loadFavoritesLayout` re-populates it right after.
+  resetFavoritesLayout();
   setFavorites(
     names.map((name): FavItem => ({ name, kind: isJournalTitle(name) ? "journal" : "page" }))
   );

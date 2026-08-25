@@ -9,7 +9,7 @@ import {
   moveFavoriteRow,
   renameGroup,
   setGroupCollapsed,
-  favoritesLayout,
+  storedFavoritesLayout,
   favoritesLayoutPage,
   loadFavoritesLayout,
   persistFavoritesLayout,
@@ -41,15 +41,15 @@ describe("favorites arrangement store", () => {
     });
     // config.edn no longer lists Stale (unfavorited in Logseq) and adds Fresh.
     await loadFavoritesLayout(["Alpha", "Beta", "Fresh"], "Favorites");
-    expect(favoritesLayout().map((g) => g.name)).toEqual([null, "Work"]);
-    expect(favoritesLayout()[0].items.map((i) => i.name)).toEqual(["Alpha", "Fresh"]);
-    expect(favoritesLayout()[1].items.map((i) => i.name)).toEqual(["Beta"]);
+    expect(storedFavoritesLayout().map((g) => g.name)).toEqual([null, "Work"]);
+    expect(storedFavoritesLayout()[0].items.map((i) => i.name)).toEqual(["Alpha", "Fresh"]);
+    expect(storedFavoritesLayout()[1].items.map((i) => i.name)).toEqual(["Beta"]);
   });
 
   it("keeps favorites when the arrangement page cannot be read", async () => {
     vi.spyOn(backend(), "getPage").mockRejectedValue(new Error("gone"));
     await loadFavoritesLayout(["Alpha", "Beta"], "Favorites");
-    expect(favoritesLayout()[0].items.map((i) => i.name)).toEqual(["Alpha", "Beta"]);
+    expect(storedFavoritesLayout()[0].items.map((i) => i.name)).toEqual(["Alpha", "Beta"]);
   });
 
   // The important one: a user who never groups anything must not find a page in
@@ -117,8 +117,8 @@ describe("favorites arrangement store", () => {
 
     adoptExternalMembership(["Alpha", "AddedInLogseq"]);
 
-    expect(favoritesLayout()[0].items.map((i) => i.name)).toEqual(["AddedInLogseq"]);
-    expect(favoritesLayout()[1].items.map((i) => i.name)).toEqual(["Alpha"]);
+    expect(storedFavoritesLayout()[0].items.map((i) => i.name)).toEqual(["AddedInLogseq"]);
+    expect(storedFavoritesLayout()[1].items.map((i) => i.name)).toEqual(["Alpha"]);
     expect(savePage).not.toHaveBeenCalled();
     expect(setFavorites).not.toHaveBeenCalled();
   });

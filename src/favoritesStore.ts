@@ -25,7 +25,11 @@ import {
 import { createSignal } from "solid-js";
 
 const [layout, setLayoutSignal] = createSignal<FavLayout>(emptyLayout());
-export const favoritesLayout = layout;
+/** The STORED arrangement: which groups exist, their order and collapse, and
+ *  which favorite sits in which. It is not the render source — `favoritesLayout`
+ *  in ui.ts reconciles this against live membership on every read, so the two
+ *  can never drift out of agreement. */
+export const storedFavoritesLayout = layout;
 
 /** The page that owns the arrangement, once this graph has one. */
 const [layoutPage, setLayoutPage] = createSignal<string | null>(null);
@@ -33,6 +37,13 @@ export const favoritesLayoutPage = layoutPage;
 
 /** Revision the arrangement page was loaded at, for the save baseline. */
 let layoutRev: string | null = null;
+
+// Where projected membership goes. A callback rather than an import so this
+// module stays free of any dependency on ui.ts, which imports it.
+let membershipSink: ((names: string[]) => void) | null = null;
+export function setMembershipSink(sink: (names: string[]) => void) {
+  membershipSink = sink;
+}
 
 export function resetFavoritesLayout() {
   setLayoutSignal(emptyLayout());
@@ -64,6 +75,17 @@ export async function loadFavoritesLayout(
   }
   setLayoutSignal(reconcileLayout(emptyLayout(), membership));
   return layout();
+}
+
+/** Membership changed inside Tine (a star toggled, a page deleted). Fold it
+ *  into the arrangement and persist — but only touch the arrangement page if
+ *  this graph already has one. A flat graph stays flat. */
+export function membershipChanged(membership: string[]): void {
+  const next = reconcileLayout(layout(), membership);
+  setLayoutSignal(next);
+  // Only touch the arrangement page if this graph already has one; a flat
+  // graph stays flat and behaves exactly as it did before groups existed.
+  if (layoutPage()) void persistFavoritesLayout(next);
 }
 
 /** Fold an externally-changed membership list into the arrangement WITHOUT
@@ -109,6 +131,10 @@ function layoutPageDto(name: string, next: FavLayout): PageDto {
 export async function persistFavoritesLayout(next: FavLayout): Promise<void> {
   setLayoutSignal(next);
   const names = layoutMembers(next).map((item) => item.name);
+  // The flat membership list follows the arrangement's display order, so a
+  // reorder or a move between groups is immediately visible everywhere that
+  // reads favorites — not only in the sidebar.
+  membershipSink?.(names);
   let page = layoutPage();
   const carriesArrangement = next.some((group) => group.name !== null);
   if (!page && !carriesArrangement) {
