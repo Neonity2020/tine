@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Joining a synced graph no longer gets stuck on an older local managed-storage
+  marker.** If Direct Files is active but a previous activation left private
+  managed state behind, Tine now archives that complete predecessor unchanged
+  before bootstrapping the other device's shared identity, instead of trying to
+  open the old marker as the new graph and reporting that it names a different
+  catalog document.
+
 ## [0.6.96] - 2026-08-24
 
 ### Added
