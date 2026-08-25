@@ -1573,6 +1573,8 @@ textarea {
   font: inherit;
   font-size: 20px;
   line-height: 1;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .page-title-row:hover .page-actions-trigger,
 .page-actions-trigger:focus-visible,
@@ -1600,6 +1602,8 @@ textarea {
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.1s, background 0.1s, color 0.1s;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .page-title-row:hover .tag-table-toggle,
 .tag-table-toggle.active {
@@ -1618,6 +1622,8 @@ textarea {
   color: var(--text-secondary);
   font-size: 12px;
   cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .guide-copy-btn:hover {
   background: var(--bg-tertiary);
@@ -3245,6 +3251,8 @@ textarea {
   gap: 8px;
   flex-wrap: wrap;
   margin-left: auto;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .carry-btn {
   background: none;

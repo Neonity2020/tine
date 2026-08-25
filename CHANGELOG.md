@@ -8,7 +8,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Copy / export names its two content choices after what you actually get.**
+  The explicit *Content* option in "Copy / export as…" now reads **Plain text**
+  (cleaned, as displayed) and **Markdown** — or **Org** on an Org page —
+  (preserved source syntax: bold, highlighting, links, properties and
+  structure). The preserve choice was always implemented but shipped under
+  the internal label "Source"; users looking for the Markdown-preserving
+  option could not find it (GH #352).
+
 ### Fixed
+
+- **Page action control labels no longer join dragged text selections.** The
+  journal carry-over buttons ("Carry unfinished tasks → today" and friends),
+  the tag-table toggle, the guide copy button, and the ⋯ page-actions trigger
+  are page chrome, not content: selecting across the page no longer copies
+  their label text, while the buttons stay fully clickable and keyboard-
+  focusable.
+
+- **Joining a synced graph no longer gets stuck on an older local managed-storage
+  marker.** If Direct Files is active but a previous activation left private
+  managed state behind, Tine now archives that complete predecessor unchanged
+  before bootstrapping the other device's shared identity, instead of trying to
+  open the old marker as the new graph and reporting that it names a different
+  catalog document.
 
 - **Direct Files delete, rename, trash, and conflict-copy moves no longer read
   every document in the graph.** These exact no-clobber moves now validate the

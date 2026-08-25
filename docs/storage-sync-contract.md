@@ -434,7 +434,13 @@ fallback.
    then publishes the one shared descriptor and records the matching local
    phase.
 2. **Direct/explicit join → Joining (joiner).** The joiner reads that exact
-   descriptor, reconstructs the descriptor-bound baseline and causal
+   descriptor. Before bootstrapping the descriptor's authority, it renames any
+   app-private managed root that is not selected by the Direct Files slot into
+   `sparse-v2-recovery`; this includes an interrupted activation candidate and
+   a complete predecessor retained after an explicit Direct Files selection.
+   The move preserves the predecessor whole and prevents its clean activation
+   marker from being reopened under the descriptor's different identities.
+   The joiner then reconstructs the descriptor-bound baseline and causal
    manifest/object closure in a private staging area, and replays it to the
    advertised frontier. Before replacing local managed authority it compares
    the complete disk-expressible page/outline semantics with the currently

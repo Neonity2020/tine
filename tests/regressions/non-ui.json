@@ -4649,6 +4649,28 @@
         "failBefore": "proven"
       },
       "notes": "The v0.6.95 startup path converts a typed core OpenRefused/Retryable result into a SparseV2Binding with no actor, constructs a managed GraphSlot anyway, and only then fails the representative-page proof with the unrelated SPARSE_V2_NOT_ACTIVE text. The real failure class and remedy are lost. The graph registry remains unpublished, but the user cannot diagnose why the Windows reopen failed."
+    },
+    {
+      "id": "REG-SYNC-DIRECT-JOIN-RETAINED-AUTHORITY-001",
+      "title": "Joining from Direct Files archives an unselected retained managed authority before bootstrapping the shared graph",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "tauri-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/sync_runtime.rs::direct_join_archives_a_retained_different_authority_before_local_active"
+        ],
+        "scenario": "sync.direct-join-retained-different-authority",
+        "failBefore": "proven"
+      },
+      "notes": "An honest interrupted activation or explicit Return to Direct Files can leave a complete old clean activation marker under the graph's app-private root while Direct Files remains selected. The Direct Files join path constructed the other device's descriptor-bound identities but activated them against that same retained root, so clean recovery correctly refused the mismatched catalog document before LocalActive. The accepted outcome archives the complete unselected predecessor by one rename into sparse-v2-recovery, preserves every byte, bootstraps the descriptor-bound authority into a fresh private root, joins successfully, and never rewrites the already-converged Markdown/Org graph. Fail-before on 0e6dcd82 reproduced the exact local_active mismatch. Pass-after covered the production command ordering, the full descriptor-bound activation/join/reopen lifecycle, and the same byte-preservation journey on the 1,045-file anonymized corpus."
     }
   ]
 }
