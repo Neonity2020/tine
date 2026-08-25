@@ -207,6 +207,13 @@ jobs:
           expect_plist "$info" ITSAppUsesNonExemptEncryption false "export-compliance declaration"
           require_file "$app/PrivacyInfo.xcprivacy" "root privacy manifest"
           require_file "$app/embedded.mobileprovision" "embedded provisioning profile"
+          bundled_icon="$app/AppIcon60x60@2x.png"
+          decoded_icon="$RUNNER_TEMP/tine-ios-primary-icon.png"
+          require_file "$bundled_icon" "compiled primary application icon"
+          xcrun pngcrush -q -revert-iphone-optimizations "$bundled_icon" "$decoded_icon"
+          node scripts/verify-ios-app-icon.mjs \
+            src-tauri/icons/ios/AppIcon-60x60@2x.png \
+            "$decoded_icon"
 
           security cms -D -i "$app/embedded.mobileprovision" > "$RUNNER_TEMP/tine-profile.plist"
           expect_plist "$RUNNER_TEMP/tine-profile.plist" Entitlements:application-identifier "$APPLE_TEAM_ID.page.tine.Tine" "profile application identifier"

@@ -9,10 +9,10 @@
         "issues": [
           337
         ],
-      "commits": [
-        "7c5bc054",
-        "f1b4cd04"
-      ]
+        "commits": [
+          "7c5bc054",
+          "f1b4cd04"
+        ]
       },
       "platforms": [
         "all"
@@ -7818,10 +7818,14 @@
       "title": "An advanced query declaring :inputs [:current-page] receives the focused pane page and reruns only when that page changes",
       "family": "query-execution",
       "sources": {
-        "issues": [301],
+        "issues": [
+          301
+        ],
         "commits": []
       },
-      "platforms": ["all"],
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
@@ -7970,7 +7974,9 @@
       "title": "Clicking a loaded Direct Files block's bullet enters that exact block without re-reading or replacing its page",
       "family": "page-routing",
       "sources": {
-        "issues": [354],
+        "issues": [
+          354
+        ],
         "commits": []
       },
       "platforms": [
@@ -7988,11 +7994,36 @@
       "notes": "GH #354 (Windows 11, Direct Files, v0.6.93): clicking a block bullet stamps a missing durable id and starts its guarded save before navigating to the block route. The route loader then re-read the same file's pre-save bytes and treated them as a competing page instance, producing the misleading unsaved-changes/other-file refusal. PageView now reuses only a block zoom's already-loaded exact path-aware owner. Component coverage drives the literal bullet click while its durable-id save is pending and proves no second read or refusal, then covers transient-live/durable identity resolution, restored-route disk loading when the owner is absent, and fail-closed handling of a different same-name physical owner."
     },
     {
+      "id": "UI-IOS-TESTFLIGHT-TINE-APP-ICON-001",
+      "title": "A signed TestFlight IPA presents Tine's application icon instead of Tauri's generated-project default",
+      "family": "application-identity",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "ios"
+      ],
+      "layer": "native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/test-release-pipeline.mjs",
+          ".github/workflows/ios-testflight.yml"
+        ],
+        "scenario": "ios.testflight-ipa-uses-tine-app-icon",
+        "failBefore": "proven"
+      },
+      "notes": "Internal report (Martin, 2026-08-25). Exact uploaded build 0.6.95.8 from Actions run 32754705290 contains Tauri's template AppIcon rather than the tracked green Tine artwork. Root cause: `tauri ios init` creates `gen/apple/Assets.xcassets/AppIcon.appiconset` from Tauri's embedded template, while Tine's complete tracked set lives under `src-tauri/icons/ios`; the preparation step installed privacy/signing resources but never overlaid those icons. The fix must replace the generated catalog before Xcode project generation and make the signed IPA contract compare its compiled primary icon with Tine's tracked source. The already-uploaded build is intentionally untouched."
+    },
+    {
       "id": "UI-ANDROID-PAGE-DELETE-HANDOFF-376",
       "title": "Android page deletion never paints an empty deleted route between durable trash and its fallback route",
       "family": "page-deletion-lifecycle",
       "sources": {
-        "issues": [376],
+        "issues": [
+          376
+        ],
         "commits": []
       },
       "platforms": [
@@ -8025,6 +8056,59 @@
         "failBefore": "proven"
       },
       "notes": "The settings surface did not exist before GH #343. It now states the exclusion and no-upload boundary beside the action, previews the exact JSON, copies only that generated report, offers native Save on desktop, and clears retained current/previous events on request."
+    },
+    {
+      "id": "UI-REFFILTER-CHIPS-FOLLOW-TEXT-173",
+      "title": "Typing in the Linked References text field also narrows the facet chips it offers, active chips stay reachable at zero, and the summary admits the list is unfiltered while the descendant index loads",
+      "family": "linked-references",
+      "sources": {
+        "issues": [
+          173
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/LinkedReferences.test.tsx::Linked References facet chips follow the text query (GH #173)::drops facets whose only backlinks no longer match the typed text",
+          "src/components/LinkedReferences.test.tsx::Linked References facet chips follow the text query (GH #173)::keeps an already-selected facet visible so it can still be cleared",
+          "src/components/LinkedReferences.test.tsx::Linked References filter summary is honest while indexing (GH #173)::says filtering is pending instead of reporting a filtered count",
+          "src/components/linkedReferencesFilterContract.test.ts",
+          "docs/contracts/linked-references-filter.md"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #173 reporter follow-up after the v0.6.0 filter shipped: he asked that typing remove non-matching references. Those ALREADY unmount (LinkedReferences.tsx <For>, asserted in this file and in e2e-query-workspace.mjs) — what never moved was the facet chip list, computed over mergedGroups() rather than the text-matched set, which is literally the list he picks from 'before making a selection'. OG's equivalent field ('Search in linked pages', reference.cljs) narrows exactly that list, so this is the half of the feature Tine lacked; Obsidian ships the other half. coRefs() deliberately does NOT depend on filters() — an earlier version of this fix did, and every chip click re-created every chip node, breaking the off/include/exclude cycle on a held element (2 GH #273 tests went red). Active-but-unmatched chips are a separate orphanFilters() memo. Second half: shown() keeps returning the unfiltered list while nativeContext loads because the fallback corpus is a SUBSET of the native one, so a fallback miss cannot prove a real miss; the summary now says so instead of printing 'N of N references'. Fail-before proven: 2 of the 3 new tests fail on the pre-fix tree; the already-selected-chip test PASSES pre-fix and is a regression guard for this change, not a repro."
+    },
+    {
+      "id": "UI-SIDEBAR-DRAG-NO-TEXT-SELECT-211",
+      "title": "Dragging a sidebar row to reorder it does not select the row's title text",
+      "family": "workspaces",
+      "sources": {
+        "issues": [
+          211
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Sidebar.favReorder.test.tsx::suppresses text selection for the duration of a reorder drag",
+          "src/components/Sidebar.favReorder.test.tsx::releases the selection lock when the drag is cancelled"
+        ],
+        "scenario": "sidebar.drag-reorder-within-list",
+        "failBefore": "proven"
+      },
+      "notes": "Reported by Martin 2026-08-25 against the shipped v0.6.91 reorder: dragging a favorite smeared its title with a text selection. rowReorder.ts never suppressed selection. Fixed by toggling a transient html.row-reorder-dragging class (user-select:none) ONCE the 4px drag threshold is crossed, plus dropping any already-anchored selection on each move — not by preventDefault() on pointerdown, which would also swallow the focus and the ordinary click the helper deliberately preserves. Released on drop and on pointercancel. Applies to both lists that use the shared helper (left-sidebar favorites, right-sidebar items). jsdom proof asserts the class lifecycle; the actual WebKitGTK selection painting is NOT verified here and wants a real-app look."
     }
   ]
 }

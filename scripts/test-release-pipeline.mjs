@@ -32,6 +32,10 @@ const iosTestFlightWorkflow = fs.readFileSync(
   path.join(process.cwd(), ".github/workflows/ios-testflight.yml"),
   "utf8"
 );
+const iosIconVerifier = fs.readFileSync(
+  path.join(process.cwd(), "scripts/verify-ios-app-icon.mjs"),
+  "utf8"
+);
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
 const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
@@ -325,6 +329,38 @@ assert.match(iosTestFlightWorkflow, /name: Validate IPA with App Store Connect\n
 assert.match(iosTestFlightWorkflow, /name: Upload IPA to TestFlight\n\s+if: inputs\.action == 'upload'/);
 assert.match(
   iosTestFlightWorkflow,
+  /AppIcon60x60@2x\.png[\s\S]*?pngcrush -q -revert-iphone-optimizations[\s\S]*?verify-ios-app-icon\.mjs[\s\S]*?src-tauri\/icons\/ios\/AppIcon-60x60@2x\.png/,
+  "the signed TestFlight IPA is not checked against Tine's tracked primary icon"
+);
+assert.match(
+  iosIconVerifier,
+  /MAX_MEAN_ABSOLUTE_RGB_ERROR[\s\S]*?meanAbsoluteRgbError[\s\S]*?assert\.ok/,
+  "the signed IPA icon verifier must tolerate packaging transforms while enforcing visual identity",
+);
+execFileSync(
+  process.execPath,
+  [
+    path.join(process.cwd(), "scripts/verify-ios-app-icon.mjs"),
+    path.join(process.cwd(), "src-tauri/icons/ios/AppIcon-60x60@2x.png"),
+    path.join(process.cwd(), "src-tauri/icons/ios/AppIcon-60x60@2x.png"),
+  ],
+  { stdio: "pipe" }
+);
+assert.throws(
+  () =>
+    execFileSync(
+      process.execPath,
+      [
+        path.join(process.cwd(), "scripts/verify-ios-app-icon.mjs"),
+        path.join(process.cwd(), "src-tauri/icons/ios/AppIcon-60x60@2x.png"),
+        path.join(process.cwd(), "src-tauri/icons/128x128.png"),
+      ],
+      { stdio: "pipe" }
+    ),
+  "the signed IPA icon verifier must reject different artwork"
+);
+assert.match(
+  iosTestFlightWorkflow,
   /name: Remove Apple signing material\n\s+if: always\(\)[\s\S]*?security delete-keychain[\s\S]*?\.appstoreconnect\/private_keys/,
   "temporary iOS App Store Connect authentication is not cleaned after failures"
 );
@@ -357,9 +393,23 @@ try {
   const fixtureTauri = path.join(iosPrepareFixture, "src-tauri");
   const fixtureApple = path.join(fixtureTauri, "gen", "apple");
   const fixtureTarget = path.join(fixtureApple, "tine_iOS");
+  const fixtureTrackedIcons = path.join(fixtureTauri, "icons", "ios");
+  const fixtureGeneratedIcons = path.join(
+    fixtureApple,
+    "Assets.xcassets",
+    "AppIcon.appiconset"
+  );
   fs.mkdirSync(fixtureTarget, { recursive: true });
+  fs.mkdirSync(fixtureTrackedIcons, { recursive: true });
+  fs.mkdirSync(fixtureGeneratedIcons, { recursive: true });
   fs.writeFileSync(path.join(fixtureTauri, "Tine.ios.entitlements"), iosEntitlements);
   fs.writeFileSync(path.join(fixtureTauri, "PrivacyInfo.xcprivacy"), iosPrivacyManifest);
+  fs.writeFileSync(path.join(fixtureTrackedIcons, "AppIcon-512@2x.png"), "tine-icon");
+  fs.writeFileSync(path.join(fixtureGeneratedIcons, "AppIcon-512@2x.png"), "tauri-icon");
+  fs.writeFileSync(
+    path.join(fixtureGeneratedIcons, "Contents.json"),
+    JSON.stringify({ images: [{ filename: "AppIcon-512@2x.png" }] })
+  );
   fs.writeFileSync(
     path.join(fixtureApple, "project.yml"),
     [
@@ -404,6 +454,11 @@ try {
   assert.equal(
     fs.readFileSync(path.join(fixtureApple, "PrivacyInfo.xcprivacy"), "utf8"),
     iosPrivacyManifest,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(fixtureGeneratedIcons, "AppIcon-512@2x.png"), "utf8"),
+    "tine-icon",
+    "iOS project preparation must replace Tauri's generated AppIcon with Tine's tracked icon"
   );
 } finally {
   fs.rmSync(iosPrepareFixture, { recursive: true, force: true });

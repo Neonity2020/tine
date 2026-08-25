@@ -120,4 +120,57 @@ describe("favorites drag reorder (GH #211)", () => {
     expect(route()).toMatchObject({ kind: "page", name: "Beta" });
     dispose();
   });
+  // Martin, 2026-08-25: dragging a favorite also started a text selection on
+  // its title, so the row's label smeared blue under the cursor. The pointer
+  // drag is not a text gesture; while it is armed the document must not be
+  // selectable, and the state must be released on drop AND on cancel.
+  it("suppresses text selection for the duration of a reorder drag", () => {
+    vi.spyOn(backend(), "setFavorites").mockResolvedValue();
+    const { dispose, rows } = mountThreeFavorites();
+    const [first, second, third] = rows();
+    setRect(first, 0, 0, 200, 30);
+    setRect(second, 0, 30, 200, 30);
+    setRect(third, 0, 60, 200, 30);
+
+    expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(false);
+
+    first.dispatchEvent(pointer("pointerdown", 10, 10));
+    // Still under the 4px threshold: this is a click, not a drag — leave
+    // ordinary text selection alone.
+    document.dispatchEvent(pointer("pointermove", 11, 11));
+    expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(false);
+
+    const prev = document.elementFromPoint;
+    try {
+      document.elementFromPoint = () => third;
+      document.dispatchEvent(pointer("pointermove", 10, 85));
+      expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(true);
+      document.dispatchEvent(pointer("pointerup", 10, 85));
+    } finally {
+      document.elementFromPoint = prev;
+    }
+    expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(false);
+    dispose();
+  });
+
+  it("releases the selection lock when the drag is cancelled", () => {
+    vi.spyOn(backend(), "setFavorites").mockResolvedValue();
+    const { dispose, rows } = mountThreeFavorites();
+    const [first, , third] = rows();
+    setRect(first, 0, 0, 200, 30);
+    setRect(third, 0, 60, 200, 30);
+
+    first.dispatchEvent(pointer("pointerdown", 10, 10));
+    const prev = document.elementFromPoint;
+    try {
+      document.elementFromPoint = () => third;
+      document.dispatchEvent(pointer("pointermove", 10, 85));
+      expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(true);
+      document.dispatchEvent(pointer("pointercancel", 10, 85));
+    } finally {
+      document.elementFromPoint = prev;
+    }
+    expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(false);
+    dispose();
+  });
 });
