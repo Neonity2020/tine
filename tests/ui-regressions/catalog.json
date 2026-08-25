@@ -7988,6 +7988,29 @@
       "notes": "GH #354 (Windows 11, Direct Files, v0.6.93): clicking a block bullet stamps a missing durable id and starts its guarded save before navigating to the block route. The route loader then re-read the same file's pre-save bytes and treated them as a competing page instance, producing the misleading unsaved-changes/other-file refusal. PageView now reuses only a block zoom's already-loaded exact path-aware owner. Component coverage drives the literal bullet click while its durable-id save is pending and proves no second read or refusal, then covers transient-live/durable identity resolution, restored-route disk loading when the owner is absent, and fail-closed handling of a different same-name physical owner."
     },
     {
+      "id": "UI-IOS-TESTFLIGHT-TINE-APP-ICON-001",
+      "title": "A signed TestFlight IPA presents Tine's application icon instead of Tauri's generated-project default",
+      "family": "application-identity",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "ios"
+      ],
+      "layer": "native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/test-release-pipeline.mjs",
+          ".github/workflows/ios-testflight.yml"
+        ],
+        "scenario": "ios.testflight-ipa-uses-tine-app-icon",
+        "failBefore": "proven"
+      },
+      "notes": "Internal report (Martin, 2026-08-25). Exact uploaded build 0.6.95.8 from Actions run 32754705290 contains Tauri's template AppIcon rather than the tracked green Tine artwork. Root cause: `tauri ios init` creates `gen/apple/Assets.xcassets/AppIcon.appiconset` from Tauri's embedded template, while Tine's complete tracked set lives under `src-tauri/icons/ios`; the preparation step installed privacy/signing resources but never overlaid those icons. The fix must replace the generated catalog before Xcode project generation and make the signed IPA contract compare its compiled primary icon with Tine's tracked source. The already-uploaded build is intentionally untouched."
+    },
+    {
       "id": "UI-ANDROID-PAGE-DELETE-HANDOFF-376",
       "title": "Android page deletion never paints an empty deleted route between durable trash and its fallback route",
       "family": "page-deletion-lifecycle",

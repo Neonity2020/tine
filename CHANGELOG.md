@@ -34,6 +34,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Future iOS/TestFlight builds now use Tine's application icon.** The generated
+  Xcode project previously retained Tauri's template icon even though Tine's
+  complete iOS icon set was tracked in the repository. Project preparation now
+  installs that set before Xcode compiles the asset catalog, and the signed-IPA
+  contract compares the packaged primary icon's pixels with Tine's source. The
+  already-submitted `0.6.95.8` beta is unchanged.
+
 - **Deleting an open page on Android no longer passes through an unexplained
   black frame.** Tine still waits for pending edits and the native trash
   operation to become durable before navigating anywhere, but it now retires

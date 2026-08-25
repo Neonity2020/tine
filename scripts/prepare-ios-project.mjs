@@ -6,7 +6,13 @@ import { execFileSync } from "node:child_process";
 const root = process.cwd();
 const source = path.join(root, "src-tauri", "Tine.ios.entitlements");
 const privacySource = path.join(root, "src-tauri", "PrivacyInfo.xcprivacy");
+const iconSource = path.join(root, "src-tauri", "icons", "ios");
 const generatedRoot = path.join(root, "src-tauri", "gen", "apple");
+const generatedIconCatalog = path.join(
+  generatedRoot,
+  "Assets.xcassets",
+  "AppIcon.appiconset",
+);
 
 const signing = {
   identity: process.env.IOS_SIGNING_IDENTITY,
@@ -41,9 +47,48 @@ if (!fs.existsSync(source)) {
 if (!fs.existsSync(privacySource)) {
   throw new Error(`missing tracked iOS privacy manifest: ${privacySource}`);
 }
+if (!fs.existsSync(iconSource)) {
+  throw new Error(`missing tracked iOS application icons: ${iconSource}`);
+}
 if (!fs.existsSync(generatedRoot)) {
   throw new Error("the generated iOS project is absent; run `npx tauri ios init --ci` first");
 }
+
+const generatedIconManifest = path.join(generatedIconCatalog, "Contents.json");
+if (!fs.existsSync(generatedIconManifest)) {
+  throw new Error(`generated iOS icon manifest is absent: ${generatedIconManifest}`);
+}
+const iconManifest = JSON.parse(fs.readFileSync(generatedIconManifest, "utf8"));
+const iconFilenames = [
+  ...new Set(
+    (iconManifest.images ?? [])
+      .map((image) => image.filename)
+      .filter((filename) => typeof filename === "string" && filename.endsWith(".png")),
+  ),
+];
+if (iconFilenames.length === 0) {
+  throw new Error("generated iOS icon manifest does not reference any PNG files");
+}
+const referencedIcons = new Set(iconFilenames);
+const trackedIcons = fs
+  .readdirSync(iconSource, { withFileTypes: true })
+  .filter((entry) => entry.isFile() && entry.name.endsWith(".png"))
+  .map((entry) => entry.name)
+  .sort();
+const unreferencedIcons = trackedIcons.filter((filename) => !referencedIcons.has(filename));
+if (unreferencedIcons.length > 0) {
+  throw new Error(
+    `tracked iOS icons are absent from the generated catalog manifest: ${unreferencedIcons.join(", ")}`,
+  );
+}
+for (const filename of iconFilenames) {
+  const trackedIcon = path.join(iconSource, filename);
+  if (!fs.existsSync(trackedIcon)) {
+    throw new Error(`generated iOS catalog requires missing tracked icon: ${trackedIcon}`);
+  }
+  fs.copyFileSync(trackedIcon, path.join(generatedIconCatalog, filename));
+}
+console.log(`installed ${iconFilenames.length} tracked Tine icons in the generated iOS catalog`);
 
 const projectSpec = path.join(generatedRoot, "project.yml");
 let project = fs.readFileSync(projectSpec, "utf8");
