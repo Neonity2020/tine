@@ -358,6 +358,12 @@
      "class": "stateful-ux",
      "userOutcome": "A native Linux titlebar close uses Tine's safe persistence path and closes the real window.",
      "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "The production app creates a schema-v1 diagnostic report without the fixture graph path or content and without automatic upload.",
+     "blocking": true,
+     "authority": "ADR 0058 and docs/diagnostics-contract.md"
     }
    ],
    "acceptableVariations": [

@@ -8051,7 +8051,7 @@
       "layer": "render",
       "status": "covered",
       "coverage": {
-        "tests": ["src/components/DiagnosticsTab.test.tsx"],
+        "tests": ["src/components/DiagnosticsTab.test.tsx", "scripts/e2e-native-titlebar.mjs"],
         "scenario": "diagnostics.user-controlled-report",
         "failBefore": "proven"
       },
