@@ -1094,6 +1094,7 @@ fn refresh_changed_configs(
     config_paths: &HashSet<PathBuf>,
     check_all: bool,
     recheck: &mut HashSet<String>,
+    seen: &mut HashMap<PathBuf, Option<tine_core::model::ConfigDescription>>,
 ) -> bool {
     let mut deferred = false;
     let state = app.state::<AppState>();
@@ -1120,8 +1121,18 @@ fn refresh_changed_configs(
         // A managed slot retains no `Graph` to ask. Its refresh is a meta-only
         // reopen with no cache to lose, so it re-reads unconditionally and lets
         // the meta comparison below decide whether anything is worth announcing.
-        if !slot.is_sparse_v2() {
-            let disk = tine_core::model::config_file_description(root);
+        let disk = tine_core::model::config_file_description(root);
+        if slot.is_sparse_v2() {
+            // A managed slot retains no `Graph` to interrogate, so the watcher
+            // remembers the configuration it last saw for that root. Without
+            // this, poll mode — which cannot name paths and therefore rechecks
+            // every graph every cycle — would reopen a derived view every three
+            // seconds forever.
+            if seen.get(root).copied() == Some(disk) {
+                continue;
+            }
+            seen.insert(root.clone(), disk);
+        } else {
             let unchanged = slot.legacy_graph().is_ok_and(|lease| {
                 // Either the graph was opened with these exact bytes, or it
                 // published them itself. The second case is what keeps a star
@@ -1725,6 +1736,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         // this cycle could not act on because the storage transition lane was
         // busy. Carried across cycles so a deferral cannot lose the change.
         let mut config_recheck: HashSet<String> = HashSet::new();
+        // Last configuration seen per MANAGED root. Direct graphs need no such
+        // memory: their own `Graph` instance is the witness.
+        let mut config_seen: HashMap<PathBuf, Option<tine_core::model::ConfigDescription>> =
+            HashMap::new();
         let mut watcher: Option<notify::RecommendedWatcher> = None;
         let mut watched: HashSet<PathBuf> = HashSet::new();
         // Last surfaced `watch()` failure per graph root, so a root that keeps
@@ -2279,6 +2294,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 &config_paths,
                 event_need_full || notify_error || !inotify,
                 &mut config_recheck,
+                &mut config_seen,
             ) {
                 // A deferral means the lane was busy, not that the change went
                 // away. Wake again; the 200 ms coalescing sleep below bounds

@@ -55,8 +55,12 @@ alone would read every star toggled in the sidebar as an outside change.
 through, and it records what it wrote.
 
 A managed slot retains no `Graph` to ask, and its refresh is a meta-only reopen
-with no cache to lose, so it re-reads unconditionally and lets the comparison in
-§4 decide whether anything is worth announcing.
+with no cache to lose. The watcher therefore keeps its own last-seen digest per
+managed root (`config_seen`) and lets the comparison in §4 decide whether
+anything is worth announcing. That memory is not an optional cache: poll mode
+cannot name paths and so rechecks every graph every cycle, which without it
+would reopen a derived view every three seconds forever. A Direct graph needs no
+such memory — its own instance is the witness.
 
 Tested by `config::tests::a_graph_reports_whether_config_edn_moved_since_it_was_opened`,
 `config::tests::a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change`

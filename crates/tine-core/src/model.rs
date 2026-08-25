@@ -5169,6 +5169,10 @@ pub struct GraphMeta {
 /// it can never land in one of those and miss the other.
 pub const CONFIG_RELATIVE_PATH: &str = "logseq/config.edn";
 
+/// Re-exported so a caller outside the crate can name what
+/// [`config_file_description`] and [`Graph::open_config_description`] return.
+pub use crate::oplog::BlobDescription as ConfigDescription;
+
 /// Digest `logseq/config.edn` as it stands on disk right now, resolving the
 /// path exactly as `Graph::open` does.
 ///

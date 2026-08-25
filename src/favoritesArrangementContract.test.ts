@@ -83,6 +83,12 @@ describe("config live-reload contract matches the source", () => {
     expect(watcher).toContain("if after != before {");
   });
 
+  it("remembers the last configuration seen for a managed root", () => {
+    expect(reload).toContain("`config_seen`");
+    expect(watcher).toContain("seen: &mut HashMap<PathBuf, Option<tine_core::model::ConfigDescription>>");
+    expect(watcher).toContain("if seen.get(root).copied() == Some(disk) {");
+  });
+
   it("keeps ONE producer of config-derived frontend state", () => {
     expect(reload).toContain("exactly **one** producer");
     expect(graph).toContain("export function applyConfigDerivedState");
