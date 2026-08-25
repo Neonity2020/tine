@@ -1313,6 +1313,12 @@ pub fn backlink_filter_context(
                             context.truncated = true;
                         } else {
                             bytes += estimated;
+                            // Same flag propagation as the ordinary-root loop
+                            // below and the managed twin: an entry truncated at
+                            // its own text/facet budget must mark the context,
+                            // or Direct reports truncated=false where managed
+                            // reports true for identical content (DUP-6).
+                            context.truncated |= entry.truncated;
                             context.entries.push(entry);
                         }
                     }

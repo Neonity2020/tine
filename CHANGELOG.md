@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Journal recency respects the configured title format.** On graphs with a
+  custom `:journal/page-title-format`, `(sort-by modified)` ranked every
+  journal last on three of the four query paths (they parsed titles with the
+  default format only). All producers now share one recency axis that honours
+  the graph's configured formats.
+- **Backlink filter truncation is reported consistently.** A page-property
+  root entry that hit its text/facet budget marked the context truncated on
+  Managed Storage but not on Direct Files; the two now agree.
+
 ### Added
 
 - **Favorites nest to any depth** (GH #102). A group can hold groups, and a

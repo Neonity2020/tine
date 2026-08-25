@@ -166,6 +166,35 @@ fn ordinal(n: u32) -> String {
 // `safe-journal-title-formatters`), and render new titles/filenames in the
 // user's format.
 
+impl JournalFormat {
+    /// The one "(sort-by modified)" recency axis (DUP-4, 2026-08-25
+    /// duplication audit): journals rank at their day's midnight parsed with
+    /// THIS GRAPH'S configured title formats (plus the safe defaults) — never
+    /// `JournalDate::from_title`, which knows only the default format and
+    /// ranked every journal of a custom-format graph at `i64::MIN` on three of
+    /// the four former producers. Non-journals rank by file mtime; anything
+    /// unavailable ranks last.
+    pub(crate) fn page_recency_secs(
+        &self,
+        is_journal: bool,
+        name: &str,
+        absolute: &std::path::Path,
+    ) -> i64 {
+        if is_journal {
+            return self
+                .parse(name)
+                .map(|date| date.to_days() * 86_400)
+                .unwrap_or(i64::MIN);
+        }
+        std::fs::metadata(absolute)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(i64::MIN)
+    }
+}
+
 pub const DEFAULT_FILE_FORMAT: &str = "yyyy_MM_dd";
 pub const DEFAULT_TITLE_FORMAT: &str = "MMM do, yyyy";
 
@@ -622,5 +651,33 @@ mod fmt_tests {
             let got = Format::compile(&vector.fmt).parse(&vector.input);
             assert_eq!(got, want, "parse {:?}", vector);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DUP-4 (2026-08-25 duplication audit): three of the four recency
+    /// producers called `JournalDate::from_title`, which compiles only
+    /// `DEFAULT_TITLE_FORMAT` — on a graph with `:journal/page-title-format
+    /// "yyyy-MM-dd"` every journal ranked at `i64::MIN` under
+    /// `(sort-by modified)`. The one shared axis honours the graph's formats.
+    #[test]
+    fn recency_axis_honours_the_configured_journal_title_format() {
+        let format = JournalFormat::new(None, Some("dd.MM.yyyy"));
+        // The pre-fix producer path cannot parse this title at all:
+        assert_eq!(JournalDate::from_title("26.06.2026"), None);
+        // The shared axis can, and ranks the journal at its day's midnight:
+        let date = format.parse("26.06.2026").expect("configured format parses");
+        assert_eq!(
+            format.page_recency_secs(true, "26.06.2026", std::path::Path::new("")),
+            date.to_days() * 86_400
+        );
+        // An unparseable journal title still ranks last, not by mtime.
+        assert_eq!(
+            format.page_recency_secs(true, "not a date", std::path::Path::new("")),
+            i64::MIN
+        );
     }
 }

@@ -1,4 +1,3 @@
-use crate::date::JournalDate;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::query::{
@@ -139,6 +138,7 @@ impl DirectProjection {
     pub(crate) fn sparse_task_query(
         &self,
         graph_root: &Path,
+        journal_format: &crate::date::JournalFormat,
         cache_generation: u64,
         pages: &[(PageEntry, Arc<Document>)],
         query_src: &str,
@@ -199,6 +199,7 @@ impl DirectProjection {
                                 &row.page_name,
                                 &row.page_path,
                                 row.page_text_kind,
+                                journal_format,
                             )
                         })
                 } else {
@@ -1113,18 +1114,14 @@ fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
     }
 }
 
-fn page_recency(root: &Path, name: &str, relative_path: &str, kind: i64) -> i64 {
-    if kind == 1 {
-        return JournalDate::from_title(name)
-            .map(|date| date.to_days() * 86_400)
-            .unwrap_or(i64::MIN);
-    }
-    std::fs::metadata(root.join(relative_path))
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(i64::MIN)
+fn page_recency(
+    root: &Path,
+    name: &str,
+    relative_path: &str,
+    kind: i64,
+    journal_format: &crate::date::JournalFormat,
+) -> i64 {
+    journal_format.page_recency_secs(kind == 1, name, &root.join(relative_path))
 }
 
 #[cfg(test)]

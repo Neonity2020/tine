@@ -5840,7 +5840,13 @@ impl Graph {
             .map(Arc::clone)?;
         let pages = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
         let result = projection.sparse_task_query(
-            &self.root, generation, &pages, query_src, max_rows, max_bytes,
+            &self.root,
+            &self.journal_format,
+            generation,
+            &pages,
+            query_src,
+            max_rows,
+            max_bytes,
         )?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
@@ -22724,22 +22730,31 @@ pub fn block_to_dto(b: &DocBlock) -> io::Result<BlockDto> {
 /// and are hydrated once per page by live consumers. Keeping this constructor
 /// separate makes it difficult to accidentally reintroduce overlapping subtree
 /// amplification in queries, references, search, or batched resolution.
-pub fn block_to_shallow_dto(b: &DocBlock) -> BlockDto {
+/// The ONE parser-backed `DocBlock` → shallow `BlockDto` facet projection
+/// (DUP-6/B9, 2026-08-25 duplication audit): both DTO constructors delegate
+/// here, so a new `BlockDto` facet is a one-site decision on this path. `id`
+/// validation stays with the callers — their polite-error vs assert difference
+/// is deliberate.
+fn doc_block_facets_dto(block: &DocBlock, id: String) -> BlockDto {
     BlockDto {
-        id: block_runtime_id(b),
-        raw: b.raw.clone(),
-        collapsed: b.collapsed(),
+        id,
+        raw: block.raw.clone(),
+        collapsed: block.collapsed(),
         children: Vec::new(),
         breadcrumb: Vec::new(),
         page_property: false,
-        marker: b.marker().map(str::to_string),
-        priority: b.priority().map(str::to_string),
-        heading_level: b.heading_level(),
-        scheduled: b.scheduled().map(str::to_string),
-        deadline: b.deadline().map(str::to_string),
-        tags: b.tags(),
-        properties: b.properties(),
+        marker: block.marker().map(str::to_string),
+        priority: block.priority().map(str::to_string),
+        heading_level: block.heading_level(),
+        scheduled: block.scheduled().map(str::to_string),
+        deadline: block.deadline().map(str::to_string),
+        tags: block.tags(),
+        properties: block.properties(),
     }
+}
+
+pub fn block_to_shallow_dto(b: &DocBlock) -> BlockDto {
+    doc_block_facets_dto(b, block_runtime_id(b))
 }
 
 fn dto_blocks_to_doc_checked(blocks: &[BlockDto], is_org: bool) -> io::Result<Vec<DocBlock>> {
@@ -22854,21 +22869,7 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
                 "block has no assigned runtime identity",
             ));
         }
-        frame.output.push(BlockDto {
-            id: block.uuid.clone(),
-            raw: block.raw.clone(),
-            collapsed: block.collapsed(),
-            children: Vec::new(),
-            breadcrumb: Vec::new(),
-            page_property: false,
-            marker: block.marker().map(str::to_string),
-            priority: block.priority().map(str::to_string),
-            heading_level: block.heading_level(),
-            scheduled: block.scheduled().map(str::to_string),
-            deadline: block.deadline().map(str::to_string),
-            tags: block.tags(),
-            properties: block.properties(),
-        });
+        frame.output.push(doc_block_facets_dto(block, block.uuid.clone()));
         if !block.children.is_empty() {
             if len == MAX_MANAGED_BLOCK_DEPTH {
                 return Err(io::Error::new(

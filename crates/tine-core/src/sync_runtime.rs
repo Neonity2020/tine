@@ -9880,27 +9880,23 @@ fn sparse_task_query_page_kind(kind: ManagedTextKind) -> PageKind {
 
 fn sparse_task_query_page_recency(
     graph_root: &Path,
+    journal_format: &crate::date::JournalFormat,
     name: &str,
     path: &ManagedPath,
     kind: ManagedTextKind,
 ) -> i64 {
-    if kind == ManagedTextKind::Journal {
-        return crate::date::JournalDate::from_title(name)
-            .map(|date| date.to_days() * 86_400)
-            .unwrap_or(i64::MIN);
-    }
-    std::fs::metadata(graph_root.join(path.as_str()))
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(i64::MIN)
+    journal_format.page_recency_secs(
+        kind == ManagedTextKind::Journal,
+        name,
+        &graph_root.join(path.as_str()),
+    )
 }
 
 impl ManagedSparseTaskQueryPageFacts {
     fn from_joined_row(
         row: &MaterializedTaskCandidateBlockRow,
         graph_root: &Path,
+        journal_format: &crate::date::JournalFormat,
     ) -> Result<Self, ManagedSparseTaskQueryFallback> {
         if LogicalPageName::parse(row.page_name.clone()).is_err() {
             return Err(ManagedSparseTaskQueryFallback::CandidateAuthority);
@@ -9917,6 +9913,7 @@ impl ManagedSparseTaskQueryPageFacts {
                 is_org: format == Format::Org,
                 recency: sparse_task_query_page_recency(
                     graph_root,
+                    journal_format,
                     &row.page_name,
                     &row.page_path,
                     row.page_kind,
@@ -10372,19 +10369,20 @@ fn application_crumb_line(raw: &str, is_org: bool) -> String {
     }
 }
 
-fn application_query_page_recency(graph_root: &Path, page: &PageDto) -> i64 {
+fn application_query_page_recency(
+    graph_root: &Path,
+    journal_format: &crate::date::JournalFormat,
+    page: &PageDto,
+) -> i64 {
     if page.kind == PageKind::Journal {
-        return crate::date::JournalDate::from_title(&page.name)
-            .map(|date| date.to_days() * 86_400)
-            .unwrap_or(i64::MIN);
+        return journal_format.page_recency_secs(true, &page.name, Path::new(""));
     }
-    ManagedPath::parse(page.path.clone())
-        .ok()
-        .and_then(|path| std::fs::metadata(graph_root.join(path.as_str())).ok())
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(i64::MIN)
+    match ManagedPath::parse(page.path.clone()) {
+        Ok(path) => {
+            journal_format.page_recency_secs(false, &page.name, &graph_root.join(path.as_str()))
+        }
+        Err(_) => i64::MIN,
+    }
 }
 
 fn application_page_block_referrers(
@@ -12922,6 +12920,7 @@ impl RuntimeActor {
                             is_org: page.format == Format::Org,
                             recency: sparse_task_query_page_recency(
                                 &self.graph.root,
+                                &self.graph.journal_format,
                                 &page.name,
                                 &page.path,
                                 page.kind,
@@ -12993,6 +12992,7 @@ impl RuntimeActor {
                         let page = ManagedSparseTaskQueryPageFacts::from_joined_row(
                             &row,
                             &self.graph.root,
+                            &self.graph.journal_format,
                         )?;
                         let sparse_page = page.sparse_page.clone();
                         page_cache.insert(row.page_id, page);
@@ -13329,7 +13329,11 @@ impl RuntimeActor {
         let pages = sources
             .into_iter()
             .map(|(_, page)| crate::query::ApplicationQueryPage {
-                recency: application_query_page_recency(&self.graph.root, &page),
+                recency: application_query_page_recency(
+                    &self.graph.root,
+                    &self.graph.journal_format,
+                    &page,
+                ),
                 page,
             })
             .collect::<Vec<_>>();
@@ -13363,7 +13367,11 @@ impl RuntimeActor {
                 }
             };
             pages.push(crate::query::ApplicationQueryPage {
-                recency: application_query_page_recency(&self.graph.root, &current.page),
+                recency: application_query_page_recency(
+                    &self.graph.root,
+                    &self.graph.journal_format,
+                    &current.page,
+                ),
                 page: current.page,
             });
         }
