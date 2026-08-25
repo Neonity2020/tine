@@ -12,6 +12,7 @@ import type {
 } from "./types";
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
 import { backend, isTauri } from "./backend";
+import { pageIdentityKey } from "./pageIdentity";
 import { membershipChanged, resetFavoritesLayout, setMembershipSink, storedFavoritesLayout } from "./favoritesStore";
 import { reconcileLayout } from "./favoritesLayout";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
@@ -1082,11 +1083,19 @@ export interface FavItem {
   kind: PageKind;
 }
 export const [favorites, setFavorites] = createSignal<FavItem[]>([]);
+/** THE membership key for favorites: alias-resolve pages, then fold with
+ *  `pageIdentityKey`, kind-scoped. Every membership decision (star button,
+ *  toggle, delete, rename dedupe) and the sidebar arrangement
+ *  (`favoritesLayout.keyOf`) must agree on this one key — they used to carry
+ *  four different predicates (exact-match, kind-blind, weak lowercase), so a
+ *  page starred as `[[foo]]` showed an unfilled star on `Foo` and clicking
+ *  appended a duplicate (DUP-2, 2026-08-25 duplication audit). */
+export function favoriteKey(name: string, kind: PageKind): string {
+  const canonical = kind === "page" ? resolveAlias(name) : name;
+  return `${kind}\0${pageIdentityKey(canonical)}`;
+}
 export function isFavorite(name: string): boolean {
-  const target = resolveAlias(name);
-  return favorites().some((f) =>
-    f.kind === "page" ? resolveAlias(f.name) === target : f.name === name
-  );
+  return favorites().some((f) => favoriteKey(f.name, f.kind) === favoriteKey(name, f.kind));
 }
 function persistFavorites(next: FavItem[]) {
   // Persist to config.edn :favorites so favorites travel with the graph and stay
@@ -1112,9 +1121,8 @@ export const favoritesLayout = createMemo(() =>
 );
 export function toggleFavorite(name: string, kind: "page" | "journal" = "page") {
   const f = favorites();
-  const target = kind === "page" ? resolveAlias(name) : name;
-  const matches = (item: FavItem) => item.kind === kind &&
-    (kind === "page" ? resolveAlias(item.name) === target : item.name === name);
+  const target = favoriteKey(name, kind);
+  const matches = (item: FavItem) => favoriteKey(item.name, item.kind) === target;
   const next = f.some(matches)
     ? f.filter((x) => !matches(x))
     : [...f, { name, kind }];
@@ -1140,7 +1148,10 @@ export function removeDeletedPageFromNavigation(targetOrName: PageTarget | strin
     : targetOrName;
   const name = target.name;
   kind = target.pageKind;
-  const nextFavs = favorites().filter((f) => f.name !== name);
+  // Kind-scoped, identity-folded: deleting a page must not drop a journal
+  // favorite that merely shares the name (was kind-blind exact match, DUP-2).
+  const removed = favoriteKey(name, kind);
+  const nextFavs = favorites().filter((f) => favoriteKey(f.name, f.kind) !== removed);
   if (nextFavs.length !== favorites().length) {
     setFavorites(nextFavs);
     persistFavorites(nextFavs);
@@ -1179,9 +1190,15 @@ export function renamePageInNavigation(fromOrName: PageTarget | string, toOrName
   const dedupe = (items: FavItem[]): FavItem[] => {
     const seen = new Set<string>();
     const out: FavItem[] = [];
+    // Identity-folded on both the rename match and the dedupe key, so a
+    // favorite stored under a different spelling of the renamed page is
+    // re-keyed too, and spelling twins collapse (DUP-2).
+    const renamed = `${from.pageKind}\0${pageIdentityKey(from.name)}`;
     for (const item of items) {
-      const next = item.kind === from.pageKind && item.name === from.name ? { ...item, name: to.name } : item;
-      const key = `${next.kind}\0${next.name}`;
+      const next = `${item.kind}\0${pageIdentityKey(item.name)}` === renamed
+        ? { ...item, name: to.name }
+        : item;
+      const key = `${next.kind}\0${pageIdentityKey(next.name)}`;
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(next);
@@ -1945,16 +1962,9 @@ export const [audioPlayer, setAudioPlayer] =
 
 // Page aliases (alias:: → canonical), keyed by normalized alias; loaded per graph.
 export const [aliasMap, setAliasMap] = createSignal<Record<string, string>>({});
-/** Mirror core `refs::page_key`: trim, Unicode lowercase, remove one boundary
- *  slash at each side, then NFC. Lowercasing is contextual (`ΟΣ` → `ος`). */
-export function pageIdentityKey(name: string): string {
-  const lowered = name.trim().toLowerCase();
-  const withoutLeading = lowered.startsWith("/") ? lowered.slice(1) : lowered;
-  const withoutBoundaries = withoutLeading.endsWith("/")
-    ? withoutLeading.slice(0, -1)
-    : withoutLeading;
-  return withoutBoundaries.normalize("NFC");
-}
+// The page-identity fold lives in the dependency-free leaf `pageIdentity.ts`
+// (DUP-2/DUP-8); re-exported here so existing importers keep working.
+export { pageIdentityKey };
 /** Resolve a page name through `alias::` to its canonical page (else unchanged). */
 export function resolveAlias(name: string): string {
   return aliasMap()[pageIdentityKey(name)] ?? name;
