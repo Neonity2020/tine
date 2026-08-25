@@ -6,8 +6,10 @@
 // Verdict contract (exit 1 = defect reproduced):
 //   * a pane whose real content fits its scroller must have NO vertical
 //     scrollbar (scrollable range == 0 and no classic scrollbar track width);
+//   * this includes reporter-shaped pages occupying 61–99% of a pane, the band
+//     the released v0.6.96 harness accidentally exempted;
 //   * a pane whose content overflows must still scroll independently;
-//   * scrolled to the end of a long pane, the last block is fully on screen
+//   * while editing a long page, its last block is fully on screen at the end
 //     with breathing room below it in [25%, 60%] of the pane's own height —
 //     the editing slack must be proportional to the PANE, not the window.
 //
@@ -16,7 +18,7 @@ import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 
-const PORT = 5299;
+const PORT = Number(process.env.TINE_PANE_SLACK_PORT ?? 5299);
 const OUT_BOARD = "/tmp/shot-pane-slack.png";
 const OUT_SCROLLED = "/tmp/shot-pane-slack-long-scrolled.png";
 
@@ -48,6 +50,20 @@ async function openPageInFocusedPane(page, name) {
   // capture-phase pane-focus rule), opening the page in the WRONG quadrant.
   await page.keyboard.press("Enter");
   await sleep(250);
+}
+
+async function makeFocusedPageReporterHeight(page, lineCount) {
+  const splitRoot = page.locator(".pane-leaf.pane-focused");
+  const root = (await splitRoot.count()) > 0 ? splitRoot : page.locator(".main-content-shell");
+  let editor = root.locator(".block-editor").first();
+  if ((await editor.count()) === 0) {
+    await root.locator(".ls-block").first().click();
+    editor = root.locator(".block-editor").first();
+  }
+  await editor.waitFor({ timeout: 4000 });
+  await editor.fill(Array.from({ length: lineCount }, (_, i) => `dashboard line ${i + 1}`).join("\n"));
+  await page.keyboard.press("Escape");
+  await sleep(150);
 }
 
 async function measurePanes(page) {
@@ -131,6 +147,7 @@ try {
     deviceScaleFactor: 1,
   });
   const errors = [];
+  const failures = [];
   page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
   page.on("pageerror", (e) => errors.push(String(e)));
 
@@ -146,11 +163,36 @@ try {
 
   // Open a short page first so the journals feed stays the single-feed-pane
   // singleton out of the way, then build the reporter's 2x2 dashboard.
-  await openPageInFocusedPane(page, "Tine");
+  await openPageInFocusedPane(page, "Dashboard Solo");
   await page.waitForFunction(
-    () => document.querySelector(".main-content .page-title")?.textContent?.trim() === "Tine",
+    () => document.querySelector(".main-content .page-title")?.textContent?.trim() === "Dashboard Solo",
     { timeout: 5000 },
   );
+  await makeFocusedPageReporterHeight(page, 20);
+  const solo = await page.evaluate(() => {
+    const scroller = document.querySelector(".main-content");
+    const inner = scroller?.querySelector(".main-content-inner");
+    if (!scroller || !inner) return null;
+    const slackPad = parseFloat(getComputedStyle(inner).paddingBottom) || 0;
+    return {
+      clientHeight: scroller.clientHeight,
+      contentH: inner.scrollHeight - slackPad,
+      range: scroller.scrollHeight - scroller.clientHeight,
+    };
+  });
+  if (!solo) {
+    failures.push("solo pane could not be measured");
+  } else {
+    const occupancy = solo.contentH / solo.clientHeight;
+    console.log(
+      `solo dashboard column ${solo.contentH}px of ${solo.clientHeight}px (${Math.round(occupancy * 100)}%) range ${solo.range}px`,
+    );
+    if (occupancy <= 0.6 || occupancy > 0.99) {
+      failures.push(`solo fixture missed the 61–99% reporter band: ${JSON.stringify(solo)}`);
+    } else if (solo.range !== 0) {
+      failures.push(`fitting idle solo pane still scrolls: ${JSON.stringify(solo)}`);
+    }
+  }
   await page.keyboard.press("Control+Alt+\\"); // split right
   await page.waitForFunction(() => document.querySelectorAll(".pane-leaf").length === 2, { timeout: 4000 });
   await page.keyboard.press("Control+Alt+Shift+\\"); // split the focused (right) pane down
@@ -196,14 +238,18 @@ try {
     }
     throw new Error(`could not focus quadrant at (${want.x}, ${want.y}) via Ctrl+1..4`);
   }
-  // TL keeps "Tine" from the initial mirror splits (a real page tall enough to
-  // overflow — its scroll range must be legit content, not slack). TR/BL get
+  // TL keeps "Dashboard Solo" from the initial mirror splits (a page in the
+  // reporter's fitting band when solo and a real overflow after the vertical
+  // split). TR/BL get
   // fresh one-block pages named after the reporter's own panes: those are the
   // short dashboard cards whose scrollbar must vanish. BR is the long pane
   // that must keep scrolling independently with breathing room at the end.
   const targets = [
-    { quad: "TR", rect: TRr, name: "Lines" },
-    { quad: "BL", rect: BLr, name: "GRID" },
+    // A single raw multiline block gives these pages natural columns around
+    // 70–85% of their half-height panes: the exact fitting band visible in the
+    // reporter's Windows dashboard and absent from the original repro.
+    { quad: "TR", rect: TRr, name: "Lines", lines: 6 },
+    { quad: "BL", rect: BLr, name: "GRID", lines: 8 },
     { quad: "BR", rect: BRr, name: "Project Plan" }, // 64+ blocks: the long pane
   ];
   for (const t of targets) {
@@ -215,44 +261,42 @@ try {
       t.name,
       { timeout: 5000 },
     );
+    if (t.lines) await makeFocusedPageReporterHeight(page, t.lines);
   }
   await sleep(600);
   await page.screenshot({ path: OUT_BOARD });
 
   const panes = await measurePanes(page);
-  const failures = [];
   console.log("pane geometry (viewport 1920x1050):");
   for (const p of panes) {
     const P = p.clientHeight;
-    const fitsClearly = p.contentH <= 0.6 * P;
     const fitsExactly = p.contentH <= P;
-    const klass = fitsClearly ? "fits" : fitsExactly ? "fits band" : "overflows";
+    const reporterBand = p.contentH > 0.6 * P && fitsExactly;
+    const klass = reporterBand ? "fits reporter band" : fitsExactly ? "fits" : "overflows";
     console.log(
       `  ${p.title.padEnd(16)} pane ${Math.round(p.rect.w)}x${Math.round(p.rect.h)} @(${Math.round(p.rect.x)},${Math.round(p.rect.y)})` +
         `  column ${p.contentH}px of ${P}px (${Math.round((100 * p.contentH) / P)}%)  range ${p.range}px  scrollbarW ${p.scrollbarW}px  ${klass}`,
     );
-    // The slack contract: a pane whose whole column fits inside 60% of its
-    // height must not scroll at all; the editing slack may then reserve up to
-    // 40% of the pane for near-full pages; an overflowing pane gets exactly
-    // content + 40%-of-pane slack as its range.
-    const expected = Math.max(0, p.contentH + Math.round(0.4 * P) - P);
-    if (fitsClearly && (p.range > 0 || p.scrollbarW > 0)) {
+    // Idle dashboard contract: if the natural page column fits at all, its
+    // range is exactly zero. Editing slack is tested separately below.
+    const expectedIdle = Math.max(0, p.contentH - P);
+    if (fitsExactly && (p.range > 0 || p.scrollbarW > 0)) {
       failures.push(
-        `${p.title}: column fits clearly (${p.contentH}px <= 60% of ${P}px) but the pane still scrolls ` +
+        `${p.title}: fitting idle column (${p.contentH}px <= ${P}px) still scrolls ` +
           `(range ${p.range}px, scrollbarW ${p.scrollbarW}px) — the useless GH #369 scrollbar`,
       );
     }
-    if (fitsExactly && !fitsClearly && p.range > 0.4 * P + 2) {
-      failures.push(
-        `${p.title}: near-full column (${p.contentH}px of ${P}px) scrolls ${p.range}px — more than the 40%-of-pane slack it should reserve while editing`,
-      );
-    }
     if (!fitsExactly && p.range <= 0) failures.push(`${p.title}: content overflows (${p.contentH}px > ${P}px) but the pane does not scroll`);
-    if (Math.abs(p.range - expected) > 3) {
+    if (Math.abs(p.range - expectedIdle) > 3) {
       failures.push(
-        `${p.title}: range ${p.range}px does not match the pane-proportional slack model (column ${p.contentH}px + 40% of ${P}px pane − pane = ${expected}px)`,
+        `${p.title}: idle range ${p.range}px does not match natural overflow (column ${p.contentH}px − pane ${P}px = ${expectedIdle}px)`,
       );
     }
+  }
+
+  const reporterBandPanes = panes.filter((p) => p.contentH > 0.6 * p.clientHeight && p.contentH <= 0.99 * p.clientHeight);
+  if (reporterBandPanes.length < 2) {
+    failures.push(`fixture did not create two 61–99%-full panes: ${JSON.stringify(reporterBandPanes)}`);
   }
 
   // Long pane: must still scroll independently, end block stays reachable, and
@@ -261,6 +305,24 @@ try {
   if (!longPane) {
     failures.push("no overflowing pane found — the Project Plan (long) pane did not overflow");
   } else {
+    // End slack is an editing affordance, not permanent dashboard overflow.
+    // Activate the final block before measuring that separate contract.
+    // A prior Escape used to finish the synthetic multiline edit may leave
+    // block-selection owning digit keys, so use the literal pane tab boundary.
+    await page.mouse.click(longPane.rect.x + 18, longPane.rect.y - 16);
+    await page.waitForFunction(
+      (want) => {
+        const scroller = document.querySelector(".pane-leaf.pane-focused .main-content");
+        if (!scroller) return false;
+        const r = scroller.getBoundingClientRect();
+        return Math.abs(r.x - want.x) <= 2 && Math.abs(r.y - want.y) <= 2;
+      },
+      longPane.rect,
+      { timeout: 4000 },
+    );
+    await page.locator(".pane-leaf.pane-focused .ls-block").last().click();
+    await page.locator(".pane-leaf.pane-focused .block-editor").waitFor({ timeout: 4000 });
+    await sleep(150);
     await page.evaluate((want) => {
       for (const leaf of document.querySelectorAll(".pane-leaf")) {
         const scroller = leaf.querySelector(".main-content");
