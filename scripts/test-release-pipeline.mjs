@@ -297,7 +297,11 @@ assert.match(
   /AppIcon60x60@2x\.png[\s\S]*?pngcrush -q -revert-iphone-optimizations[\s\S]*?verify-ios-app-icon\.mjs[\s\S]*?src-tauri\/icons\/ios\/AppIcon-60x60@2x\.png/,
   "the signed TestFlight IPA is not checked against Tine's tracked primary icon"
 );
-assert.match(iosIconVerifier, /Buffer\.compare\(bundled\.pixels, expected\.pixels\)/);
+assert.match(
+  iosIconVerifier,
+  /MAX_MEAN_ABSOLUTE_RGB_ERROR[\s\S]*?meanAbsoluteRgbError[\s\S]*?assert\.ok/,
+  "the signed IPA icon verifier must tolerate packaging transforms while enforcing visual identity",
+);
 execFileSync(
   process.execPath,
   [
