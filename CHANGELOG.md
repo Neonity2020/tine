@@ -29,6 +29,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   family, so a newly passing, renamed, or omitted test fails the contract
   instead of silently drifting outside the gate (GH #350).
 
+- **Managed Storage can reopen retained edits and moves of blocks carrying a
+  Logseq `id::` UUID.** Projection recovery now consults the same bounded
+  baseline identity candidates as planning and commit validation, instead of
+  refusing the accepted block as unauthorized when the UUID originated in the
+  activation baseline (GH #370).
+
 - **Android startup and page navigation no longer look like an unexplained black
   or blank screen while work is pending.** The native window now has light and
   night Tine backing colors before the WebView paints, startup immediately shows
