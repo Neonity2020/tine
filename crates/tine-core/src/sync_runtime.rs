@@ -7406,6 +7406,203 @@ struct CleanJoinUserPage {
     outline: Vec<(usize, String, Option<LogseqUuid>)>,
 }
 
+const CLEAN_JOIN_MAX_MISMATCH_DETAILS: usize = 32;
+
+#[derive(Debug, Eq, PartialEq)]
+enum CleanJoinMismatchDetail {
+    LocalOnly(String),
+    SharedOnly(String),
+    Changed {
+        path: String,
+        kind: bool,
+        preamble: bool,
+        outline: bool,
+        explicit_ids: bool,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CleanJoinSemanticDiff {
+    local_pages: usize,
+    shared_pages: usize,
+    local_only: usize,
+    shared_only: usize,
+    changed: usize,
+    changed_kind: usize,
+    changed_preamble: usize,
+    changed_outline: usize,
+    changed_explicit_ids: usize,
+    details: Vec<CleanJoinMismatchDetail>,
+}
+
+impl CleanJoinSemanticDiff {
+    fn record(&mut self, detail: CleanJoinMismatchDetail) {
+        match &detail {
+            CleanJoinMismatchDetail::LocalOnly(_) => self.local_only += 1,
+            CleanJoinMismatchDetail::SharedOnly(_) => self.shared_only += 1,
+            CleanJoinMismatchDetail::Changed {
+                kind,
+                preamble,
+                outline,
+                explicit_ids,
+                ..
+            } => {
+                self.changed += 1;
+                self.changed_kind += usize::from(*kind);
+                self.changed_preamble += usize::from(*preamble);
+                self.changed_outline += usize::from(*outline);
+                self.changed_explicit_ids += usize::from(*explicit_ids);
+            }
+        }
+        if self.details.len() < CLEAN_JOIN_MAX_MISMATCH_DETAILS {
+            self.details.push(detail);
+        }
+    }
+
+    fn mismatch_count(&self) -> usize {
+        self.local_only + self.shared_only + self.changed
+    }
+}
+
+impl fmt::Display for CleanJoinSemanticDiff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "sync join refused: notes not in the shared provider frontier; local-pages={} shared-pages={} local-only={} shared-only={} changed={} (kind={} preamble={} outline={} explicit-ids={}); authorities unchanged",
+            self.local_pages,
+            self.shared_pages,
+            self.local_only,
+            self.shared_only,
+            self.changed,
+            self.changed_kind,
+            self.changed_preamble,
+            self.changed_outline,
+            self.changed_explicit_ids,
+        )?;
+        for detail in &self.details {
+            match detail {
+                CleanJoinMismatchDetail::LocalOnly(path) => write!(
+                    formatter,
+                    "\nclean join mismatch detail: local-only path={path:?}"
+                )?,
+                CleanJoinMismatchDetail::SharedOnly(path) => write!(
+                    formatter,
+                    "\nclean join mismatch detail: shared-only path={path:?}"
+                )?,
+                CleanJoinMismatchDetail::Changed {
+                    path,
+                    kind,
+                    preamble,
+                    outline,
+                    explicit_ids,
+                } => {
+                    let mut categories = Vec::new();
+                    if *kind {
+                        categories.push("kind");
+                    }
+                    if *preamble {
+                        categories.push("preamble");
+                    }
+                    if *outline {
+                        categories.push("outline");
+                    }
+                    if *explicit_ids {
+                        categories.push("explicit-ids");
+                    }
+                    write!(
+                        formatter,
+                        "\nclean join mismatch detail: changed path={path:?} categories={}",
+                        categories.join(",")
+                    )?;
+                }
+            }
+        }
+        let omitted = self.mismatch_count().saturating_sub(self.details.len());
+        if omitted > 0 {
+            write!(
+                formatter,
+                "\nclean join mismatch detail: {omitted} additional mismatches omitted"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn clean_join_semantic_diff(
+    local: &[CleanJoinUserPage],
+    shared: &[CleanJoinUserPage],
+) -> Option<CleanJoinSemanticDiff> {
+    let mut diff = CleanJoinSemanticDiff {
+        local_pages: local.len(),
+        shared_pages: shared.len(),
+        local_only: 0,
+        shared_only: 0,
+        changed: 0,
+        changed_kind: 0,
+        changed_preamble: 0,
+        changed_outline: 0,
+        changed_explicit_ids: 0,
+        details: Vec::new(),
+    };
+    let (mut local_index, mut shared_index) = (0, 0);
+    while local_index < local.len() || shared_index < shared.len() {
+        match (local.get(local_index), shared.get(shared_index)) {
+            (Some(local_page), Some(shared_page)) => match local_page.path.cmp(&shared_page.path) {
+                std::cmp::Ordering::Less => {
+                    diff.record(CleanJoinMismatchDetail::LocalOnly(local_page.path.clone()));
+                    local_index += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    diff.record(CleanJoinMismatchDetail::SharedOnly(
+                        shared_page.path.clone(),
+                    ));
+                    shared_index += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    let kind = local_page.kind != shared_page.kind;
+                    let preamble = local_page.preamble != shared_page.preamble;
+                    let outline = local_page.outline.len() != shared_page.outline.len()
+                        || local_page.outline.iter().zip(&shared_page.outline).any(
+                            |(
+                                (local_depth, local_content, _),
+                                (shared_depth, shared_content, _),
+                            )| {
+                                local_depth != shared_depth || local_content != shared_content
+                            },
+                        );
+                    let explicit_ids = !outline
+                        && local_page.outline.iter().zip(&shared_page.outline).any(
+                            |((_, _, local_uuid), (_, _, shared_uuid))| local_uuid != shared_uuid,
+                        );
+                    if kind || preamble || outline || explicit_ids {
+                        diff.record(CleanJoinMismatchDetail::Changed {
+                            path: local_page.path.clone(),
+                            kind,
+                            preamble,
+                            outline,
+                            explicit_ids,
+                        });
+                    }
+                    local_index += 1;
+                    shared_index += 1;
+                }
+            },
+            (Some(local_page), None) => {
+                diff.record(CleanJoinMismatchDetail::LocalOnly(local_page.path.clone()));
+                local_index += 1;
+            }
+            (None, Some(shared_page)) => {
+                diff.record(CleanJoinMismatchDetail::SharedOnly(
+                    shared_page.path.clone(),
+                ));
+                shared_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    (diff.mismatch_count() > 0).then_some(diff)
+}
+
 fn clean_join_user_semantics(
     snapshot: CanonicalSnapshot,
 ) -> Result<Vec<CleanJoinUserPage>, SyncRuntimeRequestError> {
@@ -20038,15 +20235,8 @@ impl RuntimeActor {
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
             let local_semantics = clean_join_user_semantics(local_snapshot)?;
             let provider_semantics = clean_join_user_semantics(provider_snapshot)?;
-            if local_semantics != provider_semantics {
-                #[cfg(test)]
-                eprintln!(
-                    "clean late-join semantic mismatch\nlocal={local_semantics:#?}\nprovider={provider_semantics:#?}"
-                );
-                return Err(SyncRuntimeRequestError::ActorRefused(
-                    "this device's current Markdown/Org graph contains semantic changes that are not in the shared provider frontier; Tine left both authorities unchanged"
-                        .into(),
-                ));
+            if let Some(diff) = clean_join_semantic_diff(&local_semantics, &provider_semantics) {
+                return Err(SyncRuntimeRequestError::ActorRefused(diff.to_string()));
             }
             self.install_clean_join_candidate(&descriptor, candidate, marker)?;
         }
@@ -22171,6 +22361,144 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
+
+    fn clean_join_page(
+        path: &str,
+        kind: ManagedTextKind,
+        preamble: Option<&str>,
+        outline: &[(usize, &str, Option<u128>)],
+    ) -> CleanJoinUserPage {
+        CleanJoinUserPage {
+            path: path.to_owned(),
+            kind,
+            preamble: preamble.map(str::to_owned),
+            outline: outline
+                .iter()
+                .map(|(depth, content, uuid)| {
+                    (
+                        *depth,
+                        (*content).to_owned(),
+                        uuid.map(|value| LogseqUuid::from_uuid(Uuid::from_u128(value))),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn clean_join_semantic_diff_accepts_equal_user_semantics() {
+        let pages = vec![clean_join_page(
+            "pages/one.md",
+            ManagedTextKind::Page,
+            Some("title:: One"),
+            &[(0, "first", Some(1)), (1, "child", None)],
+        )];
+
+        assert_eq!(clean_join_semantic_diff(&pages, &pages), None);
+    }
+
+    #[test]
+    fn clean_join_semantic_diff_classifies_every_disk_expressible_difference() {
+        let local = vec![
+            clean_join_page(
+                "journals/2026_08_25.md",
+                ManagedTextKind::Journal,
+                None,
+                &[(0, "same", None)],
+            ),
+            clean_join_page(
+                "pages/changed.md",
+                ManagedTextKind::Page,
+                Some("local preamble"),
+                &[(0, "local content", Some(1))],
+            ),
+            clean_join_page(
+                "pages/id-only.md",
+                ManagedTextKind::Page,
+                None,
+                &[(0, "same content", Some(3))],
+            ),
+            clean_join_page("pages/local-only.md", ManagedTextKind::Page, None, &[]),
+        ];
+        let shared = vec![
+            clean_join_page(
+                "journals/2026_08_25.md",
+                ManagedTextKind::Journal,
+                None,
+                &[(0, "same", None)],
+            ),
+            clean_join_page(
+                "pages/changed.md",
+                ManagedTextKind::Journal,
+                Some("shared preamble"),
+                &[(1, "shared content", Some(2))],
+            ),
+            clean_join_page(
+                "pages/id-only.md",
+                ManagedTextKind::Page,
+                None,
+                &[(0, "same content", Some(4))],
+            ),
+            clean_join_page("pages/shared-only.md", ManagedTextKind::Page, None, &[]),
+        ];
+
+        let diff = clean_join_semantic_diff(&local, &shared).expect("different semantics");
+        assert_eq!(diff.local_pages, 4);
+        assert_eq!(diff.shared_pages, 4);
+        assert_eq!(diff.local_only, 1);
+        assert_eq!(diff.shared_only, 1);
+        assert_eq!(diff.changed, 2);
+        assert_eq!(diff.changed_kind, 1);
+        assert_eq!(diff.changed_preamble, 1);
+        assert_eq!(diff.changed_outline, 1);
+        assert_eq!(diff.changed_explicit_ids, 1);
+    }
+
+    #[test]
+    fn clean_join_semantic_diff_diagnostics_name_paths_without_content_or_uuids() {
+        let local = vec![clean_join_page(
+            "pages/private name.md",
+            ManagedTextKind::Page,
+            Some("secret local preamble"),
+            &[(0, "secret local text", Some(0x1111))],
+        )];
+        let shared = vec![clean_join_page(
+            "pages/private name.md",
+            ManagedTextKind::Journal,
+            Some("secret shared preamble"),
+            &[(0, "secret shared text", Some(0x2222))],
+        )];
+
+        let rendered = clean_join_semantic_diff(&local, &shared)
+            .expect("different semantics")
+            .to_string();
+        assert!(rendered.contains("local-pages=1 shared-pages=1"));
+        assert!(rendered
+            .contains("changed path=\"pages/private name.md\" categories=kind,preamble,outline"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("1111"));
+        assert!(!rendered.contains("2222"));
+    }
+
+    #[test]
+    fn clean_join_semantic_diff_bounds_path_details() {
+        let local = (0..CLEAN_JOIN_MAX_MISMATCH_DETAILS + 3)
+            .map(|index| {
+                clean_join_page(
+                    &format!("pages/local-{index}.md"),
+                    ManagedTextKind::Page,
+                    None,
+                    &[],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let rendered = clean_join_semantic_diff(&local, &[])
+            .expect("different semantics")
+            .to_string();
+        assert_eq!(rendered.matches("local-only path=").count(), 32);
+        assert!(rendered.contains("3 additional mismatches omitted"));
+    }
 
     #[test]
     fn pre_promotion_receipt_retry_preserves_one_diagnostic_tree() {
@@ -31058,6 +31386,17 @@ mod tests {
                 .contains("not in the shared provider frontier"),
             "{refusal}"
         );
+        assert!(
+            refusal.to_string().contains("local-only=1 shared-only=0"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.to_string().contains(
+                "clean join mismatch detail: local-only path=\"notes/unconverged local page.md\""
+            ),
+            "{refusal}"
+        );
+        assert!(!refusal.to_string().contains("still only on this device"));
         assert_eq!(
             user_graph_bytes(&adopter.graph_root),
             graph_before,
