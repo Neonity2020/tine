@@ -54,10 +54,11 @@ export function ReferenceExportChooser(props: {
     const nodes = props.groups.flatMap((g): ExportNode[] => {
       const chosen = g.blocks.filter((b) => selected().has(entryKey(g, b)));
       if (!chosen.length) return [];
+      const format = formatForPage(g.page);
       return [{
         raw: g.page,
-        format: "md",
-        children: blockDtosToExportNodes(chosen, formatForPage(g.page)),
+        format,
+        children: blockDtosToExportNodes(chosen, format),
       }];
     });
     if (!nodes.length) return;

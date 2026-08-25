@@ -3,7 +3,7 @@ import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
 import { initParser } from "../render/parse";
 import { backend } from "../backend";
-import { doc, resetStore } from "../store";
+import { doc, resetStore, setDoc } from "../store";
 import { closeExportModal, exportModal } from "../ui";
 import { clearTransientLayersForTest } from "../transientLayers";
 import { resetReferenceSectionState } from "../referenceSectionState";
@@ -189,6 +189,33 @@ describe("batch export of Linked References (GH #348)", () => {
       expect(req.nodes.map((n) => n.raw)).toEqual(["Note A", "Note B"]);
       expect(req.nodes[0].children).toHaveLength(2);
       expect(req.nodes[1].children).toHaveLength(1);
+    } finally {
+      closeExportModal();
+      m.dispose();
+    }
+  });
+
+  it("preserves an Org source page's syntax for both its group and blocks", async () => {
+    setDoc({
+      byId: {},
+      pages: [{ name: "Note A", kind: "page", title: "Note A", preBlock: null, roots: [], format: "org", readOnly: false, guide: false }],
+      feed: [],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([LINKED[0]]);
+    const m = mount(() => (<><LinkedReferences name="Target" /><ExportModal /></>) as JSX.Element);
+    try {
+      await settle();
+      exportButton(m.root, "Copy / export linked references").click();
+      await settle();
+      chooserButton("Copy / export…").click();
+      await settle();
+
+      const req = nodesRequest();
+      expect(req.nodes[0].format).toBe("org");
+      expect(req.nodes[0].children.every((node) => node.format === "org")).toBe(true);
+      expect([...document.querySelectorAll<HTMLButtonElement>(".export-indent-btn")]
+        .some((button) => button.textContent?.trim() === "Org")).toBe(true);
     } finally {
       closeExportModal();
       m.dispose();
