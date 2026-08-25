@@ -361,7 +361,10 @@ pub(crate) const CRUMB_MAX_CHARS: usize = 60;
 pub(crate) fn crumb_line(block: &DocBlock) -> String {
     let line = block.visible_text().lines().next().unwrap_or("").trim();
     if line.chars().count() > CRUMB_MAX_CHARS {
-        format!("{}…", line.chars().take(CRUMB_MAX_CHARS).collect::<String>())
+        format!(
+            "{}…",
+            line.chars().take(CRUMB_MAX_CHARS).collect::<String>()
+        )
     } else {
         line.to_owned()
     }

@@ -1761,7 +1761,10 @@ fn execute_application_blocks(
                 )
                 .expect("rank and evidence evaluators must agree");
                 let mut dto = crate::model::block_to_shallow_dto(block);
-                dto.breadcrumb = path.iter().map(|ancestor| crate::doc::crumb_line(ancestor)).collect();
+                dto.breadcrumb = path
+                    .iter()
+                    .map(|ancestor| crate::doc::crumb_line(ancestor))
+                    .collect();
                 let candidate = ApplicationScoredBlock {
                     relevance,
                     index: candidate_index,

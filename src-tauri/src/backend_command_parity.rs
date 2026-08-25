@@ -136,7 +136,10 @@ fn next_after_call_site(bytes: &[char], start: usize) -> usize {
 
 #[cfg(test)]
 fn starts_with(haystack: &[char], needle: &str) -> bool {
-    needle.chars().enumerate().all(|(offset, expected)| haystack.get(offset) == Some(&expected))
+    needle
+        .chars()
+        .enumerate()
+        .all(|(offset, expected)| haystack.get(offset) == Some(&expected))
 }
 
 #[cfg(test)]

@@ -125,7 +125,10 @@ fn string_literals(text: &str, label: &str) -> BTreeSet<String> {
         found.insert(after[..close].to_owned());
         rest = &after[close + 1..];
     }
-    assert!(!found.is_empty(), "scanned no string literals out of `{label}`");
+    assert!(
+        !found.is_empty(),
+        "scanned no string literals out of `{label}`"
+    );
     found
 }
 

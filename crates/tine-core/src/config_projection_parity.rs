@@ -85,13 +85,11 @@ const LOGBOOK_PROJECTED_AS: &[&str] = &[
 
 /// `GraphMeta` fields with no `Config` field behind them.
 #[cfg(test)]
-const GRAPH_META_FIELDS_WITHOUT_CONFIG: &[(&str, &str)] = &[
-    (
-        "root",
-        "the graph's filesystem root — where the config came FROM, not a \
+const GRAPH_META_FIELDS_WITHOUT_CONFIG: &[(&str, &str)] = &[(
+    "root",
+    "the graph's filesystem root — where the config came FROM, not a \
          setting inside it",
-    ),
-];
+)];
 
 /// Field names of a `pub struct NAME { … }` in a Rust source, in declaration
 /// order. Only `pub` fields count: a private field is not part of the surface
@@ -144,7 +142,11 @@ fn ts_interface_fields(source: &str, name: &str) -> Vec<String> {
     let mut fields = Vec::new();
     for line in source[body_start..end].lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with('*') || line.starts_with("/*") {
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('*')
+            || line.starts_with("/*")
+        {
             continue;
         }
         let Some((field, _)) = line.split_once(':') else {
@@ -155,7 +157,10 @@ fn ts_interface_fields(source: &str, name: &str) -> Vec<String> {
             fields.push(field.to_owned());
         }
     }
-    assert!(!fields.is_empty(), "scanned no fields out of the TS `{name}` interface");
+    assert!(
+        !fields.is_empty(),
+        "scanned no fields out of the TS `{name}` interface"
+    );
     fields
 }
 

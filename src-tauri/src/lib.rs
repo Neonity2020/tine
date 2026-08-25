@@ -8,11 +8,11 @@ mod android_managed_storage_smoke;
 mod android_media;
 mod android_safe_back;
 mod android_system_bars;
-mod backup;
 /// Test-only: `src/backend.ts` and `tauri::generate_handler!` must name the
 /// same set of commands.
 #[cfg(test)]
 mod backend_command_parity;
+mod backup;
 mod commands;
 mod data_home;
 mod debug;
