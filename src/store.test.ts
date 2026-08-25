@@ -79,6 +79,7 @@ import {
   finishPageHeaderEdit,
   ensureBlockId,
   persistentBlockRef,
+  persistBlockRefTarget,
   resolveBlockRef,
   reloadPageIfStillSafe,
   appendToTodayJournal,
@@ -1166,6 +1167,104 @@ describe("cross-page duplicate id::", () => {
       pageKind: "page",
       path: "pages/client-a/B.md",
     })).toBeNull();
+  });
+
+  it("prefers the unique authored Org id over a sibling runtime locator with the same UUID", () => {
+    const claimed = "12345678-1234-8234-8234-123456789abc";
+    const targetRuntime = "87654321-4321-8321-8321-cba987654321";
+    loadSingle({
+      name: "Org Identity",
+      kind: "page",
+      title: "Org Identity",
+      pre_block: null,
+      format: "org",
+      path: "pages/Org Identity.org",
+      blocks: [
+        { id: claimed, raw: "Wrong earlier heading", collapsed: false, children: [] },
+        {
+          id: targetRuntime,
+          raw: `Intended heading\n:PROPERTIES:\n:id: ${claimed}\n:END:`,
+          collapsed: false,
+          children: [],
+        },
+      ],
+    });
+
+    expect(resolveBlockRef({
+      uuid: claimed,
+      page: "Org Identity",
+      pageKind: "page",
+      path: "pages/Org Identity.org",
+    })).toBe(targetRuntime);
+  });
+
+  it.each([
+    ["Markdown", "md" as const, (uuid: string) => `one\nid:: ${uuid}`],
+    ["Org", "org" as const, (uuid: string) => `one\n:PROPERTIES:\n:id: ${uuid}\n:END:`],
+  ])("fails closed for duplicate authored IDs within one %s page", (_label, format, raw) => {
+    const duplicate = "12345678-1234-4234-8234-123456789abc";
+    loadSingle({
+      name: "Duplicate",
+      kind: "page",
+      title: "Duplicate",
+      pre_block: null,
+      format,
+      blocks: [
+        { id: "runtime-one", raw: raw(duplicate), collapsed: false, children: [] },
+        { id: "runtime-two", raw: raw(duplicate).replace("one", "two"), collapsed: false, children: [] },
+      ],
+    });
+
+    expect(resolveBlockRef({
+      uuid: duplicate,
+      page: "Duplicate",
+      pageKind: "page",
+    })).toBeNull();
+  });
+
+  it("keeps an ID-less runtime locator resolvable when no authored ID claims it", () => {
+    const runtime = "12345678-1234-8234-8234-123456789abc";
+    loadSingle({
+      name: "Runtime only",
+      kind: "page",
+      title: "Runtime only",
+      pre_block: null,
+      blocks: [{ id: runtime, raw: "No authored id", collapsed: false, children: [] }],
+    });
+
+    expect(resolveBlockRef({
+      uuid: runtime,
+      page: "Runtime only",
+      pageKind: "page",
+    })).toBe(runtime);
+  });
+
+  it("does not treat a runtime locator as a second identity after that block gains another authored ID", () => {
+    const runtime = "12345678-1234-8234-8234-123456789abc";
+    const authored = "87654321-4321-4321-8321-cba987654321";
+    loadSingle({
+      name: "Authored identity wins",
+      kind: "page",
+      title: "Authored identity wins",
+      pre_block: null,
+      blocks: [{
+        id: runtime,
+        raw: `Only one external identity\nid:: ${authored}`,
+        collapsed: false,
+        children: [],
+      }],
+    });
+
+    expect(resolveBlockRef({
+      uuid: runtime,
+      page: "Authored identity wins",
+      pageKind: "page",
+    })).toBeNull();
+    expect(resolveBlockRef({
+      uuid: authored,
+      page: "Authored identity wins",
+      pageKind: "page",
+    })).toBe(runtime);
   });
 });
 
@@ -3463,6 +3562,54 @@ describe("save engine (persistence)", () => {
     expect(doc.byId[storeKey].raw).toBe(`Fresh target\nid:: ${uuid}`);
     expect(await ensureBlockId(storeKey)).toBe(uuid);
     expect(doc.byId[storeKey].raw.match(/(?:^|\n)id::/g)).toHaveLength(1);
+  });
+
+  it("never persists a UUID-shaped runtime locator as a fresh block's external identity", () => {
+    const runtime = "12345678-1234-8234-8234-123456789abc";
+    const external = "87654321-4321-4321-8321-cba987654321";
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(external);
+    load([{ id: runtime, raw: "Fresh deterministic runtime target", collapsed: false, children: [] }]);
+
+    const ref = persistentBlockRef(runtime);
+
+    expect(ref.uuid).toBe(external);
+    expect(ref.uuid).not.toBe(runtime);
+    expect(doc.byId[runtime].raw).toBe(`Fresh deterministic runtime target\nid:: ${external}`);
+  });
+
+  it("mints the same fresh external identity boundary for a UUID-shaped Org runtime locator", () => {
+    const runtime = "12345678-1234-8234-8234-123456789abc";
+    const external = "87654321-4321-4321-8321-cba987654321";
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(external);
+    loadSingle({
+      name: "Org target",
+      kind: "page",
+      title: "Org target",
+      pre_block: null,
+      format: "org",
+      blocks: [{ id: runtime, raw: "Fresh Org runtime target", collapsed: false, children: [] }],
+    });
+
+    const ref = persistentBlockRef(runtime);
+
+    expect(ref.uuid).toBe(external);
+    expect(ref.uuid).not.toBe(runtime);
+    expect(doc.byId[runtime].raw).toBe(
+      `Fresh Org runtime target\n:PROPERTIES:\n:id: ${external}\n:END:`,
+    );
+  });
+
+  it("preserves the exact external ID of an already-committed inline block reference", async () => {
+    const committed = "12345678-1234-8234-8234-123456789abc";
+    const random = vi.spyOn(crypto, "randomUUID").mockReturnValue(
+      "87654321-4321-4321-8321-cba987654321",
+    );
+    load([{ id: committed, raw: "Already referenced target", collapsed: false, children: [] }]);
+
+    await persistBlockRefTarget(committed, "Test", "page");
+
+    expect(doc.byId[committed].raw).toBe(`Already referenced target\nid:: ${committed}`);
+    expect(random).not.toHaveBeenCalled();
   });
 
   it("derives a fresh Org journal's persistent identity from its format-aware drawer", async () => {

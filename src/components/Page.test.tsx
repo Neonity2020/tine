@@ -825,6 +825,48 @@ describe("tag-page table", () => {
 });
 
 describe("zoomed block view", () => {
+  it("zooms to the unique authored ID rather than a sibling's matching runtime locator (GH #373)", async () => {
+    const claimed = "12345678-1234-8234-8234-123456789abc";
+    const intendedRuntime = "87654321-4321-8321-8321-cba987654321";
+    const pageName = "Preserved zoom identity";
+    const path = "pages/Preserved zoom identity.md";
+    setDoc({
+      byId: {
+        [claimed]: node(claimed, "Wrong structural sibling", pageName),
+        [intendedRuntime]: node(
+          intendedRuntime,
+          `Intended preserved block\nid:: ${claimed}`,
+          pageName,
+        ),
+      },
+      pages: [{ ...page(pageName, "page", [claimed, intendedRuntime]), path }],
+      feed: [],
+      loaded: true,
+    });
+    const read = vi.spyOn(backend(), "getPageByPath");
+    mainPaneRouter.replaceActiveRoute({
+      kind: "page",
+      name: pageName,
+      pageKind: "page",
+      path,
+      block: claimed,
+    });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+
+      expect(read).not.toHaveBeenCalled();
+      expect(root.querySelector(".zoomed-page")).not.toBeNull();
+      expect(root.querySelector(`[data-block-id="${intendedRuntime}"]`)).not.toBeNull();
+      expect(root.querySelector(`[data-block-id="${claimed}"]`)).toBeNull();
+      expect(root.textContent).toContain("Intended preserved block");
+      expect(root.textContent).not.toContain("Wrong structural sibling");
+    } finally {
+      dispose();
+    }
+  });
+
   it("reuses the exact loaded owner when a bullet click stamps its durable id (GH #354)", async () => {
     const uuid = "12345678-1234-4234-8234-123456789abc";
     const path = "pages/Zoom race.md";
