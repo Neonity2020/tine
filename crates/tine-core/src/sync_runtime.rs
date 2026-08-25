@@ -29932,7 +29932,10 @@ mod tests {
                 .contains("clean join mismatch detail: local-only path=\"notes/local-only.md\""),
             "{refusal}"
         );
-        assert!(!refusal.to_string().contains("unmatched local work"), "{refusal}");
+        assert!(
+            !refusal.to_string().contains("unmatched local work"),
+            "{refusal}"
+        );
         assert_eq!(
             read_activation_marker(&joiner.request.enrollment_root)
                 .unwrap()
