@@ -1680,15 +1680,14 @@ mod tests {
             after.contains(":favorites [\"Replaced\"]"),
             "the real top-level entry must be the one replaced, got: {after}"
         );
-        assert!(!after.contains("[\"real\"]"), "old top-level value gone, got: {after}");
+        assert!(
+            !after.contains("[\"real\"]"),
+            "old top-level value gone, got: {after}"
+        );
 
         // A key that exists ONLY nested gets a NEW top-level entry; the nested
         // copy is not the setting and must not be edited.
-        std::fs::write(
-            &path,
-            "{:default-queries {:preferred-format :org}}\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "{:default-queries {:preferred-format :org}}\n").unwrap();
         let g = crate::model::Graph::open(&dir);
         g.set_preferred_format(crate::model::Format::Md).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();

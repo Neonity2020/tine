@@ -22869,7 +22869,9 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
                 "block has no assigned runtime identity",
             ));
         }
-        frame.output.push(doc_block_facets_dto(block, block.uuid.clone()));
+        frame
+            .output
+            .push(doc_block_facets_dto(block, block.uuid.clone()));
         if !block.children.is_empty() {
             if len == MAX_MANAGED_BLOCK_DEPTH {
                 return Err(io::Error::new(

@@ -269,7 +269,11 @@ fn collect_reference_matches<'a, M, T>(
 fn crumb_line_estimated_bytes(block: &DocBlock) -> usize {
     let line = block.visible_text().lines().next().unwrap_or("").trim();
     let mut chars = line.chars();
-    let bytes = chars.by_ref().take(60).map(char::len_utf8).sum::<usize>();
+    let bytes = chars
+        .by_ref()
+        .take(crate::doc::CRUMB_MAX_CHARS)
+        .map(char::len_utf8)
+        .sum::<usize>();
     bytes + usize::from(chars.next().is_some()) * '…'.len_utf8()
 }
 
