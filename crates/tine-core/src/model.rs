@@ -668,6 +668,15 @@ pub struct PageEntry {
     pub path: PathBuf,
 }
 
+/// Digest of one exact user-visible Markdown/Org source file.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphTextSourceDigest {
+    pub path: String,
+    pub length: u64,
+    pub digest: String,
+}
+
 /// One parser-owned interpretation of a present external graph-text document.
 ///
 /// The filename fallback and parser-declared title remain distinct so callers
@@ -6406,6 +6415,90 @@ impl Graph {
 
     fn graph_text_entries(&self, permit: &ManagedTextWritePermit) -> io::Result<Vec<PageEntry>> {
         Ok(self.graph_text_inventory(permit)?.0)
+    }
+
+    /// Enumerate every user-visible Markdown/Org source file using the same
+    /// scope and nested-layout rules as Tine's ordinary graph inventory.
+    pub fn graph_text_source_paths(&self) -> io::Result<Vec<String>> {
+        let permit = self.admit_retained_managed_text_writer()?;
+        self.graph_text_entries(&permit)
+            .map(|entries| entries.into_iter().map(|entry| entry.rel_path).collect())
+    }
+
+    /// Hash the actual bytes of one path returned by
+    /// [`Graph::graph_text_source_paths`]. The file is opened without following
+    /// links, streamed through SHA-256, then rechecked through its path. Any
+    /// observed replacement or metadata change is an incomplete verification,
+    /// never a digest result.
+    pub fn digest_graph_text_source(
+        &self,
+        relative: &str,
+        cancelled: &AtomicBool,
+    ) -> io::Result<GraphTextSourceDigest> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "graph verification cancelled",
+            ));
+        }
+        let managed = ManagedPath::parse(relative.to_owned()).map_err(|_| bad_path())?;
+        let absolute = self.root.join(managed.as_str());
+        let Some(entry) = self.graph_inventory_entry(&absolute)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not an admitted graph-text source",
+            ));
+        };
+        if entry.rel_path != managed.as_str() {
+            return Err(bad_path());
+        }
+
+        let permit = self.admit_retained_managed_text_writer()?;
+        let target = self.managed_target(&permit, &absolute, false)?;
+        projection_optional_regular_metadata(target.parent(), &target.filename)?;
+        let mut file = open_projection_file_nofollow(target.parent(), &target.filename)?;
+        let before = file.metadata()?;
+        let before_modified = before.modified()?;
+        let before_identity = canonical_projection_file_resource_id(&file)?;
+        let mut hasher = Sha256::new();
+        let mut length = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "graph verification cancelled",
+                ));
+            }
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            length = length
+                .checked_add(read as u64)
+                .ok_or_else(allocation_overflow)?;
+        }
+        let after = file.metadata()?;
+        let rebound = open_projection_file_nofollow(target.parent(), &target.filename)?;
+        let rebound_metadata = rebound.metadata()?;
+        let stable = length == before.len()
+            && after.len() == before.len()
+            && after.modified()? == before_modified
+            && rebound_metadata.len() == before.len()
+            && rebound_metadata.modified()? == before_modified
+            && canonical_projection_file_resource_id(&rebound)? == before_identity;
+        if !stable {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "graph source changed while it was being verified",
+            ));
+        }
+        Ok(GraphTextSourceDigest {
+            path: managed.to_string(),
+            length,
+            digest: format!("{:x}", hasher.finalize()),
+        })
     }
 
     /// Check historical page filenames through the retained graph capability.
@@ -44929,6 +45022,46 @@ mod tests {
                 "independent graph scan did not observe {relative}"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graph_text_byte_verification_uses_real_nested_sources_without_mutation() {
+        let dir = scratch("graph-text-byte-verification");
+        fs::create_dir_all(dir.join("pages/nested")).unwrap();
+        fs::create_dir_all(dir.join("archive/deep")).unwrap();
+        fs::write(
+            dir.join("pages/nested/Unicode 題.md"),
+            b"- exact\r\nbytes\n",
+        )
+        .unwrap();
+        fs::write(dir.join("archive/deep/Elsewhere.org"), b"* elsewhere\n").unwrap();
+        fs::write(dir.join("pages/.hidden.md"), b"- private\n").unwrap();
+        fs::write(dir.join("archive/deep/not-graph.txt"), b"ignored\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        let paths = graph.graph_text_source_paths().unwrap();
+        assert!(paths.contains(&"pages/nested/Unicode 題.md".to_owned()));
+        assert!(paths.contains(&"archive/deep/Elsewhere.org".to_owned()));
+        assert!(!paths.iter().any(|path| path.contains(".hidden.md")));
+        assert!(!paths.iter().any(|path| path.ends_with("not-graph.txt")));
+
+        let before = fs::read(dir.join("pages/nested/Unicode 題.md")).unwrap();
+        let result = graph
+            .digest_graph_text_source("pages/nested/Unicode 題.md", &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(result.length, before.len() as u64);
+        assert_eq!(result.digest, format!("{:x}", Sha256::digest(&before)));
+        assert_eq!(fs::read(dir.join(&result.path)).unwrap(), before);
+        assert_eq!(
+            graph
+                .digest_graph_text_source("pages/nested/Unicode 題.md", &AtomicBool::new(true),)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(fs::read(dir.join(&result.path)).unwrap(), before);
 
         let _ = fs::remove_dir_all(&dir);
     }
