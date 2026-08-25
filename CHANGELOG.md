@@ -26,6 +26,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   refusing the accepted block as unauthorized when the UUID originated in the
   activation baseline (GH #370).
 
+- **Android startup and page navigation no longer look like an unexplained black
+  or blank screen while work is pending.** The native window now has light and
+  night Tine backing colors before the WebView paints, startup immediately shows
+  a matching readiness surface, and an in-app page load has a small visible
+  indicator. Actual load failures still replace it with their error, and plugin
+  revocation checks still finish before community code can activate (GH #299).
+
 - **Clicking a block bullet no longer reports a false same-name file conflict.**
   A block zoom now keeps using the exact page already open in Direct Files
   instead of racing the durable block-ID save with a second read of the page's
