@@ -136,8 +136,8 @@ try {
   await browser.execute(() => {
     for (const button of document.querySelectorAll(".page-conflict button")) {
       const text = button.textContent?.trim();
-      if (text === "Keep both everywhere") button.setAttribute("data-concord-keep-both", "true");
-      if (text === "Keep This device") button.setAttribute("data-concord-keep-mine", "true");
+      if (text?.includes("Keep both everywhere")) button.setAttribute("data-concord-keep-both", "true");
+      if (text?.includes("Keep This device")) button.setAttribute("data-concord-keep-mine", "true");
       if (text === "Apply resolution") button.setAttribute("data-concord-apply", "true");
     }
   });

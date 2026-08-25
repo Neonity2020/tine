@@ -1418,7 +1418,7 @@ try {
   await browser.execute(() => {
     const action = [...document.querySelectorAll(".pdf-hl-action")]
       .find((element) => element.textContent?.trim() === "Copy ref");
-    action?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+    action?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window }));
   });
   await browser.waitUntil(() => fs.readFileSync(hlsPage, "utf8").includes(`:id: ${SAMPLE_ID}`), {
     timeout: 10_000,
@@ -1441,7 +1441,7 @@ try {
   await browser.execute(() => {
     const action = [...document.querySelectorAll(".pdf-hl-action")]
       .find((element) => element.textContent?.trim() === "Linked references");
-    action?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+    action?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window }));
   });
   await browser.waitUntil(() => browser.execute((highlightId) => {
     const block = document.querySelector(`.ls-block[data-block-ref="${highlightId}"]`);

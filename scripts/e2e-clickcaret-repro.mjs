@@ -132,7 +132,10 @@ try {
     await browser.performActions([{
       type: "pointer", id: "mouse", parameters: { pointerType: "mouse" },
       actions: [
-        { type: "pointerMove", duration: 0, x: Math.round(x), y: Math.round(y) },
+        // Stay on the leading half of the measured glyph. Rounding a
+        // fractional left-edge probe to the right can cross WebKit's caret
+        // midpoint and make the harness select the following character.
+        { type: "pointerMove", duration: 0, x: Math.floor(x), y: Math.round(y) },
         { type: "pointerDown", button: 0 },
         { type: "pointerUp", button: 0 },
       ],

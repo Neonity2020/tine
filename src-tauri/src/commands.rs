@@ -3894,9 +3894,7 @@ pub(crate) async fn vcs_marker_conflict_diff(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.with_filesystem_graph(|g| {
-            g.vcs_marker_conflict_diff(&path).map_err(|e| e.to_string())
-        })
+        slot.with_filesystem_graph(|g| g.vcs_marker_conflict_diff(&path).map_err(|e| e.to_string()))
     })
     .await
     .map_err(|error| error.to_string())?
