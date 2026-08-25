@@ -19,13 +19,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   that needs it, so the corpus reports the same result twice in a row (GH #350).
 
 - **Queries and search are much faster on Managed Storage.** Every managed
-  query used to re-parse every block of every candidate page, every time -- so
-  a page full of `{{query}}` re-parsed the graph on each open, and search
-  re-parsed it on each keystroke. Unchanged pages are now parsed once and
-  reused; an edited page is re-read on the very next query. Searching for a
-  literal phrase also consults the stored text index first instead of reading
-  every page, and a result-limited search now does its work only for the
-  results it keeps.
+  query used to re-read, re-parse, and structurally cross-check every candidate
+  page, every time -- so a page full of `{{query}}` re-parsed the graph on each
+  open, and search re-parsed it on each keystroke. Unchanged pages now reuse
+  their complete parsed application view after their exact file bytes and
+  stored page state are checked; an external edit or accepted actor change is
+  re-read immediately. Searching for a literal phrase also consults the stored
+  text index first instead of reading every page, and a result-limited search
+  now does its work only for the results it keeps.
 
 ### Fixed
 

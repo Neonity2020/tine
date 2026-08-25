@@ -9645,6 +9645,43 @@ impl Graph {
         read_projection_optional(parent.final_dir(), &target.filename)
     }
 
+    /// Capture the exact managed page bytes and refresh the same file-identity
+    /// guard as an ordinary exact page load, without parsing the page yet.
+    /// Managed application hydration uses this so a cache hit can skip parsing
+    /// without weakening the next guarded save.
+    pub(crate) fn read_application_projection_input(
+        &self,
+        path: &ManagedPath,
+    ) -> io::Result<Option<Vec<u8>>> {
+        require_projection_platform()?;
+        let target = self.projection_page_target(path.as_str())?;
+        let lock = self.page_lock(&target.absolute_path);
+        let _guard = lock.lock().unwrap();
+        let Some(parent) = self.projection_parent_optional(&target)? else {
+            return Ok(None);
+        };
+        self.ensure_projection_parent_binding(&parent, &target)?;
+        self.ensure_projection_target_shape(&parent, &target)?;
+        let (file, bytes) =
+            match open_and_read_projection_regular(parent.final_dir(), &target.filename) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        let content = std::str::from_utf8(&bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("graph text is not UTF-8: {path}"),
+            )
+        })?;
+        let file_identity = canonical_projection_file_resource_id(&file)?;
+        self.loaded_file_identities
+            .write()
+            .unwrap()
+            .insert(target.absolute_path, (content_rev(content), file_identity));
+        Ok(Some(bytes))
+    }
+
     /// Preserve the actor's exact current managed projection in user-visible,
     /// typed recovery trash before the semantic page deletion is authored.
     /// The digest-derived name makes retries idempotent; an existing destination
