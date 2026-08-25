@@ -23565,27 +23565,7 @@ pub(crate) fn move_file_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
 /// appeared after the caller's collision check. The payload is fsynced in a
 /// same-directory temp, then atomically renamed into the final name only if absent.
 pub(crate) fn atomic_write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("page");
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{fname}.{}.{}.new.tmp", std::process::id(), seq));
-    let res = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        move_file_noreplace(&tmp, path)?;
-        sync_dir(dir)
-    })();
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    res
+    atomic_publish(path, bytes, PublishMode::NoReplace)
 }
 
 /// Suffix marking a file retired by [`atomic_replace_expected`] mid-publish.
@@ -23616,6 +23596,21 @@ fn dir_fsync_is_unsupported(error: &io::Error) -> bool {
     error
         .raw_os_error()
         .is_some_and(|errno| UNSUPPORTED_ERRNOS.contains(&errno))
+}
+
+/// App-layer face of [`sync_dir`]: fsync `dir` so a rename into it survives a
+/// crash. For src-tauri writers (settings registry, backup restore, window
+/// identity) that previously discarded this result with `let _ = …` — a false
+/// ack under the in-scope crash/power-loss threat (DUP-5).
+pub fn sync_dir_for_rename(dir: &Path) -> io::Result<()> {
+    sync_dir(dir)
+}
+
+/// App-layer face of [`dir_fsync_is_unsupported`], for writers that hold their
+/// own directory handle (the cap-std restore path) and must apply the same
+/// tolerate-unsupported / report-real policy.
+pub fn dir_fsync_error_is_unsupported(error: &io::Error) -> bool {
+    dir_fsync_is_unsupported(error)
 }
 
 /// fsync a directory so a rename into it survives a crash.
@@ -23812,13 +23807,39 @@ fn retired_target_name(retired: &str) -> Option<&str> {
 /// the same path (e.g. an autosave and a highlight/rename rewrite) can't truncate
 /// each other's temp; the rename is still atomic. The temp is removed if the
 /// write fails, so a unique name never leaks an orphan behind.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// How [`atomic_publish`] lands the temp on its final name.
+enum PublishMode {
+    /// `fs::rename` — replaces an existing file (the ordinary save shape).
+    Replace,
+    /// `move_file_noreplace` — create-only; never clobbers a concurrent creator.
+    NoReplace,
+}
+
+/// THE temp+fsync+rename publish implementation, shared by [`atomic_write`]
+/// and [`atomic_write_new`] (DUP-5, 2026-08-25 duplication audit: the family
+/// had drifted into copies with different failure policies; the rationale
+/// lives here once).
+///
+/// - The temp name is unique per write (pid + per-process sequence) so two
+///   concurrent writers to the same path can't truncate each other's temp.
+/// - The temp is hidden (`.`-prefixed) and ends in `.tmp` — the shape the
+///   watcher's `is_tine_atomic_page_temp_path` and the wire-side recognizer
+///   understand; change it only together with both recognizers.
+/// - Directory-fsync errors that mean "unsupported here" are tolerated; a real
+///   `EIO`/`ENOSPC` is REPORTED, because a caller told this succeeded will
+///   report the save as durably committed (in-scope threat: crash/power loss
+///   right after the rename).
+fn atomic_publish(path: &Path, bytes: &[u8], mode: PublishMode) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("page");
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{fname}.{}.{seq}.tmp", std::process::id()));
+    let infix = match mode {
+        PublishMode::Replace => "",
+        PublishMode::NoReplace => ".new",
+    };
+    let tmp = dir.join(format!(".{fname}.{}.{seq}{infix}.tmp", std::process::id()));
     let res = (|| {
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -23827,17 +23848,20 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path)
+        match mode {
+            PublishMode::Replace => fs::rename(&tmp, path),
+            PublishMode::NoReplace => move_file_noreplace(&tmp, path),
+        }
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp); // never leave a temp behind on failure
         return res;
     }
-    // Persist the rename itself: fsync the directory so a crash right after the
-    // write can't lose the new directory entry (the rename) on some filesystems.
-    // Unsupported-here errors are tolerated; a real one is reported, because a
-    // caller told this succeeded will report the save as durably committed.
     sync_dir(dir)
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_publish(path, bytes, PublishMode::Replace)
 }
 
 fn managed_root_components(root: &str) -> Option<Vec<&str>> {

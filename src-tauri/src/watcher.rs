@@ -521,6 +521,22 @@ fn is_tine_atomic_page_temp_path(path: &Path) -> bool {
     let Some(mut stem) = name.strip_suffix(".tmp") else {
         return false;
     };
+    // Backup-restore publishes page files into the live graph through
+    // `.tine-restore-{pid}-{seq}.tmp` temps (`backup.rs::atomic_copy_new_into_live`).
+    // Recognize that shape too, or a rename event pairing such a temp with a
+    // page path is dropped and the restored page never queued — previously
+    // masked only by an unrelated `refresh_graph` call after restore (DUP-5).
+    if let Some(rest) = stem.strip_prefix(".tine-restore-") {
+        if let Some((pid, seq)) = rest.split_once('-') {
+            if !pid.is_empty()
+                && !seq.is_empty()
+                && pid.chars().all(|value| value.is_ascii_digit())
+                && seq.chars().all(|value| value.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
     if let Some(without_projection) = stem.strip_suffix(".projection") {
         stem = without_projection;
     }
@@ -4950,5 +4966,35 @@ mod tests {
         assert_eq!(full_snap, fresh);
         assert_eq!(inc_conflicts_dirty, full_conflicts_dirty);
         assert_eq!(sorted_changes(inc_changes), sorted_changes(full_changes));
+    }
+
+    /// DUP-5: every temp shape a Tine writer can rename INTO the live graph
+    /// must be recognized here, or the rename event that publishes the real
+    /// page is dropped. The restore shape was invisible until 2026-08-25.
+    #[test]
+    fn recognizes_every_tine_temp_shape_that_lands_in_the_live_graph() {
+        for recognized in [
+            ".Foo.md.1234.7.tmp",
+            ".Foo.md.1234.7.new.tmp",
+            ".Foo.md.1234.7.projection.tmp",
+            ".tine-restore-1234-7.tmp",
+        ] {
+            assert!(
+                is_tine_atomic_page_temp_path(Path::new(recognized)),
+                "{recognized} must be recognized as a Tine atomic temp"
+            );
+        }
+        for foreign in [
+            ".tine-restore-x.tmp",
+            ".tine-restore-12.tmp",
+            "tine-restore-1234-7.tmp",
+            ".Foo.md.restore.tmp",
+            "Foo.md",
+        ] {
+            assert!(
+                !is_tine_atomic_page_temp_path(Path::new(foreign)),
+                "{foreign} must NOT read as a Tine atomic temp"
+            );
+        }
     }
 }

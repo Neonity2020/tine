@@ -13898,6 +13898,19 @@ impl RuntimeActor {
         Ok(pages)
     }
 
+    /// Lookup key for the canonical-keyed managed indexes (`name_key` columns,
+    /// written with `LogicalPageName::canonical_key`). NOT `refs::normalize`:
+    /// the two folds differ on Greek final sigma, and querying a
+    /// canonical-keyed index with the refs fold returns nothing for such names
+    /// — which made a managed rename of `ΟΔΥΣΣΕΥΣ` report `Applied` while
+    /// doing nothing (DUP-1, 2026-08-25 duplication audit). Collapsing the two
+    /// folds is a `PAGE_NAME_KEY_VERSION` migration tracked in the storage
+    /// backlog; until then this helper is the only correct way to key into
+    /// those indexes from a raw page-name string.
+    fn managed_page_name_key(name: &str) -> String {
+        crate::oplog::semantic::canonical_page_name_key(name)
+    }
+
     fn application_page_rename_sources_ready(
         &self,
         old_key: &str,
@@ -15356,10 +15369,12 @@ impl RuntimeActor {
     ) -> Result<Option<OperationTransaction>, SyncApplicationPageRequestError> {
         let old = old.trim();
         let new = new.trim();
-        if old.is_empty() || crate::refs::same_page(old, new) {
+        // Managed identity comparisons use the managed fold, not refs::same_page
+        // — the folds disagree on final sigma (DUP-1).
+        if old.is_empty() || Self::managed_page_name_key(old) == Self::managed_page_name_key(new) {
             return Ok(None);
         }
-        let old_key = crate::refs::normalize(old);
+        let old_key = Self::managed_page_name_key(old);
         let old_chars = old.chars().count();
         let mut selected = self.application_page_rename_sources_ready(&old_key)?;
         let primary = selected.iter().find(|entry| entry.name_key == old_key);
@@ -15392,7 +15407,7 @@ impl RuntimeActor {
                     entry.name.chars().skip(old_chars).collect::<String>()
                 )
             };
-            let target_key = crate::refs::normalize(&target_name);
+            let target_key = Self::managed_page_name_key(&target_name);
             if !target_names.insert(target_key.clone())
                 || self
                     .application_pages_at_name_key_ready(&target_key)?
@@ -15635,7 +15650,7 @@ impl RuntimeActor {
             // external referrers; the source and destination themselves are
             // rewritten in their DTOs below because their blocks participate in
             // the merge transaction rather than surviving as independent pages.
-            let old_key = crate::refs::normalize(old);
+            let old_key = Self::managed_page_name_key(old);
             let old_chars = old.chars().count();
             let selected = self.application_page_rename_sources_ready(&old_key)?;
             let selected_paths = selected
@@ -15655,7 +15670,7 @@ impl RuntimeActor {
                         entry.name.chars().skip(old_chars).collect::<String>()
                     )
                 };
-                let target_key = crate::refs::normalize(&target_name);
+                let target_key = Self::managed_page_name_key(&target_name);
                 if !target_names.insert(target_key.clone())
                     || self
                         .application_pages_at_name_key_ready(&target_key)?
@@ -27563,6 +27578,56 @@ mod tests {
             before.managed_local_pending + 1
         );
         drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_rename_uses_the_canonical_fold_for_final_sigma_names() {
+        // "ΟΔΥΣΣΕΥΣ" is a name where refs::page_key ("οδυσσευς", contextual
+        // final sigma) and the managed canonical fold ("οδυσσευσ", char-wise)
+        // disagree. Pre-DUP-1 the rename planner keyed the canonical-keyed
+        // navigation index with the refs fold, selected nothing, and reported
+        // Applied while renaming nothing — a silent no-op.
+        let fixture = ActivationFixture::nested_unicode("rename-final-sigma", 0xa1773);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+
+        accepted_new_application_page(
+            &handle,
+            "ΟΔΥΣΣΕΥΣ",
+            vec![BlockDto {
+                id: "sigma-block".into(),
+                raw: "sigma body".into(),
+                ..BlockDto::default()
+            }],
+        );
+        drain_managed_local(&handle);
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                    old: "ΟΔΥΣΣΕΥΣ".into(),
+                    new: "Odysseus".into(),
+                    expected_path: None,
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        drain_managed_local(&handle);
+        let (renamed, _) = load_application_logical(&handle, "Odysseus", SyncPageKind::Page);
+        assert_eq!(renamed.blocks[0].raw, "sigma body");
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

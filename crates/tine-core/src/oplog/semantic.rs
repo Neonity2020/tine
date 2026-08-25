@@ -159,7 +159,15 @@ fn validate_logical_page_name(value: &str) -> Result<(), LogicalPageNameError> {
     Ok(())
 }
 
-fn canonical_page_name_key(value: &str) -> String {
+/// The managed fold behind every `name_key` column and [`PageNameKeyDigest`].
+/// NOT identical to `refs::page_key`: the char-wise lowercase here maps Greek
+/// capital sigma to `σ` unconditionally, while `str::to_lowercase` (the refs
+/// fold) applies the Unicode Final_Sigma rule (`ΟΣ` → `ος`). The digest bakes
+/// this fold into authenticated history under [`PAGE_NAME_KEY_VERSION`], so
+/// collapsing the two folds is a versioned migration (storage backlog), not a
+/// patch. Until then, every lookup into a canonical-keyed index MUST use this
+/// fold — querying it with `refs::normalize` silently misses (DUP-1).
+pub(crate) fn canonical_page_name_key(value: &str) -> String {
     let lowered: String = value.trim().chars().flat_map(char::to_lowercase).collect();
     let without_leading = lowered.strip_prefix('/').unwrap_or(&lowered);
     without_leading
@@ -1418,6 +1426,12 @@ mod tests {
             ("CAFÉ", "café"),
             ("Ａ", "ａ"),
             ("ﬀ", "ﬀ"),
+            // Final sigma: the v1 char-wise fold is deliberately pinned here
+            // as UNCONDITIONAL (`Σ` → `σ` even word-finally), which is where it
+            // diverges from `refs::page_key` (`ΟΣ` → `ος`). Changing this line
+            // is a PAGE_NAME_KEY_VERSION migration, not a bug fix (DUP-1).
+            ("ΟΣ", "οσ"),
+            ("ΟΔΥΣΣΕΥΣ", "οδυσσευσ"),
         ];
 
         for (exact, expected_key) in vectors {
