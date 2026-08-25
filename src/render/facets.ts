@@ -220,6 +220,22 @@ export function inlineText(inlines: readonly Inline[]): string {
       case "hiccup":
         out += i.v;
         break;
+      // The kinds below contribute NOTHING to facet text. They were silently
+      // skipped before DUP-8; they are now explicit so that adding a new
+      // `Inline` variant fails `tsc` in the `default` arm instead of
+      // disappearing here unnoticed. Behavior is unchanged.
+      case "break": break; // facet text intentionally excludes break (DUP-8: explicit, was silent)
+      case "hardbreak": break; // facet text intentionally excludes hardbreak (DUP-8: explicit, was silent)
+      case "macro": break; // facet text intentionally excludes macro (DUP-8: explicit, was silent)
+      case "timestamp": break; // facet text intentionally excludes timestamp (DUP-8: explicit, was silent)
+      case "fnref": break; // facet text intentionally excludes fnref (DUP-8: explicit, was silent)
+      case "inline_html": break; // facet text intentionally excludes inline_html (DUP-8: explicit, was silent)
+      case "email": break; // facet text intentionally excludes email (DUP-8: explicit, was silent)
+      default: {
+        const _exhaustive: never = i;
+        out += _exhaustive;
+        break;
+      }
     }
   }
   return out;

@@ -6971,52 +6971,82 @@ fn shared_diagnostic_name_is_taken(
 /// is dropped, so a host test can reproduce a device whose shared storage does
 /// not implement `renameat2` flags.
 ///
-/// Process-global, for the same reason as the projection leg's injection: the
-/// runtime executes `prepare_shared` on its actor thread, so a thread-local
-/// armed by a test would never be observed by the code under test. The gate runs
-/// `cargo nextest`, which gives every test its own process; the lock keeps two
-/// injections from overlapping under a threaded `cargo test`.
+/// THREAD-SCOPED, not process-global. The earlier process-global arm made the
+/// injected errno visible to every other test running concurrently under a
+/// threaded `cargo test`: its exclusion lock only serialised two INJECTORS
+/// against each other, and did nothing about the unrelated tests performing
+/// ordinary flagged provider renames on other threads at the same moment.
+/// `provider_rename_recovers_from_every_retry_and_retirement_boundary_without_overwrite`
+/// failed roughly one run in five with a foreign `EIO` on a rename it never
+/// injected, and the observed failure set differed on every run.
+///
+/// The reason the arm was global in the first place is real: the runtime
+/// executes `prepare_shared` on its actor thread, so a thread-local armed on a
+/// test thread would never be observed there. That case is now carried
+/// explicitly instead of ambiently — `SyncRuntimeHandle::prepare_shared` reads
+/// the caller's armed errno with `armed_shared_provider_flagged_rename_errno`
+/// and hands it to the actor inside the request, and the actor installs it on
+/// its own thread with `ScopedSharedProviderFlaggedRename` for exactly that
+/// request. No other thread can see it.
 #[cfg(test)]
-static ARMED_SHARED_PROVIDER_FLAGGED_RENAME: std::sync::Mutex<Option<i32>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-static SHARED_PROVIDER_FLAGGED_RENAME_INJECTION_LOCK: std::sync::Mutex<()> =
-    std::sync::Mutex::new(());
-
-#[cfg(test)]
-fn armed_shared_provider_flagged_rename() -> Option<std::io::Error> {
-    (*ARMED_SHARED_PROVIDER_FLAGGED_RENAME
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
-    .map(std::io::Error::from_raw_os_error)
+std::thread_local! {
+    static ARMED_SHARED_PROVIDER_FLAGGED_RENAME: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
-pub(crate) struct InjectedSharedProviderFlaggedRenameFailure(
-    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
-);
+fn armed_shared_provider_flagged_rename() -> Option<std::io::Error> {
+    ARMED_SHARED_PROVIDER_FLAGGED_RENAME
+        .with(std::cell::Cell::get)
+        .map(std::io::Error::from_raw_os_error)
+}
+
+/// The errno armed on THIS thread, for handing an injection across a request
+/// boundary to the thread that will actually perform the rename.
+#[cfg(test)]
+pub(crate) fn armed_shared_provider_flagged_rename_errno() -> Option<i32> {
+    ARMED_SHARED_PROVIDER_FLAGGED_RENAME.with(std::cell::Cell::get)
+}
+
+/// Install a handed-over injection on the current thread for one operation.
+#[cfg(test)]
+pub(crate) struct ScopedSharedProviderFlaggedRename(Option<i32>);
+
+#[cfg(test)]
+impl ScopedSharedProviderFlaggedRename {
+    pub(crate) fn install(errno: Option<i32>) -> Self {
+        if errno.is_some() {
+            crate::model::forget_flagged_rename_capabilities();
+        }
+        Self(ARMED_SHARED_PROVIDER_FLAGGED_RENAME.with(|armed| armed.replace(errno)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedSharedProviderFlaggedRename {
+    fn drop(&mut self) {
+        let restored = self.0;
+        ARMED_SHARED_PROVIDER_FLAGGED_RENAME.with(|armed| armed.set(restored));
+        crate::model::forget_flagged_rename_capabilities();
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct InjectedSharedProviderFlaggedRenameFailure(Option<i32>);
 
 #[cfg(test)]
 impl InjectedSharedProviderFlaggedRenameFailure {
     pub(crate) fn enter(errno: i32) -> Self {
-        let exclusive = SHARED_PROVIDER_FLAGGED_RENAME_INJECTION_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::model::forget_flagged_rename_capabilities();
-        *ARMED_SHARED_PROVIDER_FLAGGED_RENAME
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(errno);
-        Self(exclusive)
+        Self(ARMED_SHARED_PROVIDER_FLAGGED_RENAME.with(|armed| armed.replace(Some(errno))))
     }
 }
 
 #[cfg(test)]
 impl Drop for InjectedSharedProviderFlaggedRenameFailure {
     fn drop(&mut self) {
-        *ARMED_SHARED_PROVIDER_FLAGGED_RENAME
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let restored = self.0;
+        ARMED_SHARED_PROVIDER_FLAGGED_RENAME.with(|armed| armed.set(restored));
         crate::model::forget_flagged_rename_capabilities();
     }
 }

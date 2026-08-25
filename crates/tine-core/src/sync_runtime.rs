@@ -359,6 +359,14 @@ struct ManagedApplicationQueryInstrumentation {
     indexed_candidate_pages: usize,
     overlay_pages: usize,
     block_branches: usize,
+    /// How many times a block branch was narrowed through the materialized
+    /// ordered-subsequence index, and how many pages survived that narrowing.
+    fuzzy_narrowing_passes: usize,
+    fuzzy_candidate_pages: usize,
+    /// Managed pages whose converted block tree (and therefore every memoized
+    /// lsdoc projection in it) was reused / rebuilt during this measurement.
+    projection_cache_hits: usize,
+    projection_cache_misses: usize,
 }
 
 /// How many distinct simple-query answers one actor retains at a time.
@@ -3681,6 +3689,9 @@ impl SyncRuntimeHandle {
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::PrepareShared {
             reply: reply_sender,
+            #[cfg(test)]
+            injected_flagged_rename_errno:
+                crate::oplog::wire::armed_shared_provider_flagged_rename_errno(),
         })?;
         let prepared = reply_receiver
             .recv()
@@ -8379,6 +8390,13 @@ enum ActorRequest {
     },
     PrepareShared {
         reply: mpsc::Sender<Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError>>,
+        /// The flagged-rename errno armed on the CALLING thread, carried to the
+        /// actor thread that performs the renames. See
+        /// `oplog::wire::ScopedSharedProviderFlaggedRename`: the injection used
+        /// to be a process-global that leaked into every concurrently running
+        /// test.
+        #[cfg(test)]
+        injected_flagged_rename_errno: Option<i32>,
     },
     JoinShared {
         descriptor: SharedEnrollmentDescriptor,
@@ -8644,7 +8662,15 @@ fn run_actor_loop(
                 let _ = reply.send(result);
                 false
             }
-            ActorRequest::PrepareShared { reply } => {
+            ActorRequest::PrepareShared {
+                reply,
+                #[cfg(test)]
+                injected_flagged_rename_errno,
+            } => {
+                #[cfg(test)]
+                let _injected = crate::oplog::wire::ScopedSharedProviderFlaggedRename::install(
+                    injected_flagged_rename_errno,
+                );
                 let result = actor.prepare_shared();
                 let should_stop = result.is_ok();
                 let _ = reply.send(result);
@@ -9889,27 +9915,23 @@ fn sparse_task_query_page_kind(kind: ManagedTextKind) -> PageKind {
 
 fn sparse_task_query_page_recency(
     graph_root: &Path,
+    journal_format: &crate::date::JournalFormat,
     name: &str,
     path: &ManagedPath,
     kind: ManagedTextKind,
 ) -> i64 {
-    if kind == ManagedTextKind::Journal {
-        return crate::date::JournalDate::from_title(name)
-            .map(|date| date.to_days() * 86_400)
-            .unwrap_or(i64::MIN);
-    }
-    std::fs::metadata(graph_root.join(path.as_str()))
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(i64::MIN)
+    journal_format.page_recency_secs(
+        kind == ManagedTextKind::Journal,
+        name,
+        &graph_root.join(path.as_str()),
+    )
 }
 
 impl ManagedSparseTaskQueryPageFacts {
     fn from_joined_row(
         row: &MaterializedTaskCandidateBlockRow,
         graph_root: &Path,
+        journal_format: &crate::date::JournalFormat,
     ) -> Result<Self, ManagedSparseTaskQueryFallback> {
         if LogicalPageName::parse(row.page_name.clone()).is_err() {
             return Err(ManagedSparseTaskQueryFallback::CandidateAuthority);
@@ -9926,6 +9948,7 @@ impl ManagedSparseTaskQueryPageFacts {
                 is_org: format == Format::Org,
                 recency: sparse_task_query_page_recency(
                     graph_root,
+                    journal_format,
                     &row.page_name,
                     &row.page_path,
                     row.page_kind,
@@ -10229,10 +10252,11 @@ fn bound_application_reference_sources(
     lower_bound_exceeded: bool,
 ) -> SyncApplicationBoundedRefGroups {
     sources.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut rows = 0_usize;
-    let mut bytes = 0_usize;
-    let mut total = 0_usize;
-    let mut exceeded = false;
+    // Same accounting rule as Direct Files and as the managed block-referrer
+    // path: `query::ConstructionBudget`. This loop already charged payload +
+    // page name + 256 per admitted row and latched `exceeded`; naming the rule
+    // once is what keeps the three copies from drifting again.
+    let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
     let mut grouped: Vec<(Option<i64>, RefGroup)> = Vec::new();
     let mut by_name = HashMap::<String, usize>::new();
     for (_, date_key, page, matches) in sources {
@@ -10256,18 +10280,11 @@ fn bound_application_reference_sources(
             grouped[index].0 = date_key;
         }
         for (block, evidence) in matches {
-            total = total.saturating_add(1);
-            let estimated = crate::model::block_dto_estimated_bytes(&block)
-                .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence))
-                .saturating_add(page.name.len())
-                .saturating_add(256);
-            if !exceeded && rows < max_rows && bytes.saturating_add(estimated) <= max_bytes {
-                rows += 1;
-                bytes = bytes.saturating_add(estimated);
+            let payload = crate::model::block_dto_estimated_bytes(&block)
+                .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence));
+            if budget.admit_estimated(&page.name, payload) {
                 grouped[index].1.blocks.push(block);
                 grouped[index].1.evidence.push(evidence);
-            } else {
-                exceeded = true;
             }
         }
     }
@@ -10277,6 +10294,8 @@ fn bound_application_reference_sources(
             .cmp(&a.0.unwrap_or(i64::MIN))
             .then_with(|| a.1.page.cmp(&b.1.page))
     });
+    let mut total = budget.total;
+    let mut exceeded = budget.exceeded;
     if lower_bound_exceeded {
         total = total.max(max_rows.saturating_add(1));
         exceeded = true;
@@ -10365,6 +10384,9 @@ fn application_page_block_reference_counts(
     Ok(counts)
 }
 
+/// The managed path holds raw text rather than a parsed outline, so it builds a
+/// throwaway `DocBlock` to reach the projection -- but the truncation rule
+/// itself is [`crate::doc::crumb_line`], not a third copy of it (DUP-8).
 fn application_crumb_line(raw: &str, is_org: bool) -> String {
     let block = crate::doc::DocBlock {
         raw: raw.to_owned(),
@@ -10373,27 +10395,23 @@ fn application_crumb_line(raw: &str, is_org: bool) -> String {
         is_org,
         proj: std::sync::OnceLock::new(),
     };
-    let line = block.visible_text().lines().next().unwrap_or("").trim();
-    if line.chars().count() > 60 {
-        format!("{}…", line.chars().take(60).collect::<String>())
-    } else {
-        line.to_owned()
-    }
+    crate::doc::crumb_line(&block)
 }
 
-fn application_query_page_recency(graph_root: &Path, page: &PageDto) -> i64 {
+fn application_query_page_recency(
+    graph_root: &Path,
+    journal_format: &crate::date::JournalFormat,
+    page: &PageDto,
+) -> i64 {
     if page.kind == PageKind::Journal {
-        return crate::date::JournalDate::from_title(&page.name)
-            .map(|date| date.to_days() * 86_400)
-            .unwrap_or(i64::MIN);
+        return journal_format.page_recency_secs(true, &page.name, Path::new(""));
     }
-    ManagedPath::parse(page.path.clone())
-        .ok()
-        .and_then(|path| std::fs::metadata(graph_root.join(path.as_str())).ok())
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(i64::MIN)
+    match ManagedPath::parse(page.path.clone()) {
+        Ok(path) => {
+            journal_format.page_recency_secs(false, &page.name, &graph_root.join(path.as_str()))
+        }
+        Err(_) => i64::MIN,
+    }
 }
 
 fn application_page_block_referrers(
@@ -10763,6 +10781,11 @@ struct RuntimeActor {
     /// evaluator. See [`ApplicationSimpleQueryMemo`] for what it holds and
     /// what drops it; it is a cache of durable evidence, never authority.
     application_simple_query_memo: std::cell::RefCell<ApplicationSimpleQueryMemo>,
+    /// Converted managed block trees retained across query evaluations. See
+    /// [`crate::query::ApplicationProjectionCache`]: it is content-addressed by
+    /// exact comparison, so it holds no authority and cannot go stale -- a
+    /// changed page misses and is rebuilt.
+    application_projection_cache: std::cell::RefCell<crate::query::ApplicationProjectionCache>,
     #[cfg(test)]
     managed_application_query_instrumentation:
         std::cell::Cell<ManagedApplicationQueryInstrumentation>,
@@ -11034,6 +11057,9 @@ impl RuntimeActor {
             application_simple_query_memo: std::cell::RefCell::new(
                 ApplicationSimpleQueryMemo::default(),
             ),
+            application_projection_cache: std::cell::RefCell::new(
+                crate::query::ApplicationProjectionCache::default(),
+            ),
             #[cfg(test)]
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
@@ -11108,16 +11134,36 @@ impl RuntimeActor {
     fn reset_managed_application_query_instrumentation(&self) {
         self.managed_application_query_instrumentation
             .set(ManagedApplicationQueryInstrumentation::default());
+        self.application_projection_cache
+            .borrow_mut()
+            .reset_counters();
+    }
+
+    /// The converted block tree for one exact managed page, reused whenever the
+    /// page's exact content is unchanged since the last managed query.
+    fn application_projection_roots(
+        &self,
+        path: &str,
+        page: &PageDto,
+    ) -> std::sync::Arc<Vec<crate::doc::DocBlock>> {
+        self.application_projection_cache
+            .borrow_mut()
+            .roots(path, page)
     }
 
     #[cfg(test)]
     fn clear_application_simple_query_memo(&self) {
+        self.application_projection_cache.borrow_mut().clear();
         self.application_simple_query_memo.borrow_mut().clear();
     }
 
     #[cfg(test)]
     fn managed_application_query_instrumentation(&self) -> ManagedApplicationQueryInstrumentation {
-        self.managed_application_query_instrumentation.get()
+        let mut current = self.managed_application_query_instrumentation.get();
+        let (hits, misses, _) = self.application_projection_cache.borrow().counters();
+        current.projection_cache_hits = hits;
+        current.projection_cache_misses = misses;
+        current
     }
 
     #[cfg(test)]
@@ -11226,6 +11272,16 @@ impl RuntimeActor {
         let mut current = self.managed_application_query_instrumentation.get();
         current.full_inventory_passes = current.full_inventory_passes.saturating_add(1);
         current.inventory_pages = current.inventory_pages.saturating_add(pages);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    #[cfg(test)]
+    fn note_managed_application_query_fuzzy_narrowing(&self, candidate_pages: usize) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.fuzzy_narrowing_passes = current.fuzzy_narrowing_passes.saturating_add(1);
+        current.fuzzy_candidate_pages = current
+            .fuzzy_candidate_pages
+            .saturating_add(candidate_pages);
         self.managed_application_query_instrumentation.set(current);
     }
 
@@ -12220,56 +12276,73 @@ impl RuntimeActor {
                 },
             ));
         }
-        source_groups.sort_by(|a, b| {
+        // Admit in the SAME order Direct Files does. Its page cache is built
+        // from `page_build_entries`, which sorts by relative path, so Direct
+        // charges the budget page-by-page in path order and only sorts the
+        // surviving groups for display afterwards. Sorting for display BEFORE
+        // charging (which this path used to do) makes a budget-truncated
+        // managed answer retain a different set of rows than Direct for
+        // identical content.
+        source_groups.sort_by(|a, b| a.1.cmp(&b.1));
+
+        // ONE accounting rule with Direct Files (`query::ConstructionBudget`,
+        // as used by `collect_bounded_candidates`): payload + page name + 256
+        // charged per ADMITTED row, `exceeded` latched once the budget closes.
+        // This used to be open-coded here with a per-group overhead that was
+        // probed per row but accumulated once per emitted group, so identical
+        // content under an identical `max_bytes` admitted a different number of
+        // rows on the two paths.
+        let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
+        let candidate_overflow = candidate_count > max_rows;
+        let mut groups: Vec<(Option<i64>, String, RefGroup)> = Vec::new();
+        for (date_key, path, group) in source_groups {
+            let mut admitted = Vec::new();
+            for block in group.blocks {
+                if budget.closed() {
+                    budget.deny_match();
+                    continue;
+                }
+                if !budget
+                    .admit_estimated(&group.page, crate::model::block_dto_estimated_bytes(&block))
+                {
+                    continue;
+                }
+                admitted.push(block);
+            }
+            if !admitted.is_empty() {
+                groups.push((
+                    date_key,
+                    path,
+                    RefGroup {
+                        page: group.page,
+                        kind: group.kind,
+                        blocks: admitted,
+                        evidence: Vec::new(),
+                    },
+                ));
+            }
+        }
+        // OG parity, same rule as Direct `collect_bounded_candidates`: newest
+        // journal day first, non-journal pages last, page name as the
+        // deterministic tie-break (path breaking a name tie).
+        groups.sort_by(|a, b| {
             b.0.unwrap_or(i64::MIN)
                 .cmp(&a.0.unwrap_or(i64::MIN))
                 .then_with(|| a.2.page.cmp(&b.2.page))
                 .then_with(|| a.1.cmp(&b.1))
         });
-
-        let mut groups = Vec::new();
-        let mut rows = 0_usize;
-        let mut bytes = 0_usize;
-        let mut total = 0_usize;
-        let mut exceeded = candidate_count > max_rows;
-        for (_, _, group) in source_groups {
-            let mut admitted = Vec::new();
-            for block in group.blocks {
-                total = total.saturating_add(1);
-                let estimated = crate::model::block_dto_estimated_bytes(&block);
-                if rows < max_rows
-                    && bytes
-                        .saturating_add(estimated)
-                        .saturating_add(group.page.len())
-                        .saturating_add(std::mem::size_of::<RefGroup>())
-                        <= max_bytes
-                {
-                    rows += 1;
-                    bytes = bytes.saturating_add(estimated);
-                    admitted.push(block);
-                } else {
-                    exceeded = true;
-                }
-            }
-            if !admitted.is_empty() {
-                bytes = bytes
-                    .saturating_add(group.page.len())
-                    .saturating_add(std::mem::size_of::<RefGroup>());
-                groups.push(RefGroup {
-                    page: group.page,
-                    kind: group.kind,
-                    blocks: admitted,
-                    evidence: Vec::new(),
-                });
-            }
-        }
-        if candidate_count > max_rows {
+        let groups = groups
+            .into_iter()
+            .map(|(_, _, group)| group)
+            .collect::<Vec<_>>();
+        let mut total = budget.total;
+        if candidate_overflow {
             total = total.max(max_rows.saturating_add(1));
         }
         Ok(SyncApplicationBoundedRefGroups {
             groups,
             total,
-            exceeded,
+            exceeded: budget.exceeded || candidate_overflow,
         })
     }
 
@@ -12931,6 +13004,7 @@ impl RuntimeActor {
                             is_org: page.format == Format::Org,
                             recency: sparse_task_query_page_recency(
                                 &self.graph.root,
+                                &self.graph.journal_format,
                                 &page.name,
                                 &page.path,
                                 page.kind,
@@ -13002,6 +13076,7 @@ impl RuntimeActor {
                         let page = ManagedSparseTaskQueryPageFacts::from_joined_row(
                             &row,
                             &self.graph.root,
+                            &self.graph.journal_format,
                         )?;
                         let sparse_page = page.sparse_page.clone();
                         page_cache.insert(row.page_id, page);
@@ -13337,8 +13412,13 @@ impl RuntimeActor {
         sources.sort_by(|left, right| left.0.cmp(&right.0));
         let pages = sources
             .into_iter()
-            .map(|(_, page)| crate::query::ApplicationQueryPage {
-                recency: application_query_page_recency(&self.graph.root, &page),
+            .map(|(path, page)| crate::query::ApplicationQueryPage {
+                recency: application_query_page_recency(
+                    &self.graph.root,
+                    &self.graph.journal_format,
+                    &page,
+                ),
+                roots: self.application_projection_roots(&path, &page),
                 page,
             })
             .collect::<Vec<_>>();
@@ -13372,7 +13452,12 @@ impl RuntimeActor {
                 }
             };
             pages.push(crate::query::ApplicationQueryPage {
-                recency: application_query_page_recency(&self.graph.root, &current.page),
+                recency: application_query_page_recency(
+                    &self.graph.root,
+                    &self.graph.journal_format,
+                    &current.page,
+                ),
+                roots: self.application_projection_roots(&entry.rel_path, &current.page),
                 page: current.page,
             });
         }
@@ -13485,9 +13570,26 @@ impl RuntimeActor {
         }
         let mut pages = Vec::new();
         if needs_blocks {
+            // Direct Files narrows a literal fuzzy block predicate through its
+            // stored ordered-subsequence index before it walks anything. The
+            // managed frontier keeps the SAME index in its materialized
+            // projection, so ask it the same question here -- at the caller,
+            // because the caller is what owns the materialized read and knows
+            // whether the accepted frontier is the whole story. The index only
+            // chooses pages; the parser-owned matcher still decides and ranks
+            // every block, so a narrowed run returns identical results.
+            let narrowed = plan
+                .fuzzy_block_needle()
+                .and_then(|needle| self.application_fuzzy_candidate_paths_ready(needle));
             for entry in &entries {
                 if cancelled() {
                     break;
+                }
+                if narrowed
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains(entry.rel_path.as_str()))
+                {
+                    continue;
                 }
                 let current = match self.load_application_exact_ready(&entry.rel_path)? {
                     ApplicationExactLoad::Loaded(current) => current,
@@ -13498,14 +13600,60 @@ impl RuntimeActor {
                     }
                 };
                 pages.push(crate::query_plan::ApplicationQueryPlanPage {
+                    roots: self.application_projection_roots(&entry.rel_path, &current.page),
                     entry: entry.clone(),
-                    page: current.page,
                 });
             }
         }
         Ok(plan.execute_application_with_explain(
             entries, &pages, aliases, referenced, cancelled, explain,
         ))
+    }
+
+    /// Managed pages that could contain `needle` as an ordered subsequence,
+    /// read from the same materialized index Direct Files narrows through
+    /// (`SqliteGraphProjectionRead::fuzzy_subsequence_candidate_pages_after`,
+    /// which the managed read view already exposes and already populates -- the
+    /// managed unlinked-reference path reads the same `search_substring_fts`
+    /// rows).
+    ///
+    /// `None` means "do not narrow", never "no results". It is returned
+    /// whenever the materialized frontier is not the whole story -- an actor
+    /// holding a pending local suffix has page content the index has not seen,
+    /// and narrowing on a stale index would silently DROP a matching page --
+    /// and whenever the index read itself refuses, because narrowing is an
+    /// optimization and must never turn into a failed request.
+    fn application_fuzzy_candidate_paths_ready(&self, needle: &str) -> Option<HashSet<String>> {
+        if needle.is_empty() {
+            return None;
+        }
+        if self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| !managed.latest_projection_frames.is_empty())
+        {
+            return None;
+        }
+        let read = self.application_materialized_read_ready().ok()?;
+        const BATCH: usize = 1024;
+        let mut cursor = None;
+        let mut paths = HashSet::new();
+        loop {
+            let rows = read
+                .fuzzy_subsequence_candidate_pages_after(needle, cursor, BATCH)
+                .ok()?;
+            let len = rows.len();
+            for row in rows {
+                cursor = Some(row.page_id);
+                paths.insert(row.path.as_str().to_owned());
+            }
+            if len < BATCH {
+                break;
+            }
+        }
+        #[cfg(test)]
+        self.note_managed_application_query_fuzzy_narrowing(paths.len());
+        Some(paths)
     }
 
     fn application_backlink_filter_context_ready(
@@ -13905,6 +14053,19 @@ impl RuntimeActor {
             }
         }
         Ok(pages)
+    }
+
+    /// Lookup key for the canonical-keyed managed indexes (`name_key` columns,
+    /// written with `LogicalPageName::canonical_key`). NOT `refs::normalize`:
+    /// the two folds differ on Greek final sigma, and querying a
+    /// canonical-keyed index with the refs fold returns nothing for such names
+    /// — which made a managed rename of `ΟΔΥΣΣΕΥΣ` report `Applied` while
+    /// doing nothing (DUP-1, 2026-08-25 duplication audit). Collapsing the two
+    /// folds is a `PAGE_NAME_KEY_VERSION` migration tracked in the storage
+    /// backlog; until then this helper is the only correct way to key into
+    /// those indexes from a raw page-name string.
+    fn managed_page_name_key(name: &str) -> String {
+        crate::oplog::semantic::canonical_page_name_key(name)
     }
 
     fn application_page_rename_sources_ready(
@@ -15365,10 +15526,12 @@ impl RuntimeActor {
     ) -> Result<Option<OperationTransaction>, SyncApplicationPageRequestError> {
         let old = old.trim();
         let new = new.trim();
-        if old.is_empty() || crate::refs::same_page(old, new) {
+        // Managed identity comparisons use the managed fold, not refs::same_page
+        // — the folds disagree on final sigma (DUP-1).
+        if old.is_empty() || Self::managed_page_name_key(old) == Self::managed_page_name_key(new) {
             return Ok(None);
         }
-        let old_key = crate::refs::normalize(old);
+        let old_key = Self::managed_page_name_key(old);
         let old_chars = old.chars().count();
         let mut selected = self.application_page_rename_sources_ready(&old_key)?;
         let primary = selected.iter().find(|entry| entry.name_key == old_key);
@@ -15401,7 +15564,7 @@ impl RuntimeActor {
                     entry.name.chars().skip(old_chars).collect::<String>()
                 )
             };
-            let target_key = crate::refs::normalize(&target_name);
+            let target_key = Self::managed_page_name_key(&target_name);
             if !target_names.insert(target_key.clone())
                 || self
                     .application_pages_at_name_key_ready(&target_key)?
@@ -15644,7 +15807,7 @@ impl RuntimeActor {
             // external referrers; the source and destination themselves are
             // rewritten in their DTOs below because their blocks participate in
             // the merge transaction rather than surviving as independent pages.
-            let old_key = crate::refs::normalize(old);
+            let old_key = Self::managed_page_name_key(old);
             let old_chars = old.chars().count();
             let selected = self.application_page_rename_sources_ready(&old_key)?;
             let selected_paths = selected
@@ -15664,7 +15827,7 @@ impl RuntimeActor {
                         entry.name.chars().skip(old_chars).collect::<String>()
                     )
                 };
-                let target_key = crate::refs::normalize(&target_name);
+                let target_key = Self::managed_page_name_key(&target_name);
                 if !target_names.insert(target_key.clone())
                     || self
                         .application_pages_at_name_key_ready(&target_key)?
@@ -27571,6 +27734,56 @@ mod tests {
     }
 
     #[test]
+    fn managed_rename_uses_the_canonical_fold_for_final_sigma_names() {
+        // "ΟΔΥΣΣΕΥΣ" is a name where refs::page_key ("οδυσσευς", contextual
+        // final sigma) and the managed canonical fold ("οδυσσευσ", char-wise)
+        // disagree. Pre-DUP-1 the rename planner keyed the canonical-keyed
+        // navigation index with the refs fold, selected nothing, and reported
+        // Applied while renaming nothing — a silent no-op.
+        let fixture = ActivationFixture::nested_unicode("rename-final-sigma", 0xa1773);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("clean actor handle opens");
+
+        accepted_new_application_page(
+            &handle,
+            "ΟΔΥΣΣΕΥΣ",
+            vec![BlockDto {
+                id: "sigma-block".into(),
+                raw: "sigma body".into(),
+                ..BlockDto::default()
+            }],
+        );
+        drain_managed_local(&handle);
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                    old: "ΟΔΥΣΣΕΥΣ".into(),
+                    new: "Odysseus".into(),
+                    expected_path: None,
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        drain_managed_local(&handle);
+        let (renamed, _) = load_application_logical(&handle, "Odysseus", SyncPageKind::Page);
+        assert_eq!(renamed.blocks[0].raw, "sigma body");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     fn clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys() {
         let fixture = ActivationFixture::nested_unicode("clean-runtime-app-journeys", 0xa1772);
         fs::create_dir_all(fixture.graph_root.join("assets")).unwrap();
@@ -29808,8 +30021,30 @@ mod tests {
             .unwrap();
         let graph_before = user_graph_bytes(&joiner.graph_root);
         let refusal = joiner_handle.join_shared(descriptor).unwrap_err();
+        // `da0390b9 fix(sync): explain clean join semantic mismatches` replaced
+        // the single "contains semantic changes" sentence with a counted,
+        // content-free first line plus local-only detail lines, so a user can
+        // see WHICH note blocks the join. The user-visible outcome asserted
+        // here is unchanged: the join is refused, it names the unmatched local
+        // note, and it never prints that note's content.
         assert!(
-            refusal.to_string().contains("sync join refused"),
+            refusal
+                .to_string()
+                .contains("not in the shared provider frontier"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.to_string().contains("local-only=1 shared-only=0"),
+            "{refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("clean join mismatch detail: local-only path=\"notes/local-only.md\""),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.to_string().contains("unmatched local work"),
             "{refusal}"
         );
         assert_eq!(
@@ -43096,6 +43331,521 @@ mod tests {
             "query after an accepted batch",
             after_save,
             Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
+        );
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// A Direct/managed differential corpus: fixed content, no journals, one
+    /// addressable block identity for the referrer surfaces, one rare token
+    /// that the ordered-subsequence index can genuinely narrow to a single
+    /// page, and enough repeated rows for a byte budget to cut both inside a
+    /// page and between pages.
+    fn mode_differential_fixture(label: &str, seed: u128) -> ActivationFixture {
+        let fixture = ActivationFixture::empty(label, seed);
+        let directory = fixture.graph_root.join("notes/differential");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("Anchor.md"),
+            format!(
+                "title:: Differential anchor\n\n- anchor block for referrers\n  id:: {MODE_DIFFERENTIAL_ANCHOR}\n"
+            ),
+        )
+        .unwrap();
+        for page in 0..MODE_DIFFERENTIAL_PAGES {
+            let mut content = format!("title:: Differential {page}\n\n");
+            if page == 2 {
+                content.push_str("- zqx sentinel lives on exactly one page\n");
+            }
+            for block in 0..4 {
+                content.push_str(&format!(
+                    "- differential needle {page}-{block} {}\n",
+                    "padding ".repeat(6)
+                ));
+                content.push_str(&format!(
+                    "\t- referring child {page}-{block} to (({MODE_DIFFERENTIAL_ANCHOR}))\n"
+                ));
+            }
+            fs::write(
+                directory.join(format!("Differential-{page}.md")),
+                content.as_bytes(),
+            )
+            .unwrap();
+        }
+        fixture
+    }
+
+    const MODE_DIFFERENTIAL_ANCHOR: &str = "5f0a1c2e-3b4d-4e5f-8a9b-0c1d2e3f4a5b";
+    const MODE_DIFFERENTIAL_PAGES: usize = 6;
+
+    fn open_reopened_managed_actor(fixture: &ActivationFixture) -> SyncRuntimeHandle {
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("managed reopen retains its actor");
+        assert_eq!(
+            handle.status().unwrap().managed_local_pending,
+            0,
+            "the differential corpus must reopen with no pending managed-local suffix"
+        );
+        handle
+    }
+
+    fn managed_graph_search(
+        handle: &SyncRuntimeHandle,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+    ) -> crate::query_plan::QueryExecution {
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::GraphSearch {
+                source: source.into(),
+                page_limit,
+                block_limit,
+                lane: None,
+                explain: false,
+                scope: None,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::GraphSearch(execution),
+        } = outcome
+        else {
+            panic!("managed graph search returned the wrong outcome: {outcome:?}")
+        };
+        execution
+    }
+
+    fn managed_block_search(
+        handle: &SyncRuntimeHandle,
+        query: &str,
+        limit: usize,
+    ) -> Vec<RefGroup> {
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::BlockSearch {
+                query: query.into(),
+                limit,
+                lane: None,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::BlockSearch(groups),
+        } = outcome
+        else {
+            panic!("managed block search returned the wrong outcome: {outcome:?}")
+        };
+        groups
+    }
+
+    fn managed_block_referrers(
+        handle: &SyncRuntimeHandle,
+        uuid: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> SyncApplicationBoundedRefGroups {
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::BlockReferrers {
+                uuid: uuid.into(),
+                max_rows,
+                max_bytes,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::BlockReferrers(result),
+        } = outcome
+        else {
+            panic!("managed block referrers returned the wrong outcome: {outcome:?}")
+        };
+        result
+    }
+
+    fn assert_managed_graph_search_matches_direct(
+        label: &str,
+        mut managed: crate::query_plan::QueryExecution,
+        mut direct: crate::query_plan::QueryExecution,
+    ) {
+        canonicalize_graph_search_for_mode_differential(&mut managed);
+        canonicalize_graph_search_for_mode_differential(&mut direct);
+        assert_eq!(
+            serde_json::to_value(&managed).unwrap(),
+            serde_json::to_value(&direct).unwrap(),
+            "managed graph search diverged from parser-owned Direct Files semantics: {label}"
+        );
+    }
+
+    fn assert_managed_block_groups_match_direct(
+        label: &str,
+        mut managed: Vec<RefGroup>,
+        mut direct: Vec<RefGroup>,
+    ) {
+        canonicalize_query_groups_for_mode_differential(&mut managed);
+        canonicalize_query_groups_for_mode_differential(&mut direct);
+        assert_eq!(
+            serde_json::to_value(&managed).unwrap(),
+            serde_json::to_value(&direct).unwrap(),
+            "managed block groups diverged from parser-owned Direct Files semantics: {label}"
+        );
+    }
+
+    /// The Direct/managed differential for the shared block evaluator.
+    ///
+    /// One corpus, four evaluator shapes, both storage modes: a plain-text
+    /// whole-graph search, the literal fuzzy `((` block picker, the same search
+    /// under a small `limit` (which is what makes evidence and DTO construction
+    /// happen per winner rather than per retained candidate), and byte- and
+    /// row-bounded block referrers swept ACROSS their truncation boundary.
+    ///
+    /// The budget sweep is the necessity gate for the accounting fix: Direct
+    /// charges payload + page name + 256 per admitted row and latches
+    /// `exceeded`, and the managed referrer loop used to probe a per-group
+    /// overhead per row while accumulating it once per emitted group -- so the
+    /// same `max_bytes` admitted a different number of rows on the two paths.
+    #[test]
+    fn managed_query_evaluator_matches_direct_files_across_shapes_and_budgets() {
+        let fixture = mode_differential_fixture("mode-differential-evaluator", 0xa3f8);
+        let direct = Graph::open(&fixture.graph_root);
+        let handle = open_reopened_managed_actor(&fixture);
+
+        // 1. Plain-text whole-graph search: page branch plus block branch.
+        assert_managed_graph_search_matches_direct(
+            "plain text graph search",
+            managed_graph_search(&handle, "differential needle", 5, 50),
+            direct.run_graph_search("differential needle", 5, 50, false),
+        );
+
+        // 2. Literal fuzzy search -- the `((` block picker. `zqx` occurs on
+        // exactly one page, so this also proves the managed narrowing returns
+        // the same answer the unnarrowed Direct scan does.
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        assert_managed_block_groups_match_direct(
+            "literal fuzzy block search",
+            managed_block_search(&handle, "zqx sentinel", 10),
+            direct.search("zqx sentinel", 10),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(
+            counters.fuzzy_narrowing_passes, 1,
+            "a literal fuzzy block search must consult the managed candidate index: {counters:?}"
+        );
+        assert_eq!(
+            counters.fuzzy_candidate_pages, 1,
+            "`zqx` occurs on one page, so narrowing must select one page: {counters:?}"
+        );
+        assert_eq!(
+            counters.result_page_hydrations, 1,
+            "a narrowed fuzzy search must hydrate only its candidate pages: {counters:?}"
+        );
+
+        // A needle that is nowhere in the graph narrows to nothing, and both
+        // modes answer empty rather than one of them scanning everything.
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        assert_managed_block_groups_match_direct(
+            "literal fuzzy block search with no candidates",
+            managed_block_search(&handle, "zzqqxxjj", 10),
+            direct.search("zzqqxxjj", 10),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.fuzzy_candidate_pages, 0, "{counters:?}");
+        assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
+
+        // 3. Limit-bounded search: the heap keeps `limit` winners and the tie
+        // break decides which. Sweep the limit across the result size so an
+        // off-by-one in the retention rule cannot hide.
+        for limit in [1_usize, 2, 3, 7, 11] {
+            assert_managed_graph_search_matches_direct(
+                &format!("limit-bounded graph search limit={limit}"),
+                managed_graph_search(&handle, "differential needle", 0, limit),
+                direct.run_graph_search("differential needle", 0, limit, false),
+            );
+        }
+
+        // 4. Bounded block referrers, swept across the truncation boundary.
+        // The managed request surface caps both bounds, so "unbounded" here is
+        // the largest request a caller can actually make.
+        const MAX_ROWS: usize = MAX_SYNC_APPLICATION_RESULT_ROWS;
+        const MAX_BYTES: usize = MAX_SYNC_APPLICATION_RESULT_BYTES;
+        let unbounded_direct =
+            direct.block_referrers_bounded(MODE_DIFFERENTIAL_ANCHOR, MAX_ROWS, MAX_BYTES);
+        let unbounded_managed =
+            managed_block_referrers(&handle, MODE_DIFFERENTIAL_ANCHOR, MAX_ROWS, MAX_BYTES);
+        assert_eq!(
+            unbounded_direct.total,
+            MODE_DIFFERENTIAL_PAGES * 4,
+            "the differential corpus must produce one referrer per referring child"
+        );
+        assert_managed_simple_query_matches_direct(
+            "block referrers unbounded",
+            unbounded_managed.clone(),
+            unbounded_direct.clone(),
+        );
+
+        // The two modes charge the SAME rule -- payload + page name + 256 per
+        // admitted row, `exceeded` latched -- to inputs that legitimately
+        // differ: a managed block carries frontend identity (a Logseq UUID or
+        // its managed internal fallback) where a Direct block carries its
+        // structural runtime id, and the payload estimate counts that identity.
+        // So the meaningful parity claim is not "the same integer admits the
+        // same rows" but "the budget that admits k rows admits the SAME k rows,
+        // and admits exactly k". Predicting each mode's boundary from the
+        // shared rule and then checking it is what makes this a real gate: the
+        // superseded managed accounting, which probed a per-group overhead per
+        // row and accumulated it once per emitted group, admits a different
+        // count than the rule predicts as soon as more than one group is
+        // involved.
+        let row_costs = |result: &[RefGroup]| {
+            result
+                .iter()
+                .flat_map(|group| {
+                    group.blocks.iter().map(|block| {
+                        crate::model::block_dto_estimated_bytes(block)
+                            .saturating_add(group.page.len())
+                            .saturating_add(256)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let direct_costs = row_costs(&unbounded_direct.groups);
+        let managed_costs = row_costs(&unbounded_managed.groups);
+        assert_eq!(direct_costs.len(), managed_costs.len());
+        let prefix_sums = |costs: &[usize]| {
+            costs
+                .iter()
+                .scan(0_usize, |running, cost| {
+                    *running = running.saturating_add(*cost);
+                    Some(*running)
+                })
+                .collect::<Vec<_>>()
+        };
+        let direct_boundaries = prefix_sums(&direct_costs);
+        let managed_boundaries = prefix_sums(&managed_costs);
+        for admitted in 1..=direct_boundaries.len() {
+            let managed = managed_block_referrers(
+                &handle,
+                MODE_DIFFERENTIAL_ANCHOR,
+                MAX_ROWS,
+                managed_boundaries[admitted - 1],
+            );
+            let direct_bounded = direct.block_referrers_bounded(
+                MODE_DIFFERENTIAL_ANCHOR,
+                MAX_ROWS,
+                direct_boundaries[admitted - 1],
+            );
+            let rows =
+                |groups: &[RefGroup]| groups.iter().map(|group| group.blocks.len()).sum::<usize>();
+            assert_eq!(
+                rows(&direct_bounded.groups),
+                admitted,
+                "the shared rule must admit exactly the rows its own prefix sum pays for (Direct, admitted={admitted})"
+            );
+            assert_eq!(
+                rows(&managed.groups),
+                admitted,
+                "the shared rule must admit exactly the rows its own prefix sum pays for (managed, admitted={admitted})"
+            );
+            assert_managed_simple_query_matches_direct(
+                &format!("block referrers admitting {admitted} rows"),
+                managed,
+                direct_bounded,
+            );
+        }
+        // Row bounds. A bound at or above the candidate count must agree
+        // exactly, and does.
+        //
+        // BELOW that, the two modes are known to disagree for a reason this
+        // work does not own and did not introduce: the managed candidate scan
+        // stops reading index rows the moment it knows the row bound is
+        // exceeded (`candidate_count > max_rows`), which is why a bounded
+        // managed panel does not walk the graph -- but its index rows arrive in
+        // `(page_id, block_id)` order, so the candidates it keeps are an
+        // arbitrary subset rather than Direct's document-order prefix, and it
+        // reports the bound plus one as `total` rather than the whole candidate
+        // count. Closing that would mean giving up the early-out, which is a
+        // performance/product decision, not an accounting one. What the shared
+        // accounting rule owns -- how many rows survive and whether truncation
+        // is reported -- must still agree, and every retained managed row must
+        // be a genuine referrer.
+        let unbounded_rows = unbounded_direct
+            .groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
+            .collect::<HashSet<_>>();
+        for max_rows in 1..=(MODE_DIFFERENTIAL_PAGES * 4 + 1) {
+            let mut managed =
+                managed_block_referrers(&handle, MODE_DIFFERENTIAL_ANCHOR, max_rows, MAX_BYTES);
+            let direct_bounded =
+                direct.block_referrers_bounded(MODE_DIFFERENTIAL_ANCHOR, max_rows, MAX_BYTES);
+            let label = format!("block referrers max_rows={max_rows}");
+            assert_eq!(managed.exceeded, direct_bounded.exceeded, "{label}");
+            let rows =
+                |groups: &[RefGroup]| groups.iter().map(|group| group.blocks.len()).sum::<usize>();
+            assert_eq!(
+                rows(&managed.groups),
+                rows(&direct_bounded.groups),
+                "{label}: the shared rule must retain the same number of rows"
+            );
+            for group in &managed.groups {
+                for block in &group.blocks {
+                    assert!(
+                        unbounded_rows.contains(&block.raw),
+                        "{label}: managed retained a row Direct does not consider a referrer"
+                    );
+                }
+            }
+            if max_rows >= unbounded_direct.total {
+                let mut direct_groups = (*direct_bounded.groups).clone();
+                canonicalize_query_groups_for_mode_differential(&mut managed.groups);
+                canonicalize_query_groups_for_mode_differential(&mut direct_groups);
+                assert_eq!(managed.total, direct_bounded.total, "{label}");
+                assert_eq!(
+                    serde_json::to_value(managed.groups).unwrap(),
+                    serde_json::to_value(direct_groups).unwrap(),
+                    "managed row-bounded referrers diverged from Direct Files: {label}"
+                );
+            }
+        }
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The managed projection cache: what it saves and that it cannot go stale.
+    ///
+    /// Graph search is deliberately the vehicle -- unlike the simple-query
+    /// evaluator it holds no answer memo, so a repeated evaluation really does
+    /// re-walk every page and the only thing that can have become cheaper is
+    /// the per-block lsdoc projection.
+    ///
+    /// The counters are the architectural claim and hold in any build profile.
+    /// The wall-clock ratio is printed rather than asserted, because a debug
+    /// number cannot be compared against a release ceiling and widening a
+    /// ceiling to fit debug would retire it rather than move it.
+    #[test]
+    fn managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones() {
+        // Block-DENSE on purpose. A one-block-per-page corpus measures the
+        // managed page LOAD, which this cache does not touch; the cost it
+        // removes is one lsdoc parse per block per query, so the fixture has to
+        // put enough blocks behind each page load for that to be the term that
+        // moves.
+        const SYNTHETIC_PAGES: usize = 16;
+        const BLOCKS_PER_PAGE: usize = 128;
+        let fixture = ActivationFixture::scaled_with_blocks(
+            "managed-projection-cache",
+            0xa3fa,
+            SYNTHETIC_PAGES,
+            BLOCKS_PER_PAGE,
+        );
+        let direct = Graph::open(&fixture.graph_root);
+        let pages = direct.list_pages().len();
+        assert!(pages > SYNTHETIC_PAGES, "fixture did not activate at scale");
+        let handle = open_reopened_managed_actor(&fixture);
+        let source = "references";
+
+        let run = || {
+            handle
+                .reset_managed_application_query_instrumentation()
+                .unwrap();
+            let started = Instant::now();
+            let execution = managed_graph_search(&handle, source, 0, 20_000);
+            let elapsed = started.elapsed();
+            (
+                elapsed,
+                execution,
+                handle.managed_application_query_instrumentation().unwrap(),
+            )
+        };
+
+        let (cold_elapsed, cold, cold_counters) = run();
+        assert_eq!(
+            cold_counters.projection_cache_misses, pages,
+            "the first managed evaluation must convert every page exactly once: {cold_counters:?}"
+        );
+        assert_eq!(cold_counters.projection_cache_hits, 0, "{cold_counters:?}");
+        assert_managed_graph_search_matches_direct(
+            "cold managed graph search",
+            cold,
+            direct.run_graph_search(source, 0, 20_000, false),
+        );
+
+        let (warm_elapsed, warm, warm_counters) = run();
+        assert_eq!(
+            warm_counters.projection_cache_hits, pages,
+            "a repeated evaluation over unchanged pages must reuse every converted tree: {warm_counters:?}"
+        );
+        assert_eq!(
+            warm_counters.projection_cache_misses, 0,
+            "a repeated evaluation must not re-parse a single unchanged page: {warm_counters:?}"
+        );
+        assert_managed_graph_search_matches_direct(
+            "warm managed graph search",
+            warm,
+            direct.run_graph_search(source, 0, 20_000, false),
+        );
+        eprintln!(
+            "managed_projection_cache cold_ms={:.3} warm_ms={:.3} pages={pages} blocks_per_synthetic_page={BLOCKS_PER_PAGE}",
+            cold_elapsed.as_secs_f64() * 1_000.0,
+            warm_elapsed.as_secs_f64() * 1_000.0,
+        );
+
+        // The leg that matters. A retained tree is reused only after it is
+        // proved equal to the incoming DTO tree, so a saved page must MISS on
+        // the very next query and answer from its new content -- with no
+        // invalidation hook for the save path to have forgotten to call.
+        let witness_path = direct
+            .list_pages()
+            .into_iter()
+            .next()
+            .expect("the projection-cache fixture must contain pages")
+            .rel_path;
+        let (mut page, revision) = load_application_exact(&handle, &witness_path);
+        page.blocks[0].raw = format!("{} projection-cache-witness", page.blocks[0].raw);
+        let save = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        assert!(
+            matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+            "the projection-cache fixture edit was not accepted: {save:?}"
+        );
+
+        let (_, _, after_save) = run();
+        assert_eq!(
+            after_save.projection_cache_misses, 1,
+            "exactly the saved page must be reconverted: {after_save:?}"
+        );
+        assert_eq!(
+            after_save.projection_cache_hits,
+            pages - 1,
+            "every page the save did not touch must still be reused: {after_save:?}"
+        );
+
+        let reopened_direct = Graph::open(&fixture.graph_root);
+        let (_, after_save_execution, _) = run();
+        assert_managed_graph_search_matches_direct(
+            "managed graph search after an accepted save",
+            after_save_execution,
+            reopened_direct.run_graph_search(source, 0, 20_000, false),
         );
 
         assert!(matches!(

@@ -8,6 +8,10 @@ mod android_managed_storage_smoke;
 mod android_media;
 mod android_safe_back;
 mod android_system_bars;
+/// Test-only: `src/backend.ts` and `tauri::generate_handler!` must name the
+/// same set of commands.
+#[cfg(test)]
+mod backend_command_parity;
 mod backup;
 mod commands;
 mod data_home;
@@ -29,6 +33,10 @@ mod settings;
 mod spellcheck;
 mod state;
 mod storage_mode_supervisor;
+/// Test-only: the storage-transition enums and their `src/types.ts` unions are
+/// one wire format written twice.
+#[cfg(test)]
+mod storage_transition_wire_parity;
 mod sync_runtime;
 mod watcher;
 

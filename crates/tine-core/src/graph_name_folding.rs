@@ -22,8 +22,10 @@
 //!
 //! Tine's logical page name is already case- and normalization-insensitive:
 //! [`crate::oplog::LogicalPageName::key_digest`] hashes
-//! `canonical_page_name_key`, which lowercases and then applies NFC, matching
-//! Logseq. **Every pair of file names a case-folding or normalization-folding
+//! `canonical_page_name_key`, which lowercases (char-wise — it diverges from
+//! Logseq's/`refs::page_key`'s contextual fold on Greek final sigma; see the
+//! fold's own doc, DUP-1) and then applies NFC.
+//! **Every pair of file names a case-folding or normalization-folding
 //! filesystem cannot tell apart is therefore a pair Tine already treats as ONE
 //! page.** Such a filesystem cannot merge two distinct Tine pages, because two
 //! names that it folds were never two pages here.

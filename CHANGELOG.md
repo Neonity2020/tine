@@ -8,6 +8,64 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **A fault one core test injects can no longer fail an unrelated test beside
+  it.** The shared-provider "this filesystem has no `renameat2` flags" fault was
+  armed process-wide, so under a threaded `cargo test` the injected errno was
+  visible to every other test renaming a provider file at that moment; the
+  whole-suite failure set differed on every run. The fault is now scoped to the
+  thread under test and handed explicitly to the sync actor for the one request
+  that needs it, so the corpus reports the same result twice in a row (GH #350).
+
+- **Queries and search are much faster on Managed Storage.** Every managed
+  query used to re-parse every block of every candidate page, every time -- so
+  a page full of `{{query}}` re-parsed the graph on each open, and search
+  re-parsed it on each keystroke. Unchanged pages are now parsed once and
+  reused; an edited page is re-read on the very next query. Searching for a
+  literal phrase also consults the stored text index first instead of reading
+  every page, and a result-limited search now does its work only for the
+  results it keeps.
+
+### Fixed
+
+- **Managed Storage and Direct Files answer the same query the same way.** The
+  two storage modes evaluated block queries through separate copies of the same
+  logic, and the copies had drifted: a byte-budgeted block-referrers panel
+  admitted a different number of rows, and kept a different set of them, on the
+  two modes for identical content. Both now use one evaluator and one
+  result-budget rule.
+- **Journal recency respects the configured title format.** On graphs with a
+  custom `:journal/page-title-format`, `(sort-by modified)` ranked every
+  journal last on three of the four query paths (they parsed titles with the
+  default format only). All producers now share one recency axis that honours
+  the graph's configured formats.
+- **Backlink filter truncation is reported consistently.** A page-property
+  root entry that hit its text/facet budget marked the context truncated on
+  Managed Storage but not on Direct Files; the two now agree.
+- **Managed rename works for every page name.** The managed rename planner
+  keyed its index lookups with a different Unicode fold than the index itself
+  (the two disagree on Greek final sigma), so renaming such a page reported
+  success while doing nothing. Rename lookups now use the index's own fold.
+- **config.edn settings can no longer clobber a nested map.** Every setting
+  writer now edits only the root map's direct entries; a same-named keyword
+  nested inside another map (e.g. under `:default-templates`) survives
+  byte-for-byte instead of being spliced over.
+- **Write-durability errors are reported, not swallowed.** The workspaces
+  registry, backup restore, and Linux window-identity writers follow the save
+  path's directory-fsync policy (tolerate "unsupported here", report real
+  errors), the window-identity writer uses unique create-only temp files, and
+  the file watcher recognizes backup-restore temp files directly.
+
+- **One spelling of a page is one favorite.** Starring a page under one
+  spelling (different case, an alias, NFC/NFD accents, boundary slashes) now
+  fills the star and toggles off under every other spelling instead of
+  appending a duplicate; the sidebar arrangement, membership, page delete, and
+  rename all use the same kind-scoped identity, so deleting a page no longer
+  silently drops a journal favorite that merely shares its name. Backlink
+  filter chips key by the same identity, so two spellings of one co-referenced
+  page no longer produce two chips that miss each other's filters.
+
 ### Added
 
 - **Favorites nest to any depth** (GH #102). A group can hold groups, and a

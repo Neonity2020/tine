@@ -1009,8 +1009,15 @@ fn atomic_copy_new_into_live(
         drop(output);
         publish_temp_noreplace(&parent, std::path::Path::new(&temp), name)?;
         // The live name is authoritative after the atomic no-replace rename.
+        // Same dir-fsync policy as the save path (DUP-5): tolerate
+        // "unsupported here", REPORT a real EIO/ENOSPC — a restore whose
+        // rename may not survive a crash must not report success.
         if let Ok(parent_sync) = parent.try_clone() {
-            let _ = parent_sync.into_std_file().sync_all();
+            match parent_sync.into_std_file().sync_all() {
+                Ok(()) => {}
+                Err(error) if tine_core::model::dir_fsync_error_is_unsupported(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     })();

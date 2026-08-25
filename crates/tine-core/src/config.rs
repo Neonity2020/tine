@@ -327,7 +327,7 @@ impl Graph {
         self.write_config(&path, |content| {
             let mut content = content.to_string();
             const KEY: &str = ":tine/favorites-page";
-            if let Some(start) = find_keyword(&content, KEY) {
+            if let Some(start) = find_top_level_keyword(&content, KEY) {
                 let after = start + KEY.len();
                 let j = skip_blank(&content, after);
                 if content.as_bytes().get(j) == Some(&b'"') {
@@ -359,7 +359,7 @@ impl Graph {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            if let Some(start) = find_keyword(&content, ":favorites") {
+            if let Some(start) = find_top_level_keyword(&content, ":favorites") {
                 // Replace the existing `:favorites [...]` vector. Require its value to
                 // be a vector and find the matching `]` with an EDN-aware scan so a
                 // favorite NAME containing `]` (or a comment in the vector) can't
@@ -391,7 +391,7 @@ impl Graph {
         self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 let vstart = skip_blank(&content, after); // comment-aware
                 if content[vstart..].starts_with(':') {
@@ -415,53 +415,13 @@ impl Graph {
     /// Persist `:feature/enable-timetracking?`. OG treats an absent key as ON,
     /// but writing the explicit boolean keeps the Settings toggle reversible.
     pub fn set_timetracking_enabled(&self, enabled: bool) -> io::Result<()> {
-        let key = ":feature/enable-timetracking?";
-        let val = if enabled { "true" } else { "false" };
-        let path = config_path_for_write(self)?;
-        self.write_config(&path, |content| {
-            let mut content = content.to_string();
-
-            if let Some(start) = find_keyword(&content, key) {
-                let after = start + key.len();
-                match next_value_span(&content, after, content.len()) {
-                    Some((vstart, vend, _)) if vend > vstart => {
-                        content.replace_range(vstart..vend, val)
-                    }
-                    _ => content.insert_str(after, &format!(" {val}")),
-                }
-            } else if let Some(brace) = content.find('{') {
-                content.insert_str(brace + 1, &format!("\n {key} {val}\n"));
-            } else {
-                content = format!("{{{key} {val}}}\n");
-            }
-            Ok(content)
-        })
+        self.set_config_bool(":feature/enable-timetracking?", enabled)
     }
 
     /// Persist `:ui/show-brackets?`. OG treats an absent key as ON, but writing
     /// the explicit boolean keeps the Settings toggle reversible.
     pub fn set_show_brackets(&self, enabled: bool) -> io::Result<()> {
-        let key = ":ui/show-brackets?";
-        let val = if enabled { "true" } else { "false" };
-        let path = config_path_for_write(self)?;
-        self.write_config(&path, |content| {
-            let mut content = content.to_string();
-
-            if let Some(start) = find_keyword(&content, key) {
-                let after = start + key.len();
-                match next_value_span(&content, after, content.len()) {
-                    Some((vstart, vend, _)) if vend > vstart => {
-                        content.replace_range(vstart..vend, val)
-                    }
-                    _ => content.insert_str(after, &format!(" {val}")),
-                }
-            } else if let Some(brace) = content.find('{') {
-                content.insert_str(brace + 1, &format!("\n {key} {val}\n"));
-            } else {
-                content = format!("{{{key} {val}}}\n");
-            }
-            Ok(content)
-        })
+        self.set_config_bool(":ui/show-brackets?", enabled)
     }
 
     /// Persist the document-mode escape hatch. OG declares the equivalent key in
@@ -484,7 +444,7 @@ impl Graph {
         self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 match next_value_span(&content, after, content.len()) {
                     Some((vstart, vend, _)) if vend > vstart => {
@@ -503,27 +463,7 @@ impl Graph {
 
     /// Persist the one-time in-app Guide announcement flag, graph-locally.
     pub fn set_guide_announced(&self, announced: bool) -> io::Result<()> {
-        let key = ":tine/guide-announced?";
-        let val = if announced { "true" } else { "false" };
-        let path = config_path_for_write(self)?;
-        self.write_config(&path, |content| {
-            let mut content = content.to_string();
-
-            if let Some(start) = find_keyword(&content, key) {
-                let after = start + key.len();
-                match next_value_span(&content, after, content.len()) {
-                    Some((vstart, vend, _)) if vend > vstart => {
-                        content.replace_range(vstart..vend, val)
-                    }
-                    _ => content.insert_str(after, &format!(" {val}")),
-                }
-            } else if let Some(brace) = content.find('{') {
-                content.insert_str(brace + 1, &format!("\n {key} {val}\n"));
-            } else {
-                content = format!("{{{key} {val}}}\n");
-            }
-            Ok(content)
-        })
+        self.set_config_bool(":tine/guide-announced?", announced)
     }
 
     /// Persist the preferred format for new pages/journals as
@@ -540,7 +480,7 @@ impl Graph {
         self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 // Replace the FULL existing value span — whether it's a string
                 // (`"Markdown"`) or a keyword (`:org`) — so a keyword value isn't left
@@ -574,7 +514,7 @@ impl Graph {
         self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 match next_value_span(&content, after, content.len()) {
                     Some((vstart, vend, _)) if vend > vstart => {
@@ -601,7 +541,7 @@ impl Graph {
             let mut content = content.to_string();
 
             // Locate a real `:default-templates` whose value is a map literal `{ … }`.
-            let dt = find_keyword(&content, ":default-templates").and_then(|start| {
+            let dt = find_top_level_keyword(&content, ":default-templates").and_then(|start| {
                 let after = start + ":default-templates".len();
                 let j = skip_blank(&content, after); // comment-aware
                 if content.as_bytes().get(j) != Some(&b'{') {
@@ -775,7 +715,7 @@ impl Graph {
         self.write_config(&path, |content| {
             let mut content = content.to_string();
 
-            if let Some(start) = find_keyword(&content, key) {
+            if let Some(start) = find_top_level_keyword(&content, key) {
                 let after = start + key.len();
                 let vstart = skip_blank(&content, after); // comment-aware
                 let digits = content[vstart..]
@@ -968,6 +908,21 @@ fn root_map_bounds(s: &str) -> Option<(usize, usize)> {
     }
     let close = match_close_brace(s, open);
     (close < s.len() && s.as_bytes().get(close) == Some(&b'}')).then_some((open, close))
+}
+
+/// Locate `key` among the DIRECT entries of the root config map (byte index
+/// into the full string), never inside a nested map/vector/list. The
+/// depth-blind `find_keyword` returns the FIRST occurrence anywhere — so a
+/// `:favorites` nested inside `:default-templates` shadowed the real top-level
+/// entry, and a setter splicing its replacement over the nested hit corrupted
+/// config.edn (DUP-3, 2026-08-25 duplication audit). Every top-level SETTER
+/// must locate its key through this helper; `None` (absent at top level, or no
+/// balanced root map yet) sends callers to their ordinary insert/create path,
+/// which inserts at the root map's opening brace — BEFORE any nested shadow in
+/// byte order, so the depth-blind readers still see the top-level entry first.
+fn find_top_level_keyword(s: &str, key: &str) -> Option<usize> {
+    let (open, close) = root_map_bounds(s)?;
+    find_keyword_at_map_level(&s[open + 1..close], key).map(|relative| open + 1 + relative)
 }
 
 /// Span `[start, end)` of the value token following byte `from` (skipping leading
@@ -1692,6 +1647,59 @@ fn parse_macros(edn: &str) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// DUP-3 (2026-08-25 duplication audit): setters located their key with the
+    /// depth-blind `find_keyword`, which returns the FIRST occurrence anywhere.
+    /// With a `:favorites` nested inside `:default-templates` ahead of the real
+    /// top-level entry, `set_favorites` spliced its vector over the NESTED one,
+    /// corrupting the map. Setters must edit only direct root-map entries.
+    #[test]
+    fn setters_edit_the_top_level_key_never_a_nested_shadow() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-config-nested-shadow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        let path = dir.join("logseq").join("config.edn");
+        std::fs::write(
+            &path,
+            "{:default-templates {:journals \"J\" :favorites [\"nested\"]}\n :favorites [\"real\"]}\n",
+        )
+        .unwrap();
+
+        let g = crate::model::Graph::open(&dir);
+        g.set_favorites(&["Replaced".to_owned()]).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(":default-templates {:journals \"J\" :favorites [\"nested\"]}"),
+            "the nested shadow must survive byte-for-byte, got: {after}"
+        );
+        assert!(
+            after.contains(":favorites [\"Replaced\"]"),
+            "the real top-level entry must be the one replaced, got: {after}"
+        );
+        assert!(
+            !after.contains("[\"real\"]"),
+            "old top-level value gone, got: {after}"
+        );
+
+        // A key that exists ONLY nested gets a NEW top-level entry; the nested
+        // copy is not the setting and must not be edited.
+        std::fs::write(&path, "{:default-queries {:preferred-format :org}}\n").unwrap();
+        let g = crate::model::Graph::open(&dir);
+        g.set_preferred_format(crate::model::Format::Md).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(":default-queries {:preferred-format :org}"),
+            "nested copy untouched, got: {after}"
+        );
+        assert!(
+            after.contains(":preferred-format \"Markdown\""),
+            "new top-level entry inserted, got: {after}"
+        );
+    }
 
     // :tine/favorites-page identifies the page holding the Favorites
     // arrangement. Logseq ignores unknown keys, so the round trip must leave

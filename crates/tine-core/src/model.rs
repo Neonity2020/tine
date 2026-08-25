@@ -5840,7 +5840,13 @@ impl Graph {
             .map(Arc::clone)?;
         let pages = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
         let result = projection.sparse_task_query(
-            &self.root, generation, &pages, query_src, max_rows, max_bytes,
+            &self.root,
+            &self.journal_format,
+            generation,
+            &pages,
+            query_src,
+            max_rows,
+            max_bytes,
         )?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
@@ -22724,22 +22730,31 @@ pub fn block_to_dto(b: &DocBlock) -> io::Result<BlockDto> {
 /// and are hydrated once per page by live consumers. Keeping this constructor
 /// separate makes it difficult to accidentally reintroduce overlapping subtree
 /// amplification in queries, references, search, or batched resolution.
-pub fn block_to_shallow_dto(b: &DocBlock) -> BlockDto {
+/// The ONE parser-backed `DocBlock` → shallow `BlockDto` facet projection
+/// (DUP-6/B9, 2026-08-25 duplication audit): both DTO constructors delegate
+/// here, so a new `BlockDto` facet is a one-site decision on this path. `id`
+/// validation stays with the callers — their polite-error vs assert difference
+/// is deliberate.
+fn doc_block_facets_dto(block: &DocBlock, id: String) -> BlockDto {
     BlockDto {
-        id: block_runtime_id(b),
-        raw: b.raw.clone(),
-        collapsed: b.collapsed(),
+        id,
+        raw: block.raw.clone(),
+        collapsed: block.collapsed(),
         children: Vec::new(),
         breadcrumb: Vec::new(),
         page_property: false,
-        marker: b.marker().map(str::to_string),
-        priority: b.priority().map(str::to_string),
-        heading_level: b.heading_level(),
-        scheduled: b.scheduled().map(str::to_string),
-        deadline: b.deadline().map(str::to_string),
-        tags: b.tags(),
-        properties: b.properties(),
+        marker: block.marker().map(str::to_string),
+        priority: block.priority().map(str::to_string),
+        heading_level: block.heading_level(),
+        scheduled: block.scheduled().map(str::to_string),
+        deadline: block.deadline().map(str::to_string),
+        tags: block.tags(),
+        properties: block.properties(),
     }
+}
+
+pub fn block_to_shallow_dto(b: &DocBlock) -> BlockDto {
+    doc_block_facets_dto(b, block_runtime_id(b))
 }
 
 fn dto_blocks_to_doc_checked(blocks: &[BlockDto], is_org: bool) -> io::Result<Vec<DocBlock>> {
@@ -22854,21 +22869,9 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
                 "block has no assigned runtime identity",
             ));
         }
-        frame.output.push(BlockDto {
-            id: block.uuid.clone(),
-            raw: block.raw.clone(),
-            collapsed: block.collapsed(),
-            children: Vec::new(),
-            breadcrumb: Vec::new(),
-            page_property: false,
-            marker: block.marker().map(str::to_string),
-            priority: block.priority().map(str::to_string),
-            heading_level: block.heading_level(),
-            scheduled: block.scheduled().map(str::to_string),
-            deadline: block.deadline().map(str::to_string),
-            tags: block.tags(),
-            properties: block.properties(),
-        });
+        frame
+            .output
+            .push(doc_block_facets_dto(block, block.uuid.clone()));
         if !block.children.is_empty() {
             if len == MAX_MANAGED_BLOCK_DEPTH {
                 return Err(io::Error::new(
@@ -23565,27 +23568,7 @@ pub(crate) fn move_file_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
 /// appeared after the caller's collision check. The payload is fsynced in a
 /// same-directory temp, then atomically renamed into the final name only if absent.
 pub(crate) fn atomic_write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("page");
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{fname}.{}.{}.new.tmp", std::process::id(), seq));
-    let res = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        move_file_noreplace(&tmp, path)?;
-        sync_dir(dir)
-    })();
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    res
+    atomic_publish(path, bytes, PublishMode::NoReplace)
 }
 
 /// Suffix marking a file retired by [`atomic_replace_expected`] mid-publish.
@@ -23616,6 +23599,21 @@ fn dir_fsync_is_unsupported(error: &io::Error) -> bool {
     error
         .raw_os_error()
         .is_some_and(|errno| UNSUPPORTED_ERRNOS.contains(&errno))
+}
+
+/// App-layer face of [`sync_dir`]: fsync `dir` so a rename into it survives a
+/// crash. For src-tauri writers (settings registry, backup restore, window
+/// identity) that previously discarded this result with `let _ = …` — a false
+/// ack under the in-scope crash/power-loss threat (DUP-5).
+pub fn sync_dir_for_rename(dir: &Path) -> io::Result<()> {
+    sync_dir(dir)
+}
+
+/// App-layer face of [`dir_fsync_is_unsupported`], for writers that hold their
+/// own directory handle (the cap-std restore path) and must apply the same
+/// tolerate-unsupported / report-real policy.
+pub fn dir_fsync_error_is_unsupported(error: &io::Error) -> bool {
+    dir_fsync_is_unsupported(error)
 }
 
 /// fsync a directory so a rename into it survives a crash.
@@ -23812,13 +23810,39 @@ fn retired_target_name(retired: &str) -> Option<&str> {
 /// the same path (e.g. an autosave and a highlight/rename rewrite) can't truncate
 /// each other's temp; the rename is still atomic. The temp is removed if the
 /// write fails, so a unique name never leaks an orphan behind.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// How [`atomic_publish`] lands the temp on its final name.
+enum PublishMode {
+    /// `fs::rename` — replaces an existing file (the ordinary save shape).
+    Replace,
+    /// `move_file_noreplace` — create-only; never clobbers a concurrent creator.
+    NoReplace,
+}
+
+/// THE temp+fsync+rename publish implementation, shared by [`atomic_write`]
+/// and [`atomic_write_new`] (DUP-5, 2026-08-25 duplication audit: the family
+/// had drifted into copies with different failure policies; the rationale
+/// lives here once).
+///
+/// - The temp name is unique per write (pid + per-process sequence) so two
+///   concurrent writers to the same path can't truncate each other's temp.
+/// - The temp is hidden (`.`-prefixed) and ends in `.tmp` — the shape the
+///   watcher's `is_tine_atomic_page_temp_path` and the wire-side recognizer
+///   understand; change it only together with both recognizers.
+/// - Directory-fsync errors that mean "unsupported here" are tolerated; a real
+///   `EIO`/`ENOSPC` is REPORTED, because a caller told this succeeded will
+///   report the save as durably committed (in-scope threat: crash/power loss
+///   right after the rename).
+fn atomic_publish(path: &Path, bytes: &[u8], mode: PublishMode) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("page");
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{fname}.{}.{seq}.tmp", std::process::id()));
+    let infix = match mode {
+        PublishMode::Replace => "",
+        PublishMode::NoReplace => ".new",
+    };
+    let tmp = dir.join(format!(".{fname}.{}.{seq}{infix}.tmp", std::process::id()));
     let res = (|| {
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -23827,17 +23851,20 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path)
+        match mode {
+            PublishMode::Replace => fs::rename(&tmp, path),
+            PublishMode::NoReplace => move_file_noreplace(&tmp, path),
+        }
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp); // never leave a temp behind on failure
         return res;
     }
-    // Persist the rename itself: fsync the directory so a crash right after the
-    // write can't lose the new directory entry (the rename) on some filesystems.
-    // Unsupported-here errors are tolerated; a real one is reported, because a
-    // caller told this succeeded will report the save as durably committed.
     sync_dir(dir)
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_publish(path, bytes, PublishMode::Replace)
 }
 
 fn managed_root_components(root: &str) -> Option<Vec<&str>> {
@@ -50847,8 +50874,22 @@ mod tests {
             title: "Prospective".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "my draft".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,
@@ -51009,8 +51050,22 @@ mod tests {
             title: "First save".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "created".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,
@@ -51566,8 +51621,22 @@ mod tests {
             title: "New".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "mine".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,

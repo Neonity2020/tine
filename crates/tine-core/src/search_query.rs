@@ -354,3 +354,128 @@ mod tests {
         assert!(!hit("/café/", "cafe\u{301}"));
     }
 }
+
+/// DUP-8: the shared search-grammar conformance corpus.
+///
+/// This dialect is implemented twice -- here, and in `src/editor/searchQuery.ts`
+/// for the page list -- and until now the only thing keeping the two in step was
+/// the "keep the two in sync" note at the top of both files. A user typing one
+/// query into Ctrl+K gets both engines at once, so a drift between them shows up
+/// as the page list and the block list disagreeing about the same query.
+///
+/// `tests/fixtures/search-query-corpus.json` is asserted here and, case for
+/// case, by `src/editor/searchQuery.corpus.test.ts`. The corpus pins CURRENT
+/// behavior; where the two engines already disagree the row records BOTH
+/// answers under `knownDivergence: "DUP-9"` rather than either engine being
+/// changed to match the other.
+#[cfg(test)]
+mod corpus {
+    use super::*;
+    use serde_json::Value;
+
+    const CORPUS: &str = include_str!("../../../tests/fixtures/search-query-corpus.json");
+
+    fn tokens_json(query: &str) -> Value {
+        Value::Array(
+            tokenize(query)
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "text": t.text,
+                        "negated": t.negated,
+                        "quoted": t.quoted,
+                        "isOr": t.is_or,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn verdict_json(query: &str) -> Value {
+        let matcher = Matcher::parse(query);
+        match &matcher {
+            // The two regex engines word their errors differently; the message
+            // is not a contract, only the refusal is.
+            Matcher::Empty => serde_json::json!({ "kind": "empty" }),
+            Matcher::InvalidRegex(_) => serde_json::json!({ "kind": "invalid" }),
+            Matcher::Regex(re) => serde_json::json!({ "kind": "regex", "pattern": re.as_str() }),
+            Matcher::Boolean(groups) => serde_json::json!({
+                "kind": "boolean",
+                "groups": groups
+                    .iter()
+                    .map(|group| {
+                        group
+                            .iter()
+                            .map(|t| serde_json::json!({
+                                "text": t.text,
+                                "negated": t.negated,
+                                "quoted": t.quoted,
+                            }))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+                "simpleTerm": matcher.simple_term(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_rust_engine_matches_every_corpus_case() {
+        let doc: Value = serde_json::from_str(CORPUS).expect("corpus is valid JSON");
+        let cases = doc["cases"].as_array().expect("corpus has a `cases` array");
+        assert!(!cases.is_empty(), "the corpus is empty");
+
+        for case in cases {
+            let name = case["name"].as_str().expect("every case is named");
+            let query = case["query"].as_str().expect("every case has a query");
+            let expected = if case.get("knownDivergence").is_some() {
+                assert_eq!(
+                    case["knownDivergence"], "DUP-9",
+                    "{name}: the only recorded divergence class is DUP-9"
+                );
+                assert!(
+                    case["why"].as_str().is_some_and(|why| !why.is_empty()),
+                    "{name}: a divergence must say what causes it"
+                );
+                &case["rust"]
+            } else {
+                case
+            };
+            assert_eq!(
+                tokens_json(query),
+                expected["tokens"],
+                "{name}: tokenize({query:?}) changed"
+            );
+            assert_eq!(
+                verdict_json(query),
+                expected["verdict"],
+                "{name}: Matcher::parse({query:?}) changed"
+            );
+        }
+    }
+
+    /// A divergence row must actually diverge. If the two engines have been
+    /// brought into agreement, the row becomes an ordinary shared case -- and
+    /// the DUP-9 note should go with it.
+    #[test]
+    fn every_divergence_row_records_two_different_answers() {
+        let doc: Value = serde_json::from_str(CORPUS).expect("corpus is valid JSON");
+        for case in doc["cases"].as_array().expect("cases") {
+            if case.get("knownDivergence").is_none() {
+                continue;
+            }
+            let name = case["name"].as_str().expect("named");
+            let rust = &case["rust"];
+            let ts = &case["typescript"];
+            assert!(
+                rust.is_object() && ts.is_object(),
+                "{name}: a divergence needs both a `rust` and a `typescript` section"
+            );
+            assert_ne!(
+                (&rust["tokens"], &rust["verdict"]),
+                (&ts["tokens"], &ts["verdict"]),
+                "{name}: recorded as a divergence but both engines agree; make it a shared case"
+            );
+        }
+    }
+}

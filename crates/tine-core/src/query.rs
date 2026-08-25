@@ -74,17 +74,26 @@ pub struct BoundedGroups {
     pub exceeded: bool,
 }
 
-struct ConstructionBudget {
+/// The ONE result-construction accounting rule, shared by Direct Files and
+/// managed storage.
+///
+/// It exists as a type rather than as an open-coded pair of counters because
+/// the two storage modes had drifted apart on exactly this: Direct charged
+/// `payload + page name + 256` per admitted row and latched `exceeded`, while
+/// the managed block-referrer loop probed a group overhead per row but
+/// accumulated it once per emitted group -- so the same `max_bytes` admitted a
+/// different number of rows on the two paths for identical content.
+pub(crate) struct ConstructionBudget {
     max_rows: usize,
     max_bytes: usize,
     rows: usize,
     bytes: usize,
-    total: usize,
-    exceeded: bool,
+    pub(crate) total: usize,
+    pub(crate) exceeded: bool,
 }
 
 impl ConstructionBudget {
-    fn new(max_rows: usize, max_bytes: usize) -> Self {
+    pub(crate) fn new(max_rows: usize, max_bytes: usize) -> Self {
         Self {
             max_rows,
             max_bytes,
@@ -95,7 +104,7 @@ impl ConstructionBudget {
         }
     }
 
-    fn admit_estimated(&mut self, page: &str, payload_bytes: usize) -> bool {
+    pub(crate) fn admit_estimated(&mut self, page: &str, payload_bytes: usize) -> bool {
         self.total = self.total.saturating_add(1);
         let bytes = payload_bytes.saturating_add(page.len()).saturating_add(256);
         if self.exceeded
@@ -110,12 +119,12 @@ impl ConstructionBudget {
         true
     }
 
-    fn deny_match(&mut self) {
+    pub(crate) fn deny_match(&mut self) {
         self.total = self.total.saturating_add(1);
         self.exceeded = true;
     }
 
-    fn closed(&self) -> bool {
+    pub(crate) fn closed(&self) -> bool {
         self.exceeded || self.rows >= self.max_rows
     }
 }
@@ -269,7 +278,11 @@ fn collect_reference_matches<'a, M, T>(
 fn crumb_line_estimated_bytes(block: &DocBlock) -> usize {
     let line = block.visible_text().lines().next().unwrap_or("").trim();
     let mut chars = line.chars();
-    let bytes = chars.by_ref().take(60).map(char::len_utf8).sum::<usize>();
+    let bytes = chars
+        .by_ref()
+        .take(crate::doc::CRUMB_MAX_CHARS)
+        .map(char::len_utf8)
+        .sum::<usize>();
     bytes + usize::from(chars.next().is_some()) * '…'.len_utf8()
 }
 
@@ -328,22 +341,6 @@ thread_local! {
 
 /// Cancellable variant used by interactive search. Returning false from `f`
 /// stops the entire depth-first walk, including the current deep page.
-/// A short, single-line label for a block in a breadcrumb trail.
-fn crumb_line(b: &DocBlock) -> String {
-    let line = b
-        .visible_text()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if line.chars().count() > 60 {
-        format!("{}…", line.chars().take(60).collect::<String>())
-    } else {
-        line
-    }
-}
-
 /// Collect matching blocks from an exact candidate set, or from the complete
 /// already-parsed graph when no safe candidate set is available. The parser
 /// remains the semantic authority; this helper performs no disk I/O or parsing.
@@ -396,7 +393,7 @@ fn collect_bounded_candidates(
                     let mut dto = result_dto(block);
                     dto.breadcrumb = ancestors
                         .iter()
-                        .map(|ancestor| crumb_line(ancestor))
+                        .map(|ancestor| crate::doc::crumb_line(ancestor))
                         .collect();
                     Some(dto)
                 },
@@ -814,7 +811,7 @@ pub(crate) fn application_page_reference_matches(
                     output.push((dto, hit));
                 }
             }
-            ancestors.push(crumb_line(&projected));
+            ancestors.push(crate::doc::crumb_line(&projected));
             visit(
                 &block.children,
                 is_org,
@@ -970,7 +967,7 @@ fn collect_reference_occurrences_bounded(
                     let mut dto = result_dto(block);
                     dto.breadcrumb = ancestors
                         .iter()
-                        .map(|ancestor| crumb_line(ancestor))
+                        .map(|ancestor| crate::doc::crumb_line(ancestor))
                         .collect();
                     Some((dto, hit))
                 },
@@ -1313,6 +1310,12 @@ pub fn backlink_filter_context(
                             context.truncated = true;
                         } else {
                             bytes += estimated;
+                            // Same flag propagation as the ordinary-root loop
+                            // below and the managed twin: an entry truncated at
+                            // its own text/facet budget must mark the context,
+                            // or Direct reports truncated=false where managed
+                            // reports true for identical content (DUP-6).
+                            context.truncated |= entry.truncated;
                             context.entries.push(entry);
                         }
                     }
@@ -1747,6 +1750,11 @@ fn finish_query_groups(
 /// `recency` shares Direct Files' axis: journal midnight or projected-file mtime.
 pub(crate) struct ApplicationQueryPage {
     pub(crate) page: PageDto,
+    /// The page's block tree already converted for evaluation. Supplied by the
+    /// caller from [`ApplicationProjectionCache`] so an unchanged page keeps its
+    /// memoized lsdoc projections across queries, the way Direct Files keeps
+    /// them in its cached `Arc<Document>`.
+    pub(crate) roots: std::sync::Arc<Vec<DocBlock>>,
     pub(crate) recency: i64,
 }
 
@@ -2139,6 +2147,216 @@ pub(crate) fn application_query_doc_block(block: &BlockDto, is_org: bool) -> Doc
     }
 }
 
+/// Default bounds for [`ApplicationProjectionCache`].
+///
+/// The byte bound counts SOURCE raw text, not retained memory: a retained tree
+/// is roughly three to four times its raw text once every block's projection is
+/// filled (`visible` + `visible_lower` + reference vectors + per-block
+/// overhead), so 16 MiB of source is the order of 60 MiB retained at the very
+/// worst -- and only when a query actually projected every block of every
+/// cached page. Martin's real graph is 4.5 MiB across 1,045 files, so both
+/// bounds hold it whole; a graph larger than that degrades to LRU misses
+/// rather than to unbounded growth.
+pub(crate) const APPLICATION_PROJECTION_CACHE_MAX_PAGES: usize = 4_096;
+pub(crate) const APPLICATION_PROJECTION_CACHE_MAX_RAW_BYTES: usize = 16 * 1024 * 1024;
+
+struct ApplicationProjectionCacheEntry {
+    is_org: bool,
+    raw_bytes: usize,
+    used: u64,
+    roots: std::sync::Arc<Vec<DocBlock>>,
+}
+
+/// Converted managed page block trees, retained across managed query
+/// evaluations so an unchanged page is parsed once instead of once per query.
+///
+/// Why this exists at all: Direct Files gets projection memoization for free.
+/// `Graph::with_pages` hands out a cached `Arc<Document>` whose `DocBlock`s each
+/// memoize ONE lsdoc parse in a `OnceLock` ([`DocBlock::projection`]), so after
+/// the first query every Direct block projection is warm. The managed evaluator
+/// rebuilds a `PageDto` per request and used to call
+/// [`application_query_doc_block`] on it, allocating a fresh `OnceLock::new()`
+/// per block -- so managed re-parsed every block of every candidate page on
+/// EVERY query, on `{{query}}` re-render and on every search keystroke.
+///
+/// **Staleness is impossible by construction, and that is deliberate.** The
+/// cache is content-addressed by exact comparison rather than by a digest or a
+/// generation counter: a retained tree is reused only after
+/// [`doc_roots_match_dtos`] proves it structurally equal to the incoming DTO
+/// tree (raw text, block identity, child shape) at the same `is_org`, and a
+/// `BlockProjection` is a pure function of `(raw, is_org)`. There is therefore
+/// no generation window to get wrong, no digest collision to defend against,
+/// and no invalidation hook that a future write path can forget to call: a
+/// changed page simply fails the comparison and is rebuilt. The comparison is a
+/// length-guarded `memcmp` over the same bytes a parse would have read, i.e.
+/// cheaper than the parse it replaces by orders of magnitude.
+///
+/// Bounded by page count AND source bytes, evicting least-recently-used, so a
+/// graph larger than the bound degrades to the previous per-query rebuild for
+/// the evicted pages instead of growing without limit.
+pub(crate) struct ApplicationProjectionCache {
+    entries: HashMap<String, ApplicationProjectionCacheEntry>,
+    max_pages: usize,
+    max_raw_bytes: usize,
+    raw_bytes: usize,
+    clock: u64,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl Default for ApplicationProjectionCache {
+    fn default() -> Self {
+        Self::new(
+            APPLICATION_PROJECTION_CACHE_MAX_PAGES,
+            APPLICATION_PROJECTION_CACHE_MAX_RAW_BYTES,
+        )
+    }
+}
+
+impl std::fmt::Debug for ApplicationProjectionCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApplicationProjectionCache")
+            .field("pages", &self.entries.len())
+            .field("raw_bytes", &self.raw_bytes)
+            .finish()
+    }
+}
+
+impl ApplicationProjectionCache {
+    pub(crate) fn new(max_pages: usize, max_raw_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_pages,
+            max_raw_bytes,
+            raw_bytes: 0,
+            clock: 0,
+            #[cfg(test)]
+            hits: 0,
+            #[cfg(test)]
+            misses: 0,
+        }
+    }
+
+    /// The converted block tree for one exact managed page.
+    ///
+    /// `path` only selects which retained tree to COMPARE against; it never
+    /// substitutes for the comparison, so a path reused for different content
+    /// (rename, replacement, external edit) misses rather than lies.
+    pub(crate) fn roots(&mut self, path: &str, page: &PageDto) -> std::sync::Arc<Vec<DocBlock>> {
+        let is_org = page.format == Format::Org;
+        self.clock = self.clock.saturating_add(1);
+        let clock = self.clock;
+        if let Some(entry) = self.entries.get_mut(path) {
+            if entry.is_org == is_org && doc_roots_match_dtos(&entry.roots, &page.blocks) {
+                entry.used = clock;
+                #[cfg(test)]
+                {
+                    self.hits = self.hits.saturating_add(1);
+                }
+                return std::sync::Arc::clone(&entry.roots);
+            }
+        }
+        #[cfg(test)]
+        {
+            self.misses = self.misses.saturating_add(1);
+        }
+        let roots = std::sync::Arc::new(
+            page.blocks
+                .iter()
+                .map(|block| application_query_doc_block(block, is_org))
+                .collect::<Vec<_>>(),
+        );
+        let raw_bytes = dto_raw_bytes(&page.blocks);
+        if raw_bytes > self.max_raw_bytes || self.max_pages == 0 {
+            // One page bigger than the whole budget must not evict the rest of
+            // the graph to store an entry that the next insert would drop.
+            self.forget(path);
+            return roots;
+        }
+        if let Some(previous) = self.entries.insert(
+            path.to_owned(),
+            ApplicationProjectionCacheEntry {
+                is_org,
+                raw_bytes,
+                used: clock,
+                roots: std::sync::Arc::clone(&roots),
+            },
+        ) {
+            self.raw_bytes = self.raw_bytes.saturating_sub(previous.raw_bytes);
+        }
+        self.raw_bytes = self.raw_bytes.saturating_add(raw_bytes);
+        self.evict();
+        roots
+    }
+
+    fn forget(&mut self, path: &str) {
+        if let Some(previous) = self.entries.remove(path) {
+            self.raw_bytes = self.raw_bytes.saturating_sub(previous.raw_bytes);
+        }
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > self.max_pages || self.raw_bytes > self.max_raw_bytes {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(path, entry)| (entry.used, (*path).clone()))
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.forget(&victim);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counters(&self) -> (usize, usize, usize) {
+        (self.hits, self.misses, self.entries.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_counters(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.raw_bytes = 0;
+    }
+}
+
+fn dto_raw_bytes(blocks: &[BlockDto]) -> usize {
+    blocks
+        .iter()
+        .map(|block| {
+            block
+                .raw
+                .len()
+                .saturating_add(block.id.len())
+                .saturating_add(dto_raw_bytes(&block.children))
+        })
+        .sum()
+}
+
+/// Exact structural equality between a retained `DocBlock` tree and the DTO
+/// tree it was converted from. Only the fields [`application_query_doc_block`]
+/// reads participate, because only those can make the retained tree wrong:
+/// `raw` (which the memoized projection is a pure function of) and `id` (which
+/// becomes `DocBlock::uuid` and reaches the result DTO as its identity).
+fn doc_roots_match_dtos(cached: &[DocBlock], blocks: &[BlockDto]) -> bool {
+    cached.len() == blocks.len()
+        && cached.iter().zip(blocks).all(|(cached, block)| {
+            cached.raw == block.raw
+                && cached.uuid == block.id
+                && doc_roots_match_dtos(&cached.children, &block.children)
+        })
+}
+
 /// Evaluate one already-narrowed exact managed page set with the same predicate,
 /// OG top-level-root filter, result budgets, sorting and sampling as Direct Files.
 pub(crate) fn run_application_query_pages_bounded(
@@ -2191,17 +2409,13 @@ fn run_application_pred_pages_bounded(
             page_props: &page_props,
             page_tags: &page_tags,
         };
-        let roots = page
-            .blocks
-            .iter()
-            .map(|block| application_query_doc_block(block, page.format == Format::Org))
-            .collect::<Vec<_>>();
+        let roots = source.roots.as_slice();
         let mut matched = Vec::new();
         let mut path = Vec::new();
         let mut path_refs = PathRefCounts::new();
         let track_path_refs = pred.uses_path_refs();
         collect_og_query_roots(
-            &roots,
+            roots,
             &mut path,
             &mut path_refs,
             track_path_refs,
@@ -3387,7 +3601,18 @@ pub(crate) fn application_page_templates(
                 .map(|child| template_dto_from_application(child, false))
                 .collect(),
             breadcrumb: Vec::new(),
-            ..BlockDto::default()
+            // DUP-8: every field spelled out, at its `Default` value, so a new
+            // `BlockDto` field has to be decided here instead of arriving
+            // silently defaulted. A template copy carries no facets: the raw
+            // text still holds them and the caller re-derives on insert.
+            page_property: false,
+            marker: None,
+            priority: None,
+            heading_level: None,
+            scheduled: None,
+            deadline: None,
+            tags: Vec::new(),
+            properties: Vec::new(),
         }
     }
 
@@ -3460,7 +3685,16 @@ fn template_dto(b: &DocBlock, strip_template: bool) -> BlockDto {
         collapsed: false,
         children: b.children.iter().map(|c| template_dto(c, false)).collect(),
         breadcrumb: Vec::new(),
-        ..Default::default()
+        // DUP-8: every field spelled out, at its `Default` value -- see
+        // `template_dto_from_application` above, whose behavior this mirrors.
+        page_property: false,
+        marker: None,
+        priority: None,
+        heading_level: None,
+        scheduled: None,
+        deadline: None,
+        tags: Vec::new(),
+        properties: Vec::new(),
     }
 }
 
@@ -4264,24 +4498,12 @@ pub(crate) fn export_application_query_subtrees(
             )
         }
     });
-    let documents = pages
+    let hydration_pages = pages
         .iter()
-        .map(|source| {
-            let roots = source
-                .page
-                .blocks
-                .iter()
-                .map(|block| application_query_doc_block(block, source.page.format == Format::Org))
-                .collect::<Vec<_>>();
-            (source.page.kind, source.page.name.as_str(), roots)
-        })
-        .collect::<Vec<_>>();
-    let hydration_pages = documents
-        .iter()
-        .map(|(kind, name, roots)| ExportHydrationPage {
-            kind: *kind,
-            name,
-            roots,
+        .map(|source| ExportHydrationPage {
+            kind: source.page.kind,
+            name: source.page.name.as_str(),
+            roots: source.roots.as_slice(),
         })
         .collect::<Vec<_>>();
     QueryExportBatch {
@@ -5155,6 +5377,121 @@ mod tests {
 
     fn pred(src: &str) -> Pred {
         Pred::parse(src, TODAY).expect("parse")
+    }
+
+    fn projection_cache_page(path: &str, format: Format, raws: &[&str]) -> PageDto {
+        PageDto {
+            name: path.into(),
+            kind: PageKind::Page,
+            title: path.into(),
+            pre_block: None,
+            blocks: raws
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| BlockDto {
+                    id: format!("block-{index}"),
+                    raw: (*raw).into(),
+                    ..BlockDto::default()
+                })
+                .collect(),
+            rev: None,
+            format,
+            read_only: false,
+            path: path.into(),
+            activation: None,
+            guide: false,
+        }
+    }
+
+    /// The managed projection cache reuses a retained tree only for content it
+    /// has PROVED identical, and it stays inside both of its bounds.
+    ///
+    /// The path is a lookup key, never a substitute for the comparison. A path
+    /// that comes back with different content -- an external edit, a rename
+    /// that reuses a filename, a replacement page -- must miss, because the
+    /// retained tree carries memoized lsdoc projections of the OLD raw text and
+    /// the OLD block identities.
+    #[test]
+    fn application_projection_cache_reuses_only_proven_identical_content() {
+        let mut cache = ApplicationProjectionCache::default();
+        let page = projection_cache_page("a.md", Format::Md, &["- one", "- two"]);
+
+        let first = cache.roots("a.md", &page);
+        let second = cache.roots("a.md", &page);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.counters(), (1, 1, 1));
+
+        // Same path, changed raw text.
+        let edited = projection_cache_page("a.md", Format::Md, &["- one", "- CHANGED"]);
+        let third = cache.roots("a.md", &edited);
+        assert!(!std::sync::Arc::ptr_eq(&second, &third));
+        assert_eq!(third[1].raw, "- CHANGED");
+        assert_eq!(cache.counters(), (1, 2, 1));
+
+        // Same path and text, changed block identity: the id becomes
+        // `DocBlock::uuid` and reaches the result DTO, so it cannot be reused.
+        let mut reidentified = edited.clone();
+        reidentified.blocks[0].id = "block-renamed".into();
+        let fourth = cache.roots("a.md", &reidentified);
+        assert_eq!(fourth[0].uuid, "block-renamed");
+        assert_eq!(cache.counters(), (1, 3, 1));
+
+        // Same path, same text, different parser mode.
+        let org = projection_cache_page("a.md", Format::Org, &["- one", "- CHANGED"]);
+        let mut org = org;
+        org.blocks[0].id = "block-renamed".into();
+        let _ = cache.roots("a.md", &org);
+        assert_eq!(cache.counters(), (1, 4, 1));
+
+        // Changed child shape at identical parent raw text.
+        let mut nested = projection_cache_page("b.md", Format::Md, &["- parent"]);
+        nested.blocks[0].children = vec![BlockDto {
+            id: "child".into(),
+            raw: "- child".into(),
+            ..BlockDto::default()
+        }];
+        let _ = cache.roots("b.md", &nested);
+        let flat = projection_cache_page("b.md", Format::Md, &["- parent"]);
+        let _ = cache.roots("b.md", &flat);
+        assert_eq!(cache.counters(), (1, 6, 2));
+    }
+
+    /// Both bounds hold, and a page bigger than the whole byte budget is served
+    /// without evicting the graph to store something the next insert would drop.
+    #[test]
+    fn application_projection_cache_stays_inside_both_bounds() {
+        let mut cache = ApplicationProjectionCache::new(2, 1024);
+        for page in 0..4 {
+            let path = format!("p{page}.md");
+            let dto = projection_cache_page(&path, Format::Md, &["- small"]);
+            let _ = cache.roots(&path, &dto);
+        }
+        let (_, _, retained) = cache.counters();
+        assert_eq!(retained, 2, "the page bound must evict least-recently-used");
+
+        // The most recent two survive; the oldest was evicted and misses.
+        let oldest = projection_cache_page("p0.md", Format::Md, &["- small"]);
+        cache.reset_counters();
+        let _ = cache.roots("p0.md", &oldest);
+        assert_eq!(cache.counters().0, 0, "an evicted page must miss");
+
+        let mut cache = ApplicationProjectionCache::new(64, 64);
+        let huge = "- ".to_string() + &"x".repeat(4096);
+        let big = projection_cache_page("big.md", Format::Md, &[huge.as_str()]);
+        let roots = cache.roots("big.md", &big);
+        assert_eq!(roots.len(), 1, "an over-budget page is still served");
+        assert_eq!(
+            cache.counters().2,
+            0,
+            "an over-budget page must not be retained"
+        );
+        let small = projection_cache_page("small.md", Format::Md, &["- s"]);
+        let _ = cache.roots("small.md", &small);
+        assert_eq!(
+            cache.counters().2,
+            1,
+            "storing the over-budget page must not have evicted the budget"
+        );
     }
 
     fn nested_boolean(head: &str, depth: usize, leaf: &str) -> String {
@@ -7576,20 +7913,23 @@ mod tests {
         recency: i64,
         blocks: Vec<BlockDto>,
     ) -> ApplicationQueryPage {
+        let page = PageDto {
+            name: name.into(),
+            kind,
+            title: name.into(),
+            pre_block: None,
+            blocks,
+            rev: None,
+            format,
+            read_only: false,
+            path: path.into(),
+            activation: None,
+            guide: false,
+        };
+        let roots = ApplicationProjectionCache::default().roots(&page.path, &page);
         ApplicationQueryPage {
-            page: PageDto {
-                name: name.into(),
-                kind,
-                title: name.into(),
-                pre_block: None,
-                blocks,
-                rev: None,
-                format,
-                read_only: false,
-                path: path.into(),
-                activation: None,
-                guide: false,
-            },
+            page,
+            roots,
             recency,
         }
     }

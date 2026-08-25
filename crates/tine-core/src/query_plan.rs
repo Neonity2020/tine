@@ -7,7 +7,7 @@
 //! durable query workspace can grow into later.
 
 use crate::doc::DocBlock;
-use crate::model::{BlockDto, Format, Graph, PageDto, PageEntry, PageKind};
+use crate::model::{BlockDto, Graph, PageEntry, PageKind};
 use crate::refs;
 use crate::search_query::{canonical_fold, Matcher, Term};
 use regex::Regex;
@@ -18,6 +18,21 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_EVIDENCE_SPANS: usize = 32;
+
+/// How many times the shared block evaluator has produced match evidence and a
+/// result DTO. The architectural claim is that this is once per WINNER, not
+/// once per retained candidate -- O(limit), not O(retained) -- and a counter is
+/// the only way to state that as a test rather than as a comment.
+#[cfg(test)]
+thread_local! {
+    static BLOCK_EVIDENCE_EVALUATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_block_evidence_evaluations() -> usize {
+    BLOCK_EVIDENCE_EVALUATIONS.with(|count| count.replace(0))
+}
 
 /// The entity kind a query-plan branch selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +135,44 @@ pub struct QueryBranch {
     pub limit: usize,
 }
 
+impl QueryBranch {
+    /// The already-folded needle of a branch that is EXACTLY one literal fuzzy
+    /// `VisibleContent` predicate -- the `((` block-picker shape produced by
+    /// [`QueryPlan::block_search_literal`].
+    ///
+    /// Such a branch, and only such a branch, can be narrowed by a stored
+    /// ordered-subsequence candidate index: the index answers "which pages
+    /// could contain this subsequence", the parser-owned matcher still ranks
+    /// blocks and produces evidence, and a narrowed scan therefore returns the
+    /// same results as a full scan. A branch with boolean structure, negation
+    /// or a regex is NOT narrowable this way, because a page that fails the
+    /// literal test can still satisfy the branch.
+    ///
+    /// One accessor, used by both storage modes, so a future narrowable shape
+    /// cannot be taught to one evaluator and not the other.
+    pub(crate) fn fuzzy_visible_content_needle(&self) -> Option<&str> {
+        match &self.predicate {
+            QueryExpr::Text(TextPredicate {
+                field: TextField::VisibleContent,
+                mode: TextMatchMode::Fuzzy,
+                value,
+                ..
+            }) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl QueryPlan {
+    /// The narrowable fuzzy needle of this plan's block branch, if it has one.
+    pub(crate) fn fuzzy_block_needle(&self) -> Option<&str> {
+        self.branches
+            .iter()
+            .find(|branch| branch.target == QueryTarget::Blocks)
+            .and_then(QueryBranch::fuzzy_visible_content_needle)
+    }
+}
+
 /// One routed page used to scope a block-search plan. A supplied relative path
 /// is authoritative so duplicate display identities do not leak into results;
 /// otherwise kind plus Logseq's canonical page identity selects the document.
@@ -210,9 +263,15 @@ pub struct QueryExecution {
 
 /// One exact current managed page paired with the same inventory entry used by
 /// Direct Files for scope, path tie-breaking and page-hit projection.
+///
+/// `roots` is the page's already-converted block tree, supplied by the caller
+/// from its `ApplicationProjectionCache`. It is the managed analogue of the
+/// cached `Arc<Document>` Direct Files walks: retaining it here is what lets
+/// the shared evaluator hold `&DocBlock` winners and defer evidence/DTO
+/// construction until the heap is drained, exactly as the Direct path does.
 pub(crate) struct ApplicationQueryPlanPage {
     pub(crate) entry: PageEntry,
-    pub(crate) page: PageDto,
+    pub(crate) roots: std::sync::Arc<Vec<DocBlock>>,
 }
 
 /// Compiled friendly graph-search plan.  Regexes are compiled once and kept off
@@ -1507,21 +1566,6 @@ pub(crate) fn legacy_page_search_entries(
         .unwrap_or_default()
 }
 
-fn crumb_line(block: &DocBlock) -> String {
-    let line = block
-        .visible_text()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if line.chars().count() > 60 {
-        format!("{}…", line.chars().take(60).collect::<String>())
-    } else {
-        line
-    }
-}
-
 fn walk_blocks<'a>(
     blocks: &'a [DocBlock],
     ancestors: &mut Vec<&'a DocBlock>,
@@ -1541,257 +1585,83 @@ fn walk_blocks<'a>(
     true
 }
 
-fn execute_blocks(
+/// The one block-branch evaluator, shared by Direct Files and managed storage.
+///
+/// `pages` yields borrowed `(inventory entry, converted roots)` pairs, which is
+/// the only thing the two storage modes genuinely disagree about: Direct
+/// borrows from `Graph::with_pages`'s cached `Arc<Document>`, managed from the
+/// converted tree its projection cache retains. Everything the two paths used
+/// to disagree about by accident -- when evidence is evaluated, when the result
+/// DTO is built, what is cloned per candidate -- lives here now and therefore
+/// cannot drift again.
+///
+/// Evidence and the result DTO are produced once per WINNER, after the heap is
+/// drained. Doing it per retained candidate inside the walk (which the managed
+/// twin used to do) is O(retained) parses and DTOs where this is O(limit).
+///
+/// Generic, not `dyn`: monomorphization keeps each caller's walk exactly the
+/// code it would have written by hand -- no per-block allocation, no indirect
+/// call inside the block walk.
+fn execute_block_candidates<'a, I>(
     plan: &QueryPlan,
-    graph: &Graph,
+    pages: I,
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
-) -> Option<(Vec<QueryHit>, bool)> {
-    if branch.limit == 0 {
-        return Some((Vec::new(), false));
-    }
-    let candidate_pages = match &branch.predicate {
-        QueryExpr::Text(TextPredicate {
-            field: TextField::VisibleContent,
-            mode: TextMatchMode::Fuzzy,
-            value,
-            ..
-        }) => graph.direct_projection_fuzzy_candidate_pages(value),
-        _ => None,
-    };
-    let execute = |pages: &[(PageEntry, std::sync::Arc<crate::doc::Document>)]| {
-        let mut heap = BinaryHeap::new();
-        let mut has_more = false;
-        let mut index = 0usize;
-        for (entry, doc) in pages {
-            if cancelled() {
-                return None;
-            }
-            if let Some(scope) = &plan.page_scope {
-                let selected = match scope.path.as_deref() {
-                    Some(path) => entry.rel_path == path,
-                    None => {
-                        entry.kind == scope.page_kind && refs::same_page(&entry.name, &scope.name)
-                    }
-                };
-                if !selected {
-                    continue;
-                }
-            }
-            let mut ancestors = Vec::new();
-            walk_blocks(&doc.roots, &mut ancestors, &mut |block, path| {
-                if cancelled() {
-                    return false;
-                }
-                let candidate_index = index;
-                index = index.saturating_add(1);
-                let projection = block.projection();
-                let visible = &projection.visible;
-                if let Some(relevance) =
-                    block_relevance(plan, &branch.predicate, visible, &projection.visible_lower)
-                {
-                    has_more |= heap.len() >= branch.limit;
-                    let retain = heap.len() < branch.limit
-                        || heap.peek().is_some_and(|worst: &ScoredBlock<'_>| {
-                            relevance.cmp_quality(&worst.relevance) == Ordering::Greater
-                                || (relevance.cmp_quality(&worst.relevance) == Ordering::Equal
-                                    && (entry.rel_path.as_str(), candidate_index)
-                                        < (worst.page.rel_path.as_str(), worst.index))
-                        });
-                    if retain {
-                        push_block(
-                            &mut heap,
-                            branch.limit,
-                            ScoredBlock {
-                                relevance,
-                                index: candidate_index,
-                                page: entry,
-                                block,
-                                breadcrumb: path
-                                    .iter()
-                                    .map(|ancestor| crumb_line(ancestor))
-                                    .collect(),
-                            },
-                        );
-                    }
-                }
-                true
-            });
-            if cancelled() {
-                return None;
-            }
-        }
-        let mut winners = heap.into_vec();
-        winners.sort_by(|a, b| {
-            b.relevance.cmp_quality(&a.relevance).then_with(|| {
-                (a.page.rel_path.as_str(), a.index).cmp(&(b.page.rel_path.as_str(), b.index))
-            })
-        });
-        Some((
-            winners
-                .into_iter()
-                .map(|winner| {
-                    let projection = winner.block.projection();
-                    let matched = eval_ranked_block_expr(
-                        plan,
-                        &branch.predicate,
-                        &projection.visible,
-                        &projection.visible_lower,
-                    )
-                    .expect("rank and evidence evaluators must agree");
-                    // Search hits are result identities, not independent copies
-                    // of their entire descendant trees. The source page owns the
-                    // hierarchy and live consumers hydrate it once per page.
-                    let mut dto = crate::model::block_to_shallow_dto(winner.block);
-                    dto.breadcrumb = winner.breadcrumb;
-                    QueryHit::Block {
-                        page: winner.page.name.clone(),
-                        kind: winner.page.kind,
-                        path: winner.page.rel_path.clone(),
-                        block: dto,
-                        display_text: projection.visible.clone(),
-                        evidence: matched.evidence,
-                        score: winner.relevance.score(),
-                        match_class: winner.relevance.match_class,
-                    }
-                })
-                .collect(),
-            has_more,
-        ))
-    };
-    match candidate_pages.as_deref() {
-        Some(pages) => execute(pages),
-        None => graph.with_pages(execute),
-    }
-}
-
-#[derive(Debug)]
-struct ApplicationScoredBlock {
-    relevance: BlockRelevance,
-    index: usize,
-    page: PageEntry,
-    block: BlockDto,
-    display_text: String,
-    evidence: Vec<MatchEvidence>,
-}
-
-impl ApplicationScoredBlock {
-    fn is_better_than(&self, other: &Self) -> bool {
-        let quality = self.relevance.cmp_quality(&other.relevance);
-        quality == Ordering::Greater
-            || (quality == Ordering::Equal
-                && (self.page.rel_path.as_str(), self.index)
-                    < (other.page.rel_path.as_str(), other.index))
-    }
-}
-
-impl PartialEq for ApplicationScoredBlock {
-    fn eq(&self, other: &Self) -> bool {
-        self.relevance.cmp_quality(&other.relevance) == Ordering::Equal
-            && (self.page.rel_path.as_str(), self.index)
-                == (other.page.rel_path.as_str(), other.index)
-    }
-}
-impl Eq for ApplicationScoredBlock {}
-impl PartialOrd for ApplicationScoredBlock {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for ApplicationScoredBlock {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.relevance.cmp_quality(&self.relevance).then_with(|| {
-            (self.page.rel_path.as_str(), self.index)
-                .cmp(&(other.page.rel_path.as_str(), other.index))
-        })
-    }
-}
-
-fn execute_application_blocks(
-    plan: &QueryPlan,
-    pages: &[ApplicationQueryPlanPage],
-    branch: &QueryBranch,
-    cancelled: &impl Fn() -> bool,
-) -> Option<(Vec<QueryHit>, bool)> {
-    if branch.limit == 0 {
-        return Some((Vec::new(), false));
-    }
+) -> Option<(Vec<QueryHit>, bool)>
+where
+    I: IntoIterator<Item = (&'a PageEntry, &'a [DocBlock])>,
+{
     let mut heap = BinaryHeap::new();
     let mut has_more = false;
     let mut index = 0usize;
-    for source in pages {
+    for (entry, roots) in pages {
         if cancelled() {
             return None;
         }
         if let Some(scope) = &plan.page_scope {
             let selected = match scope.path.as_deref() {
-                Some(path) => source.entry.rel_path == path,
-                None => {
-                    source.entry.kind == scope.page_kind
-                        && refs::same_page(&source.entry.name, &scope.name)
-                }
+                Some(path) => entry.rel_path == path,
+                None => entry.kind == scope.page_kind && refs::same_page(&entry.name, &scope.name),
             };
             if !selected {
                 continue;
             }
         }
-        let roots = source
-            .page
-            .blocks
-            .iter()
-            .map(|block| {
-                crate::query::application_query_doc_block(block, source.page.format == Format::Org)
-            })
-            .collect::<Vec<_>>();
         let mut ancestors = Vec::new();
-        walk_blocks(&roots, &mut ancestors, &mut |block, path| {
+        walk_blocks(roots, &mut ancestors, &mut |block, path| {
             if cancelled() {
                 return false;
             }
             let candidate_index = index;
             index = index.saturating_add(1);
             let projection = block.projection();
-            let Some(relevance) = block_relevance(
-                plan,
-                &branch.predicate,
-                &projection.visible,
-                &projection.visible_lower,
-            ) else {
-                return true;
-            };
-            has_more |= heap.len() >= branch.limit;
-            let retain = heap.len() < branch.limit
-                || heap.peek().is_some_and(|worst: &ApplicationScoredBlock| {
-                    relevance.cmp_quality(&worst.relevance) == Ordering::Greater
-                        || (relevance.cmp_quality(&worst.relevance) == Ordering::Equal
-                            && (source.entry.rel_path.as_str(), candidate_index)
-                                < (worst.page.rel_path.as_str(), worst.index))
-                });
-            if retain {
-                let matched = eval_ranked_block_expr(
-                    plan,
-                    &branch.predicate,
-                    &projection.visible,
-                    &projection.visible_lower,
-                )
-                .expect("rank and evidence evaluators must agree");
-                let mut dto = crate::model::block_to_shallow_dto(block);
-                dto.breadcrumb = path.iter().map(|ancestor| crumb_line(ancestor)).collect();
-                let candidate = ApplicationScoredBlock {
-                    relevance,
-                    index: candidate_index,
-                    page: source.entry.clone(),
-                    block: dto,
-                    display_text: projection.visible.clone(),
-                    evidence: matched.evidence,
-                };
-                if heap.len() < branch.limit {
-                    heap.push(candidate);
-                } else if heap
-                    .peek()
-                    .is_some_and(|worst| candidate.is_better_than(worst))
-                {
-                    *heap.peek_mut().unwrap() = candidate;
+            let visible = &projection.visible;
+            if let Some(relevance) =
+                block_relevance(plan, &branch.predicate, visible, &projection.visible_lower)
+            {
+                has_more |= heap.len() >= branch.limit;
+                let retain = heap.len() < branch.limit
+                    || heap.peek().is_some_and(|worst: &ScoredBlock<'_>| {
+                        relevance.cmp_quality(&worst.relevance) == Ordering::Greater
+                            || (relevance.cmp_quality(&worst.relevance) == Ordering::Equal
+                                && (entry.rel_path.as_str(), candidate_index)
+                                    < (worst.page.rel_path.as_str(), worst.index))
+                    });
+                if retain {
+                    push_block(
+                        &mut heap,
+                        branch.limit,
+                        ScoredBlock {
+                            relevance,
+                            index: candidate_index,
+                            page: entry,
+                            block,
+                            breadcrumb: path
+                                .iter()
+                                .map(|ancestor| crate::doc::crumb_line(ancestor))
+                                .collect(),
+                        },
+                    );
                 }
             }
             true
@@ -1809,19 +1679,87 @@ fn execute_application_blocks(
     Some((
         winners
             .into_iter()
-            .map(|winner| QueryHit::Block {
-                page: winner.page.name,
-                kind: winner.page.kind,
-                path: winner.page.rel_path,
-                block: winner.block,
-                display_text: winner.display_text,
-                evidence: winner.evidence,
-                score: winner.relevance.score(),
-                match_class: winner.relevance.match_class,
+            .map(|winner| {
+                let projection = winner.block.projection();
+                #[cfg(test)]
+                BLOCK_EVIDENCE_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
+                let matched = eval_ranked_block_expr(
+                    plan,
+                    &branch.predicate,
+                    &projection.visible,
+                    &projection.visible_lower,
+                )
+                .expect("rank and evidence evaluators must agree");
+                // Search hits are result identities, not independent copies
+                // of their entire descendant trees. The source page owns the
+                // hierarchy and live consumers hydrate it once per page.
+                let mut dto = crate::model::block_to_shallow_dto(winner.block);
+                dto.breadcrumb = winner.breadcrumb;
+                QueryHit::Block {
+                    page: winner.page.name.clone(),
+                    kind: winner.page.kind,
+                    path: winner.page.rel_path.clone(),
+                    block: dto,
+                    display_text: projection.visible.clone(),
+                    evidence: matched.evidence,
+                    score: winner.relevance.score(),
+                    match_class: winner.relevance.match_class,
+                }
             })
             .collect(),
         has_more,
     ))
+}
+
+fn execute_blocks(
+    plan: &QueryPlan,
+    graph: &Graph,
+    branch: &QueryBranch,
+    cancelled: &impl Fn() -> bool,
+) -> Option<(Vec<QueryHit>, bool)> {
+    if branch.limit == 0 {
+        return Some((Vec::new(), false));
+    }
+    let candidate_pages = branch
+        .fuzzy_visible_content_needle()
+        .and_then(|needle| graph.direct_projection_fuzzy_candidate_pages(needle));
+    let execute = |pages: &[(PageEntry, std::sync::Arc<crate::doc::Document>)]| {
+        execute_block_candidates(
+            plan,
+            pages
+                .iter()
+                .map(|(entry, doc)| (entry, doc.roots.as_slice())),
+            branch,
+            cancelled,
+        )
+    };
+    match candidate_pages.as_deref() {
+        Some(pages) => execute(pages),
+        None => graph.with_pages(execute),
+    }
+}
+
+fn execute_application_blocks(
+    plan: &QueryPlan,
+    pages: &[ApplicationQueryPlanPage],
+    branch: &QueryBranch,
+    cancelled: &impl Fn() -> bool,
+) -> Option<(Vec<QueryHit>, bool)> {
+    if branch.limit == 0 {
+        return Some((Vec::new(), false));
+    }
+    // Managed candidate narrowing for a fuzzy predicate happens at the CALLER,
+    // which owns the materialized index and decides whether the accepted
+    // frontier is the whole story; by the time pages reach here they are
+    // already the narrowed set. See `SyncRuntimeActor::application_query_plan_ready`.
+    execute_block_candidates(
+        plan,
+        pages
+            .iter()
+            .map(|source| (&source.entry, source.roots.as_slice())),
+        branch,
+        cancelled,
+    )
 }
 
 /// Convert typed block hits back to the exact grouped shape used by existing
@@ -1908,6 +1846,93 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         (dir, graph)
+    }
+
+    /// The shared block evaluator, driven on both storage modes over literally
+    /// the same content: identical results, and evidence plus result DTOs
+    /// produced once per WINNER rather than once per retained candidate.
+    ///
+    /// The evaluation count is the point. The managed twin used to call
+    /// `eval_ranked_block_expr` and build a `BlockDto` inside the walk for
+    /// every candidate the heap retained, so a `limit`-bounded search over a
+    /// large page set did O(retained) work where Direct did O(limit). Asserting
+    /// the count is what turns "they share an evaluator now" from a comment
+    /// into a test.
+    #[test]
+    fn application_block_evaluator_matches_direct_and_evaluates_evidence_per_winner() {
+        const PAGES: usize = 5;
+        const BLOCKS: usize = 20;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tine-query-plan-modes-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        for page in 0..PAGES {
+            let mut content = String::new();
+            for block in 0..BLOCKS {
+                content.push_str(&format!(
+                    "- parent {page}-{block} needle here
+"
+                ));
+                content.push_str(&format!(
+                    "	- child {page}-{block} needle nested
+"
+                ));
+            }
+            fs::write(dir.join("pages").join(format!("Mode-{page}.md")), content).unwrap();
+        }
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let entries = graph.list_pages();
+        let pages = graph.with_pages(|pages| {
+            pages
+                .iter()
+                .map(|(entry, doc)| ApplicationQueryPlanPage {
+                    entry: entry.clone(),
+                    // Cloning a `DocBlock` resets its memoized projection, so
+                    // the managed side genuinely starts cold here rather than
+                    // borrowing Direct's warm cache.
+                    roots: std::sync::Arc::new(doc.roots.clone()),
+                })
+                .collect::<Vec<_>>()
+        });
+        let matching = PAGES * BLOCKS * 2;
+        for limit in [1_usize, 3, 7, 50, 1_000] {
+            let plan = QueryPlan::block_search("needle", limit);
+            let _ = take_block_evidence_evaluations();
+            let direct = plan.execute(&graph, || false);
+            let direct_evaluations = take_block_evidence_evaluations();
+            let managed = plan.execute_application_with_explain(
+                entries.clone(),
+                &pages,
+                Vec::new(),
+                Vec::new(),
+                || false,
+                true,
+            );
+            let managed_evaluations = take_block_evidence_evaluations();
+            assert_eq!(
+                serde_json::to_value(&managed).unwrap(),
+                serde_json::to_value(&direct).unwrap(),
+                "managed block evaluation diverged from Direct Files at limit={limit}"
+            );
+            assert_eq!(
+                direct_evaluations, managed_evaluations,
+                "the two modes must do the same amount of evidence work at limit={limit}"
+            );
+            assert_eq!(
+                managed_evaluations,
+                limit.min(matching),
+                "evidence and DTOs must be produced once per winner, not once per retained candidate, at limit={limit}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn block_fingerprint(groups: Vec<crate::model::RefGroup>) -> Vec<(String, String)> {

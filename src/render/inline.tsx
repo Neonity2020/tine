@@ -169,7 +169,7 @@ function renderInline(s: Inline, blockId?: string, spanMode = true, macroExpansi
       return renderEmail(s.text, spanMode ? coarseSpanAttrs(s.span) : undefined);
     case "entity":
       return spanMode && s.span ? <span {...(coarseSpanAttrs(s.span) ?? {})}>{s.unicode}</span> : <>{s.unicode}</>;
-    case "hiccup":
+    case "hiccup": {
       // OG 6e7afa8eb inserts direct inline Hiccup only after safe-read,
       // serialization, and sanitization
       // (src/main/frontend/components/block.cljs:1554-1562 and
@@ -178,6 +178,13 @@ function renderInline(s: Inline, blockId?: string, spanMode = true, macroExpansi
       const html = hiccupToHtml(s.v);
       if (html !== null) return renderSanitizedHtml(html, spanMode ? coarseSpanAttrs(s.span) : undefined);
       return spanMode && s.span ? <span {...(coarseSpanAttrs(s.span) ?? {})}>{s.v}</span> : <>{s.v}</>;
+    }
+    default: {
+      // DUP-8 exhaustiveness guard: a new `Inline` variant must fail `tsc` here
+      // rather than silently rendering as nothing. Unreachable at runtime.
+      const _exhaustive: never = s;
+      return _exhaustive;
+    }
   }
 }
 
@@ -196,6 +203,22 @@ export function astText(inlines: Inline[]): string {
       case "entity": out += s.unicode; break;
       case "latex": out += s.body; break;
       case "hiccup": out += s.v; break;
+      // The kinds below contribute NOTHING to astText. They were silently
+      // skipped before DUP-8; they are now explicit so that adding a new
+      // `Inline` variant fails `tsc` in the `default` arm instead of
+      // disappearing here unnoticed. Behavior is unchanged.
+      case "break": break; // astText intentionally excludes break (DUP-8: explicit, was silent)
+      case "hardbreak": break; // astText intentionally excludes hardbreak (DUP-8: explicit, was silent)
+      case "macro": break; // astText intentionally excludes macro (DUP-8: explicit, was silent)
+      case "timestamp": break; // astText intentionally excludes timestamp (DUP-8: explicit, was silent)
+      case "fnref": break; // astText intentionally excludes fnref (DUP-8: explicit, was silent)
+      case "inline_html": break; // astText intentionally excludes inline_html (DUP-8: explicit, was silent)
+      case "email": break; // astText intentionally excludes email (DUP-8: explicit, was silent)
+      default: {
+        const _exhaustive: never = s;
+        out += _exhaustive;
+        break;
+      }
     }
   }
   return out;
