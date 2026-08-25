@@ -5371,6 +5371,121 @@ mod tests {
         Pred::parse(src, TODAY).expect("parse")
     }
 
+    fn projection_cache_page(path: &str, format: Format, raws: &[&str]) -> PageDto {
+        PageDto {
+            name: path.into(),
+            kind: PageKind::Page,
+            title: path.into(),
+            pre_block: None,
+            blocks: raws
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| BlockDto {
+                    id: format!("block-{index}"),
+                    raw: (*raw).into(),
+                    ..BlockDto::default()
+                })
+                .collect(),
+            rev: None,
+            format,
+            read_only: false,
+            path: path.into(),
+            activation: None,
+            guide: false,
+        }
+    }
+
+    /// The managed projection cache reuses a retained tree only for content it
+    /// has PROVED identical, and it stays inside both of its bounds.
+    ///
+    /// The path is a lookup key, never a substitute for the comparison. A path
+    /// that comes back with different content -- an external edit, a rename
+    /// that reuses a filename, a replacement page -- must miss, because the
+    /// retained tree carries memoized lsdoc projections of the OLD raw text and
+    /// the OLD block identities.
+    #[test]
+    fn application_projection_cache_reuses_only_proven_identical_content() {
+        let mut cache = ApplicationProjectionCache::default();
+        let page = projection_cache_page("a.md", Format::Md, &["- one", "- two"]);
+
+        let first = cache.roots("a.md", &page);
+        let second = cache.roots("a.md", &page);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.counters(), (1, 1, 1));
+
+        // Same path, changed raw text.
+        let edited = projection_cache_page("a.md", Format::Md, &["- one", "- CHANGED"]);
+        let third = cache.roots("a.md", &edited);
+        assert!(!std::sync::Arc::ptr_eq(&second, &third));
+        assert_eq!(third[1].raw, "- CHANGED");
+        assert_eq!(cache.counters(), (1, 2, 1));
+
+        // Same path and text, changed block identity: the id becomes
+        // `DocBlock::uuid` and reaches the result DTO, so it cannot be reused.
+        let mut reidentified = edited.clone();
+        reidentified.blocks[0].id = "block-renamed".into();
+        let fourth = cache.roots("a.md", &reidentified);
+        assert_eq!(fourth[0].uuid, "block-renamed");
+        assert_eq!(cache.counters(), (1, 3, 1));
+
+        // Same path, same text, different parser mode.
+        let org = projection_cache_page("a.md", Format::Org, &["- one", "- CHANGED"]);
+        let mut org = org;
+        org.blocks[0].id = "block-renamed".into();
+        let _ = cache.roots("a.md", &org);
+        assert_eq!(cache.counters(), (1, 4, 1));
+
+        // Changed child shape at identical parent raw text.
+        let mut nested = projection_cache_page("b.md", Format::Md, &["- parent"]);
+        nested.blocks[0].children = vec![BlockDto {
+            id: "child".into(),
+            raw: "- child".into(),
+            ..BlockDto::default()
+        }];
+        let _ = cache.roots("b.md", &nested);
+        let flat = projection_cache_page("b.md", Format::Md, &["- parent"]);
+        let _ = cache.roots("b.md", &flat);
+        assert_eq!(cache.counters(), (1, 6, 2));
+    }
+
+    /// Both bounds hold, and a page bigger than the whole byte budget is served
+    /// without evicting the graph to store something the next insert would drop.
+    #[test]
+    fn application_projection_cache_stays_inside_both_bounds() {
+        let mut cache = ApplicationProjectionCache::new(2, 1024);
+        for page in 0..4 {
+            let path = format!("p{page}.md");
+            let dto = projection_cache_page(&path, Format::Md, &["- small"]);
+            let _ = cache.roots(&path, &dto);
+        }
+        let (_, _, retained) = cache.counters();
+        assert_eq!(retained, 2, "the page bound must evict least-recently-used");
+
+        // The most recent two survive; the oldest was evicted and misses.
+        let oldest = projection_cache_page("p0.md", Format::Md, &["- small"]);
+        cache.reset_counters();
+        let _ = cache.roots("p0.md", &oldest);
+        assert_eq!(cache.counters().0, 0, "an evicted page must miss");
+
+        let mut cache = ApplicationProjectionCache::new(64, 64);
+        let huge = "- ".to_string() + &"x".repeat(4096);
+        let big = projection_cache_page("big.md", Format::Md, &[huge.as_str()]);
+        let roots = cache.roots("big.md", &big);
+        assert_eq!(roots.len(), 1, "an over-budget page is still served");
+        assert_eq!(
+            cache.counters().2,
+            0,
+            "an over-budget page must not be retained"
+        );
+        let small = projection_cache_page("small.md", Format::Md, &["- s"]);
+        let _ = cache.roots("small.md", &small);
+        assert_eq!(
+            cache.counters().2,
+            1,
+            "storing the over-budget page must not have evicted the budget"
+        );
+    }
+
     fn nested_boolean(head: &str, depth: usize, leaf: &str) -> String {
         format!(
             "{}{}{}",
