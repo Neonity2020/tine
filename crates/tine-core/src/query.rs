@@ -3393,7 +3393,18 @@ pub(crate) fn application_page_templates(
                 .map(|child| template_dto_from_application(child, false))
                 .collect(),
             breadcrumb: Vec::new(),
-            ..BlockDto::default()
+            // DUP-8: every field spelled out, at its `Default` value, so a new
+            // `BlockDto` field has to be decided here instead of arriving
+            // silently defaulted. A template copy carries no facets: the raw
+            // text still holds them and the caller re-derives on insert.
+            page_property: false,
+            marker: None,
+            priority: None,
+            heading_level: None,
+            scheduled: None,
+            deadline: None,
+            tags: Vec::new(),
+            properties: Vec::new(),
         }
     }
 
@@ -3466,7 +3477,16 @@ fn template_dto(b: &DocBlock, strip_template: bool) -> BlockDto {
         collapsed: false,
         children: b.children.iter().map(|c| template_dto(c, false)).collect(),
         breadcrumb: Vec::new(),
-        ..Default::default()
+        // DUP-8: every field spelled out, at its `Default` value -- see
+        // `template_dto_from_application` above, whose behavior this mirrors.
+        page_property: false,
+        marker: None,
+        priority: None,
+        heading_level: None,
+        scheduled: None,
+        deadline: None,
+        tags: Vec::new(),
+        properties: Vec::new(),
     }
 }
 
