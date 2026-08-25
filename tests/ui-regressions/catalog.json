@@ -343,6 +343,31 @@
       }
     },
     {
+      "id": "UI-BLOCK-EXTERNAL-RUNTIME-IDENTITY-SEPARATION-373",
+      "title": "Block zoom and persistent block destinations never confuse an authored block ID with a structural runtime locator",
+      "family": "block-identity",
+      "sources": {
+        "issues": [
+          373
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/store.test.ts",
+          "src/components/Page.test.tsx"
+        ],
+        "scenario": "routing.block-external-runtime-identity-separation",
+        "failBefore": "proven"
+      },
+      "notes": "GH #373. A deterministic file-backed runtime locator is UUID-shaped but is not a durable block ID. Persisting that locator into a fresh block's id:: or Org :id: lets a later structural insertion assign the same runtime locator to another block; the old route then zooms to that wrong structural owner even though only the intended block has the authored ID. Authored-ID claimants must be resolved before runtime fallback, duplicate authored claimants must fail closed, and Tine must never rewrite the graph merely to repair ambiguity."
+    },
+    {
       "id": "UI-IME-COMPOSITION-237",
       "title": "IME composition keeps intermediate text transaction-local and commits the finalized editor value exactly once",
       "family": "edit-render-boundary",

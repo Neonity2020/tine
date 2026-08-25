@@ -34,6 +34,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Block zoom keeps pointing at the intended block after siblings are inserted
+  or reordered.** Tine now keeps its deterministic, UUID-shaped runtime
+  locators separate from authored `id::` / Org `:id:` identity, resolves the
+  unique authored claimant first, and refuses ambiguous duplicate authored IDs
+  instead of guessing. Existing graphs are not rewritten (GH #373).
+
 - **The full Rust core corpus now finishes and the release gate no longer hides
   passing tests.** Five obsolete shared-join test barriers now pause at current,
   finite clean-runtime concurrency cuts. An honest unfiltered run completed all
