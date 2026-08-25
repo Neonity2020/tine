@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **One spelling of a page is one favorite.** Starring a page under one
+  spelling (different case, an alias, NFC/NFD accents, boundary slashes) now
+  fills the star and toggles off under every other spelling instead of
+  appending a duplicate; the sidebar arrangement, membership, page delete, and
+  rename all use the same kind-scoped identity, so deleting a page no longer
+  silently drops a journal favorite that merely shares its name. Backlink
+  filter chips key by the same identity, so two spellings of one co-referenced
+  page no longer produce two chips that miss each other's filters.
+
 ### Added
 
 - **Favorites nest to any depth** (GH #102). A group can hold groups, and a

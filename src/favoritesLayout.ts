@@ -38,6 +38,7 @@
 // clicking it open the page or collapse the subtree?) for no benefit.
 import type { BlockDto, PageKind } from "./types";
 import { isJournalTitle } from "./journal";
+import { pageIdentityKey } from "./pageIdentity";
 
 export const FAVORITES_PAGE_PROPERTY = "tine/favorites";
 export const DEFAULT_FAVORITES_PAGE = "Favorites";
@@ -143,7 +144,10 @@ export function layoutMembers(layout: FavLayout): FavLayoutItem[] {
   return out;
 }
 
-const keyOf = (name: string) => name.trim().toLowerCase();
+// Same identity fold as membership (`favoriteKey` in ui.ts) — arrangement and
+// membership must never disagree on whether two spellings are one favorite
+// (DUP-2: this was a weaker trim+toLowerCase while membership was exact-match).
+const keyOf = (name: string) => pageIdentityKey(name);
 
 /** Fold an externally-observed membership list (config.edn, i.e. what Logseq
  *  may have changed) back into the arrangement:
