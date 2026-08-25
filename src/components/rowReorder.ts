@@ -12,6 +12,25 @@ const DRAG_THRESHOLD_PX = 4;
 
 let suppressClick = false;
 
+// Martin, 2026-08-25: dragging a favorite also started a text selection on the
+// row's title, so the label smeared blue under the cursor. A reorder is not a
+// text gesture. Rather than preventDefault() on pointerdown — which would also
+// swallow focus and the ordinary click this helper deliberately preserves — the
+// document is made unselectable only once the drag threshold is crossed, and
+// any selection the pointerdown already began is dropped. Released on drop and
+// on pointercancel.
+const DRAGGING_CLASS = "row-reorder-dragging";
+
+function setSelectionSuppressed(on: boolean): void {
+  document.documentElement.classList.toggle(DRAGGING_CLASS, on);
+  if (on) dropSelection();
+}
+
+function dropSelection(): void {
+  const selection = document.getSelection?.();
+  if (selection && selection.rangeCount > 0) selection.removeAllRanges();
+}
+
 /** True for the click that terminates a reorder drag — row click handlers
  *  must bail out when this returns true. */
 export function rowReorderClickSuppressed(): boolean {
@@ -44,7 +63,11 @@ export function beginRowReorderDrag(
     if (!dragging) {
       if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < DRAG_THRESHOLD_PX) return;
       dragging = true;
+      setSelectionSuppressed(true);
     }
+    // WebKit can re-establish the selection mid-drag; the class alone is not
+    // enough once a selection is already anchored.
+    dropSelection();
     const row = document
       .elementFromPoint(ev.clientX, ev.clientY)
       ?.closest<HTMLElement>(rowSelector);
@@ -62,6 +85,7 @@ export function beginRowReorderDrag(
     document.removeEventListener("pointermove", onMove);
     document.removeEventListener("pointerup", onUp);
     document.removeEventListener("pointercancel", cleanup);
+    setSelectionSuppressed(false);
     setIndicator(null);
   };
   const onUp = () => {
