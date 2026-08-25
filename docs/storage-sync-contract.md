@@ -118,6 +118,13 @@ manifest tail. The pre-0.7 share and join implementations compile only in
 tests. A production decoder may still recognize an old descriptor so it can
 give a bounded migration refusal, but it cannot use that descriptor to reopen
 the retired runtime; the user must Return to Direct Files and share again.
+The descriptor anchors the immutable enrollment baseline; it does not freeze
+the state a later device must already contain. Before comparing or installing,
+a clean join collects every valid descriptor-bound provider head and replays
+the union of their reachable manifest tails. The joining Markdown/Org graph is
+compared with that current reconstructed provider frontier, so an external edit
+published after share setup cannot make an already-synchronized device look
+divergent merely because it no longer matches the enrollment-time baseline.
 Both successful enrollment cuts intentionally retire the actor that entered
 them. Tauri must reopen the durable result, prove ordinary page inventory/load,
 and atomically replace the exact predecessor graph slot before reporting share

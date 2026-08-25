@@ -7707,17 +7707,18 @@ fn clean_join_user_semantics(
     Ok(pages)
 }
 
-fn matching_clean_join_head(
+fn matching_clean_join_heads(
     provider: &SharedProviderTransport,
     descriptor: &CleanSharedEnrollmentDescriptorV1,
-) -> Result<SharedProviderFrontierHeadV1, SyncRuntimeRequestError> {
+) -> Result<Vec<SharedProviderFrontierHeadV1>, SyncRuntimeRequestError> {
     let descriptor_digest = descriptor
         .digest()
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
     let mut cursor = provider
         .head_observation_cursor()
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-    let mut matching = None;
+    let mut enrollment_head = None;
+    let mut heads = BTreeMap::new();
     loop {
         match provider
             .next_observed_path(&mut cursor)
@@ -7739,22 +7740,24 @@ fn matching_clean_join_head(
                 if head.workspace_id() == descriptor.workspace_id()
                     && head.lineage_digest() == descriptor.lineage_digest()
                     && head.descriptor_digest() == descriptor_digest
-                    && head.author_device_id() == descriptor.initiator_device_id()
-                    && head.accepted_frontier_root() == descriptor.accepted_frontier_digest()
                 {
-                    if matching
-                        .as_ref()
-                        .is_some_and(|prior: &SharedProviderFrontierHeadV1| {
-                            prior.accepted_generation() != head.accepted_generation()
-                                || prior.frontier_tips() != head.frontier_tips()
-                        })
+                    if head.author_device_id() == descriptor.initiator_device_id()
+                        && head.accepted_frontier_root() == descriptor.accepted_frontier_digest()
                     {
-                        return Err(SyncRuntimeRequestError::ActorRefused(
-                            "clean join found conflicting initiator heads for the descriptor frontier"
-                                .into(),
-                        ));
+                        if enrollment_head.as_ref().is_some_and(
+                            |prior: &SharedProviderFrontierHeadV1| {
+                                prior.accepted_generation() != head.accepted_generation()
+                                    || prior.frontier_tips() != head.frontier_tips()
+                            },
+                        ) {
+                            return Err(SyncRuntimeRequestError::ActorRefused(
+                                "clean join found conflicting initiator heads for the descriptor frontier"
+                                    .into(),
+                            ));
+                        }
+                        enrollment_head = Some(head.clone());
                     }
-                    matching = Some(head);
+                    heads.insert(path, head);
                 }
             }
             SharedProviderObservation::Path(_) => {}
@@ -7762,21 +7765,25 @@ fn matching_clean_join_head(
             SharedProviderObservation::Complete => break,
         }
     }
-    matching.ok_or_else(|| {
+    enrollment_head.ok_or_else(|| {
         SyncRuntimeRequestError::ActorRefused(
             "clean shared baseline is present but its matching initiator frontier head has not arrived"
                 .into(),
         )
-    })
+    })?;
+    Ok(heads.into_values().collect())
 }
 
 fn download_clean_join_tail(
     provider: &SharedProviderTransport,
     descriptor: &CleanSharedEnrollmentDescriptorV1,
     store: &ObjectStore,
-    head: &SharedProviderFrontierHeadV1,
+    heads: &[SharedProviderFrontierHeadV1],
 ) -> Result<(), SyncRuntimeRequestError> {
-    let mut pending = head.frontier_tips().to_vec();
+    let mut pending = heads
+        .iter()
+        .flat_map(|head| head.frontier_tips().iter().copied())
+        .collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
     while let Some(batch_id) = pending.pop() {
         if !seen.insert(batch_id) {
@@ -7931,10 +7938,10 @@ fn prepare_clean_join_candidate(
                 "clean shared baseline identity differs from the descriptor".into(),
             ));
         }
-        let head = matching_clean_join_head(provider, descriptor)?;
+        let heads = matching_clean_join_heads(provider, descriptor)?;
         let store = ObjectStore::open(&operation_archive_directory, descriptor.workspace_id())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        download_clean_join_tail(provider, descriptor, &store, &head)?;
+        download_clean_join_tail(provider, descriptor, &store, &heads)?;
         let mut engine = ShardedHotEngine::new(
             descriptor.workspace_id(),
             descriptor.lineage_digest(),
@@ -7967,16 +7974,18 @@ fn prepare_clean_join_candidate(
             .replay_clean_committed_tail(baseline_claim_source.as_ref())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         drop(baseline_claim_source);
-        let root = engine
-            .accepted_frontier_root()
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        if root.acceptance_sequence() != head.accepted_generation()
-            || root.state_digest() != descriptor.accepted_frontier_digest()
+        for tip in heads
+            .iter()
+            .flat_map(|head| head.frontier_tips().iter().copied())
         {
-            return Err(SyncRuntimeRequestError::ActorRefused(
-                "clean shared baseline and provider tail do not reconstruct the descriptor frontier"
-                    .into(),
-            ));
+            if !engine
+                .accepted_frontier_contains_batch_effects(tip)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean shared baseline and provider tail did not reconstruct frontier tip {tip}"
+                )));
+            }
         }
         Ok(CleanJoinCandidate {
             staging_root: staging_root.clone(),
@@ -29651,6 +29660,72 @@ mod tests {
     }
 
     #[test]
+    fn shared_provider_clean_late_join_accepts_the_current_post_share_frontier() {
+        let initiator = ActivationFixture::nested_unicode("post-share-join-initiator", 0xa176_4000);
+        let mut joiner = ActivationFixture::nested_unicode("post-share-join-joiner", 0xa176_4000);
+        joiner.request.identities.endpoint_id =
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0xa176_5000));
+        joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(0xa176_5001));
+        joiner.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(0xa176_5002));
+
+        let initiator_handle =
+            SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone())
+                .handle
+                .expect("post-share initiator LocalActive");
+        drive_initial_feed(&initiator_handle);
+        let descriptor = initiator_handle
+            .prepare_shared()
+            .expect("post-share descriptor publication");
+        drop(initiator_handle);
+
+        let initiator_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&initiator.request)));
+        drive_initial_feed(&initiator_handle);
+        fs::write(
+            initiator.graph_root.join("Root.md"),
+            b"title:: Root logical\r\n\r\n- exact CRLF bytes after sharing\r\n",
+        )
+        .unwrap();
+        initiator_handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&initiator_handle);
+        assert!(
+            ticks
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::AdmittedComplete { .. })),
+            "the post-share external edit was not admitted: {ticks:?}"
+        );
+        settle_shared_provider(&initiator_handle);
+        let current_graph = user_graph_bytes(&initiator.graph_root);
+
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &joiner.request.provider_root,
+        );
+        for (relative, bytes) in &current_graph {
+            let destination = joiner.graph_root.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
+        }
+
+        let joiner_handle = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone())
+            .handle
+            .expect("post-share joiner LocalActive");
+        drive_initial_feed(&joiner_handle);
+        joiner_handle
+            .join_shared(descriptor)
+            .expect("a graph matching the current provider frontier must join");
+        assert_eq!(
+            user_graph_bytes(&joiner.graph_root),
+            current_graph,
+            "joining the current post-share frontier must not rewrite synchronized graph bytes"
+        );
+    }
+
+    #[test]
     fn shared_provider_clean_late_join_refuses_unmatched_local_graph_without_changing_authority() {
         let initiator = ActivationFixture::nested_unicode("late-refuse-initiator", 0xa177_0000);
         let mut joiner = ActivationFixture::nested_unicode("late-refuse-joiner", 0xa177_0000);
@@ -29698,7 +29773,7 @@ mod tests {
         let graph_before = user_graph_bytes(&joiner.graph_root);
         let refusal = joiner_handle.join_shared(descriptor).unwrap_err();
         assert!(
-            refusal.to_string().contains("semantic changes"),
+            refusal.to_string().contains("sync join refused"),
             "{refusal}"
         );
         assert_eq!(
