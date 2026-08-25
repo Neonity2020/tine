@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
@@ -236,4 +236,50 @@ export function windowsWebviewProfileSnapshot(root) {
     return { root, error: String(error), files };
   }
   return { root, files };
+}
+
+/**
+ * The one readiness wait for an E2E-launched HTTP server (vite preview today).
+ * Every suite used to carry its own copy with its own attempt budget (DUP-12);
+ * the attempt policy stays with the caller, the waiting shape lives here.
+ */
+export async function waitForHttpServer(url, tries = 40, intervalMs = 250, fetchImpl = fetch) {
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    try {
+      if ((await fetchImpl(url)).ok) return;
+    } catch {
+      // The server is still starting.
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`server did not start at ${url} after ${tries} attempts`);
+}
+
+/**
+ * The one parser for the `_NET_FRAME_EXTENTS` / `_GTK_FRAME_EXTENTS` xprop
+ * output. The two local copies had drifted (DUP-12): one treated
+ * "X property not found" as zero extents, the other as malformed. The missing
+ * property case is genuinely ambiguous — an undecorated window exposes no
+ * frame — so the policy is an explicit CALL-SITE choice (`strict`), with the
+ * parse core shared.
+ */
+export function parseFrameExtentsOutput(raw, { strict = false } = {}) {
+  const values = raw.match(/=\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)/)?.slice(1).map(Number);
+  if (values) {
+    const [left, right, top, bottom] = values;
+    return { left, right, top, bottom };
+  }
+  // Non-strict: an undecorated window has no frame, so a missing property is
+  // zero extents (e.g. the expected pre-toggle state in the titlebar suite).
+  if (/not found/i.test(raw) && !strict) return { left: 0, right: 0, top: 0, bottom: 0 };
+  throw new Error(`window manager exposed malformed frame extents: ${raw.trim()}`);
+}
+
+/** Read a window's frame extents via xprop (X11 Linux suites only). */
+export function frameExtents(id, env, { strict = false } = {}) {
+  const raw = execFileSync("xprop", ["-id", id, "_NET_FRAME_EXTENTS", "_GTK_FRAME_EXTENTS"], {
+    encoding: "utf8",
+    env,
+  });
+  return parseFrameExtentsOutput(raw, { strict });
 }

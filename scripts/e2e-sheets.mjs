@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -93,7 +94,7 @@ const env = {
 const tdLog = fs.openSync("/tmp/sheets-e2e-td.log", "w");
 const td = spawn(
   TD,
-  ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"],
+  webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"),
   { env, stdio: ["ignore", tdLog, tdLog], detached: true }
 );
 await sleep(3000);
@@ -112,11 +113,7 @@ try {
     hostname: "127.0.0.1",
     port: DRIVER_PORT,
     path: "/",
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "sheets"),
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60000,

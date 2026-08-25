@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -47,7 +48,7 @@ const env = {
   GDK_BACKEND: "x11",
 };
 
-const td = spawn(TD, ["--port", "4444", "--native-port", "4445", "--native-driver", WEBKIT_DRIVER], { env, stdio: "ignore", detached: true });
+const td = spawn(TD, webdriverServerArgs(4444, 4445, WEBKIT_DRIVER), { env, stdio: "ignore", detached: true });
 await sleep(3000);
 
 const browser = await remote({
@@ -55,7 +56,7 @@ const browser = await remote({
   port: 4444,
   path: "/",
   logLevel: "error",
-  capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
+  capabilities: tauriCapabilities(APP, "rendered-delete-verify"),
   connectionRetryCount: 1,
   connectionRetryTimeout: 60000,
 });

@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -368,7 +369,7 @@ async function assertDirectFilesActive() {
 
 async function connect(label, timeoutMs = 300_000, lease = true) {
   driverLog = fs.openSync(path.join(ARTIFACTS, `${label}-tauri-driver.log`), "w");
-  driver = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD], {
+  driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
     env,
     stdio: ["ignore", driverLog, driverLog],
     detached: true,
@@ -381,7 +382,7 @@ async function connect(label, timeoutMs = 300_000, lease = true) {
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
-    capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
+    capabilities: tauriCapabilities(APP, "managed-force-close-recovery"),
   });
   await browser.waitUntil(async () => {
     const text = await bodyText();

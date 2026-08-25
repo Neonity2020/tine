@@ -12,6 +12,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { remote } from "webdriverio";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -46,11 +47,7 @@ const env = {
 };
 
 const log = fs.openSync("/tmp/td-concord-focus.log", "w");
-const driver = spawn(TD, [
-  "--port", String(DRIVER_PORT),
-  "--native-port", String(NATIVE_PORT),
-  "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
-], { env, stdio: ["ignore", log, log], detached: true });
+const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), { env, stdio: ["ignore", log, log], detached: true });
 await sleep(3000);
 
 let browser;
@@ -60,11 +57,7 @@ try {
     hostname: "127.0.0.1",
     port: DRIVER_PORT,
     path: "/",
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "concord-focus-freshness"),
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,

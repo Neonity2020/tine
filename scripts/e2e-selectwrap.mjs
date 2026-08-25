@@ -7,16 +7,11 @@
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 
 const PORT = Number(process.env.E2E_PREVIEW_PORT || 5197);
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try { if ((await fetch(url)).ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
+const waitForServer = (url, tries = 60) => waitForHttpServer(url, tries, 250);
 
 let failures = 0;
 const check = (name, got, want) => {

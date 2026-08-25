@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -81,11 +82,7 @@ async function withApp(index, forced, fn) {
   const logPath = path.join(ARTIFACT, `driver-${index}-${forced ? "forced" : "regular"}.log`);
   const log = fs.openSync(logPath, "w");
   proof.artifacts[`driver${index}`] = logPath;
-  const driver = spawn(DRIVER, [
-    "--port", String(driverPort),
-    "--native-port", String(nativePort),
-    "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
-  ], { env: baseEnv(forced), detached: true, stdio: ["ignore", log, log] });
+  const driver = spawn(DRIVER, webdriverServerArgs(driverPort, nativePort, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), { env: baseEnv(forced), detached: true, stdio: ["ignore", log, log] });
   let browser;
   try {
     await sleep(2500);
@@ -96,11 +93,7 @@ async function withApp(index, forced, fn) {
       logLevel: "error",
       connectionRetryCount: 1,
       connectionRetryTimeout: 60_000,
-      capabilities: {
-        browserName: "wry",
-        "wdio:enforceWebDriverClassic": true,
-        "tauri:options": { application: APP },
-      },
+      capabilities: tauriCapabilities(APP, "mobile-drawers"),
     });
     await browser.$(".app-container").waitForExist({ timeout: 20_000 });
     await browser.$(".main-content").waitForExist({ timeout: 20_000 });

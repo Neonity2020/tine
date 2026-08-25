@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -86,7 +87,7 @@ const env = {
 console.log("DISPLAY=", process.env.DISPLAY, "APP=", APP);
 
 const tdLog = fs.openSync("/tmp/td-bsel.log", "w");
-const td = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"], {
+const td = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), {
   env, stdio: ["ignore", tdLog, tdLog], detached: true,
 });
 await sleep(3000);
@@ -149,11 +150,7 @@ let browser;
 try {
   browser = await remote({
     hostname: "127.0.0.1", port: DRIVER_PORT, path: "/",
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "blockselect"),
     logLevel: "error", connectionRetryCount: 1, connectionRetryTimeout: 60000,
   });
 

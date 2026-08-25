@@ -8,6 +8,7 @@ import fs from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { remote } from "webdriverio";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -56,11 +57,7 @@ const env = {
   GDK_BACKEND: "x11",
 };
 const log = fs.openSync("/tmp/td-compat-home-current-page.log", "w");
-const driver = spawn(tauriDriver, [
-  "--port", String(driverPort),
-  "--native-port", String(nativePort),
-  "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
-], { env, stdio: ["ignore", log, log], detached: true });
+const driver = spawn(tauriDriver, webdriverServerArgs(driverPort, nativePort, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), { env, stdio: ["ignore", log, log], detached: true });
 await sleep(3000);
 
 async function waitForConfig(predicate, message) {
@@ -80,11 +77,7 @@ try {
     hostname: "127.0.0.1",
     port: driverPort,
     path: "/",
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: app },
-    },
+    capabilities: tauriCapabilities(app, "compat-home-current-page"),
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,

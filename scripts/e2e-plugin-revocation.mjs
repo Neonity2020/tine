@@ -10,6 +10,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -194,11 +195,7 @@ const env = {
 };
 async function withAppSession(label, check) {
   const sessionLog = fs.openSync(path.join(TMP, `${label}-tauri-driver.log`), "w");
-  const td = spawn(TD, [
-    "--port", String(DRIVER_PORT),
-    "--native-port", String(NATIVE_PORT),
-    "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
-  ], { env, stdio: ["ignore", sessionLog, sessionLog], detached: true });
+  const td = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), { env, stdio: ["ignore", sessionLog, sessionLog], detached: true });
   await sleep(2500);
   let browser;
   try {
@@ -209,11 +206,7 @@ async function withAppSession(label, check) {
       logLevel: "error",
       connectionRetryCount: 1,
       connectionRetryTimeout: 60_000,
-      capabilities: {
-        browserName: "wry",
-        "wdio:enforceWebDriverClassic": true,
-        "tauri:options": { application: APP },
-      },
+      capabilities: tauriCapabilities(APP, "plugin-revocation"),
     });
     await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
     await check(browser);

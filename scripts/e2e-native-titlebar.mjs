@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { frameExtents as sharedFrameExtents, tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -104,16 +105,10 @@ const geometry = (id) => {
     HEIGHT: read("Height"),
   };
 };
-const frameExtents = (id) => {
-  const raw = execFileSync("xprop", ["-id", id, "_NET_FRAME_EXTENTS", "_GTK_FRAME_EXTENTS"], { encoding: "utf8", env });
-  const values = raw.match(/=\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)/)?.slice(1).map(Number);
-  // An undecorated window commonly has no property at all; that is equivalent
-  // to zero extents and is the expected pre-toggle state.
-  if (!values && /not found/i.test(raw)) return { left: 0, right: 0, top: 0, bottom: 0 };
-  if (!values) throw new Error(`window manager exposed malformed frame extents: ${raw.trim()}`);
-  const [left, right, top, bottom] = values;
-  return { left, right, top, bottom };
-};
+// An undecorated window commonly has no frame-extents property at all; the
+// shared parser (e2e-capabilities.mjs) treats that as zero extents unless the
+// caller asks for strictness — exactly this suite's old behavior.
+const frameExtents = (id) => sharedFrameExtents(id, env);
 
 const wmLog = fs.openSync(path.join(ARTIFACTS, "window-manager.log"), "w");
 const wm = spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
@@ -123,7 +118,7 @@ await sleep(600);
 if (wm.exitCode != null) throw new Error(`window manager exited early: ${fs.readFileSync(path.join(ARTIFACTS, "window-manager.log"), "utf8")}`);
 
 const driverLog = fs.openSync(path.join(ARTIFACTS, "tauri-driver.log"), "w");
-const td = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD], {
+const td = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
   env, stdio: ["ignore", driverLog, driverLog], detached: true,
 });
 await sleep(2500);
@@ -133,11 +128,7 @@ try {
   browser = await remote({
     hostname: "127.0.0.1", port: DRIVER_PORT, path: "/", logLevel: "error",
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "native-titlebar"),
   });
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   const desktopEntry = `${TMP}/xdg/data/applications/page.tine.Tine.desktop`;

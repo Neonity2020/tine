@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -42,11 +43,7 @@ const env = {
   GDK_BACKEND: "x11",
 };
 const log = fs.openSync(`${TMP}/tauri-driver.log`, "w");
-const td = spawn(TD, [
-  "--port", String(DRIVER_PORT),
-  "--native-port", String(NATIVE_PORT),
-  "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
-], { env, stdio: ["ignore", log, log], detached: true });
+const td = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), { env, stdio: ["ignore", log, log], detached: true });
 await sleep(2500);
 
 let browser;
@@ -83,11 +80,7 @@ try {
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "tag-autocomplete"),
   });
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   await browser.$(".ls-block .block-content-wrapper").click();

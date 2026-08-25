@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -140,7 +141,7 @@ const waitForForwarderExit = (child, timeoutMs) => new Promise((resolve, reject)
 const driverLog = fs.openSync(`${ARTIFACT_DIR}/tauri-driver.log`, "w");
 let td = spawn(
   TD,
-  ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD],
+  webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD),
   { env, stdio: ["ignore", driverLog, driverLog], detached: true },
 );
 await sleep(2500);
@@ -151,11 +152,7 @@ try {
     hostname: "127.0.0.1",
     port: DRIVER_PORT,
     path: "/",
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "capture"),
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
@@ -400,13 +397,13 @@ try {
   await sleep(700);
   td = spawn(
     TD,
-    ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD],
+    webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD),
     { env, stdio: ["ignore", driverLog, driverLog], detached: true },
   );
   await sleep(2_500);
   browser = await remote({
     hostname: "127.0.0.1", port: DRIVER_PORT, path: "/",
-    capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
+    capabilities: tauriCapabilities(APP, "capture"),
     logLevel: "error", connectionRetryCount: 1, connectionRetryTimeout: 60_000,
   });
   const restartedHandles = await browser.getWindowHandles();

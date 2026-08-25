@@ -115,6 +115,22 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-capabilities.test.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Shared E2E harness helpers keep one exact capability spelling, one launch-arg shape, one preview-server readiness wait, and one frame-extents parse core across every suite.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Helper signatures and per-suite session names may evolve while the shared spellings stay byte-identical to the platform contracts and the strict/lax frame-extents policy stays an explicit call-site choice."
+   ],
+   "nonRequirements": [
+    "Any product UI journey, a live WebDriver session, or a live window manager by itself."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-capture.mjs": {
    "contracts": [
     {

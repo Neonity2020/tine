@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -79,7 +80,7 @@ const env = {
 
 console.log("spawning tauri-driver:", TD);
 const tdLog = fs.openSync("/tmp/td-del.log", "w");
-const td = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WEBKIT_DRIVER], { env, stdio: ["ignore", tdLog, tdLog], detached: true });
+const td = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WEBKIT_DRIVER), { env, stdio: ["ignore", tdLog, tdLog], detached: true });
 await sleep(3000);
 console.log("driver up, DISPLAY=", process.env.DISPLAY, "APP=", APP);
 
@@ -88,11 +89,7 @@ const browser = await remote({
   port: DRIVER_PORT,
   path: "/",
   logLevel: "error",
-  capabilities: {
-    browserName: "wry",
-    "wdio:enforceWebDriverClassic": true,
-    "tauri:options": { application: APP },
-  },
+  capabilities: tauriCapabilities(APP, "delete-selection-timing"),
   connectionRetryCount: 1,
   connectionRetryTimeout: 60000,
 });

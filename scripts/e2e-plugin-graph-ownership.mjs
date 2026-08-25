@@ -6,6 +6,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -61,7 +62,7 @@ const env = {
 };
 const logPath = path.join(TMP, "tauri-driver.log");
 const log = fs.openSync(logPath, "w");
-const driver = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD], {
+const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
   env, stdio: ["ignore", log, log], detached: true,
 });
 await sleep(2500);
@@ -71,7 +72,7 @@ try {
   browser = await remote({
     hostname: "127.0.0.1", port: DRIVER_PORT, path: "/", logLevel: "error",
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
-    capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
+    capabilities: tauriCapabilities(APP, "plugin-graph-ownership"),
   });
   await browser.$('[data-block-ref="shared-id"] .block-content').waitForExist({ timeout: 20_000 });
   await browser.$('[data-block-ref="shared-id"] .block-content').click();

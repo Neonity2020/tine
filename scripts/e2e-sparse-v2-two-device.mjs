@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 if (process.platform !== "linux") throw new Error("sparse-v2 two-device proof is Linux-only");
@@ -610,7 +611,7 @@ async function clickButtonAndConfirm(text, label) {
 async function connect(label, graph, xdg, recovery = false) {
   env = deviceEnv(graph, xdg);
   driverLog = fs.openSync(path.join(ARTIFACTS, `${label}-tauri-driver.log`), "w");
-  driver = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD], {
+  driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
     env,
     stdio: ["ignore", driverLog, driverLog],
     detached: true,
@@ -623,11 +624,7 @@ async function connect(label, graph, xdg, recovery = false) {
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "sparse-v2-two-device"),
   });
   await browser.$(recovery ? ".startup-recovery-overlay" : ".ls-block, .page-title, .journal-day")
     .waitForExist({ timeout: 90_000 });

@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { frameExtents as sharedFrameExtents, tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -119,12 +120,11 @@ function windowIds() {
   }
 }
 
+// This suite's window sorting treats a missing frame-extents property as
+// malformed; the shared parser (e2e-capabilities.mjs) exposes that policy as
+// `strict: true` — the suite's old behavior, now with one parse core.
 function frameExtents(id) {
-  const raw = execFileSync("xprop", ["-id", id, "_NET_FRAME_EXTENTS", "_GTK_FRAME_EXTENTS"], { encoding: "utf8", env });
-  const values = raw.match(/=\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)/)?.slice(1).map(Number);
-  if (!values) throw new Error(`window manager exposed malformed frame extents: ${raw.trim()}`);
-  const [left, right, top, bottom] = values;
-  return { left, right, top, bottom };
+  return sharedFrameExtents(id, env, { strict: true });
 }
 
 function processAlive(pid) {
@@ -137,11 +137,7 @@ function processAlive(pid) {
 }
 
 function startDriver() {
-  driver = spawn(TD, [
-    "--port", String(DRIVER_PORT),
-    "--native-port", String(NATIVE_PORT),
-    "--native-driver", WD,
-  ], { env, stdio: ["ignore", driverLog, driverLog], detached: true });
+  driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), { env, stdio: ["ignore", driverLog, driverLog], detached: true });
 }
 
 async function stopDriver() {
@@ -166,11 +162,7 @@ async function connect() {
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "pdf-ownership"),
   });
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 30_000 });
   const windowId = await waitForNode(() => windowIds()[0], "Tine native window did not appear");

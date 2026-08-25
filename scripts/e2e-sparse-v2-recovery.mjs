@@ -12,6 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { waitForFileText as waitForPersistedFileText } from "./e2e-file-poll.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { frameExtents as sharedFrameExtents, tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -143,12 +144,10 @@ function windowIds(pattern = "^Tine( — .*)?$") {
   }
 }
 
+// Window sorting treats a missing frame-extents property as malformed; the
+// shared parser (e2e-capabilities.mjs) exposes that policy as `strict: true`.
 function frameExtents(id) {
-  const raw = execFileSync("xprop", ["-id", id, "_NET_FRAME_EXTENTS", "_GTK_FRAME_EXTENTS"], { encoding: "utf8", env });
-  const values = raw.match(/=\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)/)?.slice(1).map(Number);
-  if (!values) throw new Error(`window manager exposed malformed frame extents: ${raw.trim()}`);
-  const [left, right, top, bottom] = values;
-  return { left, right, top, bottom };
+  return sharedFrameExtents(id, env, { strict: true });
 }
 
 function windowManagerReady() {
@@ -535,7 +534,7 @@ async function stopWindowManager() {
 
 async function connect(label) {
   driverLog = fs.openSync(path.join(ARTIFACTS, `${label}-tauri-driver.log`), "w");
-  driver = spawn(TD, ["--port", String(DRIVER_PORT), "--native-port", String(NATIVE_PORT), "--native-driver", WD], {
+  driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
     env,
     stdio: ["ignore", driverLog, driverLog],
     detached: true,
@@ -548,11 +547,7 @@ async function connect(label) {
     logLevel: "error",
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
-    capabilities: {
-      browserName: "wry",
-      "wdio:enforceWebDriverClassic": true,
-      "tauri:options": { application: APP },
-    },
+    capabilities: tauriCapabilities(APP, "sparse-v2-recovery"),
   });
   await browser.$(".ls-block, .page-title, .journal-day").waitForExist({ timeout: 30_000 });
   const id = await waitFor(() => windowIds()[0], 12_000, `${label}: Tine native window did not appear`);

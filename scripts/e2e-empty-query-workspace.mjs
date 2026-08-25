@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -63,7 +64,7 @@ async function withApp(index, fn) {
   const driverPort = DRIVER_BASE + index * 2;
   const nativePort = NATIVE_BASE + index * 2;
   const log = fs.openSync(path.join(TMP, `tauri-driver-${index}.log`), "w");
-  const driver = spawn(TD, ["--port", String(driverPort), "--native-port", String(nativePort), "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"], {
+  const driver = spawn(TD, webdriverServerArgs(driverPort, nativePort, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), {
     env, stdio: ["ignore", log, log], detached: true,
   });
   let browser;
@@ -72,7 +73,7 @@ async function withApp(index, fn) {
     browser = await remote({
       hostname: "127.0.0.1", port: driverPort, path: "/", logLevel: "error",
       connectionRetryCount: 1, connectionRetryTimeout: 60_000,
-      capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
+      capabilities: tauriCapabilities(APP, "empty-query-workspace"),
     });
     // A restored session may deliberately resume directly in a virtual query
     // workspace. The first-launch scenario below separately waits for .ls-block
