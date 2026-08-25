@@ -96,6 +96,8 @@ export const WINDOWS_CORE_EXACT_TEST_NAMES = Object.freeze([
   "model::tests::windows_handle_relative_noreplace_preserves_occupied_destination",
   "model::tests::windows_first_save_and_ordinary_rename_preserve_exact_projection",
   "model::tests::windows_directory_durability_limit_does_not_block_save_or_rename",
+  "model::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt",
+  "model::tests::windows_direct_publication_receipt_requires_revision_and_file_identity",
   "model::tests::checked_open_accepts_an_approved_windows_assets_junction",
   "model::tests::projection_windows_held_handle_link_count_tracks_one_and_two_links",
   "model::tests::windows_live_graph_root_move_is_denied_without_rebinding",

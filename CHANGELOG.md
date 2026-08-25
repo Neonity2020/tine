@@ -43,6 +43,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   device/storage latency can be diagnosed without logging note names or paths
   (GH #376).
 
+- **Creating a journal no longer makes the next Direct Files page fail to save
+  on Windows.** Windows may report several `Create`, `Modify`, and rename events
+  for Tine's own atomic page publication. Those exact self echoes now validate
+  the published path, bytes, and physical file identity under the same write
+  lock instead of raising the external-change frontier while the watcher waits
+  to reconcile them. A changed external file, an identical-byte replacement
+  inode from a sync service or second Tine, ambiguous events, and portable
+  case/NFC collisions remain fail-closed (GH #374, follow-up to GH #366).
+
 - **Block zoom keeps pointing at the intended block after siblings are inserted
   or reordered.** Tine now keeps its deterministic, UUID-shaped runtime
   locators separate from authored `id::` / Org `:id:` identity, resolves the

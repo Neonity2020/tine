@@ -2651,6 +2651,17 @@ pub struct Graph {
     /// bytes we wrote and suppress that false positive (the parse-cache comparison
     /// alone races that window). See `write_page` / `sync_file_content`.
     recent_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
+    /// Recent exact Direct Files states which the native watcher may still echo.
+    /// Unlike `recent_writes`, the first receipt is minted only after Tine's
+    /// final no-follow reread proved both the published bytes and physical file
+    /// identity. Successful debounced reconciliation replaces it with the exact
+    /// accepted final state, so delayed duplicate callbacks remain no-ops while
+    /// an old state can never regain authority after a newer state was admitted.
+    /// The raw callback reopens only candidate paths under the same page lock and
+    /// may omit the external-change frontier only when both identity and revision
+    /// still match.
+    recent_graph_text_states:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, ExactGraphTextStateReceipt>>,
     /// Concord base ledger (ADR 0056): the per-page last text Tine agreed on
     /// with the disk, updated best-effort after successful saves and external-
     /// change admissions. A disposable cache stored OUTSIDE the sync tree;
@@ -2724,6 +2735,12 @@ static NEXT_EXTERNAL_OBSERVATION_INSTANCE: std::sync::atomic::AtomicU64 =
 pub struct GraphTextExternalObservationTicket {
     instance: u64,
     epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExactGraphTextStateReceipt {
+    revision: String,
+    resource_identity: ContentDigest,
 }
 
 impl GraphTextExternalObservationTicket {
@@ -4059,6 +4076,7 @@ thread_local! {
     static MANAGED_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static EXACT_GRAPH_TEXT_EVENT_AFTER_CANDIDATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static CONFLICT_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_REPLACEMENT_HANDOFF: std::cell::RefCell<Option<HandoffSafe>> = const { std::cell::RefCell::new(None) };
     static GRAPH_TEXT_ADMISSION_TEST_COUNTERS: std::cell::Cell<GraphTextAdmissionTestCounters> = const { std::cell::Cell::new(GraphTextAdmissionTestCounters { builder_enumerations: 0, direct_creation_censuses: 0, direct_creation_files_hashed: 0, point_query_attempts: 0, parser_invocations: 0, index_map_insertions: 0, event_map_key_reads: 0, event_map_key_writes: 0, event_reverse_members: 0, persistent_node_allocations: 0, persistent_rotations: 0, persistent_payload_members: 0 }) };
@@ -5052,6 +5070,18 @@ fn editor_commit_before_final_reread_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
+fn exact_graph_text_event_after_candidate_hook() {
+    EXACT_GRAPH_TEXT_EVENT_AFTER_CANDIDATE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn exact_graph_text_event_after_candidate_hook() {}
+
+#[cfg(test)]
 fn conflict_observation_hook() -> io::Result<()> {
     CONFLICT_OBSERVATION.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
@@ -5604,6 +5634,7 @@ impl Graph {
             page_list_cache: RwLock::new(None),
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            recent_graph_text_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             concord_ledger: std::sync::OnceLock::new(),
             marker_resolutions: std::sync::Mutex::new(std::collections::HashSet::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
@@ -17287,6 +17318,102 @@ impl Graph {
         }
     }
 
+    fn remember_exact_graph_text_state(
+        &self,
+        path: &Path,
+        revision: String,
+        resource_identity: ContentDigest,
+    ) {
+        let mut recent = self.recent_graph_text_states.lock().unwrap();
+        if recent.len() >= 1024 && !recent.contains_key(path) {
+            // This is only an optimization receipt. Losing it makes the next
+            // callback take the ordinary fail-closed external frontier; it can
+            // never authorize a write or weaken a collision check.
+            recent.clear();
+        }
+        recent.insert(
+            path.to_path_buf(),
+            ExactGraphTextStateReceipt {
+                revision,
+                resource_identity,
+            },
+        );
+    }
+
+    fn retire_exact_graph_text_state(&self, path: &Path) {
+        self.recent_graph_text_states.lock().unwrap().remove(path);
+    }
+
+    /// Return true only when an exact native-watcher path is still the physical
+    /// file and byte state Tine just published, or the identical state already
+    /// admitted into the cache. The callback calls this before raising the
+    /// graph-wide external-observation frontier.
+    ///
+    /// The writer permit, graph-text identity authority and per-path lock use
+    /// the same order as `save_page`. A callback delivered during atomic
+    /// publication therefore waits until the writer has completed its final
+    /// no-follow reread and cache publication. Two coherent snapshots then bind
+    /// the proof to the exact path, content revision and file identity. A sync
+    /// service or second Tine which replaced the path, even with identical
+    /// bytes, has a different identity and takes the ordinary external lane.
+    pub fn exact_graph_text_event_matches_tine_state(&self, path: &Path) -> bool {
+        if !self.recent_writes.lock().unwrap().contains_key(path)
+            && !self
+                .recent_graph_text_states
+                .lock()
+                .unwrap()
+                .contains_key(path)
+        {
+            return false;
+        }
+        exact_graph_text_event_after_candidate_hook();
+        let Ok(write) = self.admit_managed_text_writer() else {
+            return false;
+        };
+        let Ok(_identity) = self.lock_graph_text_identity_mutation() else {
+            return false;
+        };
+        let lock = self.page_lock(path);
+        let Ok(_guard) = lock.lock() else {
+            return false;
+        };
+        let first = match self.managed_read_optional_text_with_identity(&write, path) {
+            Ok(Some(snapshot)) => snapshot,
+            _ => return false,
+        };
+        let second = match self.managed_read_optional_text_with_identity(&write, path) {
+            Ok(Some(snapshot)) => snapshot,
+            _ => return false,
+        };
+        if first != second {
+            return false;
+        }
+        let revision = content_rev(&second.0);
+        let publication_matches = self
+            .recent_graph_text_states
+            .lock()
+            .unwrap()
+            .get(path)
+            .is_some_and(|receipt| {
+                receipt.revision == revision && receipt.resource_identity == second.1
+            });
+        let accepted_matches = self
+            .disk_revs
+            .read()
+            .unwrap()
+            .get(path)
+            .is_some_and(|accepted| accepted == &revision)
+            && self
+                .loaded_file_identities
+                .read()
+                .unwrap()
+                .get(path)
+                .is_some_and(|(accepted_revision, accepted_identity)| {
+                    accepted_revision == &revision && *accepted_identity == second.1
+                });
+        publication_matches || accepted_matches
+    }
+
     /// Oplog entry into the singular page serializer and commit boundary.
     /// The exact recovery reservation is durable before this can mutate a name.
     #[cfg(test)]
@@ -19414,6 +19541,9 @@ impl Graph {
             .write()
             .unwrap()
             .insert(path.to_path_buf(), (rev.clone(), identity));
+        if publication_authority == EditorPublicationAuthority::DirectFile {
+            self.remember_exact_graph_text_state(path, rev.clone(), identity);
+        }
         Ok(rev)
     }
 
@@ -19497,6 +19627,7 @@ impl Graph {
                 "managed text watcher snapshot changed before reconciliation",
             ));
         }
+        self.remember_exact_graph_text_state(path, content_rev(&content), identity);
         self.repin_retained_identity_at_equal_bytes(path, &content, identity);
         // The watcher consumes the self-write marker (one-shot) so the map stays
         // bounded to in-flight writes.
@@ -19661,6 +19792,7 @@ impl Graph {
     /// Drop a file deleted on disk from the cache; returns the entry if it was
     /// cached (so the UI can react).
     pub fn forget_file(&self, path: &Path) -> Option<PageEntry> {
+        self.retire_exact_graph_text_state(path);
         self.loaded_file_identities.write().unwrap().remove(path);
         self.revoke_conflict_authority(path);
         let entry = self.entry_for_path(path)?;
@@ -38774,6 +38906,105 @@ mod tests {
         assert_eq!(after.complete_builds, before.complete_builds);
         assert_eq!(after.exact_updates, before.exact_updates + 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GH #374 native-platform witness. ReadDirectoryChangesW may echo Tine's
+    /// atomic create several times; the exact completed publication and its
+    /// atomic create during its publication-to-final-reread window. The callback
+    /// must wait for the same-path writer rather than treating the not-yet-minted
+    /// completed receipt as an external change.
+    /// Exact completed and reconciled states are safe no-ops, but neither
+    /// matching bytes on a replacement inode nor changed bytes on the original
+    /// inode are ownership proof.
+    #[test]
+    fn windows_direct_publication_event_waits_for_inflight_writer_receipt() {
+        let dir = scratch("windows-direct-publication-inflight-event");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Arc::new(Graph::open(&dir));
+        graph.warm_cache();
+        let path = dir.join("pages/Inflight Publication.md");
+        let page = direct_save_bench_new_page("Inflight Publication");
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_graph = Arc::clone(&graph);
+        let writer = std::thread::spawn(move || {
+            EDITOR_COMMIT_BEFORE_FINAL_REREAD.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    published_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                }));
+            });
+            writer_graph.save_page(&page, None)
+        });
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer reached the publication-to-final-reread window");
+
+        let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
+        let observer_graph = Arc::clone(&graph);
+        let observer_path = path.clone();
+        let observer = std::thread::spawn(move || {
+            EXACT_GRAPH_TEXT_EVENT_AFTER_CANDIDATE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || candidate_tx.send(()).unwrap()));
+            });
+            observer_graph.exact_graph_text_event_matches_tine_state(&observer_path)
+        });
+        let reached_candidate = candidate_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        release_tx.send(()).unwrap();
+
+        writer.join().unwrap().unwrap();
+        assert!(
+            reached_candidate,
+            "the in-flight self-write marker must make the callback wait for the completed receipt"
+        );
+        assert!(
+            observer.join().unwrap(),
+            "after the writer releases its lock, exact bytes and identity must prove the self echo"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_direct_publication_receipt_requires_revision_and_file_identity() {
+        for same_bytes_new_identity in [false, true] {
+            let dir = scratch(if same_bytes_new_identity {
+                "windows-direct-publication-replaced-identity"
+            } else {
+                "windows-direct-publication-changed-bytes"
+            });
+            fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let page = direct_save_bench_new_page("Owned Publication");
+            graph.save_page(&page, None).unwrap();
+            let path = dir.join("pages/Owned Publication.md");
+            assert!(
+                graph.exact_graph_text_event_matches_tine_state(&path),
+                "the completed exact publication receipt must match"
+            );
+            graph.sync_file_checked(&path).unwrap();
+            assert!(
+                graph.exact_graph_text_event_matches_tine_state(&path),
+                "after reconciliation, exact admitted bytes and identity must match"
+            );
+
+            if same_bytes_new_identity {
+                let replacement = dir.join("external-winner.tmp");
+                fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+                fs::remove_file(&path).unwrap();
+                fs::rename(replacement, &path).unwrap();
+            } else {
+                fs::write(&path, b"- external winner\n").unwrap();
+            }
+            assert!(
+                !graph.exact_graph_text_event_matches_tine_state(&path),
+                "an external byte or physical-identity winner must take the guarded external lane"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// A debounced batch may finish after a newer raw callback has arrived. Its

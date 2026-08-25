@@ -4528,11 +4528,12 @@
     },
     {
       "id": "REG-DIRECT-WINDOWS-EXACT-WATCHER-CREATION-366",
-      "title": "One exact Windows page event triggered a full-graph scan and exhausted every new-page save retry",
+      "title": "Windows watcher handling stranded new-page saves after external events and Tine's own publication echoes",
       "family": "direct-files-data-safety-performance",
       "sources": {
         "issues": [
-          366
+          366,
+          374
         ],
         "commits": []
       },
@@ -4545,15 +4546,19 @@
         "tests": [
           "src-tauri/src/watcher.rs::tests::windows_exact_page_events_stay_incremental_through_the_pending_queue",
           "src-tauri/src/watcher.rs::tests::windows_unicode_event_reconciles_and_releases_new_page_creation",
+          "src-tauri/src/watcher.rs::tests::windows_tine_owned_create_echoes_do_not_block_following_pages_or_journals",
+          "src-tauri/src/watcher.rs::tests::windows_external_replacement_of_tine_publication_keeps_creation_blocked",
+          "crates/tine-core/src/model.rs::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt",
+          "crates/tine-core/src/model.rs::tests::windows_direct_publication_receipt_requires_revision_and_file_identity",
           "src-tauri/src/watcher.rs::tests::atomic_page_save_temp_events_stay_incremental",
           "crates/tine-core/src/model.rs::tests::direct_creation_round_trips_a_chinese_page_name",
           "crates/tine-core/src/model.rs::tests::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
           "crates/tine-core/src/model.rs::tests::external_semantic_owner_creator_wins_before_creation_publication"
         ],
-        "scenario": "direct.windows-exact-event-unicode-create-reconcile-create",
+        "scenario": "direct.windows-exact-event-and-self-publication-create-reconcile-create",
         "failBefore": "proven"
       },
-      "notes": "GH #366 on v0.6.94 / Windows 11 / Direct Files: creating TINE版本更新提示词 failed three times with `external graph-text changes arrived before creation publication`, then the editor became stuck dirty. Commit 416be3cb correctly made the raw Windows watcher treat ReadDirectoryChangesW `Create(Any)` and `Modify(Any)` as exact file events, but Pending::add_event independently classified the same event as unknown and scheduled a whole-graph diff. On the reporter's 13k-page graph that kept the safe external-change admission frontier raised beyond the frontend's complete 100 ms + 300 ms retry window. The current projection temp producer also writes `.projection.tmp`, while its regression used a retired `.tmp` spelling, so real atomic renames could take the same full-scan path. The fix makes both Windows exact event shapes and the current staging rename incremental. Fail-before is the cross-layer pending-queue test; pass-after proves one Chinese-named exact event reconciles without the full branch, lowers the admission frontier, and permits a subsequent creation. Unicode itself is covered as an accepted page name while the existing case/NFC alias, external semantic-owner and exact-target race refusals remain intact."
+      "notes": "GH #366 on v0.6.94 / Windows 11 / Direct Files: creating TINE版本更新提示词 failed three times with `external graph-text changes arrived before creation publication`, then the editor became stuck dirty. Commit 416be3cb correctly made the raw Windows watcher treat ReadDirectoryChangesW `Create(Any)` and `Modify(Any)` as exact file events, but Pending::add_event independently classified the same event as unknown and scheduled a whole-graph diff. On the reporter's 13k-page graph that kept the safe external-change admission frontier raised beyond the frontend's complete 100 ms + 300 ms retry window. GH #374 on v0.6.96 was a literal negative follow-up and revoked that coverage: Tine's own newly-published journal raised the raw external-observation frontier before debounced reconciliation could recognize the self write, so an immediate second page failed with both `awaiting watcher reconciliation` and `arrived before creation publication`. Deterministic fail-before saves journal then injects its Windows `Create(Any)` echo before the second page and observes epoch 1 instead of 0. The repaired raw boundary waits on the publication's page lock and omits the frontier only after two coherent no-follow reads match Tine's exact completed revision and physical file identity, or the identical already-admitted cache state. It covers journal-to-page, page-to-page, page-to-journal, Unicode, repeated Create/Modify/rename shapes, and a delayed duplicate after reconciliation. Different external bytes and an identical-byte replacement inode both retain the barrier. Ambiguous events, external semantic owners, exact-target races, and case/NFC aliases remain fail-closed."
     },
     {
       "id": "REG-MANAGED-FOREGROUND-SETTLES-FINITE-PRIOR-WORK-292",
