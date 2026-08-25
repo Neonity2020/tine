@@ -10,6 +10,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed rename works for every page name.** The managed rename planner
+  keyed its index lookups with a different Unicode fold than the index itself
+  (the two disagree on Greek final sigma), so renaming such a page reported
+  success while doing nothing. Rename lookups now use the index's own fold.
+- **config.edn settings can no longer clobber a nested map.** Every setting
+  writer now edits only the root map's direct entries; a same-named keyword
+  nested inside another map (e.g. under `:default-templates`) survives
+  byte-for-byte instead of being spliced over.
+- **Write-durability errors are reported, not swallowed.** The workspaces
+  registry, backup restore, and Linux window-identity writers follow the save
+  path's directory-fsync policy (tolerate "unsupported here", report real
+  errors), the window-identity writer uses unique create-only temp files, and
+  the file watcher recognizes backup-restore temp files directly.
+
 - **One spelling of a page is one favorite.** Starring a page under one
   spelling (different case, an alias, NFC/NFD accents, boundary slashes) now
   fills the star and toggles off under every other spelling instead of
