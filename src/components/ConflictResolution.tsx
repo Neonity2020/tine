@@ -24,12 +24,16 @@ import {
   type JSX,
 } from "solid-js";
 import { backend } from "../backend";
+import { openFile } from "../router";
+import { ConflictFileRow } from "./Settings";
 import {
   clearConflict,
   conflictQueue,
   pushToast,
   refreshLiveSaveConflictDraft,
   refreshSyncConflicts,
+  refreshJournalConflicts,
+  journalConflicts,
   settleArtifactConflict,
   updateLiveSaveConflictDiskRev,
 } from "../ui";
@@ -195,7 +199,33 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       ? "Unresolved merge from your version-control tool"
       : conflict().source === "live-save"
         ? "Your draft and the current file both changed"
-        : "Two versions of this page arrived";
+        : conflict().source === "duplicate-journal"
+          ? "This day has more than one file"
+          : "Two versions of this page arrived";
+
+  // The day's files, for the direct per-file actions. Read from the inventory
+  // the graph already refreshes rather than re-scanning here.
+  const duplicateDayFiles = () =>
+    conflict().source === "duplicate-journal"
+      ? journalConflicts().find((day) => day.title === conflict().page_name)?.files ?? []
+      : [];
+  const reconcileFile = async (op: () => Promise<unknown>, ok: string) => {
+    try {
+      await op();
+      pushToast(ok, "success");
+      await refreshJournalConflicts();
+    } catch (e) {
+      pushToast(`Couldn’t do that: ${String(e)}`, "error");
+    }
+  };
+  const trashDayFile = async (name: string) => {
+    const confirmed = await backend().confirm(
+      `Move the journal file “${name}” to the trash?\n\n` +
+        `It's a duplicate of another file for the same day. It moves to logseq/.tine-trash (recoverable).`
+    );
+    if (!confirmed) return;
+    await reconcileFile(() => backend().trashJournalFile(name), `Moved ${name} to trash`);
+  };
 
   // Load the diff from whichever source this object came from. Both return the
   // same `SyncConflictDiff`, so everything downstream is source-agnostic.
@@ -222,6 +252,12 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       }
       const copy = c.sides.find((s) => s.role === "theirs")?.path;
       if (!copy) return null;
+      // A duplicate day resolves pairwise: the canonical file against the FIRST
+      // stray. `null` here means the pair cannot be merged (a cross-format
+      // twin), and the file list below is the whole affordance.
+      if (c.source === "duplicate-journal") {
+        return await backend().duplicateJournalDiff(c.page_path, copy);
+      }
       return await backend().syncConflictDiff(c.page_path, copy);
     }
   );
@@ -441,15 +477,29 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           return;
         }
         releasePageSaves = holdManagedMovePages([pageName]);
-        const resolved = await backend().resolveSyncConflict(
-          pagePath,
-          copy,
-          decisions(),
-          current.base_rev,
-          current.conflict_rev,
-          current.merge_base_rev ?? null,
-          preChoice()
-        );
+        // A duplicate journal day reaches the same two-file reconciliation
+        // through its own guarded command: the guard is what keeps it from
+        // being a merge-any-two-pages surface. Everything around it — the
+        // editor lease, the quiescence flush, the generation checks — applies
+        // identically, because the canonical file is an ordinary open page.
+        const resolved = source === "duplicate-journal"
+          ? await backend().resolveDuplicateJournalDay(
+              pagePath,
+              copy,
+              decisions(),
+              current.base_rev,
+              current.conflict_rev,
+              preChoice()
+            )
+          : await backend().resolveSyncConflict(
+              pagePath,
+              copy,
+              decisions(),
+              current.base_rev,
+              current.conflict_rev,
+              current.merge_base_rev ?? null,
+              preChoice()
+            );
         if (
           pageInstanceGeneration(pageName) !== instance
           || editGeneration(pageName) !== edit
@@ -464,13 +514,21 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           throw new Error("the resolved file was committed, but its exact page could not replace the old editor; reopen the page");
         }
         settleArtifactConflict(conflictId);
-        pushToast(`Merged into “${pageName}”`, "success");
+        pushToast(
+          source === "duplicate-journal"
+            ? `Folded into “${pageName}”`
+            : `Merged into “${pageName}”`,
+          "success"
+        );
       }
       // A successful sync-copy commit has already retired its exact object
       // locally. Reconcile unrelated artifacts without keeping Apply blocked on
       // graph-wide directory walks (noticeable on Android document trees).
       if (source === "sync-copy") void refreshSyncConflicts();
       else await refreshSyncConflicts();
+      // The duplicate-day inventory is a separate scan; a day with three files
+      // still has one left to reconcile after this fold.
+      if (source === "duplicate-journal") void refreshJournalConflicts();
     } catch (e) {
       if (String(e).includes("conflict")) {
         pushToast("The file changed on disk — re-reading it, please redo your choices.", "error");
@@ -529,11 +587,35 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           {(base) => <span class="page-conflict-side base">{base()} (used for the suggestions)</span>}
         </Show>
       </div>
+      <Show when={conflict().source === "duplicate-journal"}>
+        <div class="settings-hint page-conflict-files">
+          This day has more than one file. Choosing below folds the other file in
+          and moves it to the trash (recoverable). Or act on a file directly:
+        </div>
+        <For each={duplicateDayFiles()}>
+          {(file) => (
+            <ConflictFileRow
+              file={file}
+              parentLayerId="page-conflict"
+              onOpen={() => openFile(file.path, conflict().page_name, "journal")}
+              onRename={(name) => void reconcileFile(
+                () => backend().renameFileToPage(file.path, name),
+                `Renamed ${file.name} → ${name}`
+              )}
+              onTrash={() => void trashDayFile(file.name)}
+            />
+          )}
+        </For>
+      </Show>
       <Show
         when={diff()}
         fallback={
           <div class="page-conflict-empty">
-            {diff.loading ? "Reading both versions…" : "Couldn’t read this conflict."}
+            {diff.loading
+              ? "Reading both versions…"
+              : conflict().source === "duplicate-journal"
+                ? "These two files can’t be folded together — they’re in different formats. Use the actions above."
+                : "Couldn’t read this conflict."}
           </div>
         }
       >
@@ -653,7 +735,9 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
                   fallback={
                     conflict().source === "live-save"
                       ? <>The resolved page is saved through the same guarded Direct Files path.</>
-                      : <>The copy moves to the recoverable trash once this is applied.</>
+                      : conflict().source === "duplicate-journal"
+                        ? <>The other file moves to the recoverable trash once this is applied, leaving the day one file.</>
+                        : <>The copy moves to the recoverable trash once this is applied.</>
                   }
                 >
                   Applying writes the merged page without any markers — the file becomes ordinary

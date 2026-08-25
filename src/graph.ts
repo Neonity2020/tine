@@ -207,9 +207,10 @@ export async function loadGraphPath(
   setWorkflow(meta?.preferred_workflow === "todo" ? "todo" : "now");
   setJournalTitleFormat(meta?.journal_page_title_format); // match this graph's journal titles
   seedFavorites(meta?.favorites ?? []);
-  void refreshJournalConflicts(true); // tell the user if any day has duplicate journal files
-  // Standing conflicts surface through the calm badge + in-page resolver, not
-  // a startup toast (removed 2026-08-24); this just derives the inventory.
+  // Standing conflicts — duplicate journal days included, as of the day they
+  // became queue objects — surface through the calm badge + in-page resolver,
+  // not a startup toast; these just derive the inventories.
+  void refreshJournalConflicts();
   void refreshSyncConflicts();
   if (path) {
     try {

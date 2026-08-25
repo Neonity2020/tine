@@ -763,7 +763,7 @@ export interface SyncConflictDiff {
 export type MergeDecision = "mine" | "theirs" | "both" | "merged";
 
 /** Where a conflict object came from (Concord L3). */
-export type ConflictSource = "sync-copy" | "vcs-markers" | "live-save";
+export type ConflictSource = "sync-copy" | "vcs-markers" | "live-save" | "duplicate-journal";
 
 export interface LiveSaveConflictSnapshot {
   page: PageDto;
@@ -801,7 +801,7 @@ export interface ConflictSide {
  *  judgement. Entirely DERIVED from what is on disk (no metadata is stored in
  *  the graph), so the queue survives restarts by being recomputed. */
 export interface ConflictObject {
-  /** Stable derived id — `copy:<path>` / `markers:<path>`. */
+  /** Stable derived id — `copy:<path>` / `markers:<path>` / `journal:<path>`. */
   id: string;
   source: ConflictSource;
   page_name: string;

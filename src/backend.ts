@@ -422,6 +422,15 @@ export interface Backend {
   /** Journal days that resolve to >1 file (date-stem + title-named, or md/org
    *  twin) — for the user to reconcile. */
   listJournalConflicts(): Promise<JournalConflict[]>;
+  duplicateJournalDiff(canonical: string, stray: string): Promise<SyncConflictDiff | null>;
+  resolveDuplicateJournalDay(
+    canonical: string,
+    stray: string,
+    decisions: Record<string, string>,
+    baseRev: string,
+    strayRev: string,
+    preChoice?: string,
+  ): Promise<PageDto>;
   /** Request one watcher full pass. The returned sequence is completed by a
    *  later `graph-rescan-complete` event, after ordinary change events emit. */
   rescanGraphNow(): Promise<number>;
@@ -1243,6 +1252,21 @@ class TauriBackend implements Backend {
   }
   listJournalConflicts() {
     return this.call<JournalConflict[]>("list_journal_conflicts");
+  }
+  duplicateJournalDiff(canonical: string, stray: string) {
+    return this.call<SyncConflictDiff | null>("duplicate_journal_diff", { canonical, stray });
+  }
+  resolveDuplicateJournalDay(
+    canonical: string,
+    stray: string,
+    decisions: Record<string, string>,
+    baseRev: string,
+    strayRev: string,
+    preChoice?: string,
+  ) {
+    return this.call<PageDto>("resolve_duplicate_journal_day", {
+      canonical, stray, decisions, baseRev, strayRev, preChoice,
+    });
   }
   rescanGraphNow() {
     return this.call<number>("rescan_graph_now");

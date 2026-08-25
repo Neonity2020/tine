@@ -3958,6 +3958,62 @@ pub(crate) async fn sync_conflict_diff(
     .map_err(|error| error.to_string())?
 }
 
+/// Two-way diff of a duplicate journal day's canonical file against one of its
+/// strays — the data behind the same two-column merge UI the sync-copy path
+/// uses. `Ok(None)` when the pair cannot be merged at all (a cross-format
+/// `.md`/`.org` twin), which the UI renders as file rows without row choices.
+/// Read-only.
+#[tauri::command]
+pub(crate) async fn duplicate_journal_diff(
+    canonical: String,
+    stray: String,
+    state: GraphContext<'_>,
+) -> Result<Option<tine_core::sync_diff::SyncConflictDiff>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.with_filesystem_graph(|g| {
+            g.duplicate_journal_diff(&canonical, &stray)
+                .map_err(|e| e.to_string())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Fold one stray of a duplicate journal day into that day's canonical file with
+/// the user's per-row decisions, moving the stray to recoverable trash. Guarded
+/// so it can only ever touch two files of the SAME duplicate day.
+#[tauri::command]
+pub(crate) async fn resolve_duplicate_journal_day(
+    canonical: String,
+    stray: String,
+    decisions: std::collections::HashMap<String, String>,
+    base_rev: String,
+    stray_rev: String,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<PageDto, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.legacy_graph()?
+            .resolve_duplicate_journal_day(
+                &canonical,
+                &stray,
+                &decisions,
+                &base_rev,
+                &stray_rev,
+                pre_choice.as_deref().unwrap_or("union"),
+            )
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Block-level diff of two raw page texts — a pure function of its inputs,
 /// needing no graph, path, or slot (Concord P3's path-free seam; future in-page
 /// conflict UI builds on it). `format`: `"org"` selects the org parser,

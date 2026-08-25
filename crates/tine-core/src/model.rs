@@ -12124,6 +12124,47 @@ impl Graph {
                 markers: marked.markers.clone(),
             });
         }
+        for day in self.journal_conflicts() {
+            // `journal_conflicts` sorts canonical-first, so files[0] is the
+            // keeper whether or not any file carries the canonical date stem.
+            let mut files = day.files.iter();
+            let Some(keeper) = files.next() else { continue };
+            let strays: Vec<_> = files.collect();
+            if strays.is_empty() {
+                continue;
+            }
+            let mut sides = vec![ConflictSide {
+                role: SideRole::Mine,
+                label: keeper.name.clone(),
+                path: Some(keeper.path.clone()),
+            }];
+            for stray in &strays {
+                sides.push(ConflictSide {
+                    role: SideRole::Theirs,
+                    label: stray.name.clone(),
+                    path: Some(stray.path.clone()),
+                });
+            }
+            // A day with three or more files is resolved pairwise: the row
+            // decisions belong to the keeper against the FIRST stray, and once
+            // that stray is folded in the queue re-derives with one file fewer.
+            let diff = self
+                .duplicate_journal_diff(&keeper.path, &strays[0].path)
+                .ok()
+                .flatten();
+            out.push(ConflictObject {
+                id: format!("journal:{}", keeper.path),
+                source: ConflictSource::DuplicateJournal,
+                page_name: day.title.clone(),
+                page_path: keeper.path.clone(),
+                kind: PageKind::Journal,
+                sides,
+                // `None` where the pair cannot be merged at all (cross-format):
+                // the file rows still work, but no row-by-row choice is offered.
+                block_conflicts: diff.as_ref().map(|d| decidable_row_count(&d.rows)),
+                markers: Vec::new(),
+            });
+        }
         out.sort_by(|a, b| a.page_name.cmp(&b.page_name).then_with(|| a.id.cmp(&b.id)));
         out
     }
@@ -12581,6 +12622,119 @@ impl Graph {
         // a silent substitution of the third input to a `"merged"` body.
         diff.merge_base_rev = base_c.as_deref().map(content_rev);
         Ok(Some(diff))
+    }
+
+    /// Two-way diff of a duplicate journal day's canonical file against one of
+    /// its strays.
+    ///
+    /// Unlike a sync-conflict copy, the two files here have **no common
+    /// ancestor**: they were never one document that diverged, they are two
+    /// files that ended up claiming the same day (usually a journal date-format
+    /// change, which never clobbers). So there is no ledger pin to look up and
+    /// the diff is always 2-way — which the queue already handles, since it
+    /// only offers a Base side when the diff reports `three_way`.
+    ///
+    /// Where the two files hold disjoint content every row is one-sided and
+    /// "keep both" reproduces what Settings' Merge does by concatenation; where
+    /// they overlap, the row-by-row choice can drop the duplication instead of
+    /// doubling it.
+    pub fn duplicate_journal_diff(
+        &self,
+        canonical_rel: &str,
+        stray_rel: &str,
+    ) -> io::Result<Option<crate::sync_diff::SyncConflictDiff>> {
+        let canonical = ManagedPath::parse(canonical_rel.to_owned()).map_err(|_| bad_path())?;
+        let stray = ManagedPath::parse(stray_rel.to_owned()).map_err(|_| bad_path())?;
+        let Some(canonical_bytes) = self.read_projection_input(&canonical)? else {
+            return Ok(None);
+        };
+        let Some(stray_bytes) = self.read_projection_input(&stray)? else {
+            return Ok(None);
+        };
+        let canonical_path = self.root.join(canonical_rel);
+        let stray_path = self.root.join(stray_rel);
+        // A cross-format pair (.md against .org) cannot be merged: `merge_pages`
+        // and `resolve_sync_conflict` both refuse it, and offering a row-by-row
+        // choice we cannot apply would be a dead end. Surfaced as a
+        // no-decidable-rows object instead, so the file rows still work.
+        if Format::from_path(&canonical_path) != Format::from_path(&stray_path) {
+            return Ok(None);
+        }
+        let canonical_content = String::from_utf8(canonical_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal file is not UTF-8"))?;
+        let stray_content = String::from_utf8(stray_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal file is not UTF-8"))?;
+        let mine = parse_doc(&canonical_path, &canonical_content);
+        let theirs = parse_doc(&stray_path, &stray_content);
+        let mut diff = crate::sync_diff::diff_docs(&mine, &theirs);
+        diff.base_rev = content_rev(&canonical_content);
+        diff.conflict_rev = content_rev(&stray_content);
+        diff.merge_base_rev = None;
+        Ok(Some(diff))
+    }
+
+    /// Fold one stray of a duplicate journal day into that day's canonical file,
+    /// applying the user's per-row decisions, and move the stray to recoverable
+    /// trash.
+    ///
+    /// Guarded so this can never be pointed at two unrelated pages: both paths
+    /// must belong to the SAME duplicate day as `journal_conflicts` reports it,
+    /// and the stray must not be the canonical file. Beyond those guards the
+    /// merge is exactly the two-file reconciliation the sync-copy path already
+    /// performs (same row decisions, same org round-trip firewall, same
+    /// stage-before-commit ordering, same recoverable trash), so it shares that
+    /// implementation rather than growing a second one that could drift.
+    pub fn resolve_duplicate_journal_day(
+        &self,
+        canonical_rel: &str,
+        stray_rel: &str,
+        decisions: &std::collections::HashMap<String, String>,
+        base_rev: &str,
+        stray_rev: &str,
+        pre_choice: &str,
+    ) -> io::Result<PageDto> {
+        if canonical_rel == stray_rel {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "canonical and stray are the same file",
+            ));
+        }
+        let day = self
+            .journal_conflicts()
+            .into_iter()
+            .find(|day| day.files.iter().any(|file| file.path == canonical_rel))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "not a file of a duplicate journal day",
+                )
+            })?;
+        if !day.files.iter().any(|file| file.path == stray_rel) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the two files are not the same journal day",
+            ));
+        }
+        // `journal_conflicts` sorts canonical-first, so the keeper is files[0]
+        // whether or not any file carries the canonical date stem.
+        let keeper = day.files.first().ok_or_else(bad_path)?;
+        if keeper.path != canonical_rel {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "that file is not the day's canonical file",
+            ));
+        }
+        // No ledger pin exists for a duplicate day, so the base token is None
+        // and the shared path resolves 2-way.
+        self.resolve_sync_conflict(
+            canonical_rel,
+            stray_rel,
+            decisions,
+            base_rev,
+            stray_rev,
+            None,
+            pre_choice,
+        )
     }
 
     /// Read one explicitly recognized provider conflict copy through the same
@@ -35533,6 +35687,198 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "Thursday, 25-06-2026"),
             "listed: {names:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn duplicate_day_graph(name: &str) -> PathBuf {
+        let dir = scratch(name);
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("journals").join("2026_06_26.md"),
+            "- shared line\n- only in canonical\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("journals").join("Friday, 26-06-2026.md"),
+            "- shared line\n- only in stray\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn conflict_queue_offers_duplicate_journal_days_as_resolvable_objects() {
+        // The whole point of item 5: a duplicate day used to reach the user only
+        // through a startup toast, because it was not a queue object at all. As
+        // an object it inherits the badge, the count, the dock and the walk.
+        let dir = duplicate_day_graph("queue-duplicate-journal");
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let queue = graph.conflict_queue();
+        let day = queue
+            .iter()
+            .find(|object| object.source == crate::concord_queue::ConflictSource::DuplicateJournal)
+            .expect("the duplicate day is a queue object");
+
+        assert_eq!(day.page_name, "Friday, 26-06-2026");
+        assert_eq!(day.page_path, "journals/2026_06_26.md");
+        assert_eq!(day.kind, PageKind::Journal);
+        assert_eq!(day.sides.len(), 2, "canonical + one stray");
+        assert_eq!(day.sides[0].label, "2026_06_26.md");
+        assert_eq!(day.sides[1].label, "Friday, 26-06-2026.md");
+        assert!(day.markers.is_empty());
+        // Merge is implicit: real rows, so the panel can offer keep-mine /
+        // keep-theirs / keep-both rather than a bare file list.
+        assert!(
+            day.block_conflicts.is_some_and(|rows| rows > 0),
+            "expected decidable rows, got {:?}",
+            day.block_conflicts
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_journal_ids_are_stable_across_a_restart() {
+        let dir = duplicate_day_graph("queue-duplicate-journal-stable");
+        let first = Graph::open(&dir).conflict_queue();
+        let second = Graph::open(&dir).conflict_queue();
+        let ids = |queue: &[crate::concord_queue::ConflictObject]| {
+            queue.iter().map(|o| o.id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), ids(&second));
+        assert!(first
+            .iter()
+            .any(|o| o.id == "journal:journals/2026_06_26.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_a_duplicate_day_folds_the_stray_in_and_leaves_the_queue() {
+        let dir = duplicate_day_graph("queue-duplicate-journal-resolve");
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let diff = graph
+            .duplicate_journal_diff("journals/2026_06_26.md", "journals/Friday, 26-06-2026.md")
+            .unwrap()
+            .expect("a same-format pair diffs");
+        // Keep both sides of every decidable row - the case that must reproduce
+        // what Settings' Merge does by concatenation.
+        fn keep_both(
+            rows: &[crate::sync_diff::DiffRow],
+            out: &mut std::collections::HashMap<String, String>,
+        ) {
+            for row in rows {
+                if row.kind != crate::sync_diff::RowKind::Unchanged {
+                    out.insert(row.id.clone(), "both".to_string());
+                }
+                keep_both(&row.children, out);
+            }
+        }
+        let mut decisions = std::collections::HashMap::new();
+        keep_both(&diff.rows, &mut decisions);
+
+        graph
+            .resolve_duplicate_journal_day(
+                "journals/2026_06_26.md",
+                "journals/Friday, 26-06-2026.md",
+                &decisions,
+                &diff.base_rev,
+                &diff.conflict_rev,
+                "union",
+            )
+            .unwrap();
+
+        let kept = fs::read_to_string(dir.join("journals").join("2026_06_26.md")).unwrap();
+        assert!(
+            kept.contains("only in canonical"),
+            "canonical kept: {kept:?}"
+        );
+        assert!(kept.contains("only in stray"), "stray folded in: {kept:?}");
+        assert!(
+            !dir.join("journals").join("Friday, 26-06-2026.md").exists(),
+            "the stray is gone from the graph"
+        );
+        // Recoverable, never deleted (ADR 0007).
+        let trash = typed_trash_dir(&dir, TrashEntryKind::Conflict);
+        assert!(
+            fs::read_dir(&trash)
+                .map(|entries| entries.flatten().count() > 0)
+                .unwrap_or(false),
+            "the stray must be recoverable in typed trash"
+        );
+        let after = Graph::open(&dir).conflict_queue();
+        assert!(
+            !after
+                .iter()
+                .any(|o| o.source == crate::concord_queue::ConflictSource::DuplicateJournal),
+            "the resolved day leaves the queue: {after:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_a_duplicate_day_refuses_files_from_different_days() {
+        // The guard that keeps this from becoming a merge-any-two-pages command.
+        let dir = duplicate_day_graph("queue-duplicate-journal-guard");
+        fs::write(dir.join("journals").join("2026_06_24.md"), "- other day\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let error = graph
+            .resolve_duplicate_journal_day(
+                "journals/2026_06_26.md",
+                "journals/2026_06_24.md",
+                &std::collections::HashMap::new(),
+                "whatever",
+                "whatever",
+                "union",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            fs::read_to_string(dir.join("journals").join("2026_06_24.md"))
+                .unwrap()
+                .contains("other day"),
+            "the unrelated day is untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cross_format_duplicate_day_offers_no_rows_but_still_lists_its_files() {
+        // `merge_pages` and the sync-copy resolve both refuse a .md/.org pair, so
+        // offering row choices we could never apply would be a dead end.
+        let dir = scratch("queue-duplicate-journal-cross-format");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("journals").join("2026_06_26.md"), "- markdown\n").unwrap();
+        fs::write(
+            dir.join("journals").join("Friday, 26-06-2026.org"),
+            "* org\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let queue = graph.conflict_queue();
+        let day = queue
+            .iter()
+            .find(|o| o.source == crate::concord_queue::ConflictSource::DuplicateJournal)
+            .expect("still a queue object");
+        assert_eq!(day.sides.len(), 2, "both files are still listed");
+        assert!(
+            day.block_conflicts.is_none(),
+            "no row-by-row choice on a pair that cannot be merged"
         );
         let _ = fs::remove_dir_all(&dir);
     }
