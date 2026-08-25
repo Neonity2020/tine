@@ -29892,10 +29892,29 @@ mod tests {
             .unwrap();
         let graph_before = user_graph_bytes(&joiner.graph_root);
         let refusal = joiner_handle.join_shared(descriptor).unwrap_err();
+        // `da0390b9 fix(sync): explain clean join semantic mismatches` replaced
+        // the single "contains semantic changes" sentence with a counted,
+        // content-free first line plus local-only detail lines, so a user can
+        // see WHICH note blocks the join. The user-visible outcome asserted
+        // here is unchanged: the join is refused, it names the unmatched local
+        // note, and it never prints that note's content.
         assert!(
-            refusal.to_string().contains("semantic changes"),
+            refusal
+                .to_string()
+                .contains("not in the shared provider frontier"),
             "{refusal}"
         );
+        assert!(
+            refusal.to_string().contains("local-only=1 shared-only=0"),
+            "{refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("clean join mismatch detail: local-only path=\"notes/local-only.md\""),
+            "{refusal}"
+        );
+        assert!(!refusal.to_string().contains("unmatched local work"), "{refusal}");
         assert_eq!(
             read_activation_marker(&joiner.request.enrollment_root)
                 .unwrap()
