@@ -20,6 +20,10 @@ export function ReferenceExportChooser(props: {
   onClose: () => void;
 }): JSX.Element {
   let root: HTMLDivElement | undefined;
+  // The chooser is a snapshot of what was visible when it opened. A pending
+  // filter debounce or reference refresh must not change rows underneath the
+  // user's selection or make the selected/total count disagree.
+  const groups = props.groups;
   createEffect(() => {
     const unregister = registerTransientLayer({
       id: `reference-export:${props.subject}`,
@@ -33,7 +37,7 @@ export function ReferenceExportChooser(props: {
   });
 
   const entryKey = (g: RefGroup, b: BlockDto) => `${g.kind}${g.page}${b.id}`;
-  const allKeys = () => props.groups.flatMap((g) => g.blocks.map((b) => entryKey(g, b)));
+  const allKeys = () => groups.flatMap((g) => g.blocks.map((b) => entryKey(g, b)));
   // "Copy all" is the headline case (GH #348), so start with everything chosen;
   // the subset flow is unchecking what you do not want.
   const [selected, setSelected] = createSignal<Set<string>>(new Set(allKeys()));
@@ -51,7 +55,7 @@ export function ReferenceExportChooser(props: {
   };
 
   const exportSelection = () => {
-    const nodes = props.groups.flatMap((g): ExportNode[] => {
+    const nodes = groups.flatMap((g): ExportNode[] => {
       const chosen = g.blocks.filter((b) => selected().has(entryKey(g, b)));
       if (!chosen.length) return [];
       const format = formatForPage(g.page);
@@ -78,7 +82,7 @@ export function ReferenceExportChooser(props: {
           <button type="button" disabled={!count()} onClick={() => setSelected(new Set())}>None</button>
         </div>
         <div class="ref-export-list" role="group" aria-label={`${props.subject} entries`}>
-          <For each={props.groups}>
+          <For each={groups}>
             {(g) => (
               <div class="ref-export-group">
                 <div class="ref-export-group-name"><EmojiText text={g.page} /></div>
