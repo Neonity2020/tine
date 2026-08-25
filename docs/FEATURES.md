@@ -680,7 +680,7 @@ within a column; merged cells are still v2+.
   native PDF export.)
 - **Copy/export as** Markdown for a block subtree or a whole page, with an explicit
   *Content* choice: **Markdown** (or **Org** on an Org page) preserves the original
-  source syntax exactly — bold, highlighting, links, properties — while **Plain
+  source syntax — bold, highlighting, links, properties — while **Plain
   text** flattens to what you see. Plain-text copy keeps math delimiters (`$…$`,
   `$$…$$`) so pasted math is re-parseable, pre-warms off-screen `((block ref))`
   targets before copy, and resolves user macros plus provider macros with sensible

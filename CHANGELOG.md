@@ -13,8 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Copy / export names its two content choices after what you actually get.**
   The explicit *Content* option in "Copy / export as…" now reads **Plain text**
   (cleaned, as displayed) and **Markdown** — or **Org** on an Org page —
-  (preserved source syntax: bold, highlighting, links, properties, structure,
-  byte-exact). The preserve choice was always implemented but shipped under
+  (preserved source syntax: bold, highlighting, links, properties and
+  structure). The preserve choice was always implemented but shipped under
   the internal label "Source"; users looking for the Markdown-preserving
   option could not find it (GH #352).
 

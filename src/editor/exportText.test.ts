@@ -124,7 +124,7 @@ describe("exportOutline", () => {
       },
     ];
 
-    it("preserve keeps inline markers, properties, and nested blocks byte-exact (Markdown)", () => {
+    it("preserve keeps inline markers and properties verbatim inside the exported outline (Markdown)", () => {
       expect(exportOutline(FORMATTED, opt({}))).toBe(
         "- **bold** _it_ ~~strike~~ ==high== `code` [[Some Page]] #tag\n  note:: 7\n\t- nested **child**",
       );
@@ -150,7 +150,7 @@ describe("exportOutline", () => {
       );
     });
 
-    it("preserve is the ENTIRE raw source: exactly the lines on disk, re-outlined", () => {
+    it("preserve keeps every raw content line while applying the requested outline layout", () => {
       const nodes: ExportNode[] = [{ raw: "a\nb\n\n c", children: [] }];
       expect(exportOutline(nodes, opt({ indent: "no-indent" }))).toBe("a\nb\n\n c");
     });

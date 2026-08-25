@@ -51,7 +51,7 @@ function saveOptions(o: ExportOptions): void {
 // "rendered"/"source" so persisted settings keep working.
 const CONTENT_STYLES: { value: ExportContent; label: string; hint: string }[] = [
   { value: "rendered", label: "Plain text", hint: "cleaned — the text as displayed, without markup markers (bold, highlighting, links)" },
-  { value: "source", label: "Markdown", hint: "preserved — the original source syntax exactly (bold, highlighting, links, properties)" },
+  { value: "source", label: "Markdown", hint: "preserved — original source syntax (bold, highlighting, links, properties)" },
 ];
 
 const FORMAT_STYLES: { value: ExportFormat; label: string }[] = [
