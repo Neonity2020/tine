@@ -295,6 +295,39 @@ fn config_path_for_write(graph: &Graph) -> io::Result<std::path::PathBuf> {
 }
 
 impl Graph {
+    /// Record which page holds the Favorites arrangement, as
+    /// `:tine/favorites-page "Name"`. Logseq ignores unknown keys, so this is
+    /// invisible to it; `:favorites` remains the shared membership list.
+    ///
+    /// Surgical and key-local like `set_favorites`: unknown keys, comments and
+    /// formatting elsewhere in the file survive untouched. The existing value is
+    /// located with the comment/string-aware `find_keyword` and replaced only
+    /// when it really is a string, so a stray non-string value is appended
+    /// beside rather than mis-scanned.
+    pub fn set_favorites_page(&self, name: &str) -> io::Result<()> {
+        let path = config_path_for_write(self)?;
+        let quoted = format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""));
+        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+            let mut content = content.to_string();
+            const KEY: &str = ":tine/favorites-page";
+            if let Some(start) = find_keyword(&content, KEY) {
+                let after = start + KEY.len();
+                let j = skip_blank(&content, after);
+                if content.as_bytes().get(j) == Some(&b'"') {
+                    let end = edn_str_end(&content, j);
+                    content.replace_range(start..end, &format!("{KEY} {quoted}"));
+                } else {
+                    content.insert_str(after, &format!(" {quoted}"));
+                }
+            } else if let Some(brace) = content.find('{') {
+                content.insert_str(brace + 1, &format!("\n {KEY} {quoted}\n"));
+            } else {
+                content = format!("{{{KEY} {quoted}}}\n");
+            }
+            Ok(content)
+        })
+    }
+
     /// Persist the favorites list to `:favorites [...]`, replacing the existing
     /// vector or inserting one, preserving the rest of the file.
     pub fn set_favorites(&self, names: &[String]) -> io::Result<()> {
@@ -1642,6 +1675,59 @@ fn parse_macros(edn: &str) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    // :tine/favorites-page identifies the page holding the Favorites
+    // arrangement. Logseq ignores unknown keys, so the round trip must leave
+    // every other key, comment and bit of formatting exactly as it found it —
+    // a malformed favorites value once invalidated Logseq's whole config parse,
+    // and this writer runs on the user's real config.edn.
+    #[test]
+    fn favorites_page_key_round_trips_and_preserves_the_rest_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("tine-favpage-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        let original =
+            "{;; a leading comment\n :favorites [\"Alpha\"]\n :journals-directory \"journals\"}\n";
+        std::fs::write(dir.join("logseq").join("config.edn"), original).unwrap();
+
+        let g = crate::model::Graph::open(&dir);
+        assert_eq!(g.config.favorites_page, None);
+        g.set_favorites_page("Favorites").unwrap();
+
+        let written = std::fs::read_to_string(dir.join("logseq").join("config.edn")).unwrap();
+        assert!(written.contains(";; a leading comment"), "{written}");
+        assert!(written.contains(":favorites [\"Alpha\"]"), "{written}");
+        assert!(
+            written.contains(":journals-directory \"journals\""),
+            "{written}"
+        );
+        assert_eq!(
+            Config::parse(&written).favorites_page.as_deref(),
+            Some("Favorites")
+        );
+
+        // Rewriting replaces the value in place rather than accumulating keys.
+        let g = crate::model::Graph::open(&dir);
+        g.set_favorites_page("My Favourites").unwrap();
+        let rewritten = std::fs::read_to_string(dir.join("logseq").join("config.edn")).unwrap();
+        assert_eq!(
+            rewritten.matches(":tine/favorites-page").count(),
+            1,
+            "{rewritten}"
+        );
+        assert_eq!(
+            Config::parse(&rewritten).favorites_page.as_deref(),
+            Some("My Favourites")
+        );
+        assert!(rewritten.contains(":favorites [\"Alpha\"]"), "{rewritten}");
+
+        // A quoted name containing a quote survives the round trip.
+        let g = crate::model::Graph::open(&dir);
+        g.set_favorites_page("od\"d").unwrap();
+        let odd = std::fs::read_to_string(dir.join("logseq").join("config.edn")).unwrap();
+        assert_eq!(Config::parse(&odd).favorites_page.as_deref(), Some("od\"d"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     #[test]

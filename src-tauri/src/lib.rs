@@ -54,12 +54,12 @@ use commands::{
     resolve_sync_conflict, resolve_vcs_marker_conflict, retire_editor_activation,
     run_advanced_query, run_graph_search, run_query, save_asset, save_page, save_pdf_area_image,
     save_workspaces, search, set_default_home, set_default_journal_template,
-    set_doc_mode_enter_for_new_block, set_favorites, set_guide_announced, set_journal_title_format,
-    set_logical_outdenting, set_preferred_format, set_preferred_workflow, set_show_brackets,
-    set_start_of_week, set_timetracking_enabled, stream_asset_path, sync_conflict_diff,
-    text_block_diff, text_block_diff3, tine_open_devtools, tine_quit, trash_asset,
-    trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff, write_highlights,
-    write_pdf_view_state,
+    set_doc_mode_enter_for_new_block, set_favorites, set_favorites_page, set_guide_announced,
+    set_journal_title_format, set_logical_outdenting, set_preferred_format, set_preferred_workflow,
+    set_show_brackets, set_start_of_week, set_timetracking_enabled, stream_asset_path,
+    sync_conflict_diff, text_block_diff, text_block_diff3, tine_open_devtools, tine_quit,
+    trash_asset, trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff,
+    write_highlights, write_pdf_view_state,
 };
 use debug::{debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger};
 use graph::{
@@ -776,6 +776,7 @@ pub fn run() {
             page_icons,
             existing_page_names,
             set_favorites,
+            set_favorites_page,
             set_default_home,
             set_preferred_workflow,
             set_timetracking_enabled,

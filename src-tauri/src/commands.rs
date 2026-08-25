@@ -2347,6 +2347,13 @@ pub(crate) fn set_favorites(names: Vec<String>, state: GraphContext<'_>) -> Resu
 }
 
 #[tauri::command]
+pub(crate) fn set_favorites_page(name: String, state: GraphContext<'_>) -> Result<(), String> {
+    with_config_graph(&state, |g| {
+        g.set_favorites_page(&name).map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
 pub(crate) fn set_default_home(
     name: Option<String>,
     state: GraphContext<'_>,

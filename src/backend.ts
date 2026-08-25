@@ -1130,6 +1130,12 @@ class TauriBackend implements Backend {
   setFavorites(names: string[]) {
     return this.call<void>("set_favorites", { names });
   }
+  /** Record which page holds the Favorites arrangement (`:tine/favorites-page`).
+   *  Membership stays in `:favorites`; this names the page that owns groups and
+   *  order, and is what keeps that page out of everyone's Linked References. */
+  setFavoritesPage(name: string) {
+    return this.call<void>("set_favorites_page", { name });
+  }
   setDefaultHome(name: string | null) {
     return this.call<void>("set_default_home", { name });
   }

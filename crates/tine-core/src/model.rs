@@ -5118,6 +5118,11 @@ pub struct GraphMeta {
     pub default_home: Option<String>,
     /// Favorited page names (read from config.edn `:favorites`).
     pub favorites: Vec<String>,
+    /// The page holding Tine's Favorites arrangement (`:tine/favorites-page`),
+    /// when this graph has one. `:favorites` above stays the flat, Logseq-
+    /// readable membership list; this page owns groups and order.
+    #[serde(default)]
+    pub favorites_page: Option<String>,
     /// Effective journal title format (`:journal/page-title-format`, default
     /// `MMM do, yyyy`) — so the frontend formats "today" to match the backend.
     pub journal_page_title_format: String,
@@ -11016,6 +11021,7 @@ impl Graph {
             default_journal_template: self.config.default_journal_template.clone(),
             default_home: self.config.default_home.clone(),
             favorites: self.config.favorites.clone(),
+            favorites_page: self.config.favorites_page.clone(),
             journal_page_title_format: self.journal_format.title_format().to_string(),
             journal_file_name_format: self.journal_format.file_format().to_string(),
             preferred_format: self.config.preferred_format.ext().to_string(),
