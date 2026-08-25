@@ -67,6 +67,16 @@ describe("config live-reload contract matches the source", () => {
     expect(model).toContain("pub fn config_file_description(root: &Path)");
   });
 
+  it("routes every settings write through one funnel that records it", () => {
+    expect(reload).toContain("`Graph::write_config` is therefore the single funnel");
+    const config = readFileSync("crates/tine-core/src/config.rs", "utf8");
+    expect(config).toContain("fn write_config(");
+    // No setter may go around it, or the watcher stops being able to tell
+    // Tine's own write from an outside one.
+    expect(config).not.toContain("crate::model::atomic_update(&path, &CONFIG_LOCK");
+    expect(watcher).toContain("lease.recent_config_write() == disk");
+  });
+
   it("keeps GraphMeta comparable, which is what suppresses a no-op announcement", () => {
     expect(reload).toContain("`GraphMeta` derives `PartialEq`");
     expect(model).toContain("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\npub struct GraphMeta");

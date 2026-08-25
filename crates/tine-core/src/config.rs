@@ -283,7 +283,7 @@ impl Config {
 /// Serializes ALL config.edn writers so two concurrent setting changes (or one
 /// racing a read-modify-write) can't clobber each other (audit M2). Process-global:
 /// config writes are rare and there's one config per running app. Every writer below
-/// goes through `crate::model::atomic_update(&path, &CONFIG_LOCK, …)`, which also
+/// goes through `self.write_config(&path, …)`, which also
 /// makes the read NFS-safe (NotFound→`{}`, other errors abort — audit H2) and the
 /// commit atomic.
 static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -304,10 +304,27 @@ impl Graph {
     /// located with the comment/string-aware `find_keyword` and replaced only
     /// when it really is a string, so a stray non-string value is appended
     /// beside rather than mis-scanned.
+    /// Publish one configuration edit.
+    ///
+    /// Every setter goes through here rather than calling `atomic_update`
+    /// directly, so a self-write is always recorded. Without that record the
+    /// configuration watcher cannot tell Tine's own settings write from an
+    /// outside one, and every star toggled in the sidebar would cost a
+    /// whole-graph reopen — which discards every cache the graph has built.
+    fn write_config(
+        &self,
+        path: &std::path::Path,
+        edit: impl Fn(&str) -> io::Result<String>,
+    ) -> io::Result<()> {
+        crate::model::atomic_update(path, &CONFIG_LOCK, edit)?;
+        self.note_config_write();
+        Ok(())
+    }
+
     pub fn set_favorites_page(&self, name: &str) -> io::Result<()> {
         let path = config_path_for_write(self)?;
         let quoted = format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""));
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
             const KEY: &str = ":tine/favorites-page";
             if let Some(start) = find_keyword(&content, KEY) {
@@ -332,7 +349,7 @@ impl Graph {
     /// vector or inserting one, preserving the rest of the file.
     pub fn set_favorites(&self, names: &[String]) -> io::Result<()> {
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
             let vec_str = format!(
                 "[{}]",
@@ -371,7 +388,7 @@ impl Graph {
         let kw = if wf == "todo" { ":todo" } else { ":now" };
         let key = ":preferred-workflow";
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             if let Some(start) = find_keyword(&content, key) {
@@ -401,7 +418,7 @@ impl Graph {
         let key = ":feature/enable-timetracking?";
         let val = if enabled { "true" } else { "false" };
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             if let Some(start) = find_keyword(&content, key) {
@@ -427,7 +444,7 @@ impl Graph {
         let key = ":ui/show-brackets?";
         let val = if enabled { "true" } else { "false" };
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             if let Some(start) = find_keyword(&content, key) {
@@ -464,7 +481,7 @@ impl Graph {
     fn set_config_bool(&self, key: &str, enabled: bool) -> io::Result<()> {
         let val = if enabled { "true" } else { "false" };
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             if let Some(start) = find_keyword(&content, key) {
@@ -489,7 +506,7 @@ impl Graph {
         let key = ":tine/guide-announced?";
         let val = if announced { "true" } else { "false" };
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             if let Some(start) = find_keyword(&content, key) {
@@ -520,7 +537,7 @@ impl Graph {
         };
         let key = ":preferred-format";
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             if let Some(start) = find_keyword(&content, key) {
@@ -554,7 +571,7 @@ impl Graph {
         let val = format!("\"{escaped}\"");
         let key = ":journal/page-title-format";
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             if let Some(start) = find_keyword(&content, key) {
@@ -580,7 +597,7 @@ impl Graph {
     /// preserved.
     pub fn set_default_journal_template(&self, name: Option<&str>) -> io::Result<()> {
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             // Locate a real `:default-templates` whose value is a map literal `{ … }`.
@@ -659,7 +676,7 @@ impl Graph {
     /// never destroy graph-owned configuration it does not understand.
     pub fn set_default_home_page(&self, name: Option<&str>) -> io::Result<()> {
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
             let (root_open, root_close) = root_map_bounds(&content).ok_or_else(|| {
                 io::Error::new(
@@ -755,7 +772,7 @@ impl Graph {
         let n = n.min(6);
         let key = ":start-of-week";
         let path = config_path_for_write(self)?;
-        crate::model::atomic_update(&path, &CONFIG_LOCK, |content| {
+        self.write_config(&path, |content| {
             let mut content = content.to_string();
 
             if let Some(start) = find_keyword(&content, key) {
@@ -1741,6 +1758,51 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// The other half of the watcher's economy. A settings write leaves the
+    /// running graph's parsed view stale (it always has), so the byte gate
+    /// alone would read every star toggled in the sidebar as an outside change
+    /// and reopen the whole graph — discarding every cache it has built.
+    #[test]
+    fn a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-config-selfwrite-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        std::fs::write(dir.join("logseq").join("config.edn"), "{}\n").unwrap();
+
+        let g = crate::model::Graph::open(&dir);
+        assert_eq!(g.recent_config_write(), None, "nothing published yet");
+
+        g.set_favorites(&["Alpha".to_owned()]).unwrap();
+        let disk = crate::model::config_file_description(&dir);
+
+        assert_ne!(
+            g.open_config_description(),
+            disk,
+            "the parsed view is stale after a write, as it has always been"
+        );
+        assert_eq!(
+            g.recent_config_write(),
+            disk,
+            "but the bytes on disk are the ones this instance published"
+        );
+
+        // An outside edit after our own write is still an outside edit.
+        std::fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:favorites [\"Alpha\" \"AddedInLogseq\"]}\n",
+        )
+        .unwrap();
+        let disk = crate::model::config_file_description(&dir);
+        assert_ne!(g.open_config_description(), disk);
+        assert_ne!(g.recent_config_write(), disk);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -2562,6 +2562,12 @@ pub struct Graph {
     /// on-disk config path no longer has this description.
     reconciliation_scan_open_config_description: Option<BlobDescription>,
     reconciliation_scan_open_config_utf8: bool,
+    /// Digest of the configuration bytes THIS instance last published.
+    ///
+    /// The watcher cannot otherwise tell Tine's own settings write from an
+    /// outside one, and would reopen the whole graph — discarding every cache
+    /// it has built — every time the user toggles a star.
+    recent_config_write: RwLock<Option<BlobDescription>>,
     /// Private, process-local graph-text completeness capability. This state is
     /// neither serialized nor consulted by durable import/projection paths in
     /// this packet.
@@ -5648,6 +5654,7 @@ impl Graph {
                 .as_deref()
                 .map(BlobDescription::of),
             reconciliation_scan_open_config_utf8: config_bytes.is_none() || config_text.is_some(),
+            recent_config_write: RwLock::new(None),
             graph_text_admission: Arc::new(GraphTextAdmissionControl {
                 state: RwLock::new(GraphTextAdmissionState::Unbuilt),
             }),
@@ -11051,6 +11058,21 @@ impl Graph {
     /// drops every cache the graph has built.
     pub fn open_config_description(&self) -> Option<BlobDescription> {
         self.reconciliation_scan_open_config_description
+    }
+
+    /// Digest of the configuration bytes this instance last wrote, if any.
+    ///
+    /// `None` on an instance that has published nothing — including every
+    /// short-lived managed capability, whose refresh is cheap enough not to
+    /// need the distinction.
+    pub fn recent_config_write(&self) -> Option<BlobDescription> {
+        *self.recent_config_write.read().unwrap()
+    }
+
+    /// Record what a configuration write just published. Called by the one
+    /// funnel every setter goes through (`Graph::write_config`).
+    pub(crate) fn note_config_write(&self) {
+        *self.recent_config_write.write().unwrap() = config_file_description(&self.root);
     }
 
     pub fn meta(&self) -> GraphMeta {

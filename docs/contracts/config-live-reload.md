@@ -47,11 +47,19 @@ now. A Direct graph refreshes only when they differ — which also means a
 settings write Tine performed itself costs nothing here, because the command
 already refreshed and the reopened graph matches disk.
 
+`Graph::recent_config_write()` is the second half of the same gate. A setting
+Tine writes itself leaves the running graph's *parsed* view stale — it always
+has, and `set_favorites` in particular never refreshed — so the open-time digest
+alone would read every star toggled in the sidebar as an outside change.
+`Graph::write_config` is therefore the single funnel every setter publishes
+through, and it records what it wrote.
+
 A managed slot retains no `Graph` to ask, and its refresh is a meta-only reopen
 with no cache to lose, so it re-reads unconditionally and lets the comparison in
 §4 decide whether anything is worth announcing.
 
-Tested by `config::tests::a_graph_reports_whether_config_edn_moved_since_it_was_opened`
+Tested by `config::tests::a_graph_reports_whether_config_edn_moved_since_it_was_opened`,
+`config::tests::a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change`
 and `config::tests::only_the_graph_s_own_config_edn_is_recognized_as_configuration`.
 
 ## 4. What reaches the frontend

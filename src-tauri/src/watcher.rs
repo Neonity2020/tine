@@ -1121,8 +1121,12 @@ fn refresh_changed_configs(
         // reopen with no cache to lose, so it re-reads unconditionally and lets
         // the meta comparison below decide whether anything is worth announcing.
         if !slot.is_sparse_v2() {
+            let disk = tine_core::model::config_file_description(root);
             let unchanged = slot.legacy_graph().is_ok_and(|lease| {
-                lease.open_config_description() == tine_core::model::config_file_description(root)
+                // Either the graph was opened with these exact bytes, or it
+                // published them itself. The second case is what keeps a star
+                // toggled in the sidebar from reading as an outside change.
+                lease.open_config_description() == disk || lease.recent_config_write() == disk
             });
             if unchanged {
                 continue;
