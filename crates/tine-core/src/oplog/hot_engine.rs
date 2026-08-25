@@ -1613,6 +1613,37 @@ struct ProjectionCreateShape {
     children: Vec<ProjectionCreateShape>,
 }
 
+fn projection_effect_is_pure_create(effect: &SemanticEffect) -> bool {
+    effect.pages().is_empty()
+        && effect.page_preambles().is_empty()
+        && !effect.blocks().is_empty()
+        && effect.blocks().iter().all(|delta| {
+            delta.before.is_none()
+                && delta
+                    .after
+                    .as_ref()
+                    .is_some_and(|after| matches!(after.owner, BlockOwner::Page(_)))
+        })
+        && effect.memberships().len() == effect.blocks().len()
+        && effect
+            .memberships()
+            .iter()
+            .all(|delta| delta.before.is_none() && delta.after.is_some())
+}
+
+fn projection_create_origins_match(x: BatchOrigin, z: BatchOrigin) -> bool {
+    matches!(
+        (x, z),
+        (
+            BatchOrigin::ExternalReconciliation { .. },
+            BatchOrigin::LocalMutation
+        ) | (
+            BatchOrigin::LocalMutation,
+            BatchOrigin::ExternalReconciliation { .. }
+        )
+    )
+}
+
 fn projection_create_forest(
     effect: &SemanticEffect,
     page_id: PageId,
@@ -24512,24 +24543,9 @@ impl ShardedHotEngine {
                 }
                 _ => return Ok(Vec::new()),
             };
-        let pure_create = |effect: &SemanticEffect| {
-            effect.pages().is_empty()
-                && effect.page_preambles().is_empty()
-                && !effect.blocks().is_empty()
-                && effect.blocks().iter().all(|delta| {
-                    delta.before.is_none()
-                        && delta
-                            .after
-                            .as_ref()
-                            .is_some_and(|after| matches!(after.owner, BlockOwner::Page(_)))
-                })
-                && effect.memberships().len() == effect.blocks().len()
-                && effect
-                    .memberships()
-                    .iter()
-                    .all(|delta| delta.before.is_none() && delta.after.is_some())
-        };
-        if !pure_create(external_effect) || !pure_create(local_effect) {
+        if !projection_effect_is_pure_create(external_effect)
+            || !projection_effect_is_pure_create(local_effect)
+        {
             return Ok(Vec::new());
         }
         let external_intents =
@@ -24650,19 +24666,6 @@ impl ShardedHotEngine {
             }
             let z_batch = self.load_accepted_validated_batch(z_id)?;
             let z_effect = self.accepted_semantic_effect(&z_batch)?;
-            // Batches causally after `batch_id` (an already-accepted
-            // resolution, a later user action) are not concurrent with it.
-            let z_heads = declared_batch_heads(z_batch.manifest().dependency_frontier());
-            if self
-                .collect_batch_ancestry(&z_heads, false)?
-                .contains_key(&batch_id)
-            {
-                continue;
-            }
-            let pair = ConflictPair::from_manifests(x_batch.manifest(), z_batch.manifest());
-            intents.extend(self.equivalent_projection_create_intents(
-                &x_batch, &x_effect, &z_batch, &z_effect, &pair,
-            )?);
             let shared: Vec<(&BlockDelta, &BlockDelta)> = x_effect
                 .blocks()
                 .iter()
@@ -24677,6 +24680,31 @@ impl ShardedHotEngine {
                         .map(|z_delta| (x_delta, z_delta))
                 })
                 .collect();
+            let possible_projection_create = projection_create_origins_match(
+                x_batch.manifest().origin(),
+                z_batch.manifest().origin(),
+            ) && projection_effect_is_pure_create(&x_effect)
+                && projection_effect_is_pure_create(&z_effect);
+            if shared.is_empty() && !possible_projection_create {
+                continue;
+            }
+            // Batches causally after `batch_id` (an already-accepted
+            // resolution, a later user action) are not concurrent with it.
+            // Keep this behind the two cheap overlap classifiers: ordinary
+            // unrelated accepted history must never pay an ancestry walk.
+            let z_heads = declared_batch_heads(z_batch.manifest().dependency_frontier());
+            if self
+                .collect_batch_ancestry(&z_heads, false)?
+                .contains_key(&batch_id)
+            {
+                continue;
+            }
+            let pair = ConflictPair::from_manifests(x_batch.manifest(), z_batch.manifest());
+            if possible_projection_create {
+                intents.extend(self.equivalent_projection_create_intents(
+                    &x_batch, &x_effect, &z_batch, &z_effect, &pair,
+                )?);
+            }
             if shared.is_empty() {
                 continue;
             }
