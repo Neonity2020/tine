@@ -12,6 +12,53 @@ use crate::config::FileNameFormat;
 /// page name — so the ref/backlink index and the file/cache resolution agree on
 /// identity (a non-ASCII name like `Über` must resolve the same everywhere). Display
 /// uses the original casing.
+/// Pages that never appear as reference SOURCES.
+///
+/// There are two, and both mean "this text is not user content mentioning the
+/// target": the target page itself (OG excludes a page from its own linked
+/// references), and Tine's Favorites layout page, whose `[[links]]` are a
+/// sidebar arrangement rather than a mention.
+///
+/// Both reference engines share this ONE predicate. Direct Files and managed
+/// storage previously open-coded `refs::page_key(name) == excluded` at eight
+/// separate sites, which is exactly how the two engines drift apart: a rule
+/// added to one is silently absent from the other. Keep it that way — a new
+/// exclusion belongs in this type, not at a call site.
+#[derive(Clone, Debug, Default)]
+pub struct ReferenceSourceExclusions {
+    keys: Vec<String>,
+}
+
+impl ReferenceSourceExclusions {
+    /// `self_page` is the reference target; `favorites_page` is the graph's
+    /// `:tine/favorites-page`, when it has one.
+    pub fn new(self_page: &str, favorites_page: Option<&str>) -> Self {
+        let mut keys = Vec::with_capacity(2);
+        keys.push(page_key(self_page));
+        if let Some(page) = favorites_page {
+            let key = page_key(page);
+            if !key.is_empty() && !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        Self { keys }
+    }
+
+    /// Exclude nothing. For call sites that have no graph configuration.
+    pub fn none() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    pub fn excludes_name(&self, page_name: &str) -> bool {
+        self.excludes_key(&page_key(page_name))
+    }
+
+    pub fn excludes_key(&self, key: &str) -> bool {
+        // At most two entries; a linear scan beats hashing.
+        self.keys.iter().any(|candidate| candidate == key)
+    }
+}
+
 pub fn page_key(name: &str) -> String {
     // Preserve Tine's historical surrounding-whitespace tolerance. Otherwise
     // this is OG page-name-sanity-lc: lowercase, remove one slash at each

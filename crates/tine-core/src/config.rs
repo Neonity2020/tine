@@ -57,6 +57,13 @@ pub struct Config {
     pub default_home: Option<String>,
     /// `:favorites ["Page" …]` — favorited page names (on-disk, graph-portable).
     pub favorites: Vec<String>,
+    /// `:tine/favorites-page "Name"` — the page holding Tine's Favorites
+    /// arrangement (groups and order). Tine-only; Logseq ignores unknown keys.
+    /// Identity lives here rather than in a reserved page NAME so that a user's
+    /// own page called "Favorites" is never silently treated as Tine's, and
+    /// rather than in a page property so that resolving it costs nothing on the
+    /// reference path (see `refs::ReferenceSourceExclusions`).
+    pub favorites_page: Option<String>,
     /// `:journal/file-name-format` — Logseq's journal FILENAME format (cljs-time /
     /// Joda tokens). `None` = the default `"yyyy_MM_dd"`. Tine only synthesizes
     /// the default format, so a non-default value here means Tine must NOT create
@@ -152,6 +159,7 @@ impl Default for Config {
             default_journal_template: None,
             default_home: None,
             favorites: Vec::new(),
+            favorites_page: None,
             journal_file_name_format: None,
             journal_page_title_format: None,
             preferred_format: crate::model::Format::Md,
@@ -215,6 +223,8 @@ impl Config {
         cfg.default_home = nested_string_in_balanced_map(edn, ":default-home", ":page")
             .filter(|s| !s.trim().is_empty());
         cfg.favorites = parse_string_vector(edn, ":favorites");
+        cfg.favorites_page =
+            string_value(edn, ":tine/favorites-page").filter(|s| !s.trim().is_empty());
         cfg.journal_file_name_format =
             string_value(edn, ":journal/file-name-format").filter(|s| !s.is_empty());
         cfg.journal_page_title_format =

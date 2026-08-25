@@ -12105,7 +12105,10 @@ impl RuntimeActor {
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
         let (canonical, names_norm, self_page) =
             self.application_equivalent_page_names_ready(target)?;
-        let excluded = crate::refs::page_key(&self_page);
+        let excluded = crate::refs::ReferenceSourceExclusions::new(
+            &self_page,
+            self.graph.config.favorites_page.as_deref(),
+        );
         let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
         let read = self.application_materialized_read_ready()?;
@@ -12149,8 +12152,7 @@ impl RuntimeActor {
                             page_headers.insert(row.source_page_id, header.clone());
                             header
                         };
-                    if masked_paths.contains(&path) || crate::refs::page_key(&page_name) == excluded
-                    {
+                    if masked_paths.contains(&path) || excluded.excludes_name(&page_name) {
                         continue;
                     }
                     let entry = candidates.entry(row.source_page_id).or_default();
@@ -12191,7 +12193,7 @@ impl RuntimeActor {
             let Some((_, page)) = current else {
                 continue;
             };
-            if crate::refs::page_key(&page.name) == excluded {
+            if excluded.excludes_name(&page.name) {
                 continue;
             }
             let matches = crate::query::application_page_reference_matches(
@@ -12218,7 +12220,7 @@ impl RuntimeActor {
         }
         for (page_id, candidate) in candidates {
             let current = self.load_application_page_id_ready(page_id)?;
-            if crate::refs::page_key(&current.page.name) == excluded {
+            if excluded.excludes_name(&current.page.name) {
                 continue;
             }
             let allowed = application_parser_indices_for_block_ids(&current, &candidate.blocks)?;
@@ -12269,7 +12271,10 @@ impl RuntimeActor {
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
         let (canonical, names_norm, self_page) =
             self.application_equivalent_page_names_ready(target)?;
-        let excluded = crate::refs::page_key(&self_page);
+        let excluded = crate::refs::ReferenceSourceExclusions::new(
+            &self_page,
+            self.graph.config.favorites_page.as_deref(),
+        );
         let mut sources = Vec::<ApplicationReferenceSource>::new();
 
         if application_unlinked_candidate_strategy(&names_norm)
@@ -12280,7 +12285,7 @@ impl RuntimeActor {
             // broad Direct-Files parsed cache. This exceptional path remains
             // explicit so C3 performance receipts can measure it separately.
             for (entry, _) in self.application_navigation_pages_ready()? {
-                if crate::refs::page_key(&entry.name) == excluded {
+                if excluded.excludes_name(&entry.name) {
                     continue;
                 }
                 let current = match self.load_application_exact_ready(&entry.rel_path)? {
@@ -12348,9 +12353,7 @@ impl RuntimeActor {
                         page_headers.insert(row.page_id, header.clone());
                         header
                     };
-                    if !masked_paths.contains(&path)
-                        && crate::refs::page_key(&page_name) != excluded
-                    {
+                    if !masked_paths.contains(&path) && !excluded.excludes_name(&page_name) {
                         candidate_pages.insert(row.page_id);
                     }
                 }
@@ -12365,7 +12368,7 @@ impl RuntimeActor {
             let Some((_, page)) = current else {
                 continue;
             };
-            if crate::refs::page_key(&page.name) == excluded {
+            if excluded.excludes_name(&page.name) {
                 continue;
             }
             let matches = crate::query::application_page_reference_matches(
@@ -12392,7 +12395,7 @@ impl RuntimeActor {
         }
         for page_id in candidate_pages {
             let current = self.load_application_page_id_ready(page_id)?;
-            if crate::refs::page_key(&current.page.name) == excluded {
+            if excluded.excludes_name(&current.page.name) {
                 continue;
             }
             let matches = crate::query::application_page_reference_matches(

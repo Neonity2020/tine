@@ -901,7 +901,8 @@ fn collect_reference_occurrences_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
-    let exclude = refs::page_key(self_page);
+    let exclude =
+        refs::ReferenceSourceExclusions::new(self_page, graph.config.favorites_page.as_deref());
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
     let candidate_pages = graph.reference_candidate_pages(names_norm, kind);
     let groups = {
@@ -911,7 +912,7 @@ fn collect_reference_occurrences_bounded(
         let mut sources = pages.iter().collect::<Vec<_>>();
         sources.sort_by(|(a, _), (b, _)| a.path.cmp(&b.path));
         for (entry, doc) in sources {
-            if refs::normalize(&entry.name) == exclude {
+            if exclude.excludes_name(&entry.name) {
                 continue;
             }
             let mut blocks = Vec::new();
@@ -6760,6 +6761,60 @@ mod tests {
     /// Issue #9: linked references are grouped by referring page, ordered by the
     /// referrer's journal day DESCENDING (newest journal first), with non-journal
     /// referrers last — matching OG (`components/block.cljs` `sort-by :block/journal-day >`).
+    // Tine's Favorites layout page holds `[[links]]` so that renames follow it
+    // for free — but those links are a sidebar arrangement, not a mention, so
+    // the page must never appear in anyone's Linked References. Identity comes
+    // from `:tine/favorites-page` in config.edn, NOT from a reserved page name:
+    // a user's own page called "Favorites" must keep behaving like any page.
+    #[test]
+    fn favorites_layout_page_is_never_a_reference_source() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("tine-fav-exclude-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("pages").join("Notes.md"),
+            "- a real mention [[Target]]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Favorites.md"),
+            "tine/favorites:: true\n\n- [[Target]]\n- Work\n\t- [[Target]]\n",
+        )
+        .unwrap();
+
+        // Without the config key the page is an ORDINARY page and still counts.
+        fs::write(dir.join("logseq").join("config.edn"), "{}\n").unwrap();
+        let plain = crate::model::Graph::open(&dir);
+        let names = |groups: &[crate::model::RefGroup]| {
+            let mut names = groups.iter().map(|g| g.page.clone()).collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&plain.backlinks("Target")),
+            vec!["Favorites".to_string(), "Notes".to_string()],
+            "an unmarked page named Favorites is just a page"
+        );
+
+        // With it, the layout page drops out and nothing else does.
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:tine/favorites-page \"Favorites\"}\n",
+        )
+        .unwrap();
+        let marked = crate::model::Graph::open(&dir);
+        assert_eq!(
+            names(&marked.backlinks("Target")),
+            vec!["Notes".to_string()]
+        );
+        // The target page itself is still excluded from its own references.
+        assert!(!names(&marked.backlinks("Notes")).contains(&"Notes".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn backlinks_ordered_by_referrer_journal_date_desc() {
         use std::fs;
