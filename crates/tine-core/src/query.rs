@@ -6,10 +6,10 @@
 use crate::date::JournalDate;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{
-    block_to_shallow_dto, BacklinkFilterContext, BacklinkFilterEntry, BacklinkFilterTarget,
-    BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind, RefGroup,
-    ReferenceBlockEvidence, ReferenceDiagnosticTrace, ReferenceDiagnostics, ReferenceKind,
-    TemplateDto,
+    block_to_shallow_dto, dto_block_to_doc_block, BacklinkFilterContext, BacklinkFilterEntry,
+    BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
+    RefGroup, ReferenceBlockEvidence, ReferenceDiagnosticTrace, ReferenceDiagnostics,
+    ReferenceKind, TemplateDto,
 };
 use crate::refs;
 use crate::search_query::Matcher;
@@ -795,13 +795,7 @@ pub(crate) fn application_page_reference_matches(
         for block in blocks {
             let current = *index;
             *index = index.saturating_add(1);
-            let projected = DocBlock {
-                raw: block.raw.clone(),
-                children: Vec::new(),
-                uuid: block.id.clone(),
-                is_org,
-                proj: std::sync::OnceLock::new(),
-            };
+            let projected = dto_block_to_doc_block(block, is_org);
             if allowed_indices.is_none_or(|allowed| allowed.contains(&current)) {
                 if let Some(hit) =
                     block_reference_evidence(&projected, canonical, names_norm, kind, config)
@@ -1207,13 +1201,7 @@ pub(crate) fn application_backlink_filter_entry(
         add_facet: &mut impl FnMut(&str),
         truncated: &mut bool,
     ) {
-        let projected = DocBlock {
-            raw: block.raw.clone(),
-            children: Vec::new(),
-            uuid: block.id.clone(),
-            is_org,
-            proj: std::sync::OnceLock::new(),
-        };
+        let projected = dto_block_to_doc_block(block, is_org);
         *truncated |= append_bounded_text(text, projected.visible_text(), max_text);
         let projection = projected.projection();
         for name in &projection.refs_page {
@@ -2134,17 +2122,13 @@ pub(crate) fn simple_query_candidate_plan(query_src: &str) -> SimpleQueryCandida
 }
 
 pub(crate) fn application_query_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
-    DocBlock {
-        raw: block.raw.clone(),
-        children: block
-            .children
-            .iter()
-            .map(|child| application_query_doc_block(child, is_org))
-            .collect(),
-        uuid: block.id.clone(),
-        is_org,
-        proj: std::sync::OnceLock::new(),
-    }
+    let mut doc = dto_block_to_doc_block(block, is_org);
+    doc.children = block
+        .children
+        .iter()
+        .map(|child| application_query_doc_block(child, is_org))
+        .collect();
+    doc
 }
 
 /// Default bounds for [`ApplicationProjectionCache`].

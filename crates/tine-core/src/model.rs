@@ -22757,7 +22757,31 @@ pub fn block_to_shallow_dto(b: &DocBlock) -> BlockDto {
     doc_block_facets_dto(b, block_runtime_id(b))
 }
 
-fn dto_blocks_to_doc_checked(blocks: &[BlockDto], is_org: bool) -> io::Result<Vec<DocBlock>> {
+/// The ONE `BlockDto` → `DocBlock` field mapping (2026-08-25 duplication
+/// audit, DUP-application-query-twin). Every managed path that rehydrates a
+/// parseable block from its wire DTO goes through this constructor, so a new
+/// `DocBlock` field is initialized in exactly one place. The tree walkers
+/// around it deliberately differ — [`dto_blocks_to_doc_checked`] is iterative,
+/// depth-bounded, and allocation-guarded because it validates untrusted managed
+/// page loads, while the query/projection walkers recurse over block trees that
+/// are already inside the trusted process — but the per-block field mapping
+/// must not diverge. A source guard in this module's tests pins the invariant.
+pub(crate) fn dto_block_to_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
+    DocBlock {
+        raw: block.raw.clone(),
+        children: Vec::new(),
+        uuid: block.id.clone(),
+        is_org,
+        proj: std::sync::OnceLock::new(),
+    }
+}
+
+/// Bounded tree walker over [`dto_block_to_doc_block`] for untrusted managed
+/// page loads: iterative (no recursion), depth-limited, allocation-guarded.
+pub(crate) fn dto_blocks_to_doc_checked(
+    blocks: &[BlockDto],
+    is_org: bool,
+) -> io::Result<Vec<DocBlock>> {
     struct Frame<'a> {
         source: &'a [BlockDto],
         next: usize,
@@ -22794,13 +22818,7 @@ fn dto_blocks_to_doc_checked(blocks: &[BlockDto], is_org: bool) -> io::Result<Ve
         }
         let block = &frame.source[frame.next];
         frame.next = frame.next.checked_add(1).ok_or_else(allocation_overflow)?;
-        frame.output.push(DocBlock {
-            raw: block.raw.clone(),
-            children: Vec::new(),
-            uuid: block.id.clone(),
-            is_org,
-            proj: std::sync::OnceLock::new(),
-        });
+        frame.output.push(dto_block_to_doc_block(block, is_org));
         if !block.children.is_empty() {
             if len == MAX_MANAGED_BLOCK_DEPTH {
                 return Err(io::Error::new(
@@ -32167,6 +32185,119 @@ fn atomic_update_with_hooks(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    // DUP mapping semantics (2026-08-25 duplication audit): both tree walkers
+    // delegate every block to the one shared field mapping, so identical DTO
+    // input must produce identical parseable trees (identity, format flag,
+    // fresh lazy projection included).
+    #[test]
+    fn blockdto_walkers_agree_on_the_shared_field_mapping() {
+        let leaf = BlockDto {
+            id: "u-leaf".into(),
+            raw: "TODO leaf\nkey:: value".into(),
+            ..Default::default()
+        };
+        let root = BlockDto {
+            id: "u-root".into(),
+            raw: "DONE [#B] root".into(),
+            children: vec![leaf],
+            ..Default::default()
+        };
+
+        fn shape(
+            blocks: &[DocBlock],
+        ) -> Vec<(String, String, bool, Vec<(String, String, bool, usize)>)> {
+            blocks
+                .iter()
+                .map(|b| {
+                    (
+                        b.raw.clone(),
+                        b.uuid.clone(),
+                        b.is_org,
+                        b.children
+                            .iter()
+                            .map(|c| (c.raw.clone(), c.uuid.clone(), c.is_org, c.children.len()))
+                            .collect(),
+                    )
+                })
+                .collect()
+        }
+
+        for is_org in [false, true] {
+            let via_query_walk = crate::query::application_query_doc_block(&root, is_org);
+            let via_checked_walk = dto_blocks_to_doc_checked(std::slice::from_ref(&root), is_org)
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                shape(std::slice::from_ref(&via_query_walk)),
+                shape(std::slice::from_ref(&via_checked_walk)),
+                "is_org={is_org}: every walker must run the same per-block mapping"
+            );
+            // The mapping hands out a fresh projection memo: the first access
+            // parses `raw` (facets visible), it is not inherited from anywhere.
+            assert_eq!(
+                via_checked_walk.projection().marker.as_deref(),
+                Some("DONE")
+            );
+            assert_eq!(
+                via_checked_walk.children[0].projection().marker.as_deref(),
+                Some("TODO")
+            );
+            if !is_org {
+                // Org takes properties from a :PROPERTIES: drawer, not `key::`.
+                assert_eq!(
+                    via_checked_walk.children[0].projection().properties,
+                    vec![("key".to_string(), "value".to_string())]
+                );
+            }
+            assert_eq!(via_checked_walk.projection().priority.as_deref(), Some("B"));
+        }
+    }
+
+    // DUP guard (2026-08-25 duplication audit): the `BlockDto` → `DocBlock`
+    // field mapping existed as TWO inline copies (here in
+    // `dto_blocks_to_doc_checked` and in `query.rs::application_query_doc_block`)
+    // that had to be kept in agreement manually. The mapping is the contract —
+    // which DTO fields carry into the parseable tree (and that the lazy
+    // projection starts empty) — so it is one function and this source guard
+    // forbids a second spelling.
+    #[test]
+    fn only_one_blockdto_to_docblock_field_mapping_exists() {
+        let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut spellings = Vec::new();
+        let mut stack = vec![crate_src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                // Only production code counts: the trailing `mod tests` pins and
+                // documents the rule (inline cfg(test) items above it are rare
+                // and contain no DTO conversion).
+                let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+                if production.contains("uuid: block.id.clone()") {
+                    spellings.push(
+                        path.strip_prefix(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        spellings.sort();
+        assert_eq!(
+            spellings,
+            vec!["src/model.rs"],
+            "the BlockDto -> DocBlock field mapping must stay in exactly one function"
+        );
+    }
 
     // Direct Files performance audit 2026-08-09, finding F7. The digest exists to
     // let the frontend skip transporting several thousand names it already has,
