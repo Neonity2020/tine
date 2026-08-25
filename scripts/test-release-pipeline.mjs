@@ -43,6 +43,7 @@ const flatpakMetadataWorkflow = fs.readFileSync(
 const preflight = fs.readFileSync(path.join(process.cwd(), "scripts/check-release-preflight.mjs"), "utf8");
 const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"), "utf8");
 const packageJson = fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8");
+const viteConfig = fs.readFileSync(path.join(process.cwd(), "vite.config.ts"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
 const androidManagedRuntimeScript = fs.readFileSync(
@@ -215,6 +216,23 @@ assert.match(
   /lane: windows-x86[\s\S]*?--target i686-pc-windows-msvc[\s\S]*?rust-targets: "i686-pc-windows-msvc"[\s\S]*?win-arch: x86[\s\S]*?win-exe-dir: target\/i686-pc-windows-msvc\/release/,
   "release workflow is missing the experimental Windows 32-bit cross-build"
 );
+assert.match(
+  releaseWorkflow,
+  /CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"/,
+  "release builds must retain line-level native symbol information without changing optimization"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Upload exact diagnostic symbols[\s\S]*?diagnostic-symbols-\$\{\{ matrix\.lane \}\}-\$\{\{ github\.sha \}\}/,
+  "release builds must retain exact-SHA native symbols and frontend source maps outside public packages"
+);
+assert.match(
+  viteConfig,
+  /TINE_RETAIN_SOURCE_MAPS[\s\S]*?sourcemap:[\s\S]*?"hidden"/,
+  "Vite must retain hidden release source maps outside dist instead of embedding them in the app"
+);
+assert.match(viteConfig, /target[\\/]diagnostic-symbols[\\/]frontend/);
+assert.match(viteConfig, /await fsp\.unlink\(source\)/, "retained maps must be removed from the shipped dist tree");
 assert.match(
   releaseWorkflow,
   /lane: linux-x64[\s\S]*?appimage-update-info: "gh-releases-zsync\|martinkoutecky\|tine\|latest\|Tine_\*_amd64\.AppImage\.zsync"[\s\S]*?lane: linux-arm64[\s\S]*?appimage-update-info: "gh-releases-zsync\|martinkoutecky\|tine\|latest\|Tine_\*_aarch64\.AppImage\.zsync"/,

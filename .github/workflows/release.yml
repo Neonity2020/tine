@@ -260,6 +260,8 @@ jobs:
       - name: Build Tauri bundles
         if: matrix.lane != 'macos-universal'
         env:
+          CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+          TINE_RETAIN_SOURCE_MAPS: "1"
           # Updater signing (minisign) — the app-update root of trust, SEPARATE from
           # OS code-signing. REQUIRED once `bundle.createUpdaterArtifacts` is true:
           # the bundler signs each updater artifact with this key, and the installed
@@ -280,12 +282,60 @@ jobs:
       - name: Build signed and notarized macOS bundles
         if: matrix.lane == 'macos-universal'
         env:
+          CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+          TINE_RETAIN_SOURCE_MAPS: "1"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: npm run tauri build -- ${{ matrix.args }}
+
+      - name: Collect Unix diagnostic symbols
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="target/diagnostic-symbols/native/${{ matrix.lane }}"
+          mkdir -p "$out"
+          if [ "${{ matrix.lane }}" = "macos-universal" ]; then
+            binary="target/universal-apple-darwin/release/tine"
+            if [ ! -x "$binary" ]; then
+              echo "::error::universal Tine binary is missing for diagnostic symbols"
+              exit 1
+            fi
+            dsymutil "$binary" -o "$out/Tine.dSYM"
+          else
+            binary="target/release/tine"
+            if [ ! -x "$binary" ]; then
+              echo "::error::native Tine binary is missing for diagnostic symbols"
+              exit 1
+            fi
+            objcopy --only-keep-debug "$binary" "$out/tine.debug"
+          fi
+          printf '%s\n' "commit=${{ github.sha }}" "lane=${{ matrix.lane }}" > "$out/receipt.txt"
+
+      - name: Collect Windows diagnostic symbols
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $out = "target/diagnostic-symbols/native/${{ matrix.lane }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $dir = "${{ matrix.win-exe-dir }}"
+          $pdb = @("$dir/Tine.pdb", "$dir/tine.pdb") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $pdb) { throw "native Tine PDB is missing under $dir" }
+          Copy-Item $pdb "$out/Tine.pdb"
+          @("commit=${{ github.sha }}", "lane=${{ matrix.lane }}") |
+            Set-Content -Encoding utf8 "$out/receipt.txt"
+
+      - name: Upload exact diagnostic symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-symbols-${{ matrix.lane }}-${{ github.sha }}
+          path: target/diagnostic-symbols
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Verify macOS signature and stapled notarization ticket
         if: matrix.lane == 'macos-universal'

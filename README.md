@@ -215,7 +215,17 @@ guard the ADR 0013 duplicate-instance caret/focus invariant.
   clash with the host GPU and silently drop you to (slow) software rendering. The `.deb`/`.rpm`
   packages use your system's drivers and don't have this problem.
 
-### Troubleshooting a bad startup (debug mode)
+### Troubleshooting and diagnostic reports
+
+For a problem that occurs after the window opens, use **Settings → Diagnostics**.
+Tine keeps a small, bounded record of fixed operation names, outcomes, timings
+and counts for the current and previous run. You can preview the complete JSON,
+then choose whether to copy or save it. Nothing is uploaded automatically, and
+the report excludes graph content, file paths, page titles, queries, URLs and
+credentials.
+
+For a bad startup or a directed investigation, debug mode provides a more
+detailed and less privacy-restricted trace:
 
 If Tine won't start cleanly (e.g. the window never appears), run it with debug logging on. It writes
 a timestamped trace to a file — the environment (renderer, session type, AppImage, graph), every
@@ -227,9 +237,11 @@ TINE_DEBUG=1 tine                 # or:  tine --debug
 TINE_DEBUG=1 ./Tine-*.AppImage    # AppImage
 ```
 
-Tine prints the log path on startup; it defaults to `/tmp/tine-debug.log` (override with
-`TINE_DEBUG_LOG=/path`). Reproduce the problem, then send that file. The log records no note content
-— only startup diagnostics.
+Tine prints the log path on startup; it defaults to `/tmp/tine-debug.log`
+(override with `TINE_DEBUG_LOG=/path`). Reproduce the problem, inspect the file,
+then send it only if you choose. This detailed file can contain paths,
+environment values and error text; it is never included in the privacy-safe
+report.
 
 **Quick capture** — at the top of the journal feed, a page-title field + a body composer: fill the
 title to capture a **new page**, leave it empty to **append to today**, then `Ctrl-Shift-Enter`.

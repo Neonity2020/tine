@@ -45,6 +45,7 @@ libc = "0.2"
 # the identifier-rename migration can run BEFORE the webview creates its store.
 # `dirs::data_dir()` is the exact base Tauri v2's `app_data_dir()` joins the id onto.
 dirs = "6"
+fs2 = "0.4"
 tine-core = { path = "../crates/tine-core" }
 
 [dev-dependencies]

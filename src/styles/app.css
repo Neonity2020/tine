@@ -10199,3 +10199,24 @@ img.emoji {
     gap: 2px;
   }
 }
+.diagnostics-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 1rem 0;
+}
+
+.diagnostics-preview {
+  display: grid;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+}
+
+.diagnostics-preview textarea {
+  width: 100%;
+  min-height: 20rem;
+  resize: vertical;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}

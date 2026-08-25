@@ -2,6 +2,7 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, crea
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
 import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
+import { DiagnosticsTab } from "./DiagnosticsTab";
 import { writeClipboardTextResilient } from "../clipboard";
 import { safeManagedErrorDetail } from "../managedDiagnostics";
 import {
@@ -187,6 +188,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "plugins", label: "Plugins" },
   { id: "improve", label: "Help improve Tine" },
   { id: "shortcuts", label: "Keyboard shortcuts" },
+  { id: "diagnostics", label: "Diagnostics" },
   { id: "about", label: "About" },
 ];
 
@@ -198,6 +200,7 @@ type SettingSearchEntry = {
   level?: "advanced" | "experimental";
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
+  { tab: "diagnostics", label: "Diagnostic report", description: "bug report flight recorder timings previous run privacy" },
   { tab: "appearance", label: "Theme", description: "light dark system gallery colors" },
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
   { tab: "appearance", label: "Interface size", description: "zoom scale Ctrl scroll" },
@@ -490,6 +493,9 @@ export function Settings(): JSX.Element {
                   onRecord={(id) => setRecording(recording() === id ? null : id)}
                   onReset={resetShortcutOverride}
                 />
+              </Show>
+              <Show when={tab() === "diagnostics"}>
+                <DiagnosticsTab />
               </Show>
               <Show when={tab() === "about"}>
                 <AboutTab />

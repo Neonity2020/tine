@@ -107,6 +107,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("capture_quick_switch", NoGraphSlot),
     ("capture_target", NoGraphSlot),
     ("clipboard_files", NoGraphSlot),
+    ("clear_diagnostics", NoGraphSlot),
     ("close_graph_window", NoGraphSlot),
     ("conflict_queue", Filesystem),
     ("copy_guide_into_graph", ManagedRouted),
@@ -117,6 +118,9 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("default_graph_parent", NoGraphSlot),
     ("delete_page", ManagedRouted),
     ("detect_media_editor", NoGraphSlot),
+    ("diagnostic_frontend_event", NoGraphSlot),
+    ("diagnostic_ipc_event", NoGraphSlot),
+    ("diagnostic_report", NoGraphSlot),
     ("durable_live_save_conflict_diff", Filesystem),
     ("duplicate_journal_diff", Filesystem),
     ("edit_asset_external", Filesystem),
@@ -208,6 +212,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("run_graph_search", ManagedRouted),
     ("run_query", ManagedRouted),
     ("save_asset", Filesystem),
+    ("save_diagnostic_report", NoGraphSlot),
     ("save_page", ManagedRouted),
     ("save_pdf_area_image", Filesystem),
     ("save_session", NoGraphSlot),
@@ -261,6 +266,15 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("write_highlights", ManagedRouted),
     ("write_pdf_view_state", ManagedRouted),
 ];
+
+/// The flight recorder accepts only names from the shipped IPC surface. This
+/// prevents a caller from smuggling graph text or paths into a diagnostic
+/// event through the nominally structured `command` field.
+pub(crate) fn is_known_command(command: &str) -> bool {
+    MANAGED_COMMAND_SURFACE
+        .iter()
+        .any(|(known, _)| *known == command)
+}
 
 /// Every command that a managed binding refuses outright, with the reason it
 /// is still refused. Derived from the table above by the tests, and asserted

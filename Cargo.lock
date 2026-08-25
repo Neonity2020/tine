@@ -5630,6 +5630,7 @@ dependencies = [
  "clipboard-rs",
  "dirs",
  "ed25519-dalek",
+ "fs2",
  "gdkwayland-sys",
  "gtk",
  "jni 0.21.1",

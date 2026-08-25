@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Privacy-safe diagnostic reports** (GH #343). Every production build now
+  retains a bounded current-and-previous-run flight recorder of fixed operation
+  names, outcomes, timings and counts. Settings → Diagnostics previews the JSON
+  before the user chooses to copy or save it; nothing is uploaded automatically,
+  and graph content, paths, page titles, queries, URLs and credentials are
+  excluded by the recorder API. Release CI also retains exact-commit native
+  symbols and hidden frontend source maps outside the shipped packages.
+
 - **Experimental 32-bit Windows packages** (GH #275). Releases now produce an
   `i686-pc-windows-msvc` installer and portable ZIP for older Windows 10 tablets.
   The pilot is deliberately excluded from automatic updates until it has been
