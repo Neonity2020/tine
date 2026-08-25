@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { execFileSync } from "node:child_process";
+import { assertOpaquePng } from "./lib/opaque-png.mjs";
 
 const root = process.cwd();
 const source = path.join(root, "src-tauri", "Tine.ios.entitlements");
@@ -86,6 +87,7 @@ for (const filename of iconFilenames) {
   if (!fs.existsSync(trackedIcon)) {
     throw new Error(`generated iOS catalog requires missing tracked icon: ${trackedIcon}`);
   }
+  assertOpaquePng(trackedIcon, `tracked iOS icon ${filename}`);
   fs.copyFileSync(trackedIcon, path.join(generatedIconCatalog, filename));
 }
 console.log(`installed ${iconFilenames.length} tracked Tine icons in the generated iOS catalog`);
