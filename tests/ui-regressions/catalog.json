@@ -3503,6 +3503,31 @@
       "notes": "GH #299. Android's native window had no Tine-colored backing resource before the WebView painted, index.html had an empty root until startup dependencies completed, and Page rendered a 50vh placeholder with no visible content while a route load was pending. The contract preserves cached plugin-revocation verification before activation and keeps actual page-load errors visible."
     },
     {
+      "id": "UI-DIRECT-PAGE-NAVIGATION-WORK-356",
+      "title": "Rapid Direct Files page navigation avoids redundant or superseded physical reads without weakening external-change freshness",
+      "family": "performance",
+      "sources": {
+        "issues": [
+          356
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows",
+        "all"
+      ],
+      "layer": "native",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx"
+        ],
+        "scenario": "navigation.direct-files-superseded-read-work",
+        "failBefore": "reconstructed"
+      },
+      "notes": "GH #356 remains open. A test-only exact Direct Files probe on 2026-08-25 measured three warm Alpha-Beta-Alpha loads as three physical content reads, six exact-target parse attempts, and three validation-target reads with no cache-generation change. Page already rejects an obsolete response after its backend work finishes, but Tauri invoke offers no cancellation here. The watcher and focus-rescan paths are the ordinary freshness authorities, yet a route read is currently an additional observation between external mutation and watcher/focus delivery. A cache or cancellation fast path therefore needs an explicit freshness contract and a realistic Windows graph measurement before changing native behavior; the themed pending-page surface from GH #299 only makes this work visible and does not claim to fix the CPU report."
+    },
+    {
       "id": "UI-LSDOC-ARTIFACT-CANONICALIZATION-001",
       "title": "Help improve Tine rejects oracle-artifact reports after canonical JSON normalization",
       "family": "diagnostics",
