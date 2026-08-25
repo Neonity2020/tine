@@ -2,7 +2,7 @@
 // authoritative (round-trip); these are computed projections.
 
 import type { Format } from "./ast";
-import { MARKERS } from "../markers";
+import { MARKERS, matchLeadingMarker } from "../markers";
 import { parsePageHeaderPropertyLine, splitPagePreamble } from "../editor/properties";
 
 export { MARKERS };
@@ -178,14 +178,10 @@ export function visibleBody(raw: string): string[] {
   }
   if (lines.length === 0) lines.push("");
   // Strip the marker / priority / heading prefix from the first line (chrome that
-  // facetsOf surfaces separately).
+  // facetsOf surfaces separately) via the one shared lsdoc-equivalent recognizer.
   let first = lines[0];
-  for (const m of MARKERS) {
-    if (first === m || first.startsWith(m + " ")) {
-      first = first.slice(m.length).replace(/^ /, "");
-      break;
-    }
-  }
+  const markerMatch = matchLeadingMarker(first);
+  if (markerMatch) first = first.slice(markerMatch.end).replace(/^ /, "");
   const pm = /^\[#[ABC]\]\s?/.exec(first);
   if (pm) first = first.slice(pm[0].length);
   const hm = /^(#{1,6}) /.exec(first);

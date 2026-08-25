@@ -61,7 +61,7 @@ import { journalTitle } from "./journal";
 import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden, hideAll, isPropertiesOnly, isPageHeaderPropertiesOnly, parsePageHeaderPropertyLine, splitPagePreamble } from "./editor/properties";
 import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
 import { trimBlockTrailingSpace } from "./editor/format";
-import { OPEN_MARKERS, MARKER_RE } from "./markers";
+import { OPEN_MARKERS, leadingMarker } from "./markers";
 import {
   editingId,
   endEdit,
@@ -6863,9 +6863,10 @@ export async function moveSelectionItems(dir: 1 | -1) {
 // ---------------------------------------------------------------------------
 
 function isOpenTask(id: string): boolean {
-  // Leading task marker via the one markers.ts recognizer (vocabulary == lsdoc's, so
-  // no disagreement) — parser-free, so carry works without the wasm renderer up.
-  const m = MARKER_RE.exec((doc.byId[id]?.raw ?? "").trimStart())?.[1];
+  // Leading task marker via the one markers.ts recognizer — byte-equivalent to
+  // what the lsdoc boundary projects (DUP-7), so carry and the rendered checkbox
+  // cannot disagree — and parser-free, so carry works without the wasm renderer up.
+  const m = leadingMarker(doc.byId[id]?.raw ?? "");
   return !!m && OPEN_MARKERS.has(m);
 }
 function subtreeHasOpenTask(id: string): boolean {
