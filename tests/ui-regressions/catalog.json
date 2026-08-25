@@ -7936,6 +7936,28 @@
         "failBefore": "proven"
       },
       "notes": "GH #354 (Windows 11, Direct Files, v0.6.93): clicking a block bullet stamps a missing durable id and starts its guarded save before navigating to the block route. The route loader then re-read the same file's pre-save bytes and treated them as a competing page instance, producing the misleading unsaved-changes/other-file refusal. PageView now reuses only a block zoom's already-loaded exact path-aware owner. Component coverage drives the literal bullet click while its durable-id save is pending and proves no second read or refusal, then covers transient-live/durable identity resolution, restored-route disk loading when the owner is absent, and fail-closed handling of a different same-name physical owner."
+    },
+    {
+      "id": "UI-ANDROID-PAGE-DELETE-HANDOFF-376",
+      "title": "Android page deletion never paints an empty deleted route between durable trash and its fallback route",
+      "family": "page-deletion-lifecycle",
+      "sources": {
+        "issues": [376],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "render",
+      "status": "reproduced",
+      "coverage": {
+        "tests": [
+          "src/components/ContextMenu.test.tsx"
+        ],
+        "scenario": "android.page-delete-durable-route-handoff",
+        "failBefore": "proven"
+      },
+      "notes": "GH #376 reports two serial waits on Android v0.6.96: the current note remains visible for 2–3 seconds after confirmation, then an unexplained black state appears for another 1–2 seconds before the fallback. This is not GH #356, which is an intermittent Windows Direct Files page-switch CPU/blank report. Literal fail-before resolves the native delete promise one job at a time: after the store's durable-response continuation, page P is already absent while the current pane route still names P; only ContextMenu's following `.then` retires that route. Android WebView can paint this semantically empty cut. The fix must keep dirty quiescence, native durable trash and failures ahead of any navigation, then retire every exact pane route in the same durable continuation before purging the page. Failed/conflicted draft retention, journal restoration and Direct Files remain unchanged. Debug timing must distinguish confirmation, flush, native command, durable response, route retirement, fallback fetch and first paint; physical Android timing remains the final evidence boundary."
     }
   ]
 }

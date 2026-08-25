@@ -8,6 +8,7 @@ import {
   doc,
   extendSelectionTo,
   markDirty,
+  pageByName,
   resetStore,
   selectBlock,
   selectedIds,
@@ -26,7 +27,7 @@ import {
 import { clearTransientLayersForTest, dismissTopTransient } from "../transientLayers";
 import { backend } from "../backend";
 import { clearClipboardPayload, peekClipboardPayload } from "../clipboard";
-import { tabs } from "../router";
+import { mainPaneRouter, tabs } from "../router";
 
 describe("PageMenu page-kind availability", () => {
   it("keeps rename page-only but exposes delete for pages and journals", () => {
@@ -433,5 +434,34 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
 
     expect(text).not.toContain("unsaved");
     expect(text).toContain(".tine-trash");
+  });
+
+  it("retires the current route in the durable-delete continuation before purging its page", async () => {
+    load();
+    mainPaneRouter.resetTabsToJournals();
+    mainPaneRouter.openPage("P", "page", { inPlace: true });
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    let resolveDelete!: () => void;
+    vi.spyOn(backend(), "deletePage").mockImplementation(() => new Promise<void>((resolve) => {
+      resolveDelete = resolve;
+    }));
+    const dispose = mount(() => <ContextMenu />);
+
+    openPageContextMenu(10, 10, "P", "page");
+    document.querySelector<HTMLElement>('[data-page-action-id="delete-page"]')!.click();
+    await vi.waitFor(() => expect(backend().deletePage).toHaveBeenCalledTimes(1));
+    expect(mainPaneRouter.route()).toMatchObject({ kind: "page", name: "P" });
+    expect(pageByName("P")).toBeDefined();
+
+    resolveDelete();
+    // One continuation is the store's durable response. The menu's chained
+    // `.then` is deliberately still pending here: on Android WebView the DOM can
+    // paint between those two jobs, exposing an empty black current route.
+    await Promise.resolve();
+
+    expect(mainPaneRouter.route()).toEqual({ kind: "journals" });
+    expect(pageByName("P")).toBeUndefined();
+    dispose();
+    mainPaneRouter.resetTabsToJournals();
   });
 });
