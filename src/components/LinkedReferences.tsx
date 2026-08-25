@@ -20,6 +20,7 @@ import {
 } from "../referenceSectionState";
 import { pageIdentityKey } from "../pageIdentity";
 import { mergeReferenceGroups } from "../lib/referenceGroups";
+import { ReferenceExportChooser } from "./ReferenceExportChooser";
 
 // One identity fold for chips, filters, and group merging (DUP-2/DUP-8): the
 // old private `norm` (trim+toLowerCase) split NFC/NFD and boundary-slash
@@ -127,6 +128,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     });
   };
   const [filterOpen, setFilterOpen] = createSignal(false);
+  const [exportChooserOpen, setExportChooserOpen] = createSignal(false);
   const [searchDraft, setSearchDraft] = createSignal("");
   const [searchQuery, setSearchQuery] = createSignal("");
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -351,6 +353,15 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
       }
     >
     <Show when={groups() && mergedGroups().length > 0}>
+      <Show when={exportChooserOpen()}>
+        {/* GH #348: batch export honors the visible (filtered) set, matching
+            what the section actually shows the user right now. */}
+        <ReferenceExportChooser
+          subject="Linked References"
+          groups={shown()}
+          onClose={() => setExportChooserOpen(false)}
+        />
+      </Show>
       <div class="linked-references">
         <div class="references-header" onClick={() => setCollapsedOverride(!collapsed())}>
           <span class="ref-collapse" classList={{ collapsed: collapsed() }}>
@@ -359,6 +370,18 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
             </svg>
           </span>
           Linked References <span class="references-count">{count()}</span>
+          <button
+            type="button"
+            class="reference-export-toggle"
+            aria-label="Copy / export linked references"
+            title="Copy / export selected linked references"
+            onClick={(event) => {
+              event.stopPropagation();
+              setExportChooserOpen(true);
+            }}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="currentColor" /></svg>
+          </button>
           <button
             type="button"
             class="reference-filter-toggle"

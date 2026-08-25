@@ -19,6 +19,7 @@ import {
 } from "../referenceSectionState";
 import { pageIdentityKey } from "../pageIdentity";
 import { mergeReferenceGroups } from "../lib/referenceGroups";
+import { ReferenceExportChooser } from "./ReferenceExportChooser";
 
 
 type BoundedEvidence = NonNullable<RefGroup["evidence"]>[number] & {
@@ -40,6 +41,7 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
     setOpenSignal(value);
   };
   const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
+  const [exportChooserOpen, setExportChooserOpen] = createSignal(false);
   const [collapsedGroupsSignal, setCollapsedGroupsSignal] =
     createSignal<Set<string>>(collapsedGroupsFor("unlinked", props.name));
   const collapsedGroups = collapsedGroupsSignal;
@@ -104,7 +106,27 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
           <span class="references-count">{count()}</span>
         </Show>
         <Show when={groups.loading}><span class="references-loading"> Loading…</span></Show>
+        <button
+          type="button"
+          class="reference-export-toggle"
+          aria-label="Copy / export unlinked references"
+          title="Copy / export selected unlinked references"
+          disabled={!count()}
+          onClick={(event) => {
+            event.stopPropagation();
+            setExportChooserOpen(true);
+          }}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="currentColor" /></svg>
+        </button>
       </div>
+      <Show when={exportChooserOpen()}>
+        <ReferenceExportChooser
+          subject="Unlinked References"
+          groups={mergedGroups()}
+          onClose={() => setExportChooserOpen(false)}
+        />
+      </Show>
       <Show when={open()}>
         <Show when={loadError()}>
           <div class="reference-filter-error reference-error" role="alert">

@@ -95,6 +95,62 @@ describe("ExportModal content choice (GH #352)", () => {
   });
 });
 
+describe("ExportModal page export boundary (GH #348)", () => {
+  const node = (id: string, raw: string, parent: string | null, children: string[]): StoreNode => ({
+    id, raw, collapsed: false, parent, page: "P", children,
+  });
+
+  beforeEach(() => {
+    localStorage.clear();
+    setDoc({
+      byId: {
+        root: node("root", "Page body text", null, ["child"]),
+        child: node("child", "Child body text", "root", []),
+      },
+      pages: [{ name: "P", kind: "page", title: "P", preBlock: null, roots: ["root"], format: "md", readOnly: false, guide: false }],
+      feed: ["P"],
+      loaded: true,
+    });
+  });
+
+  afterEach(() => {
+    closeExportModal();
+    clearTransientLayersForTest();
+    resetStore();
+    document.body.innerHTML = "";
+    vi.restoreAllMocks();
+  });
+
+  it("normal page export stays unchanged and never silently includes references", async () => {
+    // Linked references exist as backend data, but page export reads only the
+    // page's own blocks — references join output only through the reference
+    // batch export, never implicitly.
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([{
+      page: "Elsewhere",
+      kind: "page",
+      blocks: [{ id: "x1", raw: "backlink-only phrase", collapsed: false, children: [] }],
+    }]);
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <ExportModal />, root);
+
+    openExportModal(["root"]);
+    await Promise.resolve();
+
+    const markdown = [...document.querySelectorAll<HTMLButtonElement>(".export-indent-btn")]
+      .find((b) => b.textContent?.trim() === "Markdown");
+    markdown!.click();
+    await Promise.resolve();
+    const preview = document.querySelector<HTMLTextAreaElement>(".export-preview")!.value;
+    expect(preview).toContain("Page body text");
+    expect(preview).toContain("Child body text");
+    expect(preview).not.toContain("backlink-only phrase");
+    expect(preview).not.toContain("Elsewhere");
+
+    dispose();
+  });
+});
+
 describe("ExportModal formats", () => {
   const node = (id: string, raw: string, parent: string | null, children: string[]): StoreNode => ({
     id, raw, collapsed: false, parent, page: "P", children,

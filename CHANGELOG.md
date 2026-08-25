@@ -80,6 +80,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Batch copy/export for references** (GH #348). Linked References and
+  Unlinked References each have an explicit export affordance: every entry is
+  pre-selected for copy-all, uncheck for a subset, and the familiar Copy /
+  export modal (Text, OPML, HTML, with the usual content/indent/depth/cleanup
+  options) produces the selected blocks grouped by their source page. The two
+  sections act independently, Linked honors its active filters, and normal page
+  export is unchanged — references are never included unless you ask.
 - **Favorites nest to any depth** (GH #102). A group can hold groups, and a
   favorite can hold favorites; drag a row to the right to nest it, to the left
   to lift it out. Depth is measured from where the drag started, so a plain
