@@ -4867,8 +4867,11 @@ export interface LoadedBlockRef {
 }
 
 /** Resolve a durable external UUID back to the current live store key. The page
- * descriptor is part of the identity: even a direct `byId[uuid]` hit is rejected
- * when it belongs to another page kind or physical path. */
+ * descriptor is part of the identity. Authored `id::`/`:id:` claims take
+ * precedence over UUID-shaped runtime locators: after structural edits, a
+ * locator can be reused by another sibling while the authored ID stays with the
+ * intended block. Ambiguous authored claims fail closed; an ID-less runtime key
+ * is only a fallback when no authored block claims the UUID (GH #373). */
 export function resolveBlockRef(ref: LoadedBlockRef): string | null {
   const owner = pageByName(ref.page);
   if (
@@ -4877,24 +4880,34 @@ export function resolveBlockRef(ref: LoadedBlockRef): string | null {
     || (ref.path !== undefined && owner.path !== ref.path)
   ) return null;
 
-  const matches = (id: string): boolean => {
-    const node = doc.byId[id];
-    return !!node && node.page === ref.page && blockExternalId(id) === ref.uuid;
-  };
-  if (matches(ref.uuid)) return ref.uuid;
-
   const stack = [...owner.roots];
   const seen = new Set<string>();
+  let authoredClaim: string | null = null;
   while (stack.length) {
     const id = stack.pop()!;
     if (seen.has(id)) continue;
     seen.add(id);
     const node = doc.byId[id];
     if (!node || node.page !== ref.page) continue;
-    if (matches(id)) return id;
+    if (existingBlockId(node.raw, formatForBlock(id)) === ref.uuid) {
+      // A second authored claimant is ambiguous. Never guess, and never rewrite
+      // either block merely because a route exposed the conflict.
+      if (authoredClaim !== null) return null;
+      authoredClaim = id;
+    }
     stack.push(...node.children);
   }
-  return null;
+  if (authoredClaim !== null) return authoredClaim;
+
+  // Structural/runtime locators are a compatibility fallback, not durable
+  // external identity. Once a block has any authored ID, its runtime key must
+  // not also resolve as a second identity.
+  const runtime = doc.byId[ref.uuid];
+  return runtime
+    && runtime.page === ref.page
+    && existingBlockId(runtime.raw, formatForBlock(ref.uuid)) === null
+    ? ref.uuid
+    : null;
 }
 
 /** `raw` with a durable `id` property added in the page's on-disk format.
@@ -5014,19 +5027,39 @@ export function blockRef(id: string): LoadedBlockRef {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Ensure a block has a durable external UUID synchronously, while deliberately
- * leaving its live store key unchanged. Existing ids win; otherwise a fresh
- * transient key receives a UUID in the page's Markdown/Org property syntax. */
+ * leaving its live store key unchanged. Existing ids win; otherwise the block
+ * always receives a fresh UUID in the page's Markdown/Org property syntax.
+ * Runtime keys can themselves be deterministic UUIDs, but remain locators and
+ * must never be persisted as authored identity (GH #373). */
 export function ensureStableBlockId(id: string): string | null {
   const node = doc.byId[id];
   if (!node || !blockWritable(id)) return null;
   const fmt = formatForBlock(id);
   const existing = existingBlockId(node.raw, fmt);
   if (existing) return existing;
-  const uuid = UUID_RE.test(id) ? id : crypto.randomUUID();
+  const uuid = crypto.randomUUID();
   setDoc("byId", id, "raw", rawWithBlockId(node.raw, uuid, fmt));
   markDirty(node.page);
   // Persist now, not on the 400ms debounce: the user may quit right after
   // parking the block, and a pending timer is lost when the webview closes.
+  void flushPage(node.page);
+  return uuid;
+}
+
+/** Stamp the exact external ID already committed by an inline `((uuid))`
+ * reference. This is deliberately narrower than `ensureStableBlockId`: callers
+ * choose the external value before committing the source text. At this boundary
+ * that value is external identity even if it happens to equal the target DTO's
+ * runtime locator. Deferred stamping must preserve it exactly or the
+ * already-visible reference would dangle. */
+function ensureCommittedBlockRefId(id: string, uuid: string): string | null {
+  const node = doc.byId[id];
+  if (!node || !blockWritable(id)) return null;
+  const fmt = formatForBlock(id);
+  const existing = existingBlockId(node.raw, fmt);
+  if (existing) return existing === uuid ? existing : null;
+  setDoc("byId", id, "raw", rawWithBlockId(node.raw, uuid, fmt));
+  markDirty(node.page);
   void flushPage(node.page);
   return uuid;
 }
@@ -5108,7 +5141,7 @@ export async function persistBlockRefTarget(
   const id = resolveBlockRef(ref);
   if (id) {
     pendingBlockRefStamps.delete(uuid);
-    ensureStableBlockId(id);
+    ensureCommittedBlockRefId(id, uuid);
   }
 }
 

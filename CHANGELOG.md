@@ -43,6 +43,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   inode from a sync service or second Tine, ambiguous events, and portable
   case/NFC collisions remain fail-closed (GH #374, follow-up to GH #366).
 
+- **Block zoom keeps pointing at the intended block after siblings are inserted
+  or reordered.** Tine now keeps its deterministic, UUID-shaped runtime
+  locators separate from authored `id::` / Org `:id:` identity, resolves the
+  unique authored claimant first, and refuses ambiguous duplicate authored IDs
+  instead of guessing. Existing graphs are not rewritten (GH #373).
+
 - **Windows self-update now follows the system proxy route and shows one update
   offer at a time.** The native updater already used the Windows trust store,
   but its reduced feature set omitted Reqwest's separate Windows system-proxy

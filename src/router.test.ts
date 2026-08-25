@@ -23,7 +23,7 @@ import {
   replaceActiveRoute,
 } from "./router";
 import { setNavReuseTabs } from "./navSettings";
-import { setDoc } from "./store";
+import { doc, setDoc } from "./store";
 
 // The router holds singleton tab state, so reset to a single unpinned journals
 // tab before each test. confirm() is stubbed true so closing pinned tabs (which
@@ -312,6 +312,8 @@ describe("path-pinned routes (#21 — reach a duplicate-day stray)", () => {
   it("retains the loaded physical owner while zooming into and back out of a block", () => {
     const path = "pages/client-b/Twin.md";
     const id = "11111111-1111-4111-8111-111111111111";
+    const external = "22222222-2222-4222-8222-222222222222";
+    const random = vi.spyOn(crypto, "randomUUID").mockReturnValue(external);
     setDoc({
       byId: {
         [id]: { id, raw: "Client B", collapsed: false, parent: null, page: "Twin", children: [] },
@@ -326,10 +328,13 @@ describe("path-pinned routes (#21 — reach a duplicate-day stray)", () => {
     openFile(path, "Twin", "page");
 
     focusBlock(id);
-    expect(route()).toEqual({ kind: "page", name: "Twin", pageKind: "page", path, block: id });
+    expect(route()).toEqual({ kind: "page", name: "Twin", pageKind: "page", path, block: external });
+    expect(route()).not.toMatchObject({ block: id });
+    expect(doc.byId[id].raw).toBe(`Client B\nid:: ${external}`);
 
     focusBlock(null);
     expect(route()).toEqual({ kind: "page", name: "Twin", pageKind: "page", path });
+    random.mockRestore();
   });
 });
 
