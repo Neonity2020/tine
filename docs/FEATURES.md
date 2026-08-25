@@ -678,8 +678,10 @@ within a column; merged cells are still v2+.
   bullet rails. No extra dependency — it reuses the HTML export and the webview's own
   print engine. (Matches what the Logseq PDF-export community plugin did; OG has no
   native PDF export.)
-- **Copy/export as** Markdown for a block subtree or a whole page, with a *Rendered*
-  mode that flattens to what you see. Rendered copy keeps math delimiters (`$…$`,
+- **Copy/export as** Markdown for a block subtree or a whole page, with an explicit
+  *Content* choice: **Markdown** (or **Org** on an Org page) preserves the original
+  source syntax exactly — bold, highlighting, links, properties — while **Plain
+  text** flattens to what you see. Plain-text copy keeps math delimiters (`$…$`,
   `$$…$$`) so pasted math is re-parseable, pre-warms off-screen `((block ref))`
   targets before copy, and resolves user macros plus provider macros with sensible
   text forms: `{{embed}}` inlines the target, `{{query}}` emits a capped result list

@@ -6529,6 +6529,34 @@
       "notes": "Internal report (Martin, 2026-08-25): texts of page action controls such as the journal carry-over buttons became part of ordinary dragged text selections. The title-row controls — carry-over buttons, tag-table toggle, guide copy button and the ⋯ page-actions trigger — now opt out of native selection in both standard and WebKit-prefixed CSS while remaining ordinary activatable buttons (pointer events and keyboard focus are untouched; the icon-only favorite star contributes no selection text and is intentionally out of scope). Page and block content remains selectable."
     },
     {
+      "id": "UI-EXPORT-CONTENT-PRESERVE-CHOICE-352",
+      "title": "Copy / export as… offers an explicit preserve-Markdown/Org content choice next to cleaned plain text",
+      "family": "copy-export",
+      "sources": {
+        "issues": [
+          352
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "android",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ExportModal.test.tsx",
+          "src/editor/exportText.test.ts"
+        ],
+        "scenario": "copy-export.content-preserve-explicit-choice",
+        "failBefore": "proven"
+      },
+      "notes": "Current-state preflight: the reporter's v0.6.93 already contained the Content choice (Rendered cleaned / Source preserved, shipped 2026-07-02), but nothing on the modal said 'Markdown' or 'plain text', so the preserve option was undiscoverable — the harm is the invisible choice, the transformation itself already preserved source exactly. The Content buttons now name the outcome: Plain text (cleaned, default retained) and Markdown — format-aware, so an Org forest offers Org — with hints echoing the issue's preserve/clean wording; the two moot-toggle tooltips use the same vocabulary. Modal render tests prove both directions at the block entry point (explicit labels present; preserve keeps **bold**, [[links]], property lines, ==highlight==; default cleans them), the page entry point shares the one modal (ContextMenu.test.tsx covers both routings), and pure exportText tests pin byte-exact preservation of representative inline formatting, nested blocks, and Org emphasis/drawers."
+    },
+    {
       "id": "UI-NAV-REVEAL-COLLAPSED-BLOCK-258",
       "title": "Navigating to a block nested inside collapsed parents expands its ancestors, scrolls to it and highlights it",
       "family": "navigation",

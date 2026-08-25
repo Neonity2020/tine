@@ -111,4 +111,48 @@ describe("exportOutline", () => {
       ),
     ).toBe("first\nsecond");
   });
+
+  // GH #352 — the modal's explicit Content choice must preserve OR clean the
+  // source syntax; these pin the pure-transformation half of both directions.
+  // (The companion ExportModal.test.tsx cases pin that the choice is offered
+  // with explicit Plain text / Markdown(/Org) labels.)
+  describe("GH #352 content choice: preserve Markdown/Org source vs clean it", () => {
+    const FORMATTED: ExportNode[] = [
+      {
+        raw: "**bold** _it_ ~~strike~~ ==high== `code` [[Some Page]] #tag\nnote:: 7",
+        children: [{ raw: "nested **child**", children: [] }],
+      },
+    ];
+
+    it("preserve keeps inline markers, properties, and nested blocks byte-exact (Markdown)", () => {
+      expect(exportOutline(FORMATTED, opt({}))).toBe(
+        "- **bold** _it_ ~~strike~~ ==high== `code` [[Some Page]] #tag\n  note:: 7\n\t- nested **child**",
+      );
+    });
+
+    it("clean (rendered plain text) drops the markup markers, keeps the words", () => {
+      const flat = exportOutline(FORMATTED, opt({ content: "rendered", indent: "no-indent" }));
+      expect(flat).toContain("bold");
+      expect(flat).toContain("strike");
+      expect(flat).toContain("high");
+      expect(flat).toContain("nested child");
+      expect(flat).not.toContain("**");
+      expect(flat).not.toContain("~~");
+      expect(flat).not.toContain("==");
+    });
+
+    it("preserve keeps Org emphasis, drawers, and structure (Org)", () => {
+      const nodes: ExportNode[] = [
+        { raw: "*bold* /ital/ _under_ +strike+\n:PROPERTIES:\n:foo: bar\n:END:", format: "org", children: [] },
+      ];
+      expect(exportOutline(nodes, opt({}))).toBe(
+        "- *bold* /ital/ _under_ +strike+\n  :PROPERTIES:\n  :foo: bar\n  :END:",
+      );
+    });
+
+    it("preserve is the ENTIRE raw source: exactly the lines on disk, re-outlined", () => {
+      const nodes: ExportNode[] = [{ raw: "a\nb\n\n c", children: [] }];
+      expect(exportOutline(nodes, opt({ indent: "no-indent" }))).toBe("a\nb\n\n c");
+    });
+  });
 });
