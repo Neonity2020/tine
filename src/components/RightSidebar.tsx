@@ -22,7 +22,8 @@ import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } fr
 import { mobileDrawerMode } from "../mobileDrawers";
 import { registerTransientLayer } from "../transientLayers";
 import { MobileDrawerPanel, dismissDrawerAndRestore } from "./MobileDrawerShell";
-import { openPageTarget, openPageAtBlock } from "../router";
+import { openPageTarget, openPageAtBlock, openPageTargetInNewTab } from "../router";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { EmojiText } from "../render/emoji";
 import { backend } from "../backend";
 import { doc, ensurePageLoaded, onPageBecameReplaceable, pageByName, resolveBlockRef } from "../store";
@@ -377,10 +378,21 @@ function PageItem(props: {
         <button class="rs-item-toggle" type="button" aria-label={props.collapsed ? "Expand sidebar item" : "Collapse sidebar item"} aria-expanded={!props.collapsed} aria-controls={bodyId} data-right-sidebar-item-toggle onClick={(event) => props.onToggle(event.currentTarget)}>
           <span aria-hidden="true">▸</span>
         </button>
-        <a class="rs-item-title" onClick={() => {
-          if (rowReorderClickSuppressed()) return;
-          openPageTarget({ name: props.item.name, pageKind: props.item.pageKind, path: props.item.path });
-        }}>
+        <a
+          class="rs-item-title"
+          onMouseDown={internalLinkMouseDown}
+          onClick={(e) => {
+            if (rowReorderClickSuppressed()) return;
+            const target = { name: props.item.name, pageKind: props.item.pageKind, path: props.item.path };
+            // The shift destination (right sidebar) is meaningless for a title
+            // already IN the sidebar, so it keeps the ordinary navigation.
+            if (internalLinkDest(e) === "background") openPageTargetInNewTab(target);
+            else openPageTarget(target);
+          }}
+          onAuxClick={(e) => internalLinkAuxClick(e, () =>
+            openPageTargetInNewTab({ name: props.item.name, pageKind: props.item.pageKind, path: props.item.path })
+          )}
+        >
           <EmojiText text={props.item.name} />
         </a>
         <button class="rs-close" onClick={props.onClose} title="Close">

@@ -8196,6 +8196,54 @@
     "scenario": null,
     "failBefore": "proven"
    }
+  },
+  {
+   "id": "UI-INTERNAL-LINK-GESTURE-207",
+   "title": "Plain, Shift, Ctrl/Cmd and middle-click behave identically on every internal page/block link surface, with the middle/shift mousedown defaults suppressed up front",
+   "family": "navigation-links",
+   "sources": {
+    "issues": [
+     207
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/linkGestureSurfaces.test.tsx"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #283 established one modified-click decision (linkGesture.internalLinkDest) but left the mousedown suppression and the auxclick half per-surface; several surfaces (Unlinked Reference page headers, namespace macro/hierarchy links, zoom breadcrumb, right-sidebar item titles, query search-presentation rows) kept plain-click-only behavior, and sidebar/reference/query rows that did open a background tab still let the middle mousedown reach the browser (Windows autoscroll / Linux PRIMARY-paste), while the page title's Ctrl/Cmd+click fell through to an ordinary open. The shared root contract now also owns the mousedown guard (internalLinkMouseDown) and the auxclick dispatch (internalLinkAuxClick), and every page-reference/page-title surface routes through them. Browser autoscroll itself is not observable in jsdom; the semantic proxy asserted here is (a) middle-mousedown defaultPrevented and (b) auxclick opening a background tab without moving the foreground - the two paths the real browser maps to autoscroll and open-in-new-tab."
+  },
+  {
+   "id": "UI-SPLIT-PANE-LAST-TAB-CLOSE-207",
+   "title": "A split pane's only tab keeps a visible close control and closes the pane directly",
+   "family": "tabs",
+   "sources": {
+    "issues": [
+     207
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/TabBar.test.tsx::TabBar close control on a split pane's only tab (GH #207)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "The tab strip hid the close button whenever a pane held a single tab, so after one split it was impossible to close either pane without first dragging a tab across. closeTab already delegated a lone non-feed tab to closePane; the strip now shows the control exactly when closing is effective (any multi-tab strip, or a lone non-feed tab while the layout has multiple panes). The window's very last tab and a feed pane's last tab still hide it, matching the established feed invariant."
   }
  ]
 }

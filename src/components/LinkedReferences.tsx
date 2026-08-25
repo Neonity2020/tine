@@ -5,7 +5,7 @@ import { openPageInSidebar, openPageContextMenu } from "../ui";
 import { LiveRefGroup } from "./LiveRefGroup";
 import type { BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
-import { internalLinkDest } from "../linkGesture";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
 import {
   classifyReferenceLoadError,
@@ -474,18 +474,14 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                   <button
                     type="button"
                     class="reference-page"
+                    onMouseDown={internalLinkMouseDown}
                     onClick={(e) => {
                       const dest = internalLinkDest(e);
                       if (dest === "sidebar") openPageInSidebar(group().page, group().kind);
                       else if (dest === "background") openPageInNewTab(group().page, group().kind);
                       else openPage(group().page, group().kind);
                     }}
-                    onAuxClick={(e) => {
-                      if (e.button === 1) {
-                        e.preventDefault();
-                        openPageInNewTab(group().page, group().kind);
-                      }
-                    }}
+                    onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(group().page, group().kind))}
                     onContextMenu={(e) => {
                       if (!shouldOpenTextContextMenu(e.target)) return;
                       e.preventDefault();

@@ -11,6 +11,12 @@
 // Combined modifiers deliberately keep plain-click meaning (matching
 // GH #288's switcher guard chain) and interfaces stay modifier-free: there is
 // no setting for this contract (Martin's approved product decision).
+//
+// GH #207 made the two halves around the click decision equally shared:
+// `internalLinkMouseDown` (the default-suppression a gesture needs BEFORE the
+// click finishes) and `internalLinkAuxClick` (the completed middle-click).
+// Surfaces that skipped either half showed browser autoscroll / PRIMARY-paste
+// or plain-click-only behavior instead of the contract.
 export type InternalLinkDest = "default" | "sidebar" | "background";
 
 export function internalLinkDest(
@@ -20,4 +26,30 @@ export function internalLinkDest(
   if (e.shiftKey && !e.ctrlKey && !e.metaKey) return "sidebar";
   if (!e.shiftKey && (e.ctrlKey || e.metaKey)) return "background";
   return "default";
+}
+
+/** The mousedown half of the contract: suppress the browser defaults that the
+ *  destinations replace — shift-range text selection when Shift+click opens
+ *  the sidebar (GH #42), and middle-button autoscroll (Windows) /
+ *  PRIMARY-paste (Linux) when middle-click opens a background tab. Every
+ *  internal-link surface runs its onMouseDown through this so the suppression
+ *  cannot drift per surface (GH #207). */
+export function internalLinkMouseDown(
+  e: Pick<MouseEvent, "shiftKey" | "button" | "preventDefault">,
+): void {
+  if (e.shiftKey || e.button === 1) e.preventDefault();
+}
+
+/** The auxclick half: a completed middle-click resolves to the background-tab
+ *  destination on EVERY internal-link surface (GH #207). `openBackground` is
+ *  the surface's own tab-opening action. Returns true when the event was
+ *  consumed, so surfaces that also stopPropagation can do so conditionally. */
+export function internalLinkAuxClick(
+  e: Pick<MouseEvent, "button" | "preventDefault">,
+  openBackground: () => void,
+): boolean {
+  if (e.button !== 1) return false;
+  e.preventDefault();
+  openBackground();
+  return true;
 }

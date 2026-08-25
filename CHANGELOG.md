@@ -29,6 +29,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Page-link gestures are the same everywhere.** Middle-click now opens a
+  background tab from every page reference and page title — unlinked-reference
+  page headers, namespace macro and hierarchy links, the zoom breadcrumb,
+  right-sidebar item titles, query search-result rows, and the page title's
+  Ctrl/Cmd+click all behaved differently (plain-click only, or autoscroll on
+  Windows). Shift+click still opens the sidebar and plain click still navigates
+  (GH #207).
+- **A split pane's only tab keeps its close button.** The tab strip hid the ✕
+  whenever a pane held a single tab, so after one split neither pane could be
+  closed without first dragging a tab across. The ✕ now shows whenever closing
+  actually works: any multi-tab strip, or a lone non-feed tab whose pane can
+  close (GH #207).
 - **Managed Storage and Direct Files answer the same query the same way.** The
   two storage modes evaluated block queries through separate copies of the same
   logic, and the copies had drifted: a byte-budgeted block-referrers panel

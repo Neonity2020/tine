@@ -1,6 +1,9 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { openPage } from "../router";
+import { openPage, openPageInNewTab } from "../router";
+import { openPageContextMenu, openPageInSidebar } from "../ui";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
+import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { ReferenceExcerptBlocks } from "./ReferenceEvidence";
 import type { RefGroup } from "../types";
 import {
@@ -132,7 +135,23 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
                 >
                   {groupCollapsed(g) ? "▸" : "▾"}
                 </button>
-                <button type="button" class="reference-page" onClick={() => openPage(g.page, g.kind)}>
+                <button
+                  type="button"
+                  class="reference-page"
+                  onMouseDown={internalLinkMouseDown}
+                  onClick={(e) => {
+                    const dest = internalLinkDest(e);
+                    if (dest === "sidebar") openPageInSidebar(g.page, g.kind);
+                    else if (dest === "background") openPageInNewTab(g.page, g.kind);
+                    else openPage(g.page, g.kind);
+                  }}
+                  onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(g.page, g.kind))}
+                  onContextMenu={(e) => {
+                    if (!shouldOpenTextContextMenu(e.target)) return;
+                    e.preventDefault();
+                    openPageContextMenu(e.clientX, e.clientY, g.page, g.kind);
+                  }}
+                >
                   {g.page}
                 </button>
               </div>
