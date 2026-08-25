@@ -11530,6 +11530,56 @@ impl Graph {
         entries
     }
 
+    /// Publish the exact physical/effective page inventory already represented by
+    /// the warm parsed cache. This is used only after a successful scoped cache
+    /// mutation; watcher parse failures deliberately leave the memo absent so a
+    /// later listing revalidates the failed path from disk.
+    fn publish_warm_page_inventory(&self, generation: u64) {
+        let entries = {
+            let guard = self.cache.read().unwrap();
+            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+                return;
+            }
+            let Some(pages) = guard.as_ref() else {
+                return;
+            };
+            pages.iter().map(|(entry, _)| entry.clone()).collect()
+        };
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
+            *self.page_list_cache.write().unwrap() = Some((generation, entries));
+        }
+    }
+
+    /// Capture a current list memo before a transaction that must discard the
+    /// parsed cache. The transaction may update this in memory from bytes it
+    /// already owns, avoiding a second whole-graph read/parse after commit.
+    fn current_page_inventory_snapshot(&self) -> Option<(Vec<PageEntry>, Vec<String>)> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let entries = self
+            .page_list_cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|(memo_generation, _)| *memo_generation == generation)
+            .map(|(_, entries)| entries.clone())?;
+        let failures = self.page_index_failures.read().unwrap().clone();
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation)
+            .then_some((entries, failures))
+    }
+
+    fn publish_page_inventory_snapshot(
+        &self,
+        mut entries: Vec<PageEntry>,
+        mut failures: Vec<String>,
+    ) {
+        entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        failures.sort();
+        failures.dedup();
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        *self.page_index_failures.write().unwrap() = failures;
+        *self.page_list_cache.write().unwrap() = Some((generation, entries));
+    }
+
     /// Page names referenced anywhere in the graph — inline `[[link]]`/`#tag`/
     /// `#[[..]]` plus `tags::`/`alias::` property values (block- and page-level) —
     /// display case preserved, deduped case-insensitively. These are the pages
@@ -13004,6 +13054,7 @@ impl Graph {
     pub fn rename_file_to_page(&self, src_rel: &str, new_name: &str) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
+        let page_inventory_snapshot = self.current_page_inventory_snapshot();
         let src = self
             .resolve_managed_rel(&write, src_rel)?
             .ok_or_else(bad_path)?;
@@ -13060,13 +13111,37 @@ impl Graph {
             }
         }
         self.managed_create_dir_all(&write, &dir)?;
-        self.managed_move_noreplace(&write, &src, &dir.join(format!("{enc}.{ext}")))?;
-        // The page SET changed — drop the list memo so the new page (and the stray's
-        // disappearance from journals/) show up immediately, and discard the
-        // parsed snapshot so its page/index set is rebuilt coherently on next use.
-        *self.page_list_cache.write().unwrap() = None;
+        let dst = dir.join(format!("{enc}.{ext}"));
+        self.managed_move_noreplace(&write, &src, &dst)?;
+        // Reopen only the committed destination, not the graph: this binds the
+        // inventory entry to the exact bytes that now own the new name even if an
+        // external editor changed the retained source inode during the move.
+        let updated_page_inventory =
+            page_inventory_snapshot.and_then(|(mut inventory, mut failures)| {
+                let content = self.managed_read_to_string(&write, &dst).ok()?;
+                let provisional = self.graph_inventory_entry(&dst).ok().flatten()?;
+                let effective = parse_exact_page(self, &provisional, &content)
+                    .ok()
+                    .map(|(entry, _, _)| entry);
+                let src_rel = self.rel_path(&src);
+                let dst_rel = self.rel_path(&dst);
+                inventory.retain(|entry| entry.path != src);
+                failures.retain(|failure| failure != &src_rel && failure != &dst_rel);
+                if let Some(entry) = effective {
+                    inventory.push(entry);
+                } else {
+                    failures.push(dst_rel);
+                }
+                Some((inventory, failures))
+            });
+        // The parsed snapshot is invalidated because this rescue changes the
+        // physical kind/path. Preserve the separately updated list memo when its
+        // pre-transaction generation was current.
         *self.find_entry_cache.write().unwrap() = None;
         self.invalidate_cache_after_tine_mutation();
+        if let Some((inventory, failures)) = updated_page_inventory {
+            self.publish_page_inventory_snapshot(inventory, failures);
+        }
         Ok(())
     }
 
@@ -14201,6 +14276,7 @@ impl Graph {
                 resulting_failures.clone(),
             );
         }
+        let page_inventory_complete = resulting_failures.is_empty();
         *failures_guard = resulting_failures;
         drop(failures_guard);
         drop(guard);
@@ -14231,6 +14307,7 @@ impl Graph {
         // stamping it as current republishes that staleness permanently —
         // `list_pages` is keyed on generation equality, so it never rebuilds and
         // the missing page becomes unloadable.
+        let mut page_list_advanced = false;
         if cache_built && !failures_changed {
             if let Some((generation, entries)) = self.page_list_cache.write().unwrap().as_mut() {
                 if *generation + 1 == newgen {
@@ -14243,8 +14320,16 @@ impl Graph {
                         entries.push(evict_entry.clone());
                     }
                     *generation = newgen;
+                    page_list_advanced = true;
                 }
             }
+        }
+        // Creation paths and watcher reconciliation may intentionally have no
+        // prior list memo to retag. The warm parsed cache already contains the
+        // exact newly parsed entry and every survivor, so rebuild the in-memory
+        // inventory from it rather than reopening and reparsing the graph.
+        if cache_built && !page_list_advanced && page_inventory_complete {
+            self.publish_warm_page_inventory(newgen);
         }
         // Scoped query/backlink invalidation (#52): a content edit to one page
         // can't change a derived result the page doesn't participate in, so keep
@@ -14515,6 +14600,21 @@ impl Graph {
             *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
+        let mut page_list_advanced = false;
+        if let Some((generation, entries)) = self.page_list_cache.write().unwrap().as_mut() {
+            if *generation + 1 == newgen {
+                entries.retain(|entry| {
+                    !removed_entries
+                        .iter()
+                        .any(|removed| removed.path == entry.path)
+                });
+                *generation = newgen;
+                page_list_advanced = true;
+            }
+        }
+        if !page_list_advanced && self.page_index_failures.read().unwrap().is_empty() {
+            self.publish_warm_page_inventory(newgen);
+        }
         for entry in removed_entries {
             self.direct_projection_enqueue_delete(newgen, entry);
         }
@@ -14557,6 +14657,17 @@ impl Graph {
             *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
+        let mut page_list_advanced = false;
+        if let Some((generation, entries)) = self.page_list_cache.write().unwrap().as_mut() {
+            if *generation + 1 == newgen {
+                entries.retain(|candidate| candidate.path != entry.path);
+                *generation = newgen;
+                page_list_advanced = true;
+            }
+        }
+        if !page_list_advanced && self.page_index_failures.read().unwrap().is_empty() {
+            self.publish_warm_page_inventory(newgen);
+        }
         self.direct_projection_enqueue_delete(newgen, entry.clone());
     }
 
@@ -14993,6 +15104,7 @@ impl Graph {
         self.block_external_scope_mutation(&write, old, PageKind::Page, expected_path, "rename")?;
         let mut content_budget = RetainedContentBudget::new(managed_text_inventory_limits());
         let entries = self.managed_text_entries_with_budget(&write, false, &content_budget)?;
+        let page_inventory_snapshot = self.current_page_inventory_snapshot();
         self.validate_page_mutation_target(&write, &entries, old, PageKind::Page, expected_path)?;
         // M1: refuse to rename an ambiguous page (same-stem .md/.markdown/.org on
         // disk) — which twin moves, and which content is authoritative, is
@@ -15489,7 +15601,39 @@ impl Graph {
             self.invalidate_cache_after_tine_mutation();
             return Err(err);
         }
+        // The rename transaction already retains every changed document's final
+        // bytes. Update a current page-list memo from those bytes before dropping
+        // the parsed cache: unchanged entries preserve their exact physical and
+        // effective identity, while only the edited subset is reparsed. A cold or
+        // already-stale memo remains cold and retains the ordinary disk rebuild.
+        let updated_page_inventory =
+            page_inventory_snapshot.map(|(mut inventory, mut failures)| {
+                for edit in &edits {
+                    inventory.retain(|entry| entry.path != edit.src);
+                    let src_rel = self.rel_path(&edit.src);
+                    let dst_rel = self.rel_path(&edit.dst);
+                    failures.retain(|failure| failure != &src_rel && failure != &dst_rel);
+                    let parsed = self
+                        .graph_inventory_entry(&edit.dst)
+                        .ok()
+                        .flatten()
+                        .and_then(|entry| {
+                            parse_exact_page(self, &entry, &edit.new_content)
+                                .ok()
+                                .map(|(effective, _, _)| effective)
+                        });
+                    if let Some(entry) = parsed {
+                        inventory.push(entry);
+                    } else {
+                        failures.push(dst_rel);
+                    }
+                }
+                (inventory, failures)
+            });
         self.invalidate_cache_after_tine_mutation();
+        if let Some((inventory, failures)) = updated_page_inventory {
+            self.publish_page_inventory_snapshot(inventory, failures);
+        }
         self.finish_successful_rename_editor_lifecycle();
         Ok(RenameOutcome {
             skipped_conflicted_referrers,
@@ -36865,6 +37009,119 @@ mod tests {
     }
 
     #[test]
+    fn warm_page_inventory_survives_delete_and_watcher_lifecycle_without_graph_reread() {
+        let dir = scratch("warm-page-inventory-lifecycle");
+        for index in 0..24 {
+            fs::write(
+                dir.join("pages").join(format!("Unrelated {index}.md")),
+                format!("- unrelated {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("pages/Delete Me.md"), "- delete me\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        assert_eq!(graph.list_pages().len(), 25);
+
+        graph.delete_page("Delete Me", PageKind::Page).unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let after_delete = graph.list_pages();
+        assert_eq!(after_delete.len(), 24);
+        assert!(!after_delete.iter().any(|entry| entry.name == "Delete Me"));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+
+        let watched = dir.join("pages/Watched.md");
+        fs::write(&watched, "title:: Watched Identity\n\n- watched\n").unwrap();
+        graph.sync_file_checked(&watched).unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let after_create = graph.list_pages();
+        assert_eq!(after_create.len(), 25);
+        assert!(after_create
+            .iter()
+            .any(|entry| entry.name == "Watched Identity" && entry.path == watched));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+
+        fs::remove_file(&watched).unwrap();
+        graph.sync_deleted_file(&watched).unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let after_remove = graph.list_pages();
+        assert_eq!(after_remove.len(), 24);
+        assert!(!after_remove.iter().any(|entry| entry.path == watched));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_page_inventory_survives_rename_without_graph_reread_or_reparse() {
+        let dir = scratch("warm-page-inventory-rename");
+        for index in 0..24 {
+            fs::write(
+                dir.join("pages").join(format!("Unrelated {index}.md")),
+                format!("- unrelated {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.join("pages/Original.md"),
+            "title:: Original\n\n- [[Original]]\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        assert_eq!(graph.list_pages().len(), 25);
+
+        graph.rename_page("Original", "Renamed").unwrap();
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let after_rename = graph.list_pages();
+        assert_eq!(after_rename.len(), 25);
+        assert!(!after_rename
+            .iter()
+            .any(|entry| entry.rel_path == "pages/Original.md"));
+        assert!(after_rename.iter().any(|entry| {
+            // An explicit title remains the effective identity; the physical
+            // move must not silently reinterpret it from the new filename.
+            entry.name == "Original" && entry.rel_path == "pages/Renamed.md"
+        }));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watcher_parse_failure_cannot_republish_stale_warm_page_inventory() {
+        let dir = scratch("watcher-failure-page-inventory");
+        fs::write(dir.join("pages/Good.md"), "- good\n").unwrap();
+        let failed = dir.join("pages/Failed.md");
+        fs::write(&failed, "- initially valid\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        assert_eq!(graph.list_pages().len(), 2);
+
+        fs::write(&failed, [0xff, 0xfe, b'\n']).unwrap();
+        assert!(graph.sync_file_checked(&failed).is_err());
+        let mut good = graph.load_by_path("pages/Good.md").unwrap().unwrap();
+        good.blocks[0].raw = "saved while sibling failed".into();
+        graph.save_page(&good, good.rev.as_deref()).unwrap();
+
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        let inventory = graph.list_pages();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].name, "Good");
+        assert!(
+            GRAPH_TEXT_CONTENT_READS.with(Cell::get) >= 2,
+            "a known watcher parse failure must force exact disk revalidation"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn changed_existing_save_has_one_portable_traversal_and_no_graph_capture() {
         let dir = scratch("existing-save-portable-traversal-count");
         for index in 0..24 {
@@ -47088,6 +47345,14 @@ mod tests {
 
         // The stray became a normal page, reachable by its new unique name.
         assert!(!dir.join("journals").join("Friday, 26-06-2026.org").exists());
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let inventory = g.list_pages();
+        assert!(inventory.iter().any(|entry| {
+            entry.name == "Old Friday" && entry.rel_path == "pages/Old Friday.org"
+        }));
+        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
         let page = g.load_named("Old Friday", PageKind::Page).unwrap().unwrap();
         assert_eq!(page.blocks[0].raw, "stray body");
         assert_eq!(page.kind, PageKind::Page);

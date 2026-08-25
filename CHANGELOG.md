@@ -27,6 +27,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   that stronger proof. External edits still win or become an explicit conflict,
   and managed-storage projection behavior is unchanged.
 
+- **Page lists stay fast after Direct Files file lifecycle changes.** With a
+  warm graph, creates, deletes, watcher additions/removals, and renames now
+  update the exact in-memory page inventory instead of making the next page
+  lookup reopen and reparse the whole graph. Rename transactions reparse only
+  documents whose retained final bytes they already changed; explicit titles,
+  parse failures, physical paths, and watcher invalidation remain authoritative.
+
 ## [0.6.96] - 2026-08-24
 
 ### Added
