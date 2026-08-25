@@ -17,7 +17,8 @@ async function loadUpdate(opts: {
     return opts.platform ?? "desktop";
   });
   const openExternalMock = vi.fn(async () => {});
-  const pushToastMock = vi.fn(() => 1);
+  let nextToastId = 40;
+  const pushToastMock = vi.fn(() => ++nextToastId);
   const dismissToastMock = vi.fn();
   const getVersionMock = vi.fn(async () => opts.version ?? "0.5.3");
   const updaterCheckMock = opts.updaterReject
@@ -45,6 +46,7 @@ async function loadUpdate(opts: {
     updaterCheckMock,
     openExternalMock,
     pushToastMock,
+    dismissToastMock,
   };
 }
 
@@ -117,6 +119,25 @@ describe("update checks", () => {
     await expect(update.checkForUpdateNow()).resolves.toEqual({ kind: "current", version: "0.5.3" });
   });
 
+  it("keeps one visible offer when the startup and manual checks find the same update", async () => {
+    mockLatest("v0.6.0");
+    const { update, pushToastMock, dismissToastMock } = await loadUpdate({
+      platform: "desktop",
+      version: "0.5.3",
+    });
+
+    await update.checkForUpdate();
+    await expect(update.checkForUpdateNow()).resolves.toEqual({
+      kind: "available",
+      version: "0.6.0",
+      current: "0.5.3",
+    });
+
+    expect(pushToastMock).toHaveBeenCalledTimes(2);
+    expect(dismissToastMock).toHaveBeenCalledOnce();
+    expect(dismissToastMock).toHaveBeenCalledWith(41);
+  });
+
   it("checks without installing, then surfaces an explicit install failure (GH #241)", async () => {
     mockLatest("v0.6.0");
     const consoleErr = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -169,6 +190,7 @@ describe("update checks", () => {
   it("builds the Windows updater on the OS-native TLS transport (GH #241)", () => {
     const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
     expect(cargo).toMatch(/cfg\(target_os = "windows"\)[\s\S]*?tauri-plugin-updater\s*=\s*\{[^}]*default-features\s*=\s*false[^}]*"native-tls"/);
+    expect(cargo).toMatch(/cfg\(target_os = "windows"\)[\s\S]*?reqwest\s*=\s*\{[^}]*default-features\s*=\s*false[^}]*"system-proxy"/);
     expect(cargo).toMatch(/not\(target_os = "windows"\)[\s\S]*?tauri-plugin-updater\s*=\s*"2"/);
   });
 });

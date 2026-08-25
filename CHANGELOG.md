@@ -40,6 +40,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   unique authored claimant first, and refuses ambiguous duplicate authored IDs
   instead of guessing. Existing graphs are not rewritten (GH #373).
 
+- **Windows self-update now follows the system proxy route and shows one update
+  offer at a time.** The native updater already used the Windows trust store,
+  but its reduced feature set omitted Reqwest's separate Windows system-proxy
+  integration, so it could fail to fetch `latest.json` even while WebView2 and
+  the browser reached GitHub. Startup and manual checks also now replace the
+  same release offer instead of stacking duplicate install prompts (GH #241).
+
 - **Fitting split panes no longer keep a scrollbar merely for blank editing
   space.** The first GH #369 correction fixed short panes but still made an
   otherwise fitting page scroll whenever it occupied 60–100% of its pane. An

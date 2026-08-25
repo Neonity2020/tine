@@ -6453,7 +6453,7 @@
     },
     {
       "id": "UI-UPDATER-FAILURE-SURFACE-241",
-      "title": "Windows update checks use the native network trust path and require a separate install confirmation",
+      "title": "Windows update checks use the native network path, show one offer, and require separate install confirmation",
       "family": "updater",
       "sources": {
         "issues": [
@@ -6474,7 +6474,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "GH #241. The earlier catch fix exposed the reporter's concrete failure: Tauri's default rustls updater transport could not send the latest.json request on their otherwise-online Windows 11 installation, before manifest parsing, signature verification, download, or installation. Windows updater builds now use reqwest native-tls/Schannel so the request follows the OS-native certificate and network trust path; Linux/macOS retain the shipped rustls path. Cargo feature-tree evidence proves Windows selects native-tls and Linux selects rustls-tls; physical reporter confirmation remains necessary. The explicit Check for updates action no longer installs by itself: it reports availability and presents a separate sticky Install update action. Installer failures remain logged and visible, with the releases page as fallback."
+      "notes": "GH #241. Negative v0.6.94 reporter follow-up revoked the earlier fix claim: the WebView could fetch GitHub's release API and offer v0.6.95, but the Rust updater still reported 'error sending request' for latest.json. The Windows updater disabled default features to select native-tls/Schannel, which also left Reqwest without its separate system-proxy feature; Windows now explicitly enables that feature so the native request reads the OS proxy configuration as well as using the OS trust store. Startup and manual checks replace the prior offer instead of stacking two install toasts. Fail-before proved both omissions. Signed-manifest verification, separate install confirmation, Linux/macOS rustls behavior, and the manual releases-page fallback remain intact. Physical Windows confirmation remains required."
     },
     {
       "id": "UI-EDITOR-MATH-BLOCK-ENTER-278",
