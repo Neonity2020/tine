@@ -7842,23 +7842,26 @@
         "issues": [
           230
         ],
-        "commits": []
+        "commits": [
+          "b6d481e4"
+        ]
       },
       "platforms": [
         "windows",
         "linux"
       ],
       "layer": "native",
-    "status": "fixing",
+      "status": "released",
       "coverage": {
         "tests": [
+          "scripts/e2e-windows-smoke.mjs",
           "scripts/e2e-page-properties.mjs",
-          "scripts/e2e-print-security.mjs"
+          "scripts/e2e-pdf-logseq.mjs"
         ],
         "scenario": "e2e.windows-post-receipt-named-page-readiness",
         "failBefore": "proven"
       },
-      "notes": "The v0.6.95 release artifact passed windows-core and pdf-logseq but page-properties failed before its contract because ALL PAGES was absent at WebDriver attachment; print-security likewise failed before its safety assertion because the chosen startup page contained no .page-ref. Run 32690801901 and its retained exact-build capsules prove both setup failures. Fixture routing now uses the production Search command and an exact indexed page-result mousedown, while the page-property traversal and static script-disabled print-frame assertions remain unchanged. Both focused journeys pass locally against exact build receipts and print-security passed focused Windows run 32766862967. Page-properties remains fixing: Windows run 32766860600 found the sidebar Search button non-clickable at default geometry, and the one allowed retry 32769022952 showed that Ctrl-K did not open the switcher even though the graph had opened successfully. Both failures are before the page-property contract; the two-attempt platform stop-loss is exhausted."
+      "notes": "The v0.6.4 receipt fix exposed three independent setup/readiness failures after exact receipt validation: windows-core did not reach the app container, page-properties did not reach ALL PAGES, and pdf-logseq started on Quick Capture. The deterministic routing/readiness repair shipped in v0.6.96 at exact SHA 8bfe34c97ec27e59bb22d562b40c458159f9a03c. Hosted Windows run 32791664016 then passed all three original journeys at their actual contracts: windows-core job 97647244888, page-properties 97647244746, and pdf-logseq 97647244737. The run reported zero blocked or quarantined scenarios. The intermediate focused print-security proof remains run 32766862967; no product assertion was weakened for this closeout."
     }
   ]
 }
