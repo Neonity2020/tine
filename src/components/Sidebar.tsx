@@ -286,8 +286,12 @@ export function Sidebar(props: {
                           onPointerDown={(e) => startFavoriteDrag(i(), e)}
                         >
                           {toggle}
+                          {/* Sized to its text, not stretched: a label row is
+                              draggable like any other, and an input filling the
+                              row would leave nowhere to grab it. */}
                           <input
                             class="nav-fav-group-name"
+                            size={Math.max(row.node.raw.length, 4)}
                             value={row.node.raw}
                             aria-label={`Rename group ${row.node.raw}`}
                             onChange={(event) =>

@@ -8,6 +8,16 @@ import { favorites, seedFavorites, setFavorites, setRecentPages } from "../ui";
 import { route, openJournals } from "../router";
 import { Sidebar } from "./Sidebar";
 import { rowReorderClickSuppressed } from "./rowReorder";
+import { layoutFromBlocks } from "../favoritesLayout";
+import { persistFavoritesLayout } from "../favoritesStore";
+import type { BlockDto } from "../types";
+
+const block = (raw: string, children: BlockDto[] = []): BlockDto => ({
+  id: raw,
+  raw,
+  collapsed: false,
+  children,
+});
 
 function rect(left: number, top: number, width: number, height: number): DOMRect {
   return {
@@ -112,6 +122,40 @@ describe("favorites drag reorder (GH #211)", () => {
     const [page] = savePage.mock.calls[0];
     expect(page.blocks.map((b) => b.raw)).toEqual(["[[Alpha]]", "[[Gamma]]"]);
     expect(page.blocks[0].children.map((b) => b.raw)).toEqual(["[[Beta]]"]);
+    dispose();
+  });
+
+  // A group is a row like any other, so it drags — with everything it holds.
+  // The rename input is sized to its text rather than stretched precisely so
+  // there is somewhere left to grab.
+  it("drags a whole group, carrying what it holds", async () => {
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("rev");
+    vi.spyOn(backend(), "setFavorites").mockResolvedValue();
+    vi.spyOn(backend(), "setFavoritesPage").mockResolvedValue();
+    const { root, rows, dispose } = mountThreeFavorites();
+    await persistFavoritesLayout(
+      layoutFromBlocks([block("[[Alpha]]"), block("Work", [block("[[Beta]]"), block("[[Gamma]]")])])
+    );
+    const [alpha, work] = rows();
+    expect(work.classList.contains("nav-fav-group")).toBe(true);
+    setRect(alpha, 0, 0, 200, 30);
+    setRect(work, 0, 30, 200, 30);
+
+    work.dispatchEvent(pointer("pointerdown", 150, 40));
+    const prev = document.elementFromPoint;
+    try {
+      document.elementFromPoint = () => alpha;
+      document.dispatchEvent(pointer("pointermove", 150, 5)); // above Alpha's midpoint
+      document.dispatchEvent(pointer("pointerup", 150, 5));
+    } finally {
+      document.elementFromPoint = prev;
+    }
+
+    await new Promise((r) => setTimeout(r, 0));
+    const [page] = savePage.mock.calls[savePage.mock.calls.length - 1];
+    expect(page.blocks.map((b) => b.raw)).toEqual(["Work", "[[Alpha]]"]);
+    expect(page.blocks[0].children.map((b) => b.raw)).toEqual(["[[Beta]]", "[[Gamma]]"]);
+    expect(root.querySelectorAll("#sidebar-favorites-list .nav-page")).toHaveLength(4);
     dispose();
   });
 

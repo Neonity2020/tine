@@ -1480,7 +1480,9 @@ textarea {
   visibility: visible;
 }
 .nav-fav-group-name {
-  flex: 1;
+  /* Deliberately not `flex: 1`. The row is draggable, and an input stretched
+     across it would leave the user nothing to grab a group by. */
+  flex: 0 1 auto;
   min-width: 0;
   background: none;
   border: 1px solid transparent;
