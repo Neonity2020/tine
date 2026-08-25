@@ -854,7 +854,10 @@ ambiguous baseline claims remain unresolved after reconstruction.
 2. The immutable oplog is the source of truth for managed page/journal content,
    IDs, names/paths, references, and properties. Markdown is a projection when
    managed mode is active. Assets, PDF sidecars, `config.edn`, and app settings
-   retain their separate authorities.
+   retain their separate authorities. Merely opening a PDF reads its asset-side
+   state and does not create an empty semantic `hls__` page; the first
+   annotation write creates or updates that page through the paired sidecar and
+   managed-page publication path.
 3. SQLite, runtime scratch, and transient projection receipts are disposable.
    Deleting or version-mismatching one may cause exactly one bounded rebuild,
    never a second rebuild on the following open. A complete rebuild must be

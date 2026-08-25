@@ -16393,92 +16393,19 @@ impl RuntimeActor {
     fn open_application_pdf(
         &mut self,
         pdf_filename: &str,
-        label: &str,
+        _label: &str,
     ) -> Result<SyncApplicationPdfOpenOutcome, SyncApplicationPageRequestError> {
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
-            return Ok(SyncApplicationPdfOpenOutcome::Deferred { state });
-        }
         let state = self
             .graph
             .open_pdf_asset_only(pdf_filename)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("pdf_sidecar_open"))?;
-        let key = crate::pdf::asset_key(pdf_filename);
-        let name = crate::pdf::hls_page_name(&key);
-        let current = self
-            .active_editor_name_state_for_format(
-                name.clone(),
-                SyncPageKind::Page,
-                self.graph.preferred_format(),
-            )
-            .map_err(map_editor_application_error)?;
-        match current {
-            EditorNameState::Exact(_) => return Ok(SyncApplicationPdfOpenOutcome::Ready { state }),
-            EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
-                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
-                    "pdf_hls_page_identity",
-                ))
-            }
-            EditorNameState::Missing { .. } => {}
-        }
-
-        if self.graph.pdf_legacy_key_is_unambiguous(pdf_filename) {
-            let legacy_name =
-                crate::pdf::hls_page_name(&crate::pdf::legacy_asset_key(pdf_filename));
-            let legacy = self
-                .active_editor_name_state_for_format(
-                    legacy_name,
-                    SyncPageKind::Page,
-                    self.graph.preferred_format(),
-                )
-                .map_err(map_editor_application_error)?;
-            match legacy {
-                EditorNameState::Exact(_) => {
-                    return Ok(SyncApplicationPdfOpenOutcome::Ready { state })
-                }
-                EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
-                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
-                        "pdf_legacy_hls_page_identity",
-                    ))
-                }
-                EditorNameState::Missing { .. } => {}
-            }
-        }
-
-        let format = self.graph.preferred_format();
-        let document = crate::pdf::hls_page_document_for_format(
-            pdf_filename,
-            label,
-            &state.highlights,
-            format,
-        );
-        let page = crate::model::generated_document_page_dto(
-            &name,
-            format,
-            document,
-            "managed-pdf-open-v1",
-        )
-        .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("pdf_hls_page_build"))?;
-        match self.save_application_page(SyncApplicationPageSaveRequest {
-            target: SyncApplicationPageSaveTarget::New {
-                name,
-                page_kind: SyncPageKind::Page,
-            },
-            page,
-        })? {
-            SyncApplicationPageSaveOutcome::Prepared => Err(
-                SyncApplicationPageRequestError::ActorRefusedAt("pdf_hls_page_commit"),
-            ),
-            SyncApplicationPageSaveOutcome::Saved { .. }
-            | SyncApplicationPageSaveOutcome::Unchanged { .. } => {
-                Ok(SyncApplicationPdfOpenOutcome::Ready { state })
-            }
-            SyncApplicationPageSaveOutcome::Deferred { state: deferred } => {
-                Ok(SyncApplicationPdfOpenOutcome::Deferred { state: deferred })
-            }
-            SyncApplicationPageSaveOutcome::Conflict { .. } => Err(
-                SyncApplicationPageRequestError::ActorRefusedAt("pdf_hls_page_commit"),
-            ),
-        }
+        // Opening a document is not an annotation edit. In managed mode the
+        // hls__ graph page is born with the first highlight write below, where
+        // sidecar and semantic-page publication already share one transaction.
+        // Eager creation here made a read depend on unrelated graph
+        // reconciliation and produced a misleading "couldn't load" error even
+        // though the annotation sidecar had been read successfully.
+        Ok(SyncApplicationPdfOpenOutcome::Ready { state })
     }
 
     fn write_application_pdf_highlights(
@@ -27793,6 +27720,23 @@ mod tests {
                 .unwrap(),
             SyncApplicationPdfOpenOutcome::Ready { .. }
         ));
+        assert!(
+            relative_files(&fixture.graph_root)
+                .iter()
+                .all(|path| !path.contains("hls__")),
+            "opening a PDF must not create an empty semantic annotation page"
+        );
+        assert_eq!(
+            handle
+                .write_application_pdf_highlights(
+                    "paper.pdf".into(),
+                    "Paper".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
         drain_managed_local(&handle);
         let hls_name = crate::pdf::hls_page_name(&crate::pdf::asset_key("paper.pdf"));
         let (hls, _) = load_application_logical(&handle, &hls_name, SyncPageKind::Page);
@@ -27828,6 +27772,33 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn pdf_open_stays_read_only_while_external_reconciliation_is_pending() {
+        let fixture = ActivationFixture::nested_unicode("pdf-open-pending-external", 0xa176_5000);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("PDF fixture activates");
+        drive_initial_feed(&handle);
+
+        fs::write(
+            fixture.graph_root.join("Root.md"),
+            b"title:: Root logical\n\n- changed before watcher delivery\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            handle
+                .open_application_pdf("paper.pdf".into(), "Paper".into())
+                .unwrap(),
+            SyncApplicationPdfOpenOutcome::Ready { .. }
+        ));
+        assert!(
+            relative_files(&fixture.graph_root)
+                .iter()
+                .all(|path| !path.contains("hls__")),
+            "PDF open entered semantic page creation while external reconciliation was pending"
+        );
     }
 
     #[test]

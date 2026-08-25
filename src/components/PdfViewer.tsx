@@ -1000,7 +1000,7 @@ export function PdfViewer(props: {
       restoredScale = state.scale;
     } catch (error) {
       setHighlights([]);
-      pushToast(`Couldn't load PDF annotations. (${String(error)})`, "error");
+      pushToast(`Couldn't load PDF annotations. (${String(error)})`, "error", { sticky: true });
     }
     baseIds = highlights().map((h) => h.id); // load baseline for the 3-way merge
     let bytes: Uint8Array;
