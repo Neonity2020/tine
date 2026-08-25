@@ -297,34 +297,46 @@ export function PageView(): JSX.Element {
             router.restoreScrollFor(r);
             return;
           }
-          // A path-pinned route (#21) loads that SPECIFIC file — the way to reach a
-          // duplicate-day stray that shares a (kind,name) with the canonical day;
-          // everything else resolves by name as before.
-          const dto = r.path
-            ? await backend().getPageByPath(r.path)
-            : await backend().getPage(r.name, r.pageKind);
-          if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
-          if (r.path && (!dto || dto.path !== r.path || dto.name !== r.name || dto.kind !== r.pageKind)) {
-            throw new Error("The selected physical page is no longer available at that path.");
-          }
-          // Core page identity is Unicode-case-insensitive while display names
-          // preserve their original spelling. Alias-map warmup normally
-          // canonicalizes before navigation; this adoption also covers an early
-          // click or restored route that raced that map. Re-route once so the
-          // exact-keyed working set, tab history, Recent, and editor all own the
-          // backend's canonical display name instead of a phantom case variant.
-          if (dto && !r.path && r.pageKind === "page" && dto.name !== r.name) {
-            renamePageInNavigation(r.name, dto.name);
-            router.replaceActiveRoute({ ...r, name: dto.name });
-            return;
-          }
-          // null = page doesn't exist yet → start a fresh empty page. A failed
-          // read throws and is caught below, so we never overwrite a page whose
-          // load errored with empty content.
-          await loadRoutedPage(
-            dto ? toLoadablePage(dto, r.name) : emptyPage(r.name, r.pageKind),
-            binding,
+          const target = pageTargetFromRoute(r)!;
+          // A bullet zoom is navigation WITHIN the exact loaded owner. Re-reading
+          // it races the durable-id save started by persistentBlockRef: stale
+          // pre-save bytes then look like a competing page instance and trigger
+          // the unsaved-changes replacement refusal (GH #354). A restored zoom
+          // has no owner to reuse and still follows the ordinary disk load below;
+          // a path-pinned duplicate only reuses the matching physical file.
+          const reuseLoadedZoomOwner = !!r.block && untrack(() =>
+            pageTargetMatchesLoaded(target, pageByName(r.name))
           );
+          if (!reuseLoadedZoomOwner) {
+            // A path-pinned route (#21) loads that SPECIFIC file — the way to reach a
+            // duplicate-day stray that shares a (kind,name) with the canonical day;
+            // everything else resolves by name as before.
+            const dto = r.path
+              ? await backend().getPageByPath(r.path)
+              : await backend().getPage(r.name, r.pageKind);
+            if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
+            if (r.path && (!dto || dto.path !== r.path || dto.name !== r.name || dto.kind !== r.pageKind)) {
+              throw new Error("The selected physical page is no longer available at that path.");
+            }
+            // Core page identity is Unicode-case-insensitive while display names
+            // preserve their original spelling. Alias-map warmup normally
+            // canonicalizes before navigation; this adoption also covers an early
+            // click or restored route that raced that map. Re-route once so the
+            // exact-keyed working set, tab history, Recent, and editor all own the
+            // backend's canonical display name instead of a phantom case variant.
+            if (dto && !r.path && r.pageKind === "page" && dto.name !== r.name) {
+              renamePageInNavigation(r.name, dto.name);
+              router.replaceActiveRoute({ ...r, name: dto.name });
+              return;
+            }
+            // null = page doesn't exist yet → start a fresh empty page. A failed
+            // read throws and is caught below, so we never overwrite a page whose
+            // load errored with empty content.
+            await loadRoutedPage(
+              dto ? toLoadablePage(dto, r.name) : emptyPage(r.name, r.pageKind),
+              binding,
+            );
+          }
         }
         if (!sameRoute(currentRoute(), r)) return;
         setLoadedRoute(r);
