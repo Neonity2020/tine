@@ -9419,10 +9419,14 @@ impl Graph {
     }
 
     /// Move one exact hidden file produced by the editor publication protocol.
-    /// `ManagedPath` deliberately rejects hidden graph-text names, so recovery
-    /// cannot pretend the artifact is an ordinary document; it validates the
-    /// retained source directly and validates the destination as the ordinary
-    /// managed move does.
+    /// The retained source is validated directly rather than through
+    /// `ManagedPath`: hidden publication artifacts are not ordinary documents,
+    /// and recovery must not treat them as such. Note that `ManagedPath` itself
+    /// does NOT reject a leading-dot name — `is_managed_path` only requires a
+    /// non-empty stem and a graph-text extension — so this validation is the
+    /// boundary, not a redundant second check.
+    /// `managed_path_accepts_leading_dot_name` in `oplog::receipt` keeps that
+    /// statement honest.
     fn managed_move_editor_recovery_noreplace(
         &self,
         permit: &ManagedTextWritePermit,
