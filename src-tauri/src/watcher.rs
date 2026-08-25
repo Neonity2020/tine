@@ -1204,29 +1204,38 @@ fn observe_legacy_graph_text_event(
     if !observation.relevant {
         return false;
     }
-    // The raw platform callback is only an admission barrier. Reading and
-    // semantically parsing an exact path here defeated debounce: reconciliation
-    // read/parsed the same final file again 200 ms later, and a burst paid once
-    // per raw event before bulk coalescing even began. A relevant text event
-    // publishes an O(1) pending epoch so name-only creation refuses during the
-    // debounce window. Only genuinely ambiguous events invalidate the retained
-    // identity index; exact events remain eligible for one exact-path update by
-    // the debounced reconciler.
+    // The raw platform callback is normally only an admission barrier. Reading
+    // and semantically parsing arbitrary exact paths here defeated debounce, so
+    // external paths still publish one O(1) pending epoch and are read/parsed by
+    // the debounced reconciler. The one bounded exception is a candidate echo of
+    // a completed Tine publication: core reopens that exact path twice under the
+    // writer's identity + page locks and requires both its content revision and
+    // physical identity to match Tine's publication receipt (or the identical
+    // already-admitted cache state). Windows can emit Create(Any), Modify(Any)
+    // and rename for one atomic publication; none of those self echoes should
+    // strand the next new page. Any mismatch remains an external observation.
+    // Only genuinely ambiguous events invalidate the retained identity index.
     if observation.uncertain {
         graph.note_graph_text_external_observation();
         let _ = graph.observe_graph_text_external_paths(std::iter::empty::<&Path>(), true);
     } else if !observation.exact_paths.is_empty() {
-        graph.note_graph_text_external_observation();
+        let all_match_tine = observation
+            .exact_paths
+            .iter()
+            .all(|path| graph.exact_graph_text_event_matches_tine_state(path));
+        if !all_match_tine {
+            graph.note_graph_text_external_observation();
+        }
     }
     true
 }
 
 /// Linearize a platform callback with guarded graph-text writes before the
-/// watcher's debounce/reconciliation delay. The callback performs no content
-/// I/O: it publishes an admission epoch (and invalidates retained identity only
-/// when the event is ambiguous) under the same resource-scoped mutation
-/// authority that `Graph::save_page` uses. Debounced reconciliation captures
-/// each final path once.
+/// watcher's debounce/reconciliation delay. External callbacks publish an
+/// admission epoch (and invalidate retained identity only when ambiguous) under
+/// the same resource-scoped mutation authority that `Graph::save_page` uses.
+/// Exact candidates for a Tine self echo take a bounded two-open identity+bytes
+/// proof; debounced reconciliation still captures each final path once.
 fn observe_legacy_graph_text_callback(
     app: &tauri::AppHandle,
     event: Option<&notify::Event>,
@@ -2382,6 +2391,132 @@ mod tests {
             .exists());
     }
 
+    /// GH #374 negative follow-up to #366. Windows reports the atomic
+    /// publication of Tine's own new journal as an exact graph-text event. That
+    /// echo must not raise the external-change admission frontier and strand the
+    /// next new page before the debounced reconciler sees the journal bytes.
+    #[test]
+    fn windows_tine_owned_create_echoes_do_not_block_following_pages_or_journals() {
+        use notify::event::{CreateKind, EventKind, ModifyKind, RenameMode};
+
+        let cases = [
+            (
+                "journal-page",
+                new_journal("Aug 25th, 2026"),
+                new_page("20260825100915"),
+            ),
+            ("page-page-unicode", new_page("第一页"), new_page("第二页")),
+            (
+                "page-journal",
+                new_page("Before Journal"),
+                new_journal("Aug 24th, 2026"),
+            ),
+        ];
+        for (case, first, second) in cases {
+            let graph_dir = TempGraph::new(&format!("windows-owned-{case}"));
+            graph_dir.write("pages/Anchor.md", "- anchor\n");
+            let graph = Graph::open(&graph_dir.root);
+            warm_direct_graph(&graph);
+
+            graph.save_page(&first, None).unwrap();
+            let first_path = graph
+                .find_entry(&first.name, first.kind)
+                .expect("created first entry")
+                .path;
+            let before = graph.graph_text_external_observation_ticket();
+            // ReadDirectoryChangesW can surface several exact shapes for the
+            // one atomic publication before (and occasionally just after) the
+            // debounce pass. Every one must validate the same exact receipt.
+            for kind in [
+                EventKind::Create(CreateKind::Any),
+                EventKind::Modify(ModifyKind::Any),
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            ] {
+                let paths = if matches!(&kind, EventKind::Modify(ModifyKind::Name(_))) {
+                    let filename = first_path.file_name().unwrap().to_string_lossy();
+                    vec![
+                        first_path.with_file_name(format!(".{filename}.123.7.projection.tmp")),
+                        first_path.clone(),
+                    ]
+                } else {
+                    vec![first_path.clone()]
+                };
+                assert!(observe_legacy_graph_text_event(
+                    &graph,
+                    &graph_dir.root,
+                    Some(&event(kind, paths)),
+                ));
+                assert_eq!(
+                    graph.graph_text_external_observation_ticket(),
+                    before,
+                    "{case}: Tine's exact publication echo must not become an external frontier"
+                );
+            }
+            graph
+                .sync_file_checked(&first_path)
+                .expect("debounced self-write reconciliation");
+            assert!(observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event(EventKind::Modify(ModifyKind::Any), vec![first_path],)),
+            ));
+            assert_eq!(
+                graph.graph_text_external_observation_ticket(),
+                before,
+                "{case}: a delayed duplicate matching the admitted cache state remains a no-op"
+            );
+
+            graph
+                .save_page(&second, None)
+                .unwrap_or_else(|error| panic!("{case}: following creation failed: {error}"));
+        }
+    }
+
+    #[test]
+    fn windows_external_replacement_of_tine_publication_keeps_creation_blocked() {
+        use notify::event::{EventKind, ModifyKind};
+
+        for same_bytes in [false, true] {
+            let graph_dir = TempGraph::new(if same_bytes {
+                "windows-external-same-bytes-new-identity"
+            } else {
+                "windows-external-different-bytes"
+            });
+            graph_dir.write("pages/Anchor.md", "- anchor\n");
+            let graph = Graph::open(&graph_dir.root);
+            warm_direct_graph(&graph);
+            let first = new_page("First Publication");
+            graph.save_page(&first, None).unwrap();
+            let first_path = graph
+                .find_entry(&first.name, first.kind)
+                .expect("created page entry")
+                .path;
+            if same_bytes {
+                let bytes = std::fs::read(&first_path).unwrap();
+                let replacement = graph_dir.path("external-winner.tmp");
+                std::fs::write(&replacement, bytes).unwrap();
+                std::fs::remove_file(&first_path).unwrap();
+                std::fs::rename(replacement, &first_path).unwrap();
+            } else {
+                std::fs::write(&first_path, "- external winner\n").unwrap();
+            }
+
+            assert!(observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event(EventKind::Modify(ModifyKind::Any), vec![first_path],)),
+            ));
+            assert_new_page_waits_for_reconciliation(
+                &graph,
+                if same_bytes {
+                    "Blocked By New Physical Owner"
+                } else {
+                    "Blocked By Different External Bytes"
+                },
+            );
+        }
+    }
+
     #[test]
     fn unknown_path_event_requests_full_scan_only_for_its_owner() {
         use notify::event::{CreateKind, EventKind};
@@ -3400,6 +3535,12 @@ mod tests {
             path: String::new(),
             guide: false,
         }
+    }
+
+    fn new_journal(name: &str) -> PageDto {
+        let mut page = new_page(name);
+        page.kind = PageKind::Journal;
+        page
     }
 
     /// Warm the parsed page cache and exercise one ordinary Direct save. This

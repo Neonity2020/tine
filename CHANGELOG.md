@@ -34,6 +34,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Creating a journal no longer makes the next Direct Files page fail to save
+  on Windows.** Windows may report several `Create`, `Modify`, and rename events
+  for Tine's own atomic page publication. Those exact self echoes now validate
+  the published path, bytes, and physical file identity under the same write
+  lock instead of raising the external-change frontier while the watcher waits
+  to reconcile them. A changed external file, an identical-byte replacement
+  inode from a sync service or second Tine, ambiguous events, and portable
+  case/NFC collisions remain fail-closed (GH #374, follow-up to GH #366).
+
 - **The full Rust core corpus now finishes and the release gate no longer hides
   passing tests.** Five obsolete shared-join test barriers now pause at current,
   finite clean-runtime concurrency cuts. An honest unfiltered run completed all
