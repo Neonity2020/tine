@@ -359,6 +359,14 @@ struct ManagedApplicationQueryInstrumentation {
     indexed_candidate_pages: usize,
     overlay_pages: usize,
     block_branches: usize,
+    /// How many times a block branch was narrowed through the materialized
+    /// ordered-subsequence index, and how many pages survived that narrowing.
+    fuzzy_narrowing_passes: usize,
+    fuzzy_candidate_pages: usize,
+    /// Managed pages whose converted block tree (and therefore every memoized
+    /// lsdoc projection in it) was reused / rebuilt during this measurement.
+    projection_cache_hits: usize,
+    projection_cache_misses: usize,
 }
 
 /// How many distinct simple-query answers one actor retains at a time.
@@ -10217,10 +10225,11 @@ fn bound_application_reference_sources(
     lower_bound_exceeded: bool,
 ) -> SyncApplicationBoundedRefGroups {
     sources.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut rows = 0_usize;
-    let mut bytes = 0_usize;
-    let mut total = 0_usize;
-    let mut exceeded = false;
+    // Same accounting rule as Direct Files and as the managed block-referrer
+    // path: `query::ConstructionBudget`. This loop already charged payload +
+    // page name + 256 per admitted row and latched `exceeded`; naming the rule
+    // once is what keeps the three copies from drifting again.
+    let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
     let mut grouped: Vec<(Option<i64>, RefGroup)> = Vec::new();
     let mut by_name = HashMap::<String, usize>::new();
     for (_, date_key, page, matches) in sources {
@@ -10244,18 +10253,11 @@ fn bound_application_reference_sources(
             grouped[index].0 = date_key;
         }
         for (block, evidence) in matches {
-            total = total.saturating_add(1);
-            let estimated = crate::model::block_dto_estimated_bytes(&block)
-                .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence))
-                .saturating_add(page.name.len())
-                .saturating_add(256);
-            if !exceeded && rows < max_rows && bytes.saturating_add(estimated) <= max_bytes {
-                rows += 1;
-                bytes = bytes.saturating_add(estimated);
+            let payload = crate::model::block_dto_estimated_bytes(&block)
+                .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence));
+            if budget.admit_estimated(&page.name, payload) {
                 grouped[index].1.blocks.push(block);
                 grouped[index].1.evidence.push(evidence);
-            } else {
-                exceeded = true;
             }
         }
     }
@@ -10265,6 +10267,8 @@ fn bound_application_reference_sources(
             .cmp(&a.0.unwrap_or(i64::MIN))
             .then_with(|| a.1.page.cmp(&b.1.page))
     });
+    let mut total = budget.total;
+    let mut exceeded = budget.exceeded;
     if lower_bound_exceeded {
         total = total.max(max_rows.saturating_add(1));
         exceeded = true;
@@ -10752,6 +10756,11 @@ struct RuntimeActor {
     /// evaluator. See [`ApplicationSimpleQueryMemo`] for what it holds and
     /// what drops it; it is a cache of durable evidence, never authority.
     application_simple_query_memo: std::cell::RefCell<ApplicationSimpleQueryMemo>,
+    /// Converted managed block trees retained across query evaluations. See
+    /// [`crate::query::ApplicationProjectionCache`]: it is content-addressed by
+    /// exact comparison, so it holds no authority and cannot go stale -- a
+    /// changed page misses and is rebuilt.
+    application_projection_cache: std::cell::RefCell<crate::query::ApplicationProjectionCache>,
     #[cfg(test)]
     managed_application_query_instrumentation:
         std::cell::Cell<ManagedApplicationQueryInstrumentation>,
@@ -11023,6 +11032,9 @@ impl RuntimeActor {
             application_simple_query_memo: std::cell::RefCell::new(
                 ApplicationSimpleQueryMemo::default(),
             ),
+            application_projection_cache: std::cell::RefCell::new(
+                crate::query::ApplicationProjectionCache::default(),
+            ),
             #[cfg(test)]
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
@@ -11097,16 +11109,36 @@ impl RuntimeActor {
     fn reset_managed_application_query_instrumentation(&self) {
         self.managed_application_query_instrumentation
             .set(ManagedApplicationQueryInstrumentation::default());
+        self.application_projection_cache
+            .borrow_mut()
+            .reset_counters();
+    }
+
+    /// The converted block tree for one exact managed page, reused whenever the
+    /// page's exact content is unchanged since the last managed query.
+    fn application_projection_roots(
+        &self,
+        path: &str,
+        page: &PageDto,
+    ) -> std::sync::Arc<Vec<crate::doc::DocBlock>> {
+        self.application_projection_cache
+            .borrow_mut()
+            .roots(path, page)
     }
 
     #[cfg(test)]
     fn clear_application_simple_query_memo(&self) {
+        self.application_projection_cache.borrow_mut().clear();
         self.application_simple_query_memo.borrow_mut().clear();
     }
 
     #[cfg(test)]
     fn managed_application_query_instrumentation(&self) -> ManagedApplicationQueryInstrumentation {
-        self.managed_application_query_instrumentation.get()
+        let mut current = self.managed_application_query_instrumentation.get();
+        let (hits, misses, _) = self.application_projection_cache.borrow().counters();
+        current.projection_cache_hits = hits;
+        current.projection_cache_misses = misses;
+        current
     }
 
     #[cfg(test)]
@@ -11215,6 +11247,14 @@ impl RuntimeActor {
         let mut current = self.managed_application_query_instrumentation.get();
         current.full_inventory_passes = current.full_inventory_passes.saturating_add(1);
         current.inventory_pages = current.inventory_pages.saturating_add(pages);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    #[cfg(test)]
+    fn note_managed_application_query_fuzzy_narrowing(&self, candidate_pages: usize) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.fuzzy_narrowing_passes = current.fuzzy_narrowing_passes.saturating_add(1);
+        current.fuzzy_candidate_pages = current.fuzzy_candidate_pages.saturating_add(candidate_pages);
         self.managed_application_query_instrumentation.set(current);
     }
 
@@ -12209,56 +12249,74 @@ impl RuntimeActor {
                 },
             ));
         }
-        source_groups.sort_by(|a, b| {
+        // Admit in the SAME order Direct Files does. Its page cache is built
+        // from `page_build_entries`, which sorts by relative path, so Direct
+        // charges the budget page-by-page in path order and only sorts the
+        // surviving groups for display afterwards. Sorting for display BEFORE
+        // charging (which this path used to do) makes a budget-truncated
+        // managed answer retain a different set of rows than Direct for
+        // identical content.
+        source_groups.sort_by(|a, b| a.1.cmp(&b.1));
+
+        // ONE accounting rule with Direct Files (`query::ConstructionBudget`,
+        // as used by `collect_bounded_candidates`): payload + page name + 256
+        // charged per ADMITTED row, `exceeded` latched once the budget closes.
+        // This used to be open-coded here with a per-group overhead that was
+        // probed per row but accumulated once per emitted group, so identical
+        // content under an identical `max_bytes` admitted a different number of
+        // rows on the two paths.
+        let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
+        let candidate_overflow = candidate_count > max_rows;
+        let mut groups: Vec<(Option<i64>, String, RefGroup)> = Vec::new();
+        for (date_key, path, group) in source_groups {
+            let mut admitted = Vec::new();
+            for block in group.blocks {
+                if budget.closed() {
+                    budget.deny_match();
+                    continue;
+                }
+                if !budget.admit_estimated(
+                    &group.page,
+                    crate::model::block_dto_estimated_bytes(&block),
+                ) {
+                    continue;
+                }
+                admitted.push(block);
+            }
+            if !admitted.is_empty() {
+                groups.push((
+                    date_key,
+                    path,
+                    RefGroup {
+                        page: group.page,
+                        kind: group.kind,
+                        blocks: admitted,
+                        evidence: Vec::new(),
+                    },
+                ));
+            }
+        }
+        // OG parity, same rule as Direct `collect_bounded_candidates`: newest
+        // journal day first, non-journal pages last, page name as the
+        // deterministic tie-break (path breaking a name tie).
+        groups.sort_by(|a, b| {
             b.0.unwrap_or(i64::MIN)
                 .cmp(&a.0.unwrap_or(i64::MIN))
                 .then_with(|| a.2.page.cmp(&b.2.page))
                 .then_with(|| a.1.cmp(&b.1))
         });
-
-        let mut groups = Vec::new();
-        let mut rows = 0_usize;
-        let mut bytes = 0_usize;
-        let mut total = 0_usize;
-        let mut exceeded = candidate_count > max_rows;
-        for (_, _, group) in source_groups {
-            let mut admitted = Vec::new();
-            for block in group.blocks {
-                total = total.saturating_add(1);
-                let estimated = crate::model::block_dto_estimated_bytes(&block);
-                if rows < max_rows
-                    && bytes
-                        .saturating_add(estimated)
-                        .saturating_add(group.page.len())
-                        .saturating_add(std::mem::size_of::<RefGroup>())
-                        <= max_bytes
-                {
-                    rows += 1;
-                    bytes = bytes.saturating_add(estimated);
-                    admitted.push(block);
-                } else {
-                    exceeded = true;
-                }
-            }
-            if !admitted.is_empty() {
-                bytes = bytes
-                    .saturating_add(group.page.len())
-                    .saturating_add(std::mem::size_of::<RefGroup>());
-                groups.push(RefGroup {
-                    page: group.page,
-                    kind: group.kind,
-                    blocks: admitted,
-                    evidence: Vec::new(),
-                });
-            }
-        }
-        if candidate_count > max_rows {
+        let groups = groups
+            .into_iter()
+            .map(|(_, _, group)| group)
+            .collect::<Vec<_>>();
+        let mut total = budget.total;
+        if candidate_overflow {
             total = total.max(max_rows.saturating_add(1));
         }
         Ok(SyncApplicationBoundedRefGroups {
             groups,
             total,
-            exceeded,
+            exceeded: budget.exceeded || candidate_overflow,
         })
     }
 
@@ -13328,12 +13386,13 @@ impl RuntimeActor {
         sources.sort_by(|left, right| left.0.cmp(&right.0));
         let pages = sources
             .into_iter()
-            .map(|(_, page)| crate::query::ApplicationQueryPage {
+            .map(|(path, page)| crate::query::ApplicationQueryPage {
                 recency: application_query_page_recency(
                     &self.graph.root,
                     &self.graph.journal_format,
                     &page,
                 ),
+                roots: self.application_projection_roots(&path, &page),
                 page,
             })
             .collect::<Vec<_>>();
@@ -13372,6 +13431,7 @@ impl RuntimeActor {
                     &self.graph.journal_format,
                     &current.page,
                 ),
+                roots: self.application_projection_roots(&entry.rel_path, &current.page),
                 page: current.page,
             });
         }
@@ -13484,9 +13544,26 @@ impl RuntimeActor {
         }
         let mut pages = Vec::new();
         if needs_blocks {
+            // Direct Files narrows a literal fuzzy block predicate through its
+            // stored ordered-subsequence index before it walks anything. The
+            // managed frontier keeps the SAME index in its materialized
+            // projection, so ask it the same question here -- at the caller,
+            // because the caller is what owns the materialized read and knows
+            // whether the accepted frontier is the whole story. The index only
+            // chooses pages; the parser-owned matcher still decides and ranks
+            // every block, so a narrowed run returns identical results.
+            let narrowed = plan
+                .fuzzy_block_needle()
+                .and_then(|needle| self.application_fuzzy_candidate_paths_ready(needle));
             for entry in &entries {
                 if cancelled() {
                     break;
+                }
+                if narrowed
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains(entry.rel_path.as_str()))
+                {
+                    continue;
                 }
                 let current = match self.load_application_exact_ready(&entry.rel_path)? {
                     ApplicationExactLoad::Loaded(current) => current,
@@ -13497,14 +13574,60 @@ impl RuntimeActor {
                     }
                 };
                 pages.push(crate::query_plan::ApplicationQueryPlanPage {
+                    roots: self.application_projection_roots(&entry.rel_path, &current.page),
                     entry: entry.clone(),
-                    page: current.page,
                 });
             }
         }
         Ok(plan.execute_application_with_explain(
             entries, &pages, aliases, referenced, cancelled, explain,
         ))
+    }
+
+    /// Managed pages that could contain `needle` as an ordered subsequence,
+    /// read from the same materialized index Direct Files narrows through
+    /// (`SqliteGraphProjectionRead::fuzzy_subsequence_candidate_pages_after`,
+    /// which the managed read view already exposes and already populates -- the
+    /// managed unlinked-reference path reads the same `search_substring_fts`
+    /// rows).
+    ///
+    /// `None` means "do not narrow", never "no results". It is returned
+    /// whenever the materialized frontier is not the whole story -- an actor
+    /// holding a pending local suffix has page content the index has not seen,
+    /// and narrowing on a stale index would silently DROP a matching page --
+    /// and whenever the index read itself refuses, because narrowing is an
+    /// optimization and must never turn into a failed request.
+    fn application_fuzzy_candidate_paths_ready(&self, needle: &str) -> Option<HashSet<String>> {
+        if needle.is_empty() {
+            return None;
+        }
+        if self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| !managed.latest_projection_frames.is_empty())
+        {
+            return None;
+        }
+        let read = self.application_materialized_read_ready().ok()?;
+        const BATCH: usize = 1024;
+        let mut cursor = None;
+        let mut paths = HashSet::new();
+        loop {
+            let rows = read
+                .fuzzy_subsequence_candidate_pages_after(needle, cursor, BATCH)
+                .ok()?;
+            let len = rows.len();
+            for row in rows {
+                cursor = Some(row.page_id);
+                paths.insert(row.path.as_str().to_owned());
+            }
+            if len < BATCH {
+                break;
+            }
+        }
+        #[cfg(test)]
+        self.note_managed_application_query_fuzzy_narrowing(paths.len());
+        Some(paths)
     }
 
     fn application_backlink_filter_context_ready(

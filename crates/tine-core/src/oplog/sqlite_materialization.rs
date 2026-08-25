@@ -1914,6 +1914,14 @@ pub struct MaterializedPlainTextCandidatePageRow {
     pub page_id: PageId,
 }
 
+/// One page that could contain a literal needle as an ordered subsequence.
+/// A candidate only; the parser-owned matcher still decides and ranks blocks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedFuzzyCandidatePageRow {
+    pub page_id: PageId,
+    pub path: ManagedPath,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedBlockPropertyCandidateRow {
     pub page_id: PageId,
@@ -2420,6 +2428,28 @@ impl<'a> SqliteMaterializedRead<'a> {
             .collect()
     }
 
+    /// Page-level candidates for the legacy ordered-subsequence matcher --
+    /// the managed twin of the read Direct Files narrows through in
+    /// `direct_projection::fuzzy_candidate_paths`, over the same
+    /// `search_substring_fts` rows and the same
+    /// `to_lowercase().nfc()` normalization both writers apply.
+    pub fn fuzzy_subsequence_candidate_pages_after(
+        &self,
+        normalized_needle: &str,
+        after: Option<PageId>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedFuzzyCandidatePageRow>, MaterializationError> {
+        self.inner
+            .fuzzy_subsequence_candidate_pages_after(
+                normalized_needle,
+                after.map(|page| page.as_uuid().into_bytes()),
+                limit,
+            )?
+            .into_iter()
+            .map(fuzzy_candidate_page_row_from_storage)
+            .collect()
+    }
+
     pub fn block_property_candidates_after(
         &self,
         normalized_name: &str,
@@ -2790,6 +2820,15 @@ fn plain_text_candidate_page_row_from_storage(
 ) -> Result<MaterializedPlainTextCandidatePageRow, MaterializationError> {
     Ok(MaterializedPlainTextCandidatePageRow {
         page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+    })
+}
+
+fn fuzzy_candidate_page_row_from_storage(
+    row: storage::PhysicalFuzzyCandidatePageRow,
+) -> Result<MaterializedFuzzyCandidatePageRow, MaterializationError> {
+    Ok(MaterializedFuzzyCandidatePageRow {
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        path: ManagedPath::parse(row.path).map_err(typed_sql_decode_error)?,
     })
 }
 
