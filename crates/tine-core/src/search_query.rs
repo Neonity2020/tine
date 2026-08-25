@@ -20,6 +20,57 @@
 
 use unicode_normalization::UnicodeNormalization;
 
+fn is_search_whitespace(char: char) -> bool {
+    matches!(
+        char,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+fn common_regex_pattern(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if i + 1 < bytes.len() && matches!(bytes[i + 1], b'1'..=b'9') {
+                return false;
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'[' {
+            in_class = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b']' && in_class {
+            in_class = false;
+            i += 1;
+            continue;
+        }
+        if !in_class
+            && bytes[i] == b'('
+            && bytes.get(i + 1) == Some(&b'?')
+            && bytes.get(i + 2) != Some(&b':')
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Canonical comparison representation for non-regex search. Lowercasing is
 /// locale-independent; NFC makes canonically equivalent spellings compare
 /// alike without compatibility folding or removing accents.
@@ -73,7 +124,7 @@ pub enum Matcher {
 impl Matcher {
     /// Parse a raw query string into a matcher.
     pub fn parse(query: &str) -> Matcher {
-        let q = query.trim();
+        let q = query.trim_matches(is_search_whitespace);
         if q.is_empty() {
             return Matcher::Empty;
         }
@@ -82,6 +133,11 @@ impl Matcher {
         // treat it as a literal boolean term instead.)
         if q.len() >= 3 && q.starts_with('/') && q.ends_with('/') {
             let pat = &q[1..q.len() - 1];
+            if !common_regex_pattern(pat) {
+                return Matcher::InvalidRegex(
+                    "regex feature is not supported by both search engines".to_string(),
+                );
+            }
             return match regex::Regex::new(pat) {
                 Ok(re) => Matcher::Regex(re),
                 Err(e) => Matcher::InvalidRegex(e.to_string()),
@@ -187,14 +243,14 @@ fn tokenize(q: &str) -> Vec<Token> {
     let mut out: Vec<Token> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i].is_whitespace() {
+        if is_search_whitespace(chars[i]) {
             i += 1;
             continue;
         }
         let mut negated = false;
         // A leading `-` negates, but only when something follows it (a lone `-`
         // is treated as a literal term).
-        if chars[i] == '-' && i + 1 < chars.len() && !chars[i + 1].is_whitespace() {
+        if chars[i] == '-' && i + 1 < chars.len() && !is_search_whitespace(chars[i + 1]) {
             negated = true;
             i += 1;
         }
@@ -213,7 +269,7 @@ fn tokenize(q: &str) -> Vec<Token> {
         } else {
             // Bare token: read to the next whitespace.
             let start = i;
-            while i < chars.len() && !chars[i].is_whitespace() {
+            while i < chars.len() && !is_search_whitespace(chars[i]) {
                 i += 1;
             }
             (chars[start..i].iter().collect::<String>(), false)
@@ -321,6 +377,16 @@ mod tests {
     }
 
     #[test]
+    fn regex_contract_is_unicode_aware_and_rejects_engine_specific_features() {
+        assert!(hit(r"/\p{L}+/", "café"));
+        assert!(!hit(r"/\p{L}+/", "123"));
+        assert!(hit(r"/[(?]+/", "(?"));
+        for query in [r"/foo(?=bar)/", r"/(a)\1/", r"/(?i)abc/"] {
+            assert!(matches!(m(query), Matcher::InvalidRegex(_)), "{query}");
+        }
+    }
+
+    #[test]
     fn empty_query_matches_nothing() {
         assert!(matches!(m("   "), Matcher::Empty));
         assert!(!hit("   ", "anything"));
@@ -365,9 +431,8 @@ mod tests {
 ///
 /// `tests/fixtures/search-query-corpus.json` is asserted here and, case for
 /// case, by `src/editor/searchQuery.corpus.test.ts`. The corpus pins CURRENT
-/// behavior; where the two engines already disagree the row records BOTH
-/// answers under `knownDivergence: "DUP-9"` rather than either engine being
-/// changed to match the other.
+/// behavior. Every row has one shared answer; adding a runtime-specific answer
+/// would reintroduce the page-list/block-list split this corpus prevents.
 #[cfg(test)]
 mod corpus {
     use super::*;
@@ -428,19 +493,11 @@ mod corpus {
         for case in cases {
             let name = case["name"].as_str().expect("every case is named");
             let query = case["query"].as_str().expect("every case has a query");
-            let expected = if case.get("knownDivergence").is_some() {
-                assert_eq!(
-                    case["knownDivergence"], "DUP-9",
-                    "{name}: the only recorded divergence class is DUP-9"
-                );
-                assert!(
-                    case["why"].as_str().is_some_and(|why| !why.is_empty()),
-                    "{name}: a divergence must say what causes it"
-                );
-                &case["rust"]
-            } else {
-                case
-            };
+            assert!(
+                case.get("knownDivergence").is_none(),
+                "{name}: the conformance corpus must have one cross-runtime answer"
+            );
+            let expected = case;
             assert_eq!(
                 tokens_json(query),
                 expected["tokens"],
@@ -450,31 +507,6 @@ mod corpus {
                 verdict_json(query),
                 expected["verdict"],
                 "{name}: Matcher::parse({query:?}) changed"
-            );
-        }
-    }
-
-    /// A divergence row must actually diverge. If the two engines have been
-    /// brought into agreement, the row becomes an ordinary shared case -- and
-    /// the DUP-9 note should go with it.
-    #[test]
-    fn every_divergence_row_records_two_different_answers() {
-        let doc: Value = serde_json::from_str(CORPUS).expect("corpus is valid JSON");
-        for case in doc["cases"].as_array().expect("cases") {
-            if case.get("knownDivergence").is_none() {
-                continue;
-            }
-            let name = case["name"].as_str().expect("named");
-            let rust = &case["rust"];
-            let ts = &case["typescript"];
-            assert!(
-                rust.is_object() && ts.is_object(),
-                "{name}: a divergence needs both a `rust` and a `typescript` section"
-            );
-            assert_ne!(
-                (&rust["tokens"], &rust["verdict"]),
-                (&ts["tokens"], &ts["verdict"]),
-                "{name}: recorded as a divergence but both engines agree; make it a shared case"
             );
         }
     }

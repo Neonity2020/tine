@@ -29,6 +29,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Search and conflict handling now use one contract across runtimes.** Page
+  and block search agree on Unicode whitespace, bare Unicode tags, and the
+  common linear-time regex subset; query-workspace saves and Direct conflict
+  resolution classify bounded failure codes instead of matching error prose.
+  The browser mock now also announces the graph rebind caused by changing the
+  default home page.
+
 - **Managed Storage and Direct Files answer the same query the same way.** The
   two storage modes evaluated block queries through separate copies of the same
   logic, and the copies had drifted: a byte-budgeted block-referrers panel

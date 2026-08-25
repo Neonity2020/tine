@@ -620,6 +620,13 @@ function conflictObservationEpoch(error: unknown): number | null {
   return match ? Number(match[1]) : null;
 }
 
+/** Whether a save failed because the page revision changed underneath it.
+ * Consumers outside the persistence loop use this bounded contract instead of
+ * searching arbitrary backend prose for words such as "conflict" or "exists". */
+export function isSaveConflictFailure(error: unknown): boolean {
+  return conflictObservationEpoch(error) !== null || saveFailureCode(error) === "managed.conflict";
+}
+
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
   if (reopenRequired) return;
   if (!isRetryableSaveFailure(error)) {

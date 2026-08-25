@@ -3947,13 +3947,7 @@ pub(crate) async fn resolve_vcs_marker_conflict(
                 &base_rev,
                 pre_choice.as_deref().unwrap_or("union"),
             )
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    "conflict".to_string()
-                } else {
-                    error.to_string()
-                }
-            })
+            .map_err(direct_save_error_message)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -4258,13 +4252,7 @@ pub(crate) async fn resolve_sync_conflict(
                     merge_base_rev.as_deref(),
                     pre_choice.as_deref().unwrap_or("union"),
                 )
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        "conflict".to_string()
-                    } else {
-                        error.to_string()
-                    }
-                }),
+                .map_err(direct_save_error_message),
         }
     })
     .await

@@ -1230,7 +1230,7 @@ export function mockBackend(): Backend {
       return collect((b) => blockRefIds(b.raw).includes(uuid));
     },
     async setDefaultHome(): Promise<void> {
-      // no-op in mock
+      notifyGraphRebound();
     },
     async deletePage(): Promise<void> {
       // no-op in mock

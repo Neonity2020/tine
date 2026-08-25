@@ -77,6 +77,8 @@ type Tok =
   | { t: "word"; v: string; s: number; e: number }
   | { t: "str"; v: string; s: number; e: number };
 
+const BARE_TAG_CHAR = /[\p{L}\p{N}_/.-]/u;
+
 function tokenize(src: string): Tok[] {
   const toks: Tok[] = [];
   const ch = Array.from(src);
@@ -107,7 +109,7 @@ function tokenize(src: string): Tok[] {
       } else {
         let j = i + 1;
         let name = "";
-        while (j < ch.length && /[\w/.-]/.test(ch[j])) name += ch[j++];
+        while (j < ch.length && BARE_TAG_CHAR.test(ch[j])) name += ch[j++];
         toks.push({ t: "tag", v: name, s: i, e: j });
         i = j;
       }
