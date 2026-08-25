@@ -29,6 +29,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Task markers mean the same thing everywhere.** The editor, carry-forward,
+  the sheet state/priority writers, and the rendered checkbox now share one
+  leading-marker recognizer that is byte-faithful to the parser: a task written
+  as `TODO<tab>x` no longer counts as open for carry-forward while rendering
+  without a checkbox, cycling or setting state on an indented task replaces its
+  marker instead of prepending a second one, and a bare `TODO` followed by
+  continuation lines is no longer treated as a task the renderer cannot see.
+- **`key:: value` property lines are recognized the same way by every tool.**
+  Logbook insertion, managed template/content checks, rename, conflict handling
+  and the read index now share the parser's exact property-line rule, so a
+  dotted key like `logseq.order-list-type:: number` is treated as a block
+  property everywhere (a logbook entry could previously be inserted above it),
+  leading whitespace and Unicode keys behave identically, and `key::value`
+  without a space is (as the parser already said) not a property.
 - **Managed Storage and Direct Files answer the same query the same way.** The
   two storage modes evaluated block queries through separate copies of the same
   logic, and the copies had drifted: a byte-budgeted block-referrers panel
