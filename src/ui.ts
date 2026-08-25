@@ -546,11 +546,22 @@ export function settleArtifactConflict(id: string): void {
   ++artifactConflictRefreshGeneration;
   replaceArtifactConflictQueue(artifactConflictQueue.filter((conflict) => conflict.id !== id));
   resetConflictCursor();
-  if (settled.source === "sync-copy") {
-    const copy = settled.sides.find((side) => side.role === "theirs")?.path;
-    if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
-  } else if (settled.source === "vcs-markers") {
-    setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
+  switch (settled.source) {
+    case "sync-copy": {
+      const copy = settled.sides.find((side) => side.role === "theirs")?.path;
+      if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
+      break;
+    }
+    case "vcs-markers":
+      setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
+      break;
+    case "live-save":
+    case "duplicate-journal":
+      break;
+    default: {
+      const unhandled: never = settled.source;
+      throw new Error(`unsupported conflict source: ${String(unhandled)}`);
+    }
   }
   retireSettledArtifactArrivalToasts(artifactConflictQueue);
 }

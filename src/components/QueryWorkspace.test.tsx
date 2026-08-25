@@ -149,7 +149,7 @@ describe("materializeQueryWorkspace", () => {
 
   it("keeps the workspace virtual when a create race reaches the save guard", async () => {
     const deps = materializeDeps({
-      savePage: vi.fn(async () => { throw new Error("save conflict: page changed on disk"); }),
+      savePage: vi.fn(async () => { throw new Error("conflict:17"); }),
     });
     const result = await materializeQueryWorkspace({
       title: "Raced",
@@ -161,6 +161,23 @@ describe("materializeQueryWorkspace", () => {
 
     expect(result).toMatchObject({ ok: false, kind: "conflict" });
     expect(deps.savePage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not classify code-shaped non-conflicts from their prose", async () => {
+    const deps = materializeDeps({
+      savePage: vi.fn(async () => {
+        throw new Error("precheck.portable_collision: a page with that spelling already exists");
+      }),
+    });
+    const result = await materializeQueryWorkspace({
+      title: "Portable collision",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "list",
+      routeId: "query-portable-collision",
+    }, deps);
+
+    expect(result).toMatchObject({ ok: false, kind: "error" });
   });
 });
 

@@ -20,6 +20,8 @@ describe("parse + serialize round-trip", () => {
   it("page / tag refs", () => {
     expect(roundtrip("[[Foo]]")).toBe("[[Foo]]");
     expect(roundtrip("#bar")).toBe("[[bar]]"); // tag normalizes to page-ref (same predicate)
+    expect(roundtrip("#café")).toBe("[[café]]");
+    expect(roundtrip("#你好")).toBe("[[你好]]");
   });
 
   it("boolean operators", () => {

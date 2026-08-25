@@ -60,6 +60,15 @@ describe("searchQuery parser (#44)", () => {
     expect(hit("/(unclosed/", "(unclosed")).toBe(false);
   });
 
+  it("uses the shared Unicode regex subset", () => {
+    expect(hit("/\\p{L}+/", "café")).toBe(true);
+    expect(hit("/\\p{L}+/", "123")).toBe(false);
+    expect(hit("/[(?]+/", "(?")).toBe(true);
+    for (const query of ["/foo(?=bar)/", "/(a)\\1/", "/(?i)abc/"]) {
+      expect(parseSearchQuery(query).kind, query).toBe("invalid");
+    }
+  });
+
   it("`//` is a literal term, not a regex", () => {
     expect(parseSearchQuery("//").kind).toBe("boolean");
     expect(hit("//", "a // b")).toBe(true);

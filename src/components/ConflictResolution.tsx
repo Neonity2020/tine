@@ -63,6 +63,10 @@ import {
 } from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
 
+function unsupportedConflictSource(source: never): never {
+  throw new Error(`unsupported conflict source: ${String(source)}`);
+}
+
 /** The side labels the artifact itself supplied, shortened for a row segment. */
 function segLabel(text: string, fallback: string): string {
   const trimmed = text.trim();
@@ -233,32 +237,37 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
     () => `${conflict().id}:${conflict().live?.draft_version ?? 0}`,
     async () => {
       const c = conflict();
-      if (c.source === "live-save") {
-        const live = c.live;
-        if (!live) return null;
-        const result = live.disk_rev !== undefined
-          ? await backend().durableLiveSaveConflictDiff(live.page, live.base_text ?? null)
-          : await backend().liveSaveConflictDiff(
-              live.page,
-              live.base_rev,
-              live.conflict_epoch,
-            );
-        updateLiveSaveConflictDiskRev(c.page_name, result.conflict_rev);
-        return result;
+      switch (c.source) {
+        case "live-save": {
+          const live = c.live;
+          if (!live) return null;
+          const result = live.disk_rev !== undefined
+            ? await backend().durableLiveSaveConflictDiff(live.page, live.base_text ?? null)
+            : await backend().liveSaveConflictDiff(
+                live.page,
+                live.base_rev,
+                live.conflict_epoch,
+              );
+          updateLiveSaveConflictDiskRev(c.page_name, result.conflict_rev);
+          return result;
+        }
+        case "vcs-markers": {
+          const parsed = await backend().vcsMarkerConflictDiff(c.page_path);
+          return parsed?.diff ?? null;
+        }
+        case "duplicate-journal": {
+          const copy = c.sides.find((s) => s.role === "theirs")?.path;
+          if (!copy) return null;
+          return await backend().duplicateJournalDiff(c.page_path, copy);
+        }
+        case "sync-copy": {
+          const copy = c.sides.find((s) => s.role === "theirs")?.path;
+          if (!copy) return null;
+          return await backend().syncConflictDiff(c.page_path, copy);
+        }
+        default:
+          return unsupportedConflictSource(c.source);
       }
-      if (c.source === "vcs-markers") {
-        const parsed = await backend().vcsMarkerConflictDiff(c.page_path);
-        return parsed?.diff ?? null;
-      }
-      const copy = c.sides.find((s) => s.role === "theirs")?.path;
-      if (!copy) return null;
-      // A duplicate day resolves pairwise: the canonical file against the FIRST
-      // stray. `null` here means the pair cannot be merged (a cross-format
-      // twin), and the file list below is the whole affordance.
-      if (c.source === "duplicate-journal") {
-        return await backend().duplicateJournalDiff(c.page_path, copy);
-      }
-      return await backend().syncConflictDiff(c.page_path, copy);
     }
   );
 

@@ -4,6 +4,7 @@ import {
   flushAll,
   flushPage,
   holdManagedMovePages,
+  isSaveConflictFailure,
   isRetryableSaveFailure,
   markDirty,
   requireManagedRuntimeReopen,
@@ -69,6 +70,16 @@ describe("managed move persistence barrier", () => {
 });
 
 describe("save failure classification", () => {
+  it("recognizes only bounded content-conflict contracts", () => {
+    expect(isSaveConflictFailure("conflict:17")).toBe(true);
+    expect(isSaveConflictFailure("managed.conflict: stale_base")).toBe(true);
+    expect(isSaveConflictFailure(
+      "sync actor refused application page intent at committing the semantic page transaction (reason code: managed.conflict)",
+    )).toBe(true);
+    expect(isSaveConflictFailure("precheck.portable_collision: page already exists")).toBe(false);
+    expect(isSaveConflictFailure("ordinary prose says conflict or already exists")).toBe(false);
+  });
+
   // A non-retryable failure used to be retried twice more before toasting, and
   // each retry re-runs the whole pre-save check — on a large graph, the
   // expensive part — only to reach the same answer. GH #267's "about a minute

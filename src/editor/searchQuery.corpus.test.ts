@@ -8,8 +8,8 @@
 //
 // `tests/fixtures/search-query-corpus.json` is asserted case for case by this
 // file and by `search_query::corpus` on the Rust side. It pins CURRENT
-// behavior; the six rows the two engines already disagree on carry BOTH answers
-// under `knownDivergence: "DUP-9"` and neither tokenizer was changed.
+// behavior. Every row has one shared answer; runtime-specific expectations are
+// forbidden because users get both engines in the same search surface.
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -19,13 +19,9 @@ interface Expectation {
   tokens: unknown;
   verdict: unknown;
 }
-interface Case extends Partial<Expectation> {
+interface Case extends Expectation {
   name: string;
   query: string;
-  knownDivergence?: string;
-  why?: string;
-  rust?: Expectation;
-  typescript?: Expectation;
 }
 
 const corpus = JSON.parse(
@@ -60,27 +56,9 @@ describe("search-grammar conformance corpus (DUP-8)", () => {
   });
 
   for (const testCase of corpus.cases) {
-    const expected = testCase.knownDivergence ? testCase.typescript : testCase;
     it(testCase.name, () => {
-      if (testCase.knownDivergence) {
-        expect(testCase.knownDivergence).toBe("DUP-9");
-        expect(testCase.why ?? "").not.toBe("");
-        expect(testCase.rust).toBeDefined();
-      }
-      expect(tokenize(testCase.query)).toEqual(expected!.tokens);
-      expect(verdictOf(parseSearchQuery(testCase.query))).toEqual(expected!.verdict);
+      expect(tokenize(testCase.query)).toEqual(testCase.tokens);
+      expect(verdictOf(parseSearchQuery(testCase.query))).toEqual(testCase.verdict);
     });
   }
-
-  // A divergence row must actually diverge. If the engines have been brought
-  // into agreement, the row becomes an ordinary shared case.
-  it("every divergence row records two different answers", () => {
-    for (const testCase of corpus.cases) {
-      if (!testCase.knownDivergence) continue;
-      expect(
-        JSON.stringify(testCase.rust),
-        `${testCase.name}: recorded as a divergence but both engines agree`,
-      ).not.toBe(JSON.stringify(testCase.typescript));
-    }
-  });
 });

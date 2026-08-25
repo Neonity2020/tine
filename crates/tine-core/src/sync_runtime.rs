@@ -367,6 +367,8 @@ struct ManagedApplicationQueryInstrumentation {
     /// lsdoc projection in it) was reused / rebuilt during this measurement.
     projection_cache_hits: usize,
     projection_cache_misses: usize,
+    hydration_cache_hits: usize,
+    hydration_cache_misses: usize,
 }
 
 /// How many distinct simple-query answers one actor retains at a time.
@@ -10146,10 +10148,188 @@ struct EditorCurrentPage {
     dto: SyncEditablePageDto,
 }
 
+#[derive(Clone)]
 struct ApplicationCurrentPage {
     page: PageDto,
     revision: String,
     editor: EditorCurrentPage,
+}
+
+const APPLICATION_HYDRATION_CACHE_MAX_PAGES: usize = 16_384;
+const APPLICATION_HYDRATION_CACHE_MIN_BYTES: usize = 32 * 1024 * 1024;
+const APPLICATION_HYDRATION_CACHE_FALLBACK_BYTES: usize = 128 * 1024 * 1024;
+const APPLICATION_HYDRATION_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone)]
+struct ApplicationHydrationCacheEntry {
+    source_digest: ContentDigest,
+    materialized: MaterializedPage,
+    current: ApplicationCurrentPage,
+    retained_bytes: usize,
+    used: u64,
+}
+
+/// Actor-local cache for the expensive pure half of managed page hydration.
+///
+/// SQLite materialization and the exact projection bytes remain the inputs on
+/// every lookup. Reuse is allowed only when both still match the retained
+/// inputs, so external edits and accepted actor changes miss without an
+/// invalidation hook. The cache is disposable and carries no authority.
+struct ApplicationHydrationCache {
+    entries: HashMap<String, ApplicationHydrationCacheEntry>,
+    max_pages: usize,
+    max_retained_bytes: usize,
+    retained_bytes: usize,
+    clock: u64,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl Default for ApplicationHydrationCache {
+    fn default() -> Self {
+        Self::new(
+            APPLICATION_HYDRATION_CACHE_MAX_PAGES,
+            application_hydration_cache_budget_for_available(
+                crate::oplog::object_store::available_memory_bytes(),
+            ),
+        )
+    }
+}
+
+impl ApplicationHydrationCache {
+    fn new(max_pages: usize, max_retained_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_pages,
+            max_retained_bytes,
+            retained_bytes: 0,
+            clock: 0,
+            #[cfg(test)]
+            hits: 0,
+            #[cfg(test)]
+            misses: 0,
+        }
+    }
+
+    fn get(
+        &mut self,
+        path: &ManagedPath,
+        source_digest: ContentDigest,
+        materialized: &MaterializedPage,
+    ) -> Option<ApplicationCurrentPage> {
+        self.clock = self.clock.saturating_add(1);
+        let used = self.clock;
+        let hit = self.entries.get_mut(path.as_str()).filter(|entry| {
+            entry.source_digest == source_digest
+                && editor_materialization_matches(&entry.materialized, materialized)
+        });
+        if let Some(entry) = hit {
+            entry.used = used;
+            #[cfg(test)]
+            {
+                self.hits = self.hits.saturating_add(1);
+            }
+            return Some(entry.current.clone());
+        }
+        #[cfg(test)]
+        {
+            self.misses = self.misses.saturating_add(1);
+        }
+        None
+    }
+
+    fn insert(
+        &mut self,
+        path: &ManagedPath,
+        source_digest: ContentDigest,
+        source_bytes: usize,
+        materialized: MaterializedPage,
+        current: ApplicationCurrentPage,
+    ) {
+        let retained_bytes = application_hydration_retained_bytes(source_bytes, &materialized);
+        if self.max_pages == 0 || retained_bytes > self.max_retained_bytes {
+            self.forget(path.as_str());
+            return;
+        }
+        self.clock = self.clock.saturating_add(1);
+        if let Some(previous) = self.entries.insert(
+            path.as_str().to_owned(),
+            ApplicationHydrationCacheEntry {
+                source_digest,
+                materialized,
+                current,
+                retained_bytes,
+                used: self.clock,
+            },
+        ) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(previous.retained_bytes);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.evict();
+    }
+
+    fn forget(&mut self, path: &str) {
+        if let Some(previous) = self.entries.remove(path) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(previous.retained_bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.retained_bytes = 0;
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > self.max_pages || self.retained_bytes > self.max_retained_bytes {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(path, entry)| (entry.used, (*path).clone()))
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.forget(&victim);
+        }
+    }
+
+    #[cfg(test)]
+    fn reset_counters(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    #[cfg(test)]
+    fn counters(&self) -> (usize, usize, usize, usize) {
+        (
+            self.hits,
+            self.misses,
+            self.entries.len(),
+            self.retained_bytes,
+        )
+    }
+}
+
+fn application_hydration_cache_budget_for_available(available: Option<u64>) -> usize {
+    available
+        .and_then(|bytes| usize::try_from(bytes / 8).ok())
+        .unwrap_or(APPLICATION_HYDRATION_CACHE_FALLBACK_BYTES)
+        .clamp(
+            APPLICATION_HYDRATION_CACHE_MIN_BYTES,
+            APPLICATION_HYDRATION_CACHE_MAX_BYTES,
+        )
+}
+
+fn application_hydration_retained_bytes(
+    source_bytes: usize,
+    materialized: &MaterializedPage,
+) -> usize {
+    source_bytes
+        .saturating_mul(4)
+        .saturating_add(materialized.blocks.len().saturating_mul(512))
 }
 
 enum TrustedEditorForegroundTarget {
@@ -10786,6 +10966,7 @@ struct RuntimeActor {
     /// exact comparison, so it holds no authority and cannot go stale -- a
     /// changed page misses and is rebuilt.
     application_projection_cache: std::cell::RefCell<crate::query::ApplicationProjectionCache>,
+    application_hydration_cache: std::cell::RefCell<ApplicationHydrationCache>,
     #[cfg(test)]
     managed_application_query_instrumentation:
         std::cell::Cell<ManagedApplicationQueryInstrumentation>,
@@ -11060,6 +11241,9 @@ impl RuntimeActor {
             application_projection_cache: std::cell::RefCell::new(
                 crate::query::ApplicationProjectionCache::default(),
             ),
+            application_hydration_cache: std::cell::RefCell::new(
+                ApplicationHydrationCache::default(),
+            ),
             #[cfg(test)]
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
@@ -11137,6 +11321,9 @@ impl RuntimeActor {
         self.application_projection_cache
             .borrow_mut()
             .reset_counters();
+        self.application_hydration_cache
+            .borrow_mut()
+            .reset_counters();
     }
 
     /// The converted block tree for one exact managed page, reused whenever the
@@ -11154,6 +11341,7 @@ impl RuntimeActor {
     #[cfg(test)]
     fn clear_application_simple_query_memo(&self) {
         self.application_projection_cache.borrow_mut().clear();
+        self.application_hydration_cache.borrow_mut().clear();
         self.application_simple_query_memo.borrow_mut().clear();
     }
 
@@ -11163,6 +11351,9 @@ impl RuntimeActor {
         let (hits, misses, _) = self.application_projection_cache.borrow().counters();
         current.projection_cache_hits = hits;
         current.projection_cache_misses = misses;
+        let (hits, misses, _, _) = self.application_hydration_cache.borrow().counters();
+        current.hydration_cache_hits = hits;
+        current.hydration_cache_misses = misses;
         current
     }
 
@@ -14147,6 +14338,7 @@ impl RuntimeActor {
                     self.active_database()
                         .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?,
                     &self.graph,
+                    &self.application_hydration_cache,
                     page.page_id,
                 ) {
                     if current.editor.page.path == path {
@@ -14262,6 +14454,7 @@ impl RuntimeActor {
                     self.active_database()
                         .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?,
                     &self.graph,
+                    &self.application_hydration_cache,
                     page.page_id,
                 ) {
                     if current.editor.page.path == path {
@@ -21486,6 +21679,7 @@ fn load_projected_source_rebased_application_page_from_parts(
     engine: &ShardedHotEngine,
     database: &crate::oplog::SqliteFrontier,
     graph: &Graph,
+    cache: &std::cell::RefCell<ApplicationHydrationCache>,
     page_id: PageId,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
     let Some(mut current) = load_projected_page_from_projection(
@@ -21497,16 +21691,32 @@ fn load_projected_source_rebased_application_page_from_parts(
     else {
         return Ok(None);
     };
-    let parsed = graph
-        .load_by_path(current.page.path.as_str())
-        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("rebased_source_load_by_path"))?
+    let path = current.page.path.clone();
+    let source = graph
+        .read_application_projection_input(&path)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("rebased_source_read"))?
         .ok_or(SyncEditorRequestError::ActorRefusedAt(
             "rebased_source_path_missing",
         ))?;
+    let source_digest = ContentDigest::of(&source);
+    if let Some(cached) = cache.borrow_mut().get(&path, source_digest, &current.page) {
+        return Ok(Some(cached));
+    }
+    let materialized = current.page.clone();
+    let parsed = graph
+        .parse_exact_page_dto(&path, &source)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("rebased_source_parse"))?;
     rebase_projected_editor_page_from_source(&mut current, &parsed)?;
-    join_application_page(parsed, current)
-        .map(Some)
-        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("rebased_source_join"))
+    let joined = join_application_page(parsed, current)
+        .map_err(|_| SyncEditorRequestError::ActorRefusedAt("rebased_source_join"))?;
+    cache.borrow_mut().insert(
+        &path,
+        source_digest,
+        source.len(),
+        materialized,
+        joined.clone(),
+    );
+    Ok(Some(joined))
 }
 
 fn rebase_projected_editor_page_from_source(
@@ -44024,6 +44234,7 @@ mod tests {
         let pages = direct.list_pages().len();
         assert!(pages > SYNTHETIC_PAGES, "fixture did not activate at scale");
         let handle = open_reopened_managed_actor(&fixture);
+        handle.clear_application_simple_query_memo().unwrap();
         let source = "references";
 
         let run = || {
@@ -44046,6 +44257,11 @@ mod tests {
             "the first managed evaluation must convert every page exactly once: {cold_counters:?}"
         );
         assert_eq!(cold_counters.projection_cache_hits, 0, "{cold_counters:?}");
+        assert_eq!(
+            cold_counters.hydration_cache_misses, pages,
+            "the first evaluation must parse and join each page once: {cold_counters:?}"
+        );
+        assert_eq!(cold_counters.hydration_cache_hits, 0, "{cold_counters:?}");
         assert_managed_graph_search_matches_direct(
             "cold managed graph search",
             cold,
@@ -44061,6 +44277,11 @@ mod tests {
             warm_counters.projection_cache_misses, 0,
             "a repeated evaluation must not re-parse a single unchanged page: {warm_counters:?}"
         );
+        assert_eq!(
+            warm_counters.hydration_cache_hits, pages,
+            "a repeated evaluation must reuse every exact page hydration: {warm_counters:?}"
+        );
+        assert_eq!(warm_counters.hydration_cache_misses, 0, "{warm_counters:?}");
         assert_managed_graph_search_matches_direct(
             "warm managed graph search",
             warm,
@@ -44108,6 +44329,12 @@ mod tests {
             pages - 1,
             "every page the save did not touch must still be reused: {after_save:?}"
         );
+        assert_eq!(after_save.hydration_cache_misses, 0, "{after_save:?}");
+        assert_eq!(
+            after_save.hydration_cache_hits,
+            pages - 1,
+            "unchanged pages must retain their parsed application DTOs while the just-saved page is served from its pending foreground projection: {after_save:?}"
+        );
 
         let reopened_direct = Graph::open(&fixture.graph_root);
         let (_, after_save_execution, _) = run();
@@ -44121,6 +44348,22 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn application_hydration_cache_budget_tracks_available_memory_with_bounds() {
+        assert_eq!(
+            application_hydration_cache_budget_for_available(Some(8 * 1024 * 1024)),
+            APPLICATION_HYDRATION_CACHE_MIN_BYTES
+        );
+        assert_eq!(
+            application_hydration_cache_budget_for_available(Some(8 * 1024 * 1024 * 1024)),
+            APPLICATION_HYDRATION_CACHE_MAX_BYTES
+        );
+        assert_eq!(
+            application_hydration_cache_budget_for_available(None),
+            APPLICATION_HYDRATION_CACHE_FALLBACK_BYTES
+        );
     }
 
     /// The managed query/search performance receipt.

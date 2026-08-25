@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+- Added a read-only synchronized-graph verifier that compares the actual Markdown and Org file bytes across devices, including nested and nonstandard layouts, without requiring shell or ADB access.
+
 ### Changed
 
 - **A fault one core test injects can no longer fail an unrelated test beside
@@ -19,13 +21,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   that needs it, so the corpus reports the same result twice in a row (GH #350).
 
 - **Queries and search are much faster on Managed Storage.** Every managed
-  query used to re-parse every block of every candidate page, every time -- so
-  a page full of `{{query}}` re-parsed the graph on each open, and search
-  re-parsed it on each keystroke. Unchanged pages are now parsed once and
-  reused; an edited page is re-read on the very next query. Searching for a
-  literal phrase also consults the stored text index first instead of reading
-  every page, and a result-limited search now does its work only for the
-  results it keeps.
+  query used to re-read, re-parse, and structurally cross-check every candidate
+  page, every time -- so a page full of `{{query}}` re-parsed the graph on each
+  open, and search re-parsed it on each keystroke. Unchanged pages now reuse
+  their complete parsed application view after their exact file bytes and
+  stored page state are checked; an external edit or accepted actor change is
+  re-read immediately. Searching for a literal phrase also consults the stored
+  text index first instead of reading every page, and a result-limited search
+  now does its work only for the results it keeps.
 
 ### Fixed
 
@@ -41,6 +44,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   closed without first dragging a tab across. The ✕ now shows whenever closing
   actually works: any multi-tab strip, or a lone non-feed tab whose pane can
   close (GH #207).
+- **Search and conflict handling now use one contract across runtimes.** Page
+  and block search agree on Unicode whitespace, bare Unicode tags, and the
+  common linear-time regex subset; query-workspace saves and Direct conflict
+  resolution classify bounded failure codes instead of matching error prose.
+  The browser mock now also announces the graph rebind caused by changing the
+  default home page.
 - **Managed Storage and Direct Files answer the same query the same way.** The
   two storage modes evaluated block queries through separate copies of the same
   logic, and the copies had drifted: a byte-budgeted block-referrers panel
