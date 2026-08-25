@@ -1,5 +1,6 @@
 import { Show, createSignal, onMount } from "solid-js";
 import { backend, type DiagnosticReport } from "../backend";
+import { writeClipboardTextResilient } from "../clipboard";
 import { platformKind } from "../platform";
 import { pushToast } from "../ui";
 
@@ -25,7 +26,7 @@ export function DiagnosticsTab() {
     const current = report();
     if (!current) return;
     try {
-      await backend().writeText(current.text);
+      await writeClipboardTextResilient(current.text);
       pushToast("Diagnostic report copied", "success");
     } catch (error) {
       pushToast(`Could not copy diagnostic report: ${String(error)}`, "error");
