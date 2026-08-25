@@ -33,6 +33,10 @@ mod settings;
 mod spellcheck;
 mod state;
 mod storage_mode_supervisor;
+/// Test-only: the storage-transition enums and their `src/types.ts` unions are
+/// one wire format written twice.
+#[cfg(test)]
+mod storage_transition_wire_parity;
 mod sync_runtime;
 mod watcher;
 
