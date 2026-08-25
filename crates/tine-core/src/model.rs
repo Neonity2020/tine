@@ -14708,7 +14708,8 @@ impl Graph {
         new: &str,
         expected_path: Option<&str>,
     ) -> io::Result<()> {
-        self.rename_page_reporting(old, new, expected_path).map(|_| ())
+        self.rename_page_reporting(old, new, expected_path)
+            .map(|_| ())
     }
 
     /// `rename_page_expected`, plus what the rename deliberately did NOT do.
@@ -38730,7 +38731,11 @@ mod tests {
         fs::write(dir.join("pages").join("Alpha.md"), "- alpha\n").unwrap();
         let conflicted = "- intro\n<<<<<<< HEAD\n- mine sees [[Alpha]]\n=======\n- theirs sees [[Alpha]]\n>>>>>>> branch\n";
         fs::write(dir.join("pages").join("Conflicted.md"), conflicted).unwrap();
-        fs::write(dir.join("pages").join("Clean.md"), "- clean sees [[Alpha]]\n").unwrap();
+        fs::write(
+            dir.join("pages").join("Clean.md"),
+            "- clean sees [[Alpha]]\n",
+        )
+        .unwrap();
         let g = Graph::open(&dir);
         g.warm_cache();
 
@@ -38773,11 +38778,7 @@ mod tests {
         // rather than once per pair.
         let dir = scratch("rename-marker-namespace");
         fs::write(dir.join("pages").join("Parent.md"), "- parent\n").unwrap();
-        fs::write(
-            dir.join("pages").join("Parent%2FChild.md"),
-            "- child\n",
-        )
-        .unwrap();
+        fs::write(dir.join("pages").join("Parent%2FChild.md"), "- child\n").unwrap();
         let conflicted = "- intro\n<<<<<<< HEAD\n- [[Parent]] and [[Parent/Child]]\n=======\n- [[Parent/Child]] only\n>>>>>>> branch\n";
         fs::write(dir.join("pages").join("Conflicted.md"), conflicted).unwrap();
         let g = Graph::open(&dir);
@@ -45796,9 +45797,10 @@ mod tests {
         let dir = scratch("retired-crash-recovery");
         let path = dir.join("config.edn");
         fs::write(&path, b"{:base 1}\n").unwrap();
-        let crashed = atomic_replace_expected_with_hooks(&path, b"{:base 1}\n", b"{:next 2}\n", || {
-            Err(io::Error::other("simulated crash after retire"))
-        });
+        let crashed =
+            atomic_replace_expected_with_hooks(&path, b"{:base 1}\n", b"{:next 2}\n", || {
+                Err(io::Error::other("simulated crash after retire"))
+            });
         assert!(crashed.is_err());
         // The unwind restores it; simulate the harder case - a real crash, where
         // nothing runs - by retiring again and abandoning it.
@@ -45830,8 +45832,13 @@ mod tests {
         let recovered = restore_retired_files(&dir, &[dir.clone()]);
 
         assert_eq!(recovered, 0);
-        assert_eq!(fs::read(&path).unwrap(), b"current", "current file untouched");
-        let trashed = typed_trash_dir(&dir, TrashEntryKind::Conflict).join(".config.edn.999.0.retired");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"current",
+            "current file untouched"
+        );
+        let trashed =
+            typed_trash_dir(&dir, TrashEntryKind::Conflict).join(".config.edn.999.0.retired");
         assert_eq!(
             fs::read(&trashed).unwrap(),
             b"older",
@@ -45850,10 +45857,15 @@ mod tests {
             io::ErrorKind::PermissionDenied,
             io::ErrorKind::NotFound,
         ] {
-            assert!(dir_fsync_is_unsupported(&io::Error::new(kind, "x")), "{kind:?}");
+            assert!(
+                dir_fsync_is_unsupported(&io::Error::new(kind, "x")),
+                "{kind:?}"
+            );
         }
         for errno in [9, 13, 21, 22] {
-            assert!(dir_fsync_is_unsupported(&io::Error::from_raw_os_error(errno)));
+            assert!(dir_fsync_is_unsupported(&io::Error::from_raw_os_error(
+                errno
+            )));
         }
         // A real durability failure must surface.
         for errno in [5 /* EIO */, 28 /* ENOSPC */] {
@@ -45866,8 +45878,14 @@ mod tests {
 
     #[test]
     fn retired_names_round_trip_to_their_target() {
-        assert_eq!(retired_target_name(".config.edn.123.7.retired"), Some("config.edn"));
-        assert_eq!(retired_target_name(".a.b.c.md.1.2.retired"), Some("a.b.c.md"));
+        assert_eq!(
+            retired_target_name(".config.edn.123.7.retired"),
+            Some("config.edn")
+        );
+        assert_eq!(
+            retired_target_name(".a.b.c.md.1.2.retired"),
+            Some("a.b.c.md")
+        );
         assert_eq!(retired_target_name("config.edn"), None);
         assert_eq!(retired_target_name(".config.edn.tmp"), None);
     }
