@@ -20,6 +20,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed Storage can reopen retained edits and moves of blocks carrying a
+  Logseq `id::` UUID.** Projection recovery now consults the same bounded
+  baseline identity candidates as planning and commit validation, instead of
+  refusing the accepted block as unauthorized when the UUID originated in the
+  activation baseline (GH #370).
+
 - **Page action control labels no longer join dragged text selections.** The
   journal carry-over buttons ("Carry unfinished tasks → today" and friends),
   the tag-table toggle, the guide copy button, and the ⋯ page-actions trigger

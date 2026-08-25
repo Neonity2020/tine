@@ -10043,16 +10043,17 @@ mod tests {
     use crate::oplog::local_active::CleanLocalRuntime;
     use crate::oplog::operational_coordinator::{
         fail_next_clean_after_manifest_for_harness, CleanExternalMutationState,
-        CleanLocalMutationState, OperationalCoordinator,
+        CleanLocalMutationState, OperationalCoordinator, OperationalPhase,
     };
     use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
         AcceptedBatchEvent, ApplicationRuntimeRoot, AuthorBatch, BatchDisposition, BatchId,
         BatchOrigin, BlockLocation, CrdtPeerId, DeviceId, DocumentId, LineageDigest,
-        ManagedTextKind, ObjectStore, OperationTransaction, PortablePathIndexRoot, PreparedBatch,
-        ProjectionClaim, ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore,
-        ProjectionRecovery, RebuildSource, SemanticEffect, SemanticOperation, SessionId,
-        SqliteFrontier, MAX_MATERIALIZATION_QUERY_ROWS,
+        LogseqUuidResolution, ManagedTextKind, ObjectStore, OperationTransaction,
+        PortablePathIndexRoot, PreparedBatch, ProjectionClaim, ProjectionEndpointBinding,
+        ProjectionEndpointId, ProjectionReceiptStore, ProjectionRecovery, RebuildSource,
+        SemanticEffect, SemanticOperation, SessionId, SqliteFrontier,
+        MAX_MATERIALIZATION_QUERY_ROWS,
     };
 
     struct TestRoot(PathBuf);
@@ -10914,6 +10915,238 @@ mod tests {
             .annotations()
             .iter()
             .all(|annotation| annotation.logseq_uuid().is_none()));
+    }
+
+    #[test]
+    fn clean_uuid_history_edit_reopens_with_the_same_materialized_identity() {
+        let uuid = LogseqUuid::from_uuid(Uuid::from_u128(0x3700_0001));
+        let mut fixture = CleanSnapshotFixture::new_with_initial_uuid(
+            "uuid-history-edit",
+            &["pages/a.md"],
+            Some(uuid),
+        );
+        let block_id = fixture
+            .engine()
+            .materialize_page(fixture.page_id(0))
+            .unwrap()
+            .blocks[0]
+            .block_id;
+        fs::write(
+            fixture.graph_root.join("pages/a.md"),
+            format!("- externally edited\n  id:: {uuid}\n"),
+        )
+        .unwrap();
+        fixture.apply_external_paths(&["pages/a.md"]);
+
+        let reopened = fixture.reopen_after_config_change();
+        let page = reopened
+            .engine()
+            .materialize_page(reopened.page_id(0))
+            .unwrap();
+        let block = page
+            .blocks
+            .iter()
+            .find(|block| block.block_id == block_id)
+            .expect("edited UUID-bearing block survives clean reopen");
+        assert_eq!(block.logseq_uuid, Some(uuid));
+        assert_eq!(block.content, format!("externally edited\nid:: {uuid}"));
+    }
+
+    #[test]
+    fn clean_uuid_history_cross_page_move_reopens_with_the_stable_block() {
+        let uuid = LogseqUuid::from_uuid(Uuid::from_u128(0x3700_0002));
+        let mut fixture = CleanSnapshotFixture::new_with_initial_uuid_and_config(
+            "uuid-history-cross-page-move",
+            &["pages/a.md", "pages/b.md"],
+            Some(uuid),
+            None,
+            None,
+            Some(&["anchored", "destination"]),
+            None,
+        );
+        let block_id = fixture
+            .engine()
+            .materialize_page(fixture.page_id(0))
+            .unwrap()
+            .blocks[0]
+            .block_id;
+        fs::write(
+            fixture.graph_root.join("pages/a.md"),
+            b"- source remainder\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.graph_root.join("pages/b.md"),
+            format!("- destination\n- anchored\n  id:: {uuid}\n"),
+        )
+        .unwrap();
+        fixture.apply_external_paths(&["pages/a.md", "pages/b.md"]);
+
+        let reopened = fixture.reopen_after_config_change();
+        let destination = reopened
+            .engine()
+            .materialize_page(reopened.page_id(1))
+            .unwrap();
+        let moved = destination
+            .blocks
+            .iter()
+            .find(|block| block.block_id == block_id)
+            .expect("UUID-bearing block keeps its stable identity across the move");
+        assert_eq!(moved.logseq_uuid, Some(uuid));
+        assert_eq!(moved.content, format!("anchored\nid:: {uuid}"));
+    }
+
+    #[test]
+    fn clean_uuid_history_replacement_and_removal_reopen_without_stale_claims() {
+        let original = LogseqUuid::from_uuid(Uuid::from_u128(0x3700_0003));
+        let replacement = LogseqUuid::from_uuid(Uuid::from_u128(0x3700_0004));
+        let mut replaced = CleanSnapshotFixture::new_with_initial_uuid(
+            "uuid-history-replacement",
+            &["pages/a.md"],
+            Some(original),
+        );
+        fs::write(
+            replaced.graph_root.join("pages/a.md"),
+            format!("- page 0\n  id:: {replacement}\n"),
+        )
+        .unwrap();
+        replaced.apply_external_paths(&["pages/a.md"]);
+        let replaced = replaced.reopen_after_config_change();
+        let block = &replaced
+            .engine()
+            .materialize_page(replaced.page_id(0))
+            .unwrap()
+            .blocks[0];
+        assert_eq!(block.logseq_uuid, Some(replacement));
+        assert_eq!(
+            replaced.engine().resolve_logseq_uuid(original).unwrap(),
+            LogseqUuidResolution::Unclaimed
+        );
+
+        let mut removed = CleanSnapshotFixture::new_with_initial_uuid(
+            "uuid-history-removal",
+            &["pages/a.md"],
+            Some(original),
+        );
+        fs::write(removed.graph_root.join("pages/a.md"), b"- page 0\n").unwrap();
+        removed.apply_external_paths(&["pages/a.md"]);
+        let removed = removed.reopen_after_config_change();
+        let block = &removed
+            .engine()
+            .materialize_page(removed.page_id(0))
+            .unwrap()
+            .blocks[0];
+        assert_eq!(block.logseq_uuid, None);
+        assert_eq!(
+            removed.engine().resolve_logseq_uuid(original).unwrap(),
+            LogseqUuidResolution::Unclaimed
+        );
+    }
+
+    #[test]
+    fn clean_uuid_history_duplicate_copy_and_reference_reopen_fail_closed() {
+        let uuid = LogseqUuid::from_uuid(Uuid::from_u128(0x3700_0005));
+        let mut fixture = CleanSnapshotFixture::new_with_initial_uuid(
+            "uuid-history-duplicate-copy-reference",
+            &["pages/a.md"],
+            Some(uuid),
+        );
+        fs::write(
+            fixture.graph_root.join("pages/copy.md"),
+            format!("- copied raw block\n  id:: {uuid}\n- reference (({uuid}))\n"),
+        )
+        .unwrap();
+        let error = {
+            let mut session = fixture
+                .runtime
+                .admit_clean_mutation(&fixture.graph)
+                .unwrap();
+            match OperationalCoordinator::execute_clean_external(
+                &mut session,
+                &fixture.graph,
+                &fixture.receipts,
+                &["pages/copy.md"],
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("duplicate UUID copy unexpectedly entered durable history"),
+            }
+        };
+        assert_eq!(error.phase(), OperationalPhase::Draft);
+        assert!(error.to_string().contains("2 live authoritative claims"));
+
+        let reopened = fixture.reopen_after_config_change();
+        let claim_source = reopened.runtime.database().materialized_read().unwrap();
+        let original = reopened
+            .engine()
+            .materialize_page_with_claim_source(reopened.page_id(0), &claim_source)
+            .unwrap();
+        assert_eq!(original.blocks[0].logseq_uuid, Some(uuid));
+        drop(claim_source);
+        assert_eq!(
+            fs::read_to_string(reopened.graph_root.join("pages/copy.md")).unwrap(),
+            format!("- copied raw block\n  id:: {uuid}\n- reference (({uuid}))\n")
+        );
+    }
+
+    #[test]
+    fn clean_uuid_history_manifest_cut_replays_the_uuid_bearing_block() {
+        let uuid = LogseqUuid::from_uuid(Uuid::from_u128(0x3700_0006));
+        let mut fixture = CleanSnapshotFixture::new_with_initial_uuid(
+            "uuid-history-manifest-cut",
+            &["pages/a.md"],
+            Some(uuid),
+        );
+        let block_id = fixture
+            .engine()
+            .materialize_page(fixture.page_id(0))
+            .unwrap()
+            .blocks[0]
+            .block_id;
+        fs::write(
+            fixture.graph_root.join("pages/a.md"),
+            format!("- edited before manifest cut\n  id:: {uuid}\n"),
+        )
+        .unwrap();
+        fail_next_clean_after_manifest_for_harness();
+        let pending = {
+            let mut session = fixture
+                .runtime
+                .admit_clean_mutation(&fixture.graph)
+                .unwrap();
+            match OperationalCoordinator::execute_clean_external(
+                &mut session,
+                &fixture.graph,
+                &fixture.receipts,
+                &["pages/a.md"],
+            )
+            .unwrap()
+            {
+                CleanExternalMutationState::DurablePending(pending) => pending,
+                CleanExternalMutationState::Complete(_) => {
+                    panic!("post-manifest fault unexpectedly completed UUID-bearing edit")
+                }
+                CleanExternalMutationState::Noop => {
+                    panic!("UUID-bearing external edit unexpectedly became a no-op")
+                }
+            }
+        };
+        drop(pending);
+
+        let reopened = fixture.reopen_after_config_change();
+        let page = reopened
+            .engine()
+            .materialize_page(reopened.page_id(0))
+            .unwrap();
+        let block = page
+            .blocks
+            .iter()
+            .find(|candidate| candidate.block_id == block_id)
+            .expect("UUID-bearing block survives cold committed-tail replay");
+        assert_eq!(block.logseq_uuid, Some(uuid));
+        assert_eq!(
+            block.content,
+            format!("edited before manifest cut\nid:: {uuid}")
+        );
     }
 
     #[test]

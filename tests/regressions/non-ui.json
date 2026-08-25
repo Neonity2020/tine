@@ -4100,25 +4100,32 @@
     },
     {
       "id": "REG-MANAGED-CLEAN-UUID-PROJECTION-001",
-      "title": "Clean managed activation preserves a uniquely claimed Logseq block UUID as projection authority during the first watcher scan",
+      "title": "Clean managed history preserves uniquely claimed Logseq block UUID authority through projection and cold replay",
       "family": "managed-storage-data-safety",
       "sources": {
-        "issues": [],
+        "issues": [
+          370
+        ],
         "commits": []
       },
       "platforms": [
         "all"
       ],
       "layer": "core-native",
-      "status": "reproduced",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "crates/tine-core/src/oplog/import.rs::tests::clean_activation_prepares_both_candidates_and_final_scan_without_operations"
+          "crates/tine-core/src/oplog/import.rs::tests::clean_activation_prepares_both_candidates_and_final_scan_without_operations",
+          "crates/tine-core/src/oplog/import.rs::tests::clean_uuid_history_edit_reopens_with_the_same_materialized_identity",
+          "crates/tine-core/src/oplog/import.rs::tests::clean_uuid_history_cross_page_move_reopens_with_the_stable_block",
+          "crates/tine-core/src/oplog/import.rs::tests::clean_uuid_history_replacement_and_removal_reopen_without_stale_claims",
+          "crates/tine-core/src/oplog/import.rs::tests::clean_uuid_history_duplicate_copy_and_reference_reopen_fail_closed",
+          "crates/tine-core/src/oplog/import.rs::tests::clean_uuid_history_manifest_cut_replays_the_uuid_bearing_block"
         ],
         "scenario": "managed.clean-activation-logseq-uuid-projection-authority",
-        "failBefore": "field-reproduced"
+        "failBefore": "proven"
       },
-      "notes": "The Linux real-app recovery journey activated a 1,046-file anonymized graph successfully, then the first clean watcher scan repeatedly failed before the requested edit: a page containing one ordinary id:: UUID materialized the UUID on one block while the index-free clean engine had no baseline candidate authority. The repair makes exact-frontier SQLite the bounded baseline candidate source for watcher planning, local/external draft preparation, commit validation and cold committed-tail replay; CRDT documents remain semantic proof. A corrupt/missing terminal SQLite rebuild derives one disposable candidate snapshot from the immutable lazy-genesis capsules and drops it after publication rather than restoring a runtime Patricia or handwritten index. The focused regression now proves first watcher authorization, local edits, a post-manifest interruption, cold tail replay, corrupt-SQLite terminal reconstruction, and that duplicate baseline UUID claimants remain unresolved. Corpus contents and UUID values remain private."
+      "notes": "The Linux real-app recovery journey activated a 1,046-file anonymized graph successfully, then the first clean watcher scan repeatedly failed before the requested edit: a page containing one ordinary id:: UUID materialized the UUID on one block while the index-free clean engine had no baseline candidate authority. The first repair made exact-frontier SQLite the bounded baseline candidate source for watcher planning, local/external draft preparation, commit validation and cold committed-tail replay; CRDT documents remain semantic proof. GH #370 then supplied the exact v0.6.96 retained-history refusal on Windows: a committed UUID-bearing page could reach projection drain without that same bounded candidate source, yielding `Logseq UUID ... does not uniquely authorize materialized block ...`. The fail-before matrix reproduces that literal refusal for a UUID-bearing external edit and cross-page move; replacement/removal remain valid, a duplicate copy refuses before publication without changing source bytes, and an after-manifest interruption exercises cold replay. A corrupt/missing terminal SQLite rebuild still derives one disposable candidate snapshot from immutable lazy-genesis capsules and drops it after publication rather than restoring a runtime Patricia or handwritten index. Corpus contents and UUID values remain private."
     },
     {
       "id": "REG-MANAGED-ANDROID-CRASH-REOPEN-001",

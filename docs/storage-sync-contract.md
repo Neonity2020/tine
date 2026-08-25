@@ -803,9 +803,14 @@ path.
 
 The clean engine does not hydrate those baseline UUID introductions into a
 resident identity map. During ordinary operation the exact-frontier SQLite
-projection supplies bounded baseline candidates, the engine unions them with
-post-baseline introductions from committed manifests, and current CRDT block
-state decides whether a candidate is live and unique. If disposable SQLite is
+projection supplies bounded baseline candidates for planning, authoring,
+commit validation, and every manifested projection drain; the engine unions
+them with post-baseline introductions from committed manifests, and current
+CRDT block state decides whether a candidate is live and unique. This includes
+replaying a retained projection after an interrupted manifest-committed
+UUID-bearing edit or move: derivative Markdown authorization asks the current
+SQLite projection for the baseline claimant rather than treating the
+index-free hot suffix as the whole claim history. If disposable SQLite is
 missing or corrupt, terminal reconstruction derives one rebuild-scoped
 candidate snapshot from the immutable lazy-genesis capsules, including every
 ambiguous claimant, and drops it when SQLite publication finishes. That
