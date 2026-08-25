@@ -188,6 +188,36 @@ describe("Settings storage transitions", () => {
     dispose();
   });
 
+  it("names an affected note when a clean sync join finds semantic divergence", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
+      new Error(
+        "managed sync join failed at provider scan: sync actor refused request: sync join refused: notes not in the shared provider frontier; local-pages=1059 shared-pages=1059 local-only=0 shared-only=0 changed=1 (kind=0 preamble=0 outline=1 explicit-ids=0); authorities unchanged\n"
+        + 'clean join mismatch detail: changed path="journals/2026_08_25.md" categories=outline',
+      ),
+    );
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join a synced graph from another device")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+
+    const failure = toasts().at(-1);
+    expect(failure).toMatchObject({ sticky: true, action: { label: "Copy details" } });
+    expect(failure?.message).toContain('Changed (blocks, content, or order): "journals/2026_08_25.md"');
+    expect(failure?.message).toContain("Nothing was changed on either device");
+    dispose();
+  });
+
   it("keeps the not-yet refusal actionable after the panel truncates it to one line", async () => {
     // The native message names the file and both ordinary causes; the panel
     // shows only its first line, which is the dead end. The remedy carries the

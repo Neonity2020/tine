@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { safeManagedErrorDetail } from "./managedDiagnostics";
+import { managedJoinErrorDetail, safeManagedErrorDetail } from "./managedDiagnostics";
 
 describe("managed-storage diagnostics", () => {
   it("preserves the reason while redacting a graph-relative Markdown path", () => {
@@ -30,6 +30,46 @@ describe("managed-storage diagnostics", () => {
     )).toBe(
       "managed sync join failed at provider scan: sync actor refused request: sync join refused: notes not in the shared provider frontier; local-pages=1045 shared-pages=1045 local-only=0 shared-only=0 changed=1 (kind=0 preamble=0 outline=0 explicit-ids=1); authorities unchanged",
     );
+  });
+
+  it("shows bounded clean-join paths only through the join-specific local formatter", () => {
+    const error = new Error(
+      "managed sync join failed at provider scan: sync actor refused request: sync join refused: notes not in the shared provider frontier; local-pages=1059 shared-pages=1059 local-only=0 shared-only=0 changed=1 (kind=0 preamble=0 outline=1 explicit-ids=0); authorities unchanged\n"
+      + 'clean join mismatch detail: changed path="journals/2026_08_25.md" categories=outline',
+    );
+
+    expect(managedJoinErrorDetail(error)).toEqual({
+      visible: expect.stringContaining(
+        'Affected note: Changed (blocks, content, or order): "journals/2026_08_25.md"',
+      ),
+      copy: expect.stringContaining(
+        '- Changed (blocks, content, or order): "journals/2026_08_25.md"',
+      ),
+    });
+    expect(safeManagedErrorDetail(error)).not.toContain("2026_08_25");
+  });
+
+  it("does not expose arbitrary continuation lines as join paths", () => {
+    const error = new Error(
+      "managed sync join failed at provider scan: permission denied\n"
+      + 'clean join mismatch detail: changed path="pages/private.md" categories=outline',
+    );
+    const detail = managedJoinErrorDetail(error);
+    expect(detail.visible).not.toContain("private.md");
+    expect(detail.copy).not.toContain("private.md");
+  });
+
+  it("keeps a long affected-path list compact on screen and complete when copied", () => {
+    const lines = Array.from(
+      { length: 5 },
+      (_, index) => `clean join mismatch detail: local-only path="pages/page-${index}.md"`,
+    );
+    const detail = managedJoinErrorDetail(
+      `sync join refused: notes not in the shared provider frontier\n${lines.join("\n")}`,
+    );
+    expect(detail.visible).toContain("2 more in Copy details");
+    expect(detail.visible).not.toContain("page-4.md");
+    expect(detail.copy).toContain("page-4.md");
   });
 
   it("preserves a disappeared manifest diagnosis without exposing its identifier", () => {

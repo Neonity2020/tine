@@ -4,7 +4,7 @@ import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
 import { DiagnosticsTab } from "./DiagnosticsTab";
 import { writeClipboardTextResilient } from "../clipboard";
-import { safeManagedErrorDetail } from "../managedDiagnostics";
+import { managedJoinErrorDetail, safeManagedErrorDetail } from "../managedDiagnostics";
 import {
   settingsOpen,
   closeSettings,
@@ -2316,14 +2316,20 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     return null;
   };
 
-  const reportManagedFailure = (summary: string, detail: string, remedy?: string | null) => {
+  const reportManagedFailure = (
+    summary: string,
+    detail: string,
+    remedy?: string | null,
+    copyDetail = detail,
+  ) => {
     const message = `${summary}: ${detail}${remedy ? `\n\n${remedy}` : ""}`;
+    const copyMessage = `${summary}: ${copyDetail}${remedy ? `\n\n${remedy}` : ""}`;
     pushToast(message, "error", {
       sticky: true,
       action: {
         label: "Copy details",
         run: () => {
-          void writeClipboardTextResilient(message)
+          void writeClipboardTextResilient(copyMessage)
             .then(() => pushToast("Managed storage details copied.", "success"))
             .catch((error) => pushToast(
               `Couldn't copy managed storage details: ${safeManagedErrorDetail(error)}`,
@@ -2710,7 +2716,12 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
    * a descriptor naming another managed graph is exactly the two-independent-
    * activations case, and adoption is the operation for it.
    */
-  const reportJoinRefusal = async (summary: string, detail: string, redacted: string) => {
+  const reportJoinRefusal = async (
+    summary: string,
+    detail: string,
+    visible: string,
+    copy = visible,
+  ) => {
     if (detail.includes("names another managed graph")) {
       try {
         if (await offerAdoption()) return;
@@ -2719,7 +2730,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         return;
       }
     }
-    reportManagedFailure(summary, redacted, joinFailureRemedy(detail));
+    reportManagedFailure(summary, visible, joinFailureRemedy(detail), copy);
   };
 
   const joinShare = async (options: { fromManaged: boolean } = { fromManaged: false }) => {
@@ -2742,11 +2753,14 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       }
     } catch (error) {
       // The refusal that matters most here is raw native text. Read the remedy
-      // off the untruncated message, then report the redacted one.
+      // off the untruncated message. A clean-join mismatch additionally carries
+      // bounded affected paths which the user needs in order to reconcile it.
+      const joinDetail = managedJoinErrorDetail(error);
       await reportJoinRefusal(
         "Couldn't join the synced graph",
         String(error),
-        safeManagedErrorDetail(error)
+        joinDetail.visible,
+        joinDetail.copy,
       );
     } finally {
       endStorageTransition();
