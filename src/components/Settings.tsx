@@ -3215,12 +3215,19 @@ export function SettingsConflictPanels(): JSX.Element {
 // navigates to THIS specific file (editable, saves back to itself), Merge folds a
 // stray into the canonical day, Rename rescues it as a normal page, Trash removes
 // the redundant one (recoverable).
-function ConflictFileRow(props: {
+/** One file of a duplicate journal day, with its reconcile actions.
+ *
+ *  Exported because the in-page conflict panel renders the same rows: one
+ *  renderer, not two that drift apart. `parentLayerId` exists only so the
+ *  transient layers (the content preview, the rename box) attach to whichever
+ *  surface is hosting the row. */
+export function ConflictFileRow(props: {
   file: JournalFile;
   onOpen: () => void;
   onMerge?: () => void;
   onRename: (newName: string) => void;
   onTrash: () => void;
+  parentLayerId?: string;
 }): JSX.Element {
   const rowLayerId = `journal-conflict-${props.file.path}`;
   let renameRoot: HTMLDivElement | undefined;
@@ -3242,7 +3249,7 @@ function ConflictFileRow(props: {
     if (!open()) return;
     const unregister = registerTransientLayer({
       id: `${rowLayerId}-content`,
-      parentId: "settings",
+      parentId: props.parentLayerId ?? "settings",
       root: () => contentRoot ?? null,
       dismiss: () => { setOpen(false); return true; },
     });
@@ -3252,7 +3259,7 @@ function ConflictFileRow(props: {
     if (!renaming()) return;
     const unregister = registerTransientLayer({
       id: `${rowLayerId}-rename`,
-      parentId: "settings",
+      parentId: props.parentLayerId ?? "settings",
       root: () => renameRoot ?? null,
       dismiss: () => { setRenaming(false); setNewName(""); return true; },
     });
@@ -3320,7 +3327,7 @@ function JournalConflictsPanel(): JSX.Element {
     try {
       await op();
       pushToast(ok, "success");
-      await refreshJournalConflicts(true);
+      await refreshJournalConflicts();
     } catch (e) {
       pushToast(`Couldn’t do that: ${String(e)}`, "error");
     }

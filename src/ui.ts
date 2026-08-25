@@ -318,7 +318,7 @@ export function changeJournalTitleFormat(fmt: string) {
       // rebind and not just a repaint: anything still in flight against the old
       // binding is now aimed at paths that may not exist.
       notifyGraphRebound();
-      void refreshJournalConflicts(true); // surface any days the migration couldn't merge
+      void refreshJournalConflicts(); // the queue surfaces any day the migration couldn't merge
     })
     .catch(() => {});
 }
@@ -328,18 +328,18 @@ export function changeJournalTitleFormat(fmt: string) {
 // the user to reconcile; we surface them rather than letting a day silently show
 // twice in the feed. ---
 export const [journalConflicts, setJournalConflicts] = createSignal<JournalConflict[]>([]);
-/** Re-fetch the duplicate-journal-day list; with `notify`, toast if any exist. */
-export async function refreshJournalConflicts(notify = false): Promise<void> {
+/** Re-fetch the duplicate-journal-day list.
+ *
+ *  No longer toasts. Duplicate days became conflict-queue objects, so they
+ *  reach the user the same calm way every other standing conflict does — the
+ *  badge, the dock, and the in-page panel on the day itself — instead of a
+ *  sticky startup toast that could only point at Settings. Same reasoning as
+ *  the sync-conflict startup toast removed on 2026-08-24 (`ed550670`); it was
+ *  kept here only until this day had a surface of its own. The Settings list
+ *  stays as the fallback, exactly as Backups does for sync copies. */
+export async function refreshJournalConflicts(): Promise<void> {
   try {
-    const c = await backend().listJournalConflicts();
-    setJournalConflicts(c);
-    if (notify && c.length) {
-      pushToast(
-        `${c.length} journal day${c.length === 1 ? "" : "s"} have duplicate files in different formats — reconcile them in Settings → Backups & recovery`,
-        "info",
-        { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
-      );
-    }
+    setJournalConflicts(await backend().listJournalConflicts());
   } catch {
     /* best-effort */
   }

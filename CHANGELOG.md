@@ -10,6 +10,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **A journal day with more than one file is now resolved on the day itself.**
+  These days — usually a leftover of changing the journal date format, which
+  never overwrites the old file — used to reach you only as a sticky notice at
+  startup pointing at Settings. They now join the conflict badge, the dock and
+  the walk like every other conflict, and the day page offers the same
+  side-by-side review: keep a line from either file, or keep both. Keeping both
+  is what "Merge" did in Settings, so nothing was lost by moving it here; the
+  other file goes to the recoverable trash once you apply. Opening, renaming and
+  trashing an individual file are still offered, on the day and in Settings.
+  Two files in different formats (a `.md` and an `.org` for one day) can't be
+  folded together and say so instead of offering a choice that could not be
+  applied. The startup notice is gone.
+
+
 - **Copy / export names its two content choices after what you actually get.**
   The explicit *Content* option in "Copy / export as…" now reads **Plain text**
   (cleaned, as displayed) and **Markdown** — or **Org** on an Org page —

@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -1678,6 +1678,34 @@ export function mockBackend(): Backend {
     async emptyAssetTrash(): Promise<number> {
       return 3;
     },
+    async duplicateJournalDiff(): Promise<SyncConflictDiff | null> {
+      // The mock day's two files hold disjoint content, so every row is
+      // one-sided — the shape that makes "keep both" reproduce a plain fold.
+      return {
+        rows: [
+          {
+            id: "dup-1",
+            kind: "removed",
+            mine: { id: "m1", text: "Tried out the Org demo graph in Tine today", level: 0 },
+            theirs: null,
+            children: [],
+          },
+          {
+            id: "dup-2",
+            kind: "added",
+            mine: null,
+            theirs: { id: "t1", text: "Evening notes written on the phone", level: 0 },
+            children: [],
+          },
+        ],
+        base_rev: "mock-canonical-rev",
+        conflict_rev: "mock-stray-rev",
+        three_way: false,
+      } as unknown as SyncConflictDiff;
+    },
+    async resolveDuplicateJournalDay(): Promise<PageDto> {
+      throw new Error("resolveDuplicateJournalDay is not wired in the mock backend");
+    },
     async listJournalConflicts() {
       // Default demo state is clean: no sticky "duplicate journal day" toast and no
       // reconcile banner cluttering the marketing screenshots. The reconcile flow is
@@ -1929,6 +1957,22 @@ export function mockBackend(): Backend {
           ],
           block_conflicts: 1,
           markers: ["<<<<<<<", "=======", ">>>>>>>"],
+        },
+        {
+          id: "journal:journals/2026_06_26.org",
+          source: "duplicate-journal" as const,
+          page_name: "Friday, 26-06-2026",
+          page_path: "journals/2026_06_26.org",
+          kind: "journal" as const,
+          sides: [
+            { role: "mine" as const, label: "2026_06_26.org", path: "journals/2026_06_26.org" },
+            {
+              role: "theirs" as const,
+              label: "Friday, 26-06-2026.org",
+              path: "journals/Friday, 26-06-2026.org",
+            },
+          ],
+          block_conflicts: 2,
         },
       ];
     },

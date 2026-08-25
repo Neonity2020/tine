@@ -118,6 +118,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("delete_page", ManagedRouted),
     ("detect_media_editor", NoGraphSlot),
     ("durable_live_save_conflict_diff", Filesystem),
+    ("duplicate_journal_diff", Filesystem),
     ("edit_asset_external", Filesystem),
     ("empty_asset_trash", TrashWrite),
     ("existing_page_names", ManagedRouted),
@@ -196,6 +197,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("rescan_graph_now", NoGraphSlot),
     ("resolve_block", ManagedRouted),
     ("resolve_blocks", ManagedRouted),
+    ("resolve_duplicate_journal_day", LegacyOnly),
     ("resolve_durable_live_save_conflict", LegacyOnly),
     ("resolve_live_save_conflict", LegacyOnly),
     ("resolve_sync_conflict", ManagedRouted),
@@ -278,6 +280,12 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "present_conflict_override",
         "managed conflicts use actor-issued observations, not Direct Files editor activations",
+    ),
+    (
+        "resolve_duplicate_journal_day",
+        "a day resolving to two FILES is a Direct Files phenomenon: managed \
+         storage addresses journals by document identity, so a filename-format \
+         change cannot leave it a second file for the same day",
     ),
     (
         "resolve_durable_live_save_conflict",
