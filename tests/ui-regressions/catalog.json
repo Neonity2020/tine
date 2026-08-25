@@ -8046,12 +8046,22 @@
       "id": "UI-DIAGNOSTIC-REPORT-343",
       "title": "A user can preview, copy, save, and clear a privacy-safe diagnostic report",
       "family": "settings-diagnostics",
-      "sources": { "issues": [343], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [
+          343
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
-        "tests": ["src/components/DiagnosticsTab.test.tsx", "scripts/e2e-native-titlebar.mjs"],
+        "tests": [
+          "src/components/DiagnosticsTab.test.tsx",
+          "scripts/e2e-native-titlebar.mjs"
+        ],
         "scenario": "diagnostics.user-controlled-report",
         "failBefore": "proven"
       },
@@ -8136,7 +8146,7 @@
         "scenario": "sidebar.favorites-groups",
         "failBefore": "proven"
       },
-      "notes": "GH #102. The arrangement lives in an ordinary graph page named by config.edn :tine/favorites-page, because a page is a block tree and therefore merges through the oplog (managed) and Concord (Direct) for free, where a JSON/EDN blob is last-writer-wins - the documented cause of Obsidian's total bookmark loss across Sync. config.edn :favorites stays the flat Logseq-readable membership list, written as a one-way projection. Members are [[links]] so renames follow for free (the staleness class GH #79 fixed by hand). Group headers are plain text, never pages. Deleting a group moves its members to ungrouped and never unfavorites them (Capacities' contract; Obsidian's folders lose the reference). The page is created LAZILY - only once a group exists - so a user who never groups anything sees no change at all. The rendered arrangement is derived from live membership on every read, so the sidebar cannot show an unfavorited page or miss a favorited one. NOT COVERED: config.edn is still not re-read while Tine runs, so a Logseq-side favorites change during a live session can be overwritten; that hole predates this work and needs a config watcher."
+      "notes": "GH #102. The arrangement lives in an ordinary graph page named by config.edn :tine/favorites-page, because a page is a block tree and therefore merges through the oplog (managed) and Concord (Direct) for free, where a JSON/EDN blob is last-writer-wins - the documented cause of Obsidian's total bookmark loss across Sync. config.edn :favorites stays the flat Logseq-readable membership list, written as a one-way projection. Members are [[links]] so renames follow for free (the staleness class GH #79 fixed by hand). Group headers are plain text, never pages. Deleting a group moves its members to ungrouped and never unfavorites them (Capacities' contract; Obsidian's folders lose the reference). The page is created LAZILY - only once a group exists - so a user who never groups anything sees no change at all. The rendered arrangement is derived from live membership on every read, so the sidebar cannot show an unfavorited page or miss a favorited one. NOT COVERED: config.edn is still not re-read while Tine runs, so a Logseq-side favorites change during a live session can be overwritten; that hole predates this work and needs a config watcher. HARNESS DEBT: scripts/shot-favorites-groups.mjs was written to prove the CSS layout (grouped rows actually indent, group header aligns) because jsdom applies no layout, but it does not run on this box - every invocation is killed before producing output, with no stray process and no PID pressure. Two attempts spent, then stopped per the batch stop-loss. The group CSS is therefore VISUALLY UNVERIFIED; the class placement is asserted, the pixels are not."
     },
     {
       "id": "UI-REFSOURCE-EXCLUSION-SHARED-001",
