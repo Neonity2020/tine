@@ -1384,6 +1384,9 @@ export function mockBackend(): Backend {
     async setFavorites(): Promise<void> {
       // no-op in the browser mock
     },
+    async setFavoritesPage(): Promise<void> {
+      // no-op in the browser mock
+    },
     async setPreferredWorkflow(): Promise<void> {
       // no-op in the browser mock
     },

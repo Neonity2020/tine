@@ -371,6 +371,8 @@ export interface Backend {
   existingPageNames(names: string[]): Promise<string[]>;
   /** Persist favorited page names to config.edn `:favorites`. */
   setFavorites(names: string[]): Promise<void>;
+  /** Record which page owns the Favorites arrangement (`:tine/favorites-page`). */
+  setFavoritesPage(name: string): Promise<void>;
   /** Persist (or clear) config.edn `:default-home {:page "..."}`. */
   setDefaultHome(name: string | null): Promise<void>;
   /** Persist the task workflow to config.edn `:preferred-workflow`. */
