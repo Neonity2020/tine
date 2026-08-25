@@ -19,7 +19,7 @@ import {
   type SheetCellRemoveCtx,
 } from "../ui";
 import { openPage, openPageTarget, openPageTargetInNewTab, openPageAtBlock, openInNewTab, pageTargetMatchesLoaded, type PageTarget } from "../router";
-import { removePageTargetAcrossPanes } from "../panes";
+import { activePaneRoutes, removePageTargetAcrossPanes } from "../panes";
 import { refreshAfterRename, renameOrMergePage } from "../graph";
 import { backend } from "../backend";
 import { carryDay } from "../carry";
@@ -68,6 +68,7 @@ import { copyStripCollapsed } from "../copySettings";
 import { copyBlockOutline, writeClipboardText } from "../clipboard";
 import type { PageKind } from "../types";
 import { registerTransientLayer } from "../transientLayers";
+import { beginPageDeleteTrace } from "../pageDeleteTrace";
 
 // Copy a block reference/embed — but only after the block's id:: is durably on
 // disk. ensureBlockId returns null if the save couldn't land (conflict/error), in
@@ -853,26 +854,50 @@ function PageMenu(props: {
     const name = props.name;
     const kind = props.pageKind;
     const captured = target();
+    const trace = beginPageDeleteTrace(kind);
     // Native GTK confirm — window.confirm silently returns true here, which would
     // delete the page with no prompt.
-    if (!(await backend().confirm(deletePageConfirmText(name)))) return;
+    if (!(await backend().confirm(deletePageConfirmText(name)))) {
+      trace.finish("confirm-cancelled");
+      return;
+    }
+    trace.phase("confirm-accepted");
+    let awaitsFallbackPaint = false;
     // Route through the store (not backend directly) so it tombstones the page and
     // cancels any pending save — otherwise a just-typed, never-saved page could be
     // recreated by a queued save right after we delete it.
-    void deletePage(name, kind, captured.path)
+    void deletePage(name, kind, captured.path, {
+      phase: (phase) => trace.phase(phase),
+      retireDurableRoute: () => {
+        trace.phase("route-retirement-start");
+        awaitsFallbackPaint = activePaneRoutes().some((route) =>
+          route.kind === "page"
+          && route.name === captured.name
+          && route.pageKind === captured.pageKind
+          && route.path === captured.path
+        );
+        if (awaitsFallbackPaint) trace.armFallback();
+        removePageTargetAcrossPanes(captured);
+        trace.phase("route-retirement-complete");
+      },
+    })
       .then((ok) => {
         if (!ok) {
+          trace.finish("delete-refused");
           pushToast("Delete failed", "error");
           return;
         }
-        removePageTargetAcrossPanes(captured);
         // Deleted a day IN the journals feed (in place, no navigation) → the feed
         // loader's withToday didn't re-run, so restore today's empty placeholder
         // here if it was the one deleted (#17). No-op for an older day.
         if (kind === "journal") void restoreTodayJournalInFeed();
         pushToast(`Deleted “${name}”`, "success");
+        if (!awaitsFallbackPaint) trace.finish("complete-no-fallback");
       })
-      .catch(() => pushToast("Delete failed", "error"));
+      .catch(() => {
+        trace.finish("delete-error");
+        pushToast("Delete failed", "error");
+      });
   };
   const items: { id: string; label: string; run: () => void; danger?: boolean }[] = [
     { id: "open", label: "Open", run: () => openPageTarget(target()) },

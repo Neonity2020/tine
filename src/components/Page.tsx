@@ -31,6 +31,7 @@ import { isPropertiesOnly, splitPagePreamble } from "../editor/properties";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { PagePropertyValue } from "./PagePropertyValue";
 import { graphBinding } from "../persistence";
+import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from "../pageDeleteTrace";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -262,6 +263,18 @@ export function PageView(): JSX.Element {
     const r = currentRoute();
     const epoch = graphEpoch(); // reload when the open graph changes
     const binding = graphBinding();
+    const deleteFallbackTrace = markPageDeleteFallbackFetch(pane.paneId, r.kind);
+    const publishReady = (outcome: "ready" | "error") => {
+      setLoadedRoute(r);
+      setReady(true);
+      if (deleteFallbackTrace === null) return;
+      const afterPaint = () => {
+        if (!surfaceAlive || !sameRoute(currentRoute(), r)) return;
+        markPageDeleteFallbackFirstPaint(deleteFallbackTrace, outcome);
+      };
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(afterPaint);
+      else queueMicrotask(afterPaint);
+    };
     setReady(false);
     setLoadError(null);
     // Surface keys are STATIC per pane (matching PaneLeaf's frozen provider
@@ -279,8 +292,7 @@ export function PageView(): JSX.Element {
         if (r.kind === "query") {
           // Query workspaces are rendered by PaneLeaf, not PageView. Keep this
           // guard so the page loader never interprets a virtual route as a file.
-          setLoadedRoute(r);
-          setReady(true);
+          publishReady("ready");
           return;
         } else if (r.kind === "journals") {
           // restartJournalFeed synchronously reads the working set safety gate.
@@ -292,8 +304,7 @@ export function PageView(): JSX.Element {
           if (isGuidePageName(r.name)) {
             await ensureGuidePagesLoaded(true);
             if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
-            setLoadedRoute(r);
-            setReady(true);
+            publishReady("ready");
             router.restoreScrollFor(r);
             return;
           }
@@ -339,16 +350,14 @@ export function PageView(): JSX.Element {
           }
         }
         if (!sameRoute(currentRoute(), r)) return;
-        setLoadedRoute(r);
-        setReady(true);
+        publishReady("ready");
         // Put the scroll back where it was when we last left this entry (back/
         // forward, or returning to this tab). A new page has no saved offset → top.
         router.restoreScrollFor(r);
       } catch (e) {
         if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
-        setLoadedRoute(r);
         setLoadError(String(e));
-        setReady(true);
+        publishReady("error");
       }
     })();
   });

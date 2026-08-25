@@ -979,12 +979,24 @@ export function forgetPage(name: string) {
   invalidateAllMatrixDimensions();
 }
 
+export type PageDeleteLifecycle = {
+  phase(name: "dirty-flush-start" | "dirty-flush-complete" | "native-command-start" | "durable-response"): void;
+  /** Runs synchronously after native durability and before the deleted page is
+   * removed from the working set. It must perform UI retirement only. */
+  retireDurableRoute(): void;
+};
+
 /** Delete a page: tombstone it (so any pending/in-flight save can't recreate the
  *  file), drop its dirty/baseline/conflict state, remove it from the working set
  *  and feed, then delete on disk. Routing deletion through the store — rather than
  *  calling the backend directly — is what prevents a queued baseRev=null save from
  *  resurrecting a just-typed, never-saved page. Returns backend success. */
-export async function deletePage(name: string, kind: PageKind, expectedPath?: string): Promise<boolean> {
+export async function deletePage(
+  name: string,
+  kind: PageKind,
+  expectedPath?: string,
+  lifecycle?: PageDeleteLifecycle,
+): Promise<boolean> {
   const loaded = pageByName(name);
   if (expectedPath && loaded?.path !== expectedPath) return false;
   if (loaded?.readOnly || loaded?.guide) return false;
@@ -1016,11 +1028,11 @@ export async function deletePage(name: string, kind: PageKind, expectedPath?: st
   // every other page, drain through quiescence rather than one save so a keystroke
   // injected during that first save either becomes a second accepted snapshot or
   // causes this delete to refuse with the draft still live.
-  if (
-    captured
-    && !capturedConflicted
-    && !(await flushPageToQuiescence(name))
-  ) return false;
+  if (captured && !capturedConflicted) {
+    lifecycle?.phase("dirty-flush-start");
+    if (!(await flushPageToQuiescence(name))) return false;
+    lifecycle?.phase("dirty-flush-complete");
+  }
   // The identity proof and persistence retirement run back-to-back without a
   // yield. tombstoneIfQuiescent re-checks dirty/saving/conflict state in the same
   // synchronous turn that publishes the marker, closing the resolved-Promise
@@ -1030,6 +1042,7 @@ export async function deletePage(name: string, kind: PageKind, expectedPath?: st
     || !tombstoneIfQuiescent(name, capturedConflicted, expectedPath)
   ) return false;
   try {
+    lifecycle?.phase("native-command-start");
     if (expectedPath) await backend().deletePage(name, kind, expectedPath);
     else await backend().deletePage(name, kind);
   } catch {
@@ -1037,6 +1050,19 @@ export async function deletePage(name: string, kind: PageKind, expectedPath?: st
     // Anything that parked itself while this page looked deleted may proceed now.
     notifyPageBecameReplaceable(name);
     return false;
+  }
+  lifecycle?.phase("durable-response");
+  // Durability is already established, but the loaded page still exists. Retire
+  // every exact pane route in this same continuation so no renderer can observe
+  // the impossible middle state "current route names an already-purged page".
+  // A route callback is UI-only and must not change whether durable trash counts
+  // as success; local retirement therefore still completes if it unexpectedly
+  // throws.
+  try {
+    lifecycle?.retireDurableRoute();
+  } catch {
+    // The store remains authoritative: a durable delete must still retire its
+    // tombstone, loaded instance and navigation inventories.
   }
   forgetPage(name); // success — now drop it from the working set + feed
   removeDeletedPageFromNavigation({ name, pageKind: kind, ...(expectedPath ? { path: expectedPath } : {}) });

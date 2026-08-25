@@ -34,6 +34,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Deleting an open page on Android no longer passes through an unexplained
+  black frame.** Tine still waits for pending edits and the native trash
+  operation to become durable before navigating anywhere, but it now retires
+  the deleted page's pane routes in that same durable continuation, before the
+  loaded page is purged. Debug mode also times confirmation, saving, native
+  deletion, fallback loading and first paint separately so remaining
+  device/storage latency can be diagnosed without logging note names or paths
+  (GH #376).
+
 - **Fitting split panes no longer keep a scrollbar merely for blank editing
   space.** The first GH #369 correction fixed short panes but still made an
   otherwise fitting page scroll whenever it occupied 60–100% of its pane. An

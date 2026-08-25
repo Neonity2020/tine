@@ -7949,15 +7949,17 @@
         "android"
       ],
       "layer": "render",
-      "status": "reproduced",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "src/components/ContextMenu.test.tsx"
+          "src/components/ContextMenu.test.tsx",
+          "src/store.test.ts",
+          "src/pageDeleteTrace.test.ts"
         ],
         "scenario": "android.page-delete-durable-route-handoff",
         "failBefore": "proven"
       },
-      "notes": "GH #376 reports two serial waits on Android v0.6.96: the current note remains visible for 2–3 seconds after confirmation, then an unexplained black state appears for another 1–2 seconds before the fallback. This is not GH #356, which is an intermittent Windows Direct Files page-switch CPU/blank report. Literal fail-before resolves the native delete promise one job at a time: after the store's durable-response continuation, page P is already absent while the current pane route still names P; only ContextMenu's following `.then` retires that route. Android WebView can paint this semantically empty cut. The fix must keep dirty quiescence, native durable trash and failures ahead of any navigation, then retire every exact pane route in the same durable continuation before purging the page. Failed/conflicted draft retention, journal restoration and Direct Files remain unchanged. Debug timing must distinguish confirmation, flush, native command, durable response, route retirement, fallback fetch and first paint; physical Android timing remains the final evidence boundary."
+      "notes": "GH #376 reports two serial waits on Android v0.6.96: the current note remains visible for 2–3 seconds after confirmation, then an unexplained black state appears for another 1–2 seconds before the fallback. This is not GH #356, which is an intermittent Windows Direct Files page-switch CPU/blank report. Literal fail-before resolves the native delete promise one job at a time: after the store's durable-response continuation, page P is already absent while the current pane route still names P; only ContextMenu's following `.then` retires that route. Android WebView can paint this semantically empty cut. Pass-after makes exact route retirement a synchronous callback inside the durable response and before forgetPage, so the tested cut is journals route plus the still-loaded P rather than a missing P/current-P contradiction; the existing renderer then exposes its visible Loading page fallback. The command still flushes a non-conflicted draft through quiescence, tombstones before native work, navigates only after durable success, and retains failed/conflicted drafts. No native command, managed journal/SQLite/oplog, typed-trash or Direct Files invariant changed. A content-free debug trace now distinguishes confirmation, dirty flush, native command, durable response, route retirement, fallback fetch and requestAnimationFrame first paint. The reporter's 2–3 second native and 1–2 second fallback magnitudes remain a physical Android measurement boundary; this correction removes the proven black frame rather than claiming unmeasured storage acceleration."
     }
   ]
 }

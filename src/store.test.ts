@@ -3381,6 +3381,31 @@ describe("save engine (persistence)", () => {
     deleteSpy.mockRestore();
   });
 
+  it("hands a durable delete to route retirement before forgetting the loaded page", async () => {
+    load([blk("visible until durable route retirement")]);
+    const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
+    const phases: string[] = [];
+
+    await expect(deletePage("Test", "page", undefined, {
+      phase: (phase) => phases.push(phase),
+      retireDurableRoute: () => {
+        phases.push("retire-durable-route");
+        expect(pageByName("Test")).toBeDefined();
+      },
+    })).resolves.toBe(true);
+
+    expect(phases).toEqual([
+      "dirty-flush-start",
+      "dirty-flush-complete",
+      "native-command-start",
+      "durable-response",
+      "retire-durable-route",
+    ]);
+    expect(pageByName("Test")).toBeUndefined();
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    deleteSpy.mockRestore();
+  });
+
   it("refuses an edit injected after the quiescence helper resolves but before tombstoning", async () => {
     load([blk("clean before delete")]);
     const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
