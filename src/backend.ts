@@ -371,6 +371,8 @@ export interface Backend {
   existingPageNames(names: string[]): Promise<string[]>;
   /** Persist favorited page names to config.edn `:favorites`. */
   setFavorites(names: string[]): Promise<void>;
+  /** Record which page owns the Favorites arrangement (`:tine/favorites-page`). */
+  setFavoritesPage(name: string): Promise<void>;
   /** Persist (or clear) config.edn `:default-home {:page "..."}`. */
   setDefaultHome(name: string | null): Promise<void>;
   /** Persist the task workflow to config.edn `:preferred-workflow`. */
@@ -1177,6 +1179,12 @@ class TauriBackend implements Backend {
   }
   setFavorites(names: string[]) {
     return this.call<void>("set_favorites", { names });
+  }
+  /** Record which page holds the Favorites arrangement (`:tine/favorites-page`).
+   *  Membership stays in `:favorites`; this names the page that owns groups and
+   *  order, and is what keeps that page out of everyone's Linked References. */
+  setFavoritesPage(name: string) {
+    return this.call<void>("set_favorites_page", { name });
   }
   setDefaultHome(name: string | null) {
     return this.call<void>("set_default_home", { name });

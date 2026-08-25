@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { backend } from "../backend";
-import { favorites, setFavorites, setRecentPages } from "../ui";
+import { favorites, seedFavorites, setFavorites, setRecentPages } from "../ui";
 import { route, openJournals } from "../router";
 import { Sidebar } from "./Sidebar";
 import { rowReorderClickSuppressed } from "./rowReorder";
@@ -39,6 +39,10 @@ afterEach(async () => {
 });
 
 function mountThreeFavorites() {
+  // The favorites ARRANGEMENT is module state; seeding membership resets it,
+  // exactly as opening a graph does. Without this each test would inherit the
+  // previous one's group/order arrangement.
+  seedFavorites(["Alpha", "Beta", "Gamma"]);
   setFavorites([
     { name: "Alpha", kind: "page" },
     { name: "Beta", kind: "page" },

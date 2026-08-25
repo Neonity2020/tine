@@ -4,6 +4,7 @@
 import { backend } from "./backend";
 import { managedStorageRuntime } from "./managedStorageRuntime";
 import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
+import { loadFavoritesLayout } from "./favoritesStore";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
 import { resetTabsToJournals, openPage, restoreSession, flushSession, route, sameRoute, type PageTarget } from "./router";
@@ -207,6 +208,10 @@ export async function loadGraphPath(
   setWorkflow(meta?.preferred_workflow === "todo" ? "todo" : "now");
   setJournalTitleFormat(meta?.journal_page_title_format); // match this graph's journal titles
   seedFavorites(meta?.favorites ?? []);
+  // The arrangement (groups and order) lives in a page named by
+  // `:tine/favorites-page`; config.edn stays the authority on WHICH pages are
+  // favorited, so a change made in Logseq while Tine was closed is honoured.
+  void loadFavoritesLayout(meta?.favorites ?? [], meta?.favorites_page ?? null);
   // Standing conflicts — duplicate journal days included, as of the day they
   // became queue objects — surface through the calm badge + in-page resolver,
   // not a startup toast; these just derive the inventories.

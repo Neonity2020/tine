@@ -961,6 +961,10 @@ export interface GraphMeta {
   /** Graph-portable startup page from config.edn `:default-home {:page "..."}`. */
   default_home?: string | null;
   favorites: string[];
+  /** `:tine/favorites-page` — the page that owns the Favorites arrangement
+   *  (groups and order). `favorites` above stays the flat, Logseq-readable
+   *  membership list. Absent until this graph has one. */
+  favorites_page?: string | null;
   journal_page_title_format: string; // :journal/page-title-format (default "MMM do, yyyy")
   journal_file_name_format: string; // :journal/file-name-format (default "yyyy_MM_dd")
   preferred_format: Format; // :preferred-format — new pages/journals ("md" | "org")

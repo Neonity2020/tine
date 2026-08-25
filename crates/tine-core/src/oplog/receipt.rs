@@ -2705,6 +2705,24 @@ mod tests {
         }
     }
 
+    // A comment in model.rs once claimed ManagedPath "deliberately rejects
+    // hidden graph-text names" — it does not, and that claim was load-bearing
+    // for a storage design decision (whether a hidden dotfile could ever be a
+    // managed graph-text file). Architectural facts live in tests, not
+    // comments: this one pins the actual behaviour.
+    #[test]
+    fn managed_path_accepts_leading_dot_name() {
+        for path in [".tine-favorites.md", "logseq/.hidden.md", ".a.org"] {
+            assert!(
+                ManagedPath::parse(path).is_ok(),
+                "leading-dot names are accepted: {path}"
+            );
+        }
+        // What IS rejected is an EMPTY stem — ".md" has no name before the
+        // extension. That is the distinction the old comment blurred.
+        assert!(ManagedPath::parse(".md").is_err());
+    }
+
     #[test]
     fn managed_path_root_safe_helpers_and_portable_key_v1_are_stable() {
         let root = ManagedPath::parse("Root.MarkDown").unwrap();

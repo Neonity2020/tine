@@ -8046,12 +8046,22 @@
       "id": "UI-DIAGNOSTIC-REPORT-343",
       "title": "A user can preview, copy, save, and clear a privacy-safe diagnostic report",
       "family": "settings-diagnostics",
-      "sources": { "issues": [343], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [
+          343
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
-        "tests": ["src/components/DiagnosticsTab.test.tsx", "scripts/e2e-native-titlebar.mjs"],
+        "tests": [
+          "src/components/DiagnosticsTab.test.tsx",
+          "scripts/e2e-native-titlebar.mjs"
+        ],
         "scenario": "diagnostics.user-controlled-report",
         "failBefore": "proven"
       },
@@ -8109,6 +8119,59 @@
         "failBefore": "proven"
       },
       "notes": "Reported by Martin 2026-08-25 against the shipped v0.6.91 reorder: dragging a favorite smeared its title with a text selection. rowReorder.ts never suppressed selection. Fixed by toggling a transient html.row-reorder-dragging class (user-select:none) ONCE the 4px drag threshold is crossed, plus dropping any already-anchored selection on each move — not by preventDefault() on pointerdown, which would also swallow the focus and the ordinary click the helper deliberately preserves. Released on drop and on pointercancel. Applies to both lists that use the shared helper (left-sidebar favorites, right-sidebar items). jsdom proof asserts the class lifecycle; the actual WebKitGTK selection painting is NOT verified here and wants a real-app look."
+    },
+    {
+      "id": "UI-FAVORITES-GROUPS-102",
+      "title": "Favorites can be arranged into named one-level groups that survive restart, sync and page renames, without changing which pages are favorited",
+      "family": "workspaces",
+      "sources": {
+        "issues": [
+          102
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/favoritesLayout.test.ts",
+          "src/favoritesStore.test.ts",
+          "src/components/Sidebar.favGroups.test.tsx",
+          "crates/tine-core/src/config.rs",
+          "docs/contracts/favorites-arrangement.md"
+        ],
+        "scenario": "sidebar.favorites-groups",
+        "failBefore": "proven"
+      },
+      "notes": "GH #102. The arrangement lives in an ordinary graph page named by config.edn :tine/favorites-page, because a page is a block tree and therefore merges through the oplog (managed) and Concord (Direct) for free, where a JSON/EDN blob is last-writer-wins - the documented cause of Obsidian's total bookmark loss across Sync. config.edn :favorites stays the flat Logseq-readable membership list, written as a one-way projection. Members are [[links]] so renames follow for free (the staleness class GH #79 fixed by hand). Group headers are plain text, never pages. Deleting a group moves its members to ungrouped and never unfavorites them (Capacities' contract; Obsidian's folders lose the reference). The page is created LAZILY - only once a group exists - so a user who never groups anything sees no change at all. The rendered arrangement is derived from live membership on every read, so the sidebar cannot show an unfavorited page or miss a favorited one. NOT COVERED: config.edn is still not re-read while Tine runs, so a Logseq-side favorites change during a live session can be overwritten; that hole predates this work and needs a config watcher. HARNESS DEBT: scripts/shot-favorites-groups.mjs was written to prove the CSS layout (grouped rows actually indent, group header aligns) because jsdom applies no layout, but it does not run on this box - every invocation is killed before producing output, with no stray process and no PID pressure. Two attempts spent, then stopped per the batch stop-loss. The group CSS is therefore VISUALLY UNVERIFIED; the class placement is asserted, the pixels are not."
+    },
+    {
+      "id": "UI-REFSOURCE-EXCLUSION-SHARED-001",
+      "title": "Both reference engines share one exclusion predicate, and the favorites arrangement page never appears as a reference source",
+      "family": "references",
+      "sources": {
+        "issues": [
+          102
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/query.rs",
+          "docs/contracts/favorites-arrangement.md"
+        ],
+        "scenario": "references.source-exclusions",
+        "failBefore": "proven"
+      },
+      "notes": "refs::ReferenceSourceExclusions replaces eight open-coded `refs::page_key(name) == excluded` comparisons - one on the Direct Files path in query.rs, seven on the managed path in sync_runtime.rs. That duplication is the application_* twinning shape: a rule added to one engine is silently absent from the other. Behaviour-preserving for the pre-existing self-page exclusion, since refs::normalize IS refs::page_key (refs.rs:80-82). Necessity gate: the test fails on a build where the favorites key is ignored, and separately asserts that an UNMARKED page named Favorites is still an ordinary reference source."
     }
   ]
 }
