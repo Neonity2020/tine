@@ -1426,7 +1426,7 @@ fn finite_cgroup_available(maximum: &str, current: &str) -> Option<u64> {
     Some(maximum.saturating_sub(current))
 }
 
-fn detached_bootstrap_available_memory_bytes() -> Option<u64> {
+pub(crate) fn available_memory_bytes() -> Option<u64> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let host = fs::read_to_string("/proc/meminfo")
@@ -1473,7 +1473,7 @@ fn detached_bootstrap_construction_budget_for_available(available: Option<u64>) 
 }
 
 fn detached_bootstrap_construction_resident_budget_bytes() -> usize {
-    detached_bootstrap_construction_budget_for_available(detached_bootstrap_available_memory_bytes())
+    detached_bootstrap_construction_budget_for_available(available_memory_bytes())
 }
 
 #[cfg(test)]

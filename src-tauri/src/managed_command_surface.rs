@@ -56,6 +56,10 @@ const SCANNED_SOURCES: &[(&str, &str)] = &[
     ("data_home.rs", include_str!("data_home.rs")),
     ("debug.rs", include_str!("debug.rs")),
     ("graph.rs", include_str!("graph.rs")),
+    (
+        "graph_verification.rs",
+        include_str!("graph_verification.rs"),
+    ),
     ("lib.rs", include_str!("lib.rs")),
     (
         "migrate_identifier.rs",
@@ -99,6 +103,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("asset_trash_stats", Filesystem),
     ("block_ref_counts", ManagedRouted),
     ("block_referrers", ManagedRouted),
+    ("cancel_graph_verification", NoGraphSlot),
     ("cancel_sparse_v2", NoGraphSlot),
     // Emergency recovery starts without a bound GraphContext. The native
     // supervisor validates the selected root and supersedes stale managed work
@@ -116,6 +121,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("copy_guide_into_graph", ManagedRouted),
     ("copy_image_to_clipboard", NoGraphSlot),
     ("create_graph", NoGraphSlot),
+    ("create_graph_verification", Filesystem),
     ("debug_info", NoGraphSlot),
     ("debug_log", NoGraphSlot),
     ("default_graph_parent", NoGraphSlot),
@@ -216,6 +222,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("run_query", ManagedRouted),
     ("save_asset", Filesystem),
     ("save_diagnostic_report", NoGraphSlot),
+    ("save_graph_verification_report", NoGraphSlot),
     ("save_page", ManagedRouted),
     ("save_pdf_area_image", Filesystem),
     ("save_session", NoGraphSlot),
