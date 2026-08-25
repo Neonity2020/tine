@@ -105,6 +105,9 @@ async function loadHarness(
         : withoutLeading;
       return withoutBoundaries.normalize("NFC");
     },
+    // Read by applyConfigDerivedState, which declines to re-seed favorites the
+    // user is already being shown (docs/contracts/config-live-reload.md §4).
+    favorites: () => [] as { name: string; kind: string }[],
     seedFavorites: vi.fn(),
     pruneSidebarBlocks: vi.fn(),
     pushToast,
