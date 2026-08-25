@@ -2,6 +2,31 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-CORE-FLAGGED-RENAME-INJECTION-DETERMINISM",
+   "title": "A shared-provider flagged-rename fault injected by one test never fails an unrelated test running beside it",
+   "family": "release-test-honesty",
+   "sources": {
+    "issues": [
+     350
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "linux"
+   ],
+   "layer": "rust-test-infrastructure",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/wire.rs",
+     "crates/tine-core/src/sync_runtime.rs"
+    ],
+    "scenario": "release.shared-provider-flagged-rename-injection-is-thread-scoped",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on exact base 456652ff: InjectedSharedProviderFlaggedRenameFailure armed a PROCESS-GLOBAL errno and its exclusion lock only serialised two injectors against each other, so any test performing an ordinary flagged shared-provider rename on another thread during the arm window saw the foreign errno. Five consecutive `cargo test -p tine-core --lib oplog::` runs on that base failed once (run 3): oplog::wire::tests::provider_rename_recovers_from_every_retry_and_retirement_boundary_without_overwrite panicked with Io(\"renameat2(RENAME_EXCHANGE) retiring a shared provider name failed ...: Input/output error (os error 5)\") on a retry it never injected, and the whole-lib failure set differed from run to run. Pass-after: the arm is now a thread-local, and the one case that genuinely needed to cross a thread - the runtime executes prepare_shared on its actor thread - carries the errno explicitly inside ActorRequest::PrepareShared, where the actor installs it with ScopedSharedProviderFlaggedRename for exactly that request. Necessity gate: forcing that request field to None makes a_refused_share_preparation_leaves_the_actor_available and a_non_capability_errno_from_a_shared_provider_rename_still_refuses_share_preparation fail, so the hand-off is load-bearing. No production runtime delta: every changed item is cfg(test)."
+  },
+  {
    "id": "REG-CORE-TEST-COMPLETION-350",
    "title": "The complete tine-core release corpus terminates and reports every current failure without stale passing exclusions",
    "family": "release-test-honesty",

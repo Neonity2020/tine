@@ -3689,6 +3689,9 @@ impl SyncRuntimeHandle {
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::PrepareShared {
             reply: reply_sender,
+            #[cfg(test)]
+            injected_flagged_rename_errno:
+                crate::oplog::wire::armed_shared_provider_flagged_rename_errno(),
         })?;
         let prepared = reply_receiver
             .recv()
@@ -8378,6 +8381,13 @@ enum ActorRequest {
     },
     PrepareShared {
         reply: mpsc::Sender<Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError>>,
+        /// The flagged-rename errno armed on the CALLING thread, carried to the
+        /// actor thread that performs the renames. See
+        /// `oplog::wire::ScopedSharedProviderFlaggedRename`: the injection used
+        /// to be a process-global that leaked into every concurrently running
+        /// test.
+        #[cfg(test)]
+        injected_flagged_rename_errno: Option<i32>,
     },
     JoinShared {
         descriptor: SharedEnrollmentDescriptor,
@@ -8643,7 +8653,15 @@ fn run_actor_loop(
                 let _ = reply.send(result);
                 false
             }
-            ActorRequest::PrepareShared { reply } => {
+            ActorRequest::PrepareShared {
+                reply,
+                #[cfg(test)]
+                injected_flagged_rename_errno,
+            } => {
+                #[cfg(test)]
+                let _injected = crate::oplog::wire::ScopedSharedProviderFlaggedRename::install(
+                    injected_flagged_rename_errno,
+                );
                 let result = actor.prepare_shared();
                 let should_stop = result.is_ok();
                 let _ = reply.send(result);

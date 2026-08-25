@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **A fault one core test injects can no longer fail an unrelated test beside
+  it.** The shared-provider "this filesystem has no `renameat2` flags" fault was
+  armed process-wide, so under a threaded `cargo test` the injected errno was
+  visible to every other test renaming a provider file at that moment; the
+  whole-suite failure set differed on every run. The fault is now scoped to the
+  thread under test and handed explicitly to the sync actor for the one request
+  that needs it, so the corpus reports the same result twice in a row (GH #350).
+
 - **Queries and search are much faster on Managed Storage.** Every managed
   query used to re-parse every block of every candidate page, every time -- so
   a page full of `{{query}}` re-parsed the graph on each open, and search
