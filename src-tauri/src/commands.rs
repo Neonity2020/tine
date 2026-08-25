@@ -2715,15 +2715,12 @@ pub(crate) async fn list_templates(
     .map_err(|error| error.to_string())?
 }
 
+/// Managed command loading recognizes `key:: value` lines through the one
+/// shared recognizer (tine-core `doc::parse_property_line`, transcribed from
+/// lsdoc) instead of a local copy — the two had drifted on leading whitespace,
+/// Unicode keys and dotted keys (DUP-7).
 fn application_property_line(line: &str) -> bool {
-    let Some(separator) = line.find("::") else {
-        return false;
-    };
-    let key = line[..separator].trim();
-    !key.is_empty()
-        && key.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
-        })
+    tine_core::doc::parse_property_line(line).is_some()
 }
 
 fn application_blocks_have_content(blocks: &[BlockDto]) -> bool {

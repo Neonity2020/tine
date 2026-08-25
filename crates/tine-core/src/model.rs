@@ -32254,6 +32254,43 @@ mod tests {
         }
     }
 
+    // DUP-7 (2026-08-25 duplication audit): the block-level property recognizer
+    // (`doc::parse_property_line`, an lsdoc transcription) and this page-HEADER
+    // recognizer are deliberately different grammars — the header must never
+    // promote a property-looking prose line into page metadata, so its keys sit
+    // at column zero and its values stay verbatim; the block rule follows lsdoc
+    // (leading parser spaces skipped, `::` must be followed by a space or end,
+    // value trimmed). Do not unify them; pin the distinction.
+    #[test]
+    fn page_header_rule_stays_deliberately_distinct_from_block_rule() {
+        // Column zero: the block rule (like lsdoc) tolerates indent; the header
+        // does not — an indented property-looking line is content, not metadata.
+        assert_eq!(
+            crate::doc::parse_property_line(" key:: v"),
+            Some(("key", "v"))
+        );
+        assert_eq!(page_header_property_line(" key:: v"), None);
+        // Separator spacing: lsdoc requires a space after `::` (or line end);
+        // the header rule keeps verbatim values so `title::x` still rewrites.
+        assert_eq!(crate::doc::parse_property_line("key::value"), None);
+        assert_eq!(
+            page_header_property_line("key::value"),
+            Some(("key", "value"))
+        );
+        // Verbatim vs trimmed value.
+        assert_eq!(
+            page_header_property_line("title:: Name"),
+            Some(("title", " Name"))
+        );
+        // Both take Unicode and dotted keys; neither takes a space in the key.
+        for line in ["kéy:: v", "logseq.order-list-type:: number"] {
+            assert!(crate::doc::parse_property_line(line).is_some(), "{line}");
+            assert!(page_header_property_line(line).is_some(), "{line}");
+        }
+        assert_eq!(crate::doc::parse_property_line("a b:: v"), None);
+        assert_eq!(page_header_property_line("a b:: v"), None);
+    }
+
     // DUP guard (2026-08-25 duplication audit): the `BlockDto` → `DocBlock`
     // field mapping existed as TWO inline copies (here in
     // `dto_blocks_to_doc_checked` and in `query.rs::application_query_doc_block`)

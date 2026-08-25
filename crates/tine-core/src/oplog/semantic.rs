@@ -582,7 +582,7 @@ fn explicit_title_line(preamble: Option<&str>, is_org: bool) -> Option<(usize, u
         let line = chunk.strip_suffix('\n').unwrap_or(chunk);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let value = crate::doc::parse_property_line(line)
-            .and_then(|(key, value)| key.eq_ignore_ascii_case("title").then_some(value))
+            .and_then(|(key, value)| key.eq_ignore_ascii_case("title").then(|| value.to_string()))
             .or_else(|| {
                 is_org.then(|| {
                     let trimmed = line.trim();

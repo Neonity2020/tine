@@ -1512,14 +1512,14 @@ fn page_facets(pre_block: Option<&str>) -> (Vec<(String, String)>, Vec<String>) 
     if let Some(pre) = pre_block {
         for line in pre.lines() {
             if let Some((k, v)) = crate::doc::parse_property_line(line) {
-                if property_key_norm(&k) == "tags" {
+                if property_key_norm(k) == "tags" {
                     tags = v
                         .split(',')
                         .map(|t| strip_ref(t.trim()))
                         .filter(|t| !t.is_empty())
                         .collect();
                 }
-                props.push((k, v));
+                props.push((k.to_string(), v.to_string()));
             }
         }
     }

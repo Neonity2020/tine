@@ -832,19 +832,78 @@ pub(crate) fn property_key_norm(key: &str) -> String {
     key.trim().to_ascii_lowercase().replace([' ', '_'], "-")
 }
 
-pub(crate) fn parse_property_line(line: &str) -> Option<(String, String)> {
-    // `key:: value` — key is letters/digits/_/-/. and at least one char.
-    let idx = line.find("::")?;
-    let key = line[..idx].trim();
+/// lsdoc's parser-space set (`Parsers.is_space`: space, tab, SUB, FF) — the
+/// characters lsdoc skips at the edge of a property line's key.
+fn mldoc_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | 0x1a | 0x0c)
+}
+
+fn skip_mldoc_spaces(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && mldoc_space(bytes[i]) {
+        i += 1;
+    }
+    &s[i..]
+}
+
+/// lsdoc's property-value trim set (`trim_markdown_property_value`: space, tab,
+/// newline, CR, FF — note: NO SUB) on both ends.
+fn trim_property_value(s: &str) -> &str {
+    fn trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
+    }
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut end = bytes.len();
+    while start < end && trim(bytes[start]) {
+        start += 1;
+    }
+    while end > start && trim(bytes[end - 1]) {
+        end -= 1;
+    }
+    &s[start..end]
+}
+
+/// The ONE hand-rolled Markdown property-line recognizer (`key:: value`),
+/// transcribed from lsdoc `markdown_property_line` so every non-parser caller
+/// (rename, conflict-strip id lines, template/content probes, logbook insertion,
+/// published title lookup — and, since DUP-7, managed command loading) reads a
+/// property line exactly the way the read path's lsdoc projection does:
+///
+/// - leading lsdoc parser spaces (space/tab/SUB/FF) skipped;
+/// - the key is every byte up to the first `::` — non-empty, and containing
+///   none of `:` space tab SUB FF CR LF (so Unicode keys, leading periods and
+///   `logseq.order-list-type`-style dotted keys parse, but `a b::` does not);
+/// - the separator must be followed by a literal space (or only-spaces remains
+///   — an empty value): `key::value` is NOT a property line, matching lsdoc.
+///
+/// Returns borrowed slices into `line`: no allocation per recognized line.
+/// The page-HEADER recognizer in model.rs (`page_header_property_line`) is a
+/// deliberately narrower grammar (column-zero keys, values kept verbatim) and
+/// must NOT be unified with this one — its test pins the distinction.
+pub fn parse_property_line(line: &str) -> Option<(&str, &str)> {
+    let rest = skip_mldoc_spaces(line);
+    let pos = rest.find("::")?;
+    let key = &rest[..pos];
     if key.is_empty()
-        || !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        || key
+            .as_bytes()
+            .iter()
+            .any(|&b| b == b':' || mldoc_space(b) || b == b'\n' || b == b'\r')
     {
         return None;
     }
-    let value = line[idx + 2..].trim().to_string();
-    Some((key.to_string(), value))
+    let value = &rest[pos + 2..];
+    if let Some(value) = value.strip_prefix(' ') {
+        let value = skip_mldoc_spaces(value);
+        return Some((key, trim_property_value(value)));
+    }
+    value
+        .as_bytes()
+        .iter()
+        .all(|&b| mldoc_space(b))
+        .then_some((key, ""))
 }
 
 /// Original-case page names carried by OG-compatible `tags::`, `alias::`, or

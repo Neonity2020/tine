@@ -273,7 +273,7 @@ fn tag_boundary(raw: &str, i: usize) -> bool {
 pub fn block_id(raw: &str) -> Option<String> {
     raw.lines().find_map(|l| {
         crate::doc::parse_property_line(l)
-            .and_then(|(k, v)| k.eq_ignore_ascii_case("id").then(|| v.trim().to_string()))
+            .and_then(|(k, v)| k.eq_ignore_ascii_case("id").then(|| v.to_string()))
     })
 }
 

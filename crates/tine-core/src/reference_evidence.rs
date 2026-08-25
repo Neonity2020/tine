@@ -473,11 +473,20 @@ fn property_values(
             parse_org_property_line(line_without_newline)
         } else {
             crate::doc::parse_property_line(line_without_newline).and_then(|(key, value)| {
-                let delimiter = line_without_newline.find("::")?;
-                let key_source = &line_without_newline[..delimiter];
-                let key_leading = key_source.len() - key_source.trim_start().len();
-                let value_at = line_without_newline.rfind(&value)?;
-                Some((key, value, key_leading, key_source.trim().len(), value_at))
+                // The recognizer returns borrowed slices into this line, so the
+                // source ranges are plain pointer arithmetic — previously they
+                // were re-derived by rfind and could pair a duplicated value
+                // with the wrong offset.
+                let base = line_without_newline.as_ptr() as usize;
+                let key_at = key.as_ptr() as usize - base;
+                let value_at = value.as_ptr() as usize - base;
+                Some((
+                    key.to_string(),
+                    value.to_string(),
+                    key_at,
+                    key.len(),
+                    value_at,
+                ))
             })
         };
         if let Some((key, value, key_at, key_len, value_at)) = parsed {
