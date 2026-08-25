@@ -23690,11 +23690,21 @@ mod tests {
 
     fn save_application_block_text(
         handle: &SyncRuntimeHandle,
-        mut page: PageDto,
+        page: PageDto,
         revision: String,
         text: &str,
     ) -> (PageDto, String) {
-        page.blocks[0].raw = text.into();
+        save_application_block_text_at(handle, page, revision, 0, text)
+    }
+
+    fn save_application_block_text_at(
+        handle: &SyncRuntimeHandle,
+        mut page: PageDto,
+        revision: String,
+        index: usize,
+        text: &str,
+    ) -> (PageDto, String) {
+        page.blocks[index].raw = text.into();
         match handle
             .save_application_page(SyncApplicationPageSaveRequest {
                 target: SyncApplicationPageSaveTarget::Existing {
@@ -31371,6 +31381,154 @@ mod tests {
             );
             assert_eq!(page.blocks[0].raw, "DONE field task", "{label}");
         }
+    }
+
+    /// Field sequence from Android: a task is edited repeatedly, temporarily
+    /// gains continuation lines, loses them again, and is completed while its
+    /// shared foreground history is still draining. Every acknowledged state
+    /// must remain a valid base for the next save; otherwise the UI becomes
+    /// permanently unsaveable at `managed_read_block_mismatch`.
+    #[test]
+    fn rapid_task_edits_with_deleted_continuation_lines_remain_saveable_and_reopen() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("rapid-task-continuation-lines", 0xa181_1000);
+
+        let (mut root, revision) = load_application_exact(&receiver_handle, "Root.md");
+        root.blocks.push(application_move_test_root("TODO test", 0));
+        let (_todo, _revision) = match receiver_handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: root.path.clone(),
+                    revision,
+                },
+                page: root,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("new task block was not durable: {other:?}"),
+        };
+        settle_shared_provider(&receiver_handle);
+
+        // The visible Markdown addition reaches the peer before its provider
+        // operation, so that peer temporarily authors the same new task under
+        // its own sparse identity.
+        fs::copy(
+            receiver.graph_root.join("Root.md"),
+            initiator.graph_root.join("Root.md"),
+        )
+        .unwrap();
+        initiator_handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &initiator.request.provider_root,
+        );
+        initiator_handle.observe_provider().unwrap();
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+
+        let (todo, revision) = load_application_exact(&receiver_handle, "Root.md");
+        assert_eq!(todo.blocks.len(), 2, "new task must be visually singular");
+
+        let (doing, revision) =
+            save_application_block_text_at(&receiver_handle, todo, revision, 1, "DOING test");
+        assert!(!matches!(
+            receiver_handle.tick().unwrap(),
+            SyncRuntimeTick::RecoveryBlocked(_)
+                | SyncRuntimeTick::Blocked(_)
+                | SyncRuntimeTick::Failed(_)
+                | SyncRuntimeTick::Terminal(_)
+        ));
+        fs::copy(
+            receiver.graph_root.join("Root.md"),
+            initiator.graph_root.join("Root.md"),
+        )
+        .unwrap();
+        initiator_handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        let (todo_again, revision) =
+            save_application_block_text_at(&receiver_handle, doing, revision, 1, "TODO test");
+        assert!(!matches!(
+            receiver_handle.tick().unwrap(),
+            SyncRuntimeTick::RecoveryBlocked(_)
+                | SyncRuntimeTick::Blocked(_)
+                | SyncRuntimeTick::Failed(_)
+                | SyncRuntimeTick::Terminal(_)
+        ));
+        let (multiline, revision) = save_application_block_text_at(
+            &receiver_handle,
+            todo_again,
+            revision,
+            1,
+            "DOING test\nfirst accidental line\nsecond accidental line",
+        );
+        assert!(!matches!(
+            receiver_handle.tick().unwrap(),
+            SyncRuntimeTick::RecoveryBlocked(_)
+                | SyncRuntimeTick::Blocked(_)
+                | SyncRuntimeTick::Failed(_)
+                | SyncRuntimeTick::Terminal(_)
+        ));
+        let (trimmed, revision) =
+            save_application_block_text_at(&receiver_handle, multiline, revision, 1, "DOING test");
+        assert!(!matches!(
+            receiver_handle.tick().unwrap(),
+            SyncRuntimeTick::RecoveryBlocked(_)
+                | SyncRuntimeTick::Blocked(_)
+                | SyncRuntimeTick::Failed(_)
+                | SyncRuntimeTick::Terminal(_)
+        ));
+        let (_done, _revision) =
+            save_application_block_text_at(&receiver_handle, trimmed, revision, 1, "DONE test");
+
+        settle_shared_provider(&receiver_handle);
+        let (done, revision) = load_application_exact(&receiver_handle, "Root.md");
+        let (_durable_after_provider, _revision) = save_application_block_text_at(
+            &receiver_handle,
+            done,
+            revision,
+            1,
+            "DONE test after provider delivery",
+        );
+        settle_shared_provider(&receiver_handle);
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(receiver_handle);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        drive_initial_feed(&reopened);
+        let (page, _) = load_application_exact(&reopened, "Root.md");
+        assert_eq!(page.blocks.len(), 2);
+        assert_eq!(page.blocks[1].raw, "DONE test after provider delivery");
+        assert!(!page.blocks[1].raw.contains("accidental"));
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        drop(initiator_handle);
+        drop(initiator);
     }
 
     /// File synchronizers carry the user-visible Markdown projection and the

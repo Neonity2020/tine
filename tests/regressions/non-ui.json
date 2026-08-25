@@ -5002,6 +5002,29 @@
     "scenario": null,
     "failBefore": "proven"
    }
+  },
+  {
+   "id": "REG-MANAGED-RAPID-EDIT-READ-AUTHORITY",
+   "title": "Rapid edits to one synced task, including a temporary multiline state, remain saveable and durable while provider history arrives; they never wedge Managed Storage at managed_read_block_mismatch or require a forced Direct Files escape",
+   "family": "managed-sync-foreground-authority",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Android field report 2026-08-25"
+   },
+   "platforms": [
+    "all",
+    "android"
+   ],
+   "layer": "rust-integration",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::rapid_task_edits_with_deleted_continuation_lines_remain_saveable_and_reopen"
+    ],
+    "scenario": "managed-sync.rapid-task-edits-provider-interleave-clean-shutdown-reopen",
+    "failBefore": "proven at 1dbce51f: projection-first delivery of a newly created unstamped task authors two internal block identities at the same sibling order, then retained provider projection blocks before the rapid-edit sequence with duplicate sibling order below the page root"
+   }
   }
  ]
 }
