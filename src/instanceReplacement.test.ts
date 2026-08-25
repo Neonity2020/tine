@@ -538,8 +538,12 @@ describe("replacing a loaded instance (GH #304)", () => {
     expect(graphBinding(), "setLogicalOutdenting reopens the graph").not.toBe(afterFormat);
 
     const afterOutdenting = graphBinding();
+    await backend().setDefaultHome("Home");
+    expect(graphBinding(), "setDefaultHome reopens the graph").not.toBe(afterOutdenting);
+
+    const afterHome = graphBinding();
     await backend().restoreBackup("2026-08-10_12-00-00");
-    expect(graphBinding(), "restoreBackup reopens the graph").not.toBe(afterOutdenting);
+    expect(graphBinding(), "restoreBackup reopens the graph").not.toBe(afterHome);
   });
 
   it("abandons a save whose activation was minted by the previous binding", async () => {

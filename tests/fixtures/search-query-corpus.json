@@ -878,67 +878,31 @@
     {
       "name": "regex look-around",
       "query": "/foo(?=bar)/",
-      "knownDivergence": "DUP-9",
-      "why": "Rust's `regex` crate has no look-around -- it is what buys the linear-time guarantee -- so the pattern fails to compile; JS RegExp accepts it. The user sees an error in the block list and a working search in the page list.",
-      "rust": {
-        "tokens": [
-          {
-            "text": "/foo(?=bar)/",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "invalid"
+      "tokens": [
+        {
+          "text": "/foo(?=bar)/",
+          "negated": false,
+          "quoted": false,
+          "isOr": false
         }
-      },
-      "typescript": {
-        "tokens": [
-          {
-            "text": "/foo(?=bar)/",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "regex",
-          "pattern": "foo(?=bar)"
-        }
+      ],
+      "verdict": {
+        "kind": "invalid"
       }
     },
     {
       "name": "regex inline flag",
       "query": "/(?i)abc/",
-      "knownDivergence": "DUP-9",
-      "why": "The reverse direction: Rust's `regex` accepts inline flag groups, JS RegExp does not (flags live after the closing slash, which this grammar has no way to spell).",
-      "rust": {
-        "tokens": [
-          {
-            "text": "/(?i)abc/",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "regex",
-          "pattern": "(?i)abc"
+      "tokens": [
+        {
+          "text": "/(?i)abc/",
+          "negated": false,
+          "quoted": false,
+          "isOr": false
         }
-      },
-      "typescript": {
-        "tokens": [
-          {
-            "text": "/(?i)abc/",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "invalid"
-        }
+      ],
+      "verdict": {
+        "kind": "invalid"
       }
     },
     {
@@ -960,184 +924,85 @@
     {
       "name": "regex back-reference",
       "query": "/(a)\\1/",
-      "knownDivergence": "DUP-9",
-      "why": "Back-references are absent from Rust's `regex` for the same linear-time reason and present in JS RegExp.",
-      "rust": {
-        "tokens": [
-          {
-            "text": "/(a)\\1/",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "invalid"
+      "tokens": [
+        {
+          "text": "/(a)\\1/",
+          "negated": false,
+          "quoted": false,
+          "isOr": false
         }
-      },
-      "typescript": {
-        "tokens": [
-          {
-            "text": "/(a)\\1/",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "regex",
-          "pattern": "(a)\\1"
-        }
+      ],
+      "verdict": {
+        "kind": "invalid"
       }
     },
     {
       "name": "U+FEFF before a term",
       "query": "﻿foo",
-      "knownDivergence": "DUP-9",
-      "why": "ECMAScript WhiteSpace includes U+FEFF (ZWNBSP), so JS strips it; Rust's `char::is_whitespace` follows the Unicode White_Space property, which does not, so the BOM stays inside the term and matches nothing.",
-      "rust": {
-        "tokens": [
-          {
-            "text": "﻿foo",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "boolean",
-          "groups": [
-            [
-              {
-                "text": "﻿foo",
-                "negated": false,
-                "quoted": false
-              }
-            ]
-          ],
-          "simpleTerm": "﻿foo"
+      "tokens": [
+        {
+          "text": "foo",
+          "negated": false,
+          "quoted": false,
+          "isOr": false
         }
-      },
-      "typescript": {
-        "tokens": [
-          {
-            "text": "foo",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
+      ],
+      "verdict": {
+        "kind": "boolean",
+        "groups": [
+          [
+            {
+              "text": "foo",
+              "negated": false,
+              "quoted": false
+            }
+          ]
         ],
-        "verdict": {
-          "kind": "boolean",
-          "groups": [
-            [
-              {
-                "text": "foo",
-                "negated": false,
-                "quoted": false
-              }
-            ]
-          ],
-          "simpleTerm": "foo"
-        }
+        "simpleTerm": "foo"
       }
     },
     {
       "name": "U+FEFF between terms",
       "query": "foo﻿bar",
-      "knownDivergence": "DUP-9",
-      "why": "Same cause: JS splits on the U+FEFF and gets two AND terms, Rust gets one term with a BOM in the middle.",
-      "rust": {
-        "tokens": [
-          {
-            "text": "foo﻿bar",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "boolean",
-          "groups": [
-            [
-              {
-                "text": "foo﻿bar",
-                "negated": false,
-                "quoted": false
-              }
-            ]
-          ],
-          "simpleTerm": "foo﻿bar"
+      "tokens": [
+        {
+          "text": "foo",
+          "negated": false,
+          "quoted": false,
+          "isOr": false
+        },
+        {
+          "text": "bar",
+          "negated": false,
+          "quoted": false,
+          "isOr": false
         }
-      },
-      "typescript": {
-        "tokens": [
-          {
-            "text": "foo",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          },
-          {
-            "text": "bar",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
+      ],
+      "verdict": {
+        "kind": "boolean",
+        "groups": [
+          [
+            {
+              "text": "foo",
+              "negated": false,
+              "quoted": false
+            },
+            {
+              "text": "bar",
+              "negated": false,
+              "quoted": false
+            }
+          ]
         ],
-        "verdict": {
-          "kind": "boolean",
-          "groups": [
-            [
-              {
-                "text": "foo",
-                "negated": false,
-                "quoted": false
-              },
-              {
-                "text": "bar",
-                "negated": false,
-                "quoted": false
-              }
-            ]
-          ],
-          "simpleTerm": null
-        }
+        "simpleTerm": null
       }
     },
     {
       "name": "U+FEFF alone",
       "query": "﻿",
-      "knownDivergence": "DUP-9",
-      "why": "Same cause: JS trims the query to empty, Rust sees a one-character term.",
-      "rust": {
-        "tokens": [
-          {
-            "text": "﻿",
-            "negated": false,
-            "quoted": false,
-            "isOr": false
-          }
-        ],
-        "verdict": {
-          "kind": "boolean",
-          "groups": [
-            [
-              {
-                "text": "﻿",
-                "negated": false,
-                "quoted": false
-              }
-            ]
-          ],
-          "simpleTerm": "﻿"
-        }
-      },
-      "typescript": {
-        "tokens": [],
-        "verdict": {
-          "kind": "empty"
-        }
+      "tokens": [],
+      "verdict": {
+        "kind": "empty"
       }
     },
     {
