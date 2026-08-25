@@ -183,8 +183,8 @@ const successfulFullCiRun = {
 };
 const successfulFullCiJobs = REQUIRED_FULL_CI_JOBS.map((name) => ({ name, conclusion: "success" }));
 
-assert.equal(layout.allAssets.length, 23, "release layout must retain its exact 23-asset inventory");
-assert.equal(layout.platformAssets.length, 22, "release layout must retain its exact platform-asset inventory");
+assert.equal(layout.allAssets.length, 26, "release layout must retain its exact 26-asset inventory");
+assert.equal(layout.platformAssets.length, 25, "release layout must retain its exact platform-asset inventory");
 assert.equal(
   Object.keys(layout.updaterPlatforms).length,
   12,
@@ -197,6 +197,23 @@ assert.ok(
 assert.ok(
   layout.lanes["linux-arm64"].assets.includes(`Tine_${version}_aarch64.AppImage.zsync`),
   "linux-arm64 is missing its AppImage update metadata"
+);
+assert.deepEqual(
+  layout.lanes["windows-x86"],
+  {
+    assets: [
+      `Tine_${version}_x86-setup.exe`,
+      `Tine_${version}_x86-setup.exe.sig`,
+      `Tine_${version}_x86-portable.zip`,
+    ],
+    platforms: {},
+  },
+  "the experimental Windows 32-bit lane must ship installer and portable assets without promising updater support"
+);
+assert.match(
+  releaseWorkflow,
+  /lane: windows-x86[\s\S]*?--target i686-pc-windows-msvc[\s\S]*?rust-targets: "i686-pc-windows-msvc"[\s\S]*?win-arch: x86[\s\S]*?win-exe-dir: target\/i686-pc-windows-msvc\/release/,
+  "release workflow is missing the experimental Windows 32-bit cross-build"
 );
 assert.match(
   releaseWorkflow,

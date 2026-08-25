@@ -95,7 +95,7 @@ jobs:
     needs: preflight
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 6
       matrix:
         include:
           - platform: ubuntu-22.04
@@ -125,6 +125,17 @@ jobs:
             rust-targets: ""
             win-arch: x64
             win-exe-dir: target/release
+          # Experimental Windows 32-bit pilot (GH #275): cross-compiled on the
+          # ordinary Windows runner and published as installer + portable ZIP.
+          # It deliberately stays out of latest.json until a reporter proves it
+          # on real i686-only hardware, so this does not silently promise an
+          # updater/support contract before the device experiment succeeds.
+          - platform: windows-latest
+            lane: windows-x86
+            args: "--target i686-pc-windows-msvc --features custom-protocol"
+            rust-targets: "i686-pc-windows-msvc"
+            win-arch: x86
+            win-exe-dir: target/i686-pc-windows-msvc/release
           # Windows ARM64 (Surface Pro X, Snapdragon X laptops): CROSS-compiled from
           # the x86_64 windows runner. rustup adds the target; the VS 2022 ARM64 MSVC
           # tools are preinstalled on the windows-latest image. A `--target <triple>`

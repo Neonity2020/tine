@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Experimental 32-bit Windows packages** (GH #275). Releases now produce an
+  `i686-pc-windows-msvc` installer and portable ZIP for older Windows 10 tablets.
+  The pilot is deliberately excluded from automatic updates until it has been
+  exercised on a reporter's real 32-bit device.
+
 ### Changed
 
 - **A journal day with more than one file is now resolved on the day itself.**
