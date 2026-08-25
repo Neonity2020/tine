@@ -40,18 +40,28 @@ export function rowReorderClickSuppressed(): boolean {
 export interface RowDropTarget {
   index: number;
   before: boolean;
+  /** How far right of where the drag STARTED the pointer now is. Flat lists
+   *  ignore it; the favorites tree reads it as a change in nesting depth, which
+   *  is the only way a pointer can ask for "under that row" rather than "after
+   *  it". Relative to the grab point, not to the row's left edge — otherwise
+   *  where in the row the user happened to grab would decide the depth. */
+  dx: number;
 }
 
-/** Attach a reorder drag to a row's pointerdown. `commit(from, to)` receives
- *  the final `to` index in the post-removal array (ready for splice-insert);
- *  self-drops and no-op placements never call it. `setIndicator` reports the
+/** Attach a reorder drag to a row's pointerdown. `commit(from, to, target)`
+ *  receives the final `to` index in the post-removal array (ready for
+ *  splice-insert) plus the raw drop target, which a nested list needs because
+ *  its own arithmetic is not a single splice. Self-drops and no-op placements
+ *  never call it unless `opts.commitUnchanged` says they must — in a tree the
+ *  same slot at a different depth is a real move. `setIndicator` reports the
  *  live half-row drop target (or null) for the indicator classes. */
 export function beginRowReorderDrag(
   event: PointerEvent,
   from: number,
   rowSelector: string,
   setIndicator: (target: RowDropTarget | null) => void,
-  commit: (from: number, to: number) => void,
+  commit: (from: number, to: number, target: RowDropTarget) => void,
+  opts: { commitUnchanged?: boolean } = {},
 ): void {
   if (event.button !== 0) return;
   const startX = event.clientX;
@@ -74,7 +84,7 @@ export function beginRowReorderDrag(
     if (row && row.dataset.rowIndex !== undefined) {
       const index = Number(row.dataset.rowIndex);
       const rect = row.getBoundingClientRect();
-      target = { index, before: ev.clientY < rect.top + rect.height / 2 };
+      target = { index, before: ev.clientY < rect.top + rect.height / 2, dx: ev.clientX - startX };
     } else {
       target = null;
     }
@@ -100,7 +110,7 @@ export function beginRowReorderDrag(
     if (!target) return;
     const to = target.index + (target.before ? 0 : 1);
     const adjusted = from < to ? to - 1 : to;
-    if (adjusted !== from) commit(from, adjusted);
+    if (adjusted !== from || opts.commitUnchanged) commit(from, adjusted, target);
   };
 
   document.addEventListener("pointermove", onMove);

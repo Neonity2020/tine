@@ -1450,13 +1450,13 @@ textarea {
 .nav-toggle-caret.open {
   transform: rotate(90deg);
 }
-/* Favorites groups (one level, plain-text headers). The header is not a page:
-   it is a label the user types, so it is an input rather than a link. */
+/* Favorites group labels. A label is not a page: it is text the user types, so
+   it is an input rather than a link. It is otherwise an ordinary `.nav-page`
+   row — same height, same drag, same indent — because in the arrangement tree a
+   label and a favorite are the same kind of thing at different depths. */
 .nav-fav-group {
-  display: flex;
-  align-items: center;
   gap: 2px;
-  padding: 2px 6px 2px 4px;
+  cursor: grab;
 }
 .nav-fav-group-toggle,
 .nav-fav-group-delete {
@@ -1501,8 +1501,36 @@ textarea {
   border-color: var(--accent, #4c8bf5);
   opacity: 1;
 }
-.nav-page.grouped {
-  padding-left: 22px;
+/* Keeps a favorite's star aligned with the caret column of a label at the same
+   depth, so a level reads as a level. */
+.nav-fav-spacer {
+  flex: 0 0 14px;
+}
+#sidebar-favorites-list .nav-page {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  gap: 4px;
+}
+/* The insertion line starts where the row WOULD land, so a drop that nests is
+   visibly different from one that does not before the pointer is released. A
+   gradient rather than the flat `inset` box-shadow the right sidebar uses,
+   because only this list has a depth to show. */
+#sidebar-favorites-list .nav-page.row-drop-before,
+#sidebar-favorites-list .nav-page.row-drop-after {
+  box-shadow: none;
+  background-image: linear-gradient(
+    to right,
+    transparent 0 var(--fav-drop-indent, 0px),
+    var(--link-color) var(--fav-drop-indent, 0px)
+  );
+  background-size: 100% 2px;
+  background-repeat: no-repeat;
+}
+#sidebar-favorites-list .nav-page.row-drop-before {
+  background-position: top left;
+}
+#sidebar-favorites-list .nav-page.row-drop-after {
+  background-position: bottom left;
 }
 .nav-fav-add-group {
   background: none;

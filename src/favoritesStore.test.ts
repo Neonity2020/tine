@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { backend } from "./backend";
-import { layoutFromBlocks } from "./favoritesLayout";
+import { layoutFromBlocks, layoutMembers, layoutToMarkdown } from "./favoritesLayout";
 import {
   addGroup,
   adoptExternalMembership,
   deleteGroup,
-  locateRow,
+  favoritesPageChanged,
   moveFavoriteRow,
   renameGroup,
   setGroupCollapsed,
+  setMembershipSink,
   storedFavoritesLayout,
   favoritesLayoutPage,
   loadFavoritesLayout,
@@ -26,8 +27,12 @@ const block = (raw: string, children: BlockDto[] = []): BlockDto => ({
 
 afterEach(() => {
   resetFavoritesLayout();
+  setMembershipSink(() => {});
   vi.restoreAllMocks();
 });
+
+const names = (layout: ReturnType<typeof layoutFromBlocks>) =>
+  layoutMembers(layout).map((i) => i.name);
 
 describe("favorites arrangement store", () => {
   it("loads the arrangement page and honours config.edn membership over it", async () => {
@@ -41,15 +46,15 @@ describe("favorites arrangement store", () => {
     });
     // config.edn no longer lists Stale (unfavorited in Logseq) and adds Fresh.
     await loadFavoritesLayout(["Alpha", "Beta", "Fresh"], "Favorites");
-    expect(storedFavoritesLayout().map((g) => g.name)).toEqual([null, "Work"]);
-    expect(storedFavoritesLayout()[0].items.map((i) => i.name)).toEqual(["Alpha", "Fresh"]);
-    expect(storedFavoritesLayout()[1].items.map((i) => i.name)).toEqual(["Beta"]);
+    expect(layoutToMarkdown(storedFavoritesLayout())).toBe(
+      "- [[Alpha]]\n- Work\n\t- [[Beta]]\n- [[Fresh]]\n"
+    );
   });
 
   it("keeps favorites when the arrangement page cannot be read", async () => {
     vi.spyOn(backend(), "getPage").mockRejectedValue(new Error("gone"));
     await loadFavoritesLayout(["Alpha", "Beta"], "Favorites");
-    expect(storedFavoritesLayout()[0].items.map((i) => i.name)).toEqual(["Alpha", "Beta"]);
+    expect(names(storedFavoritesLayout())).toEqual(["Alpha", "Beta"]);
   });
 
   // The important one: a user who never groups anything must not find a page in
@@ -117,8 +122,9 @@ describe("favorites arrangement store", () => {
 
     adoptExternalMembership(["Alpha", "AddedInLogseq"]);
 
-    expect(storedFavoritesLayout()[0].items.map((i) => i.name)).toEqual(["AddedInLogseq"]);
-    expect(storedFavoritesLayout()[1].items.map((i) => i.name)).toEqual(["Alpha"]);
+    expect(layoutToMarkdown(storedFavoritesLayout())).toBe(
+      "- Work\n\t- [[Alpha]]\n- [[AddedInLogseq]]\n"
+    );
     expect(savePage).not.toHaveBeenCalled();
     expect(setFavorites).not.toHaveBeenCalled();
   });
@@ -131,63 +137,132 @@ describe("arrangement mutations", () => {
       block("Work", [block("[[Beta]]"), block("[[Gamma]]")]),
     ]);
 
-  it("locates a global row index inside its group", () => {
-    const l = arranged();
-    expect(locateRow(l, 0)).toEqual({ group: 0, index: 0 });
-    expect(locateRow(l, 1)).toEqual({ group: 1, index: 0 });
-    expect(locateRow(l, 2)).toEqual({ group: 1, index: 1 });
-    expect(locateRow(l, 3)).toBeNull();
+  it("moves a favorite into a label, at the drop position", () => {
+    expect(layoutToMarkdown(moveFavoriteRow(arranged(), [0], [1], 0))).toBe(
+      "- Work\n\t- [[Alpha]]\n\t- [[Beta]]\n\t- [[Gamma]]\n"
+    );
+    expect(layoutToMarkdown(moveFavoriteRow(arranged(), [0], [1], 1))).toBe(
+      "- Work\n\t- [[Beta]]\n\t- [[Alpha]]\n\t- [[Gamma]]\n"
+    );
   });
 
-  // `to` is a global row index in the array AFTER removal — the same contract
-  // rowReorder's commit(from, to) already uses.
-  it("moves a favorite into a group, at the drop position", () => {
-    const head = moveFavoriteRow(arranged(), 0, 0, 1);
-    expect(head[0].items).toEqual([]);
-    expect(head[1].items.map((i) => i.name)).toEqual(["Alpha", "Beta", "Gamma"]);
-
-    const middle = moveFavoriteRow(arranged(), 0, 1, 1);
-    expect(middle[1].items.map((i) => i.name)).toEqual(["Beta", "Alpha", "Gamma"]);
+  it("appends when the drop index lands past the end", () => {
+    expect(layoutToMarkdown(moveFavoriteRow(arranged(), [0], [1], 99))).toBe(
+      "- Work\n\t- [[Beta]]\n\t- [[Gamma]]\n\t- [[Alpha]]\n"
+    );
   });
 
-  it("appends to the target group when the drop index lands outside it", () => {
-    const next = moveFavoriteRow(arranged(), 0, 99, 1);
-    expect(next[1].items.map((i) => i.name)).toEqual(["Beta", "Gamma", "Alpha"]);
+  it("moves a favorite back out to the top level", () => {
+    expect(layoutToMarkdown(moveFavoriteRow(arranged(), [1, 0], [], 0))).toBe(
+      "- [[Beta]]\n- [[Alpha]]\n- Work\n\t- [[Gamma]]\n"
+    );
   });
 
-  it("moves a favorite out of a group back to ungrouped", () => {
-    const next = moveFavoriteRow(arranged(), 1, 0, 0);
-    expect(next[0].items.map((i) => i.name)).toEqual(["Beta", "Alpha"]);
-    expect(next[1].items.map((i) => i.name)).toEqual(["Gamma"]);
-  });
-
-  it("reorders within a group", () => {
-    const next = moveFavoriteRow(arranged(), 2, 1, 1);
-    expect(next[1].items.map((i) => i.name)).toEqual(["Gamma", "Beta"]);
-  });
-
-  it("adds groups without colliding", () => {
+  it("adds labels without colliding", () => {
     const next = addGroup(addGroup(arranged(), "Work"), "Work");
-    expect(next.map((g) => g.name)).toEqual([null, "Work", "Work 2", "Work 3"]);
+    expect(next.filter((n) => n.target === null).map((n) => n.raw)).toEqual([
+      "Work",
+      "Work 2",
+      "Work 3",
+    ]);
   });
 
-  it("renames a group and refuses an empty name", () => {
-    expect(renameGroup(arranged(), 1, "Projects")[1].name).toBe("Projects");
-    expect(renameGroup(arranged(), 1, "   ")[1].name).toBe("Work");
-    // The ungrouped section is not a group and cannot be renamed.
-    expect(renameGroup(arranged(), 0, "Nope")[0].name).toBeNull();
+  it("renames a label, refuses an empty name, and leaves favorites alone", () => {
+    expect(renameGroup(arranged(), [1], "Projects")[1].raw).toBe("Projects");
+    expect(renameGroup(arranged(), [1], "   ")[1].raw).toBe("Work");
+    // Re-committing the same name must not turn "Work" into "Work 2".
+    expect(renameGroup(arranged(), [1], "Work")[1].raw).toBe("Work");
+    // A favorite is a link, not a label: its text is not the user's to type.
+    expect(renameGroup(arranged(), [0], "Nope")[0].raw).toBe("[[Alpha]]");
   });
 
   // The contract worth stealing from Capacities, and the one Obsidian's
-  // bookmark folders get wrong: deleting a group must not unfavorite anything.
-  it("deletes a group without losing its favorites", () => {
-    const next = deleteGroup(arranged(), 1);
-    expect(next.map((g) => g.name)).toEqual([null]);
-    expect(next[0].items.map((i) => i.name)).toEqual(["Alpha", "Beta", "Gamma"]);
+  // bookmark folders get wrong: deleting a label must not unfavorite anything.
+  it("deletes a label without losing what it held", () => {
+    const next = deleteGroup(arranged(), [1]);
+    expect(layoutToMarkdown(next)).toBe("- [[Alpha]]\n- [[Beta]]\n- [[Gamma]]\n");
+    expect(names(next)).toEqual(["Alpha", "Beta", "Gamma"]);
   });
 
-  it("collapses and expands a group", () => {
-    expect(setGroupCollapsed(arranged(), 1, true)[1].collapsed).toBe(true);
-    expect(setGroupCollapsed(arranged(), 1, false)[1].collapsed).toBeUndefined();
+  it("refuses to delete a favorite through the label path", () => {
+    const before = arranged();
+    expect(deleteGroup(before, [0])).toBe(before);
+  });
+
+  it("collapses and expands a row", () => {
+    expect(setGroupCollapsed(arranged(), [1], true)[1].collapsed).toBe(true);
+    expect(setGroupCollapsed(arranged(), [1], false)[1].collapsed).toBeUndefined();
+  });
+});
+
+describe("the arrangement page changing under us", () => {
+  const loaded = async () => {
+    vi.spyOn(backend(), "getPage").mockResolvedValue({
+      name: "Favorites",
+      kind: "page",
+      title: "Favorites",
+      pre_block: "tine/favorites:: true",
+      rev: "r1",
+      blocks: [block("Work", [block("[[Alpha]]")])],
+    });
+    await loadFavoritesLayout(["Alpha"], "Favorites");
+  };
+
+  it("adopts a hand edit to the page, and projects it into membership", async () => {
+    await loaded();
+    const projected: string[][] = [];
+    setMembershipSink((next) => projected.push(next));
+    const setFavorites = vi.spyOn(backend(), "setFavorites").mockResolvedValue();
+    const savePage = vi.spyOn(backend(), "savePage");
+    vi.spyOn(backend(), "getPage").mockResolvedValue({
+      name: "Favorites",
+      kind: "page",
+      title: "Favorites",
+      pre_block: "tine/favorites:: true",
+      rev: "r2",
+      blocks: [block("Work", [block("[[Alpha]]"), block("[[TypedByHand]]")])],
+    });
+
+    await favoritesPageChanged(["Favorites"]);
+
+    expect(names(storedFavoritesLayout())).toEqual(["Alpha", "TypedByHand"]);
+    // Editing the page IS a membership statement, so config.edn follows...
+    expect(setFavorites).toHaveBeenCalledWith(["Alpha", "TypedByHand"]);
+    expect(projected).toEqual([["Alpha", "TypedByHand"]]);
+    // ...but the page is never written back: that would echo the user's own
+    // keystrokes into the file they are typing in.
+    expect(savePage).not.toHaveBeenCalled();
+  });
+
+  it("ignores a change to any other page", async () => {
+    await loaded();
+    const getPage = vi.spyOn(backend(), "getPage");
+    await favoritesPageChanged(["Some Other Page"]);
+    expect(getPage).not.toHaveBeenCalled();
+  });
+
+  it("ignores the echo of Tine's own write", async () => {
+    await loaded();
+    const setFavorites = vi.spyOn(backend(), "setFavorites").mockResolvedValue();
+    vi.spyOn(backend(), "getPage").mockResolvedValue({
+      name: "Favorites",
+      kind: "page",
+      title: "Favorites",
+      pre_block: "tine/favorites:: true",
+      rev: "r1", // the revision the store already holds
+      blocks: [block("Work", [block("[[Anything]]")])],
+    });
+
+    await favoritesPageChanged(["Favorites"]);
+
+    expect(names(storedFavoritesLayout())).toEqual(["Alpha"]);
+    expect(setFavorites).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when this graph has no arrangement page", async () => {
+    await loadFavoritesLayout(["Alpha"], null);
+    const getPage = vi.spyOn(backend(), "getPage");
+    await favoritesPageChanged(["Favorites"]);
+    expect(getPage).not.toHaveBeenCalled();
   });
 });

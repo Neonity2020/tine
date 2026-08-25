@@ -15,12 +15,17 @@ import {
   DEFAULT_FAVORITES_PAGE,
   FAVORITES_PAGE_PROPERTY,
   type FavLayout,
+  type FavNode,
   emptyLayout,
+  labelNode,
   layoutFromBlocks,
   layoutMembers,
-  layoutToMarkdown,
+  moveNode,
+  nodeAt,
+  promoteChildrenAt,
   reconcileLayout,
   uniqueGroupName,
+  updateAt,
 } from "./favoritesLayout";
 import { createSignal } from "solid-js";
 
@@ -96,22 +101,50 @@ export function adoptExternalMembership(membership: string[]): FavLayout {
   return next;
 }
 
+/** The arrangement page's content changed — edited in Tine's own editor, or
+ *  delivered from outside. Re-read it, because the page IS the arrangement;
+ *  before this, a hand edit was invisible until the graph was reopened.
+ *
+ *  A page edit is also a membership statement: deleting a `[[link]]` bullet
+ *  means "not a favorite any more", and adding one means the opposite. So the
+ *  reloaded tree is projected into `:favorites` exactly as a drag would be. It
+ *  does NOT write the page back — that would be an echo of the user's own
+ *  keystrokes — which is why this projects through the membership sink and
+ *  `setFavorites` rather than through `persistFavoritesLayout`. */
+export async function favoritesPageChanged(names: readonly string[]): Promise<void> {
+  const page = layoutPage();
+  if (!page || !names.includes(page)) return;
+  let dto: PageDto | null = null;
+  try {
+    dto = await backend().getPage(page, "page");
+  } catch {
+    return; // an unreadable page must never cost the user their favorites
+  }
+  if (!dto) return;
+  const rev = dto.rev ?? null;
+  // Tine's own write, echoed back by the watcher. Nothing to adopt.
+  if (rev !== null && rev === layoutRev) return;
+  layoutRev = rev;
+  const next = layoutFromBlocks(dto.blocks);
+  setLayoutSignal(next);
+  const members = layoutMembers(next).map((item) => item.name);
+  membershipSink?.(members);
+  await backend().setFavorites(members).catch(() => {});
+}
+
 function layoutPageDto(name: string, next: FavLayout): PageDto {
-  const markdown = layoutToMarkdown(next);
-  const blocks = markdown
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .reduce<{ raw: string; indented: boolean }[]>((acc, line) => {
-      const indented = line.startsWith("\t");
-      acc.push({ raw: line.replace(/^\t?- /, ""), indented });
-      return acc;
-    }, [])
-    .reduce<PageDto["blocks"]>((roots, entry) => {
-      const block = { id: "", raw: entry.raw, collapsed: false, children: [] };
-      if (entry.indented && roots.length) roots[roots.length - 1].children.push(block);
-      else roots.push(block);
-      return roots;
-    }, []);
+  // The arrangement IS a block tree, so it maps straight onto the page's blocks
+  // — no Markdown round-trip in the middle. `layoutToMarkdown` remains the
+  // human-readable rendering (and what the contract test pins), not the wire
+  // format for a save.
+  const toBlocks = (nodes: FavNode[]): PageDto["blocks"] =>
+    nodes.map((node) => ({
+      id: "",
+      raw: node.raw,
+      collapsed: node.collapsed ?? false,
+      children: toBlocks(node.children),
+    }));
+  const blocks = toBlocks(next);
   return {
     name,
     kind: "page",
@@ -136,7 +169,12 @@ export async function persistFavoritesLayout(next: FavLayout): Promise<void> {
   // reads favorites — not only in the sidebar.
   membershipSink?.(names);
   let page = layoutPage();
-  const carriesArrangement = next.some((group) => group.name !== null);
+  // Anything config.edn's flat `:favorites` list cannot express: a label, or a
+  // row nested under another. A graph with neither stays flat and never grows
+  // an arrangement page it did not ask for.
+  const carriesArrangement = next.some(
+    (node) => node.target === null || node.children.length > 0
+  );
   if (!page && !carriesArrangement) {
     // Nothing here that config.edn cannot express. A user who never groups
     // anything never grows a page in their graph they did not ask for, and
@@ -162,78 +200,53 @@ export async function persistFavoritesLayout(next: FavLayout): Promise<void> {
 // ---------------------------------------------------------------------------
 // Arrangement mutations.
 //
-// The sidebar renders one flat run of rows across all groups (group headers are
-// not rows), so a drag speaks in GLOBAL row indices plus the group the drop
-// landed in. That keeps `rowReorder` a single-list helper — the thing it
-// already is and is already tested for — instead of teaching it about
-// containers, while still allowing a drop across a group boundary, which is
-// otherwise ambiguous at the boundary index.
+// Every one is a pure function over the tree, addressed by PATH (the chain of
+// child indices). The sidebar draws one flat run of visible rows, so a drag
+// speaks in visible-row indices and a depth; `resolveDrop` in favoritesLayout
+// turns that pair into a (parent, index) before anything is mutated.
 
-/** (group index, index within group) for a global row index. */
-export function locateRow(next: FavLayout, global: number): { group: number; index: number } | null {
-  let seen = 0;
-  for (let g = 0; g < next.length; g += 1) {
-    const size = next[g].items.length;
-    if (global < seen + size) return { group: g, index: global - seen };
-    seen += size;
-  }
-  return null;
-}
-
-/** Move one favorite to a global row position, landing it in `targetGroup`. */
+/** Move the row at `from` under `parent` at `index`. */
 export function moveFavoriteRow(
   next: FavLayout,
-  from: number,
-  to: number,
-  targetGroup: number,
+  from: number[],
+  parent: number[],
+  index: number,
 ): FavLayout {
-  const source = locateRow(next, from);
-  if (!source) return next;
-  const groups = next.map((group) => ({ ...group, items: [...group.items] }));
-  const [item] = groups[source.group].items.splice(source.index, 1);
-  if (!item) return next;
-  const clampedGroup = Math.max(0, Math.min(targetGroup, groups.length - 1));
-  // `to` is a global index in the array AFTER removal, so resolve it there.
-  const landing = locateRow(
-    groups.map((group) => ({ ...group })),
-    Math.max(0, to),
-  );
-  const index =
-    landing && landing.group === clampedGroup
-      ? landing.index
-      : groups[clampedGroup].items.length;
-  groups[clampedGroup].items.splice(index, 0, item);
-  return groups;
+  return moveNode(next, from, parent, index);
 }
 
+/** Add a label at the top level. */
 export function addGroup(next: FavLayout, desired = "New group"): FavLayout {
-  return [...next, { name: uniqueGroupName(next, desired), items: [], passthrough: [] }];
+  return [...next, labelNode(uniqueGroupName(next, desired))];
 }
 
-export function renameGroup(next: FavLayout, groupIndex: number, name: string): FavLayout {
+export function renameGroup(next: FavLayout, path: number[], name: string): FavLayout {
   const trimmed = name.trim();
-  if (!trimmed || groupIndex <= 0 || groupIndex >= next.length) return next;
-  return next.map((group, i) =>
-    i === groupIndex ? { ...group, name: uniqueGroupName(next.filter((_, j) => j !== i), trimmed) } : group
-  );
+  const node = nodeAt(next, path);
+  if (!trimmed || !node || node.target !== null) return next;
+  // Uniqueness is checked against every OTHER label, so re-committing an
+  // unchanged name does not append " 2" to it.
+  const without = promoteChildrenAt(next, path);
+  return updateAt(next, path, (target) => [
+    { ...target, raw: uniqueGroupName(without, trimmed) },
+  ]);
 }
 
-/** Delete a group WITHOUT unfavoriting anything: its members move to the
- *  ungrouped section. Capacities states this contract explicitly and it is the
- *  one users rely on; Obsidian's bookmark folders lose the reference instead. */
-export function deleteGroup(next: FavLayout, groupIndex: number): FavLayout {
-  if (groupIndex <= 0 || groupIndex >= next.length) return next;
-  const doomed = next[groupIndex];
-  return next
-    .map((group, i) =>
-      i === 0
-        ? { ...group, items: [...group.items, ...doomed.items], passthrough: [...group.passthrough, ...doomed.passthrough] }
-        : group
-    )
-    .filter((_, i) => i !== groupIndex);
+/** Delete a label WITHOUT unfavoriting anything: its children take its place.
+ *  Capacities states this contract explicitly and it is the one users rely on;
+ *  Obsidian's bookmark folders lose the reference instead. */
+export function deleteGroup(next: FavLayout, path: number[]): FavLayout {
+  const node = nodeAt(next, path);
+  if (!node || node.target !== null) return next;
+  return promoteChildrenAt(next, path);
 }
 
-export function setGroupCollapsed(next: FavLayout, groupIndex: number, collapsed: boolean): FavLayout {
-  if (groupIndex <= 0 || groupIndex >= next.length) return next;
-  return next.map((group, i) => (i === groupIndex ? { ...group, collapsed: collapsed || undefined } : group));
+export function setGroupCollapsed(
+  next: FavLayout,
+  path: number[],
+  collapsed: boolean,
+): FavLayout {
+  return updateAt(next, path, (target) => [
+    { ...target, collapsed: collapsed || undefined },
+  ]);
 }

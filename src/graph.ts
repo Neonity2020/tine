@@ -15,7 +15,7 @@ import { waitForWarmCache } from "./warmCache";
 import { CUSTOM_CSS_STYLE_ID, ensureLsShimStyle } from "./lsShim";
 import { ensureThemeStyle } from "./themeGallery";
 import { isMobile, platformKind } from "./platform";
-import type { BlockDto } from "./types";
+import type { BlockDto, GraphMeta } from "./types";
 import { maybeShowGuideAnnouncement } from "./guide";
 import { endEdit } from "./editorController";
 import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
@@ -205,13 +205,7 @@ export async function loadGraphPath(
   // Journals surface performs template materialization before fetching its feed,
   // preserving #73's populated-first observation without blocking graph open.
   bumpGraphEpoch();
-  setWorkflow(meta?.preferred_workflow === "todo" ? "todo" : "now");
-  setJournalTitleFormat(meta?.journal_page_title_format); // match this graph's journal titles
-  seedFavorites(meta?.favorites ?? []);
-  // The arrangement (groups and order) lives in a page named by
-  // `:tine/favorites-page`; config.edn stays the authority on WHICH pages are
-  // favorited, so a change made in Logseq while Tine was closed is honoured.
-  void loadFavoritesLayout(meta?.favorites ?? [], meta?.favorites_page ?? null);
+  applyConfigDerivedState(meta, null);
   // Standing conflicts — duplicate journal days included, as of the day they
   // became queue objects — surface through the calm badge + in-page resolver,
   // not a startup toast; these just derive the inventories.
@@ -674,4 +668,56 @@ async function seedTodayJournal(): Promise<void> {
   } catch {
     // best-effort — never block opening the new graph on the seed
   }
+}
+
+/** Re-apply the frontend state that `config.edn` owns.
+ *
+ *  `previous` is the meta this state was last built from, or `null` to apply
+ *  everything. A graph open passes `null`; a live config change passes what the
+ *  frontend already had, so an unrelated settings write does not re-seed
+ *  favorites and re-fetch the arrangement page for nothing.
+ *
+ *  Only the settings that are NOT read reactively from `graphMeta()` need to be
+ *  here. Everything else — shortcuts, macros, hidden properties, show-brackets,
+ *  the logbook flags — already updates for free when the meta signal changes,
+ *  and adding it here would be a second producer of the same state. */
+export function applyConfigDerivedState(meta: GraphMeta, previous: GraphMeta | null): void {
+  const moved = (pick: (m: GraphMeta) => unknown) =>
+    previous === null || JSON.stringify(pick(previous)) !== JSON.stringify(pick(meta));
+  if (moved((m) => m.preferred_workflow)) {
+    setWorkflow(meta?.preferred_workflow === "todo" ? "todo" : "now");
+  }
+  if (moved((m) => m.journal_page_title_format)) {
+    // Match this graph's journal titles.
+    setJournalTitleFormat(meta?.journal_page_title_format);
+  }
+  if (moved((m) => [m.favorites, m.favorites_page])) {
+    seedFavorites(meta?.favorites ?? []);
+    // The arrangement (nesting and order) lives in a page named by
+    // `:tine/favorites-page`; config.edn stays the authority on WHICH pages are
+    // favorited, so a change made in Logseq is honoured whether Tine was
+    // running at the time or not.
+    void loadFavoritesLayout(meta?.favorites ?? [], meta?.favorites_page ?? null);
+  }
+}
+
+/** `logseq/config.edn` changed on disk and the backend re-read it.
+ *
+ *  Before this existed, Tine read the file once per graph open, so an edit made
+ *  in Logseq — or delivered by Syncthing — was invisible for the rest of the
+ *  session, and the next settings write in Tine was based on the stale copy. */
+export function applyGraphConfigChange(meta: GraphMeta): void {
+  const previous = graphMeta();
+  if (previous && previous.root !== meta.root) return; // a different graph's window
+  setGraphMeta(meta);
+  // A journal-title or format change re-dates and re-routes what is already on
+  // screen, so in-flight results from before it must not land afterwards.
+  if (
+    previous &&
+    (previous.journal_page_title_format !== meta.journal_page_title_format ||
+      previous.preferred_format !== meta.preferred_format)
+  ) {
+    bumpGraphEpoch();
+  }
+  applyConfigDerivedState(meta, previous);
 }

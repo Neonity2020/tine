@@ -1681,6 +1681,97 @@ mod tests {
     // every other key, comment and bit of formatting exactly as it found it —
     // a malformed favorites value once invalidated Logseq's whole config parse,
     // and this writer runs on the user's real config.edn.
+    /// The watcher's whole economy rests on this: it may only pay for a
+    /// whole-graph reopen when the configuration on disk differs from the bytes
+    /// the running `Graph` was opened with. A settings write Tine performed
+    /// itself already refreshed the graph, so it must read as unchanged.
+    #[test]
+    fn a_graph_reports_whether_config_edn_moved_since_it_was_opened() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-config-witness-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        std::fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:favorites [\"Alpha\"]}\n",
+        )
+        .unwrap();
+
+        let g = crate::model::Graph::open(&dir);
+        assert_eq!(
+            g.open_config_description(),
+            crate::model::config_file_description(&dir),
+            "nothing has touched the file"
+        );
+
+        // An outside write — Logseq, an editor, Syncthing delivering a peer's.
+        std::fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:favorites [\"Alpha\" \"Beta\"]}\n",
+        )
+        .unwrap();
+        assert_ne!(
+            g.open_config_description(),
+            crate::model::config_file_description(&dir),
+            "the running graph is now serving stale configuration"
+        );
+
+        // Reopening is what the watcher does about it, and settles it.
+        let reopened = crate::model::Graph::open(&dir);
+        assert_eq!(
+            reopened.open_config_description(),
+            crate::model::config_file_description(&dir)
+        );
+
+        // A graph with no configuration file at all agrees with the absence,
+        // rather than reporting a change on every single cycle.
+        let bare = std::env::temp_dir().join(format!(
+            "tine-config-witness-bare-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        let empty = crate::model::Graph::open(&bare);
+        assert_eq!(empty.open_config_description(), None);
+        assert_eq!(crate::model::config_file_description(&bare), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn only_the_graph_s_own_config_edn_is_recognized_as_configuration() {
+        use crate::model::is_config_file_path;
+        let root = std::path::Path::new("/graph");
+        assert!(is_config_file_path(
+            root,
+            std::path::Path::new("/graph/logseq/config.edn")
+        ));
+        // A case-folding filesystem may hand back either spelling; the open
+        // path resolves it case-insensitively, so this must too.
+        assert!(is_config_file_path(
+            root,
+            std::path::Path::new("/graph/Logseq/Config.edn")
+        ));
+        for other in [
+            "/graph/config.edn",
+            "/graph/logseq/custom.css",
+            "/graph/logseq/pages-metadata.edn",
+            "/graph/pages/logseq/config.edn",
+            "/elsewhere/logseq/config.edn",
+            "/graph",
+        ] {
+            assert!(
+                !is_config_file_path(root, std::path::Path::new(other)),
+                "{other} is not this graph's configuration"
+            );
+        }
+    }
+
     #[test]
     fn favorites_page_key_round_trips_and_preserves_the_rest_of_the_file() {
         let dir = std::env::temp_dir().join(format!("tine-favpage-cfg-{}", std::process::id()));

@@ -6140,6 +6140,7 @@ mod tests {
             default_journal_template: None,
             default_home: None,
             favorites: Vec::new(),
+            favorites_page: None,
             journal_page_title_format: "MMM do, yyyy".into(),
             journal_file_name_format: "yyyy_MM_dd".into(),
             preferred_format: "md".into(),

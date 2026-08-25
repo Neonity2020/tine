@@ -8,6 +8,7 @@ import {
   renameGroup,
   setGroupCollapsed,
 } from "../favoritesStore";
+import { itemKind, resolveDrop, visibleRows, type FavRow } from "../favoritesLayout";
 import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, conflictQueue, advanceConflictCursor } from "../ui";
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, reportGraphOpenFailure, type LoadGraphPathOutcome } from "../graph";
@@ -46,33 +47,82 @@ const sidebarPageOpenDeps: SidebarPageOpenDeps = {
 // Live drop target while a favorites reorder drag is in progress (GH #211).
 // Module scope: Sidebar renders once per window.
 const [favDropTarget, setFavDropTarget] = createSignal<RowDropTarget | null>(null);
-// Which GROUP the live drop target sits in. rowReorder is deliberately a
-// single-list helper, so the group is read off the target row's own
-// data-fav-group rather than taught to the helper — at a boundary index the
-// row the pointer is actually over is the only unambiguous answer.
-let favDropGroup = 0;
+/** Nesting step, in px. Also the width of one pointer "step" to the right when
+ *  choosing a drop depth, so the gesture reads the same as the result looks. */
+const FAV_INDENT_PX = 16;
+/** The depth the live drop would land at — drawn as the indent of the insertion
+ *  line, so the user sees WHERE a nested drop goes before releasing. */
+const [favDropDepth, setFavDropDepth] = createSignal(0);
+
+/** The depth the pointer is asking for: the dragged row's own depth, plus one
+ *  level per indent step it has been dragged to the right (or left). */
+function requestedDepth(rows: FavRow[], from: number, dx: number): number {
+  const origin = rows[from];
+  if (!origin) return 0;
+  return origin.depth + Math.round(dx / FAV_INDENT_PX);
+}
+
 /** Pointerdown on a favorites row starts a reorder drag — never from an
  *  interactive child. */
 function startFavoriteDrag(index: number, event: PointerEvent) {
   if ((event.target as HTMLElement | null)?.closest("button, a, input, [contenteditable=\"true\"]")) return;
+  const rows = visibleRows(favoritesLayout());
   beginRowReorderDrag(
     event,
     index,
     "#sidebar-favorites-list .nav-page",
     (target) => {
       if (target) {
-        const row = document.querySelector<HTMLElement>(
-          `#sidebar-favorites-list .nav-page[data-row-index="${target.index}"]`
+        const slot = target.index + (target.before ? 0 : 1);
+        setFavDropDepth(
+          resolveDropFor(rows, index, slot, requestedDepth(rows, index, target.dx)).depth
         );
-        const group = Number(row?.dataset.favGroup);
-        if (Number.isFinite(group)) favDropGroup = group;
       }
       setFavDropTarget(target);
     },
-    (from, to) => {
-      void persistFavoritesLayout(moveFavoriteRow(favoritesLayout(), from, to, favDropGroup));
+    (from, _to, target) => {
+      const slot = target.index + (target.before ? 0 : 1);
+      const { parent, index: at } = resolveDropFor(
+        rows,
+        from,
+        slot,
+        requestedDepth(rows, from, target.dx)
+      );
+      const origin = rows[from];
+      if (!origin) return;
+      void persistFavoritesLayout(moveFavoriteRow(favoritesLayout(), origin.path, parent, at));
     },
+    // A drop at the same slot but a different depth re-parents the row, so the
+    // flat helper's "nothing moved" shortcut must not swallow it.
+    { commitUnchanged: true },
   );
+}
+
+/** Resolve a drop, ignoring the rows the dragged subtree itself occupies — a
+ *  node may not become its own descendant, and its own rows must not be counted
+ *  when working out which parent the slot belongs to. */
+function resolveDropFor(
+  rows: FavRow[],
+  from: number,
+  slot: number,
+  depth: number,
+): { parent: number[]; index: number; depth: number } {
+  const origin = rows[from];
+  if (!origin) return { parent: [], index: 0, depth: 0 };
+  const dragged = new Set<number>();
+  rows.forEach((row, i) => {
+    if (row.path.length >= origin.path.length && origin.path.every((v, k) => row.path[k] === v)) {
+      dragged.add(i);
+    }
+  });
+  const rest = rows.filter((_, i) => !dragged.has(i));
+  const restSlot = rows.slice(0, slot).filter((_, i) => !dragged.has(i)).length;
+  const resolved = resolveDrop(rest, restSlot, depth);
+  const parentRow = resolved.parent.length
+    ? rest.find((row) => row.path.length === resolved.parent.length
+        && resolved.parent.every((v, k) => row.path[k] === v))
+    : null;
+  return { ...resolved, depth: parentRow ? parentRow.depth + 1 : 0 };
 }
 
 export function openSidebarPageTarget(
@@ -194,94 +244,108 @@ export function Sidebar(props: {
             </button>
             <Show when={favoritesSectionExpanded()}>
               <div id="sidebar-favorites-list">
-                <For each={favoritesLayout()}>
-                  {(group, groupIndex) => {
-                    const before = () =>
-                      favoritesLayout()
-                        .slice(0, groupIndex())
-                        .reduce((n, g) => n + g.items.length, 0);
+                {/* One flat run of rows, pre-order, indented by depth — not
+                    nested markup. The visible index IS `data-row-index`, so the
+                    drop target found by elementFromPoint needs no translation,
+                    and a label row and a favorite row are draggable on exactly
+                    the same terms. */}
+                <For each={visibleRows(favoritesLayout())}>
+                  {(row, i) => {
+                    const indent = () => ({ "padding-left": `${6 + row.depth * FAV_INDENT_PX}px` });
+                    const dropping = () => favDropTarget()?.index === i();
+                    const rowClasses = () => ({
+                      "row-drop-before": dropping() && favDropTarget()!.before,
+                      "row-drop-after": dropping() && !favDropTarget()!.before,
+                    });
+                    const dropIndent = () =>
+                      dropping() ? { "--fav-drop-indent": `${6 + favDropDepth() * FAV_INDENT_PX}px` } : {};
+                    const toggle = (
+                      <Show when={row.node.children.length > 0} fallback={<span class="nav-fav-spacer" />}>
+                        <button
+                          type="button"
+                          class="nav-fav-group-toggle"
+                          aria-expanded={!row.node.collapsed}
+                          aria-label={row.node.collapsed ? "Expand" : "Collapse"}
+                          onClick={() =>
+                            void persistFavoritesLayout(
+                              setGroupCollapsed(favoritesLayout(), row.path, !row.node.collapsed)
+                            )
+                          }
+                        >
+                          <span class="nav-toggle-caret" classList={{ open: !row.node.collapsed }}>▸</span>
+                        </button>
+                      </Show>
+                    );
+                    if (row.node.target === null) {
+                      return (
+                        <div
+                          class="nav-page nav-fav-group"
+                          data-row-index={i()}
+                          classList={rowClasses()}
+                          style={{ ...indent(), ...dropIndent() }}
+                          onPointerDown={(e) => startFavoriteDrag(i(), e)}
+                        >
+                          {toggle}
+                          <input
+                            class="nav-fav-group-name"
+                            value={row.node.raw}
+                            aria-label={`Rename group ${row.node.raw}`}
+                            onChange={(event) =>
+                              void persistFavoritesLayout(
+                                renameGroup(favoritesLayout(), row.path, event.currentTarget.value)
+                              )
+                            }
+                          />
+                          <button
+                            type="button"
+                            class="nav-fav-group-delete"
+                            /* Deleting a group keeps its favorites — they move up
+                               to where it stood — so this needs no confirmation,
+                               which is just as well: WebKitGTK's confirm() is a
+                               no-op (#confirm). */
+                            title="Delete this group (what it holds moves up a level)"
+                            aria-label={`Delete group ${row.node.raw}`}
+                            onClick={() =>
+                              void persistFavoritesLayout(deleteGroup(favoritesLayout(), row.path))
+                            }
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    }
+                    const name = row.node.target;
+                    const target = () => sidebarPageTarget(name, itemKind(name));
                     return (
-                      <>
-                        <Show when={group.name !== null}>
-                          <div class="nav-fav-group" data-fav-group-header={groupIndex()}>
-                            <button
-                              type="button"
-                              class="nav-fav-group-toggle"
-                              aria-expanded={!group.collapsed}
-                              onClick={() =>
-                                void persistFavoritesLayout(
-                                  setGroupCollapsed(favoritesLayout(), groupIndex(), !group.collapsed)
-                                )
-                              }
-                            >
-                              <span class="nav-toggle-caret" classList={{ open: !group.collapsed }}>▸</span>
-                            </button>
-                            <input
-                              class="nav-fav-group-name"
-                              value={group.name ?? ""}
-                              aria-label={`Rename group ${group.name}`}
-                              onChange={(event) =>
-                                void persistFavoritesLayout(
-                                  renameGroup(favoritesLayout(), groupIndex(), event.currentTarget.value)
-                                )
-                              }
-                            />
-                            <button
-                              type="button"
-                              class="nav-fav-group-delete"
-                              /* Deleting a group keeps its favorites — they move
-                                 to the ungrouped section — so this needs no
-                                 confirmation, which is just as well: WebKitGTK's
-                                 confirm() is a no-op (#confirm). */
-                              title="Delete this group (its favorites move to the ungrouped list)"
-                              aria-label={`Delete group ${group.name}`}
-                              onClick={() =>
-                                void persistFavoritesLayout(deleteGroup(favoritesLayout(), groupIndex()))
-                              }
-                            >
-                              ×
-                            </button>
-                          </div>
-                        </Show>
-                        <Show when={group.name === null || !group.collapsed}>
-                          <For each={group.items}>
-                            {(fav, i) => {
-                              const row = () => before() + i();
-                              const target = () => sidebarPageTarget(fav.name, fav.kind);
-                              return (
-                                <div
-                                  class="nav-page"
-                                  data-row-index={row()}
-                                  data-fav-group={groupIndex()}
-                                  classList={{ active: isActive(target().name), grouped: group.name !== null, "row-drop-before": favDropTarget()?.index === row() && favDropTarget()!.before, "row-drop-after": favDropTarget()?.index === row() && !favDropTarget()!.before }}
-                                  onPointerDown={(e) => startFavoriteDrag(row(), e)}
-                                  onMouseDown={shiftGuard}
-                                  onClick={(e) => {
-                                    if (rowReorderClickSuppressed()) return;
-                                    const dest = internalLinkDest(e);
-                                    openSidebarPageTarget(fav.name, fav.kind, dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
-                                  }}
-                                  onAuxClick={(e) => {
-                                    if (e.button === 1) {
-                                      e.preventDefault();
-                                      openSidebarPageTarget(fav.name, fav.kind, "new-tab");
-                                    }
-                                  }}
-                                  onContextMenu={(e) => {
-                                    e.preventDefault();
-                                    openSidebarPageTarget(fav.name, fav.kind, "context", { x: e.clientX, y: e.clientY });
-                                  }}
-                                >
-                                  {/* ⭐ + name via EmojiText: WebKitGTK's Skia COLRv1 path
-                                      crashes painting a raw color-emoji glyph on hardened
-                                      libstdc++ (#29); Twemoji <img> never touches the font. */}
-                                  <EmojiText text={`⭐ ${fav.name}`} />
-                                </div>
-                              );
-                            }}
-                          </For>
-                        </Show>
-                      </>
+                      <div
+                        class="nav-page"
+                        data-row-index={i()}
+                        classList={{ active: isActive(target().name), ...rowClasses() }}
+                        style={{ ...indent(), ...dropIndent() }}
+                        onPointerDown={(e) => startFavoriteDrag(i(), e)}
+                        onMouseDown={shiftGuard}
+                        onClick={(e) => {
+                          if (rowReorderClickSuppressed()) return;
+                          const dest = internalLinkDest(e);
+                          openSidebarPageTarget(name, itemKind(name), dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
+                        }}
+                        onAuxClick={(e) => {
+                          if (e.button === 1) {
+                            e.preventDefault();
+                            openSidebarPageTarget(name, itemKind(name), "new-tab");
+                          }
+                        }}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          openSidebarPageTarget(name, itemKind(name), "context", { x: e.clientX, y: e.clientY });
+                        }}
+                      >
+                        {toggle}
+                        {/* ⭐ + name via EmojiText: WebKitGTK's Skia COLRv1 path
+                            crashes painting a raw color-emoji glyph on hardened
+                            libstdc++ (#29); Twemoji <img> never touches the font. */}
+                        <EmojiText text={`⭐ ${name}`} />
+                      </div>
                     );
                   }}
                 </For>

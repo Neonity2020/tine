@@ -21,6 +21,7 @@ import {
   sweepReplaceable,
 } from "./store";
 import { backend } from "./backend";
+import { favoritesPageChanged } from "./favoritesStore";
 import { onGraphRebound } from "./modeHooks";
 import {
   markConflict,
@@ -1005,6 +1006,11 @@ async function doSave(
       baseRev.set(name, rev);
       if (baseline === null) bumpPageInventoryRev();
     }
+    // The favorites arrangement lives in an ordinary page, so editing it in
+    // Tine's own editor is how a keyboard user reorders favorites. The sidebar
+    // has to follow that edit, and this is the one place every in-app page save
+    // passes through.
+    void favoritesPageChanged([name]);
     clearTransientRetry(name);
     conflictObservation.delete(name);
     // The bytes landed, so any banner still up is answered. Only a re-observation

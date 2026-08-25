@@ -1,5 +1,8 @@
 use crate::settings::{settings_path, update_settings};
-use crate::state::{AppState, GraphSlot, LegacyGraphLease};
+use crate::state::{
+    refresh_graph_for_label, slot_for_window, AppState, GraphSlot, LegacyGraphLease,
+    RefreshLaneWait, RefreshOutcome,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -114,6 +117,11 @@ struct SparseV2ErrorEvent {
 struct Pending {
     paths: HashSet<PathBuf>,
     full_paths: HashSet<PathBuf>,
+    /// Candidate `logseq/config.edn` paths. Configuration is not graph text --
+    /// `incremental_page_paths` discards it a few lines below, which is why an
+    /// external config edit was invisible until the next graph open -- so it
+    /// needs its own queue rather than a place in `paths`.
+    config_paths: HashSet<PathBuf>,
     /// Highest raw-callback frontier admitted into this pending batch for each
     /// Direct graph root. The callback records this while holding the same
     /// mutex used to add its notify event, so a drained batch can never
@@ -147,6 +155,13 @@ impl Pending {
 
     fn add_event(&mut self, event: notify::Event) {
         self.note_event_arrival();
+        for path in event
+            .paths
+            .iter()
+            .filter(|path| path_is_config_file_name(path))
+        {
+            self.config_paths.insert(path.clone());
+        }
         if event.need_rescan() {
             if event.paths.is_empty() {
                 self.need_full = true;
@@ -582,6 +597,18 @@ fn watch_event_is_tool_noise(event: &notify::Event, roots: &HashSet<PathBuf>) ->
         .paths
         .iter()
         .all(|path| roots.iter().any(|root| path_is_tool_noise(root, path)))
+}
+
+/// A watch event path that *might* be some graph's `logseq/config.edn`.
+///
+/// Only the filename, deliberately: which graph owns it -- and whether it sits
+/// at the one graph-relative location that counts -- is
+/// `tine_core::model::is_config_file_path`'s decision, made per root when the
+/// batch drains. This is the cheap gate that keeps the pending set small.
+fn path_is_config_file_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("config.edn"))
 }
 
 fn incremental_page_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
@@ -1050,6 +1077,85 @@ fn reconcile_pending(
         let (changes, conflicts_dirty, errors) = incremental_reconcile(graph, snap, paths);
         (changes, conflicts_dirty, false, errors)
     }
+}
+
+/// Re-read `logseq/config.edn` for the graphs an event named, and refresh any
+/// whose configuration actually moved.
+///
+/// A separate pass rather than a branch inside the reconcile loops, because
+/// configuration is not graph text: it is the same plain file under both
+/// storage engines -- never in `GraphTextScope`, never in the oplog, never
+/// projected -- so one pass serves Direct and managed alike.
+///
+/// Returns true when a refresh was deferred and wants another cycle.
+fn refresh_changed_configs(
+    app: &tauri::AppHandle,
+    labels_by_root: &[(String, PathBuf)],
+    config_paths: &HashSet<PathBuf>,
+    check_all: bool,
+    recheck: &mut HashSet<String>,
+) -> bool {
+    let mut deferred = false;
+    let state = app.state::<AppState>();
+    for (label, root) in labels_by_root {
+        let named = check_all
+            || recheck.contains(label)
+            || config_paths
+                .iter()
+                .any(|path| tine_core::model::is_config_file_path(root, path));
+        if !named {
+            continue;
+        }
+        recheck.remove(label);
+        let Ok(slot) = slot_for_window(&state, label) else {
+            continue;
+        };
+        // A Direct graph carries a digest of the exact bytes it was opened
+        // with, so this costs nothing after Tine's own settings write: that
+        // command already refreshed the slot, and the reopened graph matches
+        // disk. Skipping here is what keeps a settings toggle from paying for
+        // a second whole-graph reopen -- which discards every cache the graph
+        // has built.
+        //
+        // A managed slot retains no `Graph` to ask. Its refresh is a meta-only
+        // reopen with no cache to lose, so it re-reads unconditionally and lets
+        // the meta comparison below decide whether anything is worth announcing.
+        if !slot.is_sparse_v2() {
+            let unchanged = slot.legacy_graph().is_ok_and(|lease| {
+                lease.open_config_description() == tine_core::model::config_file_description(root)
+            });
+            if unchanged {
+                continue;
+            }
+        }
+        let before = slot.graph_meta();
+        drop(slot);
+        match refresh_graph_for_label(&state, app, label, RefreshLaneWait::TryOnce) {
+            Ok(RefreshOutcome::Deferred) => {
+                recheck.insert(label.clone());
+                deferred = true;
+            }
+            Ok(RefreshOutcome::Refreshed) => {
+                let Ok(slot) = slot_for_window(&state, label) else {
+                    continue;
+                };
+                let after = slot.graph_meta();
+                // A rewrite that changed no setting we surface -- Logseq
+                // touching an unrelated key, Syncthing redelivering identical
+                // bytes with a new mtime -- announces nothing.
+                if after != before {
+                    let _ = app.emit_to(label, "graph-config-changed", after);
+                }
+            }
+            Err(message) => {
+                // Not silent: until this succeeds the window is serving stale
+                // configuration, which is exactly the failure this whole pass
+                // exists to prevent.
+                let _ = app.emit_to(label, "graph-watch-error", &message);
+            }
+        }
+    }
+    deferred
 }
 
 /// Which pending event paths this graph should reconcile incrementally.
@@ -1611,6 +1717,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
 
         let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
         let mut sparse_graphs: HashMap<String, WatchedSparse> = HashMap::new();
+        // Windows whose configuration still needs re-reading: named by an event
+        // this cycle could not act on because the storage transition lane was
+        // busy. Carried across cycles so a deferral cannot lose the change.
+        let mut config_recheck: HashSet<String> = HashSet::new();
         let mut watcher: Option<notify::RecommendedWatcher> = None;
         let mut watched: HashSet<PathBuf> = HashSet::new();
         // Last surfaced `watch()` failure per graph root, so a root that keeps
@@ -1793,6 +1903,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             let (
                 paths,
                 full_paths,
+                config_paths,
                 drained_observation_epochs,
                 event_need_full,
                 notify_error,
@@ -1801,6 +1912,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 if let Ok(mut p) = pending.lock() {
                     let paths = std::mem::take(&mut p.paths);
                     let full_paths = std::mem::take(&mut p.full_paths);
+                    let config_paths = std::mem::take(&mut p.config_paths);
                     let observation_epochs = p.take_legacy_observation_epochs();
                     let need_full = p.need_full;
                     let notify_error = p.notify_error;
@@ -1810,6 +1922,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     (
                         paths,
                         full_paths,
+                        config_paths,
                         observation_epochs,
                         need_full,
                         notify_error,
@@ -1817,6 +1930,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     )
                 } else {
                     (
+                        HashSet::new(),
                         HashSet::new(),
                         HashSet::new(),
                         HashMap::new(),
@@ -1827,6 +1941,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 }
             } else {
                 (
+                    HashSet::new(),
                     HashSet::new(),
                     HashSet::new(),
                     HashMap::new(),
@@ -2150,6 +2265,23 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             // finished the requested full pass and all ordinary change events
             // were emitted before this completion marker. The frontend still
             // waits for its asynchronous handlers before admitting edits.
+            // Configuration, for every graph this cycle could have touched. A
+            // kernel rescan or notify error carries no usable paths, and poll
+            // mode has none at all, so both re-check every graph -- one file
+            // read and one digest each, against a stat scan they already pay.
+            if refresh_changed_configs(
+                &app,
+                &labels_by_root,
+                &config_paths,
+                event_need_full || notify_error || !inotify,
+                &mut config_recheck,
+            ) {
+                // A deferral means the lane was busy, not that the change went
+                // away. Wake again; the 200 ms coalescing sleep below bounds
+                // how fast this can retry while a transition holds the lane.
+                let _ = tx.send(());
+            }
+
             if let Some(sequence) = explicit_rescan {
                 complete_full_rescan(&app, sequence);
             }
@@ -3560,6 +3692,53 @@ mod tests {
             paths,
             attrs: Default::default(),
         }
+    }
+
+    /// Configuration is deliberately not graph text, so `incremental_page_paths`
+    /// throws it away — which is exactly why an outside edit to `config.edn` was
+    /// invisible until the next graph open. It has to be queued separately, for
+    /// every shape a writer can produce: an in-place write, and the temp+rename
+    /// that Tine, Logseq and Syncthing all actually use.
+    #[test]
+    fn a_config_edn_write_is_queued_even_though_it_is_not_graph_text() {
+        use notify::event::{CreateKind, DataChange, EventKind, ModifyKind, RenameMode};
+        let config = PathBuf::from("/graph/logseq/config.edn");
+
+        for kind in [
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Create(CreateKind::File),
+        ] {
+            let mut pending = Pending::default();
+            pending.add_event(event(kind, vec![config.clone()]));
+            assert!(
+                pending.paths.is_empty(),
+                "{kind:?}: configuration is not graph text and must not enter the page queue"
+            );
+            assert!(
+                pending.config_paths.contains(&config),
+                "{kind:?}: but it must reach the configuration queue"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_page_write_queues_no_configuration_work() {
+        use notify::event::{DataChange, EventKind, ModifyKind};
+        let mut pending = Pending::default();
+        pending.add_event(event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            vec![PathBuf::from("/graph/pages/Alpha.md")],
+        ));
+        assert!(pending.config_paths.is_empty());
+        // And an unrelated EDN file is not configuration either. The filename
+        // gate is cheap and rough; `is_config_file_path` is the decision.
+        let mut pending = Pending::default();
+        pending.add_event(event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            vec![PathBuf::from("/graph/logseq/pages-metadata.edn")],
+        ));
+        assert!(pending.config_paths.is_empty());
     }
 
     fn new_page(name: &str) -> PageDto {
