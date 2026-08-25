@@ -669,7 +669,9 @@ mod tests {
         // The pre-fix producer path cannot parse this title at all:
         assert_eq!(JournalDate::from_title("26.06.2026"), None);
         // The shared axis can, and ranks the journal at its day's midnight:
-        let date = format.parse("26.06.2026").expect("configured format parses");
+        let date = format
+            .parse("26.06.2026")
+            .expect("configured format parses");
         assert_eq!(
             format.page_recency_secs(true, "26.06.2026", std::path::Path::new("")),
             date.to_days() * 86_400
