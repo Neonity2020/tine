@@ -297,7 +297,10 @@ fn malformed_hierarchies_fail_closed() {
         plan_projection(workspace(1), &cycle, None,),
         Err(ProjectionError::CyclicTree(_))
     ));
+}
 
+#[test]
+fn concurrent_equal_sibling_orders_use_block_identity_as_a_stable_tie_breaker() {
     let duplicate_order = page(
         "pages/order.md",
         vec![
@@ -305,10 +308,12 @@ fn malformed_hierarchies_fail_closed() {
             block(2, None, "same", "two", None),
         ],
     );
-    assert!(matches!(
-        plan_projection(workspace(1), &duplicate_order, None,),
-        Err(ProjectionError::DuplicateSiblingOrder { .. })
-    ));
+    let forward = plan_projection(workspace(1), &duplicate_order, None).unwrap();
+    let mut reversed = duplicate_order.clone();
+    reversed.page.blocks.reverse();
+    let reversed = plan_projection(workspace(1), &reversed, None).unwrap();
+    assert_eq!(text(forward.target()), "- one\n- two\n");
+    assert_eq!(forward.target(), reversed.target());
 }
 
 #[test]

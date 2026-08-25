@@ -5017,10 +5017,12 @@
     "android"
    ],
    "layer": "rust-integration",
-   "status": "reproduced",
+   "status": "fixed",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/sync_runtime.rs::tests::rapid_task_edits_with_deleted_continuation_lines_remain_saveable_and_reopen"
+     "crates/tine-core/src/sync_runtime.rs::tests::rapid_task_edits_with_deleted_continuation_lines_remain_saveable_and_reopen",
+     "crates/tine-core/src/sync_runtime.rs::tests::genuinely_different_concurrent_same_position_creates_keep_both_blocks",
+     "crates/tine-core/src/oplog/projection_integration_tests.rs::concurrent_equal_sibling_orders_use_block_identity_as_a_stable_tie_breaker"
     ],
     "scenario": "managed-sync.rapid-task-edits-provider-interleave-clean-shutdown-reopen",
     "failBefore": "proven at 1dbce51f: projection-first delivery of a newly created unstamped task authors two internal block identities at the same sibling order, then retained provider projection blocks before the rapid-edit sequence with duplicate sibling order below the page root"

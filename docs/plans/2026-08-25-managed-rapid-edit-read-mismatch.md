@@ -28,7 +28,8 @@ filesystem forgery.
 ## Proof checklist
 
 1. Reproduce the field edit sequence with provider work interleaved and prove
-   the pre-fix failure is `managed_read_block_mismatch`.
+   the earliest structural failure that can strand the later
+   `managed_read_block_mismatch` state.
 2. Prove every acknowledged save survives clean shutdown and cold reopen.
 3. Prove a temporary multiline state that was subsequently deleted does not
    reappear locally or on a peer.
@@ -42,3 +43,25 @@ This is one actor/read-authority boundary in `tine-core`; the frontend retry UI
 is only the reporter. The expected fix is local to selection of the current
 managed page authority plus focused runtime tests. A wider storage migration is
 not part of this packet.
+
+## Diagnosis and resolution
+
+The failing causal chain began one layer before the reported read refusal. A
+file synchronizer can deliver a newly created unstamped block's visible
+Markdown before its provider operation. The receiving external-import lane and
+the original local mutation then hold different internal block identities at
+the same sibling position. Hot materialization already used block identity as
+a deterministic tie-break, but projection rejected equal order keys, leaving
+the accepted provider batch permanently retained at projection drain. Later
+foreground state could consequently disagree with the projection selected for
+an application read and surface as `managed_read_block_mismatch`.
+
+Equal sibling order is now treated as a valid concurrent CRDT state and is
+projected deterministically. A separate, narrow conflict intent recognizes an
+exact projection echo from accepted batch origin, complete target bytes, and
+the created unstamped forest's structure. It retires only the unchanged
+external duplicate through the ordinary durable mutation path. A differential
+test proves that genuinely different concurrent same-position creations remain
+two blocks. The field-shaped regression covers rapid marker edits, temporary
+continuation lines, provider delivery, a later save, clean shutdown, and cold
+reopen.

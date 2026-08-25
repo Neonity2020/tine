@@ -19338,6 +19338,45 @@ impl RuntimeActor {
                             derivation_incomplete = true;
                         }
                     }
+                    crate::oplog::ConflictResolutionIntent::ConvergeProjectionCreate {
+                        page_id,
+                        retire_roots,
+                        resolution_author_device,
+                        pair: _,
+                    } => {
+                        if resolution_author_device != my_device {
+                            continue;
+                        }
+                        let page = match engine.materialize_page(page_id) {
+                            Ok(page) => page,
+                            Err(crate::oplog::EngineError::PageDeleted(_)) => continue,
+                            Err(_) => {
+                                derivation_incomplete = true;
+                                continue;
+                            }
+                        };
+                        let operations = retire_roots
+                            .into_iter()
+                            .filter(|root_block_id| {
+                                page.blocks
+                                    .iter()
+                                    .any(|block| block.block_id == *root_block_id)
+                            })
+                            .map(|root_block_id| SemanticOperation::DeleteSubtree {
+                                root_block_id,
+                                page_id,
+                            })
+                            .collect::<Vec<_>>();
+                        if operations.is_empty() {
+                            continue;
+                        }
+                        resolution = OperationTransaction::new(operations)
+                            .ok()
+                            .map(|transaction| (transaction, page.path));
+                        if resolution.is_none() {
+                            derivation_incomplete = true;
+                        }
+                    }
                 }
                 if resolution.is_some() {
                     break;
@@ -31529,6 +31568,78 @@ mod tests {
 
         drop(initiator_handle);
         drop(initiator);
+    }
+
+    #[test]
+    fn genuinely_different_concurrent_same_position_creates_keep_both_blocks() {
+        let (left, right, left_handle, right_handle) =
+            joined_shared_pair("different-concurrent-creates", 0xa181_2000);
+
+        let (mut left_page, left_revision) = load_application_exact(&left_handle, "Root.md");
+        left_page
+            .blocks
+            .push(application_move_test_root("left-only task", 0));
+        let left_outcome = left_handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: left_page.path.clone(),
+                    revision: left_revision,
+                },
+                page: left_page,
+            })
+            .unwrap();
+        assert!(matches!(
+            left_outcome,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+
+        let (mut right_page, right_revision) = load_application_exact(&right_handle, "Root.md");
+        right_page
+            .blocks
+            .push(application_move_test_root("right-only task", 0));
+        let right_outcome = right_handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: right_page.path.clone(),
+                    revision: right_revision,
+                },
+                page: right_page,
+            })
+            .unwrap();
+        assert!(matches!(
+            right_outcome,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+
+        settle_shared_provider(&left_handle);
+        settle_shared_provider(&right_handle);
+        copy_provider_tree(&left.request.provider_root, &right.request.provider_root);
+        right_handle.observe_provider().unwrap();
+        settle_shared_provider(&right_handle);
+        copy_provider_tree(&right.request.provider_root, &left.request.provider_root);
+        left_handle.observe_provider().unwrap();
+        settle_shared_provider(&left_handle);
+        copy_provider_tree(&left.request.provider_root, &right.request.provider_root);
+        right_handle.observe_provider().unwrap();
+        settle_shared_provider(&right_handle);
+
+        for (label, handle) in [("left", &left_handle), ("right", &right_handle)] {
+            let (page, _) = load_application_exact(handle, "Root.md");
+            let contents = page
+                .blocks
+                .iter()
+                .map(|block| block.raw.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(page.blocks.len(), 3, "{label}: {contents:?}");
+            assert!(
+                contents.contains(&"left-only task"),
+                "{label}: {contents:?}"
+            );
+            assert!(
+                contents.contains(&"right-only task"),
+                "{label}: {contents:?}"
+            );
+        }
     }
 
     /// File synchronizers carry the user-visible Markdown projection and the

@@ -711,6 +711,17 @@ sibling has deterministic conflict-pair identity so later convergence can
 retire it, but retirement is permitted only while its text is unchanged and it
 has no children; any user-touched sibling remains user data.
 
+Concurrent new blocks may legitimately choose the same sibling-order key.
+Projection orders that temporary merged state by `(order key, block identity)`;
+equal order keys are not corruption and must not block provider recovery. A
+new-block projection echo collapses only when one concurrent batch is an
+external reconciliation, the other is an ordinary local mutation, both carry
+the same complete projected bytes for the same page, and their newly created
+unstamped forests have the same structure and content. The unchanged external
+forest is then retired by an ordinary durable semantic operation. Different
+projected bytes, explicit Logseq identities, or a changed external subtree are
+preserved for ordinary conflict handling.
+
 **An applied provider batch always owes a Markdown projection.** The same rule
 holds on the receiving side, and there it is a durability rule rather than a
 planning optimization. A receiver decides whether an inbound foreign projection
