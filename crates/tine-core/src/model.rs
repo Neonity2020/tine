@@ -2562,6 +2562,12 @@ pub struct Graph {
     /// on-disk config path no longer has this description.
     reconciliation_scan_open_config_description: Option<BlobDescription>,
     reconciliation_scan_open_config_utf8: bool,
+    /// Digest of the configuration bytes THIS instance last published.
+    ///
+    /// The watcher cannot otherwise tell Tine's own settings write from an
+    /// outside one, and would reopen the whole graph — discarding every cache
+    /// it has built — every time the user toggles a star.
+    recent_config_write: RwLock<Option<BlobDescription>>,
     /// Private, process-local graph-text completeness capability. This state is
     /// neither serialized nor consulted by durable import/projection paths in
     /// this packet.
@@ -5099,7 +5105,10 @@ fn rename_source_remove_failpoint() -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `PartialEq` is load-bearing, not a convenience: the config watcher refreshes
+// a graph and then compares the meta it produced against the meta the frontend
+// already has, so a rewrite that changes no setting emits nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphMeta {
     pub root: String,
     pub journals_dir: String,
@@ -5153,6 +5162,43 @@ pub struct GraphMeta {
     /// Tine-owned graph-local flag: whether this graph has already seen the
     /// one-time in-app Guide announcement.
     pub guide_announced: bool,
+}
+
+/// The graph-relative location of the configuration file, as `Graph::open`
+/// reads it and as the exact-feed classifier names it. One constant, so moving
+/// it can never land in one of those and miss the other.
+pub const CONFIG_RELATIVE_PATH: &str = "logseq/config.edn";
+
+/// Re-exported so a caller outside the crate can name what
+/// [`config_file_description`] and [`Graph::open_config_description`] return.
+pub use crate::oplog::BlobDescription as ConfigDescription;
+
+/// Digest `logseq/config.edn` as it stands on disk right now, resolving the
+/// path exactly as `Graph::open` does.
+///
+/// `None` means "no readable configuration file", which is precisely what
+/// `open` would have parsed as an empty `Config` -- so a `None` here and a
+/// `None` from [`Graph::open_config_description`] agree that nothing changed.
+pub fn config_file_description(root: &Path) -> Option<BlobDescription> {
+    fs::read(reconciliation_scan_config_path_at_open(root))
+        .ok()
+        .map(|bytes| BlobDescription::of(&bytes))
+}
+
+/// Is `path` the configuration file of the graph rooted at `root`?
+///
+/// Case-insensitive, like the open path and the classifier: a graph delivered
+/// by a case-folding filesystem may spell it `Logseq/Config.edn`.
+pub fn is_config_file_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(relative) = relative.to_str() else {
+        return false;
+    };
+    relative
+        .replace(std::path::MAIN_SEPARATOR, "/")
+        .eq_ignore_ascii_case(CONFIG_RELATIVE_PATH)
 }
 
 fn reconciliation_scan_config_path_at_open(root: &Path) -> PathBuf {
@@ -5612,6 +5658,7 @@ impl Graph {
                 .as_deref()
                 .map(BlobDescription::of),
             reconciliation_scan_open_config_utf8: config_bytes.is_none() || config_text.is_some(),
+            recent_config_write: RwLock::new(None),
             graph_text_admission: Arc::new(GraphTextAdmissionControl {
                 state: RwLock::new(GraphTextAdmissionState::Unbuilt),
             }),
@@ -10262,7 +10309,7 @@ impl Graph {
         relative: &str,
     ) -> io::Result<GraphTextExactFeedPathClass> {
         validate_graph_text_exact_feed_relative(relative)?;
-        if relative.eq_ignore_ascii_case("logseq/config.edn") {
+        if relative.eq_ignore_ascii_case(CONFIG_RELATIVE_PATH) {
             return Ok(GraphTextExactFeedPathClass::Configuration);
         }
         let mut parent = String::new();
@@ -11004,6 +11051,32 @@ impl Graph {
         map.entry(path.to_path_buf())
             .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// The `logseq/config.edn` bytes this instance was opened with, digested.
+    /// `None` when there was no readable file.
+    ///
+    /// Compare against [`config_file_description`] to learn whether an external
+    /// write actually changed the configuration this instance is serving. The
+    /// watcher does exactly that before paying for a whole-graph reopen, which
+    /// drops every cache the graph has built.
+    pub fn open_config_description(&self) -> Option<BlobDescription> {
+        self.reconciliation_scan_open_config_description
+    }
+
+    /// Digest of the configuration bytes this instance last wrote, if any.
+    ///
+    /// `None` on an instance that has published nothing — including every
+    /// short-lived managed capability, whose refresh is cheap enough not to
+    /// need the distinction.
+    pub fn recent_config_write(&self) -> Option<BlobDescription> {
+        *self.recent_config_write.read().unwrap()
+    }
+
+    /// Record what a configuration write just published. Called by the one
+    /// funnel every setter goes through (`Graph::write_config`).
+    pub(crate) fn note_config_write(&self) {
+        *self.recent_config_write.write().unwrap() = config_file_description(&self.root);
     }
 
     pub fn meta(&self) -> GraphMeta {

@@ -13,7 +13,7 @@ config.edn        --reconcile-> arrangement            (external changes)
 
 - **`config.edn :favorites`** stays the shared, Logseq-readable answer to *which*
   pages are favorited, in display order. Logseq keeps working unchanged.
-- **The arrangement page** owns *groups, order and collapse*. It is an ordinary
+- **The arrangement page** owns *nesting, order and collapse*. It is an ordinary
   graph page, so it merges deterministically through the oplog on Managed
   Storage and reaches the Concord conflict UI on Direct Files — for free, and
   with **no new write path**: it saves through the audited `save_page`.
@@ -43,22 +43,47 @@ the file survive. Tested by
 ```
 tine/favorites:: true
 
-- [[Alpha]]            <- ungrouped favorite
-- Work                 <- group header: PLAIN TEXT, never a page
+- [[Alpha]]            <- a favorite
+- Work                 <- a label: PLAIN TEXT, never a page
 	- [[Beta]]
-	- [[Gamma]]
+	- Active             <- labels nest
+		- [[Gamma]]
+- [[Delta]]            <- favorites nest under favorites too
+	- [[Epsilon]]
 ```
 
-- A favorite is a bullet that is **nothing but one `[[link]]`**. `see [[Alpha]]`
-  is not a favorite. Links are used so **renames follow for free** — the
-  staleness class GH #79 had to fix by hand for the flat list.
-- A group header is plain text. Making it a page would couple sidebar structure
-  to page lifecycle (rename? delete? does clicking it open the page or collapse
-  the group?) for no benefit.
-- **Groups are one level.** The stored data may nest deeper without corrupting;
-  the sidebar renders one level.
-- **Anything unrecognized is preserved verbatim.** This is a real page and the
-  user may type in it.
+- **One node type, at any depth.** A bullet is a *favorite* when it is
+  **nothing but one `[[link]]`**, and a *label* otherwise; both nest and both
+  carry their children. There is no "group containing items" structure, because
+  the page does not have one — which is why arbitrary depth costs nothing here
+  and why nothing has to be flattened on read or invented on write.
+- `see [[Alpha]]` is not a favorite. Links are used so **renames follow for
+  free** — the staleness class GH #79 had to fix by hand for the flat list.
+- A label is plain text. Making it a page would couple sidebar structure to page
+  lifecycle (rename? delete? does clicking it open the page or collapse it?) for
+  no benefit.
+- **Every bullet round-trips verbatim, at every depth.** This is a real page and
+  the user may type in it. The one deletion is a bullet whose text is empty —
+  it can be neither rendered nor named — and even then its children are kept.
+- `layoutMembers` walks the tree **pre-order**, and that is the order projected
+  into `config.edn :favorites`, so Logseq sees a sensible flattening.
+
+## 3a. Drop placement
+
+The sidebar draws one flat run of visible rows (pre-order, skipping what a
+collapsed row hides), so `data-row-index` **is** the visible index and a drop
+target found by `elementFromPoint` needs no translation.
+
+Depth is taken from how far the pointer has travelled **from where the drag
+started**, not from the row's left edge — otherwise where in a row the user
+happened to grab would decide the nesting. A straight vertical drag therefore
+can never nest, which is what keeps depth opt-in.
+
+`depthRange` applies the ordinary outliner rule: no deeper than one level under
+the row above, no shallower than the row below. A depth the tree cannot honour
+is **clamped**, never satisfied by inventing intermediate parents. A node may
+not become its own descendant, and its own rows are excluded before the slot is
+resolved.
 
 ## 4. Reference exclusion
 
@@ -76,18 +101,19 @@ Tested by `query::tests::favorites_layout_page_is_never_a_reference_source`.
 | Event | Rule |
 |---|---|
 | Graph open | `config.edn :favorites` is the authority on membership; the arrangement is reconciled against it |
-| Favorite added in Tine | Appended to the ungrouped section |
-| Favorite removed anywhere | Removed from its group. The arrangement **never resurrects** an unfavorited page |
-| Re-favorited later | Lands at the **end of ungrouped**, not silently back in its old group |
-| Group deleted | Its favorites move to the ungrouped section. **Deleting a group never unfavorites anything** (the Capacities contract; Obsidian's bookmark folders lose the reference) |
-| Group renamed to an existing name | Disambiguated (`Work 2`), never merged |
+| Favorite added in Tine | Appended at the top level |
+| Favorite removed anywhere | Removed wherever it sat, and **its children take its place** — unstarring a parent must not silently unstar what was nested under it |
+| Re-favorited later | Lands at the **end**, not silently back in its old place |
+| Label deleted | What it held moves up one level. **Deleting a label never unfavorites anything** (the Capacities contract; Obsidian's bookmark folders lose the reference) |
+| Label renamed to an existing name | Disambiguated (`Work 2`), never merged. Re-committing a label's own unchanged name is a no-op |
+| Row dropped into a collapsed row | That row expands, so the move stays visible |
 | Page renamed | Followed automatically, because members are `[[links]]` |
 | Arrangement page missing or unreadable | Favorites still work, flat, from `config.edn` |
 
 ## 6. Lazy materialization
 
 **No page is created until the arrangement carries something `config.edn` cannot
-express — a group.** A user who never groups anything never grows a page in
+express — a label, or a row nested under another.** A user who never groups anything never grows a page in
 their graph they did not ask for, and their favorites behave exactly as they did
 before this existed.
 
@@ -99,10 +125,25 @@ folds the page back into agreement. If the page write fails, membership is
 **still** projected — losing an arrangement is survivable, losing the favorites
 is not. Both directions are tested.
 
-## 8. Known gap
+## 8. Live re-reads
 
-`config.edn :favorites` is read at graph open and **not re-read while Tine
-runs**, so a favorite added or removed in Logseq during a live Tine session can
-be overwritten by Tine's next projection. This predates the arrangement (the
-flat list had the same hole) and closing it needs a config-file watcher, which
-does not exist yet.
+Both stores are re-read while Tine runs; neither is a graph-open snapshot any
+more.
+
+- **`config.edn`** — the watcher queues `logseq/config.edn` separately from
+  graph text (it is not graph text, so the page-path filter discards it) and
+  refreshes the graph when the bytes differ from those the running `Graph` was
+  opened with. See `docs/contracts/config-live-reload.md`.
+- **The arrangement page** — an edit in Tine's own editor, or one arriving from
+  outside, re-reads the page and updates the sidebar. A page edit **is a
+  membership statement**: deleting a `[[link]]` bullet unfavorites that page and
+  adding one favorites it, so the reloaded tree is projected into
+  `config.edn :favorites` exactly as a drag would be. The page is never written
+  back in response — that would echo the user's own keystrokes — and the
+  revision the store last saved is ignored, so Tine's own write is not adopted
+  as an external one.
+
+This also gives favorites reordering a keyboard route: the arrangement is an
+ordinary page, so it can be edited with the keyboard like any other. Pointer
+drag remains the only way to reorder *in the sidebar* (WCAG 2.2 SC 2.5.7 is
+still open, deferred with GH #211).

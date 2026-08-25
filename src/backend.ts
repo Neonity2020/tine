@@ -659,6 +659,10 @@ export interface Backend {
   /** Subscribe to coalesced external bulk revisions (Concord P2): one event
    *  per reconcile cycle that changed more than the bulk threshold of pages. */
   onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void>;
+  /** Subscribe to `logseq/config.edn` being re-read after an outside change.
+   *  Carries the fresh GraphMeta; a graph whose settings did not move emits
+   *  nothing. */
+  onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void>;
   /** Subscribe to an admitted aggregate managed-storage change. */
   onSparseV2Changed(cb: () => void): Promise<() => void>;
   /** Subscribe to deduplicated managed-sync reconciliation failures. */
@@ -1606,6 +1610,10 @@ class TauriBackend implements Backend {
   async onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
+  }
+  async onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
   }
   async onSparseV2Changed(cb: () => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");

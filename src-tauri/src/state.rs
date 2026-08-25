@@ -714,14 +714,60 @@ pub(crate) fn with_trash_graph<T>(
     slot_for_context(ctx)?.with_trash_graph(f)
 }
 
+/// How a refresh should behave when another operation holds the storage
+/// transition lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefreshLaneWait {
+    /// A user-initiated settings change: wait for the lane.
+    Block,
+    /// A watcher cycle: never block. Blocking here would stall the reconcile
+    /// loop for *every* graph behind one graph's load or storage promotion, so
+    /// a busy lane reports `Deferred` and the next cycle tries again -- the
+    /// on-disk configuration is still there, so nothing is lost by waiting.
+    TryOnce,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefreshOutcome {
+    Refreshed,
+    Deferred,
+}
+
 pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     let label = ctx.window.label().to_string();
+    refresh_graph_for_label(
+        &ctx.state,
+        ctx.window.app_handle(),
+        &label,
+        RefreshLaneWait::Block,
+    )
+    .map(|_| ())
+}
+
+/// Re-read configuration for one window's graph without a `GraphContext`.
+///
+/// The watcher has a window label and an `AppHandle` and no command context, so
+/// this is the shared body; `refresh_graph` is the blocking command-side entry.
+pub(crate) fn refresh_graph_for_label(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    label: &str,
+    wait: RefreshLaneWait,
+) -> Result<RefreshOutcome, String> {
+    let label = label.to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
     // Serialize the whole operation with graph loads and sparse-v2 promotion.
-    let root_hint = slot_for_window(&ctx.state, &label)?.root_key.clone();
-    let transition_gate = ctx.state.storage_supervisor.transition_lane(&root_hint);
-    let _transition = transition_gate.lock().unwrap();
-    let old = slot_for_window(&ctx.state, &label)?;
+    let root_hint = slot_for_window(state, &label)?.root_key.clone();
+    let transition_gate = state.storage_supervisor.transition_lane(&root_hint);
+    let _transition = match wait {
+        RefreshLaneWait::Block => transition_gate.lock().unwrap(),
+        RefreshLaneWait::TryOnce => match transition_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RefreshOutcome::Deferred),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        },
+    };
+    let old = slot_for_window(state, &label)?;
     if old.root_key != root_hint {
         return Err("graph changed while refresh waited for its transition lane".into());
     }
@@ -735,12 +781,11 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
         // renames journal files, which is a graph-text mutation the oplog owns;
         // it stays refused until managed renames exist.
         old.refresh_filesystem_meta();
-        poke_watcher(&ctx.state);
-        return Ok(());
+        poke_watcher(state);
+        return Ok(RefreshOutcome::Refreshed);
     }
     old.legacy_graph()?;
-    let approved =
-        crate::settings::approved_external_assets(ctx.window.app_handle(), &old.root_key);
+    let approved = crate::settings::approved_external_assets(app, &old.root_key);
     let graph = Graph::open_checked_with_assets(&old.root_key, approved.as_deref())
         .map_err(|e| e.to_string())?;
     // Concord invariant 4: a refresh re-reads configuration, it does not rewrite
@@ -749,9 +794,9 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     // the user's files as a side effect. (This site did not even take the
     // pre-migration snapshot the open path used to.)
     let replacement = Arc::new(GraphSlot::refreshed(graph, &old)?);
-    ctx.state.graphs.write().unwrap().bind(label, replacement)?;
-    poke_watcher(&ctx.state);
-    Ok(())
+    state.graphs.write().unwrap().bind(label, replacement)?;
+    poke_watcher(state);
+    Ok(RefreshOutcome::Refreshed)
 }
 
 pub(crate) fn poke_watcher(state: &AppState) {

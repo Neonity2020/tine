@@ -8,6 +8,16 @@ import { favorites, seedFavorites, setFavorites, setRecentPages } from "../ui";
 import { route, openJournals } from "../router";
 import { Sidebar } from "./Sidebar";
 import { rowReorderClickSuppressed } from "./rowReorder";
+import { layoutFromBlocks } from "../favoritesLayout";
+import { persistFavoritesLayout } from "../favoritesStore";
+import type { BlockDto } from "../types";
+
+const block = (raw: string, children: BlockDto[] = []): BlockDto => ({
+  id: raw,
+  raw,
+  collapsed: false,
+  children,
+});
 
 function rect(left: number, top: number, width: number, height: number): DOMRect {
   return {
@@ -79,6 +89,73 @@ describe("favorites drag reorder (GH #211)", () => {
 
     expect(favorites().map((f) => f.name)).toEqual(["Beta", "Gamma", "Alpha"]);
     expect(setFavs).toHaveBeenCalledWith(["Beta", "Gamma", "Alpha"]);
+    dispose();
+  });
+
+  // Martin, 2026-08-25: nesting is opt-in and invisible to anyone who does not
+  // drag sideways, which is why depth is measured from the GRAB POINT rather
+  // than the row's left edge — a straight vertical drag can never nest.
+  it("nests a favorite under the one above it when dragged to the right", async () => {
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("rev");
+    vi.spyOn(backend(), "setFavorites").mockResolvedValue();
+    vi.spyOn(backend(), "setFavoritesPage").mockResolvedValue();
+    const { dispose, rows } = mountThreeFavorites();
+    const [first, second] = rows();
+    setRect(first, 0, 0, 200, 30);
+    setRect(second, 0, 30, 200, 30);
+
+    second.dispatchEvent(pointer("pointerdown", 10, 40));
+    const prev = document.elementFromPoint;
+    try {
+      document.elementFromPoint = () => first;
+      // Onto Alpha's lower half, and 20px to the right: "under Alpha".
+      document.dispatchEvent(pointer("pointermove", 30, 20));
+      document.dispatchEvent(pointer("pointerup", 30, 20));
+    } finally {
+      document.elementFromPoint = prev;
+    }
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(rows().map((row) => row.style.paddingLeft)).toEqual(["6px", "22px", "6px"]);
+    // Nesting is not membership: all three are still favorites, in tree order.
+    expect(favorites().map((f) => f.name)).toEqual(["Alpha", "Beta", "Gamma"]);
+    const [page] = savePage.mock.calls[0];
+    expect(page.blocks.map((b) => b.raw)).toEqual(["[[Alpha]]", "[[Gamma]]"]);
+    expect(page.blocks[0].children.map((b) => b.raw)).toEqual(["[[Beta]]"]);
+    dispose();
+  });
+
+  // A group is a row like any other, so it drags — with everything it holds.
+  // The rename input is sized to its text rather than stretched precisely so
+  // there is somewhere left to grab.
+  it("drags a whole group, carrying what it holds", async () => {
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("rev");
+    vi.spyOn(backend(), "setFavorites").mockResolvedValue();
+    vi.spyOn(backend(), "setFavoritesPage").mockResolvedValue();
+    const { root, rows, dispose } = mountThreeFavorites();
+    await persistFavoritesLayout(
+      layoutFromBlocks([block("[[Alpha]]"), block("Work", [block("[[Beta]]"), block("[[Gamma]]")])])
+    );
+    const [alpha, work] = rows();
+    expect(work.classList.contains("nav-fav-group")).toBe(true);
+    setRect(alpha, 0, 0, 200, 30);
+    setRect(work, 0, 30, 200, 30);
+
+    work.dispatchEvent(pointer("pointerdown", 150, 40));
+    const prev = document.elementFromPoint;
+    try {
+      document.elementFromPoint = () => alpha;
+      document.dispatchEvent(pointer("pointermove", 150, 5)); // above Alpha's midpoint
+      document.dispatchEvent(pointer("pointerup", 150, 5));
+    } finally {
+      document.elementFromPoint = prev;
+    }
+
+    await new Promise((r) => setTimeout(r, 0));
+    const [page] = savePage.mock.calls[savePage.mock.calls.length - 1];
+    expect(page.blocks.map((b) => b.raw)).toEqual(["Work", "[[Alpha]]"]);
+    expect(page.blocks[0].children.map((b) => b.raw)).toEqual(["[[Beta]]", "[[Gamma]]"]);
+    expect(root.querySelectorAll("#sidebar-favorites-list .nav-page")).toHaveLength(4);
     dispose();
   });
 

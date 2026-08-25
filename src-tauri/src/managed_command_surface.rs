@@ -229,6 +229,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("set_default_journal_template", ConfigWrite),
     ("set_doc_mode_enter_for_new_block", ConfigWrite),
     ("set_favorites", ConfigWrite),
+    ("set_favorites_page", ConfigWrite),
     ("set_guide_announced", ConfigWrite),
     ("set_journal_title_format", ConfigWrite),
     ("set_link_first_match", NoGraphSlot),
@@ -526,6 +527,7 @@ mod tests {
         let scanned = scanned_surface();
         for command in [
             "set_favorites",
+            "set_favorites_page",
             "set_preferred_workflow",
             "set_preferred_format",
             "set_journal_title_format",

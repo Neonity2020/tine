@@ -10,6 +10,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Favorites nest to any depth** (GH #102). A group can hold groups, and a
+  favorite can hold favorites; drag a row to the right to nest it, to the left
+  to lift it out. Depth is measured from where the drag started, so a plain
+  vertical drag never nests by accident, and the insertion line is drawn at the
+  depth the drop will land. Deleting a group still keeps everything it held —
+  now one level up rather than at the top. The arrangement page round-trips
+  every bullet at every depth, so hand-written nesting survives.
+
+- **Editing the Favorites page updates the sidebar** (GH #102). The arrangement
+  lives in an ordinary page, so editing it — in Tine or outside — is now
+  reflected immediately instead of at the next graph open. A page edit is a
+  membership statement: removing a `[[link]]` bullet unfavorites that page and
+  adding one favorites it. This also gives favorites reordering a keyboard
+  route, since the arrangement is a page like any other.
+
+- **`logseq/config.edn` is re-read while Tine runs.** A settings change made in
+  Logseq, in a text editor, or delivered by Syncthing is now picked up during
+  the session rather than being ignored until the next graph open — and
+  therefore no longer computed against a stale copy. Favorites, shortcuts,
+  macros, the home page, journal formats, hidden properties and the rest all
+  follow. Tine only pays for the reload when the file's bytes actually differ
+  from those it is serving, so its own settings writes and repeated identical
+  deliveries cost nothing.
+
 - **Privacy-safe diagnostic reports** (GH #343). Every production build now
   retains a bounded current-and-previous-run flight recorder of fixed operation
   names, outcomes, timings and counts. Settings → Diagnostics previews the JSON
