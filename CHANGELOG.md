@@ -8,6 +8,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Favorites can be arranged into named groups.** One level, plain-text group
+  names, collapsible, with drag between groups as well as within one. Deleting a
+  group never unfavorites anything — its pages move back to the ungrouped list.
+  The arrangement lives in an ordinary page in your graph, so it syncs and
+  merges like everything else rather than as an opaque settings blob, and
+  because its entries are real links a page rename follows them automatically.
+  `config.edn :favorites` stays exactly what it was — the flat list Logseq
+  reads — so Logseq keeps working. Nothing is created until you actually make a
+  group: if you never group anything, nothing about Favorites changes (GH #102).
+
 ### Changed
 
 - **Typing in the Linked References search box now also narrows the reference
