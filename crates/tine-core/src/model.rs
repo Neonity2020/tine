@@ -5226,14 +5226,205 @@ impl Graph {
         Ok(graph)
     }
 
-    /// Restore any small file left mid-publish by a crash.
+    /// Restore any small file or Direct editor publication left mid-publish by
+    /// a crash.
     ///
     /// [`atomic_replace_expected`] vacates the target name for the length of one
     /// rename, so a crash in that window leaves the content under a `.retired`
-    /// sibling and the file itself missing. Runs once per checked open, over the
-    /// registered directories only - never a whole-graph walk.
+    /// sibling and the file itself missing. Small-file recovery scans only its
+    /// registered directories. Editor recovery performs one bounded no-follow
+    /// graph-scope name walk and never reads unrelated document contents.
     pub fn recover_interrupted_publishes(&self) -> usize {
         restore_retired_files(&self.root, &[self.root.join("logseq")])
+            .saturating_add(self.recover_interrupted_editor_publications())
+    }
+
+    /// Reconcile exact files stranded by a crash inside the Direct Files
+    /// retire/publish window. A sole claim for a missing live name is restored
+    /// with no-replace. When a live name exists, every recognized artifact is
+    /// moved intact to typed recovery trash. Multiple claims for one missing
+    /// target stay untouched because choosing one would discard information.
+    fn recover_interrupted_editor_publications(&self) -> usize {
+        let Ok(write) = self.admit_managed_text_writer() else {
+            return 0;
+        };
+        let Ok(claims) = self.editor_publication_recovery_claims(&write) else {
+            return 0;
+        };
+        let mut by_target = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+        for (artifact, target) in claims {
+            by_target.entry(target).or_default().push(artifact);
+        }
+
+        let mut reconciled = 0_usize;
+        for (target, artifacts) in by_target {
+            let target_present = match self.managed_exists(&write, &target) {
+                Ok(present) => present,
+                Err(_) => continue,
+            };
+            if !target_present {
+                if artifacts.len() != 1 {
+                    continue;
+                }
+                let artifact = &artifacts[0];
+                let Ok(identity) =
+                    self.managed_move_editor_recovery_noreplace(&write, artifact, &target)
+                else {
+                    continue;
+                };
+                if self
+                    .managed_optional_file_identity(&write, &target)
+                    .ok()
+                    .flatten()
+                    == Some(identity)
+                {
+                    reconciled = reconciled.saturating_add(1);
+                }
+                continue;
+            }
+
+            let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+            if self.managed_create_dir_all(&write, &trash).is_err() {
+                continue;
+            }
+            for artifact in artifacts {
+                let Some(filename) = artifact.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Some(target_name) = editor_recovery_target_name(filename) else {
+                    continue;
+                };
+                let Some(extension) = text_extension_from_path(Path::new(target_name)) else {
+                    continue;
+                };
+                let destination = trash.join(format!(
+                    "{}__editor-publication__{}.{}",
+                    trash_stamp(),
+                    filename.trim_start_matches('.'),
+                    extension
+                ));
+                let Ok(identity) =
+                    self.managed_move_editor_recovery_noreplace(&write, &artifact, &destination)
+                else {
+                    continue;
+                };
+                if self
+                    .managed_optional_file_identity(&write, &destination)
+                    .ok()
+                    .flatten()
+                    == Some(identity)
+                {
+                    reconciled = reconciled.saturating_add(1);
+                }
+            }
+        }
+        reconciled
+    }
+
+    /// Discover only names emitted by `managed_atomic_replace_bound`, through
+    /// the retained no-follow graph capability. This is not a suffix glob: the
+    /// parser requires the complete producer shape, and the claimed target must
+    /// be an eligible graph-text file in the same retained directory.
+    fn editor_publication_recovery_claims(
+        &self,
+        permit: &ManagedTextWritePermit,
+    ) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+        struct PendingDirectory {
+            directory: Dir,
+            relative: String,
+            depth: usize,
+        }
+
+        let limits = managed_text_inventory_limits();
+        let mut pending = vec![PendingDirectory {
+            directory: self.managed_permit_root(permit)?.try_clone()?,
+            relative: String::new(),
+            depth: 0,
+        }];
+        let mut claims = Vec::new();
+        let mut all_entries = 0_usize;
+        let mut directories = 1_usize;
+        let mut path_bytes = 0_u64;
+
+        while let Some(PendingDirectory {
+            directory,
+            relative,
+            depth,
+        }) = pending.pop()
+        {
+            for entry in directory.entries()? {
+                all_entries = all_entries
+                    .checked_add(1)
+                    .ok_or_else(|| managed_text_inventory_limit_error("all directory entries"))?;
+                if all_entries > limits.all_entries {
+                    return Err(managed_text_inventory_limit_error("all directory entries"));
+                }
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let child_relative = if relative.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                path_bytes = path_bytes
+                    .checked_add(usize_to_u64(child_relative.len())?)
+                    .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                if path_bytes > limits.path_bytes {
+                    return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                }
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    if !self.graph_text_scope.should_descend(&child_relative) {
+                        continue;
+                    }
+                    let child_depth = depth.checked_add(1).ok_or_else(|| {
+                        managed_text_inventory_limit_error("managed directory depth")
+                    })?;
+                    if child_depth > limits.directory_depth {
+                        return Err(managed_text_inventory_limit_error(
+                            "managed directory depth",
+                        ));
+                    }
+                    directories = directories
+                        .checked_add(1)
+                        .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                    if directories > limits.directories {
+                        return Err(managed_text_inventory_limit_error("directory count"));
+                    }
+                    projection_real_directory(&directory, &name)?;
+                    pending.push(PendingDirectory {
+                        directory: open_projection_dir_nofollow(&directory, &name)?,
+                        relative: child_relative,
+                        depth: child_depth,
+                    });
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Some(target_name) = editor_recovery_target_name(&name) else {
+                    continue;
+                };
+                let target_relative = if relative.is_empty() {
+                    target_name.to_owned()
+                } else {
+                    format!("{relative}/{target_name}")
+                };
+                if !self.graph_text_scope.is_eligible(&target_relative) {
+                    continue;
+                }
+                claims.push((
+                    self.root.join(&child_relative),
+                    self.root.join(target_relative),
+                ));
+            }
+        }
+        Ok(claims)
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
@@ -9194,6 +9385,67 @@ impl Graph {
             destination,
             GraphTextPublicationValidation::TransactionInventory,
         )
+    }
+
+    /// Move one exact hidden file produced by the editor publication protocol.
+    /// `ManagedPath` deliberately rejects hidden graph-text names, so recovery
+    /// cannot pretend the artifact is an ordinary document; it validates the
+    /// retained source directly and validates the destination as the ordinary
+    /// managed move does.
+    fn managed_move_editor_recovery_noreplace(
+        &self,
+        permit: &ManagedTextWritePermit,
+        source_path: &Path,
+        destination_path: &Path,
+    ) -> io::Result<ContentDigest> {
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        let destination_managed =
+            ManagedPath::parse(self.rel_path(destination_path)).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("editor recovery destination is not portable: {error}"),
+                )
+            })?;
+        self.validate_graph_text_portable_aliases_path_local(permit, &destination_managed, true)?;
+
+        let source = self.managed_target(permit, source_path, false)?;
+        projection_optional_regular_metadata(source.parent(), &source.filename)?;
+        let source_file = open_projection_file_nofollow(source.parent(), &source.filename)?;
+        let source_identity = canonical_projection_file_resource_id(&source_file)?;
+        validate_graph_text_single_link(&source_file, &self.rel_path(source_path))?;
+        drop(source_file);
+
+        let destination = self.managed_target(permit, destination_path, true)?;
+        match destination.parent().symlink_metadata(&destination.filename) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            Err(error) => return Err(error),
+        }
+        managed_write_before_mutation_hook()?;
+        let rebound = open_projection_file_nofollow(source.parent(), &source.filename)?;
+        if canonical_projection_file_resource_id(&rebound)? != source_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "editor recovery artifact changed before reconciliation",
+            ));
+        }
+        validate_graph_text_single_link(&rebound, &self.rel_path(source_path))?;
+        self.validate_graph_text_portable_aliases_path_local(permit, &destination_managed, true)?;
+        match destination.parent().symlink_metadata(&destination.filename) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            Err(error) => return Err(error),
+        }
+        rename_managed_noreplace(
+            source.parent(),
+            &source.filename,
+            destination.parent(),
+            &destination.filename,
+        )?;
+        sync_projection_chain_required(&source.chain)?;
+        sync_projection_chain_required(&destination.chain)?;
+        self.finish_tine_owned_graph_text_identity_paths(std::iter::once(destination_path))?;
+        Ok(source_identity)
     }
 
     fn managed_move_noreplace_validated(
@@ -29769,6 +30021,28 @@ fn create_editor_staged_recovery(dir: &Dir, filename: &str, bytes: &[u8]) -> io:
     create_projection_staging_file(dir, filename, bytes, "editor-staged-recovery")
 }
 
+/// Parse only the complete filenames emitted by the editor publication
+/// protocol. The two numeric fields are part of the authority: a user file
+/// that merely ends in `editor-recovery` is not a cleanup candidate.
+fn editor_recovery_target_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix('.')?;
+    let rest = rest
+        .strip_suffix(".editor-staged-recovery")
+        .or_else(|| rest.strip_suffix(".editor-recovery"))?;
+    let (rest, sequence) = rest.rsplit_once('.')?;
+    let (target, process) = rest.rsplit_once('.')?;
+    if target.is_empty()
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || sequence.is_empty()
+        || !process.bytes().all(|byte| byte.is_ascii_digit())
+        || process.is_empty()
+        || text_extension_from_path(Path::new(target)).is_none()
+    {
+        return None;
+    }
+    Some(target)
+}
+
 fn create_projection_staging_file(
     dir: &Dir,
     filename: &str,
@@ -45887,6 +46161,111 @@ mod tests {
             "the superseded copy must be recoverable"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checked_open_restores_one_stranded_editor_recovery_without_guessing() {
+        let dir = scratch("editor-recovery-single-restore");
+        let recovery = dir.join("pages").join(".Note.md.4242.1.editor-recovery");
+        fs::write(&recovery, b"- exact pre-crash bytes\n").unwrap();
+
+        let graph = Graph::open_checked(&dir).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("pages/Note.md")).unwrap(),
+            b"- exact pre-crash bytes\n"
+        );
+        assert!(!recovery.exists());
+        assert!(graph.list_pages().iter().any(|entry| entry.name == "Note"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editor_recovery_sweep_preserves_ambiguous_and_superseded_bytes() {
+        // Two distinct claims and no live target are ambiguous. Neither is
+        // selected, renamed, or deleted.
+        let ambiguous = scratch("editor-recovery-ambiguous");
+        let old = ambiguous
+            .join("pages")
+            .join(".Note.md.4242.1.editor-recovery");
+        let edited = ambiguous
+            .join("pages")
+            .join(".Note.md.4242.2.editor-staged-recovery");
+        fs::write(&old, b"- old bytes\n").unwrap();
+        fs::write(&edited, b"- edited bytes\n").unwrap();
+        let _graph = Graph::open_checked(&ambiguous).unwrap();
+        assert!(!ambiguous.join("pages/Note.md").exists());
+        assert_eq!(fs::read(&old).unwrap(), b"- old bytes\n");
+        assert_eq!(fs::read(&edited).unwrap(), b"- edited bytes\n");
+
+        // If a live winner exists, it stays byte-identical and every stranded
+        // artifact moves intact to recoverable conflict trash.
+        let superseded = scratch("editor-recovery-superseded");
+        let live = superseded.join("pages/Note.md");
+        let old = superseded
+            .join("pages")
+            .join(".Note.md.4242.1.editor-recovery");
+        let edited = superseded
+            .join("pages")
+            .join(".Note.md.4242.2.editor-staged-recovery");
+        fs::write(&live, b"- external winner\n").unwrap();
+        fs::write(&old, b"- old bytes\n").unwrap();
+        fs::write(&edited, b"- edited bytes\n").unwrap();
+        let _graph = Graph::open_checked(&superseded).unwrap();
+        assert_eq!(fs::read(&live).unwrap(), b"- external winner\n");
+        assert!(!old.exists());
+        assert!(!edited.exists());
+        let recovered = fs::read_dir(typed_trash_dir(&superseded, TrashEntryKind::Conflict))
+            .unwrap()
+            .flatten()
+            .map(|entry| fs::read(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(recovered.contains(&b"- old bytes\n".to_vec()));
+        assert!(recovered.contains(&b"- edited bytes\n".to_vec()));
+
+        let _ = fs::remove_dir_all(&ambiguous);
+        let _ = fs::remove_dir_all(&superseded);
+    }
+
+    #[test]
+    fn editor_recovery_sweep_ignores_lookalikes_and_restores_a_sole_staged_copy() {
+        let dir = scratch("editor-recovery-exact-name");
+        let staged = dir
+            .join("pages")
+            .join(".Note.md.4242.1.editor-staged-recovery");
+        let lookalike = dir
+            .join("pages")
+            .join(".Other.md.not-a-pid.1.editor-recovery");
+        fs::write(&staged, b"- sole staged bytes\n").unwrap();
+        fs::write(&lookalike, b"- ordinary lookalike\n").unwrap();
+
+        let _graph = Graph::open_checked(&dir).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("pages/Note.md")).unwrap(),
+            b"- sole staged bytes\n"
+        );
+        assert_eq!(fs::read(&lookalike).unwrap(), b"- ordinary lookalike\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_recovery_sweep_refuses_a_multi_link_artifact() {
+        let dir = scratch("editor-recovery-hardlink");
+        let artifact = dir.join("pages").join(".Note.md.4242.1.editor-recovery");
+        fs::write(&artifact, b"- linked bytes\n").unwrap();
+        fs::hard_link(&artifact, dir.join("linked-copy")).unwrap();
+
+        let _graph = Graph::open_checked(&dir).unwrap();
+
+        assert!(!dir.join("pages/Note.md").exists());
+        assert_eq!(fs::read(&artifact).unwrap(), b"- linked bytes\n");
+        assert_eq!(
+            fs::read(dir.join("linked-copy")).unwrap(),
+            b"- linked bytes\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -298,6 +298,18 @@ property, tag, and search facts accepted by managed storage's disposable
 projection; it contains no binding, oplog frontier, sync role, or authority
 stamp. Markdown/Org remains the sole Direct Files authority.
 
+Direct editor replacement briefly retains the old live inode as
+`.<target>.<pid>.<sequence>.editor-recovery` and the proposed bytes as the
+matching `editor-staged-recovery` name. Checked Direct Files open reconciles
+only that complete producer shape through retained no-follow capabilities. If
+the live target is absent and exactly one artifact claims it, that exact inode
+is restored with no-replace. Multiple claims for an absent target remain in
+place for explicit recovery; when a live target exists, every artifact is moved
+unchanged to typed conflict trash. Every move rechecks the artifact's physical
+identity and single-link status immediately before publication. A suffix
+lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
+or failed identity recheck is never deleted or selected as authority.
+
 The existing parsed `PageEntry + Arc<Document>` cache feeds one background
 SQLite owner. The database retains each page's exact caller-owned content
 revision together with the Direct fact-extractor version as disposable adapter

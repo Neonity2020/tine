@@ -15,6 +15,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   source and destination through retained metadata and portable path checks;
   document contents remain untouched and unrelated files are never opened.
 
+- **A crash inside a Direct Files save can no longer leave a page invisible
+  under hidden recovery names.** On the next checked open, one unambiguous
+  stranded copy is restored without clobbering a live file. Ambiguous or
+  superseded copies are retained or moved intact to recoverable conflict trash;
+  lookalikes and files whose physical identity cannot be proved are untouched.
+
 ## [0.6.96] - 2026-08-24
 
 ### Added
