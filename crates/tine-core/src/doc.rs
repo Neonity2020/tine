@@ -345,6 +345,132 @@ impl DocBlock {
     }
 }
 
+/// How many characters of a block's first visible line a breadcrumb label keeps
+/// before it is elided. One value, because a trail whose segments truncate at
+/// different lengths depending on which code path produced them is a bug the
+/// user sees.
+pub(crate) const CRUMB_MAX_CHARS: usize = 60;
+
+/// A short, single-line label for a block in a breadcrumb trail: the first line
+/// of its visible text, trimmed, elided with `…` past [`CRUMB_MAX_CHARS`].
+///
+/// DUP-8: this used to exist three times -- byte-identical in `query.rs` and
+/// `query_plan.rs`, and a third time in `sync_runtime.rs` over a synthesized
+/// `DocBlock`. Three copies of a truncation rule is three places for the rule
+/// to drift.
+pub(crate) fn crumb_line(block: &DocBlock) -> String {
+    let line = block.visible_text().lines().next().unwrap_or("").trim();
+    if line.chars().count() > CRUMB_MAX_CHARS {
+        format!("{}…", line.chars().take(CRUMB_MAX_CHARS).collect::<String>())
+    } else {
+        line.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod crumb_line_tests {
+    use super::*;
+
+    fn block(raw: &str) -> DocBlock {
+        DocBlock {
+            raw: raw.to_owned(),
+            children: Vec::new(),
+            uuid: String::new(),
+            is_org: false,
+            proj: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn a_line_of_exactly_the_limit_is_kept_whole() {
+        let raw = "x".repeat(CRUMB_MAX_CHARS);
+        assert_eq!(crumb_line(&block(&raw)), raw);
+    }
+
+    #[test]
+    fn one_character_past_the_limit_elides() {
+        let raw = "x".repeat(CRUMB_MAX_CHARS + 1);
+        let crumb = crumb_line(&block(&raw));
+        assert_eq!(crumb, format!("{}…", "x".repeat(CRUMB_MAX_CHARS)));
+        assert_eq!(crumb.chars().count(), CRUMB_MAX_CHARS + 1);
+    }
+
+    /// The limit counts CHARACTERS, not bytes -- 60 multi-byte characters are
+    /// still 60 characters.
+    #[test]
+    fn the_limit_counts_characters_not_bytes() {
+        let raw = "é".repeat(CRUMB_MAX_CHARS);
+        assert_eq!(crumb_line(&block(&raw)), raw);
+        assert_eq!(
+            crumb_line(&block(&"é".repeat(CRUMB_MAX_CHARS + 1))),
+            format!("{}…", "é".repeat(CRUMB_MAX_CHARS))
+        );
+    }
+
+    /// Only the FIRST line becomes the label, and it is trimmed.
+    #[test]
+    fn a_multi_line_block_labels_on_its_first_line_only() {
+        assert_eq!(
+            crumb_line(&block("  Parent heading  \nsecond line\nthird line")),
+            "Parent heading"
+        );
+    }
+
+    /// Properties are not visible text, so they never reach a breadcrumb.
+    #[test]
+    fn properties_are_not_part_of_the_label() {
+        assert_eq!(
+            crumb_line(&block("Parent heading\nid:: 6512-abcd\ncollapsed:: true")),
+            "Parent heading"
+        );
+    }
+
+    #[test]
+    fn an_empty_block_has_an_empty_label() {
+        assert_eq!(crumb_line(&block("")), "");
+    }
+
+    /// The three collapsed copies had one rule between them; this pins the rule
+    /// each of them implemented, verbatim, so the collapse cannot have moved
+    /// any output.
+    #[test]
+    fn the_shared_rule_reproduces_what_the_three_copies_did() {
+        fn original(block: &DocBlock) -> String {
+            let line = block
+                .visible_text()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if line.chars().count() > 60 {
+                format!("{}…", line.chars().take(60).collect::<String>())
+            } else {
+                line
+            }
+        }
+        for raw in [
+            "",
+            "   ",
+            "\n\n",
+            "short",
+            "  padded  ",
+            "one\ntwo",
+            &"x".repeat(59),
+            &"x".repeat(60),
+            &"x".repeat(61),
+            &"é".repeat(61),
+            &format!("{}\nsecond", "x".repeat(61)),
+            "TODO [#A] a task with a marker",
+            "Parent heading\nid:: 6512-abcd",
+            "  \tleading tab and a very long tail ---------------------------------------",
+        ] {
+            let b = block(raw);
+            assert_eq!(crumb_line(&b), original(&b), "diverged on {raw:?}");
+        }
+    }
+}
+
 fn push_tag(out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, tag: String) {
     let tag = tag.trim().to_string();
     if tag.is_empty() {

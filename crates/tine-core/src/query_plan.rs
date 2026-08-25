@@ -1507,21 +1507,6 @@ pub(crate) fn legacy_page_search_entries(
         .unwrap_or_default()
 }
 
-fn crumb_line(block: &DocBlock) -> String {
-    let line = block
-        .visible_text()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if line.chars().count() > 60 {
-        format!("{}…", line.chars().take(60).collect::<String>())
-    } else {
-        line
-    }
-}
-
 fn walk_blocks<'a>(
     blocks: &'a [DocBlock],
     ancestors: &mut Vec<&'a DocBlock>,
@@ -1609,7 +1594,7 @@ fn execute_blocks(
                                 block,
                                 breadcrumb: path
                                     .iter()
-                                    .map(|ancestor| crumb_line(ancestor))
+                                    .map(|ancestor| crate::doc::crumb_line(ancestor))
                                     .collect(),
                             },
                         );
@@ -1776,7 +1761,7 @@ fn execute_application_blocks(
                 )
                 .expect("rank and evidence evaluators must agree");
                 let mut dto = crate::model::block_to_shallow_dto(block);
-                dto.breadcrumb = path.iter().map(|ancestor| crumb_line(ancestor)).collect();
+                dto.breadcrumb = path.iter().map(|ancestor| crate::doc::crumb_line(ancestor)).collect();
                 let candidate = ApplicationScoredBlock {
                     relevance,
                     index: candidate_index,

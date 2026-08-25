@@ -328,22 +328,6 @@ thread_local! {
 
 /// Cancellable variant used by interactive search. Returning false from `f`
 /// stops the entire depth-first walk, including the current deep page.
-/// A short, single-line label for a block in a breadcrumb trail.
-fn crumb_line(b: &DocBlock) -> String {
-    let line = b
-        .visible_text()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if line.chars().count() > 60 {
-        format!("{}…", line.chars().take(60).collect::<String>())
-    } else {
-        line
-    }
-}
-
 /// Collect matching blocks from an exact candidate set, or from the complete
 /// already-parsed graph when no safe candidate set is available. The parser
 /// remains the semantic authority; this helper performs no disk I/O or parsing.
@@ -396,7 +380,7 @@ fn collect_bounded_candidates(
                     let mut dto = result_dto(block);
                     dto.breadcrumb = ancestors
                         .iter()
-                        .map(|ancestor| crumb_line(ancestor))
+                        .map(|ancestor| crate::doc::crumb_line(ancestor))
                         .collect();
                     Some(dto)
                 },
@@ -814,7 +798,7 @@ pub(crate) fn application_page_reference_matches(
                     output.push((dto, hit));
                 }
             }
-            ancestors.push(crumb_line(&projected));
+            ancestors.push(crate::doc::crumb_line(&projected));
             visit(
                 &block.children,
                 is_org,
@@ -970,7 +954,7 @@ fn collect_reference_occurrences_bounded(
                     let mut dto = result_dto(block);
                     dto.breadcrumb = ancestors
                         .iter()
-                        .map(|ancestor| crumb_line(ancestor))
+                        .map(|ancestor| crate::doc::crumb_line(ancestor))
                         .collect();
                     Some((dto, hit))
                 },
