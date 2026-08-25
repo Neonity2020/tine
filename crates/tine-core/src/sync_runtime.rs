@@ -22170,7 +22170,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Barrier;
     use uuid::Uuid;
 
     #[test]
