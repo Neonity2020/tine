@@ -6,6 +6,7 @@ export const RELEASE_LANES = [
   "linux-arm64",
   "macos-universal",
   "windows-x64",
+  "windows-x86",
   "windows-arm64",
   "android",
 ];
@@ -88,6 +89,16 @@ export function releaseLayout(version) {
           `Tine_${version}_x64-setup.exe.sig`,
         ],
       },
+    },
+    "windows-x86": {
+      assets: [
+        `Tine_${version}_x86-setup.exe`,
+        `Tine_${version}_x86-setup.exe.sig`,
+        `Tine_${version}_x86-portable.zip`,
+      ],
+      // Pilot lane for GH #275.  Keep it out of latest.json until real 32-bit
+      // hardware has proved the installer, WebView2 runtime and graph workflow.
+      platforms: {},
     },
     "windows-arm64": {
       assets: [

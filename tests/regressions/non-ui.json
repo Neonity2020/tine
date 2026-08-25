@@ -4709,6 +4709,36 @@
         "failBefore": "proven"
       },
       "notes": "An honest interrupted activation or explicit Return to Direct Files can leave a complete old clean activation marker under the graph's app-private root while Direct Files remains selected. The Direct Files join path constructed the other device's descriptor-bound identities but activated them against that same retained root, so clean recovery correctly refused the mismatched catalog document before LocalActive. The accepted outcome archives the complete unselected predecessor by one rename into sparse-v2-recovery, preserves every byte, bootstraps the descriptor-bound authority into a fresh private root, joins successfully, and never rewrites the already-converged Markdown/Org graph. Fail-before on 0e6dcd82 reproduced the exact local_active mismatch. Pass-after covered the production command ordering, the full descriptor-bound activation/join/reopen lifecycle, and the same byte-preservation journey on the 1,045-file anonymized corpus."
+    },
+    {
+      "id": "REG-RELEASE-WINDOWS-X86-275",
+      "title": "Release assembly carries an experimental 32-bit Windows lane without promising updater support",
+      "family": "release-platform-matrix",
+      "sources": { "issues": [275], "commits": [] },
+      "platforms": ["windows"],
+      "layer": "release",
+      "status": "covered",
+      "coverage": {
+        "tests": ["scripts/test-release-pipeline.mjs"],
+        "scenario": "release.windows-i686-pilot",
+        "failBefore": "proven"
+      },
+      "notes": "The fail-before inventory had no i686 lane or assets. The release matrix now cross-builds MSVC i686, stages an x86 installer and portable ZIP, and deliberately leaves latest.json unchanged until a real reporter validates usefulness on old hardware."
+    },
+    {
+      "id": "REG-DIAGNOSTIC-FLIGHT-RECORDER-343",
+      "title": "Production diagnostics retain bounded content-free events and exact-build decoding evidence",
+      "family": "diagnostic-observability",
+      "sources": { "issues": [343], "commits": [] },
+      "platforms": ["all"],
+      "layer": "tauri-release",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src-tauri/src/debug.rs", "scripts/test-release-pipeline.mjs"],
+        "scenario": "diagnostics.bounded-safe-recorder-and-symbols",
+        "failBefore": "proven"
+      },
+      "notes": "The recorder writer accepts only fixed event names, catalogued IPC command names, enums, booleans, counts and durations; detailed debug strings never enter the report. Current/previous one-MiB segments, unclean-exit marker, private files and process lock are native-tested. Release tests pin line-level symbols, hidden maps copied outside dist, exact-SHA artifact naming and removal of maps from shipped assets."
     }
   ]
 }

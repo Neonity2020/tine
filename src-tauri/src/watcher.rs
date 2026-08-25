@@ -239,6 +239,21 @@ pub(crate) struct WatcherLatencyReceipt {
     event_to_emit_ms: Option<u64>,
 }
 
+/// Report form of a watcher receipt. Graph labels are deliberately omitted:
+/// they can contain a user-chosen graph name.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WatcherDiagnosticReceipt {
+    mode: &'static str,
+    pages: usize,
+    event_paths: usize,
+    full_diff: bool,
+    errors: usize,
+    event_to_reconcile_ms: Option<u64>,
+    reconcile_ms: u64,
+    event_to_emit_ms: Option<u64>,
+}
+
 /// Concord L0's reload-on-focus fallback. Some filesystems and sync clients
 /// deliver no inotify edge at all (network mounts, a suspended app, a client
 /// that writes through a path the kernel doesn't report), so the ONE thing the
@@ -350,9 +365,39 @@ fn record_latency_receipt(mut receipt: WatcherLatencyReceipt) {
         receipt.reconcile_ms,
         stage(receipt.event_to_emit_ms),
     ));
+    crate::debug::record_watcher_latency(
+        receipt.mode,
+        u64::try_from(receipt.pages).unwrap_or(u64::MAX),
+        u64::try_from(receipt.event_paths).unwrap_or(u64::MAX),
+        receipt.full_diff,
+        u64::try_from(receipt.errors).unwrap_or(u64::MAX),
+        receipt.event_to_reconcile_ms,
+        receipt.reconcile_ms,
+        receipt.event_to_emit_ms,
+    );
     if let Ok(mut ring) = latency_receipts().lock() {
         push_latency_receipt(&mut ring, receipt);
     }
+}
+
+pub(crate) fn diagnostic_latency_snapshot() -> Vec<WatcherDiagnosticReceipt> {
+    latency_receipts()
+        .lock()
+        .map(|ring| {
+            ring.iter()
+                .map(|receipt| WatcherDiagnosticReceipt {
+                    mode: receipt.mode,
+                    pages: receipt.pages,
+                    event_paths: receipt.event_paths,
+                    full_diff: receipt.full_diff,
+                    errors: receipt.errors,
+                    event_to_reconcile_ms: receipt.event_to_reconcile_ms,
+                    reconcile_ms: receipt.reconcile_ms,
+                    event_to_emit_ms: receipt.event_to_emit_ms,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Debug command for bug reports: the last 64 external-change latency receipts,
