@@ -50,4 +50,19 @@ describe("Android system-bar theme synchronization", () => {
     expect(activity.match(/SystemBarAppearance\.restore\(this\)/g)).toHaveLength(2);
     expect(activity.indexOf("SystemBarAppearance.restore(this)")).toBeGreaterThan(activity.indexOf("super.onCreate"));
   });
+
+  it("uses a light or night Tine backing color before the WebView paints", () => {
+    const root = path.resolve(import.meta.dirname, "..");
+    const values = path.join(root, "src-tauri/gen/android/app/src/main/res/values");
+    const night = path.join(root, "src-tauri/gen/android/app/src/main/res/values-night");
+    const lightTheme = fs.readFileSync(path.join(values, "themes.xml"), "utf8");
+    const darkTheme = fs.readFileSync(path.join(night, "themes.xml"), "utf8");
+    const lightColors = fs.readFileSync(path.join(values, "colors.xml"), "utf8");
+    const darkColors = fs.readFileSync(path.join(night, "colors.xml"), "utf8");
+
+    expect(lightTheme).toContain('<item name="android:windowBackground">@color/tine_window_background</item>');
+    expect(darkTheme).toContain('<item name="android:windowBackground">@color/tine_window_background</item>');
+    expect(lightColors).toContain('<color name="tine_window_background">#FFFFFFFF</color>');
+    expect(darkColors).toContain('<color name="tine_window_background">#FF1A1B1E</color>');
+  });
 });

@@ -5,11 +5,35 @@ import { describe, expect, it } from "vitest";
 const root = path.resolve(import.meta.dirname, "..");
 const config = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"));
 const capability = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/capabilities/default.json"), "utf8"));
+const index = fs.readFileSync(path.join(root, "index.html"), "utf8");
 const main = fs.readFileSync(path.join(root, "src/main.tsx"), "utf8");
 const native = fs.readFileSync(path.join(root, "src-tauri/src/lib.rs"), "utf8");
 const app = fs.readFileSync(path.join(root, "src/App.tsx"), "utf8");
 
 describe("stable desktop startup reveal (GH #132)", () => {
+  it("paints a themed readiness shell before the application modules load", () => {
+    const shell = index.indexOf('class="startup-shell"');
+    const module = index.indexOf('type="module"');
+
+    expect(index).toContain('id="tine-startup-style"');
+    expect(index).toContain('localStorage.getItem("logseq-claude.theme")');
+    expect(index).toContain('matchMedia("(prefers-color-scheme: dark)")');
+    expect(shell).toBeGreaterThanOrEqual(0);
+    expect(module).toBeGreaterThan(shell);
+    expect(main).toContain("root.replaceChildren();");
+    expect(main.indexOf("root.replaceChildren();")).toBeLessThan(main.indexOf("render(() => <App />"));
+  });
+
+  it("does not bypass cached plugin revocation checks to mount sooner", () => {
+    const startup = main.indexOf("const communityExtensionsReady = startCommunityExtensions()");
+    const readinessGate = main.indexOf("communityExtensionsReady,", startup);
+    const mount = main.indexOf("]).then(mount, mount)", readinessGate);
+
+    expect(startup).toBeGreaterThanOrEqual(0);
+    expect(readinessGate).toBeGreaterThan(startup);
+    expect(mount).toBeGreaterThan(readinessGate);
+  });
+
   it("starts the main window hidden and reveals it after a stable themed frame", () => {
     expect(config.app.windows.find((window: { label: string }) => window.label === "main")?.visible).toBe(false);
     expect(capability.permissions).toContain("core:window:allow-show");

@@ -2039,10 +2039,16 @@ fn execute_manifested_projection_work_located(
     let guarded_layout = decoded.guarded_layout();
     let local_attempt_intent = decoded.receiver_local_intent().clone();
     if let Some(target) = target {
+        let claim_source = projection_phase!(
+            "uuid_claim_source",
+            projection
+                .materialized_read()
+                .map_err(|error| ProjectionError::Work(error.to_string()))
+        )?;
         let current = projection_phase!(
             "authorize_write",
             engine
-                .authorize_clean_accepted_projection_write(work.page_id())
+                .authorize_clean_accepted_projection_write(work.page_id(), &claim_source)
                 .map_err(ProjectionError::Engine)
         )?;
         let replay = projection_phase!(

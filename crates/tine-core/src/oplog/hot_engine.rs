@@ -19777,13 +19777,16 @@ impl ShardedHotEngine {
     /// different page, and must not make the earlier record appear to depend
     /// on unaccepted state. The actor is single-owner, so detach only the
     /// disposable overlay for this synchronous accepted-state proof and put it
-    /// back before returning; user-visible reads never observe the gap.
+    /// back before returning; user-visible reads never observe the gap. The
+    /// exact-frontier projection remains the bounded source of baseline UUID
+    /// claimants that the index-free accepted suffix cannot reconstruct alone.
     pub(crate) fn authorize_clean_accepted_projection_write(
         &mut self,
         page_id: PageId,
+        claim_source: &dyn ProjectionClaimSource,
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
         let overlay = std::mem::take(&mut self.local_overlay);
-        let result = self.authorize_projection_write_inner(page_id, None);
+        let result = self.authorize_projection_write_inner(page_id, Some(claim_source));
         self.local_overlay = overlay;
         result
     }
