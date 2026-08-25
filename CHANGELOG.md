@@ -34,6 +34,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Fitting split panes no longer keep a scrollbar merely for blank editing
+  space.** The first GH #369 correction fixed short panes but still made an
+  otherwise fitting page scroll whenever it occupied 60–100% of its pane. An
+  idle pane now has zero blank scroll range at every fitting height; the 40%
+  pane-relative breathing room returns while a block is actively edited, so a
+  long page's tail remains comfortably reachable.
+
 - **The full Rust core corpus now finishes and the release gate no longer hides
   passing tests.** Five obsolete shared-join test barriers now pause at current,
   finite clean-runtime concurrency cuts. An honest unfiltered run completed all

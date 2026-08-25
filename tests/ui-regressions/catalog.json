@@ -7863,7 +7863,7 @@
     },
     {
       "id": "UI-PANE-SCROLL-SLACK-369",
-      "title": "A split pane whose content fits shows no vertical scrollbar; a longer pane scrolls independently and keeps pane-proportional end-of-page editing slack",
+      "title": "An idle split pane whose content fits shows no vertical scrollbar; an actively edited long pane keeps pane-proportional tail room",
       "family": "scroll-layout",
       "sources": {
         "issues": [
@@ -7875,7 +7875,7 @@
         "all"
       ],
       "layer": "browser",
-      "status": "reproduced",
+      "status": "covered",
       "coverage": {
         "tests": [
           "scripts/shot-pane-slack.mjs",
@@ -7884,7 +7884,7 @@
         "scenario": "panes.fitting-content-no-scrollbar-and-pane-proportional-end-slack",
         "failBefore": "proven"
       },
-      "notes": "GH #369 (Windows), evidence reset after the reporter's negative v0.6.96 follow-up. The released 778ee0be correction removed window-relative 40vh padding, but its non-shrinking 40%-of-pane flex spacer still manufactures scroll range whenever an otherwise fitting page occupies 60–100% of its pane. The previous harness used only one-block 41%-full panes and explicitly accepted this missed band, so its fixed claim is revoked. Current reproduction must use the reporter-shaped 61–99% band and preserve true-overflow independent scrolling plus actively edited long-page tail reach. Headless Chromium exposes the causal scroll range but uses overlay bars; the reporter's Windows classic-bar paint remains a platform confirmation boundary."
+      "notes": "GH #369 (Windows), revalidated after the reporter's negative v0.6.96 follow-up revoked the first fixed claim. The released 778ee0be correction removed window-relative 40vh padding, but its non-shrinking 40%-of-pane flex spacer still manufactured scroll range whenever an otherwise fitting page occupied 60–100% of its pane. Literal fail-before on base 0f2e584b at 1920x1050: the reporter-shaped Lines column occupied 321/466px (69%) yet had 41px range, and GRID occupied 373/466px (80%) yet had 93px range; true-overflow panes also carried 186px permanent blank range. The idle spacer now starts at zero and shrinks, so pass-after is 0px for a 685/1,002px solo dashboard and for Lines/GRID, and exactly natural overflow for the long split panes. A non-shrinking 40%-of-pane basis is restored only while .block-editor is mounted; the 2,305px Project Plan final block remained visible with 186px (40%) tail room. The style guard proves the idle/active split and the #103 scrollbar-style neighbor remains unchanged. Headless Chromium exposes the causal range but uses overlay bars, so the reporter's Windows classic-bar paint remains a platform confirmation boundary."
     },
     {
       "id": "UI-E2E-WINDOWS-POST-RECEIPT-ROUTING-230",
