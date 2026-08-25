@@ -4739,6 +4739,28 @@
         "failBefore": "proven"
       },
       "notes": "The recorder writer accepts only fixed event names, catalogued IPC command names, enums, booleans, counts and durations; detailed debug strings never enter the report. Current/previous one-MiB segments, unclean-exit marker, private files and process lock are native-tested. Release tests pin line-level symbols, hidden maps copied outside dist, exact-SHA artifact naming and removal of maps from shipped assets."
+    },
+    {
+      "id": "REG-SYNC-JOIN-SEMANTIC-MISMATCH-DIAGNOSTICS-001",
+      "title": "A refused sync join identifies the semantic mismatch class without exposing note content or changing either authority",
+      "family": "sync-data-safety",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::clean_join_semantic_diff_accepts_equal_user_semantics",
+          "crates/tine-core/src/sync_runtime.rs::clean_join_semantic_diff_classifies_every_disk_expressible_difference",
+          "crates/tine-core/src/sync_runtime.rs::clean_join_semantic_diff_diagnostics_name_paths_without_content_or_uuids",
+          "crates/tine-core/src/sync_runtime.rs::clean_join_semantic_diff_bounds_path_details",
+          "crates/tine-core/src/sync_runtime.rs::adoption_stops_on_unconverged_files_and_leaves_the_archive_readable",
+          "src/managedDiagnostics.test.ts"
+        ],
+        "scenario": "sync.join-semantic-mismatch-diagnostics",
+        "failBefore": "proven"
+      },
+      "notes": "An Android join refusal reported only that the local notes were not in the shared frontier, collapsing local-only, shared-only, kind, preamble, outline and explicit-ID differences into one message. The comparison now remains linear over its sorted semantic snapshots, reports complete content-free category counts on the shareable first line, and writes at most 32 exact relative paths plus categories to the detailed local trace. It never serializes note text or UUID values. The existing refusal and authority-preservation behavior is unchanged; the 1,045-file anonymized adoption journey still passes."
     }
   ]
 }
