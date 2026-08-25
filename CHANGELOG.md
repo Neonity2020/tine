@@ -20,6 +20,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Clicking a block bullet no longer reports a false same-name file conflict.**
+  A block zoom now keeps using the exact page already open in Direct Files
+  instead of racing the durable block-ID save with a second read of the page's
+  older bytes. Restored zoom tabs still load missing owners from disk, and
+  genuinely different same-name physical files remain fail-closed (GH #354).
+
 - **Page action control labels no longer join dragged text selections.** The
   journal carry-over buttons ("Carry unfinished tasks → today" and friends),
   the tag-table toggle, the guide copy button, and the ⋯ page-actions trigger

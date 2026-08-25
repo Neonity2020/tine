@@ -7862,6 +7862,28 @@
         "failBefore": "proven"
       },
       "notes": "The v0.6.4 receipt fix exposed three independent setup/readiness failures after exact receipt validation: windows-core did not reach the app container, page-properties did not reach ALL PAGES, and pdf-logseq started on Quick Capture. The deterministic routing/readiness repair shipped in v0.6.96 at exact SHA 8bfe34c97ec27e59bb22d562b40c458159f9a03c. Hosted Windows run 32791664016 then passed all three original journeys at their actual contracts: windows-core job 97647244888, page-properties 97647244746, and pdf-logseq 97647244737. The run reported zero blocked or quarantined scenarios. The intermediate focused print-security proof remains run 32766862967; no product assertion was weakened for this closeout."
+    },
+    {
+      "id": "UI-DIRECT-FILES-BLOCK-ZOOM-OWNER-354",
+      "title": "Clicking a loaded Direct Files block's bullet enters that exact block without re-reading or replacing its page",
+      "family": "page-routing",
+      "sources": {
+        "issues": [354],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx"
+        ],
+        "scenario": "routing.block-zoom-reuses-exact-loaded-owner",
+        "failBefore": "proven"
+      },
+      "notes": "GH #354 (Windows 11, Direct Files, v0.6.93): clicking a block bullet stamps a missing durable id and starts its guarded save before navigating to the block route. The route loader then re-read the same file's pre-save bytes and treated them as a competing page instance, producing the misleading unsaved-changes/other-file refusal. PageView now reuses only a block zoom's already-loaded exact path-aware owner. Component coverage drives the literal bullet click while its durable-id save is pending and proves no second read or refusal, then covers transient-live/durable identity resolution, restored-route disk loading when the owner is absent, and fail-closed handling of a different same-name physical owner."
     }
   ]
 }
