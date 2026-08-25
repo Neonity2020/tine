@@ -310,6 +310,15 @@ identity and single-link status immediately before publication. A suffix
 lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
 or failed identity recheck is never deleted or selected as authority.
 
+For an existing Direct editor save, the initial exact-file read supplies the
+serialization baseline. The late external-writer proof is the atomic
+retirement itself: after the expected physical owner is detached from the live
+name, Tine reads that retained inode and compares it byte-for-byte with the
+baseline before publishing. A mismatch restores the same inode when possible
+and mints a conflict from the retained snapshot. There is no separate
+pre-retirement full-file reread; creates, unpinned auxiliary writes, and managed
+projections keep their independent recheck rules.
+
 The existing parsed `PageEntry + Arc<Document>` cache feeds one background
 SQLite owner. The database retains each page's exact caller-owned content
 revision together with the Direct fact-extractor version as disposable adapter

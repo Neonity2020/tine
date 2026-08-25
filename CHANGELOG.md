@@ -21,6 +21,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   superseded copies are retained or moved intact to recoverable conflict trash;
   lookalikes and files whose physical identity cannot be proved are untouched.
 
+- **Changed Direct Files saves perform one fewer full-file read.** The atomic
+  retirement already detaches and byte-checks the exact expected inode before
+  publishing, so Tine no longer rereads the same live name immediately before
+  that stronger proof. External edits still win or become an explicit conflict,
+  and managed-storage projection behavior is unchanged.
+
 ## [0.6.96] - 2026-08-24
 
 ### Added

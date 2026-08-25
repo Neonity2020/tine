@@ -19025,13 +19025,24 @@ impl Graph {
         creation_proof: Option<DirectCreationProof>,
         publication_authority: EditorPublicationAuthority,
     ) -> io::Result<String> {
+        // The Direct existing-file replacement already performs the late
+        // baseline proof at the stronger boundary: it atomically retires the
+        // exact expected inode, reads that detached inode, and restores it on a
+        // byte mismatch before reporting the conflict. Reading the live name in
+        // `commit_write` immediately beforehand duplicated a full-file read
+        // without closing an additional race. Keep that earlier recheck for
+        // creates, unpinned auxiliary writes, and reconstructible managed
+        // projections; this cut is deliberately Direct Files only.
+        let commit_recheck = recheck
+            && !(publication_authority == EditorPublicationAuthority::DirectFile
+                && expected_identity.is_some());
         let create_parent = creation_proof.is_none();
         let (rev, ()) = self.commit_write(
             write,
             path,
             content,
             baseline,
-            recheck,
+            commit_recheck,
             create_parent,
             editor_episode,
             || match (expected_identity, creation_proof) {
@@ -36841,8 +36852,8 @@ mod tests {
         graph.save_page(&exact, exact.rev.as_deref()).unwrap();
         assert_eq!(
             GRAPH_TEXT_CONTENT_READS.with(Cell::get),
-            3,
-            "exact save reads validation, coherent late-recheck, and final receipt snapshots"
+            2,
+            "exact save reads initial validation and the final receipt; the atomic retirement validates the baseline without a pre-retirement reread"
         );
         assert_eq!(
             GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get),
@@ -36896,8 +36907,8 @@ mod tests {
         assert_eq!(GRAPH_TEXT_VALIDATION_TARGET_READS.with(Cell::get), 1);
         assert_eq!(
             GRAPH_TEXT_CONTENT_READS.with(Cell::get),
-            3,
-            "only exact validation, coherent late recheck, and the target receipt may read content"
+            2,
+            "only exact validation and the target receipt may read content; retirement itself validates the baseline"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -49724,7 +49735,7 @@ mod tests {
         let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         // Preserve the inode while changing its bytes. Revision-only force used
         // to overwrite this unseen second winner.
-        EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let path = path.clone();
             *hook.borrow_mut() = Some(Box::new(move || {
                 fs::write(path, "- unseen second winner\n")
@@ -49733,7 +49744,7 @@ mod tests {
         let error = graph
             .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
             .unwrap_err();
-        assert_eq!(gh254_code(&error), "conflict.commit_recheck");
+        assert_eq!(gh254_code(&error), "conflict.replace_retired_mismatch");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "- unseen second winner\n"
@@ -50535,14 +50546,14 @@ mod tests {
     }
 
     #[test]
-    fn gh254_s3_commit_recheck_reads_bytes_and_identity_together() {
+    fn gh254_s3_retired_snapshot_reads_bytes_and_identity_together() {
         let (root, path, graph, page) = gh254_loaded("s3");
-        EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let path = path.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s3 winner\n")));
         });
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
-        assert_eq!(gh254_code(&error), "conflict.commit_recheck");
+        assert_eq!(gh254_code(&error), "conflict.replace_retired_mismatch");
         graph
             .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
             .unwrap();
