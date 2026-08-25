@@ -19,6 +19,7 @@
 //! and then refused inside `tine-core`, because appending a capture to today's
 //! journal is a graph-text write the oplog owns.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 /// How one command reaches a graph, and therefore what a **managed** binding
@@ -48,6 +49,7 @@ use ManagedRouting::{ConfigWrite, Filesystem, LegacyOnly, ManagedRouted, NoGraph
 /// folder-picker and system-bar commands are deliberately outside this list;
 /// `no_graph_routing_hides_in_the_unscanned_sources` proves they hold no graph
 /// routing rather than taking it on trust.
+#[cfg(test)]
 const SCANNED_SOURCES: &[(&str, &str)] = &[
     ("backup.rs", include_str!("backup.rs")),
     ("commands.rs", include_str!("commands.rs")),
@@ -67,6 +69,7 @@ const SCANNED_SOURCES: &[(&str, &str)] = &[
     ("watcher.rs", include_str!("watcher.rs")),
 ];
 
+#[cfg(test)]
 const UNSCANNED_SOURCES: &[(&str, &str)] = &[
     (
         "android_folder_picker.rs",
@@ -281,6 +284,7 @@ pub(crate) fn is_known_command(command: &str) -> bool {
 /// against this list so shrinking it is a deliberate edit.
 ///
 /// Each entry says what the command needs before it can come back.
+#[cfg(test)]
 const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "apply_journal_filename_migrations",
@@ -331,6 +335,7 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
 /// The routing helpers a command body can use, most specific first. A body that
 /// dispatches on `sparse_application_handle` has a managed implementation even
 /// though its other arm takes the legacy graph, so that marker wins.
+#[cfg(test)]
 const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("sparse_application_handle", ManagedRouted),
     ("legacy_graph(", LegacyOnly),
@@ -340,6 +345,7 @@ const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("with_filesystem_graph(", Filesystem),
 ];
 
+#[cfg(test)]
 const MARKER_PRECEDENCE: &[ManagedRouting] = &[
     ManagedRouted,
     LegacyOnly,
@@ -350,6 +356,7 @@ const MARKER_PRECEDENCE: &[ManagedRouting] = &[
 
 /// Read every `#[tauri::command]` out of one source and classify it by the
 /// routing helper its body uses.
+#[cfg(test)]
 fn commands_in(source: &str) -> Vec<(String, ManagedRouting)> {
     let lines: Vec<&str> = source.lines().collect();
     let mut found = Vec::new();
@@ -392,6 +399,7 @@ fn commands_in(source: &str) -> Vec<(String, ManagedRouting)> {
 }
 
 /// `fn name(`, `pub(crate) async fn name<R: Runtime>(` and everything between.
+#[cfg(test)]
 fn fn_name(line: &str) -> Option<String> {
     let after = line
         .split_once(" fn ")
@@ -408,6 +416,7 @@ fn fn_name(line: &str) -> Option<String> {
     Some(name)
 }
 
+#[cfg(test)]
 fn scanned_surface() -> BTreeMap<String, ManagedRouting> {
     let mut surface = BTreeMap::new();
     for (file, source) in SCANNED_SOURCES {
