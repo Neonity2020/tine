@@ -43,6 +43,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   inode from a sync service or second Tine, ambiguous events, and portable
   case/NFC collisions remain fail-closed (GH #374, follow-up to GH #366).
 
+- **Windows self-update now follows the system proxy route and shows one update
+  offer at a time.** The native updater already used the Windows trust store,
+  but its reduced feature set omitted Reqwest's separate Windows system-proxy
+  integration, so it could fail to fetch `latest.json` even while WebView2 and
+  the browser reached GitHub. Startup and manual checks also now replace the
+  same release offer instead of stacking duplicate install prompts (GH #241).
+
+- **Fitting split panes no longer keep a scrollbar merely for blank editing
+  space.** The first GH #369 correction fixed short panes but still made an
+  otherwise fitting page scroll whenever it occupied 60–100% of its pane. An
+  idle pane now has zero blank scroll range at every fitting height; the 40%
+  pane-relative breathing room returns while a block is actively edited, so a
+  long page's tail remains comfortably reachable.
+
 - **The full Rust core corpus now finishes and the release gate no longer hides
   passing tests.** Five obsolete shared-join test barriers now pause at current,
   finite clean-runtime concurrency cuts. An honest unfiltered run completed all

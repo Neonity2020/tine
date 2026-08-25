@@ -868,15 +868,20 @@ textarea {
   outline: none;
 }
 
-/* End-of-page editing slack (GH #369): grows to absorb whatever free space the
-   pane has left — a fitting pane ends exactly flush, with no useless
-   scrollbar — and never shrinks below 40% of the PANE's own height, so a long
-   page keeps the breathing room (scroll the tail up off the bottom edge) that
-   the old window-relative padding gave the solo pane. Flex percentages in this
-   column resolve against the scroller, which is what makes the slack
-   pane-relative instead of window-relative. */
+/* End-of-page slack (GH #369): an idle dashboard pane gets only its actual free
+   space, so ANY naturally fitting page ends flush without acquiring a scroll
+   range. The released first correction used a non-shrinking 40% basis here;
+   that still forced a bar whenever content occupied 60–100% of the pane. */
 .main-content::after {
   content: "";
+  flex: 1 1 0;
+}
+
+/* The breathing room is an editing affordance. Restore its non-shrinking 40%
+   pane-relative basis only while this pane owns a mounted editor: long-page
+   tails can still move comfortably above the bottom edge, while read-only
+   dashboards never scroll through blank space. */
+.main-content:has(.block-editor)::after {
   flex: 1 0 40%;
 }
 

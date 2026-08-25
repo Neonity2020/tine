@@ -39,11 +39,16 @@ describe("pane end-of-page slack is pane-relative (GH #369)", () => {
     expect(inner).toContain("flex: 0 0 auto");
   });
 
-  it("declares a spacer that absorbs free space down to 40% of the pane", () => {
+  it("lets the idle spacer absorb only real free space, never manufacture overflow", () => {
     const spacer = ruleBody(/^\.main-content::after\s*\{([^}]*)\}/m);
-    // grow to fill leftover pane space (no range, no scrollbar on fitting
-    // content), never shrink below 40% of the pane (long pages keep slack).
+    // Grow through unused pane space, but start from zero and remain shrinkable:
+    // an idle page that naturally fits at any occupancy must have no range.
     expect(spacer).toContain('content: ""');
-    expect(spacer).toMatch(/flex:\s*1\s+0\s+40%/);
+    expect(spacer).toMatch(/flex:\s*1\s+1\s+0/);
+  });
+
+  it("restores 40%-of-pane tail room only while a page editor is active", () => {
+    const active = ruleBody(/^\.main-content:has\(\.block-editor\)::after\s*\{([^}]*)\}/m);
+    expect(active).toMatch(/flex:\s*1\s+0\s+40%/);
   });
 });

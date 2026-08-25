@@ -81,6 +81,11 @@ clipboard-rs = { version = "0.3.5", default-features = false }
 # latest.json on a reporter's otherwise-online Windows 11 system (GH #241).
 [target.'cfg(target_os = "windows")'.dependencies]
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
+# `tauri-plugin-updater` disables Reqwest defaults and selects only its TLS
+# feature above. Opt back into Reqwest's separate Windows system-proxy reader so
+# the native updater follows the same configured network route as WebView2 and
+# the user's browser instead of consulting only proxy environment variables.
+reqwest = { version = "0.13", default-features = false, features = ["system-proxy"] }
 
 # Keep the established rustls transport on Linux/macOS, where it is proven in
 # shipped packages. Mobile does not compile or expose the updater.
