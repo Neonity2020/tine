@@ -6504,6 +6504,31 @@
       "notes": "The reporter's concrete copied suffixes are UI labels, not page content: `+ Add block`, `Linked References`, and `Unlinked References`. The trailing target and every references header now opt out of native selection in both standard and WebKit-prefixed CSS, so mouse/touch selection can cross the page without copying application chrome. This deliberately does not attempt nonstandard region-containment semantics; actual reference block content remains selectable."
     },
     {
+      "id": "UI-NATIVE-SELECTION-EXCLUDES-PAGE-ACTIONS-001",
+      "title": "Native page selections exclude page action control labels (carry-over buttons, tag-table toggle, guide copy, ⋯ trigger)",
+      "family": "native-text-selection",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "android",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/styles/uiChromeSelection.test.ts"
+        ],
+        "scenario": "selection.page-content-excludes-ui-chrome",
+        "failBefore": "proven"
+      },
+      "notes": "Internal report (Martin, 2026-08-25): texts of page action controls such as the journal carry-over buttons became part of ordinary dragged text selections. The title-row controls — carry-over buttons, tag-table toggle, guide copy button and the ⋯ page-actions trigger — now opt out of native selection in both standard and WebKit-prefixed CSS while remaining ordinary activatable buttons (pointer events and keyboard focus are untouched; the icon-only favorite star contributes no selection text and is intentionally out of scope). Page and block content remains selectable."
+    },
+    {
       "id": "UI-NAV-REVEAL-COLLAPSED-BLOCK-258",
       "title": "Navigating to a block nested inside collapsed parents expands its ancestors, scrolls to it and highlights it",
       "family": "navigation",

@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Page action control labels no longer join dragged text selections.** The
+  journal carry-over buttons ("Carry unfinished tasks → today" and friends),
+  the tag-table toggle, the guide copy button, and the ⋯ page-actions trigger
+  are page chrome, not content: selecting across the page no longer copies
+  their label text, while the buttons stay fully clickable and keyboard-
+  focusable.
+
 ## [0.6.96] - 2026-08-24
 
 ### Added
