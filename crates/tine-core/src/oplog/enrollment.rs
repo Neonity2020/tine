@@ -6478,14 +6478,15 @@ fn openat_regular(directory: &Dir, name: &str, flags: i32, mode: u32) -> std::io
 
 // Must exist wherever ANY caller does. Two different exclusion lists reach it:
 // the `not(any(unix, windows))` helpers above, and `rename_noreplace`'s fallback
-// below, which is `not(any(linux, macos, android, windows))` and therefore
-// compiles on iOS/tvOS/BSD — all of which ARE `unix`. Gating this on
+// below, which is `not(any(linux, macos, ios, android, windows))` and therefore
+// compiles on tvOS/BSD — all of which ARE `unix`. Gating this on
 // `not(any(unix, windows))` made it vanish exactly where that fallback needed it,
 // breaking the iOS build from 6162b381 (2026-07-26) until 2026-08-08. The list
 // below is the union of both caller sets.
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]
@@ -6522,7 +6523,7 @@ fn rename_noreplace(directory: &Dir, from: &str, to: &str) -> std::io::Result<()
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn rename_noreplace(directory: &Dir, from: &str, to: &str) -> std::io::Result<()> {
     let from = CString::new(from)
         .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid temporary name"))?;
@@ -6558,6 +6559,7 @@ fn rename_noreplace(directory: &Dir, from: &str, to: &str) -> std::io::Result<()
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]

@@ -4302,7 +4302,7 @@ fn move_pending_cleanup_marker_noreplace(
         .ok_or_else(io::Error::last_os_error)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn move_pending_cleanup_marker_noreplace(
     source: &Dir,
     destination: &Dir,
@@ -4338,6 +4338,7 @@ fn move_pending_cleanup_marker_noreplace(
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]

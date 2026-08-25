@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import process from "node:process";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
+import { assertOpaquePng } from "./lib/opaque-png.mjs";
 
 const [, , expectedPath, bundledPath] = process.argv;
 // Xcode may normalize alpha and color encoding when compiling an asset catalog.
@@ -12,6 +13,9 @@ if (!expectedPath || !bundledPath) {
     "usage: verify-ios-app-icon.mjs <tracked-icon.png> <decoded-bundled-icon.png>",
   );
 }
+
+assertOpaquePng(expectedPath, "tracked iOS icon");
+assertOpaquePng(bundledPath, "signed IPA primary icon");
 
 async function rgba(path) {
   const image = await loadImage(path);

@@ -23886,6 +23886,7 @@ fn projection_component_is_portable(component: &str) -> bool {
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
+    target_os = "ios",
     windows
 ))]
 fn require_projection_platform() -> io::Result<()> {
@@ -23896,6 +23897,7 @@ fn require_projection_platform() -> io::Result<()> {
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
+    target_os = "ios",
     windows
 )))]
 fn require_projection_platform() -> io::Result<()> {
@@ -30900,7 +30902,7 @@ fn preflight_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
 const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
     "renameat2(RENAME_NOREPLACE) publishing the projection";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
     "renameatx_np(RENAME_EXCL) publishing the projection";
 
@@ -30911,6 +30913,7 @@ const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]
@@ -30948,7 +30951,7 @@ fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::
         .ok_or_else(io::Error::last_os_error)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsFd, AsRawFd};
@@ -31083,6 +31086,7 @@ fn rename_projection_between_noreplace(
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]
@@ -31538,7 +31542,7 @@ fn rename_managed_noreplace(
         .ok_or_else(io::Error::last_os_error)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn rename_managed_noreplace(
     source_dir: &Dir,
     source: &str,
@@ -31592,6 +31596,7 @@ fn rename_managed_noreplace(
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]

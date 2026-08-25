@@ -410,6 +410,53 @@
    }
   },
   {
+   "id": "REG-IOS-GUIDE-COPY-ATOMIC-PUBLICATION-001",
+   "title": "Copying the bundled Guide can atomically create pages on iOS",
+   "family": "platform-compatibility",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "ios"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/iosAtomicPublicationContract.test.ts",
+     "crates/tine-core/src/onboarding.rs"
+    ],
+    "scenario": "ios.guide-copy-atomic-publication",
+    "failBefore": "proven"
+   },
+   "notes": "A physical iPhone running the first public TestFlight beta reached the bundled Guide but Copy the guide into your graph failed because model.rs selected renameatx_np(RENAME_EXCL) only for macOS and compiled iOS into the unsupported fallback. The correction applies the Darwin primitive to iOS across graph projection, managed no-clobber moves, enrollment publication, and cleanup-marker rotation; the contract test fails if a macOS-only atomic-publication branch returns."
+  },
+  {
+   "id": "REG-IOS-APP-ICON-OPAQUE-001",
+   "title": "Every TestFlight app icon is an opaque Tine icon accepted by App Store Connect",
+   "family": "release-packaging",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "ios"
+   ],
+   "layer": "release",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "scripts/prepare-ios-project.mjs",
+     "scripts/verify-ios-app-icon.mjs",
+     ".github/workflows/ios-testflight.yml"
+    ],
+    "scenario": "ios.testflight-opaque-app-icon",
+    "failBefore": "proven"
+   },
+   "notes": "The first post-beta signed IPA carried the tracked Tine artwork but App Store Connect rejected it with error 90717 because all tracked PNGs retained an alpha-bearing color type. The tracked catalog is now opaque, project preparation refuses any alpha color type or tRNS transparency before Xcode runs, and signed-IPA verification applies the same encoding check to the compiled primary icon in addition to its visual identity comparison. Fail-before: hosted upload run 32897900691 compiled, signed, and verified the IPA locally before Apple rejected its large icon."
+  },
+  {
    "id": "REG-WATCHER-ATOMIC-SAVE-SCOPE-001",
    "title": "Atomic page-save events reconcile incrementally and never rescan unrelated graphs",
    "family": "performance",
