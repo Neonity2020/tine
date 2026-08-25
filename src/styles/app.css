@@ -8853,6 +8853,16 @@ img.emoji {
 .nav-page.row-drop-before {
   box-shadow: inset 0 2px 0 var(--link-color);
 }
+/* A row reorder drag is not a text gesture: while one is armed nothing on the
+   page is selectable, so dragging a favorite no longer smears its title blue
+   (GH #211 follow-up, Martin 2026-08-25). Transient — the class is only present
+   between the drag threshold and the drop. */
+html.row-reorder-dragging,
+html.row-reorder-dragging * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
 .rs-item.row-drop-after,
 .nav-page.row-drop-after {
   box-shadow: inset 0 -2px 0 var(--link-color);

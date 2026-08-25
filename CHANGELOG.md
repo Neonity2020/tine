@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Typing in the Linked References search box now also narrows the reference
+  chips below it.** The reference list already shrank as you typed; the chips —
+  the pages and tags you pick from — were computed over every backlink, so they
+  and their counts never moved. They now follow what you type, which is what
+  Logseq's equivalent field does and what the list is for. A chip you have
+  already selected stays visible even when your text filters its last backlink
+  away, at count zero, so a filter can never become unreachable (GH #173).
+
 - **A journal day with more than one file is now resolved on the day itself.**
   These days — usually a leftover of changing the journal date format, which
   never overwrites the old file — used to reach you only as a sticky notice at
@@ -40,7 +48,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   installs that set before Xcode compiles the asset catalog, and the signed-IPA
   contract compares the packaged primary icon's pixels with Tine's source. The
   already-submitted `0.6.95.8` beta is unchanged.
-
+- **Dragging a favourite in the sidebar no longer selects its title.** The
+  reorder drag is a pointer gesture, not a text gesture, but nothing suppressed
+  selection, so the label smeared under the cursor. Applies to both reorderable
+  sidebar lists.
+- **The Linked References filter no longer claims to have filtered a list it has
+  not.** While the descendant index is still loading the panel deliberately
+  shows every reference — the local text it has is only a subset, so hiding a
+  reference could hide a real match — but the summary still read "N of N
+  references". It now says indexing is in progress and that the filter applies
+  when it finishes (GH #173).
 - **Deleting an open page on Android no longer passes through an unexplained
   black frame.** Tine still waits for pending edits and the native trash
   operation to become durable before navigating anywhere, but it now retires
