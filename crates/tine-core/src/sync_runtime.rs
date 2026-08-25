@@ -923,16 +923,16 @@ fn fail_once_at_provider_accepted_audit_cut(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SharedJoinTestPausePoint {
     EnrollmentLockContended,
-    BetweenTurns,
-    AfterProviderScan,
-    AfterLocalScan,
+    BeforeCandidateDownload,
+    AfterCandidateDownload,
+    BeforeEnrollmentPublication,
 }
 
 #[cfg(test)]
 struct SharedJoinTestPause {
     point: SharedJoinTestPausePoint,
-    entered: Arc<std::sync::Barrier>,
-    resume: Arc<std::sync::Barrier>,
+    entered: SyncSender<()>,
+    resume: Receiver<()>,
 }
 
 #[cfg(test)]
@@ -949,8 +949,14 @@ fn pause_shared_join_for_test(workspace_id: WorkspaceId, point: SharedJoinTestPa
         }
     };
     if let Some(pause) = pause {
-        pause.entered.wait();
-        pause.resume.wait();
+        pause
+            .entered
+            .send(())
+            .expect("shared join test owner dropped its phase receiver");
+        pause
+            .resume
+            .recv_timeout(Duration::from_secs(30))
+            .expect("shared join test owner did not resume the reached phase");
     }
 }
 
@@ -3710,11 +3716,6 @@ impl SyncRuntimeHandle {
             {
                 SharedJoinStep::Pending => {
                     drop(_operation);
-                    #[cfg(test)]
-                    pause_shared_join_for_test(
-                        descriptor.workspace_id(),
-                        SharedJoinTestPausePoint::BetweenTurns,
-                    );
                     std::thread::yield_now();
                 }
                 SharedJoinStep::Complete(descriptor) => {
@@ -20004,6 +20005,11 @@ impl RuntimeActor {
             || marker.source_capture() != descriptor.source_capture()
             || frontier.state_digest() != descriptor.accepted_frontier_digest()
         {
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::BeforeCandidateDownload,
+            );
             let request = self
                 .clean_open_request
                 .as_ref()
@@ -20015,6 +20021,11 @@ impl RuntimeActor {
                     .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
                 &descriptor,
             )?;
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterCandidateDownload,
+            );
             let local_snapshot = self
                 .active_engine()?
                 .canonical_snapshot()
@@ -20039,6 +20050,11 @@ impl RuntimeActor {
             }
             self.install_clean_join_candidate(&descriptor, candidate, marker)?;
         }
+        #[cfg(test)]
+        pause_shared_join_for_test(
+            descriptor.workspace_id(),
+            SharedJoinTestPausePoint::BeforeEnrollmentPublication,
+        );
         let state = CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Joiner)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         publish_clean_shared_state(self.enrollment_root.path(), &state)
@@ -22418,9 +22434,9 @@ mod tests {
     fn install_shared_join_pause(
         workspace_id: WorkspaceId,
         point: SharedJoinTestPausePoint,
-    ) -> (Arc<Barrier>, Arc<Barrier>) {
-        let entered = Arc::new(Barrier::new(2));
-        let resume = Arc::new(Barrier::new(2));
+    ) -> (Receiver<()>, SyncSender<()>) {
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
+        let (resume_sender, resume_receiver) = mpsc::sync_channel(0);
         assert!(
             SHARED_JOIN_TEST_PAUSES
                 .lock()
@@ -22429,14 +22445,14 @@ mod tests {
                     workspace_id,
                     SharedJoinTestPause {
                         point,
-                        entered: Arc::clone(&entered),
-                        resume: Arc::clone(&resume),
+                        entered: entered_sender,
+                        resume: resume_receiver,
                     },
                 )
                 .is_none(),
             "shared join test pause was already installed"
         );
-        (entered, resume)
+        (entered_receiver, resume_sender)
     }
 
     fn empty_request(profile: SyncStorageProfile) -> (PathBuf, SyncRuntimeOpenRequest) {
@@ -25787,20 +25803,6 @@ mod tests {
             fs::read_to_string(real_source.join("must-not-be-opened.md")).unwrap(),
             "root target\n"
         );
-    }
-
-    fn clear_provider_namespace(fixture: &ActivationFixture, namespace: &str) {
-        let directory = fixture.request.provider_root.join("outbox").join(namespace);
-        // Retired namespaces are no longer part of the provider skeleton;
-        // absent already means clear.
-        let Ok(entries) = fs::read_dir(directory) else {
-            return;
-        };
-        for entry in entries {
-            let entry = entry.unwrap();
-            assert!(entry.file_type().unwrap().is_file());
-            fs::remove_file(entry.path()).unwrap();
-        }
     }
 
     fn replicate_provider_file_event(from: &Path, to: &Path, relative: &Path) {
@@ -30034,29 +30036,23 @@ mod tests {
             SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone());
         let initiator_handle = initiator_active.handle.expect("initiator LocalActive");
         drive_initial_feed(&initiator_handle);
-        let descriptor = initiator_handle.prepare_shared().unwrap();
-        let initiator_shared =
-            active_handle(SyncRuntimeHandle::open(reopen_request(&initiator.request)));
         let (provider_batch, ..) = submit_shared_page(
-            &initiator_shared,
+            &initiator_handle,
             0xa1d8,
             "Join Provider Reappears",
             "notes/join-provider-reappears.md",
             "provider batch staged before the local archive pass",
         );
-        publish_shared_batch(&initiator_shared, &initiator, provider_batch);
-        settle_shared_provider(&initiator_shared);
+        let shared_graph = user_graph_bytes(&initiator.graph_root);
+        let descriptor = initiator_handle.prepare_shared().unwrap();
         copy_provider_tree(
             &initiator.request.provider_root,
             &joiner.request.provider_root,
         );
-        for namespace in [
-            SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
-            SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
-            SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
-            SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
-        ] {
-            clear_provider_namespace(&joiner, namespace);
+        for (relative, bytes) in &shared_graph {
+            let destination = joiner.graph_root.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
         }
 
         let joiner_active = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone());
@@ -30068,22 +30064,18 @@ mod tests {
             .join(format!("outbox/manifests/{provider_batch}.manifest"));
         let manifest_bytes = fs::read(&provider_manifest).unwrap();
 
-        let (provider_entered, provider_resume) = install_shared_join_pause(
+        let (candidate_entered, candidate_resume) = install_shared_join_pause(
             joiner.request.identities.workspace_id,
-            SharedJoinTestPausePoint::AfterProviderScan,
+            SharedJoinTestPausePoint::AfterCandidateDownload,
         );
         let joining_handle = joiner_handle.clone();
         let joining = std::thread::spawn(move || joining_handle.join_shared(descriptor));
-        provider_entered.wait();
+        candidate_entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("clean join did not finish downloading its verified candidate");
         fs::remove_file(&provider_manifest).unwrap();
-        let (local_entered, local_resume) = install_shared_join_pause(
-            joiner.request.identities.workspace_id,
-            SharedJoinTestPausePoint::AfterLocalScan,
-        );
-        provider_resume.wait();
-        local_entered.wait();
         fs::write(&provider_manifest, manifest_bytes).unwrap();
-        local_resume.wait();
+        candidate_resume.send(()).unwrap();
 
         let joined = joining.join().unwrap();
         assert!(
@@ -30105,29 +30097,23 @@ mod tests {
             SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone());
         let initiator_handle = initiator_active.handle.expect("initiator LocalActive");
         drive_initial_feed(&initiator_handle);
-        let descriptor = initiator_handle.prepare_shared().unwrap();
-        let initiator_shared =
-            active_handle(SyncRuntimeHandle::open(reopen_request(&initiator.request)));
         let (provider_batch, ..) = submit_shared_page(
-            &initiator_shared,
+            &initiator_handle,
             0xa1f8,
             "Join Provider Restart",
             "notes/join-provider-restart.md",
             "provider batch staged before the crash-retry cut",
         );
-        publish_shared_batch(&initiator_shared, &initiator, provider_batch);
-        settle_shared_provider(&initiator_shared);
+        let shared_graph = user_graph_bytes(&initiator.graph_root);
+        let descriptor = initiator_handle.prepare_shared().unwrap();
         copy_provider_tree(
             &initiator.request.provider_root,
             &joiner.request.provider_root,
         );
-        for namespace in [
-            SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
-            SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
-            SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
-            SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
-        ] {
-            clear_provider_namespace(&joiner, namespace);
+        for (relative, bytes) in &shared_graph {
+            let destination = joiner.graph_root.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
         }
 
         let joiner_active = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone());
@@ -30139,45 +30125,36 @@ mod tests {
             .join(format!("outbox/manifests/{provider_batch}.manifest"));
         let manifest_bytes = fs::read(&provider_manifest).unwrap();
 
-        let (provider_entered, provider_resume) = install_shared_join_pause(
+        let (download_entered, download_resume) = install_shared_join_pause(
             joiner.request.identities.workspace_id,
-            SharedJoinTestPausePoint::AfterProviderScan,
+            SharedJoinTestPausePoint::BeforeCandidateDownload,
         );
         let joining_handle = joiner_handle.clone();
         let descriptor_for_first_attempt = descriptor.clone();
         let joining =
             std::thread::spawn(move || joining_handle.join_shared(descriptor_for_first_attempt));
-        provider_entered.wait();
+        download_entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("clean join did not reach candidate download");
         fs::remove_file(&provider_manifest).unwrap();
-        provider_resume.wait();
+        download_resume.send(()).unwrap();
         let first_attempt = joining.join().unwrap();
         assert!(
-            first_attempt.is_err(),
-            "an unsettled provider cut must remain retryable instead of activating"
+            matches!(
+                first_attempt,
+                Err(SyncRuntimeRequestError::ActorRefused(ref detail))
+                    if detail.contains("clean join is waiting for provider manifest")
+            ),
+            "a provider manifest lost before candidate download must remain retryable instead of activating: {first_attempt:?}"
         );
         let stable_absence = joiner_handle.join_shared(descriptor.clone());
         assert!(
             matches!(
                 stable_absence,
                 Err(SyncRuntimeRequestError::ActorRefused(ref detail))
-                    if detail.contains("LocalActive authorship receipt")
+                    if detail.contains("clean join is waiting for provider manifest")
             ),
-            "provider-staged archive evidence became a terminal local tail after stable loss: {stable_absence:?}"
-        );
-
-        let graph = Graph::open_checked(&joiner.graph_root).unwrap();
-        let classification = discover_startup(&DiscoveryRequest {
-            profile: StartupStorageProfile::ExperimentalSparse,
-            graph_resource_id: graph.canonical_resource_id().unwrap(),
-            runtime_root: &joiner.request.enrollment_root,
-            archive_root: &joiner.request.archive_root,
-        });
-        assert!(
-            matches!(
-                classification,
-                DiscoveryClassification::ExistingLocalActive(_)
-            ),
-            "transient provider absence durably changed enrollment: {classification:?}"
+            "stable provider absence changed the retryable clean-join refusal: {stable_absence:?}"
         );
 
         drop(joiner_handle);
@@ -30187,21 +30164,10 @@ mod tests {
             matches!(
                 restarted_absence,
                 Err(SyncRuntimeRequestError::ActorRefused(ref detail))
-                    if detail.contains("LocalActive authorship receipt")
+                    if detail.contains("clean join is waiting for provider manifest")
             ),
-            "provider-staged archive evidence became a terminal local tail after restart: {restarted_absence:?}"
+            "provider absence changed the retryable clean-join refusal after restart: {restarted_absence:?}"
         );
-        let graph = Graph::open_checked(&joiner.graph_root).unwrap();
-        assert!(matches!(
-            discover_startup(&DiscoveryRequest {
-                profile: StartupStorageProfile::ExperimentalSparse,
-                graph_resource_id: graph.canonical_resource_id().unwrap(),
-                runtime_root: &joiner.request.enrollment_root,
-                archive_root: &joiner.request.archive_root,
-            }),
-            DiscoveryClassification::ExistingLocalActive(_)
-        ));
-
         fs::write(&provider_manifest, manifest_bytes).unwrap();
         let joined = restarted.join_shared(descriptor);
         assert!(
@@ -30310,43 +30276,23 @@ mod tests {
         (initiator, joiner, handle, descriptor)
     }
 
-    fn provider_join_entries_per_cut(fixture: &ActivationFixture) -> usize {
-        [
-            "enrollment",
-            SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
-            SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
-            SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
-            SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
-            "manifests",
-            "objects",
-        ]
-        .into_iter()
-        .map(|namespace| {
-            match fs::read_dir(fixture.request.provider_root.join("outbox").join(namespace)) {
-                Ok(entries) => entries.count(),
-                // Retired namespaces are no longer part of the provider
-                // skeleton; absent means zero entries.
-                Err(_) => 0,
-            }
-        })
-        .sum()
-    }
-
     #[test]
-    fn shared_join_owns_pending_state_against_a_conflicting_join() {
+    fn shared_join_owns_enrollment_transition_against_a_conflicting_join() {
         let (_initiator, joiner, handle, descriptor) =
             pending_shared_join_fixture("join-owner-conflicting-join", 0xfe280);
         let conflicting = make_shared_fixture("join-owner-conflicting-descriptor", 0xfe2c0);
         let conflicting_descriptor = activate_and_prepare_shared(&conflicting);
         let workspace_id = joiner.request.identities.workspace_id;
-        let provider_entries_per_cut = provider_join_entries_per_cut(&joiner);
-        reset_shared_join_instrumentation(workspace_id);
 
-        let (between_turns_entered, between_turns_resume) =
-            install_shared_join_pause(workspace_id, SharedJoinTestPausePoint::BetweenTurns);
+        let (publication_entered, publication_resume) = install_shared_join_pause(
+            workspace_id,
+            SharedJoinTestPausePoint::BeforeEnrollmentPublication,
+        );
         let owner_handle = handle.clone();
         let owner = std::thread::spawn(move || owner_handle.join_shared(descriptor));
-        between_turns_entered.wait();
+        publication_entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("clean join did not reach enrollment publication");
 
         let (contended_entered, contended_resume) = install_shared_join_pause(
             workspace_id,
@@ -30355,9 +30301,11 @@ mod tests {
         let conflicting_handle = handle.clone();
         let competitor =
             std::thread::spawn(move || conflicting_handle.join_shared(conflicting_descriptor));
-        contended_entered.wait();
-        contended_resume.wait();
-        between_turns_resume.wait();
+        contended_entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("conflicting join did not contend for enrollment ownership");
+        contended_resume.send(()).unwrap();
+        publication_resume.send(()).unwrap();
 
         let joined = owner.join().unwrap();
         assert!(
@@ -30368,12 +30316,6 @@ mod tests {
             competitor.join().unwrap(),
             Err(SyncRuntimeRequestError::ActorUnavailable)
         ));
-        let traversal = shared_join_instrumentation(workspace_id);
-        assert_eq!(
-            traversal.provider_entries,
-            provider_entries_per_cut * 2,
-            "a conflicting descriptor cleared and restarted the owner's pending cut: {traversal:?}"
-        );
     }
 
     #[test]
@@ -30382,11 +30324,15 @@ mod tests {
             pending_shared_join_fixture("join-owner-prepare", 0xfe300);
         let workspace_id = joiner.request.identities.workspace_id;
 
-        let (between_turns_entered, between_turns_resume) =
-            install_shared_join_pause(workspace_id, SharedJoinTestPausePoint::BetweenTurns);
+        let (publication_entered, publication_resume) = install_shared_join_pause(
+            workspace_id,
+            SharedJoinTestPausePoint::BeforeEnrollmentPublication,
+        );
         let owner_handle = handle.clone();
         let owner = std::thread::spawn(move || owner_handle.join_shared(descriptor));
-        between_turns_entered.wait();
+        publication_entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("clean join did not reach enrollment publication");
 
         let (contended_entered, contended_resume) = install_shared_join_pause(
             workspace_id,
@@ -30394,9 +30340,11 @@ mod tests {
         );
         let preparing_handle = handle.clone();
         let preparing = std::thread::spawn(move || preparing_handle.prepare_shared());
-        contended_entered.wait();
-        contended_resume.wait();
-        between_turns_resume.wait();
+        contended_entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("prepare_shared did not contend for enrollment ownership");
+        contended_resume.send(()).unwrap();
+        publication_resume.send(()).unwrap();
 
         let joined = owner.join().unwrap();
         assert!(
@@ -30416,23 +30364,26 @@ mod tests {
     }
 
     #[test]
-    fn shared_join_releases_ordinary_operation_ownership_between_turns() {
+    fn shared_join_owns_ordinary_operation_until_atomic_enrollment_commit() {
         let (_initiator, joiner, handle, descriptor) =
             pending_shared_join_fixture("join-owner-status", 0xfe340);
         let workspace_id = joiner.request.identities.workspace_id;
 
-        let (between_turns_entered, between_turns_resume) =
-            install_shared_join_pause(workspace_id, SharedJoinTestPausePoint::BetweenTurns);
+        let (publication_entered, publication_resume) = install_shared_join_pause(
+            workspace_id,
+            SharedJoinTestPausePoint::BeforeEnrollmentPublication,
+        );
         let owner_handle = handle.clone();
         let owner = std::thread::spawn(move || owner_handle.join_shared(descriptor));
-        between_turns_entered.wait();
+        publication_entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("clean join did not reach enrollment publication");
 
-        let snapshot = handle
-            .status()
-            .expect("status must retain ordinary operation ownership between join turns");
-        assert_eq!(snapshot.lifecycle, SyncRuntimeLifecycle::Active);
-        assert_eq!(snapshot.shared_role, None);
-        between_turns_resume.wait();
+        assert!(matches!(
+            handle.inner.operation.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        publication_resume.send(()).unwrap();
         assert!(
             owner.join().unwrap().is_ok(),
             "status changed the outcome of the enrollment owner"

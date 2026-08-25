@@ -20,6 +20,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **The full Rust core corpus now finishes and the release gate no longer hides
+  passing tests.** Five obsolete shared-join test barriers now pause at current,
+  finite clean-runtime concurrency cuts. An honest unfiltered run completed all
+  2,116 selected-or-ignored tests without a hang or timeout, and 47 stale or
+  passing names were removed from the release exclusion. The remaining 45
+  known-red legacy-oracle tests are listed exactly and classified by behavior
+  family, so a newly passing, renamed, or omitted test fails the contract
+  instead of silently drifting outside the gate (GH #350).
+
 - **Page action control labels no longer join dragged text selections.** The
   journal carry-over buttons ("Carry unfinished tasks → today" and friends),
   the tag-table toggle, the guide copy button, and the ⋯ page-actions trigger

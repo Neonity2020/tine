@@ -2,6 +2,32 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "REG-CORE-TEST-COMPLETION-350",
+      "title": "The complete tine-core release corpus terminates and reports every current failure without stale passing exclusions",
+      "family": "release-test-honesty",
+      "sources": {
+        "issues": [
+          350
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux"
+      ],
+      "layer": "rust-test-infrastructure",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "scripts/test-tine-core-nextest-contract.mjs",
+          "scripts/tine-core-nextest-contract.mjs"
+        ],
+        "scenario": "release.tine-core-complete-honest-corpus",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before on exact base 22478c64559ab1b7235df9b486481f62a2244d72: sync_runtime::tests::shared_join_releases_ordinary_operation_ownership_between_turns remained blocked beyond a 75-second diagnostic cap because the clean join now completes in one actor request and never reaches the retired BetweenTurns pause. Four sibling tests waited at equally unreachable BetweenTurns, AfterProviderScan, or AfterLocalScan hooks. Pass-after evidence replaced those hooks with finite current clean-join cuts and all five rewritten tests passed. Honest unfiltered nextest run d8601013-53d9-4e02-ad2b-880423efdafb completed all 2,116 tests in 143.706 seconds: 2,071 passed, 45 failed normally, 41 were ignored, and none hung or timed out. All 45 failures were already named in the old 92-test exclusion, no unexpected test failed, and 47 stale or passing exclusions were removed. The exact residual set is classified into activation/enrollment, application/semantic convergence, provider recovery/publication, and bounded discovery/traversal families. Those legacy-oracle failures do not authorize production changes without independent current-runtime fail-before proof; this change has no production runtime delta."
+    },
+    {
       "id": "REG-MANAGED-BULK-INSERTION-ADMISSION-001",
       "title": "Bulk insertions are admitted against the exact active storage runtime's page limits before the page changes, and a stale or missing binding fails closed",
       "family": "managed-storage-data-safety",

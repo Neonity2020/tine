@@ -89,13 +89,13 @@ jobs:
 
       # PRs run the SAME curated tine-core selection and profile as the release
       # shards, not `cargo test -p tine-core`. The bare package still contains
-      # the pre-0.7 adversarial actor oracle: it is deterministically red, and
-      # several of its scenarios never terminate. libtest has no per-test
-      # timeout, so this step used to hang until the GitHub job limit and the
-      # plugin SDK step below never ran on any PR. The `ci` nextest profile
-      # gives each test its own process, a 5m per-test timeout with
-      # `on-timeout = "fail"`, and no retries. What this selection deliberately
-      # leaves out is proven by name, not by module prefix, in
+      # the exact known-red legacy actor oracle. Its obsolete synchronization
+      # cuts once made several scenarios never terminate; current cuts are
+      # finite, and the honest unfiltered corpus completes with ordinary test
+      # failures only. The `ci` nextest profile gives each test its own process,
+      # a 5m per-test timeout with `on-timeout = "fail"`, and no retries. What
+      # this selection deliberately leaves out is proven by exact name and
+      # classified by behavior family in
       # scripts/tine-core-nextest-contract.mjs.
       - name: Install cargo-nextest 0.9.143
         uses: taiki-e/install-action@v2

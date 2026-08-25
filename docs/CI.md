@@ -61,13 +61,18 @@ deterministic fixtures.
 Linux is Tine's complete behavior matrix: its nextest inventory contract proves
 every selected non-ignored `tine-core` test runs exactly once across four
 isolated shards. Selection is allow-by-default: every current and newly added
-test enters the release gate automatically. The only subtraction is the
-surviving pre-0.7 adversarial actor oracle, proven BY NAME rather than by module
-prefix: `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` in
+test enters the release gate automatically. The only subtraction is the exact
+known-red legacy-oracle corpus, proven BY NAME and classified by behavior family
+rather than hidden behind a module prefix:
+`KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES` in
 `scripts/tine-core-nextest-contract.mjs` lists every excluded test, and the
 contract fails both when another test is omitted and when a listed name no
-longer exists. The same selection and profile run on every pull request, so the
-PR gate and the release shards cannot drift apart. Those tests
+longer exists. The 2026-08-25 honest unfiltered run completed 2,116 tests with
+2,071 passing, 45 normally failing, 41 ignored, and no hangs or timeouts; it
+removed 47 stale or passing exclusions. A residual legacy-oracle failure is not
+itself a current production fail-before. The same selection and profile run on
+every pull request, so the PR gate and the release shards cannot drift apart.
+Those tests
 exercise Tine's semantic and lifecycle integration with the
 exact certified `tine-storage` pin. The package's own complete Linux, Windows,
 Android, format, crash-cut, and API matrix runs when a storage version is cut;

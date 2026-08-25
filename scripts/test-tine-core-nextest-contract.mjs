@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import {
   LINUX_CORE_RELEASE_FILTERSET,
   LINUX_TINE_CORE_SHARD_COUNT,
-  PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+  KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+  KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES,
   WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
   WINDOWS_CORE_EXACT_TEST_NAMES,
   WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
@@ -46,22 +47,22 @@ const releaseSelectedNames = [
   "sync_runtime::tests::current_clean_runtime_contract",
   "sync_runtime::tests::new_production_test_is_selected_automatically",
 ];
-const coreWithLegacyOracle = listedInventory("tine-core", [
+const coreWithKnownRedOracle = listedInventory("tine-core", [
   ...releaseSelectedNames,
-  ...PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+  ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
 ]);
-const releaseWithoutLegacyOracle = listedInventory("tine-core", releaseSelectedNames);
+const releaseWithoutKnownRedOracle = listedInventory("tine-core", releaseSelectedNames);
 assert.deepEqual(
-  verifyLinuxReleaseSelection(coreWithLegacyOracle, releaseWithoutLegacyOracle),
+  verifyLinuxReleaseSelection(coreWithKnownRedOracle, releaseWithoutKnownRedOracle),
   {
-    coreTestCount: releaseSelectedNames.length + PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length,
+    coreTestCount: releaseSelectedNames.length + KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length,
     releaseTestCount: releaseSelectedNames.length,
-    legacyOracleTestCount: PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length,
+    knownRedTestCount: KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length,
   }
 );
 assert.throws(
   () => verifyLinuxReleaseSelection(
-    coreWithLegacyOracle,
+    coreWithKnownRedOracle,
     listedInventory("tine-core", releaseSelectedNames.slice(0, 2))
   ),
   /Linux release exclusion contract changed.*new_production_test_is_selected_automatically/
@@ -69,13 +70,13 @@ assert.throws(
 
 // And a listed exclusion whose test no longer exists must fail too, so the list
 // cannot rot through renames or deletions.
-const staleOracleName = PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES[0];
+const staleOracleName = KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES[0];
 const coreWithoutOneOracleTest = listedInventory("tine-core", [
   ...releaseSelectedNames,
-  ...PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.filter((name) => name !== staleOracleName),
+  ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.filter((name) => name !== staleOracleName),
 ]);
 assert.throws(
-  () => verifyLinuxReleaseSelection(coreWithoutOneOracleTest, releaseWithoutLegacyOracle),
+  () => verifyLinuxReleaseSelection(coreWithoutOneOracleTest, releaseWithoutKnownRedOracle),
   new RegExp(`Linux release exclusion contract changed; missing \\[${staleOracleName}\\]`)
 );
 
@@ -83,17 +84,28 @@ assert.throws(
 // the omitted test is in sync_runtime or another module.
 assert.throws(
   () => verifyLinuxReleaseSelection(
-    coreWithLegacyOracle,
+    coreWithKnownRedOracle,
     listedInventory("tine-core", releaseSelectedNames.filter((name) => !name.startsWith("model::tests::")))
   ),
   /excluded non-oracle test/
 );
-for (const name of PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES) {
+const familyNames = Object.values(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES).flat();
+assert.deepEqual([...familyNames].sort(), KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES);
+assert.deepEqual(Object.keys(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES), [
+  "activationAndEnrollment",
+  "applicationAndSemanticConvergence",
+  "providerRecoveryAndPublication",
+  "boundedDiscoveryAndTraversal",
+]);
+for (const names of Object.values(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES)) {
+  assert.ok(names.length > 0);
+}
+for (const name of KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES) {
   assert.match(name, /^sync_runtime::tests::/);
 }
 assert.equal(
-  new Set(PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES).size,
-  PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length
+  new Set(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES).size,
+  KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length
 );
 
 assert.match(

@@ -1370,16 +1370,20 @@ The ordinary release suite tests the clean baseline-plus-manifest runtime,
 including activation, cold reopen, editor/application saves, external
 reconciliation, cross-page moves, graph/PDF/guide reads, sharing, late join,
 restart, and clean shutdown. Every current and newly added non-ignored
-`tine-core` test is selected automatically. The frozen pre-0.7 actor failure
+`tine-core` test is selected automatically. The known-red legacy actor failure
 corpus remains a regression oracle for the retirement campaign, but retired
 enrollment, Patricia, persistent projection-work, and promoted-runtime
 mechanics are not compiled production alternatives and cannot redefine the
 release contract. The only tests the release gate does not run are enumerated
-by name in `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` in
+by behavior family and exact name in
+`KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES` in
 `scripts/tine-core-nextest-contract.mjs`; the contract fails both on any other
-omission and on a listed name with no test behind it. Architectural guards that
-bind this document to the code therefore enter the release suite without a
-second hand-maintained allowlist.
+omission and on a listed name with no test behind it. The 2026-08-25 honest
+unfiltered run established the current boundary: 2,071 passing, 45 normally
+failing, 41 ignored, and no hangs or timeouts. A legacy-oracle failure does not
+authorize a production change without an independent current-runtime
+fail-before. Architectural guards that bind this document to the code therefore
+enter the release suite without a second hand-maintained allowlist.
 
 Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
 20. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
