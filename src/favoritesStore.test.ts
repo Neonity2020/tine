@@ -2,7 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { backend } from "./backend";
 import { layoutFromBlocks } from "./favoritesLayout";
 import {
+  addGroup,
   adoptExternalMembership,
+  deleteGroup,
+  locateRow,
+  moveFavoriteRow,
+  renameGroup,
+  setGroupCollapsed,
   favoritesLayout,
   favoritesLayoutPage,
   loadFavoritesLayout,
@@ -115,5 +121,73 @@ describe("favorites arrangement store", () => {
     expect(favoritesLayout()[1].items.map((i) => i.name)).toEqual(["Alpha"]);
     expect(savePage).not.toHaveBeenCalled();
     expect(setFavorites).not.toHaveBeenCalled();
+  });
+});
+
+describe("arrangement mutations", () => {
+  const arranged = () =>
+    layoutFromBlocks([
+      block("[[Alpha]]"),
+      block("Work", [block("[[Beta]]"), block("[[Gamma]]")]),
+    ]);
+
+  it("locates a global row index inside its group", () => {
+    const l = arranged();
+    expect(locateRow(l, 0)).toEqual({ group: 0, index: 0 });
+    expect(locateRow(l, 1)).toEqual({ group: 1, index: 0 });
+    expect(locateRow(l, 2)).toEqual({ group: 1, index: 1 });
+    expect(locateRow(l, 3)).toBeNull();
+  });
+
+  // `to` is a global row index in the array AFTER removal — the same contract
+  // rowReorder's commit(from, to) already uses.
+  it("moves a favorite into a group, at the drop position", () => {
+    const head = moveFavoriteRow(arranged(), 0, 0, 1);
+    expect(head[0].items).toEqual([]);
+    expect(head[1].items.map((i) => i.name)).toEqual(["Alpha", "Beta", "Gamma"]);
+
+    const middle = moveFavoriteRow(arranged(), 0, 1, 1);
+    expect(middle[1].items.map((i) => i.name)).toEqual(["Beta", "Alpha", "Gamma"]);
+  });
+
+  it("appends to the target group when the drop index lands outside it", () => {
+    const next = moveFavoriteRow(arranged(), 0, 99, 1);
+    expect(next[1].items.map((i) => i.name)).toEqual(["Beta", "Gamma", "Alpha"]);
+  });
+
+  it("moves a favorite out of a group back to ungrouped", () => {
+    const next = moveFavoriteRow(arranged(), 1, 0, 0);
+    expect(next[0].items.map((i) => i.name)).toEqual(["Beta", "Alpha"]);
+    expect(next[1].items.map((i) => i.name)).toEqual(["Gamma"]);
+  });
+
+  it("reorders within a group", () => {
+    const next = moveFavoriteRow(arranged(), 2, 1, 1);
+    expect(next[1].items.map((i) => i.name)).toEqual(["Gamma", "Beta"]);
+  });
+
+  it("adds groups without colliding", () => {
+    const next = addGroup(addGroup(arranged(), "Work"), "Work");
+    expect(next.map((g) => g.name)).toEqual([null, "Work", "Work 2", "Work 3"]);
+  });
+
+  it("renames a group and refuses an empty name", () => {
+    expect(renameGroup(arranged(), 1, "Projects")[1].name).toBe("Projects");
+    expect(renameGroup(arranged(), 1, "   ")[1].name).toBe("Work");
+    // The ungrouped section is not a group and cannot be renamed.
+    expect(renameGroup(arranged(), 0, "Nope")[0].name).toBeNull();
+  });
+
+  // The contract worth stealing from Capacities, and the one Obsidian's
+  // bookmark folders get wrong: deleting a group must not unfavorite anything.
+  it("deletes a group without losing its favorites", () => {
+    const next = deleteGroup(arranged(), 1);
+    expect(next.map((g) => g.name)).toEqual([null]);
+    expect(next[0].items.map((i) => i.name)).toEqual(["Alpha", "Beta", "Gamma"]);
+  });
+
+  it("collapses and expands a group", () => {
+    expect(setGroupCollapsed(arranged(), 1, true)[1].collapsed).toBe(true);
+    expect(setGroupCollapsed(arranged(), 1, false)[1].collapsed).toBeUndefined();
   });
 });

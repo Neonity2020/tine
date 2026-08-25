@@ -20,6 +20,7 @@ import {
   layoutMembers,
   layoutToMarkdown,
   reconcileLayout,
+  uniqueGroupName,
 } from "./favoritesLayout";
 import { createSignal } from "solid-js";
 
@@ -130,4 +131,83 @@ export async function persistFavoritesLayout(next: FavLayout): Promise<void> {
     // through and still project, so the favorites themselves persist.
   }
   await backend().setFavorites(names).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Arrangement mutations.
+//
+// The sidebar renders one flat run of rows across all groups (group headers are
+// not rows), so a drag speaks in GLOBAL row indices plus the group the drop
+// landed in. That keeps `rowReorder` a single-list helper — the thing it
+// already is and is already tested for — instead of teaching it about
+// containers, while still allowing a drop across a group boundary, which is
+// otherwise ambiguous at the boundary index.
+
+/** (group index, index within group) for a global row index. */
+export function locateRow(next: FavLayout, global: number): { group: number; index: number } | null {
+  let seen = 0;
+  for (let g = 0; g < next.length; g += 1) {
+    const size = next[g].items.length;
+    if (global < seen + size) return { group: g, index: global - seen };
+    seen += size;
+  }
+  return null;
+}
+
+/** Move one favorite to a global row position, landing it in `targetGroup`. */
+export function moveFavoriteRow(
+  next: FavLayout,
+  from: number,
+  to: number,
+  targetGroup: number,
+): FavLayout {
+  const source = locateRow(next, from);
+  if (!source) return next;
+  const groups = next.map((group) => ({ ...group, items: [...group.items] }));
+  const [item] = groups[source.group].items.splice(source.index, 1);
+  if (!item) return next;
+  const clampedGroup = Math.max(0, Math.min(targetGroup, groups.length - 1));
+  // `to` is a global index in the array AFTER removal, so resolve it there.
+  const landing = locateRow(
+    groups.map((group) => ({ ...group })),
+    Math.max(0, to),
+  );
+  const index =
+    landing && landing.group === clampedGroup
+      ? landing.index
+      : groups[clampedGroup].items.length;
+  groups[clampedGroup].items.splice(index, 0, item);
+  return groups;
+}
+
+export function addGroup(next: FavLayout, desired = "New group"): FavLayout {
+  return [...next, { name: uniqueGroupName(next, desired), items: [], passthrough: [] }];
+}
+
+export function renameGroup(next: FavLayout, groupIndex: number, name: string): FavLayout {
+  const trimmed = name.trim();
+  if (!trimmed || groupIndex <= 0 || groupIndex >= next.length) return next;
+  return next.map((group, i) =>
+    i === groupIndex ? { ...group, name: uniqueGroupName(next.filter((_, j) => j !== i), trimmed) } : group
+  );
+}
+
+/** Delete a group WITHOUT unfavoriting anything: its members move to the
+ *  ungrouped section. Capacities states this contract explicitly and it is the
+ *  one users rely on; Obsidian's bookmark folders lose the reference instead. */
+export function deleteGroup(next: FavLayout, groupIndex: number): FavLayout {
+  if (groupIndex <= 0 || groupIndex >= next.length) return next;
+  const doomed = next[groupIndex];
+  return next
+    .map((group, i) =>
+      i === 0
+        ? { ...group, items: [...group.items, ...doomed.items], passthrough: [...group.passthrough, ...doomed.passthrough] }
+        : group
+    )
+    .filter((_, i) => i !== groupIndex);
+}
+
+export function setGroupCollapsed(next: FavLayout, groupIndex: number, collapsed: boolean): FavLayout {
+  if (groupIndex <= 0 || groupIndex >= next.length) return next;
+  return next.map((group, i) => (i === groupIndex ? { ...group, collapsed: collapsed || undefined } : group));
 }
