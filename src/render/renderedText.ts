@@ -236,6 +236,13 @@ function inlineText(nodes: Inline[], o: RenderedTextOptions): string {
       case "hiccup":
         out += s.v;
         break;
+      default: {
+        // DUP-8 exhaustiveness guard: a new `Inline` variant must fail `tsc`
+        // here rather than silently vanishing from rendered text.
+        const _exhaustive: never = s;
+        out += _exhaustive;
+        break;
+      }
     }
   }
   return out;

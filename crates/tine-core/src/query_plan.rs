@@ -1566,21 +1566,6 @@ pub(crate) fn legacy_page_search_entries(
         .unwrap_or_default()
 }
 
-fn crumb_line(block: &DocBlock) -> String {
-    let line = block
-        .visible_text()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if line.chars().count() > 60 {
-        format!("{}…", line.chars().take(60).collect::<String>())
-    } else {
-        line
-    }
-}
-
 fn walk_blocks<'a>(
     blocks: &'a [DocBlock],
     ancestors: &mut Vec<&'a DocBlock>,
@@ -1671,7 +1656,7 @@ where
                             index: candidate_index,
                             page: entry,
                             block,
-                            breadcrumb: path.iter().map(|ancestor| crumb_line(ancestor)).collect(),
+                            breadcrumb: path.iter().map(|ancestor| crate::doc::crumb_line(ancestor)).collect(),
                         },
                     );
                 }

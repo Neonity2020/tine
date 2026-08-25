@@ -10357,6 +10357,9 @@ fn application_page_block_reference_counts(
     Ok(counts)
 }
 
+/// The managed path holds raw text rather than a parsed outline, so it builds a
+/// throwaway `DocBlock` to reach the projection -- but the truncation rule
+/// itself is [`crate::doc::crumb_line`], not a third copy of it (DUP-8).
 fn application_crumb_line(raw: &str, is_org: bool) -> String {
     let block = crate::doc::DocBlock {
         raw: raw.to_owned(),
@@ -10365,12 +10368,7 @@ fn application_crumb_line(raw: &str, is_org: bool) -> String {
         is_org,
         proj: std::sync::OnceLock::new(),
     };
-    let line = block.visible_text().lines().next().unwrap_or("").trim();
-    if line.chars().count() > 60 {
-        format!("{}…", line.chars().take(60).collect::<String>())
-    } else {
-        line.to_owned()
-    }
+    crate::doc::crumb_line(&block)
 }
 
 fn application_query_page_recency(

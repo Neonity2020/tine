@@ -5,6 +5,10 @@
 pub mod concord_ledger;
 pub mod concord_queue;
 pub mod config;
+/// Test-only: every `Config` field either reaches `GraphMeta` (Rust and TS) or
+/// says why it does not.
+#[cfg(test)]
+mod config_projection_parity;
 pub mod date;
 mod direct_projection;
 pub mod doc;

@@ -253,7 +253,7 @@ function parseBoolean(q: string): Term[][] {
   return groups.filter((g) => g.length > 0);
 }
 
-interface Token {
+export interface Token {
   text: string;
   negated: boolean;
   quoted: boolean;
@@ -262,7 +262,11 @@ interface Token {
 
 // Split into tokens, honoring `"quoted phrases"` (may contain spaces) and a
 // leading `-` for negation. A bare unquoted `OR` becomes an OR separator.
-function tokenize(q: string): Token[] {
+//
+// Exported so the shared conformance corpus
+// (`tests/fixtures/search-query-corpus.json`) can be asserted against the same
+// function the Rust side asserts against, rather than against a proxy.
+export function tokenize(q: string): Token[] {
   const chars = Array.from(q);
   const out: Token[] = [];
   let i = 0;

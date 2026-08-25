@@ -278,7 +278,11 @@ fn collect_reference_matches<'a, M, T>(
 fn crumb_line_estimated_bytes(block: &DocBlock) -> usize {
     let line = block.visible_text().lines().next().unwrap_or("").trim();
     let mut chars = line.chars();
-    let bytes = chars.by_ref().take(60).map(char::len_utf8).sum::<usize>();
+    let bytes = chars
+        .by_ref()
+        .take(crate::doc::CRUMB_MAX_CHARS)
+        .map(char::len_utf8)
+        .sum::<usize>();
     bytes + usize::from(chars.next().is_some()) * '…'.len_utf8()
 }
 
@@ -337,22 +341,6 @@ thread_local! {
 
 /// Cancellable variant used by interactive search. Returning false from `f`
 /// stops the entire depth-first walk, including the current deep page.
-/// A short, single-line label for a block in a breadcrumb trail.
-fn crumb_line(b: &DocBlock) -> String {
-    let line = b
-        .visible_text()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if line.chars().count() > 60 {
-        format!("{}…", line.chars().take(60).collect::<String>())
-    } else {
-        line
-    }
-}
-
 /// Collect matching blocks from an exact candidate set, or from the complete
 /// already-parsed graph when no safe candidate set is available. The parser
 /// remains the semantic authority; this helper performs no disk I/O or parsing.
@@ -405,7 +393,7 @@ fn collect_bounded_candidates(
                     let mut dto = result_dto(block);
                     dto.breadcrumb = ancestors
                         .iter()
-                        .map(|ancestor| crumb_line(ancestor))
+                        .map(|ancestor| crate::doc::crumb_line(ancestor))
                         .collect();
                     Some(dto)
                 },
@@ -823,7 +811,7 @@ pub(crate) fn application_page_reference_matches(
                     output.push((dto, hit));
                 }
             }
-            ancestors.push(crumb_line(&projected));
+            ancestors.push(crate::doc::crumb_line(&projected));
             visit(
                 &block.children,
                 is_org,
@@ -979,7 +967,7 @@ fn collect_reference_occurrences_bounded(
                     let mut dto = result_dto(block);
                     dto.breadcrumb = ancestors
                         .iter()
-                        .map(|ancestor| crumb_line(ancestor))
+                        .map(|ancestor| crate::doc::crumb_line(ancestor))
                         .collect();
                     Some((dto, hit))
                 },
@@ -3613,7 +3601,18 @@ pub(crate) fn application_page_templates(
                 .map(|child| template_dto_from_application(child, false))
                 .collect(),
             breadcrumb: Vec::new(),
-            ..BlockDto::default()
+            // DUP-8: every field spelled out, at its `Default` value, so a new
+            // `BlockDto` field has to be decided here instead of arriving
+            // silently defaulted. A template copy carries no facets: the raw
+            // text still holds them and the caller re-derives on insert.
+            page_property: false,
+            marker: None,
+            priority: None,
+            heading_level: None,
+            scheduled: None,
+            deadline: None,
+            tags: Vec::new(),
+            properties: Vec::new(),
         }
     }
 
@@ -3686,7 +3685,16 @@ fn template_dto(b: &DocBlock, strip_template: bool) -> BlockDto {
         collapsed: false,
         children: b.children.iter().map(|c| template_dto(c, false)).collect(),
         breadcrumb: Vec::new(),
-        ..Default::default()
+        // DUP-8: every field spelled out, at its `Default` value -- see
+        // `template_dto_from_application` above, whose behavior this mirrors.
+        page_property: false,
+        marker: None,
+        priority: None,
+        heading_level: None,
+        scheduled: None,
+        deadline: None,
+        tags: Vec::new(),
+        properties: Vec::new(),
     }
 }
 

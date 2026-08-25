@@ -50874,8 +50874,22 @@ mod tests {
             title: "Prospective".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "my draft".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,
@@ -51036,8 +51050,22 @@ mod tests {
             title: "First save".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "created".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,
@@ -51593,8 +51621,22 @@ mod tests {
             title: "New".into(),
             pre_block: None,
             blocks: vec![BlockDto {
+                // DUP-8: spelled out at its `Default` value so a new `BlockDto`
+                // field has to be decided here rather than arriving silently
+                // defaulted.
+                id: String::new(),
                 raw: "mine".into(),
-                ..Default::default()
+                collapsed: false,
+                children: Vec::new(),
+                breadcrumb: Vec::new(),
+                page_property: false,
+                marker: None,
+                priority: None,
+                heading_level: None,
+                scheduled: None,
+                deadline: None,
+                tags: Vec::new(),
+                properties: Vec::new(),
             }],
             rev: None,
             format: Format::Md,
