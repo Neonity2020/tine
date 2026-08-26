@@ -1027,10 +1027,22 @@ fn every_top_level_receipt_namespace_fails_closed_after_deletion_or_copy_replace
     }
 }
 
+/// A per-intent recovery namespace that is missing on reopen is **recreated**,
+/// not refused.
+///
+/// Refusal census 2026-08-26 (P-census). This test replaces
+/// `established_per_intent_namespaces_cannot_be_deleted_replaced_or_recreated_after_reopen`,
+/// which asserted the opposite: that a per-intent namespace bound by its
+/// reservation/authority artifact pair could never be recreated by name. That
+/// refusal defended only an actor able to rename directories inside Tine's
+/// app-private receipt store — out of scope per
+/// `specs/notes/2026-08-07-trust-model-and-threat-model-decision.md` — while
+/// making a lost or torn 1 KB binding artifact wedge the page's projection
+/// permanently. The artifacts and the refusals are gone; absence is recovery.
 #[test]
-fn established_per_intent_namespaces_cannot_be_deleted_replaced_or_recreated_after_reopen() {
+fn a_missing_per_intent_recovery_namespace_is_recreated_instead_of_wedging_projection() {
     for namespace in ["attempts", "forensics"] {
-        let root = TestDir::new(&format!("per-intent-authority-{namespace}"));
+        let root = TestDir::new(&format!("per-intent-recovery-{namespace}"));
         let store = ProjectionReceiptStore::open(root.path(), workspace(1)).unwrap();
         let projection = plan(
             &page(
@@ -1043,54 +1055,30 @@ fn established_per_intent_namespaces_cannot_be_deleted_replaced_or_recreated_aft
         let intent_id = store.publish_intent(intent, None).unwrap();
         let name = intent_id.to_string();
         let live = root.path().join(namespace).join(&name);
-        let retained = root.path().join(namespace).join(format!("{name}-retained"));
-        fs::rename(&live, &retained).unwrap();
-
-        let missing = if namespace == "attempts" {
-            store.load_attempt_reservations(intent).map(|_| ())
-        } else {
-            store.local_forensic_evidence(intent).map(|_| ())
-        };
-        assert!(matches!(
-            missing,
-            Err(ProjectionStoreError::NamespaceSubstitution(_))
-        ));
-
-        copy_directory_tree(&retained, &live);
-        let replacement = if namespace == "attempts" {
-            store.load_attempt_reservations(intent).map(|_| ())
-        } else {
-            store.local_forensic_evidence(intent).map(|_| ())
-        };
-        assert!(matches!(
-            replacement,
-            Err(ProjectionStoreError::NamespaceSubstitution(_))
-        ));
+        assert!(live.is_dir());
         drop(store);
 
+        // The state a crash between `mkdir` and the next barrier can leave, and
+        // the state the deleted binding artifacts used to make unrecoverable.
         fs::remove_dir_all(&live).unwrap();
-        fs::remove_file(
-            root.path()
-                .join(namespace)
-                .join(format!("{name}.namespace-authority")),
-        )
-        .unwrap();
-        fs::remove_file(
-            root.path()
-                .join(namespace)
-                .join(format!("{name}.namespace-reservation")),
-        )
-        .unwrap();
+
         let reopened = ProjectionReceiptStore::open(root.path(), workspace(1)).unwrap();
-        let deleted = if namespace == "attempts" {
-            reopened.load_attempt_reservations(intent).map(|_| ())
-        } else {
-            reopened.local_forensic_evidence(intent).map(|_| ())
-        };
-        assert!(matches!(
-            deleted,
-            Err(ProjectionStoreError::NamespaceSubstitution(_))
-        ));
-        assert!(!live.exists());
+        let reservation = reopened
+            .reserve_attempt(intent)
+            .expect("a missing per-intent namespace is recreated, not refused");
+        // `begin_mutation` needs BOTH per-intent namespaces, so it is what
+        // proves the forensics namespace recovers too.
+        let authority = reopened
+            .begin_mutation(intent, Some(&reservation))
+            .expect("a missing per-intent namespace is recreated, not refused");
+        drop(authority);
+        assert!(
+            live.is_dir(),
+            "the {namespace} namespace is recreated on demand"
+        );
+        assert_eq!(
+            reopened.load_attempt_reservations(intent).unwrap(),
+            vec![reservation]
+        );
     }
 }

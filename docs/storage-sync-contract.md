@@ -926,9 +926,27 @@ hardening; it is unpaid latency, and later a source of availability bugs.
 | `fsync` before reading a projection evidence file | `model::sync_and_read_projection_regular` | — | A read through the same process's page cache returns the bytes the writer wrote whether or not they are on the platter. Flushing cannot change the result and cannot detect corruption. | Plain bounded read (`read_projection_regular`) |
 | `fsync` before opening-and-reading a projection file | `model::sync_open_and_read_projection_regular` | — | As above. On Windows it additionally forced a write-capable open for a read. | `open_and_read_projection_regular` |
 | `fsync` before re-reading a retained quarantine handle | `model::sync_and_reread_retained_projection_file` | — | As above; the handle is the one this process just wrote through. | `reread_retained_projection_file` |
+| Per-intent namespace **reservation** artifact (`<intent>.namespace-reservation`) and its refusals | `projection_store::open_intent_namespace` | — | Published before `mkdir` of `attempts/<intent>` and `forensics/<intent>` and re-read on every open. It detects only a directory renamed/replaced *inside Tine's app-private receipt store*, which needs an actor with write access as the user — out of scope. No crash, torn write, disk error, sync delivery, external-editor race, honest concurrent instance, or honest multi-device divergence can rename a directory. A torn or lost 1 KB binding, by contrast, wedged the page's projection permanently. | Absence is recovery: `ensure_directory_nofollow` recreates the namespace and the drain republishes its byte-identical contents |
+| Per-intent namespace **authority** artifact (`<intent>.namespace-authority`) and its refusals | `projection_store::open_intent_namespace`, `projection_store::validate_live_intent_namespace` | — | As above. Its device/inode binding re-proved, from a file, a fact the live directory handle already answers for free. | The live `canonical_directory_identity` comparison against the identity the in-flight `DurableProjectionMutationAuthority` already records; no artifact, no barrier |
 
-Between them these fired three times per managed save and eight times per
-cross-page move. Integrity of projection evidence is still checked, by the means
+The three `fsync`-on-read helpers fired three times per managed save and eight
+times per cross-page move. The two per-intent namespace binding artifacts fired
+**four times per projected page** (two namespaces x reservation + authority),
+costing eight barriers per page: eight of an ordinary save's 45 and sixteen of a
+cross-page move's 109. Removing them is the four-artifact cut Martin signed on
+2026-08-26 after the refusal census
+(`specs/notes/2026-08-26-p-census-receipt.md`) confirmed that no in-scope
+scenario relies on them.
+
+The refusals they carried are replaced by recovery, not by nothing: a per-intent
+recovery namespace that is absent on reopen is recreated
+(`projection_store::intent_namespace`), and everything inside it is
+content- or intent-addressed, so the drain — which still holds the undrained
+journal frame for the accepted edit — republishes byte-identical artifacts.
+`projection_integration_tests::a_missing_per_intent_recovery_namespace_is_recreated_instead_of_wedging_projection`
+is that recovery's test; it replaces
+`established_per_intent_namespaces_cannot_be_deleted_replaced_or_recreated_after_reopen`,
+which asserted the deleted refusal. Integrity of projection evidence is still checked, by the means
 that actually detects corruption: `projection_recovery_matches_record` compares
 the exact `BlobDescription` and the canonical file resource id. No read path may
 reintroduce a durability barrier.
@@ -1233,21 +1251,25 @@ are deleted, and no read path may reintroduce one. See the `MS-REF-` note below.
 barrier `tine-core` initiates and
 `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 asserts the per-operation totals against
-`MANAGED_SAVE_BARRIER_BUDGET` = **45** and `MANAGED_MOVE_BARRIER_BUDGET` =
-**109**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+`MANAGED_SAVE_BARRIER_BUDGET` = **37** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**93**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
 appends and SQLite file-set publication are not reachable from this crate and
 are excluded (measured at three more per save, four per move).
 
 The cost-model audit's target is 3 and 5. The gap is stated here rather than
-hidden, and it is entirely in two places that this contract does not yet cover:
+hidden, and it is in two places that this contract does not yet cover:
 
-* The **projection receipt store** publishes nine artifacts per intent (base,
-  two per-intent namespace bindings of two artifacts each, intent, attempt
-  reservation, mutation authority, completion) = 18 barriers per projected page.
-  They are not batched because their readers treat "present with unexpected
-  bytes" as namespace substitution and refuse, and because four of the nine
-  exist only to defend against an adversary the trust model puts out of scope.
-  Collapsing them is a scope decision, not an implementation detail.
+* The **projection receipt store** publishes five artifacts per intent (base,
+  intent, attempt reservation, mutation authority, completion) = 10 barriers per
+  projected page, plus one forensic-evidence record and one pending-cleanup
+  marker for each recovery file a projection displaces. It published *nine*
+  before the 2026-08-26 refusal census cut the four per-intent namespace
+  bindings; the survivors each name an in-scope crash/torn-write scenario and
+  are recorded in the census
+  (`specs/notes/2026-08-26-p-census-receipt.md`). They are still published one
+  at a time: each is separated from the next by a read-back of the artifact just
+  published, so staging them behind one barrier would have to carry the staged
+  bytes in memory as well. Collapsing that is the next step, not this one.
 * The **projection directory chain** is flushed about six times per foreground
   save (12 barriers for a two-deep chain). That is the user-visible Markdown
   write path, whose temp + fsync + rename + base-revision guard + lock semantics

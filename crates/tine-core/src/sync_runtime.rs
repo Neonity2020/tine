@@ -40496,6 +40496,16 @@ mod tests {
     /// the budget was set, because barrier count is a property of the *shape*
     /// of an accepted batch and not of graph size — which is exactly why a
     /// small fixture can guard it.
+    /// Mark the operation boundary in a `TINE_PUBLISH_TRACE=1` run, so the
+    /// per-artifact-class ledger the budget produces can be split into
+    /// "activation", "save" and "move" instead of read as one undivided list.
+    /// Silent otherwise.
+    fn publication_trace_phase(phase: &str) {
+        if std::env::var_os("TINE_PUBLISH_TRACE").is_some() {
+            eprintln!("PUBLISH PHASE {phase}");
+        }
+    }
+
     #[test]
     fn managed_save_and_move_stay_within_their_barrier_budget() {
         let session = crate::durability_counters::BarrierSession::begin();
@@ -40511,6 +40521,7 @@ mod tests {
         // (c) one accepted single-block save, foreground plus deferred drain.
         let (page, revision) = load_application_exact(&handle, &request.source_path);
         session.reset();
+        publication_trace_phase("save");
         let (page, revision) =
             save_application_block_text(&handle, page, revision, "budgeted single-block edit");
         let save_foreground = session.counts();
@@ -40529,6 +40540,7 @@ mod tests {
             load_application_exact(&handle, &request.destination_path);
         request.destination_revision = destination_revision;
         session.reset();
+        publication_trace_phase("move");
         let moved = accepted_application_move(&handle, &request);
         assert!(matches!(
             moved,

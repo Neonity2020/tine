@@ -32,7 +32,6 @@ use super::object_store::{
     sync_dir_required, StoreError,
 };
 use super::sync_layout::{
-    INTENT_NAMESPACE_AUTHORITY_SUFFIX, INTENT_NAMESPACE_RESERVATION_SUFFIX,
     MUTATION_AUTHORITY_LEASE_SUFFIX, MUTATION_AUTHORITY_SUFFIX,
     PROJECTION_ATTEMPTS_DIR as ATTEMPTS_DIR, PROJECTION_BASES_DIR as BASES_DIR,
     PROJECTION_CLEANUP_ROUND_0_DIR, PROJECTION_CLEANUP_ROUND_1_DIR,
@@ -80,7 +79,7 @@ const PENDING_CLEANUP_MARKER_SCHEMA_VERSION: u32 = 1;
 const PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION: u32 = 1;
 pub(crate) const PROJECTION_RECOVERY_GRACE_SECONDS: u64 = 24 * 60 * 60;
 pub(crate) const MAX_PENDING_PROJECTION_CLEANUP_PER_PASS: usize = 64;
-const INTENT_NAMESPACE_SCHEMA_VERSION: u32 = 1;
+const PENDING_CLEANUP_NAMESPACE_SCHEMA_VERSION: u32 = 1;
 const MUTATION_AUTHORITY_SCHEMA_VERSION: u32 = 1;
 const MAX_MUTATION_ATTEMPTS: usize = 1_000_000;
 const MAX_MUTATION_AUTHORITY_BYTES: usize = 64 * 1024 * 1024;
@@ -709,25 +708,6 @@ impl ReceiptNamespaces {
             self.forensics.identity,
         ]
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IntentNamespaceReservation {
-    schema_version: u32,
-    store_id: ProjectionReceiptStoreId,
-    namespace: String,
-    intent_id: ProjectionIntentId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IntentNamespaceAuthority {
-    schema_version: u32,
-    store_id: ProjectionReceiptStoreId,
-    namespace: String,
-    intent_id: ProjectionIntentId,
-    directory_identity: DirectoryIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2401,6 +2381,36 @@ impl ProjectionReceiptStore {
         retained.capability.try_clone().map_err(Into::into)
     }
 
+    /// Open this intent's private recovery namespace, creating it if it is
+    /// absent.
+    ///
+    /// **Refusal census 2026-08-26 (P-census).** This used to bind the
+    /// directory with two immutable artifacts per namespace — a reservation
+    /// published before `mkdir` and an authority published after it, recording
+    /// the directory's device/inode identity — and to refuse
+    /// `NamespaceSubstitution` whenever either was absent, non-canonical, or
+    /// disagreed with the live directory. Four artifacts, eight durability
+    /// barriers, per projected page.
+    ///
+    /// The only failure those refusals detected is an actor who can rename or
+    /// replace a directory *inside Tine's app-private receipt store*. That
+    /// actor already has write access as the user and could replace the Tine
+    /// binary, which
+    /// `specs/notes/2026-08-07-trust-model-and-threat-model-decision.md` puts
+    /// explicitly out of scope. No in-scope failure — crash or power loss,
+    /// torn write, disk error, Syncthing/Dropbox delivery, external-editor
+    /// race, honest concurrent instance, honest multi-device divergence,
+    /// malformed imported content — is detected by them: the receipt store is
+    /// app-private, is never synced, is single-writer under the workspace
+    /// runtime lease, and a crash cannot rename a directory. What the refusals
+    /// *did* add was a wedge: a torn 1 KB JSON binding, or a namespace whose
+    /// binding artifact was lost, refused the page's projection permanently.
+    ///
+    /// Per the refusal-scenario rule, the check is therefore gone and absence
+    /// is a **recovery**: recreate the directory and continue. Recreating it is
+    /// safe because everything inside is content- or intent-addressed and is
+    /// republished byte-identically by the drain, which still holds the
+    /// undrained journal frame for the accepted edit.
     fn intent_namespace(
         &self,
         namespace: &str,
@@ -2423,18 +2433,15 @@ impl ProjectionReceiptStore {
         self.open_intent_namespace(namespace, intent_id, false)
     }
 
+    /// The recovery form of [`Self::intent_namespace`]: a namespace that an
+    /// earlier published intent implies must exist is recreated when it is
+    /// missing instead of refusing the projection forever.
     fn required_intent_namespace(
         &self,
         namespace: &str,
         intent_id: ProjectionIntentId,
     ) -> Result<Dir, ProjectionStoreError> {
-        self.existing_intent_namespace(namespace, intent_id)?
-            .ok_or_else(|| {
-                ProjectionStoreError::NamespaceSubstitution(format!(
-                    "missing established {namespace}/{}",
-                    hex(intent_id.as_bytes())
-                ))
-            })
+        self.intent_namespace(namespace, intent_id)
     }
 
     fn open_intent_namespace(
@@ -2445,109 +2452,24 @@ impl ProjectionReceiptStore {
     ) -> Result<Option<Dir>, ProjectionStoreError> {
         let parent = self.namespace(namespace)?;
         let name = hex(intent_id.as_bytes());
-        let reservation_name = format!("{name}{INTENT_NAMESPACE_RESERVATION_SUFFIX}");
-        let authority_name = format!("{name}{INTENT_NAMESPACE_AUTHORITY_SUFFIX}");
-        let expected_reservation = IntentNamespaceReservation {
-            schema_version: INTENT_NAMESPACE_SCHEMA_VERSION,
-            store_id: self.store_id,
-            namespace: namespace.to_owned(),
-            intent_id,
-        };
-        let reservation_bytes = serde_json::to_vec(&expected_reservation)
-            .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?;
-
-        if let Some(bytes) = read_optional_regular(&parent, &authority_name, 1024, None)? {
-            let authority: IntentNamespaceAuthority = serde_json::from_slice(&bytes)
-                .map_err(|error| ProjectionStoreError::Decode(error.to_string()))?;
-            if serde_json::to_vec(&authority)
-                .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?
-                != bytes
-                || authority.schema_version != INTENT_NAMESPACE_SCHEMA_VERSION
-                || authority.store_id != self.store_id
-                || authority.namespace != namespace
-                || authority.intent_id != intent_id
-            {
-                return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                    "{namespace}/{name}"
+        match parent.symlink_metadata(&name) {
+            // A non-directory (or a symlink) at a per-intent namespace name is
+            // still refused: `open_dir_nofollow` would refuse it anyway, and
+            // this names the artifact instead of returning a bare ENOTDIR.
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(ProjectionStoreError::UnsafeEntry(format!(
+                    "private receipt namespace {namespace}/{name} is not a directory"
                 )));
             }
-            let directory = open_dir_nofollow(&parent, &name).map_err(|error| {
-                ProjectionStoreError::NamespaceSubstitution(format!("{namespace}/{name}: {error}"))
-            })?;
-            if canonical_directory_identity(&directory)? != authority.directory_identity {
-                return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                    "{namespace}/{name}"
-                )));
-            }
-            return Ok(Some(directory));
+            Ok(_) => return Ok(Some(open_dir_nofollow(&parent, &name)?)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-
-        match read_optional_regular(&parent, &reservation_name, 1024, None)? {
-            Some(bytes) => {
-                if bytes != reservation_bytes {
-                    return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                        "{namespace}/{name}"
-                    )));
-                }
-                if !create {
-                    return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                        "incomplete established {namespace}/{name}"
-                    )));
-                }
-            }
-            None => {
-                match parent.symlink_metadata(&name) {
-                    Ok(_) => {
-                        return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                            "unbound {namespace}/{name}"
-                        )));
-                    }
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-                if !create {
-                    return Ok(None);
-                }
-                publish_immutable_exact(
-                    &parent,
-                    &reservation_name,
-                    &reservation_bytes,
-                    "per-intent namespace reservation",
-                )?;
-            }
+        if !create {
+            return Ok(None);
         }
-
         ensure_directory_nofollow(&parent, &name)?;
-        let directory = open_dir_nofollow(&parent, &name)?;
-        if directory.entries()?.next().transpose()?.is_some() {
-            return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                "unbound nonempty {namespace}/{name}"
-            )));
-        }
-        let authority = IntentNamespaceAuthority {
-            schema_version: INTENT_NAMESPACE_SCHEMA_VERSION,
-            store_id: self.store_id,
-            namespace: namespace.to_owned(),
-            intent_id,
-            directory_identity: canonical_directory_identity(&directory)?,
-        };
-        let authority_bytes = serde_json::to_vec(&authority)
-            .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?;
-        publish_immutable_exact(
-            &parent,
-            &authority_name,
-            &authority_bytes,
-            "per-intent namespace authority",
-        )?;
-        let live = open_dir_nofollow(&parent, &name).map_err(|error| {
-            ProjectionStoreError::NamespaceSubstitution(format!("{namespace}/{name}: {error}"))
-        })?;
-        if canonical_directory_identity(&live)? != authority.directory_identity {
-            return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-                "{namespace}/{name}"
-            )));
-        }
-        Ok(Some(directory))
+        Ok(Some(open_dir_nofollow(&parent, &name)?))
     }
 
     fn validate_forensic_record(
@@ -3102,35 +3024,25 @@ impl Drop for ProjectionMutationAuthority {
     }
 }
 
+/// Re-check that a per-intent recovery namespace still is the exact directory
+/// this in-flight mutation authority was sealed against.
+///
+/// **Refusal census 2026-08-26 (P-census).** The artifact half of this check —
+/// reading the per-intent `*.namespace-authority` binding — is gone with the
+/// artifact; see [`ProjectionReceiptStore::intent_namespace`]. What remains is
+/// the live device/inode comparison against the identity the durable authority
+/// already recorded, which costs no durability barrier and needs no artifact.
+/// It is retained rather than deleted because it is free, and because a
+/// mismatch is not reachable from any in-scope failure: a crash cannot rename a
+/// directory, and the authority is created and consumed inside one drain turn.
 fn validate_live_intent_namespace(
     parent: &Dir,
     namespace: &str,
-    store_id: ProjectionReceiptStoreId,
+    _store_id: ProjectionReceiptStoreId,
     intent_id: ProjectionIntentId,
     expected_identity: DirectoryIdentity,
 ) -> Result<(), ProjectionStoreError> {
     let name = hex(intent_id.as_bytes());
-    let authority_name = format!("{name}{INTENT_NAMESPACE_AUTHORITY_SUFFIX}");
-    let bytes = read_optional_regular(parent, &authority_name, 1024, None)?.ok_or_else(|| {
-        ProjectionStoreError::NamespaceSubstitution(format!(
-            "missing established {namespace}/{name} authority"
-        ))
-    })?;
-    let authority: IntentNamespaceAuthority = serde_json::from_slice(&bytes)
-        .map_err(|error| ProjectionStoreError::Decode(error.to_string()))?;
-    if serde_json::to_vec(&authority)
-        .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?
-        != bytes
-        || authority.schema_version != INTENT_NAMESPACE_SCHEMA_VERSION
-        || authority.store_id != store_id
-        || authority.namespace != namespace
-        || authority.intent_id != intent_id
-        || authority.directory_identity != expected_identity
-    {
-        return Err(ProjectionStoreError::NamespaceSubstitution(format!(
-            "{namespace}/{name}"
-        )));
-    }
     let live = open_dir_nofollow(parent, &name).map_err(|error| {
         ProjectionStoreError::NamespaceSubstitution(format!("{namespace}/{name}: {error}"))
     })?;
@@ -3542,7 +3454,7 @@ fn open_pending_cleanup_namespace(
     let directory = open_dir_nofollow(forensics, PENDING_CLEANUP_DIR)?;
     let identity = canonical_directory_identity(&directory)?;
     let authority = PendingCleanupNamespaceAuthority {
-        schema_version: INTENT_NAMESPACE_SCHEMA_VERSION,
+        schema_version: PENDING_CLEANUP_NAMESPACE_SCHEMA_VERSION,
         store_id,
         directory_identity: identity,
     };
