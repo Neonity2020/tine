@@ -10,6 +10,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed Storage saves wait on fewer disk flushes.** Each accepted edit used
+  to write four small bookkeeping files whose only job was to notice if
+  something had swapped out a folder inside Tine's own private data directory --
+  which nothing but a program already running as you could do, and which Tine
+  does not defend against by design. Each of those files cost two waits for the
+  disk to confirm, on every page an edit touches. They are gone, and Tine now
+  simply recreates the folder if it is missing instead of refusing to save the
+  page forever. An ordinary edit now waits on 37 disk flushes instead of 45, and
+  a cross-page move on 93 instead of 109. On a slow or network-backed disk that
+  wait is the bulk of the delay between finishing a keystroke and the file being
+  safely on disk.
+
 - **Opening and scrolling the Journals feed no longer walks the whole graph on
   Managed Storage.** The feed was assembled by enumerating every page in the
   graph and then loading the handful of days it actually shows -- on every
