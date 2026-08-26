@@ -4,9 +4,32 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { auditableSourceFingerprint } from "./release-readiness-lib.mjs";
+import { auditableSourceFingerprint, changelogItems, releaseSection } from "./release-readiness-lib.mjs";
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "tine-release-readiness-test-"));
+
+const changelogWithUppercaseZ = `# Changelog
+
+## [0.6.97] - 2026-08-26
+
+### Added
+
+- Experimental ZIP package.
+- The item after ZIP must remain in the release.
+
+## [0.6.96] - 2026-08-24
+
+### Fixed
+
+- Older release.
+`;
+const parsedSection = releaseSection(changelogWithUppercaseZ, "0.6.97");
+assert.ok(parsedSection, "the requested release section must exist");
+assert.deepEqual(
+  changelogItems(parsedSection).map((item) => item.text),
+  ["Experimental ZIP package.", "The item after ZIP must remain in the release."],
+  "an uppercase Z inside release prose must not truncate the section",
+);
 
 function write(relative, contents) {
   const absolute = path.join(temporary, relative);

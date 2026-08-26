@@ -6,8 +6,12 @@ export const dispositionStatuses = new Set(["update", "current", "not-applicable
 
 export function releaseSection(changelog, version) {
   const escaped = version.replaceAll(".", "\\.");
-  const match = changelog.match(new RegExp(`^## \\[${escaped}\\] - \\d{4}-\\d{2}-\\d{2}\\n([\\s\\S]*?)(?=^## \\[|\\Z)`, "m"));
-  return match?.[1] ?? null;
+  const header = new RegExp(`^## \\[${escaped}\\] - \\d{4}-\\d{2}-\\d{2}\\n`, "m");
+  const match = header.exec(changelog);
+  if (!match) return null;
+  const rest = changelog.slice(match.index + match[0].length);
+  const next = /^## \[/m.exec(rest);
+  return next ? rest.slice(0, next.index) : rest;
 }
 
 export function changelogItems(section) {
