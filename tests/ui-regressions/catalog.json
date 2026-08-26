@@ -8367,6 +8367,30 @@
     "failBefore": "proven"
    },
    "notes": "GH #275 follow-up on 32-bit Windows: a PDF flashed, disappeared, and pdf.js reported that the same canvas was used by multiple render operations. renderPage cancelled an existing task before awaiting getPage, but did not claim same-page ownership until after that await. Two synchronous observer/navigation triggers therefore both reached page.render on the same canvas. Per-page and layout generations now establish ownership before getPage and invalidate stale requests across zoom, eviction, and layout rebuild. The current-master duplicate-trigger test called render twice before the fix and once after it."
+  },
+  {
+   "id": "UI-MANAGED-LARGE-UNLINKED-SOURCE-388",
+   "title": "Managed Unlinked References scans source pages larger than the editor gateway limit while retaining bounded panel results",
+   "family": "managed-reference-query",
+   "sources": {
+    "issues": [
+     388
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::managed_unlinked_references_scan_source_pages_larger_than_the_editor_gateway_limit"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #388: a candidate source page at the 10,000-block boundary was rejected by the write-oriented whole-page editor gateway before the bounded Unlinked References result could be constructed. Reference panels now retain the projected fast path for ordinary pages and use one linear authenticated hot-page read only for an explicit page-size refusal. Output remains governed by the existing row and byte construction budgets. The synthetic large-page managed graph failed with RequestTooLarge before the fix and returns its single semantic match after it. The intermittent narrow-layout report is separately covered by UI-PANE-WIDTH-382."
   }
  ]
 }

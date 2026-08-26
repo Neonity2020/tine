@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Unlinked References now opens when a matching source page contains 10,000
+  or more blocks** (GH #388). Managed storage was applying the whole-page
+  editor payload limit before constructing the already-bounded reference
+  result. Large source pages now take one linear authenticated read while the
+  panel keeps its existing row and byte limits.
+
 - **PDFs no longer flash and disappear when two render triggers reach the same
   page together** (GH #275). Visibility and navigation could both begin before
   the first PDF page lookup finished, causing PDF.js to reject two simultaneous

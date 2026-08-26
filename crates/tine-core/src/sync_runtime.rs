@@ -11266,12 +11266,23 @@ impl RuntimeActor {
         &self,
         page_id: PageId,
     ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+        self.load_active_hot_application_page_with_block_limit(
+            page_id,
+            MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+        )
+    }
+
+    fn load_active_hot_application_page_with_block_limit(
+        &self,
+        page_id: PageId,
+        block_limit: usize,
+    ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
         load_hot_source_authenticated_page_with_block_limit_from_engine(
             self.active_engine()
                 .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
             &self.graph,
             page_id,
-            MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+            block_limit,
         )
     }
 
@@ -12715,7 +12726,7 @@ impl RuntimeActor {
             ));
         }
         for (page_id, block_ids) in candidates {
-            let current = self.load_application_page_id_ready(page_id)?;
+            let current = self.load_application_reference_page_id_ready(page_id)?;
             let allowed = application_parser_indices_for_block_ids(&current, &block_ids)?;
             let blocks = application_page_block_referrers(&current.page, target, Some(&allowed));
             if blocks.is_empty() {
@@ -12966,7 +12977,7 @@ impl RuntimeActor {
             sources.push((path.as_str().to_owned(), entry.date_key, page, matches));
         }
         for (page_id, candidate) in candidates {
-            let current = self.load_application_page_id_ready(page_id)?;
+            let current = self.load_application_reference_page_id_ready(page_id)?;
             if excluded.excludes_name(&current.page.name) {
                 continue;
             }
@@ -13035,7 +13046,7 @@ impl RuntimeActor {
                 if excluded.excludes_name(&entry.name) {
                     continue;
                 }
-                let current = match self.load_application_exact_ready(&entry.rel_path)? {
+                let current = match self.load_application_reference_exact_ready(&entry.rel_path)? {
                     ApplicationExactLoad::Loaded(current) => current,
                     ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
                         return Err(SyncApplicationPageRequestError::ActorRefusedAt(
@@ -13141,7 +13152,7 @@ impl RuntimeActor {
             sources.push((path.as_str().to_owned(), entry.date_key, page, matches));
         }
         for page_id in candidate_pages {
-            let current = self.load_application_page_id_ready(page_id)?;
+            let current = self.load_application_reference_page_id_ready(page_id)?;
             if excluded.excludes_name(&current.page.name) {
                 continue;
             }
@@ -14888,6 +14899,17 @@ impl RuntimeActor {
         &self,
         path: &ManagedPath,
     ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
+        self.load_hot_application_exact_untracked_ready_with_block_limit(
+            path,
+            MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+        )
+    }
+
+    fn load_hot_application_exact_untracked_ready_with_block_limit(
+        &self,
+        path: &ManagedPath,
+        block_limit: usize,
+    ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
         let page_id = match self
             .active_engine()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
@@ -14907,7 +14929,7 @@ impl RuntimeActor {
             }
         };
         let current = self
-            .load_active_hot_application_page(page_id)
+            .load_active_hot_application_page_with_block_limit(page_id, block_limit)
             .map_err(map_editor_application_error)?
             .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
                 "application_load_hot_exact_page_missing",
@@ -14920,12 +14942,59 @@ impl RuntimeActor {
         Ok(ApplicationExactLoad::Loaded(current))
     }
 
+    /// Reference panels return a bounded set of shallow matches, so the
+    /// write-oriented whole-page editor limit must not reject a larger source
+    /// page before that result budget is applied. Ordinary pages retain the
+    /// projected fast path; only its explicit size refusal falls back to one
+    /// linear authenticated read of the source page.
+    fn load_application_reference_exact_ready(
+        &self,
+        path: &str,
+    ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
+        match self.load_application_exact_ready(path) {
+            Err(SyncApplicationPageRequestError::RequestTooLarge(size))
+                if size.blocks > MAX_SYNC_APPLICATION_PAGE_BLOCKS =>
+            {
+                let path = ManagedPath::parse(path.to_owned()).map_err(|_| {
+                    SyncApplicationPageRequestError::InvalidRequest(
+                        SyncApplicationPageInvalidRequest::InvalidPath,
+                    )
+                })?;
+                self.load_hot_application_exact_untracked_ready_with_block_limit(&path, usize::MAX)
+                    .map(|current| self.finish_managed_application_query_exact_load(current))
+            }
+            result => result,
+        }
+    }
+
     fn load_application_page_id_ready(
         &self,
         page_id: PageId,
     ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
         self.load_application_page_id_untracked_ready(page_id)
             .map(|current| self.finish_managed_application_query_result_page_hydration(current))
+    }
+
+    fn load_application_reference_page_id_ready(
+        &self,
+        page_id: PageId,
+    ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
+        match self.load_application_page_id_untracked_ready(page_id) {
+            Err(SyncApplicationPageRequestError::RequestTooLarge(size))
+                if size.blocks > MAX_SYNC_APPLICATION_PAGE_BLOCKS =>
+            {
+                self.load_active_hot_application_page_with_block_limit(page_id, usize::MAX)
+                    .map_err(map_editor_application_error)?
+                    .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_reference_page_missing",
+                    ))
+                    .map(|current| {
+                        self.finish_managed_application_query_result_page_hydration(current)
+                    })
+            }
+            Ok(current) => Ok(self.finish_managed_application_query_result_page_hydration(current)),
+            Err(error) => Err(error),
+        }
     }
 
     fn load_application_page_id_untracked_ready(
@@ -44806,6 +44875,48 @@ mod tests {
             panic!("managed block referrers returned the wrong outcome: {outcome:?}")
         };
         result
+    }
+
+    #[test]
+    fn managed_unlinked_references_scan_source_pages_larger_than_the_editor_gateway_limit() {
+        let fixture = ActivationFixture::empty("managed-large-unlinked-source", 0xa3f9);
+        fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+        fs::write(
+            fixture.graph_root.join("pages/Target.md"),
+            "- target page\n",
+        )
+        .unwrap();
+        let source = fixture.graph_root.join("pages/Large source.md");
+        let mut body = String::with_capacity(MAX_SYNC_APPLICATION_PAGE_BLOCKS * 24);
+        for index in 0..MAX_SYNC_APPLICATION_PAGE_BLOCKS {
+            body.push_str(&format!("- unrelated block {index}\n"));
+        }
+        body.push_str("- Target appears here\n");
+        fs::write(&source, body).unwrap();
+
+        let handle = open_reopened_managed_actor(&fixture);
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::UnlinkedReferences {
+                name: "Target".into(),
+                max_rows: 32,
+                max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::UnlinkedReferences(result),
+        } = outcome
+        else {
+            panic!("managed unlinked references returned the wrong outcome: {outcome:?}")
+        };
+        assert_eq!(result.total, 1);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].page, "Large source");
+        assert_eq!(result.groups[0].blocks[0].raw, "Target appears here");
+        assert!(!result.exceeded);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     fn assert_managed_graph_search_matches_direct(
