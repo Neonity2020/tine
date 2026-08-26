@@ -5096,6 +5096,32 @@
     "scenario": "managed-sync.pending-local-watcher-epoch-before-provider-delete",
     "failBefore": "proven at 3f4273ad: provider transport preempted the pending watcher epoch and projected the deletion before the local bytes were authored"
    }
+  },
+  {
+   "id": "REG-MANAGED-JOURNAL-FEED-OPEN-GRAPH-SIZED",
+   "title": "Opening or scrolling the Journals feed under managed storage stays proportional to the days shown, not to the size of the graph",
+   "family": "managed-storage-performance",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "managed-storage cost-model audit 2026-08-26, defect D6 (fix packet P-open-feed)"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "tine-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_open_is_not_graph_sized_and_refreshes_after_an_accepted_change",
+     "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_page_matches_the_inventory_walk_across_pagination",
+     "crates/tine-core/src/sync_runtime.rs::tests::inventory_walk_feed_is_graph_sized_per_request",
+     "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_matches_the_inventory_walk_on_a_real_graph_copy"
+    ],
+    "scenario": "managed-storage.journal-feed-open-shares-one-inventory-scan",
+    "failBefore": "proven at 34e247ac: journal_feed_page assembled the feed in the shell from the complete application_page_inventory, so every open and every scroll step walked every page in the graph. On the 1,045-file anonymized corpus that walk was 5.19 ms p50 of a 6.22 ms feed open (release, this box), and the frontend requests three days at a time. inventory_walk_feed_is_graph_sized_per_request pins that retired shape; disabling the retained index makes the budget assertion fail (2 scans observed, 1 required)."
+   },
+   "notes": "User outcome: the Journals surface is Martin's primary view and its back gesture reloads a feed nothing has changed. Classification: blocking core operation (responsiveness of the primary surface), not an exact-value contract. The budget is stated as inventory scans per accepted frontier, not milliseconds, so a reasonable alternative implementation that answers the feed without enumerating the graph passes. Correctness is guarded separately by a differential against the retired inventory walk over full pagination, on a synthetic fixture whose journal filename format (dd-MM-yyyy) makes path order deliberately differ from date order, and on a real anonymized graph copy behind TINE_MANAGED_NAV_GRAPH_COPY."
   }
  ]
 }

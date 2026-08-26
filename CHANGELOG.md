@@ -8,6 +8,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Opening and scrolling the Journals feed no longer walks the whole graph on
+  Managed Storage.** The feed was assembled by enumerating every page in the
+  graph and then loading the handful of days it actually shows -- on every
+  open, and again for each three-day step as you scroll back. The runtime now
+  keeps the graph's journal days indexed and rebuilds that index only when
+  something is actually accepted, so a feed page costs a lookup plus its own
+  page loads. Going back to Journals with nothing changed in between does no
+  graph-sized work at all, and the whole request is now answered in one
+  runtime turn instead of one per page.
+
 ## [0.6.97] - 2026-08-26
 
 ### Added

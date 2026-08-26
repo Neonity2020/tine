@@ -478,6 +478,51 @@ impl ApplicationSimpleQueryMemo {
     }
 }
 
+/// Everything outside the SQLite rows that the journal day index is derived
+/// from, so a change to any of it drops the index instead of silently keeping
+/// days that were computed under different rules.
+///
+/// The frontier pair covers the projection's content: `application_materialized
+/// _read_ready` admits only a database carrying the exact accepted-frontier
+/// stamp, so equal `(acceptance_sequence, state_digest)` means the same rows.
+/// The three format members cover the derivation: a journal's day and its
+/// canonical-filename test come from decoding the file stem with the graph's
+/// `:file/name-format` and journal patterns, and none of that is in the
+/// frontier stamp.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApplicationJournalFeedIndexKey {
+    acceptance_sequence: u64,
+    state_digest: ContentDigest,
+    file_name_format: crate::config::FileNameFormat,
+    journal_file_format: String,
+    journal_title_format: String,
+}
+
+/// The graph's journal days, deduplicated and newest first, retained across
+/// feed requests.
+///
+/// The Journals feed asks for at most a handful of days at a time and is
+/// paginated, so answering it from the complete page inventory made every open
+/// and every scroll step walk the whole graph (managed-storage cost-model
+/// audit 2026-08-26, D6). This index is that walk's result, derived once per
+/// accepted frontier: a hit answers a feed page with a binary search and
+/// `limit` page loads.
+///
+/// It is a cache of a pure function over durable evidence, never authority.
+/// `application_inventory_ready` reads only SQLite and the graph's format
+/// configuration — it opens no file and consults no pending local suffix — so
+/// an entry is valid exactly while [`ApplicationJournalFeedIndexKey`] holds,
+/// and a dropped entry costs one rebuild and nothing else.
+#[derive(Debug, Default)]
+struct ApplicationJournalFeedIndex {
+    key: Option<ApplicationJournalFeedIndexKey>,
+    /// Shared so a feed request can take the day list out of the `RefCell`
+    /// before it starts loading pages. Page loading reaches deep into the
+    /// actor, and a borrow held across it is a re-entrancy panic waiting for
+    /// the first caller that touches the index from inside a load.
+    days: Rc<Vec<PageEntry>>,
+}
+
 /// A sparse result is authoritative only when every input and structural fact
 /// is complete.  These stable categories make test receipts distinguish a
 /// deliberate complete-page fallback from a successful sparse execution.
@@ -2111,6 +2156,37 @@ pub enum SyncEditorSaveOutcome {
 pub enum SyncApplicationPageInventoryOutcome {
     Loaded { pages: Vec<PageEntry> },
     Deferred { state: SyncEditorDeferred },
+}
+
+/// One page of the Journals feed: the day window the caller wants.
+///
+/// `as_of_day` is the caller's local calendar day, which excludes future
+/// journals from the feed; `before_day` is the exclusive ordinal-day cursor
+/// returned by the previous page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncApplicationJournalFeedRequest {
+    pub limit: usize,
+    pub before_day: Option<i64>,
+    pub as_of_day: i64,
+}
+
+/// The Journals feed answered in ONE actor turn: day selection and every page
+/// load observe the same accepted frontier, so a day cannot be selected
+/// against one state and loaded against another.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationJournalFeedOutcome {
+    Loaded {
+        pages: Vec<PageDto>,
+        next_before_day: Option<i64>,
+        done: bool,
+    },
+    /// A selected day's exact path did not resolve to one identifiable page.
+    Ambiguous,
+    Deferred {
+        state: SyncEditorDeferred,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3876,6 +3952,22 @@ impl SyncRuntimeHandle {
         self.application_request(|reply| ActorRequest::ApplicationPageInventory { reply })
     }
 
+    /// Answer one Journals feed page — day selection plus the page loads — in
+    /// a single actor turn.
+    ///
+    /// The feed used to be assembled in the shell from the complete page
+    /// inventory plus `limit` separate load turns, so every open and every
+    /// scroll step walked the whole graph to answer a question about at most
+    /// `limit` days (managed-storage cost-model audit 2026-08-26, D6). The
+    /// day index behind this request is derived once per accepted frontier and
+    /// reused, and the window is a slice of it.
+    pub fn journal_feed_page(
+        &self,
+        request: SyncApplicationJournalFeedRequest,
+    ) -> Result<SyncApplicationJournalFeedOutcome, SyncApplicationPageRequestError> {
+        self.application_request(|reply| ActorRequest::ApplicationJournalFeed { request, reply })
+    }
+
     /// Answer page navigation/autocomplete from the exact managed projection,
     /// without constructing the Direct Files parsed-graph cache.
     pub fn application_navigation(
@@ -4251,6 +4343,23 @@ impl SyncRuntimeHandle {
         reply_receiver
             .recv()
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    /// How many whole-graph page-inventory scans this actor has executed.
+    ///
+    /// The budget this exists to defend: opening or paginating the Journals
+    /// feed must not be graph-sized work. Every scan goes through
+    /// `application_inventory_of_kind_ready`, so this counts all of them.
+    #[cfg(test)]
+    fn application_inventory_scans(&self) -> Result<usize, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ApplicationInventoryScans {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
@@ -8294,6 +8403,12 @@ enum ActorRequest {
             Result<SyncApplicationPageInventoryOutcome, SyncApplicationPageRequestError>,
         >,
     },
+    ApplicationJournalFeed {
+        request: SyncApplicationJournalFeedRequest,
+        reply: mpsc::Sender<
+            Result<SyncApplicationJournalFeedOutcome, SyncApplicationPageRequestError>,
+        >,
+    },
     LastRetainedPublication {
         reply: mpsc::Sender<Option<SyncRetainedPublicationReport>>,
     },
@@ -8418,6 +8533,8 @@ enum ActorRequest {
     #[cfg(test)]
     ResetManagedApplicationQueryInstrumentation { reply: mpsc::Sender<()> },
     #[cfg(test)]
+    ApplicationInventoryScans { reply: mpsc::Sender<usize> },
+    #[cfg(test)]
     ClearApplicationSimpleQueryMemo { reply: mpsc::Sender<()> },
     #[cfg(test)]
     ApplicationCompletePageSimpleQuery {
@@ -8532,6 +8649,11 @@ fn run_actor_loop(
             }
             ActorRequest::ApplicationPageInventory { reply } => {
                 let result = actor.application_page_inventory();
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::ApplicationJournalFeed { request, reply } => {
+                let result = actor.application_journal_feed(request);
                 let _ = reply.send(result);
                 false
             }
@@ -8764,6 +8886,11 @@ fn run_actor_loop(
             ActorRequest::ResetManagedApplicationQueryInstrumentation { reply } => {
                 actor.reset_managed_application_query_instrumentation();
                 let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ApplicationInventoryScans { reply } => {
+                let _ = reply.send(actor.application_inventory_scans.get());
                 false
             }
             #[cfg(test)]
@@ -10967,6 +11094,16 @@ struct RuntimeActor {
     /// changed page misses and is rebuilt.
     application_projection_cache: std::cell::RefCell<crate::query::ApplicationProjectionCache>,
     application_hydration_cache: std::cell::RefCell<ApplicationHydrationCache>,
+    /// The graph's journal days, newest first, retained across Journals feed
+    /// requests. See [`ApplicationJournalFeedIndex`]: it is a cache of durable
+    /// evidence keyed by the accepted frontier plus the journal-naming
+    /// configuration, never authority.
+    application_journal_feed_index: std::cell::RefCell<ApplicationJournalFeedIndex>,
+    /// Whole-graph page-inventory scans this actor has executed. Counted here
+    /// rather than in a thread-local because the scan runs on the actor thread
+    /// and every reader is on another one.
+    #[cfg(test)]
+    application_inventory_scans: std::cell::Cell<usize>,
     #[cfg(test)]
     managed_application_query_instrumentation:
         std::cell::Cell<ManagedApplicationQueryInstrumentation>,
@@ -11244,6 +11381,11 @@ impl RuntimeActor {
             application_hydration_cache: std::cell::RefCell::new(
                 ApplicationHydrationCache::default(),
             ),
+            application_journal_feed_index: std::cell::RefCell::new(
+                ApplicationJournalFeedIndex::default(),
+            ),
+            #[cfg(test)]
+            application_inventory_scans: std::cell::Cell::new(0),
             #[cfg(test)]
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
@@ -11844,6 +11986,128 @@ impl RuntimeActor {
         }
         self.application_inventory_ready()
             .map(|pages| SyncApplicationPageInventoryOutcome::Loaded { pages })
+    }
+
+    fn application_journal_feed(
+        &mut self,
+        request: SyncApplicationJournalFeedRequest,
+    ) -> Result<SyncApplicationJournalFeedOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
+            return Ok(SyncApplicationJournalFeedOutcome::Deferred { state });
+        }
+        self.application_journal_feed_ready(request)
+    }
+
+    /// The journal-naming half of [`ApplicationJournalFeedIndexKey`]: the graph
+    /// configuration a stem's day and canonical form are decoded with.
+    fn application_journal_naming(&self) -> (crate::config::FileNameFormat, String, String) {
+        (
+            self.graph.config.file_name_format,
+            self.graph.journal_format.file_format().to_owned(),
+            self.graph.journal_format.title_format().to_owned(),
+        )
+    }
+
+    /// Refresh the retained journal day index when the accepted frontier or
+    /// the journal-naming configuration it was derived under has moved.
+    fn refresh_application_journal_feed_index_ready(
+        &self,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        let key = {
+            let read = self.application_materialized_read_ready()?;
+            let acceptance_sequence = read.acceptance_sequence();
+            drop(read);
+            let state_digest = self
+                .active_engine()
+                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+                .accepted_frontier_root()
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_journal_feed_frontier_root",
+                    )
+                })?
+                .state_digest();
+            let (file_name_format, journal_file_format, journal_title_format) =
+                self.application_journal_naming();
+            ApplicationJournalFeedIndexKey {
+                acceptance_sequence,
+                state_digest,
+                file_name_format,
+                journal_file_format,
+                journal_title_format,
+            }
+        };
+        if self.application_journal_feed_index.borrow().key.as_ref() == Some(&key) {
+            return Ok(());
+        }
+        // Journal-kind rows only: the projection stores the kind the managed
+        // path classifier assigned, and every other page is discarded by the
+        // feed anyway. Ordering is the projection's own `(path, page_id)`, so
+        // the duplicate-day tie-break sees candidates in the same order the
+        // complete inventory presented them.
+        let entries = self.application_inventory_of_kind_ready(Some(ManagedTextKind::Journal))?;
+        *self.application_journal_feed_index.borrow_mut() = ApplicationJournalFeedIndex {
+            key: Some(key),
+            days: Rc::new(crate::journal_feed::journal_feed_candidates_desc(entries)),
+        };
+        Ok(())
+    }
+
+    fn application_journal_feed_ready(
+        &self,
+        request: SyncApplicationJournalFeedRequest,
+    ) -> Result<SyncApplicationJournalFeedOutcome, SyncApplicationPageRequestError> {
+        self.refresh_application_journal_feed_index_ready()?;
+        let days = Rc::clone(&self.application_journal_feed_index.borrow().days);
+        // The index is sorted newest-first, so the requested window is the
+        // contiguous run after the first day at or below both bounds. This is
+        // the whole point of retaining it: a feed page costs a binary search
+        // and `limit` loads, not a walk of the graph.
+        let ceiling = match request.before_day {
+            Some(before) => request.as_of_day.min(before.saturating_sub(1)),
+            None => request.as_of_day,
+        };
+        let start = days.partition_point(|entry| entry.date_key.unwrap_or(0) > ceiling);
+        let mut ambiguous = false;
+        let mut refusal = None;
+        let selection = crate::journal_feed::collect_journal_feed_page(
+            days[start..].iter().cloned(),
+            request.limit,
+            |entry| match self.load_application_exact_ready(&entry.rel_path) {
+                Ok(ApplicationExactLoad::Loaded(current)) => {
+                    let mut page = current.page;
+                    page.rev = Some(current.revision);
+                    Ok(page)
+                }
+                // A day whose file vanished after the index was built is
+                // skipped; its day still advances the cursor.
+                Ok(ApplicationExactLoad::Missing) => {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                }
+                Ok(ApplicationExactLoad::Ambiguous) => {
+                    ambiguous = true;
+                    Err(std::io::Error::other("ambiguous journal day"))
+                }
+                Err(error) => {
+                    refusal = Some(error);
+                    Err(std::io::Error::other("journal feed page load refused"))
+                }
+            },
+        );
+        if let Some(error) = refusal {
+            return Err(error);
+        }
+        if ambiguous {
+            return Ok(SyncApplicationJournalFeedOutcome::Ambiguous);
+        }
+        let selection = selection.map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("application_journal_feed_page_load")
+        })?;
+        Ok(SyncApplicationJournalFeedOutcome::Loaded {
+            pages: selection.pages,
+            next_before_day: selection.next_before_day,
+            done: selection.done,
+        })
     }
 
     fn application_navigation(
@@ -14141,6 +14405,19 @@ impl RuntimeActor {
     fn application_inventory_ready(
         &self,
     ) -> Result<Vec<PageEntry>, SyncApplicationPageRequestError> {
+        self.application_inventory_of_kind_ready(None)
+    }
+
+    /// The complete parser-owned inventory, optionally narrowed to one managed
+    /// text kind by the projection's own `text_kind` column.
+    ///
+    /// Every whole-graph page walk in this actor comes through here, so the
+    /// scan counter below counts them all and a caller cannot acquire a second
+    /// copy of this loop that the budget test cannot see.
+    fn application_inventory_of_kind_ready(
+        &self,
+        kind: Option<ManagedTextKind>,
+    ) -> Result<Vec<PageEntry>, SyncApplicationPageRequestError> {
         // `application_materialized_read_ready` admits only a database carrying
         // the exact accepted-frontier stamp. The candidate builder publishes
         // that stamp only after its authenticated page-catalog cursor was
@@ -14149,6 +14426,9 @@ impl RuntimeActor {
         // contain prospective watcher observations) or with the frontier's raw
         // document count (which also includes non-page documents).
         let read = self.application_materialized_read_ready()?;
+        #[cfg(test)]
+        self.application_inventory_scans
+            .set(self.application_inventory_scans.get() + 1);
         const INVENTORY_BATCH: usize = 256;
         let mut pages = Vec::new();
         let mut cursor: Option<(ManagedPath, PageId)> = None;
@@ -14156,7 +14436,7 @@ impl RuntimeActor {
             let batch = read
                 .page_inventory_after(
                     cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
-                    None,
+                    kind,
                     INVENTORY_BATCH,
                 )
                 .map_err(|_| {
@@ -44550,16 +44830,397 @@ mod tests {
         ));
     }
 
+    /// A graph whose journals exercise every feed selection rule at once: a
+    /// run of ordinary days, a day owning two files, a nested journal, a
+    /// journal-kind file whose stem is not a date, a future day, and an
+    /// ordinary page. The fixture's configured journal filename format is
+    /// `dd-MM-yyyy`, so lexicographic path order is deliberately NOT date
+    /// order — a feed that leaned on the projection's path ordering would
+    /// return these days scrambled.
+    fn journal_feed_fixture(label: &str, seed: u128) -> ActivationFixture {
+        let fixture = ActivationFixture::empty(label, seed);
+        let journals = fixture.graph_root.join("diary");
+        fs::create_dir_all(journals.join("nested")).unwrap();
+        for day in 14..=24 {
+            fs::write(
+                journals.join(format!("{day}-07-2026.md")),
+                format!("- july {day}\n"),
+            )
+            .unwrap();
+        }
+        // Two files for 2026-07-25: the feed shows the day once.
+        fs::write(journals.join("25-07-2026.md"), b"- july 25 flat\n").unwrap();
+        fs::write(
+            journals.join("nested/25-07-2026.org"),
+            b"* july 25 nested\n",
+        )
+        .unwrap();
+        // Journal-kind by path, but no date in its stem: never a feed day.
+        fs::write(journals.join("not-a-date.md"), b"- undated\n").unwrap();
+        // A future day stays a reachable page but is not in the feed.
+        fs::write(journals.join("01-01-2099.md"), b"- future\n").unwrap();
+        fs::write(
+            fixture.graph_root.join("notes/Ordinary.md"),
+            b"- ordinary page\n",
+        )
+        .unwrap();
+        fixture
+    }
+
+    /// The complete pre-2026-08-26 shell implementation of `journal_feed_page`
+    /// under managed storage, retained as the differential oracle: the whole
+    /// page inventory, the feed's dedup/cutoff rules, then `limit` exact page
+    /// loads. `SyncRuntimeHandle::journal_feed_page` must answer identically.
+    fn journal_feed_page_by_inventory_walk(
+        handle: &SyncRuntimeHandle,
+        request: SyncApplicationJournalFeedRequest,
+    ) -> (Vec<String>, Option<i64>, bool) {
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("inventory walk did not load: {other:?}"),
+        };
+        let entries = crate::journal_feed::journal_feed_inventory(pages, request.as_of_day);
+        let selection = crate::journal_feed::collect_journal_feed_page(
+            entries.into_iter().filter(|entry| {
+                crate::journal_feed::journal_feed_candidate_in_window(
+                    entry,
+                    request.as_of_day,
+                    request.before_day,
+                )
+            }),
+            request.limit,
+            |entry| match handle
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::ExactPath {
+                        path: entry.rel_path.clone(),
+                    },
+                })
+                .unwrap()
+            {
+                SyncApplicationPageLoadOutcome::Loaded { mut page, revision } => {
+                    page.rev = Some(revision);
+                    Ok(page)
+                }
+                SyncApplicationPageLoadOutcome::Missing { .. } => {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                }
+                other => panic!("inventory-walk feed load did not load: {other:?}"),
+            },
+        )
+        .unwrap();
+        (
+            selection
+                .pages
+                .iter()
+                .map(|page| format!("{}|{}|{:?}", page.path, page.name, page.rev))
+                .collect(),
+            selection.next_before_day,
+            selection.done,
+        )
+    }
+
+    fn journal_feed_page_indexed(
+        handle: &SyncRuntimeHandle,
+        request: SyncApplicationJournalFeedRequest,
+    ) -> (Vec<String>, Option<i64>, bool) {
+        match handle.journal_feed_page(request).unwrap() {
+            SyncApplicationJournalFeedOutcome::Loaded {
+                pages,
+                next_before_day,
+                done,
+            } => (
+                pages
+                    .iter()
+                    .map(|page| format!("{}|{}|{:?}", page.path, page.name, page.rev))
+                    .collect(),
+                next_before_day,
+                done,
+            ),
+            other => panic!("indexed journal feed did not load: {other:?}"),
+        }
+    }
+
+    /// Paginate the whole feed both ways and require the same days, in the
+    /// same order, with the same cursors — the correctness half of dropping
+    /// the inventory walk.
+    #[test]
+    fn journal_feed_page_matches_the_inventory_walk_across_pagination() {
+        let fixture = journal_feed_fixture("journal-feed-differential", 0xfeed_0001);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&handle);
+
+        // `20260726` is deliberately after the newest ordinary day and before
+        // the future one, so the cutoff itself is under test.
+        for as_of_day in [20_260_726, 20_260_723, 20_991_231] {
+            for limit in [0, 1, 3, 100] {
+                let mut cursor = None;
+                let mut walked_days = Vec::new();
+                let mut indexed_days = Vec::new();
+                for _ in 0..16 {
+                    let request = SyncApplicationJournalFeedRequest {
+                        limit,
+                        before_day: cursor,
+                        as_of_day,
+                    };
+                    let walked = journal_feed_page_by_inventory_walk(&handle, request);
+                    let indexed = journal_feed_page_indexed(&handle, request);
+                    assert_eq!(
+                        walked, indexed,
+                        "feed divergence at as_of_day={as_of_day} limit={limit} cursor={cursor:?}"
+                    );
+                    walked_days.extend(walked.0.clone());
+                    indexed_days.extend(indexed.0.clone());
+                    if walked.2 || limit == 0 {
+                        break;
+                    }
+                    cursor = walked.1;
+                    assert!(cursor.is_some(), "an unfinished feed must advance");
+                }
+                assert_eq!(walked_days, indexed_days);
+            }
+        }
+
+        // The whole feed, once, so the fixture's own selection rules are
+        // pinned rather than only compared with themselves.
+        let whole = journal_feed_page_indexed(
+            &handle,
+            SyncApplicationJournalFeedRequest {
+                limit: 100,
+                before_day: None,
+                as_of_day: 20_260_726,
+            },
+        );
+        let paths = whole
+            .0
+            .iter()
+            .map(|row| row.split('|').next().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            (14..=25)
+                .rev()
+                .map(|day| format!("diary/{day}-07-2026.md"))
+                .collect::<Vec<_>>(),
+            "one row per day, newest first, no undated or future rows"
+        );
+        assert!(whole.2);
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// Opening and scrolling the Journals feed must not be graph-sized work.
+    ///
+    /// Budget: repeated feed pages against an unchanged accepted frontier
+    /// perform ONE whole-graph page-inventory scan in total, not one per
+    /// request (managed-storage cost-model audit 2026-08-26, D6). An accepted
+    /// change must still be visible, so the same test proves the index is
+    /// rebuilt after a save rather than serving stale days.
+    #[test]
+    fn journal_feed_open_is_not_graph_sized_and_refreshes_after_an_accepted_change() {
+        let fixture = journal_feed_fixture("journal-feed-budget", 0xfeed_0002);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&handle);
+
+        let as_of_day = 20_260_726;
+        let feed_page = |cursor: Option<i64>| {
+            journal_feed_page_indexed(
+                &handle,
+                SyncApplicationJournalFeedRequest {
+                    limit: 3,
+                    before_day: cursor,
+                    as_of_day,
+                },
+            )
+        };
+
+        // The shell's own shape: one open plus a scroll to the end of the feed.
+        let baseline = handle.application_inventory_scans().unwrap();
+        let mut cursor = None;
+        let mut requests = 0;
+        loop {
+            let page = feed_page(cursor);
+            requests += 1;
+            if page.2 {
+                break;
+            }
+            cursor = page.1;
+        }
+        assert!(requests >= 4, "the fixture must actually paginate");
+        assert_eq!(
+            handle.application_inventory_scans().unwrap() - baseline,
+            1,
+            "{requests} feed pages over an unchanged frontier must share one inventory scan"
+        );
+
+        // Reopening the feed from the top changes nothing, so it must not scan.
+        let reopened = feed_page(None);
+        assert_eq!(
+            handle.application_inventory_scans().unwrap() - baseline,
+            1,
+            "reopening an unchanged feed must not walk the graph again"
+        );
+
+        // An accepted change is visible, and costs exactly one rebuild.
+        let (page, revision) = load_application_exact(&handle, "diary/24-07-2026.md");
+        let _ = save_application_block_text(&handle, page, revision, "- july 24 edited");
+        drain_managed_local(&handle);
+        let after = feed_page(None);
+        assert_ne!(
+            after.0, reopened.0,
+            "the feed must show the accepted edit, not the retained index"
+        );
+        assert!(
+            after
+                .0
+                .iter()
+                .any(|row| row.contains("diary/24-07-2026.md")),
+            "the edited day is still in the feed: {:?}",
+            after.0
+        );
+        let scans = handle.application_inventory_scans().unwrap() - baseline;
+        assert_eq!(scans, 2, "one accepted change costs one index rebuild");
+        assert_eq!(
+            feed_page(None).0,
+            after.0,
+            "the rebuilt index answers the next open without another scan"
+        );
+        assert_eq!(handle.application_inventory_scans().unwrap() - baseline, 2);
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The same differential on a real graph copy: synthetic fixtures are
+    /// generated from our model of a graph, and that model is what produced
+    /// the code under test. Run with
+    /// `TINE_MANAGED_NAV_GRAPH_COPY=<copy> cargo test -p tine-core --release
+    /// journal_feed_matches_the_inventory_walk_on_a_real_graph_copy --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "real-graph gate: journal feed differential on a supplied graph copy"]
+    fn journal_feed_matches_the_inventory_walk_on_a_real_graph_copy() {
+        let source_root = real_graph_copy_source_from_env("TINE_MANAGED_NAV_GRAPH_COPY");
+        let fixture =
+            ActivationFixture::copied_graph("journal-feed-real-copy", 0xfeed_0004, &source_root);
+        let source = user_graph_bytes(&fixture.graph_root);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+
+        let as_of_day = crate::date::JournalDate::today().ordinal_key();
+        let mut cursor = None;
+        let mut days = 0usize;
+        let mut pages = 0usize;
+        let indexed_baseline = handle.application_inventory_scans().unwrap();
+        let mut indexed_pages = Vec::new();
+        // FEED_PAGE in src/components/Page.tsx.
+        for _ in 0..4096 {
+            let request = SyncApplicationJournalFeedRequest {
+                limit: 3,
+                before_day: cursor,
+                as_of_day,
+            };
+            let indexed = journal_feed_page_indexed(&handle, request);
+            indexed_pages.push((request, indexed.clone()));
+            pages += 1;
+            days += indexed.0.len();
+            if indexed.2 {
+                break;
+            }
+            cursor = indexed.1;
+            assert!(cursor.is_some(), "an unfinished feed must advance");
+        }
+        let indexed_scans = handle.application_inventory_scans().unwrap() - indexed_baseline;
+        assert!(pages >= 2 && days >= 2, "the corpus must have a real feed");
+
+        let walked_baseline = handle.application_inventory_scans().unwrap();
+        for (request, indexed) in &indexed_pages {
+            assert_eq!(
+                journal_feed_page_by_inventory_walk(&handle, *request),
+                *indexed,
+                "feed divergence on the real copy at cursor={:?}",
+                request.before_day
+            );
+        }
+        let walked_scans = handle.application_inventory_scans().unwrap() - walked_baseline;
+        eprintln!(
+            "journal_feed_real_copy pages={pages} days={days} indexed_scans={indexed_scans} walked_scans={walked_scans}"
+        );
+        assert_eq!(indexed_scans, 1, "the whole feed shares one inventory scan");
+        assert_eq!(walked_scans, pages, "the retired shape scans per feed page");
+
+        assert_eq!(user_graph_bytes(&fixture.graph_root), source);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The pre-fix shape, kept as the necessity proof for the budget above:
+    /// answering the same feed pages from the complete page inventory walks
+    /// the graph once per request. This is what the assertion above rejects.
+    #[test]
+    fn inventory_walk_feed_is_graph_sized_per_request() {
+        let fixture = journal_feed_fixture("journal-feed-necessity", 0xfeed_0003);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&handle);
+
+        let baseline = handle.application_inventory_scans().unwrap();
+        let mut cursor = None;
+        let mut requests = 0;
+        loop {
+            let page = journal_feed_page_by_inventory_walk(
+                &handle,
+                SyncApplicationJournalFeedRequest {
+                    limit: 3,
+                    before_day: cursor,
+                    as_of_day: 20_260_726,
+                },
+            );
+            requests += 1;
+            if page.2 {
+                break;
+            }
+            cursor = page.1;
+        }
+        assert!(requests >= 4);
+        assert_eq!(
+            handle.application_inventory_scans().unwrap() - baseline,
+            requests,
+            "the retired shell implementation scans the whole graph per feed page"
+        );
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
     /// The Journals back-gesture, staged.
     ///
     /// Martin reports that under managed storage on Android, opening a page
     /// forward is fast while the back gesture to Journals — a feed loaded
     /// seconds earlier, with nothing changed in between — takes 2–3 seconds.
-    /// The commands behind the two gestures are not the same shape:
-    /// `get_page` is ONE actor page load, while `journal_feed_page` is a FULL
-    /// page inventory followed by `limit` page loads. This receipt separates
-    /// those stages so the cost is attributed rather than guessed at, and
-    /// prints the Direct Files analogue of each stage beside it.
+    /// The commands behind the two gestures were not the same shape:
+    /// `get_page` is ONE actor page load, while `journal_feed_page` used to be
+    /// a FULL page inventory followed by `limit` page loads. This receipt
+    /// separates those stages so the cost is attributed rather than guessed
+    /// at, times the current indexed feed beside the retired inventory-walk
+    /// shape, and prints the Direct Files analogue of each stage. It also
+    /// times the Logical forward open, which is what `get_page` actually
+    /// uses — the audit measured only the `ExactPath` leaf.
     #[test]
     #[ignore = "manual benchmark: the Journals back gesture, staged, on a supplied graph copy"]
     fn managed_journals_back_navigation_manual_benchmark() {
@@ -44628,6 +45289,8 @@ mod tests {
                 .collect()
         };
 
+        let mut indexed_feed_samples = Vec::with_capacity(rounds);
+        let mut forward_logical_samples = Vec::with_capacity(rounds);
         let mut inventory_samples = Vec::with_capacity(rounds);
         let mut feed_load_samples = Vec::with_capacity(rounds);
         let mut feed_total_samples = Vec::with_capacity(rounds);
@@ -44666,10 +45329,33 @@ mod tests {
             feed_load_samples.push(loads_elapsed);
             feed_total_samples.push(feed_elapsed);
 
-            // Forward gesture: get_page = ONE actor page load.
+            // The same back gesture through the retained journal day index:
+            // one actor turn, no whole-graph walk.
+            let indexed_started = Instant::now();
+            match handle
+                .journal_feed_page(SyncApplicationJournalFeedRequest {
+                    limit: FEED_LIMIT,
+                    before_day: None,
+                    as_of_day: today,
+                })
+                .unwrap()
+            {
+                SyncApplicationJournalFeedOutcome::Loaded { pages, .. } => {
+                    assert!(!pages.is_empty(), "the indexed feed answered nothing");
+                }
+                other => panic!("indexed journal feed did not load: {other:?}"),
+            }
+            indexed_feed_samples.push(indexed_started.elapsed());
+
+            // Forward gesture: get_page = ONE actor page load. Production uses
+            // the Logical selector; the ExactPath leg is the audit's probe.
             let forward_started = Instant::now();
             let _ = load_application_exact(&handle, &forward_entry.rel_path);
             forward_samples.push(forward_started.elapsed());
+
+            let forward_logical_started = Instant::now();
+            let _ = load_application_logical(&handle, &forward_entry.name, SyncPageKind::Page);
+            forward_logical_samples.push(forward_logical_started.elapsed());
 
             // Direct Files analogues of the same two gestures.
             let direct_feed_started = Instant::now();
@@ -44706,7 +45392,9 @@ mod tests {
         report("managed_back_total", &feed_total_samples);
         report("managed_back_inventory", &inventory_samples);
         report("managed_back_page_loads", &feed_load_samples);
+        report("managed_back_indexed_total", &indexed_feed_samples);
         report("managed_forward_one_page", &forward_samples);
+        report("managed_forward_one_page_logical", &forward_logical_samples);
         report("direct_back_total", &direct_feed_samples);
         report("direct_forward_one_page", &direct_forward_samples);
 
