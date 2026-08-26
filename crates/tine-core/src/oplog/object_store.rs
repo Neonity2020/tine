@@ -7002,11 +7002,9 @@ impl ArchiveBatchPublication {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn commit(self) -> Result<(), StoreError> {
-        let result = self.commit_staged();
-        for artifact in &self.staged {
-            let _ = self.namespaces[artifact.namespace].remove_file(&artifact.temp_name);
-        }
-        result
+        // `Drop` removes the temporaries whether this succeeds or not, so an
+        // abandoned batch cannot leak names into the archive namespaces.
+        self.commit_staged()
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -7065,6 +7063,20 @@ impl ArchiveBatchPublication {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn commit(self) -> Result<(), StoreError> {
         Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Drop for ArchiveBatchPublication {
+    /// Remove every temporary this batch created, on the committed and the
+    /// abandoned path alike. A batch abandoned mid-stage (a validation error,
+    /// or the deterministic cut a crash test arms) must not leave temporaries
+    /// behind: they are invisible to readers, but they are still bytes in the
+    /// user's archive.
+    fn drop(&mut self) {
+        for artifact in &self.staged {
+            let _ = self.namespaces[artifact.namespace].remove_file(&artifact.temp_name);
+        }
     }
 }
 

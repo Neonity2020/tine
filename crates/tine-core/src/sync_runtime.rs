@@ -27289,6 +27289,13 @@ mod tests {
             let installed = archive_object_names(&objects_dir)
                 .difference(&genesis_objects)
                 .count();
+            assert!(
+                !fs::read_dir(&objects_dir)
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-")),
+                "an abandoned batch must not leak temporaries into the archive"
+            );
             match cut {
                 // The cut precedes the batch's barrier, so nothing may be
                 // installed yet.
