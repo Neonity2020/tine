@@ -8,6 +8,18 @@ export interface AndroidBackListener {
   unregister(): Promise<void> | void;
 }
 
+type AndroidProcessApi = { exit(code?: number): Promise<void> };
+
+/** Exit only after the safe-close coordinator has made graph state durable.
+ * Tauri exposes Activity/process exit through plugin-process; plugin:app has no
+ * exit command and leaves the transition shield active on Android. */
+export async function exitAndroidActivity(
+  loadProcess: () => Promise<AndroidProcessApi> = () => import("@tauri-apps/plugin-process"),
+): Promise<void> {
+  const { exit } = await loadProcess();
+  await exit(0);
+}
+
 export interface AndroidBackDispatchDeps {
   dismissTransient(): boolean;
   dismissDrawer(): boolean;

@@ -155,7 +155,7 @@ import {
   trackGraphChangeApplication,
 } from "./reloadOnFocus";
 import { freshnessVisible } from "./freshnessBarrier";
-import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./androidBack";
+import { createAndroidRootCloseCoordinator, exitAndroidActivity, installAndroidBackHandler } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
@@ -197,10 +197,7 @@ const safeClose = createSafeCloseCoordinator({
 
 const androidRootClose = createAndroidRootCloseCoordinator(safeClose, {
   prepareNativeClose: () => backend().prepareQuit(),
-  finishActivity: async () => {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("plugin:app|exit");
-  },
+  finishActivity: exitAndroidActivity,
   nativePrepareFailed: (failure) => pushToast(
     failure.status === "refused" || failure.status === "partial"
       ? "Tine-managed storage could not verify a clean stop. The app remains open so you can retry or inspect recovery status."

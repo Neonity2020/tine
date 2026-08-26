@@ -8295,6 +8295,30 @@
     "failBefore": "proven"
    },
    "notes": "Each reference section header carries a quiet export affordance opening a chooser: every entry pre-selected (copy-all is two clicks), uncheck for a subset, All/None bulk toggles, Cancel/overlay/Escape close without side effects. The chooser hands the SAME Copy / export modal (Text/OPML/HTML plus the usual content/indent/depth/cleanup options) a node forest grouped by source page — the shape query export already uses and the structure the section shows. Linked honors the section's active filters (the visible set); the two sections act independently. Everything is read-only: entries export from the backend DTOs the section already holds, never hydrating pages into the store or running a save path. Normal page export is untouched, and a dedicated test asserts references never silently join it. Fail-before: no affordance existed anywhere in either section (all chooser tests red)."
+  },
+  {
+   "id": "UI-ANDROID-ROOT-CLOSE-386",
+   "title": "Android Back beyond the first route safely prepares graph storage and then exits the Activity through Tauri's installed process plugin instead of leaving a gray, shielded app",
+   "family": "android-navigation",
+   "sources": {
+    "issues": [
+     386
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/androidBack.test.ts::GH #161 Android SafeBack owner::hands a safely prepared root close to Tauri's installed process exit API"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #386: Direct Files reaches the same safe root-close coordinator as managed storage. After successful preparation App.tsx invoked nonexistent `plugin:app|exit`; Tauri's installed exit API is `@tauri-apps/plugin-process` (`plugin:process|exit`). The rejected invoke left the transition shield active and produced the reported gray screen plus misleading managed-storage toast. App now calls a tested exitAndroidActivity helper through the installed process plugin. Current-master necessity test failed before the correction; Android runtime confirmation remains required."
   }
  ]
 }

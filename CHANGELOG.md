@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Pressing Back beyond the first Android page now closes Tine instead of
+  leaving a gray, unusable screen** (GH #386). Storage was already stopped
+  safely, but the final handoff called a Tauri command that does not exist.
+  Android now uses the installed process-exit API after the same guarded save
+  and shutdown checks.
+
 - **Enter at either side of an in-block line break now creates a clean new
   block** (GH #361). The first fix handled the caret at the start of line two,
   but pressing Enter at the end of line one still copied the newline into the
