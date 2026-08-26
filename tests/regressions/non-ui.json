@@ -5122,6 +5122,32 @@
     "failBefore": "proven at 34e247ac: journal_feed_page assembled the feed in the shell from the complete application_page_inventory, so every open and every scroll step walked every page in the graph. On the 1,045-file anonymized corpus that walk was 5.19 ms p50 of a 6.22 ms feed open (release, this box), and the frontend requests three days at a time. inventory_walk_feed_is_graph_sized_per_request pins that retired shape; disabling the retained index makes the budget assertion fail (2 scans observed, 1 required)."
    },
    "notes": "User outcome: the Journals surface is Martin's primary view and its back gesture reloads a feed nothing has changed. Classification: blocking core operation (responsiveness of the primary surface), not an exact-value contract. The budget is stated as inventory scans per accepted frontier, not milliseconds, so a reasonable alternative implementation that answers the feed without enumerating the graph passes. Correctness is guarded separately by a differential against the retired inventory walk over full pagination, on a synthetic fixture whose journal filename format (dd-MM-yyyy) makes path order deliberately differ from date order, and on a real anonymized graph copy behind TINE_MANAGED_NAV_GRAPH_COPY."
+  },
+  {
+   "id": "REG-CORE-MANAGED-SAVE-DURABILITY-BARRIER-CONFETTI",
+   "title": "An ordinary managed edit does not pay a device round trip per archive artifact",
+   "family": "managed-storage-durability",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "android",
+    "windows",
+    "macos"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs",
+     "crates/tine-core/src/durability_counters.rs"
+    ],
+    "scenario": "storage.managed-save-and-move-durability-barrier-budget",
+    "failBefore": "proven"
+   },
+   "notes": "Internal report from the 2026-08-26 managed-storage cost-model audit (defect D1), verified by an independent Codex lane and an LD_PRELOAD fsync interposer. User-visible harm: every accepted managed edit blocked on one device round trip per separately durable artifact, so save latency scaled with artifact count rather than edit size - about 20 ms on the audit box's local ext4 and plausibly hundreds of ms on a slow or network filesystem. Classification: blocking stateful UX (latency of the core edit loop), with a data-safety contract attached because the fix changes when bytes become durable. Fail-before on exact base 34e247ac with the new counters: one accepted single-block managed save performed 55 core-initiated durability barriers and one cross-page move 130 (the audit's own broader counter set, which also sees tine-storage-internal barriers, measured 66 and 151 on the 1,045-file anonymized graph). Pass-after: 45 and 109. Two changes: (1) an accepted batch's archive objects and manifest are now staged under temporary names, flushed with ONE syncfs, and only then installed under their final immutable names - ten to sixteen barriers become three; (2) three fsync-before-read helpers on the managed projection paths, which fired three times per save and eight times per move and defended no in-scope failure, are deleted. Crash safety: docs/storage-sync-contract.md section 2.10a-i states the one-durability-point invariant and a crash-point table; clean_batched_archive_publication_leaves_no_torn_immutable_name drives a deterministic cut before the barrier and a second cut mid-install and proves that no immutable name is ever observable with bytes that were never flushed, that the graph still reopens, and that a fresh session completes the same edit. Necessity gate: managed_save_and_move_stay_within_their_barrier_budget fails on the pre-fix code (55 > 45); the mid-install crash test fails against the install-before-flush primitive (tine_storage::ExactImmutablePublicationBatch), which leaves a zero-length immutable object and makes ObjectStore::validate_namespace refuse the whole archive on reopen. Remaining gap to the audit's target of 3/5 is stated in the contract: the projection receipt store's nine artifacts per intent, and the six projection-directory chain flushes on the user-visible Markdown write path, which this packet deliberately did not touch."
   }
  ]
 }

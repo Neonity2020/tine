@@ -417,6 +417,7 @@ impl CanonicalArchiveResourceId {
         let mut file = create_new_archive_claim(directory)?;
         validate_archive_claim_handle(&file)?;
         file.write_all(&bytes)?;
+        crate::durability_counters::note(crate::durability_counters::Barrier::File);
         file.sync_all()?;
         sync_dir_required(directory).map_err(|error| std::io::Error::other(error.to_string()))?;
         derive_archive_resource_id(directory, &bytes)

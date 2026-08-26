@@ -370,6 +370,7 @@ fn publish_android_private_immutable(
         return Ok(());
     }
 
+    crate::durability_counters::note_immutable_publication();
     let temp_name = format!(".tmp-{}", Uuid::new_v4());
     let temp_name_c = CString::new(temp_name.as_str())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt temp filename"))?;

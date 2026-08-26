@@ -34,6 +34,7 @@ pub(crate) fn sync_private_tree(path: &Path) -> io::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn sync_filesystem(path: &Path) -> io::Result<()> {
+    crate::durability_counters::note(crate::durability_counters::Barrier::Filesystem);
     let directory = fs::File::open(path)?;
     // SAFETY: the opened descriptor names the filesystem containing the
     // complete private tree. Android may reject this filesystem-wide operation
@@ -52,6 +53,55 @@ const fn android_filesystem_sync_may_fallback(kind: io::ErrorKind) -> bool {
         kind,
         io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
     )
+}
+
+/// Flush every dirty byte of the filesystem containing `directory` with one
+/// barrier.
+///
+/// This is the single durability point of a batched publication: after it
+/// returns, every byte written into that filesystem — including files this
+/// process has not individually `fsync`ed — is on stable storage. One syscall
+/// replaces one `fsync` per staged artifact, which is the whole point (the
+/// 2026-08-26 cost-model audit measured ten of those per ordinary edit).
+///
+/// The caller owns the fallback policy: this function reports the platform's
+/// refusal rather than deciding what to do about it, because the right answer
+/// differs between "flush a graph-sized private tree" and "flush the four
+/// files I just staged".
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn sync_filesystem_containing(directory: &Dir) -> io::Result<()> {
+    use std::os::fd::FromRawFd as _;
+
+    crate::durability_counters::note(crate::durability_counters::Barrier::Filesystem);
+    // cap-std may retain an O_PATH capability, which cannot be the subject of
+    // syncfs. Derive one real descriptor through the retained capability.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_fd().as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned one newly owned directory descriptor.
+    let opened = unsafe { fs::File::from_raw_fd(fd) };
+    let result = unsafe { libc::syncfs(opened.as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Whether a platform refused a durability primitive as a capability, rather
+/// than reporting a real I/O failure. Android vendor filesystems deny
+/// filesystem-wide flush on app-private storage even where per-file flush
+/// works; every other errno stays fatal.
+#[cfg(target_os = "android")]
+pub(crate) fn is_capability_refusal(error: &io::Error) -> bool {
+    android_filesystem_sync_may_fallback(error.kind())
 }
 
 /// Which durability class an artifact belongs to. Platform durability policy is
@@ -170,6 +220,7 @@ fn sync_private_tree_exact(path: &Path) -> io::Result<()> {
 /// directory fsync even after permitting every exact file sync. That platform
 /// limitation must not block activation; ordinary I/O errors remain fatal.
 pub(crate) fn sync_reconstructible_directory(directory: &Dir) -> io::Result<()> {
+    crate::durability_counters::note(crate::durability_counters::Barrier::Directory);
     finish_android_reconstructible_directory_sync(tine_storage::sync_dir_required(directory))
 }
 
@@ -208,6 +259,7 @@ fn simulate_android_reconstructible_directory_sync(result: io::Result<()>) -> io
 
 #[cfg(any(test, not(target_os = "linux")))]
 pub(crate) fn sync_regular_file(path: &Path) -> io::Result<()> {
+    crate::durability_counters::note(crate::durability_counters::Barrier::File);
     let mut options = OpenOptions::new();
     options.read(true);
     // FlushFileBuffers requires a write-capable handle on Windows.

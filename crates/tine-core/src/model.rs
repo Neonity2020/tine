@@ -4537,7 +4537,7 @@ fn projection_post_publish_hook(path: &Path) -> io::Result<()> {
             file.set_len(0)?;
             file.seek(io::SeekFrom::Start(0))?;
             file.write_all(&bytes)?;
-            file.sync_all()?;
+            barrier_sync_all(&file)?;
         }
         Ok(())
     })
@@ -9378,7 +9378,7 @@ impl Graph {
             retired = true;
 
             let (retired_file, retired_bytes) =
-                sync_open_and_read_projection_regular(target.parent(), &recovery)?;
+                open_and_read_projection_regular(target.parent(), &recovery)?;
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
             validate_graph_text_single_link(&retired_file, managed_path.as_str())?;
             drop(retired_file);
@@ -17712,7 +17712,7 @@ impl Graph {
             self.managed_optional_file_identity(write, &target.absolute_path)?,
         )?;
         let (file, current) =
-            sync_open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+            open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
         if current != expected_target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -17732,7 +17732,7 @@ impl Graph {
                 "existing projection differs from guarded page serialization",
             ));
         }
-        file.sync_all()?;
+        barrier_sync_all(&file)?;
         sync_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         self.ensure_projection_target_shape(&parent, &target)?;
@@ -17939,7 +17939,7 @@ impl Graph {
                         if let Some(expected_base) = expected_base.filter(|_| !resumed_retirement) {
                             let retired = reservation.recovery_filename().to_owned();
                             let (displaced_file, displaced) =
-                                sync_open_and_read_projection_regular(
+                                open_and_read_projection_regular(
                                     parent.final_dir(),
                                     &target_path.filename,
                                 )?;
@@ -17951,7 +17951,7 @@ impl Graph {
                                     "projection precondition changed before displacement",
                                 ));
                             }
-                            displaced_file.sync_all()?;
+                            barrier_sync_all(&displaced_file)?;
                             drop(displaced_file);
                             let captured = ProjectionRecoveryEvidence::new_bound(
                                 &target_path.relative_path,
@@ -18364,7 +18364,7 @@ impl Graph {
             projection_late_collision_hook()?;
             validate_retirement_boundary()?;
             let (displaced_file, displaced) =
-                sync_open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+                open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
             let displaced_identity = canonical_projection_file_resource_id(&displaced_file)?;
             if displaced != expected_base {
                 return Err(io::Error::new(
@@ -18372,7 +18372,7 @@ impl Graph {
                     "projection removal precondition changed before displacement",
                 ));
             }
-            displaced_file.sync_all()?;
+            barrier_sync_all(&displaced_file)?;
             drop(displaced_file);
             let captured = ProjectionRecoveryEvidence::new_bound(
                 &target.relative_path,
@@ -18387,7 +18387,7 @@ impl Graph {
             // foreign replacement remains live rather than being displaced by
             // a tombstone authored against the old inode.
             let (live_file, live) =
-                sync_open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+                open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
             let live_identity = canonical_projection_file_resource_id(&live_file)?;
             if live != expected_base || live_identity != displaced_identity {
                 return Err(io::Error::new(
@@ -18395,7 +18395,7 @@ impl Graph {
                     "projection removal base changed after exact capture",
                 ));
             }
-            live_file.sync_all()?;
+            barrier_sync_all(&live_file)?;
             drop(live_file);
             retire_projection_target(parent.final_dir(), &target.filename, &retired)?;
             retirement_occurred = true;
@@ -18464,8 +18464,7 @@ impl Graph {
                     Ok(())
                 })();
                 combine_projection_hook_validation(hooks, validation)?;
-                let final_displaced =
-                    sync_and_read_projection_regular(parent.final_dir(), &retired)?;
+                let final_displaced = read_projection_regular(parent.final_dir(), &retired)?;
                 if final_displaced != expected_base {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
@@ -18838,7 +18837,7 @@ impl Graph {
         let lock = self.page_lock(&target.absolute_path);
         let _guard = lock.lock().unwrap();
         let parent = self.projection_parent(&target, false)?;
-        let bytes = sync_and_read_projection_regular(parent.final_dir(), &evidence.filename)?;
+        let bytes = read_projection_regular(parent.final_dir(), &evidence.filename)?;
         preflight_reconstructible_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
         Ok(bytes)
@@ -19037,7 +19036,7 @@ impl Graph {
                 return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
             }
         };
-        opened.sync_all()?;
+        barrier_sync_all(&opened)?;
         if !projection_recovery_matches_record(&opened, &bytes, record)? {
             let relative_path = retain_projection_recovery_conflict(
                 &target,
@@ -19108,12 +19107,12 @@ impl Graph {
             if !seen.insert(filename) {
                 continue;
             }
-            let (file, bytes) =
-                match sync_open_and_read_projection_regular(parent.final_dir(), filename) {
-                    Ok(observed) => observed,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                };
+            let (file, bytes) = match open_and_read_projection_regular(parent.final_dir(), filename)
+            {
+                Ok(observed) => observed,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             let _ = canonical_projection_file_resource_id(&file)?;
             evidence.push(ProjectionRecoveryEvidence::new_unbound(
                 &target.relative_path,
@@ -19149,7 +19148,7 @@ impl Graph {
                     continue;
                 }
                 let (file, bytes) =
-                    match sync_open_and_read_projection_regular(parent.final_dir(), &filename) {
+                    match open_and_read_projection_regular(parent.final_dir(), &filename) {
                         Ok(observed) => observed,
                         Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                         Err(error) => return Err(error),
@@ -19385,7 +19384,7 @@ impl Graph {
         )?;
 
         let (file, current) =
-            sync_open_and_read_projection_regular(parent.final_dir(), &target_path.filename)?;
+            open_and_read_projection_regular(parent.final_dir(), &target_path.filename)?;
         if current != expected_target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -19402,7 +19401,7 @@ impl Graph {
         let rev = content_rev(text);
         self.note_self_write(&target_path.absolute_path, rev.clone());
         let result = (|| {
-            file.sync_all()?;
+            barrier_sync_all(&file)?;
             sync_reconstructible_projection_chain(&parent.chain)?;
             let hooks = combine_projection_hook_results(
                 projection_post_publish_hook(&target_path.absolute_path),
@@ -21314,8 +21313,7 @@ impl Graph {
                 "committed journal target parent changed before durability proof",
             ));
         }
-        let (file, reread) =
-            sync_open_and_read_projection_regular(target.parent(), &target.filename)?;
+        let (file, reread) = open_and_read_projection_regular(target.parent(), &target.filename)?;
         let identity = canonical_projection_file_resource_id(&file)?;
         if reread != plan.target.as_bytes() {
             return Err(io::Error::new(
@@ -21323,7 +21321,7 @@ impl Graph {
                 "committed journal target changed before durability proof",
             ));
         }
-        file.sync_all()?;
+        barrier_sync_all(&file)?;
         journal_projection_after_file_sync_hook()?;
         sync_reconstructible_projection_chain(&target.chain)?;
         let rebound = self.managed_target(write, &plan.path, false)?;
@@ -23764,13 +23762,51 @@ pub fn dir_fsync_error_is_unsupported(error: &io::Error) -> bool {
     dir_fsync_is_unsupported(error)
 }
 
+/// A file handle that can be forced to stable storage.
+///
+/// Both `std::fs::File` and the capability-scoped `cap_std::fs::File` appear on
+/// managed write paths; this lets one counted barrier helper serve both.
+pub(crate) trait DurableFileHandle {
+    fn sync_to_stable_storage(&self) -> io::Result<()>;
+}
+
+impl DurableFileHandle for fs::File {
+    fn sync_to_stable_storage(&self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+impl DurableFileHandle for cap_std::fs::File {
+    fn sync_to_stable_storage(&self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+/// `fsync` one regular file and record the durability barrier.
+///
+/// Every production file barrier in this module goes through here so the
+/// per-operation barrier count is a measurable, testable number rather than an
+/// invisible sum spread across modules (2026-08-26 cost-model audit, D1).
+#[inline]
+fn barrier_sync_all(file: &impl DurableFileHandle) -> io::Result<()> {
+    crate::durability_counters::note(crate::durability_counters::Barrier::File);
+    file.sync_to_stable_storage()
+}
+
+/// `fsync` one already-opened directory handle and record the barrier.
+#[inline]
+fn barrier_sync_dir_handle(handle: &fs::File) -> io::Result<()> {
+    crate::durability_counters::note(crate::durability_counters::Barrier::Directory);
+    handle.sync_all()
+}
+
 /// fsync a directory so a rename into it survives a crash.
 ///
 /// Errors that mean "unsupported here" are swallowed; everything else is
 /// propagated, because a caller told the durability succeeded when it did not
 /// will happily report a save as committed.
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    match fs::File::open(dir).and_then(|handle| handle.sync_all()) {
+    match fs::File::open(dir).and_then(|handle| barrier_sync_dir_handle(&handle)) {
         Ok(()) => Ok(()),
         Err(error) if dir_fsync_is_unsupported(&error) => Ok(()),
         Err(error) => Err(error),
@@ -23833,7 +23869,7 @@ fn atomic_replace_expected_with_hooks(
             .create_new(true)
             .open(&tmp)?;
         file.write_all(next)?;
-        file.sync_all()?;
+        barrier_sync_all(&file)?;
         Ok(())
     })();
     if let Err(error) = staged {
@@ -23997,7 +24033,7 @@ fn atomic_publish(path: &Path, bytes: &[u8], mode: PublishMode) -> io::Result<()
             .create_new(true)
             .open(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        barrier_sync_all(&f)?;
         drop(f);
         match mode {
             PublishMode::Replace => fs::rename(&tmp, path),
@@ -24393,8 +24429,14 @@ enum StableProjectionQuarantineRetirement {
     Changed,
 }
 
-fn sync_and_reread_retained_projection_file(file: &mut fs::File) -> io::Result<Vec<u8>> {
-    file.sync_all()?;
+/// Re-read a retained projection handle from the start.
+///
+/// This deliberately does NOT `fsync` the handle first. A read through an open
+/// descriptor is served from the same page cache the writer wrote into, so
+/// forcing the bytes to the platter cannot change what this function returns.
+/// The barrier it used to perform defended no in-scope failure — see the
+/// read-path row of the refusal table in `docs/storage-sync-contract.md`.
+fn reread_retained_projection_file(file: &mut fs::File) -> io::Result<Vec<u8>> {
     file.seek(std::io::SeekFrom::Start(0))?;
     let length = file.metadata()?.len();
     if length > MAX_PROJECTION_EVIDENCE_BYTES {
@@ -24417,7 +24459,7 @@ fn retire_stable_projection_quarantine(
     projection_chain: &[Dir],
 ) -> io::Result<StableProjectionQuarantineRetirement> {
     projection_recovery_final_retirement_hook()?;
-    let bytes = sync_and_reread_retained_projection_file(&mut quarantined)?;
+    let bytes = reread_retained_projection_file(&mut quarantined)?;
     if !projection_recovery_matches_record(&quarantined, &bytes, record)? {
         return Ok(StableProjectionQuarantineRetirement::Changed);
     }
@@ -24436,7 +24478,7 @@ fn retire_stable_projection_quarantine(
             format!("projection recovery name rebound; retained as {quarantine_name}"),
         ));
     }
-    let final_bytes = sync_and_reread_retained_projection_file(&mut quarantined)?;
+    let final_bytes = reread_retained_projection_file(&mut quarantined)?;
     if !projection_recovery_matches_record(&quarantined, &final_bytes, record)? {
         return Ok(StableProjectionQuarantineRetirement::Changed);
     }
@@ -24501,39 +24543,9 @@ fn open_and_read_projection_regular_with_budget(
     Ok((file, bytes, reservation))
 }
 
-fn sync_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<Vec<u8>> {
-    sync_open_and_read_projection_regular(dir, name).map(|(_, bytes)| bytes)
-}
-
-fn sync_open_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<(fs::File, Vec<u8>)> {
-    let mut file = open_projection_file_nofollow_for_sync(dir, name)?;
-    let len = file.metadata()?.len();
-    if len > MAX_PROJECTION_EVIDENCE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "projection evidence exceeds the reload bound",
-        ));
-    }
-    file.sync_all()
-        .map_err(|error| projection_platform_error("fsync of a projection file", name, error))?;
-    let capacity = usize::try_from(len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "projection evidence length is not addressable",
-        )
-    })?;
-    let mut bytes = Vec::with_capacity(capacity);
-    let read_limit = MAX_PROJECTION_EVIDENCE_BYTES
-        .checked_add(1)
-        .ok_or_else(allocation_overflow)?;
-    (&mut file).take(read_limit).read_to_end(&mut bytes)?;
-    if usize_to_u64(bytes.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "projection evidence grew beyond the reload bound",
-        ));
-    }
-    Ok((file, bytes))
+/// Read one projection-evidence file's bytes under the evidence bound.
+fn read_projection_regular(dir: &Dir, name: &str) -> io::Result<Vec<u8>> {
+    open_and_read_projection_regular(dir, name).map(|(_, bytes)| bytes)
 }
 
 fn read_projection_optional(dir: &Dir, name: &str) -> io::Result<Option<Vec<u8>>> {
@@ -26393,11 +26405,11 @@ impl BootstrapSourcePassWriters {
     }
 
     fn sync_all(&mut self) -> io::Result<()> {
-        self.inventory.sync_all()?;
-        self.entries.sync_all()?;
-        self.chunks.sync_all()?;
-        self.aliases.sync_all()?;
-        self.portable.sync_all()
+        barrier_sync_all(&self.inventory)?;
+        barrier_sync_all(&self.entries)?;
+        barrier_sync_all(&self.chunks)?;
+        barrier_sync_all(&self.aliases)?;
+        barrier_sync_all(&self.portable)
     }
 }
 
@@ -27581,7 +27593,7 @@ fn sort_bootstrap_source_spool(
             write_bootstrap_source_frame(&mut file, row)?;
         }
         note_bootstrap_source_io_stage("sync in-memory sorted bootstrap source spool");
-        file.sync_all()?;
+        barrier_sync_all(&file)?;
         instrumentation.spool_bytes = instrumentation
             .spool_bytes
             .checked_add(file.metadata()?.len())
@@ -27596,7 +27608,7 @@ fn sort_bootstrap_source_spool(
             .create_new(true)
             .open(&sorted)?;
         note_bootstrap_source_io_stage("sync empty sorted bootstrap source spool");
-        file.sync_all()?;
+        barrier_sync_all(&file)?;
         return Ok(());
     }
     let mut generation = 0_u64;
@@ -27653,7 +27665,7 @@ fn bootstrap_source_flush_sort_run(
     for row in rows.iter() {
         write_bootstrap_source_frame(&mut file, row)?;
     }
-    file.sync_all()?;
+    barrier_sync_all(&file)?;
     instrumentation.sort_runs = instrumentation
         .sort_runs
         .checked_add(1)
@@ -27718,7 +27730,7 @@ fn merge_bootstrap_source_runs(
                 .sum(),
         );
     }
-    file.sync_all()?;
+    barrier_sync_all(&file)?;
     instrumentation.sort_runs = instrumentation
         .sort_runs
         .checked_add(1)
@@ -30709,7 +30721,7 @@ fn create_projection_staged_recovery(
     let mut options = CapOpenOptions::new();
     options.write(true).create_new(true);
     let mut file = dir.open_with(&name, &options)?;
-    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    let result = file.write_all(bytes).and_then(|()| barrier_sync_all(&file));
     drop(file);
     if let Err(error) = result {
         let _ = dir.remove_file(&name);
@@ -30763,7 +30775,7 @@ fn create_projection_staging_file(
         options.write(true).create_new(true);
         match dir.open_with(&name, &options) {
             Ok(mut file) => {
-                let result = file.write_all(bytes).and_then(|()| file.sync_all());
+                let result = file.write_all(bytes).and_then(|()| barrier_sync_all(&file));
                 drop(file);
                 if let Err(error) = result {
                     let _ = dir.remove_file(&name);
@@ -30845,7 +30857,7 @@ fn validate_projection_recovery_object_exact(
     expected_identity: ContentDigest,
 ) -> io::Result<()> {
     let (recovery_file, recovery_bytes) =
-        sync_open_and_read_projection_regular(parent.final_dir(), recovery)?;
+        open_and_read_projection_regular(parent.final_dir(), recovery)?;
     let recovery_identity = canonical_projection_file_resource_id(&recovery_file)?;
     if recovery_identity != expected_identity {
         return Err(io::Error::new(
@@ -30859,7 +30871,7 @@ fn validate_projection_recovery_object_exact(
             format!("projection recovery bytes changed after capture: {recovery}"),
         ));
     }
-    recovery_file.sync_all()
+    barrier_sync_all(&recovery_file)
 }
 
 fn preserve_and_restore_projection_recovery(
@@ -31840,6 +31852,7 @@ fn sync_projection_directory_with_class(
             crate::filesystem_durability::finish_durability_barrier(class, result)
         };
     }
+    crate::durability_counters::note(crate::durability_counters::Barrier::Directory);
     let result = tine_storage::sync_dir_required(dir).map_err(name);
     crate::filesystem_durability::finish_durability_barrier(class, result)
 }
@@ -32154,7 +32167,7 @@ pub fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
             .create_new(true)
             .open(&tmp)?;
         std::io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
+        barrier_sync_all(&output)?;
         drop(output);
         fs::rename(&tmp, dst)
     })();
@@ -32187,7 +32200,7 @@ pub fn atomic_copy_new(src: &Path, dst: &Path) -> io::Result<()> {
             .create_new(true)
             .open(&tmp)?;
         std::io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
+        barrier_sync_all(&output)?;
         drop(output);
         move_file_noreplace(&tmp, dst)?;
         sync_dir(dir)
@@ -32226,7 +32239,7 @@ pub fn atomic_copy_file_new(input: &mut fs::File, dst: &Path, max_bytes: u64) ->
                 format!("capture exceeds {max_bytes} byte limit"),
             ));
         }
-        output.sync_all()?;
+        barrier_sync_all(&output)?;
         drop(output);
         move_file_noreplace(&tmp, dst)?;
         sync_dir(dir)

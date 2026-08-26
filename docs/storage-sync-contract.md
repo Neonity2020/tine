@@ -914,6 +914,25 @@ in this table.
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
 | `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
 
+#### Checks with no in-scope scenario, and what happened to them
+
+The rule that every refusal, fail-closed path, or re-verification of already
+established state must name a concrete in-scope failure applies to *silent*
+defensive work too. A barrier or re-proof that cannot name a scenario is not
+hardening; it is unpaid latency, and later a source of availability bugs.
+
+| Removed check | Where it was | Scenario it claimed | Why it has none | Replaced by |
+| --- | --- | --- | --- | --- |
+| `fsync` before reading a projection evidence file | `model::sync_and_read_projection_regular` | — | A read through the same process's page cache returns the bytes the writer wrote whether or not they are on the platter. Flushing cannot change the result and cannot detect corruption. | Plain bounded read (`read_projection_regular`) |
+| `fsync` before opening-and-reading a projection file | `model::sync_open_and_read_projection_regular` | — | As above. On Windows it additionally forced a write-capable open for a read. | `open_and_read_projection_regular` |
+| `fsync` before re-reading a retained quarantine handle | `model::sync_and_reread_retained_projection_file` | — | As above; the handle is the one this process just wrote through. | `reread_retained_projection_file` |
+
+Between them these fired three times per managed save and eight times per
+cross-page move. Integrity of projection evidence is still checked, by the means
+that actually detects corruption: `projection_recovery_matches_record` compares
+the exact `BlobDescription` and the canonical file resource id. No read path may
+reintroduce a durability barrier.
+
 Every public durable open/activation refusal carries its scenario ID separately
 from its bounded reason/stage code. Retryable open failures do not invent a
 scenario; if a lower storage boundary detects a durable refusal it emits the
@@ -1121,6 +1140,118 @@ at the primitive, and
 `sync_runtime::tests::clean_runtime_save_survives_an_android_projection_directory_barrier_refusal`
 plus `…::a_projection_directory_barrier_refusal_stays_pending_off_android`
 at the save boundary.
+
+### 2.10a-i Durability barriers and the batch commit point
+
+A **durability barrier** is a syscall that forces bytes to stable storage:
+`fsync` of a file, `fsync` of a directory, or `syncfs` of a filesystem. Each one
+is a device round trip. Their *count per accepted operation* — not the time any
+single phase reports — is what turns an ordinary edit from milliseconds on a
+local SSD into hundreds of milliseconds on a slow or network filesystem, and it
+is invisible to phase timers because the multiplicity is spread across modules.
+
+**Invariant — one durability point per accepted batch.** An accepted batch's
+archive materialization (its content-addressed operation objects and its batch
+manifest) is made durable by exactly ONE barrier for the whole set. Before that
+barrier, no artifact of the batch need be individually durable and the batch is
+**not accepted**; after it, every artifact is durable together. Recovery treats
+a partially written batch as not-accepted and reconstructs it, and no reader may
+be able to observe an artifact of the batch in a state that is neither "absent"
+nor "exactly the intended bytes".
+
+**The protocol** (`oplog/object_store.rs::ArchiveBatchPublication`):
+
+1. **Stage.** Each artifact is written under a temporary name in its own
+   namespace, with no barrier. Temporary names are not archive entries: every
+   reader — `ObjectStore::validate_namespace`, `inspect_batch`, every replay —
+   addresses artifacts by content-addressed or batch-addressed *final* names.
+2. **One barrier.** `syncfs` on the private archive filesystem. This is the
+   batch's single durability point.
+3. **Install.** Each final name is inserted no-replace. This is metadata over
+   data that is already durable.
+4. **Directory barriers.** One `fsync` per distinct namespace touched — two for
+   an ordinary batch (`objects`, `batches`).
+
+Step 3 comes after step 2 deliberately, and that ordering is the whole
+crash-safety argument. Installing final names *before* the flush (which is what
+`tine_storage::ExactImmutablePublicationBatch` does, and why this path does not
+use it) admits a state where an immutable name is present with bytes that never
+reached the platter — most visibly zero-length under ext4 delayed allocation.
+`validate_namespace` correctly refuses such an archive
+(`StoreError::ObjectPathMismatch`), so that state would strand an accepted edit
+that is still durable in the journal. Staging first removes the state from the
+reachable set instead of adding recovery for it.
+
+**Ordering between artifact classes.** Pointer-before-pointee durability is
+preserved without a second barrier because the pointer and the pointee are in
+the *same* batch: the manifest references its objects, and the single barrier
+makes objects and manifest durable together. Two references cross the batch
+boundary and keep their own barriers: the archive's **lineage claim**, which
+every manifest asserts and which is written once in an archive's lifetime
+before this batch runs; and the **local journal frame**, which is the acceptance
+authority and is already durable from the foreground save. Nothing outside the
+batch points *into* it before the batch completes: the journal frame is
+checkpointed — the point at which the archive becomes authoritative and the
+frame becomes reclaimable — strictly after this publication returns.
+
+**Crash points.**
+
+| Crash at | On disk | Recovery |
+| --- | --- | --- |
+| During staging | Temporary names only, contents arbitrary | Batch not accepted. The journal frame is undrained, so the drain republishes the byte-identical batch. Temporaries are invisible to readers. |
+| After staging, before the barrier | As above | As above. |
+| After the barrier, during installs | A prefix of final names, every one with durable, byte-correct content | The drain republishes; each already-installed name verifies byte-identical and is accepted as published. |
+| After installs, before a directory barrier | Possibly no name insertion durable | Same as the row above; any surviving name is byte-correct. |
+| After the directory barriers | The whole batch durable | The drain proceeds to checkpoint. |
+
+In every row the *accepted operation* is unaffected: it became durable in the
+local journal during the foreground save, before any of this runs.
+
+**In-scope scenarios defended:** crash/power loss, torn write, disk error,
+interrupted delivery, honest concurrent instance (the archive is a single-writer
+namespace held under lease), honest multi-device divergence (unchanged — this
+publication is device-local). **Out of scope:** an adversary who can write
+arbitrary bytes to the user's filesystem
+(`specs/notes/2026-08-07-trust-model-and-threat-model-decision.md`).
+
+**Platforms without `syncfs`** (Windows, macOS) have no batched barrier to take,
+so `ArchiveBatchPublication::stage` publishes each artifact through the ordinary
+durable publisher and `commit` is inert; the barrier count there is unchanged.
+On Android, a vendor filesystem that denies the filesystem-wide flush as a
+*capability* (`EPERM`/`ENOTSUP`/`EINVAL`) falls back to one `fsync` per staged
+artifact — the barriers this batch exists to avoid, but a correct durability
+point and an available product. Every other errno stays fatal.
+
+**Read paths take no barriers.** `fsync` before reading a file defends nothing:
+a read is served from the same page cache the writer wrote into, so forcing
+those bytes to the platter cannot change the returned bytes, and it cannot
+detect corruption either. Three such helpers existed on the managed projection
+paths and fired three times per save and eight times per cross-page move; they
+are deleted, and no read path may reintroduce one. See the `MS-REF-` note below.
+
+**The budget, and where it stands.** `crate::durability_counters` counts every
+barrier `tine-core` initiates and
+`sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
+asserts the per-operation totals against
+`MANAGED_SAVE_BARRIER_BUDGET` = **45** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**109**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+appends and SQLite file-set publication are not reachable from this crate and
+are excluded (measured at three more per save, four per move).
+
+The cost-model audit's target is 3 and 5. The gap is stated here rather than
+hidden, and it is entirely in two places that this contract does not yet cover:
+
+* The **projection receipt store** publishes nine artifacts per intent (base,
+  two per-intent namespace bindings of two artifacts each, intent, attempt
+  reservation, mutation authority, completion) = 18 barriers per projected page.
+  They are not batched because their readers treat "present with unexpected
+  bytes" as namespace substitution and refuse, and because four of the nine
+  exist only to defend against an adversary the trust model puts out of scope.
+  Collapsing them is a scope decision, not an implementation detail.
+* The **projection directory chain** is flushed about six times per foreground
+  save (12 barriers for a two-deep chain). That is the user-visible Markdown
+  write path, whose temp + fsync + rename + base-revision guard + lock semantics
+  are deliberately untouched.
 
 ### 2.10b No-clobber publication when the filesystem has no rename flags
 
