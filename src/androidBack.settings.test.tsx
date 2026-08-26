@@ -109,14 +109,16 @@ describe("Android Back and the Settings modal", () => {
 
     // Rung 2: a non-empty settings search query.
     const search = host.querySelector<HTMLInputElement>(".settings-search-input")!;
-    search.value = "journal";
+    search.value = "Find in page";
     search.dispatchEvent(new Event("input", { bubbles: true }));
     await tick();
-    expect(host.querySelector(".settings-search-results")).not.toBeNull();
+    expect(host.querySelector(".settings-search-results")).toBeNull();
+    expect([...host.querySelectorAll<HTMLElement>(".help-shortcut-id")].map((id) => id.textContent))
+      .toEqual(["go/find-in-page"]);
     const queryPress = pressBack();
     await tick();
     expect(queryPress).toEqual({ disposition: "transient", fallbacks: [] });
-    expect(host.querySelector(".settings-search-results")).toBeNull();
+    expect(host.querySelectorAll(".help-shortcut-id").length).toBeGreaterThan(1);
     expect(settingsOpen()).toBe(true);
 
     // Rung 3: the modal itself.
