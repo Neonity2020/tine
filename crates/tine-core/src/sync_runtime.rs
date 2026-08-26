@@ -19132,11 +19132,17 @@ impl RuntimeActor {
             }
         }
         // Provider delivery and the visible Markdown projection travel through
-        // file synchronizers independently. Drain every provider batch already
-        // visible in this observation before classifying races, or an
-        // intermediate operation can be mistaken for a final offline edit
-        // while its causal descendant is waiting in this same queue.
-        if self.provider_transport_has_work() {
+        // file synchronizers independently. Capture a pending projection
+        // observation before provider projection can overwrite it. Once that
+        // watcher epoch is durable, drain every provider batch already visible
+        // before classifying races so an intermediate operation is not mistaken
+        // for a final offline edit while its causal descendant is queued.
+        let projection_observation_pending = self.clean.as_ref().is_some_and(|clean| {
+            clean.full_scan.is_some()
+                || clean.completed_full_scan.is_some()
+                || clean.watcher.pending()
+        });
+        if !projection_observation_pending && self.provider_transport_has_work() {
             return self.tick_clean_provider();
         }
         if let Some(tick) = self.resolve_pending_conflict() {

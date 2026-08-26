@@ -5074,6 +5074,28 @@
     "scenario": "managed-sync.rapid-task-edits-provider-interleave-clean-shutdown-reopen",
     "failBefore": "proven at 1dbce51f: projection-first delivery of a newly created unstamped task authors two internal block identities at the same sibling order, then retained provider projection blocks before the rapid-edit sequence with duplicate sibling order below the page root"
    }
+  },
+  {
+   "id": "REG-MANAGED-LOCAL-EDIT-PROVIDER-DELETE-ORDER",
+   "title": "When one sync observation contains a pending local Markdown or Org edit and a provider deletion of that page, the local edit is captured into immutable history before provider projection can replace the file",
+   "family": "managed-sync-reconciliation-order",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "v0.6.97 exact-candidate full-CI release gate"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-integration",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::provider_delete_racing_a_local_edit_of_the_same_page_settles"
+    ],
+    "scenario": "managed-sync.pending-local-watcher-epoch-before-provider-delete",
+    "failBefore": "proven at 3f4273ad: provider transport preempted the pending watcher epoch and projected the deletion before the local bytes were authored"
+   }
   }
  ]
 }

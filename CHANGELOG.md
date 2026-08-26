@@ -297,6 +297,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   open the old marker as the new graph and reporting that it names a different
   catalog document.
 
+- **A provider deletion can no longer erase a local edit that arrived in the
+  same sync pass.** Managed sync now captures a pending Markdown or Org watcher
+  epoch before applying provider projection, then drains the complete visible
+  provider cut before classifying the resulting race. The local edit therefore
+  enters immutable history and the normal edit-versus-delete rule settles it,
+  even when the filesystem and oplog notifications arrive together.
+
 - **Direct Files delete, rename, trash, and conflict-copy moves no longer read
   every document in the graph.** These exact no-clobber moves now validate the
   source and destination through retained metadata and portable path checks;

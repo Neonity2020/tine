@@ -24525,6 +24525,17 @@ impl ShardedHotEngine {
         Ok(SemanticEffect::decode(semantic_objects[0].payload())?)
     }
 
+    fn accepted_batch_causal_containment(
+        &self,
+        batch: &ValidatedBatch,
+    ) -> Result<AcceptedBatchCausalContainment, EngineError> {
+        self.batch_causal_containment(
+            batch.manifest().batch_id(),
+            batch.manifest().causal_dot(),
+            batch.manifest().causal_dependency_heads(),
+        )
+    }
+
     fn equivalent_projection_create_intents(
         &self,
         x_batch: &ValidatedBatch,
@@ -24655,16 +24666,18 @@ impl ShardedHotEngine {
         if x_effect.blocks().is_empty() {
             return Ok(Vec::new());
         }
-        let x_heads = declared_batch_heads(x_batch.manifest().dependency_frontier());
-        let x_ancestry = self.collect_batch_ancestry(&x_heads, false)?;
+        let x_containment = self.accepted_batch_causal_containment(&x_batch)?;
         let accepted = self.status().accepted_batches()?.to_vec();
         let mut intents = Vec::new();
         for candidate in accepted {
             let z_id = candidate.batch_id;
-            if z_id == batch_id || x_ancestry.contains_key(&z_id) {
+            if z_id == batch_id {
                 continue;
             }
             let z_batch = self.load_accepted_validated_batch(z_id)?;
+            if x_containment.contains(z_batch.manifest().causal_dot(), z_id) {
+                continue;
+            }
             let z_effect = self.accepted_semantic_effect(&z_batch)?;
             let shared: Vec<(&BlockDelta, &BlockDelta)> = x_effect
                 .blocks()
@@ -24690,13 +24703,10 @@ impl ShardedHotEngine {
             }
             // Batches causally after `batch_id` (an already-accepted
             // resolution, a later user action) are not concurrent with it.
-            // Keep this behind the two cheap overlap classifiers: ordinary
-            // unrelated accepted history must never pay an ancestry walk.
-            let z_heads = declared_batch_heads(z_batch.manifest().dependency_frontier());
-            if self
-                .collect_batch_ancestry(&z_heads, false)?
-                .contains_key(&batch_id)
-            {
+            // Keep this behind the two cheap overlap classifiers: unrelated
+            // accepted history never needs even a sparse-clock lookup.
+            let z_containment = self.accepted_batch_causal_containment(&z_batch)?;
+            if z_containment.contains(x_batch.manifest().causal_dot(), batch_id) {
                 continue;
             }
             let pair = ConflictPair::from_manifests(x_batch.manifest(), z_batch.manifest());
@@ -24733,6 +24743,8 @@ impl ShardedHotEngine {
         block_id: BlockId,
         pair: &ConflictPair,
     ) -> Result<bool, EngineError> {
+        let min_batch = self.load_accepted_validated_batch(pair.min_batch)?;
+        let max_batch = self.load_accepted_validated_batch(pair.max_batch)?;
         let accepted = self.status().accepted_batches()?.to_vec();
         for candidate in accepted {
             let w_id = candidate.batch_id;
@@ -24748,9 +24760,9 @@ impl ShardedHotEngine {
             {
                 continue;
             }
-            let w_heads = declared_batch_heads(w_batch.manifest().dependency_frontier());
-            let w_ancestry = self.collect_batch_ancestry(&w_heads, false)?;
-            if w_ancestry.contains_key(&pair.min_batch) && w_ancestry.contains_key(&pair.max_batch)
+            let containment = self.accepted_batch_causal_containment(&w_batch)?;
+            if containment.contains(min_batch.manifest().causal_dot(), pair.min_batch)
+                && containment.contains(max_batch.manifest().causal_dot(), pair.max_batch)
             {
                 return Ok(true);
             }
@@ -24778,6 +24790,8 @@ impl ShardedHotEngine {
         } else {
             pair.min_batch
         };
+        let x_batch = self.load_accepted_validated_batch(x_batch_id)?;
+        let z_batch = self.load_accepted_validated_batch(z_batch_id)?;
         let mut converged = BTreeSet::new();
         for candidate in self.status().accepted_batches()?.to_vec() {
             let w_id = candidate.batch_id;
@@ -24785,23 +24799,32 @@ impl ShardedHotEngine {
                 continue;
             }
             let w_batch = self.load_accepted_validated_batch(w_id)?;
-            let w_heads = declared_batch_heads(w_batch.manifest().dependency_frontier());
-            let w_ancestry = self.collect_batch_ancestry(&w_heads, false)?;
-            let descends_x = w_ancestry.contains_key(&x_batch_id);
-            let descends_z = w_ancestry.contains_key(&z_batch_id);
-            if descends_x == descends_z {
-                continue;
-            }
-            let target = if descends_x { z_after } else { x_after };
             let w_effect = self.accepted_semantic_effect(&w_batch)?;
-            let matches_other_branch = w_effect.blocks().iter().any(|delta| {
+            let matches_x = w_effect.blocks().iter().any(|delta| {
                 delta.block_id == block_id
                     && delta.after.as_ref().is_some_and(|after| {
-                        after.owner == target.owner && after.content == target.content
+                        after.owner == x_after.owner && after.content == x_after.content
                     })
             });
-            if matches_other_branch {
-                converged.insert(target.content.clone());
+            let matches_z = w_effect.blocks().iter().any(|delta| {
+                delta.block_id == block_id
+                    && delta.after.as_ref().is_some_and(|after| {
+                        after.owner == z_after.owner && after.content == z_after.content
+                    })
+            });
+            if !matches_x && !matches_z {
+                continue;
+            }
+            let containment = self.accepted_batch_causal_containment(&w_batch)?;
+            let descends_x = containment.contains(x_batch.manifest().causal_dot(), x_batch_id);
+            let descends_z = containment.contains(z_batch.manifest().causal_dot(), z_batch_id);
+            if descends_x != descends_z {
+                if descends_x && matches_z {
+                    converged.insert(z_after.content.clone());
+                }
+                if descends_z && matches_x {
+                    converged.insert(x_after.content.clone());
+                }
             }
         }
         if converged.len() == 1 {
@@ -24827,29 +24850,35 @@ impl ShardedHotEngine {
         };
         let x_batch = self.load_accepted_validated_batch(x_batch_id)?;
         let z_batch = self.load_accepted_validated_batch(z_batch_id)?;
-        let x_heads = declared_batch_heads(x_batch.manifest().dependency_frontier());
-        let z_heads = declared_batch_heads(z_batch.manifest().dependency_frontier());
-        let x_ancestry = self.collect_batch_ancestry(&x_heads, false)?;
-        let z_ancestry = self.collect_batch_ancestry(&z_heads, false)?;
+        let x_containment = self.accepted_batch_causal_containment(&x_batch)?;
+        let z_containment = self.accepted_batch_causal_containment(&z_batch)?;
 
         let mut pairs = BTreeSet::from([(pair.min_batch, pair.max_batch)]);
-        for ancestor in x_ancestry.keys() {
-            if !z_ancestry.contains_key(ancestor) {
-                pairs.insert(if *ancestor < z_batch_id {
-                    (*ancestor, z_batch_id)
-                } else {
-                    (z_batch_id, *ancestor)
-                });
+        for candidate in self.status().accepted_batches()?.to_vec() {
+            let ancestor_id = candidate.batch_id;
+            if ancestor_id == x_batch_id || ancestor_id == z_batch_id {
+                continue;
             }
-        }
-        for ancestor in z_ancestry.keys() {
-            if !x_ancestry.contains_key(ancestor) {
-                pairs.insert(if x_batch_id < *ancestor {
-                    (x_batch_id, *ancestor)
-                } else {
-                    (*ancestor, x_batch_id)
-                });
+            let ancestor = self.load_accepted_validated_batch(ancestor_id)?;
+            let effect = self.accepted_semantic_effect(&ancestor)?;
+            if !effect
+                .blocks()
+                .iter()
+                .any(|delta| delta.block_id == block_id && delta.after.is_some())
+            {
+                continue;
             }
+            let in_x = x_containment.contains(ancestor.manifest().causal_dot(), ancestor_id);
+            let in_z = z_containment.contains(ancestor.manifest().causal_dot(), ancestor_id);
+            if in_x == in_z {
+                continue;
+            }
+            let other = if in_x { z_batch_id } else { x_batch_id };
+            pairs.insert(if ancestor_id < other {
+                (ancestor_id, other)
+            } else {
+                (other, ancestor_id)
+            });
         }
 
         let mut retirements = Vec::new();
@@ -38768,8 +38797,8 @@ mod validation_tests {
             .expect("production half remains identifiable");
         assert_eq!(
             production.matches("collect_batch_ancestry(").count(),
-            6,
-            "five full ancestry call sites plus their definition stay confined to conflict/reconstruction paths"
+            3,
+            "two full ancestry call sites plus their definition stay confined to reconstruction paths"
         );
     }
 

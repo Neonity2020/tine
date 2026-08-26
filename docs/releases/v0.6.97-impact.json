@@ -969,6 +969,31 @@
     },
     {
       "section": "Fixed",
+      "text": "**A provider deletion can no longer erase a local edit that arrived in the same sync pass.** Managed sync now captures a pending Markdown or Org watcher epoch before applying provider projection, then drains the complete visible provider cut before classifying the resulting race. The local edit therefore enters immutable history and the normal edit-versus-delete rule settles it, even when the filesystem and oplog notifications arrive together.",
+      "userVisible": true,
+      "regressions": [
+        "REG-MANAGED-LOCAL-EDIT-PROVIDER-DELETE-ORDER"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
+        "refs": [
+          "docs/storage-sync-contract.md"
+        ]
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch item does not require a separate public website change.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the changelog carries the relevant release detail.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
       "text": "**A crash inside a Direct Files save can no longer leave a page invisible under hidden recovery names.** On the next checked open, one unambiguous stranded copy is restored without clobbering a live file. Ambiguous or superseded copies are retained or moved intact to recoverable conflict trash; lookalikes and files whose physical identity cannot be proved are untouched.",
       "userVisible": true,
       "regressions": [],
