@@ -27,6 +27,7 @@ icon:: 📱
   - Everything the phone skips is here: tabs with pin, reorder, and reopen, split panes, saved workspaces, multiple windows, the modifier-click gestures, and global quick capture.
   - **In-app updates** run on Windows and Linux — the app checks once per launch and Settings → **About** → **Check for updates** downloads, installs, and relaunches in place. On macOS the same notice opens the releases page instead, because today's unsigned app bundle cannot safely replace itself.
   - Any folder on your disk can be a graph — choose it with the ordinary folder picker; there is no sandboxed document picker.
+  - Releases also include an **experimental 32-bit Windows** installer and portable ZIP for older Windows 10 tablets. It is a manual-download pilot, not offered by automatic updates; ordinary Windows users should keep using the x64 package.
 - ## iOS today
   - There is **no public iOS app** — public releases ship the desktop apps and the Android APK, and iOS is being scoped.
   - Some iOS words already exist in the source so a future app is prepared for — the folder-picker handling and the plugin manifest's `ios` platform value — but that is checked-in scaffolding and developer vocabulary, not an installable app. A plugin declaring only `ios` has no host to run on today.

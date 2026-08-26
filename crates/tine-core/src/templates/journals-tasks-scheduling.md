@@ -10,7 +10,7 @@ icon:: 📅
 - ## Task markers
   - The marker set is `TODO`, `DOING`, `NOW`, `LATER`, `WAITING`, `WAIT`, `STARTED`, `IN-PROGRESS`, `DONE`, `CANCELED`, `CANCELLED` — stored as the plain first word of the block's first line, like Logseq.
   - Settings → **Journals** → **Task workflow** chooses between two cycling lanes, TODO / DOING and NOW / LATER (`:preferred-workflow`, traveling with the graph); NOW / LATER is the default.
-  - Click the marker chip to cycle (TODO → DOING → DONE → none; LATER → NOW → DONE → none). **Ctrl+Enter** (Cmd on Mac) while editing does the same, applied to every selected task when several blocks are selected.
+  - Click the marker chip for Logseq's two-state progress toggle: TODO ↔ DOING or LATER ↔ NOW. Click the checkbox to finish as DONE (and again to reopen). **Ctrl+Enter** (Cmd on Mac) uses the full keyboard cycle TODO → DOING → DONE → none, or LATER → NOW → DONE → none, applied to every selected task when several blocks are selected.
   - Every task also shows a checkbox in front of it: click to mark DONE, click again to reopen to the workflow's open marker (TODO or LATER). `DONE` shows a checked box; `CANCELED`/`CANCELLED` show none. Checkboxes appear read-only inside query results, linked references, and embeds.
   - Queries filter on markers with a task clause, e.g. `(task TODO DOING)` in `{{query }}` or in the visual query builder.
 - ## Priorities

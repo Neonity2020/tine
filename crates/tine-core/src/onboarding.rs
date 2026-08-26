@@ -659,6 +659,9 @@ mod tests {
         assert!(page.markdown.contains("logseq/.tine-trash"));
         assert!(page.markdown.contains("Watch for external edits"));
         assert!(page.markdown.contains("Snapshots to keep"));
+        assert!(page.markdown.contains("Verify synchronized graph"));
+        assert!(page.markdown.contains("`logseq/config.edn` is live too"));
+        assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
         assert!(page.markdown.contains("What you should see"));
 
         let index = GUIDE_TEMPLATES
@@ -755,6 +758,10 @@ mod tests {
         assert!(page.markdown.contains("- # Troubleshooting and recovery"));
         assert!(page.markdown.contains("TINE_DEBUG=1"));
         assert!(page.markdown.contains("Help improve Tine"));
+        assert!(page
+            .markdown
+            .contains("Create a privacy-safe diagnostic report"));
+        assert!(page.markdown.contains("**Verify synchronized graph**"));
         assert!(page.markdown.contains("Use disk version"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page
@@ -861,6 +868,7 @@ mod tests {
             .markdown
             .contains("- # Journals, tasks, and scheduling"));
         assert!(page.markdown.contains("TODO → DOING → DONE"));
+        assert!(page.markdown.contains("TODO ↔ DOING or LATER ↔ NOW"));
         assert!(page.markdown.contains("Scheduled &amp; Deadline"));
         assert!(page.markdown.contains("`++1w`"));
         assert!(page
@@ -914,6 +922,8 @@ mod tests {
         assert!(page.markdown.contains("- # Find and revisit"));
         assert!(page.markdown.contains("**Ctrl+K**"));
         assert!(page.markdown.contains("Open search tab"));
+        assert!(page.markdown.contains("+ New group"));
+        assert!(page.markdown.contains("copy/export button"));
         assert!(page.markdown.contains("{{query [[Project/Roadmap]]}}"));
         assert!(page
             .markdown
@@ -967,6 +977,8 @@ mod tests {
             .markdown
             .contains("- # Pages, links, references, and search"));
         assert!(page.markdown.contains("Unlinked References"));
+        assert!(page.markdown.contains("available page/tag chips"));
+        assert!(page.markdown.contains("**Copy / export**"));
         assert!(page.markdown.contains("dotted underline"));
         assert!(page.markdown.contains("alias:: Kitchen sink (features)"));
         assert!(page.markdown.contains("Save page"));
@@ -1064,6 +1076,7 @@ mod tests {
         assert!(page.markdown.contains("**t l**"));
         assert!(page.markdown.contains("**t r**"));
         assert!(page.markdown.contains("**Shift+?**"));
+        assert!(page.markdown.contains("Favorites can be arranged"));
         assert!(page.markdown.contains("[[Welcome to Tine]]"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Features/Tips & shortcuts]]"));
@@ -1202,6 +1215,7 @@ mod tests {
         assert!(page.markdown.contains("Question 2"));
         assert!(page.markdown.contains("640 px"));
         assert!(page.markdown.contains("All files access"));
+        assert!(page.markdown.contains("experimental 32-bit Windows"));
         assert!(page.markdown.contains("no public iOS app"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Workflows/Extend Tine]]"));

@@ -11,8 +11,15 @@ icon:: 🔍
 - ## Follow the trail: links, tags, and references
   - 1. Click any `[[link]]` or `#tag` to open its page. A dimmed, dotted-underlined link isn't broken — opening it creates the page. While editing, **Ctrl+O** follows the link at the caret and **Ctrl+Shift+O** opens it in the right sidebar.
   - 2. On the page you reach, scroll to **Linked References**: every block that points here — busy pages group them by source — with a chip filter to narrow to blocks that also mention something else. Open **Unlinked References** to catch plain-text mentions you never linked.
-  - 3. Found a line worth quoting in your own note? Edit the note, type `((`, and search the line's text to insert a block reference — a live copy that updates whenever the original changes.
+  - 3. Need several references outside Tine? Use the copy/export button on **Linked References** or **Unlinked References**. Every visible entry starts selected; uncheck a subset, then use the ordinary Text / OPML / HTML export choices. Linked References honors the text and chip filters already applied.
+  - 4. Found a line worth quoting in your own note? Edit the note, type `((`, and search the line's text to insert a block reference — a live copy that updates whenever the original changes.
   - What you should see: the reference renders as link-styled text with the source's current words, and the source block gains a small reference-count badge that lists its referrers.
+- ## Keep what matters close: Favorites
+  - 1. Favorite a page from its title menu. It appears under **Favorites** in the left sidebar and remains in Logseq's ordinary flat `config.edn :favorites` list.
+  - 2. Choose **+ New group**, type a plain-text name, and drag a favorite onto it. Drag right to nest under the preceding row, left to lift out, or vertically to reorder without changing depth. Groups and favorites can both contain children.
+  - 3. Collapse any row that has children. Delete a group when you no longer need the label: what it held moves up one level and stays favorited.
+  - 4. Prefer the keyboard, or need to resolve a sync edit? Open the arrangement page Tine created. A bullet that is exactly one `[[page link]]` is a favorite; any other bullet is a label. Editing, nesting, adding, or removing those bullets updates the sidebar immediately.
+  - What you should see: the richer tree follows page renames and syncs as an ordinary graph page, while Logseq continues to read the same flat favorites membership. Tine does not create the arrangement page until you make a group or nest a row.
 - ## Keep the search: make a search tab
   - 1. From any Ctrl+K search, press **Open search tab** in the footer. The whole search becomes its own tab with its own search box — nothing is written to your graph yet, and the tab comes back after a restart.
   - 2. Refine it there: switch **Search / List / Table / Board** freely — that changes only how results are shown, never which blocks matched. Open **Filters / Advanced** for fields and date ranges, or **Edit as visual query** to build filters chip by chip; **Explain query** describes what Tine understood.

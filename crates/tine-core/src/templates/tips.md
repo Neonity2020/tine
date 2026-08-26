@@ -24,7 +24,7 @@ icon:: ⌨️
 	- When a pane has more tabs than fit, use its tab-overview button to see every full title, activate or pin a tab, close it, or reorder it with the drag handle / **Alt+Up/Down** without guessing from truncated labels.
 	- For arranging tabs with the sidebars and split panes into a working layout — and saving it as a workspace — see [[Workflows/Keep context visible]]; [[Start/Where things are]] maps the places first.
 - ## The sidebars
-	- **t l** toggles the left sidebar — journals, favorites, recents, all pages, and a namespace tree. Favorites and Recent can be folded independently.
+	- **t l** toggles the left sidebar — journals, favorites, recents, all pages, and a namespace tree. Favorites and Recent can be folded independently; **+ New group** arranges favorites into collapsible labels, and dragging left/right lifts or nests rows.
 	- **t r** toggles the right sidebar; **Shift-click** any bullet's dot to open it there and keep it beside your work. Each right-sidebar item can be folded independently, and its menu can collapse, expand, or close them all.
 	- On a phone-width window (below 640 px), either sidebar opens over the page. Tap the shaded outside edge, use the close button, press **Esc**, or press Android **Back** to return to the page. Wider tablet and desktop windows keep the ordinary persistent, resizable sidebars.
 	- Click the vertical outline guide below a bullet to expand its complete descendant subtree when anything inside is folded, or collapse all of those descendants when everything is open. The bullet itself keeps its ordinary one-level action.

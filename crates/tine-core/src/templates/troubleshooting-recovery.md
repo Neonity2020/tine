@@ -20,9 +20,9 @@ icon:: 🛟
 	- 2. On the page, compare the complete versions in the block-by-block review. Each row previews its first differing line and can expand to full text. Accept or change each suggestion: when both sides edited separate parts of one block, Tine may offer a combined **Merged** version; otherwise choose either side or keep both. Choose page properties separately when needed, then **Apply resolution**. The review's slim pinned notice keeps it reachable while you scroll without losing your choices.
 	- 3. What you should see: the chosen page is saved through the normal guarded path. A provider conflict copy moves to the trash; before a version-control page is written without conflict markers, its exact pre-resolution file is kept in recoverable trash. If a conflict copy's original page no longer exists, discard the copy in Settings or restore the page in Logseq first.
 - ## Reconcile a duplicate journal day
-	- 1. Open Settings → **Backups & recovery** → **Duplicate journal days** — usually left over from a journal date-format change or a sync.
-	- 2. Choose **Open** to view a file (it saves back to itself), **Merge** to fold it into the canonical day, **Rename** to turn it into a normal page, or **Trash** (recoverable).
-	- 3. What you should see: the stray file handled, with the day otherwise intact — Tine kept both files rather than dropping one.
+	- 1. Open the affected journal day from the **N conflicts** queue. Tine shows both files in the same block-by-block review used for provider conflicts; each file also has **Open**, **Rename**, and **Trash** actions. The same inventory remains in Settings → **Backups & recovery** → **Duplicate journal days**.
+	- 2. Choose which version of each differing block to keep (or keep both), then **Apply resolution**. The old Settings **Merge** action is the same keep-both outcome.
+	- 3. What you should see: the chosen content saved as the day and the other file moved to recoverable trash. Tine kept both source files until you decided rather than dropping one.
 - ## Tine will not start
 	- 1. Run it with debug logging: `TINE_DEBUG=1 tine` (or `tine --debug`; the AppImage the same way), reproduce the problem, then quit.
 	- 2. Tine prints the log path on startup. By default it is `tine-debug.log` in your platform's temporary folder; `TINE_DEBUG_LOG=/path` overrides it.
@@ -35,6 +35,11 @@ icon:: 🛟
 	- 3. **Return … to Direct Files…** — offered only for a graph you enrolled in experimental Tine-managed storage; it puts that graph back on plain files.
 	- 4. **Copy details** — copies the phase and error text for an issue report. Use this before anything else if you plan to report it.
 	- 5. What you should see: no managed-storage data has been discarded by the failure. Retrying, choosing another graph, or closing and relaunching Tine are all safe to try before any manual recovery.
+- ## Create a privacy-safe diagnostic report
+	- 1. Open Settings → **Diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
+	- 2. Review the JSON, then choose **Copy report** (or **Save report…** on desktop). Nothing is uploaded automatically. The recorder excludes graph content, paths, page titles, queries, URLs, credentials, and the opt-in detailed debug log.
+	- 3. For a suspected Syncthing/Dropbox mismatch, use **Verify synchronized graph** in the same tab on both devices, exchange the generated reports, and compare them. This check includes paths and page names but never note contents.
+	- 4. What you should see: a report you can attach to an issue without first setting up `adb`, SSH, or a terminal. **Clear recorded events** removes the retained flight-recorder history after you are done.
 - ## Something parses or renders wrong
 	- 1. Open Settings → **Help improve Tine**: Tine runs its own parser and Logseq's parser over your graph, locally, and lists every place they disagree plus a parse-speed comparison.
 	- 2. Copy the report shown there — every snippet is anonymized (page names and words are scrubbed, markup shape kept) and re-verified to still reproduce the divergence before it is shown. Nothing is uploaded.
