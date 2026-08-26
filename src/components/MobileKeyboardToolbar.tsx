@@ -43,6 +43,7 @@ const ACTIONS: ToolbarAction[] = [
 ];
 
 const KEYBOARD_GAP_THRESHOLD = 48;
+const EDITOR_TOOLBAR_MARGIN = 8;
 
 function activeEditorHasFocus(): boolean {
   const el = document.activeElement;
@@ -52,6 +53,21 @@ function activeEditorHasFocus(): boolean {
 function viewportKeyboardTop(): number {
   const vv = window.visualViewport;
   return vv ? vv.height + vv.offsetTop : window.innerHeight;
+}
+
+export function revealFocusedEditorAboveToolbar(toolbarTop: number): boolean {
+  const editor = document.activeElement;
+  if (!(editor instanceof HTMLTextAreaElement) || !editor.classList.contains("block-editor")) {
+    return false;
+  }
+  const overlap = editor.getBoundingClientRect().bottom + EDITOR_TOOLBAR_MARGIN - toolbarTop;
+  if (overlap <= 0) return false;
+  const scroller = editor.closest<HTMLElement>(
+    ".main-content, .right-sidebar-scroll, .left-sidebar-scroll",
+  );
+  if (scroller) scroller.scrollTop += overlap;
+  else window.scrollBy({ top: overlap });
+  return true;
 }
 
 function Icon(props: { name: ToolbarIcon }): JSX.Element {
@@ -94,6 +110,7 @@ export function MobileKeyboardToolbar(): JSX.Element {
   const [dockTop, setDockTop] = createSignal(typeof window !== "undefined" ? window.innerHeight : 0);
   const [keyboardVisible, setKeyboardVisible] = createSignal(false);
   const [focusedFallback, setFocusedFallback] = createSignal(false);
+  let revealFrame = 0;
 
   const updateDock = () => {
     const top = viewportKeyboardTop();
@@ -105,19 +122,40 @@ export function MobileKeyboardToolbar(): JSX.Element {
   onMount(() => {
     if (!isMobilePlatform) return;
     const vv = window.visualViewport;
-    const updateAfterFocusChange = () => setTimeout(updateDock, 0);
+    const scheduleEditorReveal = () => {
+      if (revealFrame) return;
+      revealFrame = requestAnimationFrame(() => {
+        revealFrame = 0;
+        if (toolbarRef && visible()) {
+          revealFocusedEditorAboveToolbar(toolbarRef.getBoundingClientRect().top);
+        }
+      });
+    };
+    const updateViewport = () => {
+      updateDock();
+      scheduleEditorReveal();
+    };
+    const updateAfterFocusChange = () => setTimeout(updateViewport, 0);
+    const revealAfterEditorInput = (event: Event) => {
+      if (event.target instanceof HTMLTextAreaElement && event.target.classList.contains("block-editor")) {
+        scheduleEditorReveal();
+      }
+    };
     updateDock();
-    vv?.addEventListener("resize", updateDock);
-    vv?.addEventListener("scroll", updateDock);
-    window.addEventListener("resize", updateDock);
+    vv?.addEventListener("resize", updateViewport);
+    vv?.addEventListener("scroll", updateViewport);
+    window.addEventListener("resize", updateViewport);
     window.addEventListener("focusin", updateAfterFocusChange);
     window.addEventListener("focusout", updateAfterFocusChange);
+    document.addEventListener("input", revealAfterEditorInput, true);
     onCleanup(() => {
-      vv?.removeEventListener("resize", updateDock);
-      vv?.removeEventListener("scroll", updateDock);
-      window.removeEventListener("resize", updateDock);
+      vv?.removeEventListener("resize", updateViewport);
+      vv?.removeEventListener("scroll", updateViewport);
+      window.removeEventListener("resize", updateViewport);
       window.removeEventListener("focusin", updateAfterFocusChange);
       window.removeEventListener("focusout", updateAfterFocusChange);
+      document.removeEventListener("input", revealAfterEditorInput, true);
+      if (revealFrame) cancelAnimationFrame(revealFrame);
     });
   });
 
@@ -165,6 +203,7 @@ export function MobileKeyboardToolbar(): JSX.Element {
       const top = toolbarRef.getBoundingClientRect().top;
       const lift = Math.max(0, window.innerHeight - top) + 8;
       root.style.setProperty("--mobile-kb-toolbar-lift", `${lift}px`);
+      revealFocusedEditorAboveToolbar(top);
     });
   });
   onCleanup(() => {

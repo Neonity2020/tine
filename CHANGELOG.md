@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **The block you are typing in stays above the Android keyboard toolbar**
+  (GH #384). Tine now accounts for its own toolbar when focus moves, the block
+  grows, or the keyboard viewport changes, instead of letting the active text
+  remain hidden behind the fixed controls.
+
 - **Pressing Back beyond the first Android page now closes Tine instead of
   leaving a gray, unusable screen** (GH #386). Storage was already stopped
   safely, but the final handoff called a Tauri command that does not exist.

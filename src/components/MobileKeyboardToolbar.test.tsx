@@ -102,6 +102,31 @@ describe("MobileKeyboardToolbar", () => {
     dispose();
   });
 
+  it("moves the focused editor fully above the toolbar without disturbing an already-visible block (GH #384)", async () => {
+    const { revealFocusedEditorAboveToolbar } = await import("./MobileKeyboardToolbar");
+    const scroller = document.createElement("main");
+    scroller.className = "main-content";
+    const editor = document.createElement("textarea");
+    editor.className = "block-editor";
+    scroller.appendChild(editor);
+    document.body.appendChild(scroller);
+    editor.focus();
+
+    editor.getBoundingClientRect = () => ({
+      top: 470, bottom: 540, left: 0, right: 300, width: 300, height: 70, x: 0, y: 470,
+      toJSON() { return {}; },
+    });
+    expect(revealFocusedEditorAboveToolbar(520)).toBe(true);
+    expect(scroller.scrollTop).toBe(28); // 20px overlap + 8px breathing room
+
+    editor.getBoundingClientRect = () => ({
+      top: 420, bottom: 500, left: 0, right: 300, width: 300, height: 80, x: 0, y: 420,
+      toJSON() { return {}; },
+    });
+    expect(revealFocusedEditorAboveToolbar(520)).toBe(false);
+    expect(scroller.scrollTop).toBe(28);
+  });
+
   it("consumes the full hide-keyboard gesture instead of touching through (GH #336)", async () => {
     platform.mobile = true;
     const { render } = await import("solid-js/web");

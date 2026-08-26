@@ -8319,6 +8319,30 @@
     "failBefore": "proven"
    },
    "notes": "GH #386: Direct Files reaches the same safe root-close coordinator as managed storage. After successful preparation App.tsx invoked nonexistent `plugin:app|exit`; Tauri's installed exit API is `@tauri-apps/plugin-process` (`plugin:process|exit`). The rejected invoke left the transition shield active and produced the reported gray screen plus misleading managed-storage toast. App now calls a tested exitAndroidActivity helper through the installed process plugin. Current-master necessity test failed before the correction; Android runtime confirmation remains required."
+  },
+  {
+   "id": "UI-ANDROID-EDITOR-ABOVE-TOOLBAR-384",
+   "title": "While typing on Android, the focused block remains fully above Tine's keyboard toolbar instead of being hidden behind the fixed overlay",
+   "family": "mobile-editor-viewport",
+   "sources": {
+    "issues": [
+     384
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/MobileKeyboardToolbar.test.tsx::MobileKeyboardToolbar::moves the focused editor fully above the toolbar without disturbing an already-visible block (GH #384)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #384: the mobile keyboard toolbar is fixed above the IME, but the nearest note scroller was unaware that Tine's overlay shortened the usable viewport. Native keyboard scrolling could therefore leave the active textarea behind the toolbar. Focus, typing, and visual-viewport movement now measure the real toolbar top and shift only the nearest note scroller by the overlap plus 8 px; an already-visible editor is untouched. The causal render test failed before the helper existed and passes after; Android runtime confirmation remains required."
   }
  ]
 }
