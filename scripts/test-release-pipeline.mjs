@@ -71,6 +71,9 @@ const iosPrivacyManifest = fs.readFileSync(
   path.join(process.cwd(), "src-tauri/PrivacyInfo.xcprivacy"),
   "utf8"
 );
+const iosIconFixture = fs.readFileSync(
+  path.join(process.cwd(), "src-tauri/icons/ios/AppIcon-512@2x.png")
+);
 const aboutTab = fs.readFileSync(path.join(process.cwd(), "src/components/AboutTab.tsx"), "utf8");
 const websiteIndex = fs.readFileSync(path.join(process.cwd(), "website/index.html"), "utf8");
 const websitePrivacy = fs.readFileSync(path.join(process.cwd(), "website/privacy.html"), "utf8");
@@ -404,7 +407,7 @@ try {
   fs.mkdirSync(fixtureGeneratedIcons, { recursive: true });
   fs.writeFileSync(path.join(fixtureTauri, "Tine.ios.entitlements"), iosEntitlements);
   fs.writeFileSync(path.join(fixtureTauri, "PrivacyInfo.xcprivacy"), iosPrivacyManifest);
-  fs.writeFileSync(path.join(fixtureTrackedIcons, "AppIcon-512@2x.png"), "tine-icon");
+  fs.writeFileSync(path.join(fixtureTrackedIcons, "AppIcon-512@2x.png"), iosIconFixture);
   fs.writeFileSync(path.join(fixtureGeneratedIcons, "AppIcon-512@2x.png"), "tauri-icon");
   fs.writeFileSync(
     path.join(fixtureGeneratedIcons, "Contents.json"),
@@ -455,9 +458,9 @@ try {
     fs.readFileSync(path.join(fixtureApple, "PrivacyInfo.xcprivacy"), "utf8"),
     iosPrivacyManifest,
   );
-  assert.equal(
-    fs.readFileSync(path.join(fixtureGeneratedIcons, "AppIcon-512@2x.png"), "utf8"),
-    "tine-icon",
+  assert.deepEqual(
+    fs.readFileSync(path.join(fixtureGeneratedIcons, "AppIcon-512@2x.png")),
+    iosIconFixture,
     "iOS project preparation must replace Tauri's generated AppIcon with Tine's tracked icon"
   );
 } finally {
