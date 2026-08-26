@@ -266,6 +266,31 @@ describe("PdfViewer resource safety", () => {
     }
   });
 
+  it("coalesces duplicate visibility triggers before they can render into the same canvas (GH #275)", async () => {
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const visiblePage = page(612, 792);
+    const pdf = documentWithPages([visiblePage]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="race.pdf" label="Race PDF" />, host);
+    try {
+      await flush();
+      const pageElement = host.querySelector(".pdf-page")!;
+      const observer = TestIntersectionObserver.instances[0];
+      observer.show(pageElement);
+      observer.show(pageElement);
+      await flush();
+
+      expect(visiblePage.render).toHaveBeenCalledOnce();
+      expect(host.querySelector(".pdf-load-error")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
   it("bounds all retained backing stores by pixels and zeroes each evicted canvas", async () => {
     vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 1, scale: 4 });
     vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));

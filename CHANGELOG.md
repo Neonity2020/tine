@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **PDFs no longer flash and disappear when two render triggers reach the same
+  page together** (GH #275). Visibility and navigation could both begin before
+  the first PDF page lookup finished, causing PDF.js to reject two simultaneous
+  renders into one canvas. Each page now has one render owner from before its
+  first asynchronous lookup through completion, zoom, eviction, or teardown.
+
 - **The block you are typing in stays above the Android keyboard toolbar**
   (GH #384). Tine now accounts for its own toolbar when focus moves, the block
   grows, or the keyboard viewport changes, instead of letting the active text

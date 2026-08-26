@@ -8343,6 +8343,30 @@
     "failBefore": "proven"
    },
    "notes": "GH #384: the mobile keyboard toolbar is fixed above the IME, but the nearest note scroller was unaware that Tine's overlay shortened the usable viewport. Native keyboard scrolling could therefore leave the active textarea behind the toolbar. Focus, typing, and visual-viewport movement now measure the real toolbar top and shift only the nearest note scroller by the overlap plus 8 px; an already-visible editor is untouched. The causal render test failed before the helper existed and passes after; Android runtime confirmation remains required."
+  },
+  {
+   "id": "UI-PDF-SINGLE-CANVAS-RENDER-275",
+   "title": "Duplicate PDF visibility or navigation triggers coalesce to one live render per page canvas instead of failing and closing the document",
+   "family": "pdf-render-lifecycle",
+   "sources": {
+    "issues": [
+     275
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/PdfViewer.test.tsx::PdfViewer resource safety::coalesces duplicate visibility triggers before they can render into the same canvas (GH #275)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #275 follow-up on 32-bit Windows: a PDF flashed, disappeared, and pdf.js reported that the same canvas was used by multiple render operations. renderPage cancelled an existing task before awaiting getPage, but did not claim same-page ownership until after that await. Two synchronous observer/navigation triggers therefore both reached page.render on the same canvas. Per-page and layout generations now establish ownership before getPage and invalidate stale requests across zoom, eviction, and layout rebuild. The current-master duplicate-trigger test called render twice before the fix and once after it."
   }
  ]
 }

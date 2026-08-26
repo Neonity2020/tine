@@ -317,6 +317,10 @@ export function PdfViewer(props: {
   const renderedScale: Record<number, number> = {};
   // Live render tasks (so a zoom mid-render can cancel the stale raster).
   const tasks: Record<number, pdfjs.RenderTask> = {};
+  // Ownership begins before getPage(): duplicate observer/navigation requests
+  // can otherwise both pass the await and render into one canvas concurrently.
+  const renderGeneration: Record<number, number> = {};
+  let layoutGeneration = 0;
   // Pages whose REAL unscaled size has been measured (others use a page-1
   // estimate until first render), so opening a long PDF doesn't parse every page
   // dict before first paint.
@@ -568,6 +572,7 @@ export function PdfViewer(props: {
   // in as they scroll into view.
   function buildLayout() {
     if (!pdfDoc) return;
+    layoutGeneration += 1;
     releaseAllCanvases();
     scrollRef.innerHTML = "";
     for (const k of Object.keys(pageEls)) delete pageEls[Number(k)];
@@ -641,6 +646,9 @@ export function PdfViewer(props: {
     }
     const wrap = pageEls[n];
     if (!wrap) return;
+    const generation = (renderGeneration[n] ?? 0) + 1;
+    const layout = layoutGeneration;
+    renderGeneration[n] = generation;
     tasks[n]?.cancel();
     delete tasks[n];
 
@@ -651,7 +659,10 @@ export function PdfViewer(props: {
       failPdf(errorMessage("Couldn't render this PDF page", err));
       return;
     }
-    if (scale() !== s || !pageEls[n]) return; // zoomed again while awaiting
+    if (
+      disposed || layoutGeneration !== layout || renderGeneration[n] !== generation
+      || scale() !== s || pageEls[n] !== wrap
+    ) return; // superseded, rebuilt, or zoomed again while awaiting
     const viewport = page.getViewport({ scale: s });
     // First time we touch this page, learn its real unscaled size and correct the
     // wrapper if the page-1 estimate was off (non-uniform PDF).
@@ -709,12 +720,14 @@ export function PdfViewer(props: {
     try {
       await task.promise;
     } catch (err) {
+      if (tasks[n] === task) delete tasks[n];
+      if (renderGeneration[n] !== generation || layoutGeneration !== layout) return;
       if ((err as { name?: string } | undefined)?.name === "RenderingCancelledException") return;
       failPdf(errorMessage("Couldn't render this PDF page", err));
       return;
     }
-    if (scale() !== s) return;
-    delete tasks[n];
+    if (tasks[n] === task) delete tasks[n];
+    if (renderGeneration[n] !== generation || layoutGeneration !== layout || scale() !== s) return;
 
     // Canvas is crisp now — the page is usable. Rebuild the (expensive) text
     // layer off the hot path so it doesn't make every zoom step janky.
@@ -811,6 +824,7 @@ export function PdfViewer(props: {
     makeRoomForCanvas(-1, 0);
   }
   function freePage(n: number) {
+    renderGeneration[n] = (renderGeneration[n] ?? 0) + 1;
     tasks[n]?.cancel();
     delete tasks[n];
     const canvas = pageEls[n]?.querySelector("canvas") as HTMLCanvasElement | null;
