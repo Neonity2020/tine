@@ -928,6 +928,7 @@ hardening; it is unpaid latency, and later a source of availability bugs.
 | `fsync` before re-reading a retained quarantine handle | `model::sync_and_reread_retained_projection_file` | — | As above; the handle is the one this process just wrote through. | `reread_retained_projection_file` |
 | Per-intent namespace **reservation** artifact (`<intent>.namespace-reservation`) and its refusals | `projection_store::open_intent_namespace` | — | Published before `mkdir` of `attempts/<intent>` and `forensics/<intent>` and re-read on every open. It detects only a directory renamed/replaced *inside Tine's app-private receipt store*, which needs an actor with write access as the user — out of scope. No crash, torn write, disk error, sync delivery, external-editor race, honest concurrent instance, or honest multi-device divergence can rename a directory. A torn or lost 1 KB binding, by contrast, wedged the page's projection permanently. | Absence is recovery: `ensure_directory_nofollow` recreates the namespace and the drain republishes its byte-identical contents |
 | Per-intent namespace **authority** artifact (`<intent>.namespace-authority`) and its refusals | `projection_store::open_intent_namespace`, `projection_store::validate_live_intent_namespace` | — | As above. Its device/inode binding re-proved, from a file, a fact the live directory handle already answers for free. | The live `canonical_directory_identity` comparison against the identity the in-flight `DurableProjectionMutationAuthority` already records; no artifact, no barrier |
+| `fsync` of every **ancestor** of a projection target's parent chain | `model::sync_projection_chain_with_class` (leaf-to-root loop), reached from ~30 write/rename/preflight call sites | — | The operation changes entry lists in the chain leaf only. An ancestor Tine created in this operation is already flushed by `create_projection_chain_component` at creation; an ancestor it did not create already has a durable entry in its own parent, and no in-scope scenario (crash/power loss, torn write, disk error, sync delivery, external-editor race, honest concurrent instance, honest multi-device divergence, malformed import) can un-durable an entry already on stable storage. See §2.10a-i for the one out-of-ownership case it did cover. | One barrier on the chain leaf, plus the existing per-creation barrier |
 
 The three `fsync`-on-read helpers fired three times per managed save and eight
 times per cross-page move. The two per-intent namespace binding artifacts fired
@@ -1247,12 +1248,52 @@ detect corruption either. Three such helpers existed on the managed projection
 paths and fired three times per save and eight times per cross-page move; they
 are deleted, and no read path may reintroduce one. See the `MS-REF-` note below.
 
+**Invariant — a projection operation flushes one directory, the one whose
+entries it changed.** `model::sync_projection_chain_with_class` — the single
+place every projection directory barrier passes through, for Direct Files and
+managed storage alike — flushes `chain.last()` and nothing above it. The
+argument has two halves and they are exhaustive:
+
+* An ancestor **Tine created during this operation** is made durable when it is
+  created, not afterwards: `model::create_projection_chain_component` is the
+  only place a chain component is created, and it flushes the parent that now
+  holds the new name before the chain builder descends into it. A crash between
+  the `mkdir` and the operation's own barrier therefore cannot lose the path the
+  operation is about to publish into
+  (`model::tests::projection_retry_resumes_after_synced_partial_parent_chain`
+  drives exactly that crash point and proves the retry converges).
+* An ancestor **Tine did not create in this operation** already had a durable
+  entry in *its* parent before the operation began. No in-scope scenario
+  un-durables an entry that is already on stable storage: crash/power loss,
+  torn write, disk error, sync-service delivery, external-editor race, honest
+  concurrent instance, honest multi-device divergence and malformed imported
+  content can all destroy or replace such a directory, but none of them can be
+  repaired by this process re-issuing `fsync` on it, and every one of them is
+  already handled by the guarded-conflict, no-follow and recovery machinery
+  above. The removed flushes are removed because **no in-scope scenario needs
+  them**, not because they were expensive — the refusal-scenario rule in
+  `AGENTS.md` §5 cuts both ways, and a barrier with no scenario is latency the
+  user pays for nothing.
+
+The one failure the removed flushes did cover is **another** process creating an
+ancestor directory and not flushing it itself — a durability obligation that
+belongs to that writer, that Tine cannot discharge on every subsequent write
+without paying the barrier forever, and that Linux's ordered metadata journals
+largely subsume anyway (a directory `fsync` commits the transaction that created
+its parent). It is recorded here rather than defended.
+
+Enforced by
+`model::tests::a_projection_operation_flushes_one_directory_whatever_its_depth`
+(chain depth must not change the barrier count) and
+`model::tests::a_created_projection_ancestor_costs_exactly_one_extra_barrier`
+(each created ancestor still costs its own barrier, exactly once).
+
 **The budget, and where it stands.** `crate::durability_counters` counts every
 barrier `tine-core` initiates and
 `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 asserts the per-operation totals against
-`MANAGED_SAVE_BARRIER_BUDGET` = **37** and `MANAGED_MOVE_BARRIER_BUDGET` =
-**93**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+`MANAGED_SAVE_BARRIER_BUDGET` = **28** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**77**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
 appends and SQLite file-set publication are not reachable from this crate and
 are excluded (measured at three more per save, four per move).
 
@@ -1270,10 +1311,14 @@ hidden, and it is in two places that this contract does not yet cover:
   at a time: each is separated from the next by a read-back of the artifact just
   published, so staging them behind one barrier would have to carry the staged
   bytes in memory as well. Collapsing that is the next step, not this one.
-* The **projection directory chain** is flushed about six times per foreground
-  save (12 barriers for a two-deep chain). That is the user-visible Markdown
-  write path, whose temp + fsync + rename + base-revision guard + lock semantics
-  are deliberately untouched.
+* The **projection directory chain** is still entered about six times per
+  foreground save. Each entry now costs exactly one barrier instead of one per
+  chain level — the 2026-08-26 chain-flush cut, measured on the fixture as
+  foreground 14 → 8 and per-save total 37 → 28, cross-page move 93 → 77 — but
+  six entries is still six barriers, and collapsing *those* means changing the
+  publication protocol rather than the barrier rule. That is the user-visible
+  Markdown write path, whose temp + fsync + rename + base-revision guard + lock
+  semantics are deliberately untouched.
 
 ### 2.10b No-clobber publication when the filesystem has no rename flags
 

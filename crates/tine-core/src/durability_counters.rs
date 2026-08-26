@@ -61,11 +61,11 @@ use std::sync::Arc;
 /// The value is asserted against the contract document by
 /// `durability_counters::tests::the_contract_states_the_barrier_budget`, so
 /// the two cannot drift apart.
-pub const MANAGED_SAVE_BARRIER_BUDGET: u64 = 37;
+pub const MANAGED_SAVE_BARRIER_BUDGET: u64 = 28;
 
 /// The same ceiling for one accepted cross-page (for example cross-day) move,
 /// which projects two pages and therefore pays the receipt-store cost twice.
-pub const MANAGED_MOVE_BARRIER_BUDGET: u64 = 93;
+pub const MANAGED_MOVE_BARRIER_BUDGET: u64 = 77;
 
 /// The primitive kinds counted here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

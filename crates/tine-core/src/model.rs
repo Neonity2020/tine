@@ -6332,8 +6332,11 @@ impl Graph {
             match projection_real_directory(current, component) {
                 Ok(()) => {}
                 Err(error) if create_parent && error.kind() == io::ErrorKind::NotFound => {
-                    current.create_dir(component)?;
-                    sync_projection_directory_required(current)?;
+                    create_projection_chain_component(
+                        current,
+                        component,
+                        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+                    )?;
                 }
                 Err(error) => return Err(error),
             }
@@ -11502,8 +11505,11 @@ impl Graph {
             match projection_real_directory(current, component) {
                 Ok(()) => {}
                 Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
-                    current.create_dir(component)?;
-                    sync_reconstructible_projection_directory(current)?;
+                    create_projection_chain_component(
+                        current,
+                        component,
+                        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
+                    )?;
                     projection_parent_after_sync_hook()?;
                 }
                 Err(error) => return Err(error),
@@ -31036,6 +31042,9 @@ fn preserve_and_restore_projection_recovery(
 /// exact directory capability, then records its documented lack of a
 /// directory-entry flush primitive as a platform limitation.
 ///
+/// The probe covers exactly the directory the operation will later flush — the
+/// chain leaf — because that is the only barrier the operation takes.
+///
 /// This is the strict, sole-authority variant. The Markdown/Org projection of
 /// an accepted manifest uses [`preflight_reconstructible_projection_chain`];
 /// see [`crate::filesystem_durability::DurabilityArtifactClass`] for why the
@@ -31776,6 +31785,9 @@ fn rename_managed_noreplace(
 /// authority for — conflict copies, trash, withdrawn bytes, assets. A barrier
 /// the filesystem refuses for those is a real durability failure and stays fatal
 /// on every platform, Android included.
+///
+/// One barrier, on the directory whose entries the operation changed; see
+/// [`sync_projection_chain_with_class`] for why the ancestors take none.
 fn sync_projection_chain_required(chain: &[Dir]) -> io::Result<()> {
     projection_directory_sync_hook(Path::new("."))?;
     sync_projection_chain_with_class(
@@ -31788,6 +31800,9 @@ fn sync_projection_chain_required(chain: &[Dir]) -> io::Result<()> {
 /// manifest. Android shared storage can refuse this barrier outright
 /// (`EPERM`/`ENOTSUP`/`EINVAL`); those bytes are reconstructible from the
 /// private manifest, so the refusal degrades there instead of retrying forever.
+///
+/// One barrier, on the directory whose entries the operation changed; see
+/// [`sync_projection_chain_with_class`] for why the ancestors take none.
 fn sync_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
     projection_directory_sync_hook(Path::new("."))?;
     sync_projection_chain_with_class(
@@ -31796,34 +31811,54 @@ fn sync_reconstructible_projection_chain(chain: &[Dir]) -> io::Result<()> {
     )
 }
 
+/// Make the directory-entry changes of one projection operation durable.
+///
+/// **Only the leaf is flushed**, because only the leaf's entry list changed:
+/// the operation inserted, replaced or removed a name in `chain.last()`. An
+/// ancestor is flushed by exactly one mechanism, and it is not this one —
+/// [`create_projection_chain_component`] flushes the parent of every directory
+/// Tine creates while building the chain, at the moment it creates it. An
+/// ancestor that Tine did not create in this operation already had a durable
+/// entry in *its* parent before the operation began, and no in-scope failure
+/// (crash/power loss, torn write, disk error, sync-service delivery,
+/// external-editor race, honest concurrent instance, honest multi-device
+/// divergence, malformed imported content) can un-durable an entry that is
+/// already on stable storage. Re-flushing it therefore defends nothing.
+///
+/// See `docs/storage-sync-contract.md` §2.10a-i, which carries the same
+/// argument and the refusal scenario for the flushes this removed. Before the
+/// 2026-08-26 chain-flush cut this walked the whole chain leaf-to-root, so a
+/// two-deep page path paid three barriers per call and about twelve per
+/// foreground save.
 fn sync_projection_chain_with_class(
     chain: &[Dir],
     class: crate::filesystem_durability::DurabilityArtifactClass,
 ) -> io::Result<()> {
     let depth = chain.len();
-    for (index, dir) in chain.iter().enumerate().rev() {
-        sync_projection_directory_with_class(dir, class, index, depth)?;
-    }
-    Ok(())
+    let Some(leaf) = chain.last() else {
+        return Ok(());
+    };
+    sync_projection_directory_with_class(leaf, class, depth.saturating_sub(1), depth)
 }
 
-fn sync_projection_directory_required(dir: &Dir) -> io::Result<()> {
-    sync_projection_directory_with_class(
-        dir,
-        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
-        0,
-        1,
-    )
-}
-
-/// Flush one freshly created parent of the reconstructible projection tree.
-fn sync_reconstructible_projection_directory(dir: &Dir) -> io::Result<()> {
-    sync_projection_directory_with_class(
-        dir,
-        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
-        0,
-        1,
-    )
+/// Create one missing component of a projection parent chain and make the new
+/// directory's NAME durable in the parent that now holds it.
+///
+/// This is the *only* place a freshly created projection ancestor gets its
+/// barrier, and it is what lets [`sync_projection_chain_with_class`] flush the
+/// leaf alone: after this returns, the created entry is on stable storage, so a
+/// crash between here and the operation's own barrier cannot lose the path the
+/// operation is about to publish into.
+/// `model::tests::a_created_projection_ancestor_costs_exactly_one_extra_barrier`
+/// and `…::projection_retry_resumes_after_synced_partial_parent_chain` hold this
+/// invariant; do not create a chain component anywhere else.
+fn create_projection_chain_component(
+    parent: &Dir,
+    component: &str,
+    class: crate::filesystem_durability::DurabilityArtifactClass,
+) -> io::Result<()> {
+    parent.create_dir(component)?;
+    sync_projection_directory_with_class(parent, class, 0, 1)
 }
 
 /// The single place the projection leg calls the platform directory-flush
@@ -45269,6 +45304,172 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"- retry target\n");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Count the directory barriers one projection write initiates.
+    ///
+    /// `BarrierSession` is a per-thread attribution channel, and
+    /// `write_projection_exact` runs entirely on the calling thread, so this
+    /// sees exactly this write's barriers even while other tests run.
+    fn projection_write_directory_barriers(graph: &Graph, relative: &str, bytes: &[u8]) -> u64 {
+        let session = crate::durability_counters::BarrierSession::begin();
+        graph
+            .write_projection_exact(relative, None, bytes)
+            .expect("the projection write under measurement must succeed");
+        let counted = session
+            .counts()
+            .get(crate::durability_counters::Barrier::Directory);
+        crate::durability_counters::BarrierSession::detach_current_thread();
+        counted
+    }
+
+    /// **The chain-flush invariant** (`docs/storage-sync-contract.md` §2.10a-i).
+    ///
+    /// A projection operation changes the entry list of exactly one directory —
+    /// the chain leaf — so it takes its directory barrier there and nowhere
+    /// else. Path depth is therefore free. Before the 2026-08-26 cut the write
+    /// path walked the chain leaf-to-root on every write, rename and preflight,
+    /// so a namespaced page silently paid a device round trip per path
+    /// component; this assertion fails on that code.
+    #[test]
+    fn a_projection_operation_flushes_one_directory_whatever_its_depth() {
+        let dir = scratch("projection-chain-flush-depth");
+        fs::create_dir_all(dir.join("pages/one/two/three")).unwrap();
+        let graph = Graph::open(&dir);
+
+        let shallow =
+            projection_write_directory_barriers(&graph, "pages/Shallow.md", b"- shallow\n");
+        let deep =
+            projection_write_directory_barriers(&graph, "pages/one/two/three/Deep.md", b"- deep\n");
+
+        assert!(
+            shallow > 0,
+            "a projection write must still take its own directory barrier"
+        );
+        assert_eq!(
+            deep, shallow,
+            "chain depth must not cost directory barriers: the three-deep page took {deep}              and the one-deep page took {shallow}. Only the leaf's entry list changed, and              an ancestor entry that is already durable cannot be un-durabled by any in-scope              failure."
+        );
+        assert_eq!(
+            fs::read(dir.join("pages/one/two/three/Deep.md")).unwrap(),
+            b"- deep\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the invariant: an ancestor Tine *creates* still gets a
+    /// barrier — exactly one, in the parent that now holds its name, taken by
+    /// `create_projection_chain_component` at the moment of creation rather
+    /// than by a chain walk afterwards.
+    #[test]
+    fn a_created_projection_ancestor_costs_exactly_one_extra_barrier() {
+        let dir = scratch("projection-created-ancestor-barrier");
+        let graph = Graph::open(&dir);
+
+        let existing =
+            projection_write_directory_barriers(&graph, "pages/Existing.md", b"- existing\n");
+        let one_new = projection_write_directory_barriers(&graph, "pages/alpha/One.md", b"- one\n");
+        let two_new =
+            projection_write_directory_barriers(&graph, "pages/beta/gamma/Two.md", b"- two\n");
+
+        assert_eq!(
+            one_new,
+            existing + 1,
+            "creating one ancestor must cost exactly one barrier more than writing into an              existing chain ({one_new} vs {existing})"
+        );
+        assert_eq!(
+            two_new,
+            existing + 2,
+            "creating two ancestors must cost exactly two barriers more ({two_new} vs              {existing})"
+        );
+        assert_eq!(
+            fs::read(dir.join("pages/beta/gamma/Two.md")).unwrap(),
+            b"- two\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The second reachable post-crash state of the same crash point that
+    /// `projection_retry_resumes_after_synced_partial_parent_chain` covers.
+    ///
+    /// `mkdir` and its parent's barrier are not atomic, so a crash between them
+    /// leaves the ancestor either absent (that test) or present — which on the
+    /// next boot is indistinguishable from an ancestor that was always there.
+    /// Retry must converge from this state too, and must not re-flush the
+    /// surviving ancestor to do it.
+    #[test]
+    fn projection_retry_converges_when_a_created_ancestor_survived_the_crash() {
+        let dir = scratch("projection-surviving-ancestor-retry");
+        let relative = "pages/created/synced/deep/Projection.md";
+        let path = dir.join(relative);
+        let graph = Graph::open(&dir);
+
+        // The state a crash between `mkdir` and its barrier can leave behind.
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let barriers = projection_write_directory_barriers(&graph, relative, b"- retry target\n");
+        assert_eq!(fs::read(&path).unwrap(), b"- retry target\n");
+
+        let flat = scratch("projection-surviving-ancestor-baseline");
+        let baseline = projection_write_directory_barriers(
+            &Graph::open(&flat),
+            "pages/Projection.md",
+            b"- retry target\n",
+        );
+        assert_eq!(
+            barriers, baseline,
+            "a surviving ancestor is an ordinary existing directory and must cost nothing              ({barriers} vs {baseline})"
+        );
+
+        let _ = fs::remove_dir_all(&flat);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A cross-directory move syncs BOTH the source and the destination chain
+    /// (`managed_move_noreplace_validated`). Each of those is one barrier on
+    /// the directory whose entry list actually changed — the source loses a
+    /// name, the destination gains one — so the depth of either chain is free.
+    ///
+    /// This drives the Direct Files path deliberately: `rename_file_to_page`
+    /// is a real user operation on a Direct graph, and the chain helpers are
+    /// shared by both storage modes.
+    #[test]
+    fn a_cross_directory_move_flushes_one_directory_per_side() {
+        fn move_barriers(tag: &str, source_rel: &str, new_name: &str) -> u64 {
+            let dir = scratch(tag);
+            fs::create_dir_all(dir.join(source_rel).parent().unwrap()).unwrap();
+            fs::write(dir.join(source_rel), "- loose\n").unwrap();
+            let graph = Graph::open(&dir);
+
+            let session = crate::durability_counters::BarrierSession::begin();
+            graph
+                .rename_file_to_page(source_rel, new_name)
+                .expect("the rescue rename under measurement must succeed");
+            let counted = session
+                .counts()
+                .get(crate::durability_counters::Barrier::Directory);
+            crate::durability_counters::BarrierSession::detach_current_thread();
+
+            assert!(dir.join("pages").join(format!("{new_name}.md")).is_file());
+            assert!(!dir.join(source_rel).exists());
+            let _ = fs::remove_dir_all(&dir);
+            counted
+        }
+
+        let shallow = move_barriers("projection-move-shallow", "journals/Loose.md", "Rescued");
+        let deep = move_barriers(
+            "projection-move-deep",
+            "pages/one/two/three/Loose.md",
+            "Rescued",
+        );
+
+        assert!(shallow > 0, "a move must still take its directory barriers");
+        assert_eq!(
+            deep, shallow,
+            "the depth of the source chain must not cost directory barriers: a three-deep              source took {deep} and a one-deep source took {shallow}"
+        );
     }
 
     #[test]
