@@ -45117,7 +45117,27 @@ mod tests {
         let handle = activated.handle.expect("activation retains its actor");
         drive_initial_feed_with_turn_budget(&handle, 4096);
 
-        let as_of_day = crate::date::JournalDate::today().ordinal_key();
+        // The anonymized corpus scrambles journal filenames, so its parseable
+        // days land far in the future and today's feed is empty. Run the
+        // differential at an as-of day past every one of them, which also
+        // makes it the widest possible feed, and again at today's, which
+        // exercises the empty-window boundary on the same graph.
+        for as_of_day in [99_999_999, crate::date::JournalDate::today().ordinal_key()] {
+            journal_feed_real_copy_differential(&handle, as_of_day, as_of_day == 99_999_999);
+        }
+
+        assert_eq!(user_graph_bytes(&fixture.graph_root), source);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    fn journal_feed_real_copy_differential(
+        handle: &SyncRuntimeHandle,
+        as_of_day: i64,
+        require_days: bool,
+    ) {
         let mut cursor = None;
         let mut days = 0usize;
         let mut pages = 0usize;
@@ -45130,7 +45150,7 @@ mod tests {
                 before_day: cursor,
                 as_of_day,
             };
-            let indexed = journal_feed_page_indexed(&handle, request);
+            let indexed = journal_feed_page_indexed(handle, request);
             indexed_pages.push((request, indexed.clone()));
             pages += 1;
             days += indexed.0.len();
@@ -45141,29 +45161,28 @@ mod tests {
             assert!(cursor.is_some(), "an unfinished feed must advance");
         }
         let indexed_scans = handle.application_inventory_scans().unwrap() - indexed_baseline;
-        assert!(pages >= 2 && days >= 2, "the corpus must have a real feed");
+        if require_days {
+            assert!(pages >= 2 && days >= 2, "the corpus must have a real feed");
+        }
 
         let walked_baseline = handle.application_inventory_scans().unwrap();
         for (request, indexed) in &indexed_pages {
             assert_eq!(
-                journal_feed_page_by_inventory_walk(&handle, *request),
+                journal_feed_page_by_inventory_walk(handle, *request),
                 *indexed,
-                "feed divergence on the real copy at cursor={:?}",
+                "feed divergence on the real copy at as_of_day={as_of_day} cursor={:?}",
                 request.before_day
             );
         }
         let walked_scans = handle.application_inventory_scans().unwrap() - walked_baseline;
         eprintln!(
-            "journal_feed_real_copy pages={pages} days={days} indexed_scans={indexed_scans} walked_scans={walked_scans}"
+            "journal_feed_real_copy as_of_day={as_of_day} pages={pages} days={days} indexed_scans={indexed_scans} walked_scans={walked_scans}"
         );
-        assert_eq!(indexed_scans, 1, "the whole feed shares one inventory scan");
+        assert!(
+            indexed_scans <= 1,
+            "the whole feed shares at most one inventory scan"
+        );
         assert_eq!(walked_scans, pages, "the retired shape scans per feed page");
-
-        assert_eq!(user_graph_bytes(&fixture.graph_root), source);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
     }
 
     /// The pre-fix shape, kept as the necessity proof for the budget above:
@@ -45307,8 +45326,44 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| direct_entries[0].clone());
 
+        // An anonymized corpus can carry scrambled journal filenames whose
+        // parseable days all sit in the future, so today's feed would be
+        // empty and time nothing. Both legs below therefore use the newest
+        // day the graph actually has when that is later than today, exactly
+        // as `feed_paths` already falls back.
+        let bench_as_of_day = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages
+                .iter()
+                .filter(|entry| entry.kind == PageKind::Journal)
+                .filter_map(|entry| entry.date_key)
+                .max()
+                .map_or(today, |newest| newest.max(today)),
+            other => panic!("managed page inventory did not load: {other:?}"),
+        };
+
         let mut inventory_len = 0usize;
         for _ in 0..rounds {
+            // The same back gesture through the retained journal day index:
+            // one actor turn, no whole-graph walk. It runs FIRST in each round
+            // so it pays the cold page loads and the retired walk leg below
+            // gets the warm ones — the conservative direction for this
+            // comparison.
+            let indexed_started = Instant::now();
+            match handle
+                .journal_feed_page(SyncApplicationJournalFeedRequest {
+                    limit: FEED_LIMIT,
+                    before_day: None,
+                    as_of_day: bench_as_of_day,
+                })
+                .unwrap()
+            {
+                SyncApplicationJournalFeedOutcome::Loaded { pages, .. } => {
+                    assert!(!pages.is_empty(), "the indexed feed answered nothing");
+                }
+                other => panic!("indexed journal feed did not load: {other:?}"),
+            }
+            indexed_feed_samples.push(indexed_started.elapsed());
+
             // Back gesture: journal_feed_page = inventory, then FEED_LIMIT loads.
             let feed_started = Instant::now();
             let inventory_started = Instant::now();
@@ -45328,24 +45383,6 @@ mod tests {
             inventory_samples.push(inventory_elapsed);
             feed_load_samples.push(loads_elapsed);
             feed_total_samples.push(feed_elapsed);
-
-            // The same back gesture through the retained journal day index:
-            // one actor turn, no whole-graph walk.
-            let indexed_started = Instant::now();
-            match handle
-                .journal_feed_page(SyncApplicationJournalFeedRequest {
-                    limit: FEED_LIMIT,
-                    before_day: None,
-                    as_of_day: today,
-                })
-                .unwrap()
-            {
-                SyncApplicationJournalFeedOutcome::Loaded { pages, .. } => {
-                    assert!(!pages.is_empty(), "the indexed feed answered nothing");
-                }
-                other => panic!("indexed journal feed did not load: {other:?}"),
-            }
-            indexed_feed_samples.push(indexed_started.elapsed());
 
             // Forward gesture: get_page = ONE actor page load. Production uses
             // the Logical selector; the ExactPath leg is the audit's probe.
@@ -45384,7 +45421,7 @@ mod tests {
             );
         };
         eprintln!(
-            "managed_journals_back_nav pages={inventory_len} direct_pages={} rounds={rounds} feed_limit={FEED_LIMIT} direct_list_cold_ms={:.3} direct_list_warm_ms={:.3}",
+            "managed_journals_back_nav pages={inventory_len} direct_pages={} rounds={rounds} feed_limit={FEED_LIMIT} as_of_day={bench_as_of_day} direct_list_cold_ms={:.3} direct_list_warm_ms={:.3}",
             direct_entries.len(),
             startup_ms(direct_list_cold),
             startup_ms(direct_list_warm),
