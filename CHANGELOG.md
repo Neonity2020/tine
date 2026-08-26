@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Pages no longer become narrow or jump sideways when you start editing or
+  expand references** (GH #382). The pane-relative end-of-page space added in
+  v0.6.96 accidentally let the centered page column shrink to the width of its
+  current contents. Standard pages now hold a stable reading width, and Wide
+  mode fills the pane as intended. Settings → Appearance → Advanced also lets
+  you tune the standard width or give Wide mode a custom maximum on this device.
+
 - **Saving a page in a subfolder no longer costs extra waits for the disk.**
   Every time Tine wrote or renamed a file in your graph, it asked the operating
   system to confirm not just the folder it had actually changed, but every

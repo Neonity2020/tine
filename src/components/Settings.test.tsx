@@ -8,6 +8,12 @@ import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import * as store from "../store";
 import type { SparseV2ActivationProgress, SparseV2Status } from "../types";
 import { formatJournal, parseJournalWith } from "../journal";
+import {
+  changeWideContentWidth,
+  resetStandardContentWidth,
+  standardContentWidth,
+  wideContentWidth,
+} from "../contentWidth";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const showSparsePanel = async (root: HTMLElement) => {
@@ -36,6 +42,8 @@ afterEach(() => {
   setGraphMeta(null);
   vi.restoreAllMocks();
   vi.useRealTimers();
+  resetStandardContentWidth();
+  changeWideContentWidth(null);
 });
 
 describe("Settings storage transitions", () => {
@@ -1185,6 +1193,44 @@ describe("Settings progressive disclosure and search", () => {
     await tick();
     expect(advanced.getAttribute("aria-expanded")).toBe("false");
     expect(root.textContent).not.toContain("Edit diagram assets in your own installed app");
+    dispose();
+  });
+
+  it("finds and applies device-local standard and wide page widths", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    openSettings("appearance");
+    await tick();
+
+    const search = root.querySelector(".settings-search-input") as HTMLInputElement;
+    search.value = "standard page width";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    await tick();
+    const result = root.querySelector(".settings-search-result") as HTMLButtonElement;
+    expect(result.textContent).toContain("Appearance › Advanced");
+    result.click();
+    await tick();
+
+    const standard = root.querySelector<HTMLInputElement>('input[aria-label="Standard page width in pixels"]')!;
+    standard.value = "960";
+    standard.dispatchEvent(new Event("change", { bubbles: true }));
+    await tick();
+    expect(standardContentWidth()).toBe(960);
+    expect(localStorage.getItem("logseq-claude.standard-content-width")).toBe("960");
+
+    const wideMode = root.querySelector<HTMLSelectElement>('select[aria-label="Wide page width mode"]')!;
+    wideMode.value = "custom";
+    wideMode.dispatchEvent(new Event("change", { bubbles: true }));
+    await tick();
+    expect(wideContentWidth()).toBe(1280);
+    expect(root.querySelector('input[aria-label="Wide page width in pixels"]')).not.toBeNull();
+
+    wideMode.value = "fill";
+    wideMode.dispatchEvent(new Event("change", { bubbles: true }));
+    await tick();
+    expect(wideContentWidth()).toBeNull();
+    expect(localStorage.getItem("logseq-claude.wide-content-width")).toBeNull();
     dispose();
   });
 

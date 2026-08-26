@@ -39,6 +39,14 @@ describe("pane end-of-page slack is pane-relative (GH #369)", () => {
     expect(inner).toContain("flex: 0 0 auto");
   });
 
+  it("stretches the page column to the configured reading width instead of its current contents", () => {
+    const inner = ruleBody(/^\.main-content-inner\s*\{([^}]*)\}/m);
+    // A flex item with auto side margins and only max-width shrink-wraps to its
+    // children. Entering an editor or expanding references then changes the
+    // entire page width (GH #382).
+    expect(inner).toMatch(/\bwidth:\s*100%/);
+  });
+
   it("lets the idle spacer absorb only real free space, never manufacture overflow", () => {
     const spacer = ruleBody(/^\.main-content::after\s*\{([^}]*)\}/m);
     // Grow through unused pane space, but start from zero and remain shrinkable:

@@ -140,6 +140,18 @@ import {
   setLauncherRankingEnabled,
 } from "../launcherRanking";
 import { registerTransientLayer } from "../transientLayers";
+import {
+  DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH,
+  DEFAULT_STANDARD_CONTENT_WIDTH,
+  CONTENT_WIDTH_SLIDER_MAX,
+  MAX_CONTENT_WIDTH,
+  MIN_CONTENT_WIDTH,
+  changeStandardContentWidth,
+  changeWideContentWidth,
+  resetStandardContentWidth,
+  standardContentWidth,
+  wideContentWidth,
+} from "../contentWidth";
 
 // Journal display-title formats offered in the date-format dropdown — OG's
 // `journal-title-formatters` set (frontend/date.cljs). Display-only; the on-disk
@@ -205,6 +217,8 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
   { tab: "appearance", label: "Interface size", description: "zoom scale Ctrl scroll" },
   { tab: "appearance", label: "Wide mode", description: "reading width" },
+  { tab: "appearance", label: "Standard page width", description: "reading column pixels cap reset", aliases: ["narrow width"], level: "advanced" },
+  { tab: "appearance", label: "Wide page width", description: "fill pane custom pixels cap", aliases: ["wide mode width"], level: "advanced" },
   { tab: "appearance", label: "Document mode", description: "hide bullets prose" },
   { tab: "appearance", label: "Document-mode Enter creates a new block", description: "Enter Shift Enter internal newline config" },
   { tab: "appearance", label: "Show brackets", description: "page references config shortcut" },
@@ -1551,6 +1565,84 @@ function AppearanceTab(props: { search: string }): JSX.Element {
       </Field>
 
       <AdvancedSection tab="appearance" forceOpen={advancedMatch("appearance", props.search)}>
+        <Field
+          label="Standard page width"
+          hint="Maximum reading-column width on this device. Reset uses the active theme's default (810 px in Tine's built-in themes)."
+        >
+          <div class="settings-width-control">
+            <input
+              class="settings-width-range"
+              aria-label="Standard page width"
+              type="range"
+              min={MIN_CONTENT_WIDTH}
+              max={CONTENT_WIDTH_SLIDER_MAX}
+              step="10"
+              value={standardContentWidth() ?? DEFAULT_STANDARD_CONTENT_WIDTH}
+              onInput={(event) => changeStandardContentWidth(event.currentTarget.valueAsNumber)}
+            />
+            <input
+              class="settings-num settings-width-number"
+              aria-label="Standard page width in pixels"
+              type="number"
+              min={MIN_CONTENT_WIDTH}
+              max={MAX_CONTENT_WIDTH}
+              step="10"
+              value={standardContentWidth() ?? DEFAULT_STANDARD_CONTENT_WIDTH}
+              onChange={(event) => changeStandardContentWidth(event.currentTarget.valueAsNumber)}
+            />
+            <span class="settings-width-unit">px</span>
+            <Show when={standardContentWidth() !== null}>
+              <button class="settings-btn" onClick={resetStandardContentWidth}>Reset</button>
+            </Show>
+          </div>
+        </Field>
+
+        <Field
+          label="Wide page width"
+          hint="Wide mode can fill the available pane or stop at a custom maximum. Saved on this device."
+        >
+          <div class="settings-width-control">
+            <select
+              class="settings-select"
+              aria-label="Wide page width mode"
+              value={wideContentWidth() === null ? "fill" : "custom"}
+              onChange={(event) =>
+                changeWideContentWidth(
+                  event.currentTarget.value === "fill"
+                    ? null
+                    : (wideContentWidth() ?? DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH),
+                )
+              }
+            >
+              <option value="fill">Fill pane</option>
+              <option value="custom">Custom maximum</option>
+            </select>
+            <Show when={wideContentWidth() !== null}>
+              <input
+                class="settings-width-range"
+                aria-label="Wide page width"
+                type="range"
+                min={MIN_CONTENT_WIDTH}
+                max={CONTENT_WIDTH_SLIDER_MAX}
+                step="10"
+                value={wideContentWidth() ?? DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH}
+                onInput={(event) => changeWideContentWidth(event.currentTarget.valueAsNumber)}
+              />
+              <input
+                class="settings-num settings-width-number"
+                aria-label="Wide page width in pixels"
+                type="number"
+                min={MIN_CONTENT_WIDTH}
+                max={MAX_CONTENT_WIDTH}
+                step="10"
+                value={wideContentWidth() ?? DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH}
+                onChange={(event) => changeWideContentWidth(event.currentTarget.valueAsNumber)}
+              />
+              <span class="settings-width-unit">px</span>
+            </Show>
+          </div>
+        </Field>
+
         <Field
           label="Smooth scrolling (experimental)"
           hint="Animate the journal feed's scrolling to smooth out WebKitGTK's stepped mouse-wheel jumps. Off by default; this is a feel experiment — turn it off if it gets in the way."

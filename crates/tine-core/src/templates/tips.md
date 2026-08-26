@@ -31,6 +31,9 @@ icon:: ⌨️
 - ## Focus mode & dimming — t f / t b
 	- **t f** (focus mode) hides the sidebars and toolbar so the screen is just your text; layered **Esc** steps back out.
 	- **t b** (dim inactive blocks) fades everything except the bullet you're editing — a typewriter-style spotlight. Use it on its own, or let focus mode turn it on for you.
+- ## Page width — t w
+	- **t w** switches between the standard reading column and Wide mode. The page keeps the same width while you edit, fold blocks, or open reference sections.
+	- Wide mode fills the available pane by default. To tune either layout on this device, open Settings → **Appearance** → **Advanced**: set the standard page width in pixels, or give Wide mode a custom maximum.
 - ## A few more worth knowing
 	- Use the **…** beside an ordinary page title for its complete actions menu: open the source file, copy/export, inspect properties, rename, carry tasks, or delete. It is the same menu as right-click and works from the keyboard and touch.
 	- **Carry unfinished tasks** forward into today (from the command palette) — the last 7 / 30 / 365 days, optionally with their context.

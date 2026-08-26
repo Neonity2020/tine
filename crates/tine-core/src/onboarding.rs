@@ -1267,6 +1267,20 @@ mod tests {
     }
 
     #[test]
+    fn tips_document_stable_and_configurable_page_widths() {
+        let tips = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Features/Tips & shortcuts")
+            .expect("tips page is registered");
+        assert!(tips.markdown.contains("Page width — t w"));
+        assert!(tips
+            .markdown
+            .contains("keeps the same width while you edit"));
+        assert!(tips.markdown.contains("Appearance** → **Advanced"));
+        assert!(tips.markdown.contains("custom maximum"));
+    }
+
+    #[test]
     fn guide_link_validator_rejects_accidental_targets_and_ignores_inline_code() {
         let templates = [GuideTemplate {
             title: "Test source",

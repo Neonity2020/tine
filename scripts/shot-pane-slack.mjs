@@ -17,14 +17,15 @@
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import path from "node:path";
 
 const PORT = Number(process.env.TINE_PANE_SLACK_PORT ?? 5299);
 const OUT_BOARD = "/tmp/shot-pane-slack.png";
 const OUT_SCROLLED = "/tmp/shot-pane-slack-long-scrolled.png";
 
 const server = spawn(
-  "npx",
-  ["vite", "preview", "--port", String(PORT), "--strictPort", "--configLoader", "runner"],
+  process.execPath,
+  [path.resolve("node_modules/vite/bin/vite.js"), "preview", "--port", String(PORT), "--strictPort", "--configLoader", "runner"],
   { stdio: "ignore" },
 );
 
@@ -136,6 +137,20 @@ async function measureEndSlack(page, leafRect) {
   }, leafRect);
 }
 
+async function measureFocusedPageWidth(page) {
+  return page.evaluate(() => {
+    const scroller = document.querySelector(".pane-leaf.pane-focused .main-content") ??
+      document.querySelector(".main-content");
+    const inner = scroller?.querySelector(".main-content-inner");
+    if (!scroller || !inner) return null;
+    return {
+      scroller: scroller.getBoundingClientRect().width,
+      inner: inner.getBoundingClientRect().width,
+      maxWidth: getComputedStyle(inner).maxWidth,
+    };
+  });
+}
+
 try {
   await waitForServer(`http://localhost:${PORT}/`);
   const browser = await chromium.launch({
@@ -168,6 +183,34 @@ try {
     () => document.querySelector(".main-content .page-title")?.textContent?.trim() === "Dashboard Solo",
     { timeout: 5000 },
   );
+
+  // GH #382: the page column itself must not shrink-wrap to whichever child is
+  // currently widest. The reporter showed both edit entry and expanding
+  // Unlinked References changing the whole page width. Exercise the intrinsic
+  // width boundary directly before building the separate GH #369 pane board.
+  const widthStates = [];
+  widthStates.push({ state: "short-read", ...(await measureFocusedPageWidth(page)) });
+  const widthEditor = page.locator(".main-content .ls-block").first();
+  await widthEditor.click();
+  const widthTextarea = page.locator(".main-content .block-editor").first();
+  await widthTextarea.waitFor({ timeout: 4000 });
+  await widthTextarea.fill("x");
+  await sleep(100);
+  widthStates.push({ state: "short-edit", ...(await measureFocusedPageWidth(page)) });
+  await widthTextarea.fill("a long line ".repeat(80));
+  await sleep(100);
+  widthStates.push({ state: "long-edit", ...(await measureFocusedPageWidth(page)) });
+  await page.keyboard.press("Escape");
+  await sleep(100);
+  widthStates.push({ state: "long-read", ...(await measureFocusedPageWidth(page)) });
+  const measuredWidths = widthStates.map((state) => state.inner).filter(Number.isFinite);
+  console.log("page width through read/edit content changes:", widthStates);
+  if (measuredWidths.length !== widthStates.length) {
+    failures.push(`could not measure every GH #382 width state: ${JSON.stringify(widthStates)}`);
+  } else if (Math.max(...measuredWidths) - Math.min(...measuredWidths) > 1) {
+    failures.push(`page column changes width with its contents: ${JSON.stringify(widthStates)}`);
+  }
+
   await makeFocusedPageReporterHeight(page, 20);
   const solo = await page.evaluate(() => {
     const scroller = document.querySelector(".main-content");
@@ -356,10 +399,10 @@ try {
   await browser.close();
   server.kill("SIGKILL");
   if (failures.length) {
-    console.error("GH #369 defect REPRODUCED:\n - " + failures.join("\n - "));
+    console.error("Pane geometry defect REPRODUCED (GH #369 / GH #382):\n - " + failures.join("\n - "));
     process.exit(1);
   }
-  console.log("OK: short panes have no useless scrollbar, long pane scrolls with pane-proportional end slack");
+  console.log("OK: page width is content-independent; short panes have no useless scrollbar; long pane keeps pane-relative end slack");
   process.exit(errors.length ? 1 : 0);
 } catch (e) {
   console.error(String(e));

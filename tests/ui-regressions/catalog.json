@@ -2,6 +2,31 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "UI-PAGE-WIDTH-CONTENT-INDEPENDENT-382",
+   "title": "Page width stays fixed while entering edit mode or expanding content, with configurable standard and wide caps",
+   "family": "page-layout",
+   "sources": {
+    "issues": [
+     382
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/styles/paneSlack.test.ts",
+     "scripts/shot-pane-slack.mjs"
+    ],
+    "scenario": "page-layout.content-independent-width",
+    "failBefore": "proven"
+   },
+   "notes": "The v0.6.96 pane-slack flex conversion left the centered page column with max-width but no width. As a flex item with auto side margins it shrink-wrapped to the current children, so edit entry and expanding references visibly resized the whole page. The browser harness measures the column across short-read, short-edit, long-edit, and long-read states while retaining the independent GH #369 vertical-slack proof."
+  },
+  {
    "id": "UI-CONCORD-LIVE-DIRECT-SAVE-337",
    "title": "A Direct Files save conflict enters Concord with both exact versions, survives restart, and resolves without the retired global conflict bar",
    "family": "external-change-conflict-resolution",
