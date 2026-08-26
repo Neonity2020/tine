@@ -189,6 +189,17 @@ describe("editing/collapse boundary regressions", () => {
 // boundary break as an empty line in either block — Logseq's behavior. The
 // fix is in the editor's split calculation; parser/round-trip untouched.
 describe("splitBlock at an in-block line boundary (GH #361)", () => {
+  it("consumes the boundary newline when the caret is at the end of the first line", () => {
+    setDoc({
+      byId: { b: node("b", "line1\nline2", "M") },
+      pages: [page("M", ["b"])], feed: ["M"], loaded: true,
+    });
+    splitBlock("b", 5); // caret immediately before the in-block newline
+    expect(doc.byId.b.raw).toBe("line1");
+    const next = doc.pages[0].roots[1];
+    expect(doc.byId[next].raw).toBe("line2");
+  });
+
   it("consumes the boundary newline: neither block keeps an empty line", () => {
     setDoc({
       byId: { b: node("b", "line1\nline2", "M") },

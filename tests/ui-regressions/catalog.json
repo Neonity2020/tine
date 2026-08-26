@@ -7567,7 +7567,7 @@
   },
   {
    "id": "UI-ENTER-LINE-BOUNDARY-361",
-   "title": "Enter with the caret immediately after an in-block newline splits there and consumes the boundary break: the new block starts with that line's text and the original keeps no trailing empty line, while Shift+Enter in-block newlines, mid-line splits, caret-at-start, Markdown and Org behavior are preserved",
+   "title": "Enter with the caret immediately before or after an in-block newline splits there and consumes the boundary break: the new block starts with that line's text and the original keeps no trailing empty line, while Shift+Enter in-block newlines, mid-line splits, caret-at-start, Markdown and Org behavior are preserved",
    "family": "editor-enter",
    "sources": {
     "issues": [
@@ -7582,6 +7582,7 @@
    "status": "covered",
    "coverage": {
     "tests": [
+     "src/editingBoundary.regression.test.ts::splitBlock at an in-block line boundary (GH #361)::consumes the boundary newline when the caret is at the end of the first line",
      "src/editingBoundary.regression.test.ts::splitBlock at an in-block line boundary (GH #361)::consumes the boundary newline: neither block keeps an empty line",
      "src/editingBoundary.regression.test.ts::splitBlock at an in-block line boundary (GH #361)::behaves identically in Org pages",
      "src/components/Block.enterLineBoundary.test.tsx::Enter at an in-block line boundary (GH #361)::keeps Shift+Enter inserting an in-block newline",
@@ -7592,7 +7593,7 @@
     "scenario": null,
     "failBefore": "proven"
    },
-   "notes": "GH #361: a block 'line1\\nline2' with the caret at the start of line2 retained the boundary newline as an empty line. store.splitBlock now consumes exactly that separator so the prior block loses the trailing newline and the new block starts with the line's text. The same rule handles blank or whitespace-only prefixes by moving the post-boundary text into the original block while preserving hidden properties; otherwise the start-of-block special case left the newline untouched. Preserved and pinned: intentional interior blank lines from Shift+Enter, mid-line splits, caret-at-zero empty-block-before, ordered-list Org propagation, IME, and mobile through the shared splitBlock choke point. Parser and round-trip behavior are untouched."
+   "notes": "GH #361 negative follow-up: the released fix covered a caret immediately after an in-block newline, but a caret immediately before that same newline still left an empty first line in the new block. store.splitBlock now treats either caret position as the same structural boundary and consumes exactly one newline; a doubled newline still preserves one intentional blank line. The shared path serves desktop and mobile. Fail-before on current master produced a new block with raw `\\nline2`; the focused test passes after the fix."
   },
   {
    "id": "UI-MANAGED-SHARE-SINGLE-TERMINAL-OUTCOME-001",

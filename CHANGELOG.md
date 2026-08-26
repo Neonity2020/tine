@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Enter at either side of an in-block line break now creates a clean new
+  block** (GH #361). The first fix handled the caret at the start of line two,
+  but pressing Enter at the end of line one still copied the newline into the
+  new block as an empty first line. Both caret positions now consume the same
+  structural boundary on desktop and mobile while preserving intentional blank
+  lines.
+
 - **Pages no longer become narrow or jump sideways when you start editing or
   expand references** (GH #382). The pane-relative end-of-page space added in
   v0.6.96 accidentally let the centered page column shrink to the width of its
