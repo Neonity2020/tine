@@ -45427,6 +45427,89 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The chain-*creation* half of the anonymized-corpus acceptance gate for
+    /// the 2026-08-26 chain-flush cut. Its sibling,
+    /// `sync_runtime::tests::managed_nested_projection_lands_on_a_real_graph_copy`,
+    /// drives the managed save and cross-page move on the same corpus.
+    ///
+    /// Synthetic fixtures are generated from our own model of a graph, so this
+    /// runs the case the model keeps getting wrong at real scale: a page whose
+    /// projection path needs a directory that does not exist yet — the first
+    /// journal of a month, or a namespace page creating `pages/foo/`.
+    ///
+    /// ```text
+    /// TINE_MS_AUDIT_GRAPH_COPY=/path/to/graph/copy \
+    ///   cargo test -p tine-core --lib \
+    ///   projection_creates_a_nested_parent_on_a_real_graph_copy -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual acceptance gate: chain creation on a real graph copy"]
+    fn projection_creates_a_nested_parent_on_a_real_graph_copy() {
+        let source = PathBuf::from(
+            std::env::var("TINE_MS_AUDIT_GRAPH_COPY")
+                .expect("set TINE_MS_AUDIT_GRAPH_COPY to a disposable graph copy"),
+        );
+        assert!(
+            fs::symlink_metadata(&source)
+                .expect("the graph copy must be readable")
+                .file_type()
+                .is_dir(),
+            "the graph copy must name a real directory, not a symlink"
+        );
+
+        let dir = scratch("projection-real-graph-chain-creation");
+        let _ = fs::remove_dir_all(&dir);
+        copy_real_graph_tree(&source, &dir);
+        assert!(dir.join("pages").is_dir() && dir.join("journals").is_dir());
+        let graph = Graph::open(&dir);
+
+        let flat = projection_write_directory_barriers(
+            &graph,
+            "pages/Chain Flush Gate.md",
+            b"- flat acceptance\n",
+        );
+        let created = projection_write_directory_barriers(
+            &graph,
+            "pages/Chain Flush Gate/Nested.md",
+            b"- created acceptance\n",
+        );
+
+        assert_eq!(
+            created,
+            flat + 1,
+            "creating one parent on the real corpus must cost exactly one barrier more \
+             ({created} vs {flat})"
+        );
+        assert_eq!(
+            fs::read(dir.join("pages/Chain Flush Gate/Nested.md")).unwrap(),
+            b"- created acceptance\n"
+        );
+        eprintln!(
+            "real-graph projection: flat={flat} dir_fsync, creating-one-parent={created} dir_fsync"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Copy a disposable real-graph tree without following symlinks.
+    fn copy_real_graph_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        let mut pending = vec![(from.to_path_buf(), to.to_path_buf())];
+        while let Some((source, destination)) = pending.pop() {
+            for entry in fs::read_dir(&source).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                let target = destination.join(entry.file_name());
+                if kind.is_dir() {
+                    fs::create_dir_all(&target).unwrap();
+                    pending.push((entry.path(), target));
+                } else if kind.is_file() {
+                    fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+    }
+
     /// A cross-directory move syncs BOTH the source and the destination chain
     /// (`managed_move_noreplace_validated`). Each of those is one barrier on
     /// the directory whose entry list actually changed — the source loses a

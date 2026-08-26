@@ -10,6 +10,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Saving a page in a subfolder no longer costs extra waits for the disk.**
+  Every time Tine wrote or renamed a file in your graph, it asked the operating
+  system to confirm not just the folder it had actually changed, but every
+  folder above it up to the graph root. A page in `pages/Work/Notes.md` therefore
+  waited three times where a page in `pages/Notes.md` waited once, on roughly six
+  file operations per save. Only the folder that actually changed is confirmed
+  now; a folder Tine has just created is still confirmed at the moment it is
+  created, so a crash cannot lose the path your page was written into. On
+  Managed Storage an ordinary edit now waits on 28 disk flushes instead of 37,
+  and a cross-page move on 77 instead of 93 -- measured both on a test fixture
+  and on a 1,045-file copy of a real graph.
+
 - **Managed Storage saves wait on fewer disk flushes.** Each accepted edit used
   to write four small bookkeeping files whose only job was to notice if
   something had swapped out a folder inside Tine's own private data directory --

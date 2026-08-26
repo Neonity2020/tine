@@ -40686,6 +40686,135 @@ mod tests {
         crate::durability_counters::BarrierSession::detach_current_thread();
     }
 
+    /// The anonymized-corpus acceptance gate for the 2026-08-26 chain-flush cut
+    /// (`docs/storage-sync-contract.md` §2.10a-i).
+    ///
+    /// A projection operation now flushes only the directory whose entry list
+    /// it changed; a freshly created ancestor gets its barrier from
+    /// `create_projection_chain_component` instead. Synthetic fixtures are
+    /// generated from our own model of a graph, so this drives the real shape:
+    /// a namespaced page whose projection path is two deep, plus a cross-page
+    /// move whose source and destination chains are distinct. The other half of
+    /// the invariant — a chain component the projection has to *create* — is
+    /// driven on the same corpus by
+    /// `model::tests::projection_creates_a_nested_parent_on_a_real_graph_copy`,
+    /// because a managed save whose page directory has been removed underneath
+    /// it is an external-deletion conflict, not a chain-creation path.
+    ///
+    /// ```text
+    /// TINE_MS_AUDIT_GRAPH_COPY=/path/to/graph/copy \
+    ///   cargo test -p tine-core --lib \
+    ///   managed_nested_projection_lands_on_a_real_graph_copy -- --ignored --nocapture
+    /// ```
+    ///
+    /// The copy must contain at least one page under a subdirectory of
+    /// `pages/`; the gate says so rather than silently passing without one.
+    #[test]
+    #[ignore = "manual acceptance gate: nested projection chains on a real graph copy"]
+    fn managed_nested_projection_lands_on_a_real_graph_copy() {
+        let source = real_graph_copy_source_from_env("TINE_MS_AUDIT_GRAPH_COPY");
+        let session = crate::durability_counters::BarrierSession::begin();
+        let fixture = ActivationFixture::copied_graph("ms-nested-projection", 0xa1c3, &source);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("the real graph copy activates");
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("nested-projection inventory did not load: {other:?}"),
+        };
+        let mut nested: Vec<String> = pages
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .filter(|path| path.starts_with("pages/") && path.matches('/').count() >= 2)
+            .collect();
+        nested.sort();
+        let nested = nested
+            .first()
+            .expect(
+                "this gate needs a page under a subdirectory of pages/; add one to the graph copy",
+            )
+            .clone();
+        let mut journals: Vec<String> = pages
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .filter(|path| path.starts_with("journals/"))
+            .collect();
+        journals.sort();
+
+        // (a) Save into an existing two-deep chain.
+        let (page, revision) = load_application_exact(&handle, &nested);
+        session.reset();
+        let (page, revision) =
+            save_application_block_text(&handle, page, revision, "nested chain acceptance one");
+        drain_managed_local(&handle);
+        eprintln!(
+            "nested save into an existing chain: [{}]",
+            session.counts().report()
+        );
+        let absolute = fixture.graph_root.join(&nested);
+        assert!(
+            fs::read_to_string(&absolute)
+                .unwrap()
+                .contains("nested chain acceptance one"),
+            "the nested page's bytes must reach {nested}"
+        );
+
+        // (b) A cross-page move: two distinct chains, source and destination.
+        let mut nonempty = Vec::new();
+        for path in &journals {
+            let (candidate, _) = load_application_exact(&handle, path);
+            if !candidate.blocks.is_empty() {
+                nonempty.push(path.clone());
+            }
+            if nonempty.len() == 2 {
+                break;
+            }
+        }
+        let day1 = nonempty.first().expect("the copy has a nonempty journal");
+        let day2 = nonempty.get(1).expect("the copy has a second journal");
+        let (source_page, source_revision) = load_application_exact(&handle, day1);
+        let (destination_page, destination_revision) = load_application_exact(&handle, day2);
+        session.reset();
+        let outcome = handle
+            .move_application_subtrees(SyncApplicationMoveSubtreesRequest {
+                episode_id: Uuid::new_v4().to_string(),
+                source_path: source_page.path.clone(),
+                source_revision,
+                destination_path: destination_page.path.clone(),
+                destination_revision,
+                roots: vec![SyncApplicationMoveRoot {
+                    identity: source_page.blocks[0].id.clone(),
+                    raw_rewrite: None,
+                }],
+                placement: SyncApplicationMovePlacement::Root { position: 0 },
+                admission: application_move_admission(),
+            })
+            .unwrap();
+        assert!(
+            !matches!(outcome, SyncApplicationMoveSubtreesOutcome::NoCommit { .. }),
+            "the acceptance move did not commit: {outcome:?}"
+        );
+        drain_managed_local(&handle);
+        eprintln!("cross-page move: [{}]", session.counts().report());
+        let moved_text = source_page.blocks[0].raw.clone();
+        assert!(
+            fs::read_to_string(fixture.graph_root.join(day2))
+                .unwrap()
+                .contains(moved_text.lines().next().unwrap_or(&moved_text)),
+            "the moved block must reach the destination journal"
+        );
+
+        let _ = revision;
+        let _ = page;
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        crate::durability_counters::BarrierSession::detach_current_thread();
+    }
+
     #[test]
     #[ignore = "manual release gate: activation of a real graph copy"]
     fn managed_activation_real_graph_manual_benchmark() {
