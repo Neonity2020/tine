@@ -8,6 +8,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Managed Storage saves stop paying a disk round trip per internal file.**
+  Every accepted edit fanned its history out into several separately-flushed
+  private files, and each flush is a real device round trip: one single-block
+  save performed 55 of them and a cross-page move 130. On a local SSD that is
+  tens of milliseconds; on a slow, network, or phone filesystem it is what makes
+  an edit feel heavy. An accepted edit's history is now written and made durable
+  as ONE unit -- 45 and 109 -- and three flushes that ran before *reading* a
+  file, which could not affect what was read, are gone. Crash safety is
+  unchanged and is now stated and tested: a save interrupted by a crash or power
+  loss is either fully recorded or not recorded at all, never half-written, and
+  the graph still reopens and completes the same edit.
+
 ## [0.6.97] - 2026-08-26
 
 ### Added

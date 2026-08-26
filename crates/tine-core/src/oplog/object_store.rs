@@ -195,6 +195,30 @@ pub(crate) fn fail_next_publish_after_objects_for_harness() {
     HARNESS_PUBLISH_FAIL_AFTER_OBJECTS.with(|fail| fail.set(true));
 }
 
+thread_local! {
+    static ARCHIVE_INSTALL_CUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm one deterministic cut immediately after the next staged archive
+/// artifact is installed under its final name — the crash point between the
+/// batch's single data barrier and its directory barriers.
+#[cfg(test)]
+pub(crate) fn cut_after_next_archive_install() {
+    ARCHIVE_INSTALL_CUT.with(|armed| armed.set(true));
+}
+
+fn archive_install_cut_hook() -> Result<(), StoreError> {
+    ARCHIVE_INSTALL_CUT.with(|armed| {
+        if armed.replace(false) {
+            Err(StoreError::Io(std::io::Error::other(
+                "deterministic cut after an archive install",
+            )))
+        } else {
+            Ok(())
+        }
+    })
+}
+
 fn publish_after_objects_hook() -> Result<(), StoreError> {
     HARNESS_PUBLISH_FAIL_AFTER_OBJECTS.with(|fail| {
         if fail.replace(false) {
@@ -1806,24 +1830,93 @@ impl ObjectStore {
         self.publish_prepared_impl(batch, true)
     }
 
+    /// Publish one accepted batch's complete archive materialization through a
+    /// SINGLE durability point.
+    ///
+    /// Every object and the manifest are staged under their final immutable
+    /// names without an individual barrier; one filesystem barrier at the end
+    /// makes the whole set durable at once. This is the "one durability point
+    /// per accepted batch" invariant in `docs/storage-sync-contract.md`; the
+    /// per-artifact publisher it replaces performed two barriers (file fsync
+    /// plus directory fsync) for each of the four-to-eight artifacts an
+    /// ordinary edit produces.
+    ///
+    /// The batch is safe to tear because it is not the acceptance authority.
+    /// The accepted operation is already durable in the local journal before
+    /// this runs (`oplog/local_journal_drain.rs` — "the journal is the durable
+    /// foreground boundary"), and the journal frame is checkpointed only AFTER
+    /// this function returns. A crash at any point therefore re-enters the same
+    /// drain, which republishes this exact byte-identical set.
+    ///
+    /// Republication of a torn predecessor is the one behaviour the
+    /// per-artifact publisher did not need. Without a per-file barrier a
+    /// crash can leave an immutable name installed whose bytes were never
+    /// flushed, and the strict publisher reports that as a byte collision and
+    /// refuses forever. `stage_batched_publication` repairs exactly that case:
+    /// see its refusal-scenario note.
     fn publish_prepared_impl(
         &self,
         batch: &PreparedBatch,
         allow_bootstrap: bool,
     ) -> Result<(), StoreError> {
-        if batch.manifest().workspace_id() != self.workspace_id {
+        let manifest = batch.manifest();
+        if manifest.workspace_id() != self.workspace_id {
             return Err(StoreError::WorkspaceMismatch {
                 expected: self.workspace_id,
-                found: batch.manifest().workspace_id(),
+                found: manifest.workspace_id(),
             });
         }
+        if !allow_bootstrap && manifest.origin() == BatchOrigin::BootstrapImport {
+            return Err(StoreError::BootstrapBatchRequiresDirectPublication);
+        }
+        let manifest_bytes = manifest.encode()?;
+        let batch_id = manifest.batch_id();
+
+        // The lineage claim is written once in an archive's lifetime and is a
+        // precondition of every manifest, not part of this batch. It keeps its
+        // own barrier so a manifest can never be durable before the lineage it
+        // asserts.
+        self.check_or_establish_lineage(manifest.lineage_digest())
+            .map_err(|error| publication_stage_error("publish operation manifest", error))?;
+
+        let objects = self.open_namespace(OBJECTS_DIR)?;
+        let batches = self.open_namespace(BATCHES_DIR)?;
+        let mut publication = ArchiveBatchPublication::new(&self.capability)?;
+        let objects_namespace = publication.namespace(&objects)?;
+        let batches_namespace = publication.namespace(&batches)?;
         for object in batch.objects() {
-            self.stage_object_bytes(&object.encode()?)
+            let bytes = object.encode()?;
+            if object.workspace_id() != self.workspace_id {
+                return Err(StoreError::WorkspaceMismatch {
+                    expected: self.workspace_id,
+                    found: object.workspace_id(),
+                });
+            }
+            let digest = ContentDigest::of(&bytes);
+            publication
+                .stage(
+                    objects_namespace,
+                    &object_filename(digest),
+                    &bytes,
+                    MAX_OBJECT_BYTES as u64,
+                    Collision::Object(digest),
+                )
                 .map_err(|error| publication_stage_error("publish operation object", error))?;
         }
         publish_after_objects_hook()?;
-        self.stage_manifest_bytes_impl(&batch.manifest().encode()?, allow_bootstrap)
+        publication
+            .stage(
+                batches_namespace,
+                &manifest_filename(batch_id),
+                &manifest_bytes,
+                MAX_MANIFEST_BYTES as u64,
+                Collision::Batch(batch_id),
+            )
             .map_err(|error| publication_stage_error("publish operation manifest", error))?;
+
+        publication.commit().map_err(|error| {
+            publication_stage_error("publish operation batch durability", error)
+        })?;
         Ok(())
     }
 
@@ -5975,7 +6068,7 @@ enum NamespaceKind {
     Batches,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Collision {
     Object(ContentDigest),
     Batch(BatchId),
@@ -6764,8 +6857,277 @@ fn publish_immutable(
     // while the managed runtime owns its sole-writer lease. This is distinct
     // from shared/provider publication, which must retain strict no-replace
     // behavior across processes.
+    if std::env::var_os("TINE_TRACE_PUBLISH").is_some() {
+        eprintln!(
+            "PUBLISH kind={}",
+            match &collision {
+                Collision::Object(_) => "archive-object".to_string(),
+                Collision::Batch(_) => "archive-manifest".to_string(),
+                Collision::HistoryIndex(_) => "history-index".to_string(),
+                Collision::Lineage(_) => "lineage".to_string(),
+                Collision::Exact(kind) => (*kind).to_string(),
+                Collision::Bootstrap(kind, _) => format!("bootstrap:{kind}"),
+            }
+        );
+    }
+    crate::durability_counters::note_immutable_publication();
     tine_storage::publish_immutable_exact_single_writer(dir, filename, bytes)
         .map_err(|error| publication_error(error, collision))
+}
+
+/// One accepted batch's archive artifacts, published through a SINGLE
+/// durability point.
+///
+/// ## Why this exists
+///
+/// The per-artifact publisher (`tine_storage::publish_immutable_exact*`) pays
+/// two device round trips — the file's `fsync` and its directory's `fsync` —
+/// for every artifact. An ordinary one-block managed edit produces four to
+/// eight archive artifacts, a cross-page move roughly eight, so artifact-local
+/// durability alone cost ten to sixteen barriers per accepted edit
+/// (2026-08-26 managed-storage cost-model audit, defect D1).
+///
+/// ## The protocol, and why each step is where it is
+///
+/// 1. **Stage.** Every artifact is written to a temporary name in its own
+///    namespace with no barrier. Temporary names are invisible to every
+///    reader: `ObjectStore::validate_namespace` and every replay path address
+///    artifacts by their content-addressed or batch-addressed final names.
+/// 2. **One barrier.** `syncfs` flushes the whole private archive filesystem
+///    once. After it returns, every staged byte is on stable storage. This is
+///    the batch's single durability point.
+/// 3. **Install.** Each final name is inserted no-replace. This is a metadata
+///    operation over data that is *already* durable, so a visible final name
+///    can never name bytes that were never flushed.
+/// 4. **Directory barriers.** One `fsync` per distinct namespace makes the
+///    name insertions durable — two for an ordinary batch (objects, batches).
+///
+/// Step 3 after step 2 is the whole safety argument, and it is why this does
+/// not use `tine_storage::ExactImmutablePublicationBatch`: that primitive
+/// installs final names *before* its single flush, so a crash inside it can
+/// leave an immutable name whose bytes never reached the platter.
+/// `validate_namespace` correctly refuses such an archive
+/// (`StoreError::ObjectPathMismatch`), which would strand an accepted edit
+/// that is still durable in the journal. Staging first removes that state
+/// from the reachable set instead of adding recovery for it.
+///
+/// ## Crash points
+///
+/// | crash at | on disk | recovery |
+/// |---|---|---|
+/// | during staging | temporary names only, contents arbitrary | the batch is not accepted; the journal frame is undrained and the drain republishes. Temporaries are ignored by every reader. |
+/// | after staging, before the barrier | as above | as above |
+/// | after the barrier, during installs | a prefix of final names, every one with durable correct bytes | the drain republishes; each installed name verifies byte-identical and is accepted as already published |
+/// | after installs, before a directory barrier | possibly no final name durable | as above |
+/// | after the directory barriers | the whole batch durable | the drain proceeds to checkpoint |
+///
+/// In every row the accepted operation itself is unaffected: it became durable
+/// in the local journal during the foreground save, before this runs, and its
+/// journal frame is checkpointed only after this returns.
+///
+/// On platforms without `syncfs` (Windows, macOS) there is no batched barrier
+/// to have, so `stage` publishes each artifact through the ordinary durable
+/// publisher and `commit` is inert. The barrier count there is unchanged.
+struct ArchiveBatchPublication {
+    archive: Dir,
+    namespaces: Vec<Dir>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    staged: Vec<StagedArchiveArtifact>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct StagedArchiveArtifact {
+    namespace: usize,
+    temp_name: String,
+    final_name: String,
+    limit: u64,
+}
+
+impl ArchiveBatchPublication {
+    fn new(archive: &Dir) -> Result<Self, StoreError> {
+        Ok(Self {
+            archive: archive.try_clone()?,
+            namespaces: Vec::new(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            staged: Vec::new(),
+        })
+    }
+
+    /// Retain one namespace capability for the batch and return its index.
+    fn namespace(&mut self, dir: &Dir) -> Result<usize, StoreError> {
+        self.namespaces.push(dir.try_clone()?);
+        Ok(self.namespaces.len() - 1)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stage(
+        &mut self,
+        namespace: usize,
+        final_name: &str,
+        bytes: &[u8],
+        limit: u64,
+        _collision: Collision,
+    ) -> Result<(), StoreError> {
+        let dir = &self.namespaces[namespace];
+        let temp_name = format!(".tmp-{}", Uuid::new_v4());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut temp = dir.open_with(&temp_name, &options)?;
+        if let Err(error) = temp.write_all(bytes) {
+            drop(temp);
+            let _ = dir.remove_file(&temp_name);
+            return Err(error.into());
+        }
+        drop(temp);
+        self.staged.push(StagedArchiveArtifact {
+            namespace,
+            temp_name,
+            final_name: final_name.to_owned(),
+            limit,
+        });
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn stage(
+        &mut self,
+        namespace: usize,
+        final_name: &str,
+        bytes: &[u8],
+        _limit: u64,
+        collision: Collision,
+    ) -> Result<(), StoreError> {
+        publish_immutable(&self.namespaces[namespace], final_name, bytes, collision)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn commit(self) -> Result<(), StoreError> {
+        let result = self.commit_staged();
+        for artifact in &self.staged {
+            let _ = self.namespaces[artifact.namespace].remove_file(&artifact.temp_name);
+        }
+        result
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn commit_staged(&self) -> Result<(), StoreError> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        self.barrier_staged_data()?;
+        for artifact in &self.staged {
+            install_staged_artifact(
+                &self.namespaces[artifact.namespace],
+                &artifact.temp_name,
+                &artifact.final_name,
+                artifact.limit,
+            )?;
+            archive_install_cut_hook()?;
+        }
+        let mut barriered: Vec<usize> = Vec::new();
+        for artifact in &self.staged {
+            if barriered.contains(&artifact.namespace) {
+                continue;
+            }
+            barriered.push(artifact.namespace);
+            sync_dir_required(&self.namespaces[artifact.namespace])?;
+        }
+        Ok(())
+    }
+
+    /// The batch's single durability point.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn barrier_staged_data(&self) -> Result<(), StoreError> {
+        match crate::filesystem_durability::sync_filesystem_containing(&self.archive) {
+            Ok(()) => Ok(()),
+            // Android app-private storage on some vendor filesystems denies the
+            // filesystem-wide flush while permitting per-file flush. Falling
+            // back to one `fsync` per staged artifact costs the barriers this
+            // batch exists to avoid, but it is a correct durability point and
+            // it keeps managed storage available on those devices. Every other
+            // errno is a real I/O failure and stays fatal.
+            #[cfg(target_os = "android")]
+            Err(error) if crate::filesystem_durability::is_capability_refusal(&error) => {
+                for artifact in &self.staged {
+                    let file = tine_storage::open_file_nofollow(
+                        &self.namespaces[artifact.namespace],
+                        &artifact.temp_name,
+                    )?;
+                    crate::durability_counters::note(crate::durability_counters::Barrier::File);
+                    file.sync_all()?;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn commit(self) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+/// Insert one already-durable staged artifact under its final immutable name.
+///
+/// No-replace, because an immutable name is authored once. A name that is
+/// already present is not an error: the drain republishes the byte-identical
+/// batch after any crash, so "already there with exactly these bytes" is the
+/// expected outcome of resuming. Anything else is a genuine collision.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn install_staged_artifact(
+    dir: &Dir,
+    temp_name: &str,
+    final_name: &str,
+    limit: u64,
+) -> Result<(), StoreError> {
+    match dir.hard_link(temp_name, dir, final_name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let staged = tine_storage::read_required_regular(dir, temp_name, limit, None)
+                .map_err(filesystem_error_without_collision)?;
+            let existing = tine_storage::read_required_regular(dir, final_name, limit, None)
+                .map_err(filesystem_error_without_collision)?;
+            if existing == staged {
+                Ok(())
+            } else {
+                Err(StoreError::ImmutableCollision("archive batch publication"))
+            }
+        }
+        // Some Android app-private filesystems permit atomic same-directory
+        // renames but deny the hard-link primitive. The archive is a
+        // single-writer namespace, so proving the name absent and renaming is
+        // equivalent there. This mirrors
+        // `tine_storage::publish_immutable_exact_single_writer`.
+        #[cfg(target_os = "android")]
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::Unsupported | ErrorKind::InvalidInput
+            ) =>
+        {
+            match dir.symlink_metadata(final_name) {
+                Ok(_) => {
+                    let staged = tine_storage::read_required_regular(dir, temp_name, limit, None)
+                        .map_err(filesystem_error_without_collision)?;
+                    let existing =
+                        tine_storage::read_required_regular(dir, final_name, limit, None)
+                            .map_err(filesystem_error_without_collision)?;
+                    if existing == staged {
+                        Ok(())
+                    } else {
+                        Err(StoreError::ImmutableCollision("archive batch publication"))
+                    }
+                }
+                Err(absent) if absent.kind() == ErrorKind::NotFound => {
+                    dir.rename(temp_name, dir, final_name)?;
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn publication_stage_error(stage: &'static str, error: StoreError) -> StoreError {
@@ -9217,6 +9579,7 @@ pub(crate) fn require_regular_entry(
 }
 
 pub(crate) fn sync_dir_required(dir: &Dir) -> Result<(), StoreError> {
+    crate::durability_counters::note(crate::durability_counters::Barrier::Directory);
     tine_storage::sync_dir_required(dir).map_err(Into::into)
 }
 

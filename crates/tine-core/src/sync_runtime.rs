@@ -3178,9 +3178,13 @@ impl SyncRuntimeHandle {
             });
             let recovery_request = clean_request.clone();
             let (recovery_sender, recovery_receiver) = mpsc::sync_channel(1);
+            let open_barrier_session = crate::durability_counters::current_session();
             let recovery_worker = match thread::Builder::new()
                 .name("tine-clean-runtime-open".into())
                 .spawn(move || {
+                    if let Some(session) = open_barrier_session {
+                        session.attach();
+                    }
                     let _ = recovery_sender.send(open_clean_runtime_resources(&recovery_request));
                 }) {
                 Ok(worker) => worker,
@@ -3317,10 +3321,19 @@ impl SyncRuntimeHandle {
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
         let actor_status = Arc::clone(&status);
         let thread_name = format!("tine-sync-{}", &graph_resource_id.to_string()[..12]);
+        // The actor performs most of a managed operation's durability barriers,
+        // including every deferred one. Inherit the creating thread's barrier
+        // attribution channel so a budget test can measure THIS runtime's
+        // barriers while other graphs run concurrently in the same process.
+        // In production no session is ever open and this is a `None` clone.
+        let barrier_session = crate::durability_counters::current_session();
         let join = match thread::Builder::new()
             .name(thread_name)
             .stack_size(ACTOR_STACK_BYTES)
             .spawn(move || {
+                if let Some(session) = barrier_session {
+                    session.attach();
+                }
                 #[cfg(test)]
                 ACTOR_THREADS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -27150,6 +27163,219 @@ mod tests {
             .contains("edit cut after objects"));
     }
 
+    /// Locate the one directory with `name` below `root`, so a crash-repair
+    /// test can tear real on-disk bytes without hard-coding the private
+    /// managed layout.
+    fn find_single_named_directory(root: &Path, name: &str) -> Option<PathBuf> {
+        let mut found = None;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+                    assert!(
+                        found.is_none(),
+                        "expected exactly one {name} directory below the fixture"
+                    );
+                    found = Some(path);
+                } else {
+                    pending.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// A batched archive publication has ONE durability point, and its
+    /// protocol is chosen so that no crash inside it can leave an immutable
+    /// name whose bytes never reached stable storage. Artifacts are staged
+    /// under temporary names, flushed once, and only then installed under
+    /// their final names.
+    ///
+    /// This is the crash-safety contract in `docs/storage-sync-contract.md`,
+    /// "Durability barriers and the batch commit point": every final name a
+    /// reader can see names durable, byte-correct content, and a torn batch is
+    /// simply not accepted. `ObjectStore::validate_namespace` refuses an
+    /// archive containing a name whose bytes do not hash to it, so a design
+    /// that installed before flushing could strand an accepted edit that is
+    /// still durable in the journal.
+    ///
+    /// In-scope scenario: crash or power loss during a batched publication.
+    #[test]
+    fn clean_batched_archive_publication_leaves_no_torn_immutable_name() {
+        for cut in [
+            ArchiveBatchCut::BeforeManifest,
+            ArchiveBatchCut::DuringInstall,
+        ] {
+            let fixture = ActivationFixture::nested_unicode(
+                &format!("clean-archive-batch-cut-{cut:?}"),
+                0xa1c1 + cut as u128,
+            );
+            let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+            let resources =
+                activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+            let CleanRuntimeResources {
+                graph,
+                receipts,
+                runtime,
+            } = resources;
+            let accepted_before = runtime.engine().accepted_batch_count().unwrap();
+            let mut actor = CleanRuntimeActorCore::new(runtime, false);
+            let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
+            let owner = actor
+                .runtime
+                .database()
+                .materialized_read()
+                .unwrap()
+                .pages_by_path(&root_path, 2)
+                .unwrap()
+                .pop()
+                .expect("clean SQLite names Root.md");
+            let edit = |actor: &mut CleanRuntimeActorCore| {
+                let current = actor
+                    .load_current_editor_page(owner.page_id)
+                    .unwrap()
+                    .expect("clean actor loads Root.md");
+                let first = current.blocks.first().expect("Root.md has one block");
+                OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: first.block_id,
+                        home_document_id: first.home_document_id,
+                    },
+                    content: "batch cut edit".into(),
+                }])
+                .unwrap()
+            };
+
+            let objects_dir = find_single_named_directory(
+                &fixture.root,
+                crate::oplog::sync_layout::ARCHIVE_OBJECTS_DIR,
+            )
+            .expect("the archive publishes its objects namespace");
+            let before_bytes = fs::read(fixture.graph_root.join("Root.md")).unwrap();
+            let genesis_objects = archive_object_names(&objects_dir);
+
+            match cut {
+                ArchiveBatchCut::BeforeManifest => {
+                    crate::oplog::object_store::fail_next_publish_after_objects()
+                }
+                ArchiveBatchCut::DuringInstall => {
+                    crate::oplog::object_store::cut_after_next_archive_install()
+                }
+            }
+            let transaction = edit(&mut actor);
+            let cut_outcome = actor.execute_local(&graph, &receipts, &transaction);
+            assert!(
+                !matches!(cut_outcome, Ok(CleanActorMutationOutcome::Durable(_))),
+                "the armed {cut:?} cut must not report a durable save: {cut_outcome:?}"
+            );
+            assert_eq!(
+                fs::read(fixture.graph_root.join("Root.md")).unwrap(),
+                before_bytes,
+                "an unpublished batch must not project Markdown"
+            );
+            drop(actor);
+
+            // The invariant: every installed final name still hashes to its
+            // own content. Temporary names are not archive entries and are
+            // allowed to hold anything.
+            assert_archive_object_names_match_their_bytes(&objects_dir, cut);
+            let installed = archive_object_names(&objects_dir)
+                .difference(&genesis_objects)
+                .count();
+            match cut {
+                // The cut precedes the batch's barrier, so nothing may be
+                // installed yet.
+                ArchiveBatchCut::BeforeManifest => assert_eq!(
+                    installed, 0,
+                    "a pre-barrier cut must not install any final archive name"
+                ),
+                // The cut is mid-install, so the test is only meaningful if at
+                // least one final name really was installed.
+                ArchiveBatchCut::DuringInstall => assert!(
+                    installed > 0,
+                    "the mid-install cut did not install anything; the crash point is untested"
+                ),
+            }
+
+            let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+                .unwrap()
+                .unwrap_or_else(|| panic!("a {cut:?} cut must not make the graph unopenable"));
+            assert_eq!(
+                reopened.runtime.engine().accepted_batch_count().unwrap(),
+                accepted_before,
+                "a torn batch must not enter accepted history"
+            );
+            let CleanRuntimeResources {
+                graph,
+                receipts,
+                runtime,
+            } = reopened;
+            let mut actor = CleanRuntimeActorCore::new(runtime, false);
+            let retry = edit(&mut actor);
+            let repaired = actor.execute_local(&graph, &receipts, &retry);
+            assert!(
+                matches!(repaired, Ok(CleanActorMutationOutcome::Durable(_))),
+                "a fresh session must complete the same edit after a {cut:?} cut: {repaired:?}"
+            );
+            assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+                .unwrap()
+                .contains("batch cut edit"));
+            drop(actor);
+
+            let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+                .unwrap()
+                .expect("the completed batch cold-reopens");
+            assert_eq!(reopened.runtime.engine().accepted_batch_count().unwrap(), 1);
+            assert_archive_object_names_match_their_bytes(&objects_dir, cut);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ArchiveBatchCut {
+        /// Between the objects and the manifest, before the batch's barrier.
+        BeforeManifest,
+        /// After the batch's single data barrier, part-way through installing
+        /// final names and before the directory barriers.
+        DuringInstall,
+    }
+
+    fn archive_object_names(objects_dir: &Path) -> BTreeSet<String> {
+        fs::read_dir(objects_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with(".tmp-"))
+            .collect()
+    }
+
+    fn assert_archive_object_names_match_their_bytes(objects_dir: &Path, cut: ArchiveBatchCut) {
+        for entry in fs::read_dir(objects_dir).unwrap().flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".tmp-") {
+                continue;
+            }
+            let bytes = fs::read(&path).unwrap();
+            let digest = format!("{}", ContentDigest::of(&bytes));
+            assert!(
+                name.contains(&digest),
+                "after a {cut:?} cut the archive entry {name} does not name its own \
+                 content ({digest}); a reader would refuse the whole archive"
+            );
+        }
+    }
+
     /// An external formatting-only rewrite (same semantics, different bytes)
     /// must be adopted as the endpoint's exact baseline: the file keeps the
     /// external spelling and the next local save still works. Refusing to
@@ -39960,6 +40186,205 @@ mod tests {
             );
         }
         assert_activation_near_linear(&small_receipt, &large_receipt);
+    }
+
+    /// The permanent per-operation durability-barrier budget (cost-model audit
+    /// 2026-08-26, defect D1).
+    ///
+    /// A durability barrier is a device round trip. Their *count* — not any
+    /// phase timer — is what scales an ordinary edit from milliseconds on a
+    /// local SSD to hundreds of milliseconds on a slow or network filesystem.
+    /// Before this budget existed, one accepted single-block managed save
+    /// performed 66 barriers and a cross-page move 151, because durability was
+    /// decided artifact by artifact and no test ever looked at the sum.
+    ///
+    /// The numbers asserted here are *core-initiated* barriers, as
+    /// [`crate::durability_counters`] documents: the local journal's own append
+    /// barriers inside `tine-storage` and the SQLite VFS are not visible from
+    /// this crate and are excluded from both sides of the comparison.
+    ///
+    /// This test is deliberately cheap (a five-file fixture, not the real
+    /// corpus) so it runs in CI on every change. `managed_save_and_move_barrier_probe`
+    /// is its real-graph companion; the two agreed to within one barrier when
+    /// the budget was set, because barrier count is a property of the *shape*
+    /// of an accepted batch and not of graph size — which is exactly why a
+    /// small fixture can guard it.
+    #[test]
+    fn managed_save_and_move_stay_within_their_barrier_budget() {
+        let session = crate::durability_counters::BarrierSession::begin();
+        let fixture = ActivationFixture::nested_unicode("barrier-budget", 0xa1c0);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("barrier budget fixture activates");
+        drive_initial_feed(&handle);
+
+        let mut request = simple_application_move_request(&handle, "Barrier Budget");
+        drain_managed_local(&handle);
+
+        // (c) one accepted single-block save, foreground plus deferred drain.
+        let (page, revision) = load_application_exact(&handle, &request.source_path);
+        session.reset();
+        let (page, revision) =
+            save_application_block_text(&handle, page, revision, "budgeted single-block edit");
+        let save_foreground = session.counts();
+        drain_managed_local(&handle);
+        let save_total = session.counts();
+        eprintln!(
+            "managed save barriers: foreground [{}] total [{}]",
+            save_foreground.report(),
+            save_total.report()
+        );
+
+        // (d) one accepted cross-page move, foreground plus deferred drain.
+        request.source_revision = revision;
+        request.roots[0].identity = page.blocks[0].id.clone();
+        let (_destination, destination_revision) =
+            load_application_exact(&handle, &request.destination_path);
+        request.destination_revision = destination_revision;
+        session.reset();
+        let moved = accepted_application_move(&handle, &request);
+        assert!(matches!(
+            moved,
+            SyncApplicationMoveSubtreesOutcome::Committed { .. }
+        ));
+        let move_foreground = session.counts();
+        drain_managed_local(&handle);
+        let move_total = session.counts();
+        eprintln!(
+            "managed cross-page move barriers: foreground [{}] total [{}]",
+            move_foreground.report(),
+            move_total.report()
+        );
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        crate::durability_counters::BarrierSession::detach_current_thread();
+
+        assert!(
+            save_total.total() <= crate::durability_counters::MANAGED_SAVE_BARRIER_BUDGET,
+            "one accepted single-block managed save performed {} core-initiated durability \
+             barriers, budget {} ({}). Each barrier is a device round trip; a regression \
+             here is a latency regression on every edit.",
+            save_total.total(),
+            crate::durability_counters::MANAGED_SAVE_BARRIER_BUDGET,
+            save_total.report()
+        );
+        assert!(
+            move_total.total() <= crate::durability_counters::MANAGED_MOVE_BARRIER_BUDGET,
+            "one accepted cross-page move performed {} core-initiated durability barriers, \
+             budget {} ({}).",
+            move_total.total(),
+            crate::durability_counters::MANAGED_MOVE_BARRIER_BUDGET,
+            move_total.report()
+        );
+    }
+
+    /// The real-graph companion to
+    /// `managed_save_and_move_stay_within_their_barrier_budget`.
+    ///
+    /// The fast budget test runs on a five-file fixture because barrier count
+    /// is a property of the *shape* of an accepted batch, not of graph size.
+    /// This probe is what proves that claim on a real corpus, and it is what
+    /// the 2026-08-26 cost-model audit measured (66 barriers per save, 151 per
+    /// cross-day move, on the anonymized 1,045-file graph). Run it after any
+    /// change to the publication protocol and compare against the fixture.
+    ///
+    /// ```text
+    /// TINE_MS_AUDIT_GRAPH_COPY=/path/to/graph \
+    ///   cargo test -p tine-core --release --lib \
+    ///   managed_save_and_move_barrier_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual probe: per-operation durability barriers on a real graph copy"]
+    fn managed_save_and_move_barrier_probe() {
+        let source = real_graph_copy_source_from_env("TINE_MS_AUDIT_GRAPH_COPY");
+        let session = crate::durability_counters::BarrierSession::begin();
+        let fixture = ActivationFixture::copied_graph("ms-barrier-probe", 0xa1c2, &source);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("the barrier probe activates");
+        eprintln!("activation barriers: [{}]", session.counts().report());
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("barrier probe inventory did not load: {other:?}"),
+        };
+        let mut journals: Vec<String> = pages
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .filter(|path| path.starts_with("journals/"))
+            .collect();
+        journals.sort();
+        let mut nonempty = Vec::new();
+        for path in &journals {
+            let (page, _) = load_application_exact(&handle, path);
+            if !page.blocks.is_empty() {
+                nonempty.push(path.clone());
+            }
+            if nonempty.len() == 2 {
+                break;
+            }
+        }
+        let day1 = nonempty
+            .first()
+            .expect("the corpus has a nonempty journal")
+            .clone();
+        let day2 = nonempty
+            .get(1)
+            .expect("the corpus has a second nonempty journal")
+            .clone();
+
+        for sample in 0..3 {
+            let (page, revision) = load_application_exact(&handle, &day1);
+            session.reset();
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("barrier probe save sample {sample}"),
+            );
+            let foreground = session.counts();
+            drain_managed_local(&handle);
+            eprintln!(
+                "save sample {sample}: foreground [{}] total [{}]",
+                foreground.report(),
+                session.counts().report()
+            );
+        }
+
+        let (source_page, source_revision) = load_application_exact(&handle, &day1);
+        let (destination_page, destination_revision) = load_application_exact(&handle, &day2);
+        session.reset();
+        let outcome = handle
+            .move_application_subtrees(SyncApplicationMoveSubtreesRequest {
+                episode_id: Uuid::new_v4().to_string(),
+                source_path: source_page.path.clone(),
+                source_revision,
+                destination_path: destination_page.path.clone(),
+                destination_revision,
+                roots: vec![SyncApplicationMoveRoot {
+                    identity: source_page.blocks[0].id.clone(),
+                    raw_rewrite: None,
+                }],
+                placement: SyncApplicationMovePlacement::Root { position: 0 },
+                admission: application_move_admission(),
+            })
+            .unwrap();
+        assert!(
+            !matches!(outcome, SyncApplicationMoveSubtreesOutcome::NoCommit { .. }),
+            "the barrier probe move did not commit: {outcome:?}"
+        );
+        let foreground = session.counts();
+        drain_managed_local(&handle);
+        eprintln!(
+            "cross-day move: foreground [{}] total [{}]",
+            foreground.report(),
+            session.counts().report()
+        );
+        crate::durability_counters::BarrierSession::detach_current_thread();
     }
 
     #[test]
