@@ -8391,6 +8391,82 @@
     "failBefore": "proven"
    },
    "notes": "GH #388: a candidate source page at the 10,000-block boundary was rejected by the write-oriented whole-page editor gateway before the bounded Unlinked References result could be constructed. Reference panels now retain the projected fast path for ordinary pages and use one linear authenticated hot-page read only for an explicit page-size refusal. Output remains governed by the existing row and byte construction budgets. The synthetic large-page managed graph failed with RequestTooLarge before the fix and returns its single semantic match after it. The intermittent narrow-layout report is separately covered by UI-PANE-WIDTH-382."
+  },
+  {
+   "id": "UI-SHORTCUT-RECORD-CTRL-378",
+   "title": "On macOS the keyboard-shortcut recorder captures the physical Control key as a distinct ctrl+ binding instead of dropping it, while Cmd keeps mapping to mod and every existing binding keeps its meaning",
+   "family": "settings-shortcuts",
+   "sources": {
+    "issues": [
+     378
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "macos"
+   ],
+   "layer": "unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/keybindings.test.ts::records physical Control distinctly from Command on macOS (GH #378)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "On macOS eventToChord derived mod from metaKey only and read e.ctrlKey nowhere, so recording Ctrl+<key> stored the bare key (or nothing for a bare press) while Cmd/Option/Shift worked: physical Control had no representation in the Chord model (\"ctrl\" parsed as an alias of mod). The chord now carries a distinct ctrl member populated from e.ctrlKey on macOS (unchanged off-Mac, where Control IS mod), serializes as the ctrl+ token, parses \"ctrl\" as physical Control on macOS (still a mod alias off-Mac, where it always meant that key), and participates in chord equality; parsing, defaults, and Linux/Windows behavior are untouched. Verified with platform-correct KeyboardEvent fixtures under a macOS navigator.platform; no physical macOS runner exists in this environment, so on-device confirmation remains with the manager."
+  },
+  {
+   "id": "UI-SHORTCUT-SEARCH-380",
+   "title": "The Settings search field filters shortcut commands while the Keyboard Shortcuts section is open",
+   "family": "settings-shortcuts",
+   "sources": {
+    "issues": [
+     380
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/HelpShortcuts.test.tsx::filters command labels, ids, and bindings for Settings search (GH #380)",
+     "src/components/Settings.p1a1.recording.test.tsx::routes the existing Settings search to shortcut commands on that tab (GH #380)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "The single Settings search affordance kept rendering the global settings index on the shortcuts tab, while the shortcut rows ignored its query. The contextual search now matches command labels, ids, and effective bindings (plus built-in labels, ids, bindings, and details), retains their normal scope groups, and renders a shortcut-specific empty state without adding a second search box."
+  },
+  {
+   "id": "UI-PAGE-LINK-LONG-PRESS-207",
+   "title": "Android long-press opens the page context menu for body links, reference links and headers, and page search results",
+   "family": "page-link-gestures",
+   "sources": {
+    "issues": [
+     207
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/render/longPress.test.tsx::fires one contextmenu after a still hold through the delay",
+     "src/render/PageRefLongPress.test.tsx::page-ref long-press gesture (GH #231)",
+     "src/components/linkGestureSurfaces.test.tsx::linked-reference page header suppresses the middle-mousedown default",
+     "src/components/QuickSwitcher.modifiedClicks.test.tsx::opens a page result's context menu on a still touch hold (GH #207)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "The shared touch recognizer emitted a synthetic contextmenu, but the mobile text-selection policy rejected it because tests exercised desktop policy. Reference group headers and quick-switch page rows also lacked the recognizer. Synthetic Tine-owned holds are now distinguished from native selection events, and the same long-press contract is attached across the reported page-link surfaces without changing quick taps, scrolling, desktop right-click, or middle/modified clicks."
   }
  ]
 }

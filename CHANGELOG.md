@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Keyboard Shortcuts can now be searched in place** (GH #380). The existing
+  Settings search field filters command names, IDs, and bindings while that
+  section is open, including built-in shortcuts and a clear no-results state.
+
 ### Fixed
 
 - **Unlinked References now opens when a matching source page contains 10,000
@@ -40,6 +46,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   structural boundary on desktop and mobile while preserving intentional blank
   lines.
 
+- **Android page links now open their page menu consistently on long-press**
+  (GH #207). Body wiki links, links and page headers in Linked References, and
+  page results in search now distinguish Tine's deliberate hold from the
+  browser's native text-selection gesture. Quick taps, scrolling, and desktop
+  click gestures are unchanged.
+
+- **The keyboard-shortcut recorder now captures Control on macOS** (GH #378).
+  Physical Control is recorded as `ctrl`, while portable `mod` remains Command
+  on macOS and Control on Windows/Linux.
 - **Pages no longer become narrow or jump sideways when you start editing or
   expand references** (GH #382). The pane-relative end-of-page space added in
   v0.6.96 accidentally let the centered page column shrink to the width of its

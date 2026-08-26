@@ -277,6 +277,27 @@ describe("plugin command context", () => {
 });
 
 describe("keyboard binding strings", () => {
+  it("records physical Control distinctly from Command on macOS (GH #378)", async () => {
+    vi.resetModules();
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    try {
+      const macBindings = await import("./keybindings");
+      expect(macBindings.eventToBindingString(keyEvent({
+        key: "k",
+        code: "KeyK",
+        ctrlKey: true,
+      }))).toBe("ctrl+k");
+      expect(macBindings.eventToBindingString(keyEvent({
+        key: "k",
+        code: "KeyK",
+        metaKey: true,
+      }))).toBe("mod+k");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.resetModules();
+    }
+  });
+
   it("binds Insert link to Mod-L by default", () => {
     const byId = Object.fromEntries(commandDefaults().map((c) => [c.id, c]));
     expect(byId["editor/insert-link"]).toMatchObject({ binding: "mod+l", scope: "editor" });

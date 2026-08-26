@@ -419,8 +419,8 @@ export function Settings(): JSX.Element {
               <input
                 class="settings-search-input"
                 type="search"
-                placeholder="Search settings…"
-                aria-label="Search settings"
+                placeholder={tab() === "shortcuts" ? "Search shortcuts..." : "Search settings…"}
+                aria-label={tab() === "shortcuts" ? "Search shortcuts" : "Search settings"}
                 value={settingsQuery()}
                 onInput={(event) => setSettingsQuery(event.currentTarget.value)}
                 onKeyDown={(event) => {
@@ -459,7 +459,7 @@ export function Settings(): JSX.Element {
               </button>
             </div>
             <div class="settings-pane-body">
-              <Show when={settingsQuery().trim()}>
+              <Show when={settingsQuery().trim() && tab() !== "shortcuts"}>
                 <div class="settings-search-results" aria-live="polite">
                   <Show when={matches().length} fallback={<div class="settings-search-empty">No matching settings</div>}>
                     <For each={matches()}>
@@ -503,6 +503,7 @@ export function Settings(): JSX.Element {
               <Show when={tab() === "shortcuts"}>
                 <ShortcutsSettingsPane
                   shortcuts={shortcuts()}
+                  search={settingsQuery()}
                   recording={recording()}
                   onRecord={(id) => setRecording(recording() === id ? null : id)}
                   onReset={resetShortcutOverride}

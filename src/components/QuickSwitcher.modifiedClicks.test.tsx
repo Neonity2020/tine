@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { QuickSwitcher } from "./QuickSwitcher";
 import { __setBackendForTest, type Backend } from "../backend";
@@ -10,10 +10,13 @@ import {
   setRightSidebarOpen,
   rightSidebarOpen,
   switcherOpen,
+  contextMenu,
+  closeContextMenu,
 } from "../ui";
 import { layoutPaneIds, paneRouter, resetPaneLayoutToSingle } from "../panes";
 import { routeTitle } from "../router";
 import { clearTransientLayersForTest } from "../transientLayers";
+import { LONG_PRESS_DELAY } from "../render/longPress";
 
 // GH #288: pointer modifiers on result rows must mirror the Enter-key
 // semantics — Ctrl/Cmd+click fans a background tab out of the origin pane
@@ -89,6 +92,8 @@ const blockHit = {
 };
 
 afterEach(() => {
+  vi.useRealTimers();
+  closeContextMenu();
   closeSwitcher();
   setRecentPages([]);
   setRightSidebarOpen(false);
@@ -99,6 +104,29 @@ afterEach(() => {
 });
 
 describe("QuickSwitcher modified clicks (GH #288)", () => {
+  it("opens a page result's context menu on a still touch hold (GH #207)", async () => {
+    const { root } = mount();
+    setRecentPages([{ name: "Alpha", kind: "page" }]);
+    openSwitcher();
+    await settle();
+    const row = rows(root)[0];
+
+    vi.useFakeTimers();
+    row.dispatchEvent(new PointerEvent("pointerdown", {
+      bubbles: true,
+      cancelable: true,
+      pointerType: "touch",
+      isPrimary: true,
+      pointerId: 7,
+      clientX: 12,
+      clientY: 24,
+    }));
+    vi.advanceTimersByTime(LONG_PRESS_DELAY);
+
+    expect(contextMenu()).toMatchObject({ kind: "page", name: "Alpha" });
+    expect(switcherOpen()).toBe(true);
+  });
+
   it("middle-click opens a background tab in the origin pane, keeps the switcher open, and swallows the follow-up paste", async () => {
     const { root } = mount();
     setRecentPages([{ name: "Alpha", kind: "page" }]);

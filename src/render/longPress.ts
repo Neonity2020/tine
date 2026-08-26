@@ -7,6 +7,14 @@
 export const LONG_PRESS_DELAY = 500; // ms — the conventional hold time
 export const LONG_PRESS_MOVE_TOLERANCE = 10; // px — beyond it, the hold is a scroll/drag
 
+const ownedContextMenuEvents = new WeakSet<Event>();
+
+/** True only for the synthetic contextmenu produced by Tine's deliberate hold.
+ * Native mobile contextmenu events remain owned by text selection. */
+export function isLongPressContextMenu(event: Event): boolean {
+  return ownedContextMenuEvents.has(event);
+}
+
 export interface LongPressHandlers {
   onPointerDown(e: PointerEvent): void;
   onPointerMove(e: PointerEvent): void;
@@ -58,14 +66,14 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
         firedPointer = armedNow.id;
         const el = target();
         if (!el) return;
-        el.dispatchEvent(
-          new MouseEvent("contextmenu", {
-            bubbles: true,
-            cancelable: true,
-            clientX: armedNow.x,
-            clientY: armedNow.y,
-          }),
-        );
+        const contextMenu = new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: armedNow.x,
+          clientY: armedNow.y,
+        });
+        ownedContextMenuEvents.add(contextMenu);
+        el.dispatchEvent(contextMenu);
       }, LONG_PRESS_DELAY);
     },
     onPointerMove(e: PointerEvent) {
@@ -91,6 +99,10 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
       cancel();
     },
     consumeClick() {
+      // Some touch WebViews synthesize compatibility mouse events before
+      // pointerup. Surfaces that activate on mousedown must be able to decline
+      // them as soon as the hold has fired, not only after release.
+      if (firedPointer !== null) return true;
       if (!suppressClick) return false;
       clearSuppression();
       return true;

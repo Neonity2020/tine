@@ -26,6 +26,7 @@ import { NamespaceHierarchy, NamespaceMacro } from "./Namespace";
 import { RightSidebar } from "./RightSidebar";
 import { PageView } from "./Page";
 import type { PageEntry, QueryExecution } from "../types";
+import { LONG_PRESS_DELAY } from "../render/longPress";
 
 // GH #207: the internal-link gesture contract (linkGesture.ts, GH #283) is ONE
 // decision — plain click opens, Shift+click → right sidebar, Ctrl/Cmd+click or
@@ -93,6 +94,18 @@ function click(el: HTMLElement, init: MouseEventInit = {}) {
 function auxMiddle(el: HTMLElement) {
   el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 1 }));
   el.dispatchEvent(new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }));
+}
+
+function touch(type: string, x = 20, y = 30): PointerEvent {
+  return new PointerEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    pointerType: "touch",
+    isPrimary: true,
+    pointerId: 7,
+    clientX: x,
+    clientY: y,
+  });
 }
 
 /** Dispatch a middle-button mousedown and report whether the browser default
@@ -179,7 +192,18 @@ describe("reference page headers follow the gesture contract (GH #207)", () => {
         return el!;
       });
       expect(middleDefaultPrevented(header)).toBe(true);
+
+      vi.useFakeTimers();
+      openPage("Elsewhere", "page");
+      header.dispatchEvent(touch("pointerdown"));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY);
+      expect(contextMenu()).toMatchObject({ kind: "page", name: "Backlink Owner" });
+      header.dispatchEvent(touch("pointerup"));
+      header.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      expect(activeRouteName()).toBe("Elsewhere");
+      vi.useRealTimers();
     } finally {
+      vi.useRealTimers();
       m.dispose();
     }
   });
