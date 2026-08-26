@@ -729,11 +729,26 @@ await withApp(2, async (browser) => {
   }
   await showFull.click();
 
+  // This journey does not exercise notifications. Persistent startup/Guide
+  // toasts can cover the bottom-right reference controls even after WebDriver
+  // scrolls them into view, so dismiss them before driving those controls.
+  await browser.execute(() => {
+    document.querySelectorAll(".toast-close").forEach((button) => {
+      if (button instanceof HTMLButtonElement) button.click();
+    });
+  });
+  await browser.waitUntil(async () => (await browser.$$(".toast")).length === 0, {
+    timeout: 5_000,
+    timeoutMsg: "persistent notifications did not dismiss before reference controls",
+  });
+
   const unlinkedBulk = await browser.$$(".unlinked-references .reference-bulk-controls button");
+  await unlinkedBulk[0].scrollIntoView({ block: "center", inline: "center" });
   await unlinkedBulk[0].click();
   await browser.waitUntil(async () => (await browser.$$(".unlinked-references .reference-blocks")).length === 0, {
     timeout: 5_000, timeoutMsg: "Collapse all did not unmount unlinked reference bodies",
   });
+  await unlinkedBulk[1].scrollIntoView({ block: "center", inline: "center" });
   await unlinkedBulk[1].click();
   await browser.waitUntil(async () => (await browser.$$(".unlinked-references .reference-blocks")).length === unlinkedProof.groupCount, {
     timeout: 5_000, timeoutMsg: "Expand all did not restore unlinked reference bodies",
