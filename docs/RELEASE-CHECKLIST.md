@@ -16,9 +16,14 @@ may tag, publish, comment, and close issues.
    `tine-storage` tag/commit to the checked-in upstream certification receipt
    and persistent-format manifest, with no path, patch, branch, or rev override.
 2. Generate `docs/releases/vX.Y.Z-impact.json` from every Added, Changed, and
-   Fixed changelog bullet. For each item record regression coverage and its
-   Guide/docs, website, and blog disposition (`update`, `current`,
-   `not-applicable`, or `consult`). `consult` blocks the release.
+   Fixed changelog bullet. For each item record regression coverage and four
+   separate dispositions: user-facing **Guide**, engineering docs/contracts,
+   website, and blog (`update`, `current`, `not-applicable`, or `consult`). A
+   contract or changelog is not Guide coverage: Guide `update`/`current` must
+   cite canonical files under `crates/tine-core/src/templates/`. Every
+   user-visible Added item needs Guide coverage; a user-visible Changed item
+   may opt out only as explicitly performance-only, packaging-only, or
+   internal-only. `consult` blocks the release.
 3. For every accepted bug, require an entry in the indexed regression catalogs
    before the production fix begins (UI/native in the UI inventory; other bugs
    in the non-UI inventory). Public Fixed entries reference their GitHub issue;

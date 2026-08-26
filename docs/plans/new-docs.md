@@ -175,9 +175,10 @@ substitute for task-oriented explanation.
 ## 5. Pre-registered user journeys
 
 Do not create a second feature/coverage catalogue. Release-impact records already
-force a Guide/docs disposition for accepted user-visible changes. The program is
-judged against these manager-defined journeys rather than topics the worker
-invents, prioritizes, and marks complete itself:
+force separate user-facing Guide and engineering-doc dispositions for accepted
+user-visible changes; an ADR, contract, test, or changelog entry does not count
+as Guide coverage. The program is judged against these manager-defined journeys
+rather than topics the worker invents, prioritizes, and marks complete itself:
 
 | ID | A user can… | Principal current pages |
 |---|---|---|

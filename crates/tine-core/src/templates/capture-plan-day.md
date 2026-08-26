@@ -10,7 +10,7 @@ icon:: ✅
   - When a thought arrives while you are in another app, press your desktop quick-capture shortcut, type, and the note is appended to today's journal without switching windows. One-time setup, the optional page-title field, and the Enter-key tuning are all in [[Features/Quick capture]].
 - ## Turn a bullet into a task
   - 1. With the caret anywhere in a bullet, press **Ctrl+Enter** (Cmd on Mac). The bullet becomes `TODO …`; press again for `DOING`, again for `DONE`, once more to drop the marker. (Under the NOW / LATER workflow the cycle is LATER → NOW → DONE.)
-  - 2. Prefer the mouse? Click the marker chip to cycle, or click the checkbox in front of the task to finish it in one step.
+  - 2. Prefer the mouse? Click the marker chip to toggle between the workflow's two open states (TODO ↔ DOING or LATER ↔ NOW), or click the checkbox in front of the task to finish it in one step.
   - 3. Select several blocks first and the same keypress cycles every selected task at once.
   - 4. What you should see: a colored marker chip at the start of the block, plus an empty checkbox until the task is done.
 - ## Rank it
