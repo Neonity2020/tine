@@ -6068,6 +6068,32 @@ enum NamespaceKind {
     Batches,
 }
 
+/// `TINE_PUBLISH_TRACE=1` names the artifact class of every individually
+/// published immutable artifact on stderr.
+///
+/// The barrier budget in `docs/storage-sync-contract.md` 2.10a-i is a number;
+/// this is how you find out WHICH artifacts make it up when the number moves.
+/// Read once per process, like the other `TINE_*_TRACE` switches in this crate.
+fn publication_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TINE_PUBLISH_TRACE").is_some())
+}
+
+impl Collision {
+    /// The artifact class this publication belongs to, for the publication
+    /// trace.
+    fn artifact_class(&self) -> String {
+        match self {
+            Self::Object(_) => "archive-object".to_owned(),
+            Self::Batch(_) => "archive-manifest".to_owned(),
+            Self::HistoryIndex(_) => "history-index".to_owned(),
+            Self::Lineage(_) => "archive-lineage-claim".to_owned(),
+            Self::Exact(kind) => (*kind).to_owned(),
+            Self::Bootstrap(kind, _) => format!("bootstrap:{kind}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Collision {
     Object(ContentDigest),
@@ -6857,18 +6883,8 @@ fn publish_immutable(
     // while the managed runtime owns its sole-writer lease. This is distinct
     // from shared/provider publication, which must retain strict no-replace
     // behavior across processes.
-    if std::env::var_os("TINE_TRACE_PUBLISH").is_some() {
-        eprintln!(
-            "PUBLISH kind={}",
-            match &collision {
-                Collision::Object(_) => "archive-object".to_string(),
-                Collision::Batch(_) => "archive-manifest".to_string(),
-                Collision::HistoryIndex(_) => "history-index".to_string(),
-                Collision::Lineage(_) => "lineage".to_string(),
-                Collision::Exact(kind) => (*kind).to_string(),
-                Collision::Bootstrap(kind, _) => format!("bootstrap:{kind}"),
-            }
-        );
+    if publication_trace_enabled() {
+        eprintln!("PUBLISH kind={}", collision.artifact_class());
     }
     crate::durability_counters::note_immutable_publication();
     tine_storage::publish_immutable_exact_single_writer(dir, filename, bytes)
