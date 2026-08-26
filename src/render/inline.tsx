@@ -35,7 +35,7 @@ import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { resolveBlockBatched } from "../resolveBatch";
 import { doc, setRaw, formatForPage, formatForBlock, blockRef } from "../store";
-import { internalLinkDest } from "../linkGesture";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { QueryMacro, EmbedMacro, VideoMacro, TweetMacro, YoutubeTimestamp, ClozeMacro, ZoteroMacro } from "../components/Macro";
 import { NamespaceMacro } from "../components/Namespace";
 import { guideTargetForLink, isGuidePageName } from "../guide";
@@ -348,10 +348,10 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
         ref={anchorEl}
         class={`${props.tag ? "tag" : "page-ref"}${missing() ? " page-ref-missing" : ""}`}
         {...(props.spanAttrs ?? {})}
-        // Shift+click opens the page in the sidebar (via `open`); suppress the
-        // browser's native shift-range-selection so the main editor's text isn't
-        // selected as a side effect (GH #42).
-        onMouseDown={(e) => { if (e.shiftKey || e.button === 1) e.preventDefault(); }}
+        // Shift+click opens the page in the sidebar (via `open`); the shared
+        // guard suppresses native shift-range-selection / middle-click autoscroll
+        // so the gestures can't leak to the browser (GH #42, GH #207).
+        onMouseDown={internalLinkMouseDown}
         onClick={open}
         onMouseEnter={peek.anchorEnter}
         onMouseLeave={peek.anchorLeave}
@@ -361,13 +361,9 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
         onPointerCancel={longPress.onPointerCancel}
 
         onAuxClick={(e) => {
-          if (e.button === 1) {
-            e.preventDefault();
-            e.stopPropagation();
-            // A background tab belongs to the pane that was already active, not
-            // necessarily the pane containing this link (GH #87).
-            openPageInNewTab(targetName(), kind());
-          }
+          // A background tab belongs to the pane that was already active, not
+          // necessarily the pane containing this link (GH #87).
+          if (internalLinkAuxClick(e, () => openPageInNewTab(targetName(), kind()))) e.stopPropagation();
         }}
         onContextMenu={(e) => {
           if (!shouldOpenTextContextMenu(e.target)) return;
@@ -1268,21 +1264,21 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
         title={annotation()
           ? "Click to open the highlight in its PDF; shift-click → sidebar; right-click for more"
           : "Click to go to the block; shift-click → sidebar; right-click for more"}
-        // Suppress native shift-range-selection when shift+click opens the sidebar (GH #42).
-        onMouseDown={(e) => { if (e.shiftKey || e.button === 1) e.preventDefault(); }}
+        // Shared guard: suppress native shift-range-selection / middle-click
+        // autoscroll up front (GH #42, GH #207).
+        onMouseDown={internalLinkMouseDown}
         onMouseEnter={peek.anchorEnter}
         onMouseLeave={peek.anchorLeave}
         // Middle-click → background tab with the block anchor (GH #283).
         onAuxClick={(e) => {
-          if (e.button !== 1) return;
-          e.preventDefault();
-          e.stopPropagation();
-          const g = grp();
-          if (!g) return;
-          const ref = doc.byId[props.id]
-            ? blockRef(props.id)
-            : { uuid: props.id, page: g.page, pageKind: g.kind };
-          openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+          if (internalLinkAuxClick(e, () => {
+            const g = grp();
+            if (!g) return;
+            const ref = doc.byId[props.id]
+              ? blockRef(props.id)
+              : { uuid: props.id, page: g.page, pageKind: g.kind };
+            openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+          })) e.stopPropagation();
         }}
         onContextMenu={(e) => {
           const g = grp();

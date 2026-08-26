@@ -1,13 +1,14 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
-import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, type PaneRouter } from "../router";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, blockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
+import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, openInNewTab, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
   isFavorite, toggleFavorite,
-  graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
+  graphEpoch, openPageInSidebar, openBlockInSidebar, openPageContextMenu, carryDays, showCarryButtons,
   agendaQuery, contextMenu, dataRev, isConflicted, renamePageInNavigation,
   vcsMarkerConflictFor, conflictObjectFor,
 } from "../ui";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
 import { ensureJournalTemplateForDay, switchGraph, refreshAfterRename, renameOrMergePage } from "../graph";
@@ -614,7 +615,14 @@ function ZoomedView(props: { id: string }): JSX.Element {
       <div class="zoom-breadcrumb">
         <a
           class="crumb crumb-page"
-          onClick={() => router.openPageTarget(pageTarget())}
+          onMouseDown={internalLinkMouseDown}
+          onClick={(e) => {
+            const dest = internalLinkDest(e);
+            if (dest === "sidebar") openPageInSidebar(pageTarget());
+            else if (dest === "background") openPageTargetInNewTab(pageTarget());
+            else router.openPageTarget(pageTarget());
+          }}
+          onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
         >
           {pageName()}
         </a>
@@ -622,7 +630,24 @@ function ZoomedView(props: { id: string }): JSX.Element {
           {(aid) => (
             <>
               <span class="crumb-sep">›</span>
-              <a class="crumb" onClick={() => router.focusBlock(aid)}>
+              <a
+                class="crumb"
+                onMouseDown={internalLinkMouseDown}
+                onClick={(e) => {
+                  const dest = internalLinkDest(e);
+                  if (dest === "default") {
+                    router.focusBlock(aid);
+                    return;
+                  }
+                  const ref = blockRef(aid);
+                  if (dest === "sidebar") openBlockInSidebar(ref);
+                  else openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+                }}
+                onAuxClick={(e) => internalLinkAuxClick(e, () => {
+                  const ref = blockRef(aid);
+                  openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+                })}
+              >
                 <InlineText text={crumb(aid)} format={formatForBlock(aid)} />
               </a>
             </>
@@ -822,16 +847,13 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
             classList={{ "journal-title": props.page.kind === "journal" }}
             title={props.page.guide ? "Bundled Guide page" : props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar, middle-click → new tab)" : "Shift-click to open in sidebar, middle-click → new tab"}
             onClick={(e) => {
-              if (e.shiftKey && !props.page.guide) openPageInSidebar(pageTarget());
+              const dest = internalLinkDest(e);
+              if (dest === "sidebar" && !props.page.guide) openPageInSidebar(pageTarget());
+              else if (dest === "background" && !props.page.guide) openPageTargetInNewTab(pageTarget());
               else router.openPageTarget(pageTarget());
             }}
-            onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
-            onAuxClick={(e) => {
-              if (e.button === 1) {
-                e.preventDefault(); // middle-click → background tab, like a body link
-                openPageTargetInNewTab(pageTarget());
-              }
-            }}
+            onMouseDown={internalLinkMouseDown}
+            onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
             onDblClick={startRename}
             onContextMenu={(e) => {
               if (props.page.guide) return;

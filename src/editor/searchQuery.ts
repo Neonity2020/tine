@@ -36,6 +36,62 @@ export function canonicalFold(value: string): string {
   return value.toLowerCase().normalize("NFC");
 }
 
+// The exact cross-runtime whitespace contract. ECMAScript and Rust's Unicode
+// helpers disagree on U+FEFF and U+0085, so using either runtime's broad helper
+// would make one query split differently between the page and block engines.
+function isSearchWhitespace(char: string): boolean {
+  const code = char.codePointAt(0) ?? 0;
+  return (
+    (code >= 0x0009 && code <= 0x000d)
+    || code === 0x0020
+    || code === 0x00a0
+    || code === 0x1680
+    || (code >= 0x2000 && code <= 0x200a)
+    || code === 0x2028
+    || code === 0x2029
+    || code === 0x202f
+    || code === 0x205f
+    || code === 0x3000
+    || code === 0xfeff
+  );
+}
+
+function trimSearchWhitespace(value: string): string {
+  const chars = Array.from(value);
+  let start = 0;
+  let end = chars.length;
+  while (start < end && isSearchWhitespace(chars[start])) start += 1;
+  while (end > start && isSearchWhitespace(chars[end - 1])) end -= 1;
+  return chars.slice(start, end).join("");
+}
+
+/** Reject regex constructs for which Rust `regex` and JavaScript RegExp do not
+ * share semantics. Non-capturing groups remain available; look-around, inline
+ * flags, named/engine-specific groups, and backreferences do not. */
+function commonRegexPattern(pattern: string): boolean {
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i += 1) {
+    if (pattern[i] === "\\") {
+      const escaped = pattern[i + 1];
+      if (escaped && escaped >= "1" && escaped <= "9") return false;
+      i += 1;
+      continue;
+    }
+    if (pattern[i] === "[") {
+      inClass = true;
+      continue;
+    }
+    if (pattern[i] === "]" && inClass) {
+      inClass = false;
+      continue;
+    }
+    if (!inClass && pattern[i] === "(" && pattern[i + 1] === "?" && pattern[i + 2] !== ":") {
+      return false;
+    }
+  }
+  return true;
+}
+
 interface SourceSpan { start: number; end: number }
 
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -90,16 +146,19 @@ function canonicalSubstringSpans(text: string, needle: string, limit: number): S
 }
 
 export function parseSearchQuery(query: string): SearchMatcher {
-  const q = query.trim();
+  const q = trimSearchWhitespace(query);
   if (!q) return { kind: "empty" };
   // Whole-query regex: `/pattern/` with a non-empty pattern. (`//` is too short —
   // an empty pattern matches everything — so it falls through to a literal term.)
   if (q.length >= 3 && q.startsWith("/") && q.endsWith("/")) {
     const pat = q.slice(1, -1);
+    if (!commonRegexPattern(pat)) {
+      return { kind: "invalid", error: "regex feature is not supported by both search engines" };
+    }
     try {
       // Case-sensitive (no `i`), matching the Rust `regex` side: the pattern owns
       // its case classes, so `[A-Z]` works.
-      return { kind: "regex", re: new RegExp(pat) };
+      return { kind: "regex", re: new RegExp(pat, "u") };
     } catch (e) {
       return { kind: "invalid", error: e instanceof Error ? e.message : "invalid regex" };
     }
@@ -271,13 +330,13 @@ export function tokenize(q: string): Token[] {
   const out: Token[] = [];
   let i = 0;
   while (i < chars.length) {
-    if (/\s/.test(chars[i])) {
+    if (isSearchWhitespace(chars[i])) {
       i += 1;
       continue;
     }
     let negated = false;
     // Leading `-` negates, but only when something non-space follows it.
-    if (chars[i] === "-" && i + 1 < chars.length && !/\s/.test(chars[i + 1])) {
+    if (chars[i] === "-" && i + 1 < chars.length && !isSearchWhitespace(chars[i + 1])) {
       negated = true;
       i += 1;
     }
@@ -294,7 +353,7 @@ export function tokenize(q: string): Token[] {
     } else {
       // Bare token: read to the next whitespace.
       const start = i;
-      while (i < chars.length && !/\s/.test(chars[i])) i += 1;
+      while (i < chars.length && !isSearchWhitespace(chars[i])) i += 1;
       text = chars.slice(start, i).join("");
       quoted = false;
     }

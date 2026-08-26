@@ -1,6 +1,9 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { openPage } from "../router";
+import { openPage, openPageInNewTab } from "../router";
+import { openPageContextMenu, openPageInSidebar } from "../ui";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
+import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { ReferenceExcerptBlocks } from "./ReferenceEvidence";
 import type { RefGroup } from "../types";
 import {
@@ -16,6 +19,7 @@ import {
 } from "../referenceSectionState";
 import { pageIdentityKey } from "../pageIdentity";
 import { mergeReferenceGroups } from "../lib/referenceGroups";
+import { ReferenceExportChooser } from "./ReferenceExportChooser";
 
 
 type BoundedEvidence = NonNullable<RefGroup["evidence"]>[number] & {
@@ -37,6 +41,7 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
     setOpenSignal(value);
   };
   const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
+  const [exportChooserOpen, setExportChooserOpen] = createSignal(false);
   const [collapsedGroupsSignal, setCollapsedGroupsSignal] =
     createSignal<Set<string>>(collapsedGroupsFor("unlinked", props.name));
   const collapsedGroups = collapsedGroupsSignal;
@@ -101,7 +106,27 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
           <span class="references-count">{count()}</span>
         </Show>
         <Show when={groups.loading}><span class="references-loading"> Loading…</span></Show>
+        <button
+          type="button"
+          class="reference-export-toggle"
+          aria-label="Copy / export unlinked references"
+          title="Copy / export selected unlinked references"
+          disabled={!count()}
+          onClick={(event) => {
+            event.stopPropagation();
+            setExportChooserOpen(true);
+          }}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="currentColor" /></svg>
+        </button>
       </div>
+      <Show when={exportChooserOpen()}>
+        <ReferenceExportChooser
+          subject="Unlinked References"
+          groups={mergedGroups()}
+          onClose={() => setExportChooserOpen(false)}
+        />
+      </Show>
       <Show when={open()}>
         <Show when={loadError()}>
           <div class="reference-filter-error reference-error" role="alert">
@@ -132,7 +157,23 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
                 >
                   {groupCollapsed(g) ? "▸" : "▾"}
                 </button>
-                <button type="button" class="reference-page" onClick={() => openPage(g.page, g.kind)}>
+                <button
+                  type="button"
+                  class="reference-page"
+                  onMouseDown={internalLinkMouseDown}
+                  onClick={(e) => {
+                    const dest = internalLinkDest(e);
+                    if (dest === "sidebar") openPageInSidebar(g.page, g.kind);
+                    else if (dest === "background") openPageInNewTab(g.page, g.kind);
+                    else openPage(g.page, g.kind);
+                  }}
+                  onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(g.page, g.kind))}
+                  onContextMenu={(e) => {
+                    if (!shouldOpenTextContextMenu(e.target)) return;
+                    e.preventDefault();
+                    openPageContextMenu(e.clientX, e.clientY, g.page, g.kind);
+                  }}
+                >
                   {g.page}
                 </button>
               </div>

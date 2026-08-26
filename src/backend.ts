@@ -740,6 +740,10 @@ export interface Backend {
   diagnosticReport(buildCommit: string, buildTime: string): Promise<DiagnosticReport>;
   saveDiagnosticReport(buildCommit: string, buildTime: string): Promise<boolean>;
   clearDiagnostics(): Promise<void>;
+  createGraphVerification(operationId: string): Promise<GraphVerificationReport>;
+  cancelGraphVerification(operationId: string): Promise<void>;
+  saveGraphVerificationReport(text: string): Promise<boolean>;
+  onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void>;
   diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number): Promise<void>;
 }
 
@@ -753,6 +757,21 @@ export interface DebugInfo {
 export interface DiagnosticReport {
   text: string;
   suggestedFileName: string;
+}
+
+export interface GraphVerificationReport {
+  text: string;
+  suggestedFileName: string;
+  totalFiles: number;
+  totalBytes: number;
+  aggregateDigest?: string;
+  complete: boolean;
+}
+
+export interface GraphVerificationProgress {
+  operationId: string;
+  processed: number;
+  total: number;
 }
 
 /** Backend-visible rendering-environment facts (Linux-relevant; all false on
@@ -1692,6 +1711,19 @@ class TauriBackend implements Backend {
   }
   clearDiagnostics() {
     return this.call<void>("clear_diagnostics");
+  }
+  createGraphVerification(operationId: string) {
+    return this.call<GraphVerificationReport>("create_graph_verification", { operationId });
+  }
+  cancelGraphVerification(operationId: string) {
+    return this.call<void>("cancel_graph_verification", { operationId });
+  }
+  saveGraphVerificationReport(text: string) {
+    return this.call<boolean>("save_graph_verification_report", { text });
+  }
+  async onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<GraphVerificationProgress>("graph-verification-progress", (event) => cb(event.payload));
   }
   diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number) {
     return this.call<void>("diagnostic_frontend_event", { kind, line, column, delayMs });

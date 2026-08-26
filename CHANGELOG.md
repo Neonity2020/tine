@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+- Added a read-only synchronized-graph verifier that compares the actual Markdown and Org file bytes across devices, including nested and nonstandard layouts, without requiring shell or ADB access.
+
 ### Changed
 
 - **A fault one core test injects can no longer fail an unrelated test beside
@@ -19,13 +21,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   that needs it, so the corpus reports the same result twice in a row (GH #350).
 
 - **Queries and search are much faster on Managed Storage.** Every managed
-  query used to re-parse every block of every candidate page, every time -- so
-  a page full of `{{query}}` re-parsed the graph on each open, and search
-  re-parsed it on each keystroke. Unchanged pages are now parsed once and
-  reused; an edited page is re-read on the very next query. Searching for a
-  literal phrase also consults the stored text index first instead of reading
-  every page, and a result-limited search now does its work only for the
-  results it keeps.
+  query used to re-read, re-parse, and structurally cross-check every candidate
+  page, every time -- so a page full of `{{query}}` re-parsed the graph on each
+  open, and search re-parsed it on each keystroke. Unchanged pages now reuse
+  their complete parsed application view after their exact file bytes and
+  stored page state are checked; an external edit or accepted actor change is
+  re-read immediately. Searching for a literal phrase also consults the stored
+  text index first instead of reading every page, and a result-limited search
+  now does its work only for the results it keeps.
 
 ### Fixed
 
@@ -43,6 +46,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   property everywhere (a logbook entry could previously be inserted above it),
   leading whitespace and Unicode keys behave identically, and `key::value`
   without a space is (as the parser already said) not a property.
+- **Page-link gestures are the same everywhere.** Middle-click now opens a
+  background tab from every page reference and page title — unlinked-reference
+  page headers, namespace macro and hierarchy links, the zoom breadcrumb,
+  right-sidebar item titles, query search-result rows, and the page title's
+  Ctrl/Cmd+click all behaved differently (plain-click only, or autoscroll on
+  Windows). Shift+click still opens the sidebar and plain click still navigates
+  (GH #207).
+- **A split pane's only tab keeps its close button.** The tab strip hid the ✕
+  whenever a pane held a single tab, so after one split neither pane could be
+  closed without first dragging a tab across. The ✕ now shows whenever closing
+  actually works: any multi-tab strip, or a lone non-feed tab whose pane can
+  close (GH #207).
+- **Search and conflict handling now use one contract across runtimes.** Page
+  and block search agree on Unicode whitespace, bare Unicode tags, and the
+  common linear-time regex subset; query-workspace saves and Direct conflict
+  resolution classify bounded failure codes instead of matching error prose.
+  The browser mock now also announces the graph rebind caused by changing the
+  default home page.
 - **Managed Storage and Direct Files answer the same query the same way.** The
   two storage modes evaluated block queries through separate copies of the same
   logic, and the copies had drifted: a byte-budgeted block-referrers panel
@@ -82,6 +103,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Batch copy/export for references** (GH #348). Linked References and
+  Unlinked References each have an explicit export affordance: every entry is
+  pre-selected for copy-all, uncheck for a subset, and the familiar Copy /
+  export modal (Text, OPML, HTML, with the usual content/indent/depth/cleanup
+  options) produces the selected blocks grouped by their source page. The two
+  sections act independently, Linked honors its active filters, and normal page
+  export is unchanged — references are never included unless you ask.
 - **Favorites nest to any depth** (GH #102). A group can hold groups, and a
   favorite can hold favorites; drag a row to the right to nest it, to the left
   to lift it out. Depth is measured from where the drag started, so a plain

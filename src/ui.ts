@@ -23,6 +23,7 @@ import { setJournalTitleFormat, isJournalTitle } from "./journal";
 import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawerFocus, type DrawerSide } from "./mobileDrawers";
 import { currentPdfOwnership, type PdfOwnership } from "./pdfOwnership";
 import { issue248Collector, issue248Now } from "./issue248Probe";
+import type { ExportNode } from "./editor/exportText";
 
 const THEME_KEY = "logseq-claude.theme";
 export type ThemePreference = "light" | "dark" | "system";
@@ -545,11 +546,22 @@ export function settleArtifactConflict(id: string): void {
   ++artifactConflictRefreshGeneration;
   replaceArtifactConflictQueue(artifactConflictQueue.filter((conflict) => conflict.id !== id));
   resetConflictCursor();
-  if (settled.source === "sync-copy") {
-    const copy = settled.sides.find((side) => side.role === "theirs")?.path;
-    if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
-  } else if (settled.source === "vcs-markers") {
-    setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
+  switch (settled.source) {
+    case "sync-copy": {
+      const copy = settled.sides.find((side) => side.role === "theirs")?.path;
+      if (copy) setSyncConflicts(syncConflicts().filter((conflict) => conflict.path !== copy));
+      break;
+    }
+    case "vcs-markers":
+      setVcsMarkerConflicts(vcsMarkerConflicts().filter((conflict) => conflict.path !== settled.page_path));
+      break;
+    case "live-save":
+    case "duplicate-journal":
+      break;
+    default: {
+      const unhandled: never = settled.source;
+      throw new Error(`unsupported conflict source: ${String(unhandled)}`);
+    }
   }
   retireSettledArtifactArrivalToasts(artifactConflictQueue);
 }
@@ -833,9 +845,15 @@ export function closePageProps() {
 
 // "Copy / export as" modal — a live-preview text export of a block subtree or a
 // multi-block selection, with indent-style + remove options (mirrors OG Logseq).
-export const [exportModal, setExportModal] = createSignal<{ ids: string[] } | null>(null);
+// Two sources: store block ids (page/block gestures) or a prebuilt node forest
+// (GH #348 reference batch export, whose blocks are backend DTOs, not store ids).
+export type ExportRequest = { ids: string[] } | { nodes: ExportNode[]; count: number };
+export const [exportModal, setExportModal] = createSignal<ExportRequest | null>(null);
 export function openExportModal(ids: string[]) {
   if (ids.length) setExportModal({ ids });
+}
+export function openExportNodesModal(nodes: ExportNode[], count: number) {
+  if (nodes.length) setExportModal({ nodes, count });
 }
 export function closeExportModal() {
   setExportModal(null);

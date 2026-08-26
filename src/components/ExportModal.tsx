@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { exportModal, closeExportModal, pushToast, typographyMode, graphMeta } from "../ui";
+import { exportModal, closeExportModal, pushToast, typographyMode, graphMeta, type ExportRequest } from "../ui";
 import { exportNodesFor, formatForPage } from "../store";
 import { backend } from "../backend";
 import { writeClipboardText } from "../clipboard";
@@ -146,7 +146,7 @@ function pageRefTarget(s: string): string | null {
   return /^\[\[([^\]]+)\]\]$/.exec(s.trim())?.[1] ?? null;
 }
 
-function blockDtosToExportNodes(blocks: BlockDto[], format: Format): ExportNode[] {
+export function blockDtosToExportNodes(blocks: BlockDto[], format: Format): ExportNode[] {
   return blocks.map((b) => ({ raw: b.raw, format, children: blockDtosToExportNodes(b.children, format) }));
 }
 
@@ -366,12 +366,12 @@ export async function warmExportResolutions(nodes: ExportNode[], warmed: Map<str
 export function ExportModal(): JSX.Element {
   return (
     <Show when={exportModal()}>
-      {(m) => <Modal ids={m().ids} />}
+      {(m) => <Modal request={m()} />}
     </Show>
   );
 }
 
-function Modal(props: { ids: string[] }): JSX.Element {
+function Modal(props: { request: ExportRequest }): JSX.Element {
   let root: HTMLDivElement | undefined;
   createEffect(() => {
     const unregister = registerTransientLayer({ id: "copy-export", root: () => root ?? null, dismiss: () => { closeExportModal(); return true; } });
@@ -391,7 +391,7 @@ function Modal(props: { ids: string[] }): JSX.Element {
   // Build the node forest once (the selection is fixed while the modal is open);
   // the preview recomputes from it as options change. Rendered mode applies the
   // typographic glyphs exactly when the app displays them (not persisted).
-  const nodes = exportNodesFor(props.ids);
+  const nodes = "ids" in props.request ? exportNodesFor(props.request.ids) : props.request.nodes;
   // Name the preserved syntax after the selection's actual format: a Markdown
   // forest offers "Markdown", an Org forest "Org", a mix "Markdown/Org" — so
   // the preserve choice says what it preserves (GH #352).
@@ -470,7 +470,7 @@ function Modal(props: { ids: string[] }): JSX.Element {
     return undefined;
   };
 
-  const blockCount = props.ids.length;
+  const blockCount = "ids" in props.request ? props.request.ids.length : props.request.count;
   return (
     <div class="modal-overlay" onClick={closeExportModal}>
       <div ref={root} class="export-modal" onClick={(e) => e.stopPropagation()}>

@@ -4,7 +4,7 @@ import { routeTitle, type PaneRouter, type Route } from "../router";
 import { doc, formatForBlock } from "../store";
 import { splitProps, isBuiltinHidden, type PropFormat } from "../editor/properties";
 import { EmojiText } from "../render/emoji";
-import { moveTabToPane, moveTabToRootEdge, moveTabToSeamSplit, moveTabToSplitPane } from "../panes";
+import { moveTabToPane, moveTabToRootEdge, moveTabToSeamSplit, moveTabToSplitPane, layoutHasMultiplePanes } from "../panes";
 import { registerTransientLayer } from "../transientLayers";
 
 const MAX_TITLE = 32;
@@ -622,10 +622,13 @@ export function TabBar(props: { router: PaneRouter; dragRegion?: boolean; paneSt
               </span>
             </Show>
             <span class="tab-title"><EmojiText text={tabTitle(router.tabRoute(t))} /></span>
-            {/* The last tab can't be closed (closeTab keeps one), so hide its ✕.
+            {/* Offer ✕ only when closing actually works: another tab remains, OR
+                this lone tab can close its whole split pane (GH #207 — closeTab
+                hands a lone non-feed tab to closePane). The window's very last
+                tab and a feed pane's last tab stay unclosable, so they hide it.
                 A real button with its own title: keyboard-operable, and its hover
                 tooltip can't fall back to the tab's pin hint (GH #340). */}
-            <Show when={router.tabs().length > 1}>
+            <Show when={router.tabs().length > 1 || (router.tabRoute(t).kind !== "journals" && layoutHasMultiplePanes())}>
               <button
                 class="tab-close"
                 type="button"
@@ -709,7 +712,8 @@ export function TabBar(props: { router: PaneRouter; dragRegion?: boolean; paneSt
                   <span class="tab-overview-active" aria-hidden="true">{tab.id === router.activeId() ? "✓" : ""}</span>
                   <Show when={tab.pinned}><span class="tab-overview-pin" title="Pinned"><EmojiText text="📌" /></span></Show>
                   <span class="tab-overview-title"><EmojiText text={tabFullTitle(router.tabRoute(tab))} /></span>
-                  <Show when={router.tabs().length > 1}>
+                  {/* Same close predicate as the strip's ✕ (GH #207). */}
+                  <Show when={router.tabs().length > 1 || (router.tabRoute(tab).kind !== "journals" && layoutHasMultiplePanes())}>
                     <button
                       class="tab-overview-close"
                       type="button"

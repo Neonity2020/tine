@@ -3,7 +3,7 @@ import { backend } from "../backend";
 import { dataRev, graphEpoch } from "../ui";
 import { openPage, openPageInNewTab } from "../router";
 import { openPageInSidebar, openPageContextMenu } from "../ui";
-import { internalLinkDest } from "../linkGesture";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { blockExternalId } from "../store";
@@ -69,18 +69,14 @@ export function BlockReferences(props: { id: string }): JSX.Element {
                 </button>
                 <div
                   class="reference-page"
+                  onMouseDown={internalLinkMouseDown}
                   onClick={(e) => {
                     const dest = internalLinkDest(e);
                     if (dest === "sidebar") openPageInSidebar(g.page, g.kind);
                     else if (dest === "background") openPageInNewTab(g.page, g.kind);
                     else openPage(g.page, g.kind);
                   }}
-                  onAuxClick={(e) => {
-                    if (e.button === 1) {
-                      e.preventDefault();
-                      openPageInNewTab(g.page, g.kind);
-                    }
-                  }}
+                  onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(g.page, g.kind))}
                   onContextMenu={(e) => {
                     if (!shouldOpenTextContextMenu(e.target)) return;
                     e.preventDefault();

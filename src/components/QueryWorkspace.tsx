@@ -34,6 +34,7 @@ import { SearchResultRow, buildSearchExcerpt } from "./SearchResultRow";
 import { registerTransientLayer } from "../transientLayers";
 import { bumpPageInventoryRev } from "../ui";
 import { blockDtoExternalId } from "../blockIdentity";
+import { isSaveConflictFailure } from "../persistence";
 
 const PAGE_LIMIT = 40;
 const BLOCK_LIMIT = 100;
@@ -141,7 +142,7 @@ export async function materializeQueryWorkspace(
     return { ok: true, name, page, rev };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (/conflict|already exists/i.test(detail)) {
+    if (isSaveConflictFailure(error)) {
       return {
         ok: false,
         kind: "conflict",

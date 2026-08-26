@@ -3,7 +3,7 @@
 // backend's shape so the UI behaves identically.
 
 import { notifyGraphRebound } from "./modeHooks";
-import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
+import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, GraphVerificationReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
 import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
@@ -1228,7 +1228,7 @@ export function mockBackend(): Backend {
       return collect((b) => blockRefIds(b.raw).includes(uuid));
     },
     async setDefaultHome(): Promise<void> {
-      // no-op in mock
+      notifyGraphRebound();
     },
     async deletePage(): Promise<void> {
       // no-op in mock
@@ -2199,6 +2199,35 @@ export function mockBackend(): Backend {
     },
     async clearDiagnostics(): Promise<void> {
       // no-op in the browser mock
+    },
+    async createGraphVerification(): Promise<GraphVerificationReport> {
+      const text = JSON.stringify({
+        schemaVersion: 1,
+        tool: "tine-graph-bytes",
+        algorithm: "sha256",
+        complete: true,
+        generatedAtUnixMs: Date.now(),
+        files: [],
+        aggregateDigest: "0".repeat(64),
+        errors: [],
+      }, null, 2);
+      return {
+        text,
+        suggestedFileName: "tine-graph-verification-mock.json",
+        totalFiles: 0,
+        totalBytes: 0,
+        aggregateDigest: "0".repeat(64),
+        complete: true,
+      };
+    },
+    async cancelGraphVerification(): Promise<void> {
+      // no-op in the browser mock
+    },
+    async saveGraphVerificationReport(): Promise<boolean> {
+      return false;
+    },
+    async onGraphVerificationProgress(): Promise<() => void> {
+      return () => {};
     },
     async diagnosticFrontendEvent(): Promise<void> {
       // no-op in the browser mock

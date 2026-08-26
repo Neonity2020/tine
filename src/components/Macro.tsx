@@ -1,11 +1,11 @@
 import { For, Show, Switch, Match, createMemo, createResource, createSignal, useContext, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { focusedRouter } from "../panes";
-import { openPageTarget, openPageAtBlock, openPageTargetInNewTab } from "../router";
-import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
+import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
+import { openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
-import { internalLinkDest } from "../linkGesture";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { QueryBuilder } from "./QueryBuilder";
@@ -678,11 +678,23 @@ export function QueryMacro(props: {
                                   <button
                                     type="button"
                                     class="query-search-page"
-                                    onClick={() => openPageTarget({
+                                    onMouseDown={internalLinkMouseDown}
+                                    onClick={(e) => {
+                                      const target = {
+                                        name: hit.page.name,
+                                        pageKind: hit.page.kind,
+                                        ...(hit.page.path ? { path: hit.page.path } : {}),
+                                      };
+                                      const dest = internalLinkDest(e);
+                                      if (dest === "sidebar") openPageInSidebar(target);
+                                      else if (dest === "background") openPageTargetInNewTab(target);
+                                      else openPageTarget(target);
+                                    }}
+                                    onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab({
                                       name: hit.page.name,
                                       pageKind: hit.page.kind,
                                       ...(hit.page.path ? { path: hit.page.path } : {}),
-                                    })}
+                                    }))}
                                   >
                                     <span class="switcher-kind">{hit.page.kind}</span>
                                     <span>{hit.display_text}</span>
@@ -693,11 +705,27 @@ export function QueryMacro(props: {
                                   <button
                                     type="button"
                                     class="query-search-hit switcher-row block-result"
-                                    onClick={() => openPageAtBlock({
-                                      name: blockHit().page,
-                                      pageKind: blockHit().kind,
-                                      block: blockDtoExternalId(blockHit().block),
-                                      ...(blockHit().path ? { path: blockHit().path } : {}),
+                                    onMouseDown={internalLinkMouseDown}
+                                    onClick={(e) => {
+                                      const bh = blockHit();
+                                      const uuid = blockDtoExternalId(bh.block);
+                                      const dest = internalLinkDest(e);
+                                      if (dest === "sidebar") {
+                                        openBlockInSidebar({ uuid, page: bh.page, pageKind: bh.kind, ...(bh.path ? { path: bh.path } : {}) });
+                                      } else if (dest === "background") {
+                                        openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: uuid, ...(bh.path ? { path: bh.path } : {}) });
+                                      } else {
+                                        openPageAtBlock({
+                                          name: bh.page,
+                                          pageKind: bh.kind,
+                                          block: uuid,
+                                          ...(bh.path ? { path: bh.path } : {}),
+                                        });
+                                      }
+                                    }}
+                                    onAuxClick={(e) => internalLinkAuxClick(e, () => {
+                                      const bh = blockHit();
+                                      openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: blockDtoExternalId(bh.block), ...(bh.path ? { path: bh.path } : {}) });
                                     })}
                                   >
                                     <SearchResultRow
@@ -798,6 +826,7 @@ export function QueryMacro(props: {
                                   </td>
                                   <td
                                     class="qt-page"
+                                    onMouseDown={internalLinkMouseDown}
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       const target = { name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) };
@@ -807,11 +836,9 @@ export function QueryMacro(props: {
                                       else openPageTarget(target);
                                     }}
                                     onAuxClick={(e) => {
-                                      if (e.button === 1) {
-                                        e.preventDefault();
-                                        e.stopPropagation();
-                                        openPageTargetInNewTab({ name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) });
-                                      }
+                                      if (internalLinkAuxClick(e, () =>
+                                        openPageTargetInNewTab({ name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) })
+                                      )) e.stopPropagation();
                                     }}
                                     onContextMenu={(e) => {
                                       if (!shouldOpenTextContextMenu(e.target)) return;
@@ -875,6 +902,7 @@ function QueryGroup(props: { group: () => RefGroup | undefined; flat?: boolean }
         <div class="query-group" classList={{ "query-group-flat": props.flat }}>
           <div
             class={props.flat ? "query-crumb" : "query-page"}
+            onMouseDown={internalLinkMouseDown}
             onClick={(e) => {
               e.stopPropagation();
               const dest = internalLinkDest(e);
@@ -883,11 +911,7 @@ function QueryGroup(props: { group: () => RefGroup | undefined; flat?: boolean }
               else openPageTarget(target());
             }}
             onAuxClick={(e) => {
-              if (e.button === 1) {
-                e.preventDefault();
-                e.stopPropagation();
-                openPageTargetInNewTab(target());
-              }
+              if (internalLinkAuxClick(e, () => openPageTargetInNewTab(target()))) e.stopPropagation();
             }}
             onContextMenu={(e) => {
               if (!shouldOpenTextContextMenu(e.target)) return;

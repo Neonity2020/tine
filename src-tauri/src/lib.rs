@@ -17,6 +17,7 @@ mod commands;
 mod data_home;
 mod debug;
 mod graph;
+mod graph_verification;
 #[cfg(target_os = "ios")]
 mod ios_folder_picker;
 #[cfg(target_os = "linux")]
@@ -77,6 +78,9 @@ use graph::{
     app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph,
     default_graph_parent, inspect_graph_access, load_graph, open_graph_window, startup_graph_path,
     warm_done,
+};
+use graph_verification::{
+    cancel_graph_verification, create_graph_verification, save_graph_verification_report,
 };
 use platform::{clipboard_files, copy_image_to_clipboard, gpu_env, open_external};
 use plugins::{
@@ -755,6 +759,9 @@ pub fn run() {
             journal_feed_page,
             get_page,
             graph_source_files,
+            create_graph_verification,
+            cancel_graph_verification,
+            save_graph_verification_report,
             save_page,
             move_managed_application_subtrees,
             recover_managed_application_subtrees,

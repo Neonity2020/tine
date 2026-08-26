@@ -2,7 +2,7 @@ import { For, Show, createMemo, createResource, createSignal, type JSX } from "s
 import { backend } from "../backend";
 import { openPage, openPageInNewTab } from "../router";
 import { openPageInSidebar } from "../ui";
-import { internalLinkDest } from "../linkGesture";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { allPageNames } from "../pages";
 import { EmojiText } from "../render/emoji";
 import type { PageKind } from "../types";
@@ -25,18 +25,14 @@ export function NamespaceCrumb(props: { name: string }): JSX.Element {
               <>
                 <span
                   class="ns-crumb-item"
-                  onMouseDown={(e) => { if (e.shiftKey || e.button === 1) e.preventDefault(); }}
+                  onMouseDown={internalLinkMouseDown}
                   onClick={(e) => {
                     const dest = internalLinkDest(e);
                     if (dest === "sidebar") openPageInSidebar(prefix(), "page");
                     else if (dest === "background") openPageInNewTab(prefix(), "page");
                     else openPage(prefix(), "page");
                   }}
-                  onAuxClick={(e) => {
-                    if (e.button !== 1) return;
-                    e.preventDefault();
-                    openPageInNewTab(prefix(), "page");
-                  }}
+                  onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(prefix(), "page"))}
                 >
                   {parts()[i()]}
                 </span>
@@ -103,20 +99,16 @@ function NsNodeView(props: {
         <span
           class="ns-node-label"
           // Shift+click opens in the right sidebar (GH #63), Ctrl/Cmd+click a
-          // background tab (GH #283); onMouseDown guard suppresses native
-          // shift-range text-selection / middle-click autoscroll.
-          onMouseDown={(e) => { if (e.shiftKey || e.button === 1) e.preventDefault(); }}
+          // background tab (GH #283); the shared guard suppresses native
+          // shift-range text-selection / middle-click autoscroll (GH #207).
+          onMouseDown={internalLinkMouseDown}
           onClick={(e) => {
             const dest = internalLinkDest(e);
             if (dest === "sidebar") openPageInSidebar(props.node.full, "page");
             else if (dest === "background") openPageInNewTab(props.node.full, "page");
             else (openPage(props.node.full, "page"), props.onActiveNavigationComplete?.());
           }}
-          onAuxClick={(e) => {
-            if (e.button !== 1) return;
-            e.preventDefault();
-            openPageInNewTab(props.node.full, "page");
-          }}
+          onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(props.node.full, "page"))}
           onContextMenu={(e) => {
             if (!shouldOpenTextContextMenu(e.target)) return;
             props.onPageContextMenu?.(e, props.node.full, "page");
@@ -179,7 +171,20 @@ function NsMacroNode(props: { node: NsNode; depth: number; icons: Record<string,
             <EmojiText text={props.icons[props.node.full]} />
           </span>
         </Show>
-        <a class="page-ref" onClick={(e) => { e.stopPropagation(); openPage(props.node.full, "page"); }}>
+        <a
+          class="page-ref"
+          onMouseDown={internalLinkMouseDown}
+          onClick={(e) => {
+            e.stopPropagation();
+            const dest = internalLinkDest(e);
+            if (dest === "sidebar") openPageInSidebar(props.node.full, "page");
+            else if (dest === "background") openPageInNewTab(props.node.full, "page");
+            else openPage(props.node.full, "page");
+          }}
+          onAuxClick={(e) => {
+            if (internalLinkAuxClick(e, () => openPageInNewTab(props.node.full, "page"))) e.stopPropagation();
+          }}
+        >
           <EmojiText text={props.node.seg} />
         </a>
       </div>
@@ -228,7 +233,20 @@ export function NamespaceMacro(props: { root: string }): JSX.Element {
                   <EmojiText text={iconOf(root.full)!} />
                 </span>
               </Show>
-              <a class="page-ref" onClick={(e) => { e.stopPropagation(); openPage(root.full, "page"); }}>
+              <a
+                class="page-ref"
+                onMouseDown={internalLinkMouseDown}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const dest = internalLinkDest(e);
+                  if (dest === "sidebar") openPageInSidebar(root.full, "page");
+                  else if (dest === "background") openPageInNewTab(root.full, "page");
+                  else openPage(root.full, "page");
+                }}
+                onAuxClick={(e) => {
+                  if (internalLinkAuxClick(e, () => openPageInNewTab(root.full, "page"))) e.stopPropagation();
+                }}
+              >
                 <EmojiText text={root.seg} />
               </a>
             </div>
@@ -304,7 +322,17 @@ export function NamespaceHierarchy(props: { name: string }): JSX.Element {
                           </Show>
                           <a
                             class="page-ref"
-                            onClick={(e) => { e.stopPropagation(); openPage(full(), "page"); }}
+                            onMouseDown={internalLinkMouseDown}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const dest = internalLinkDest(e);
+                              if (dest === "sidebar") openPageInSidebar(full(), "page");
+                              else if (dest === "background") openPageInNewTab(full(), "page");
+                              else openPage(full(), "page");
+                            }}
+                            onAuxClick={(e) => {
+                              if (internalLinkAuxClick(e, () => openPageInNewTab(full(), "page"))) e.stopPropagation();
+                            }}
                           >
                             <span class="bracket">[[</span>
                             {seg}
