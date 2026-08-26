@@ -8318,6 +8318,31 @@
     "failBefore": "proven"
    },
    "notes": "On macOS eventToChord derived mod from metaKey only and read e.ctrlKey nowhere, so recording Ctrl+<key> stored the bare key (or nothing for a bare press) while Cmd/Option/Shift worked: physical Control had no representation in the Chord model (\"ctrl\" parsed as an alias of mod). The chord now carries a distinct ctrl member populated from e.ctrlKey on macOS (unchanged off-Mac, where Control IS mod), serializes as the ctrl+ token, parses \"ctrl\" as physical Control on macOS (still a mod alias off-Mac, where it always meant that key), and participates in chord equality; parsing, defaults, and Linux/Windows behavior are untouched. Verified with platform-correct KeyboardEvent fixtures under a macOS navigator.platform; no physical macOS runner exists in this environment, so on-device confirmation remains with the manager."
+  },
+  {
+   "id": "UI-SHORTCUT-SEARCH-380",
+   "title": "The Settings search field filters shortcut commands while the Keyboard Shortcuts section is open",
+   "family": "settings-shortcuts",
+   "sources": {
+    "issues": [
+     380
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/HelpShortcuts.test.tsx::filters command labels, ids, and bindings for Settings search (GH #380)",
+     "src/components/Settings.p1a1.recording.test.tsx::routes the existing Settings search to shortcut commands on that tab (GH #380)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "The single Settings search affordance kept rendering the global settings index on the shortcuts tab, while the shortcut rows ignored its query. The contextual search now matches command labels, ids, and effective bindings (plus built-in labels, ids, bindings, and details), retains their normal scope groups, and renders a shortcut-specific empty state without adding a second search box."
   }
  ]
 }

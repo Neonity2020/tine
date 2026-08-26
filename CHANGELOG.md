@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Keyboard Shortcuts can now be searched in place** (GH #380). The existing
+  Settings search field filters command names, IDs, and bindings while that
+  section is open, including built-in shortcuts and a clear no-results state.
+
 ### Fixed
 
 - **The keyboard-shortcut recorder now captures Control on macOS** (GH #378).

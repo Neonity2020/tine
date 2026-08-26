@@ -151,11 +151,21 @@ const SHORTCUT_GROUPS: { scope: ShortcutScope; title: string; description: strin
   },
 ];
 
-export function buildShortcutPaneData(shortcuts: ShortcutSettingRow[]): ShortcutPaneSection[] {
+export function buildShortcutPaneData(shortcuts: ShortcutSettingRow[], search = ""): ShortcutPaneSection[] {
+  const query = search.trim().toLocaleLowerCase();
+  const queryTerms = query.split(/\s+/).filter(Boolean);
+  const includesQuery = (...values: (string | undefined)[]) => {
+    const haystack = values.filter(Boolean).join(" ").toLocaleLowerCase();
+    return queryTerms.every((term) => haystack.includes(term));
+  };
   return SHORTCUT_GROUPS.map((group) => ({
     ...group,
-    commands: shortcuts.filter((s) => s.scope === group.scope),
-    builtins: BUILTIN_KEYS.filter((s) => s.scope === group.scope),
+    commands: shortcuts.filter((s) =>
+      s.scope === group.scope && includesQuery(s.label, s.id, s.effective, s.binding)
+    ),
+    builtins: BUILTIN_KEYS.filter((s) =>
+      s.scope === group.scope && includesQuery(s.label, s.id, s.binding, s.details)
+    ),
   }));
 }
 
@@ -365,24 +375,36 @@ function BuiltinRow(props: { row: BuiltinKeyDef }): JSX.Element {
 
 export function ShortcutsSettingsPane(props: {
   shortcuts: ShortcutSettingRow[];
+  search: string;
   recording: string | null;
   onRecord: (id: string) => void;
   onReset: (id: string) => void;
 }): JSX.Element {
-  const sections = createMemo(() => buildShortcutPaneData(props.shortcuts));
+  const query = () => props.search.trim();
+  const sections = createMemo(() => buildShortcutPaneData(props.shortcuts, query()));
+  const hasMatches = createMemo(() => sections().some(
+    (section) => section.commands.length > 0 || section.builtins.length > 0,
+  ));
 
   return (
     <div class="help-shortcuts-pane">
-      <div class="settings-hint settings-block">
-        Click a binding to record new keys (<code>mod</code> = Ctrl, or Cmd on macOS). Esc cancels.
-        Overrides are saved locally on top of <code>config.edn</code>.
-      </div>
+      <Show when={!query()}>
+        <div class="settings-hint settings-block">
+          Click a binding to record new keys (<code>mod</code> = Ctrl, or Cmd on macOS). Esc cancels.
+          Overrides are saved locally on top of <code>config.edn</code>.
+        </div>
 
-      <TriggerTable shortcuts={props.shortcuts} />
-      <SyntaxTable />
+        <TriggerTable shortcuts={props.shortcuts} />
+        <SyntaxTable />
+      </Show>
+
+      <Show when={!query() || hasMatches()} fallback={
+        <div class="settings-search-empty help-shortcut-search-empty">No matching shortcuts</div>
+      }>
 
       <For each={sections()}>
         {(section) => (
+          <Show when={section.commands.length || section.builtins.length}>
           <section class="help-settings-section help-shortcut-group">
             <div class="help-section-head help-shortcut-group-head">
               <div>
@@ -416,8 +438,10 @@ export function ShortcutsSettingsPane(props: {
               </div>
             </Show>
           </section>
+          </Show>
         )}
       </For>
+      </Show>
     </div>
   );
 }
