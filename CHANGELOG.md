@@ -10,6 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **The keyboard-shortcut recorder now captures Control on macOS** (GH #378).
+  Physical Control is recorded as `ctrl`, while portable `mod` remains Command
+  on macOS and Control on Windows/Linux.
+
 - **Pages no longer become narrow or jump sideways when you start editing or
   expand references** (GH #382). The pane-relative end-of-page space added in
   v0.6.96 accidentally let the centered page column shrink to the width of its

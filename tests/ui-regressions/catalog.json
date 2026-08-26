@@ -8293,7 +8293,31 @@
     "scenario": null,
     "failBefore": "proven"
    },
-   "notes": "Each reference section header carries a quiet export affordance opening a chooser: every entry pre-selected (copy-all is two clicks), uncheck for a subset, All/None bulk toggles, Cancel/overlay/Escape close without side effects. The chooser hands the SAME Copy / export modal (Text/OPML/HTML plus the usual content/indent/depth/cleanup options) a node forest grouped by source page — the shape query export already uses and the structure the section shows. Linked honors the section's active filters (the visible set); the two sections act independently. Everything is read-only: entries export from the backend DTOs the section already holds, never hydrating pages into the store or running a save path. Normal page export is untouched, and a dedicated test asserts references never silently join it. Fail-before: no affordance existed anywhere in either section (all chooser tests red)."
+   "notes": "Each reference section header carries a quiet export affordance opening a chooser: every entry pre-selected (copy-all is two clicks), uncheck for a subset, All/None bulk toggles, Cancel/overlay/Escape close without side effects. The chooser hands the SAME Copy / export modal (Text/OPML/HTML plus the usual content/indent/depth/cleanup options) a node forest grouped by source page \u2014 the shape query export already uses and the structure the section shows. Linked honors the section's active filters (the visible set); the two sections act independently. Everything is read-only: entries export from the backend DTOs the section already holds, never hydrating pages into the store or running a save path. Normal page export is untouched, and a dedicated test asserts references never silently join it. Fail-before: no affordance existed anywhere in either section (all chooser tests red)."
+  },
+  {
+   "id": "UI-SHORTCUT-RECORD-CTRL-378",
+   "title": "On macOS the keyboard-shortcut recorder captures the physical Control key as a distinct ctrl+ binding instead of dropping it, while Cmd keeps mapping to mod and every existing binding keeps its meaning",
+   "family": "settings-shortcuts",
+   "sources": {
+    "issues": [
+     378
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "macos"
+   ],
+   "layer": "unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/keybindings.test.ts::records physical Control distinctly from Command on macOS (GH #378)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "On macOS eventToChord derived mod from metaKey only and read e.ctrlKey nowhere, so recording Ctrl+<key> stored the bare key (or nothing for a bare press) while Cmd/Option/Shift worked: physical Control had no representation in the Chord model (\"ctrl\" parsed as an alias of mod). The chord now carries a distinct ctrl member populated from e.ctrlKey on macOS (unchanged off-Mac, where Control IS mod), serializes as the ctrl+ token, parses \"ctrl\" as physical Control on macOS (still a mod alias off-Mac, where it always meant that key), and participates in chord equality; parsing, defaults, and Linux/Windows behavior are untouched. Verified with platform-correct KeyboardEvent fixtures under a macOS navigator.platform; no physical macOS runner exists in this environment, so on-device confirmation remains with the manager."
   }
  ]
 }
