@@ -419,7 +419,16 @@ async function openSyncSettings() {
   if ((await experimental.getAttribute("aria-expanded")) !== "true") {
     await experimental.click();
   }
-  await assertVisible("Testing only.", "experimental managed-storage disclosure");
+  // Assert the disclosure EXISTS and the section is open, not its wording:
+  // the copy is deliberately edited (it last changed in 027b5ae1, which left
+  // this oracle pinned to a string no build has emitted since) and this
+  // journey's contract lists settings copy under acceptable variations.
+  const disclosure = await browser.$(".settings-experimental-warning");
+  await disclosure.waitForExist({ timeout: 10_000 });
+  await browser.waitUntil(async () => (await disclosure.getText()).trim().length > 0, {
+    timeout: 10_000,
+    timeoutMsg: "experimental managed-storage disclosure was empty",
+  });
 }
 
 async function closeSettings() {
