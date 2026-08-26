@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "version": "0.6.97",
   "baseTag": "v0.6.96",
   "items": [
@@ -8,6 +8,14 @@
       "text": "Added a read-only synchronized-graph verifier that compares the actual Markdown and Org file bytes across devices, including nested and nonstandard layouts, without requiring shell or ADB access.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/files-external-edits-backups.md",
+          "crates/tine-core/src/templates/troubleshooting-recovery.md"
+        ]
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -31,6 +39,11 @@
       "regressions": [
         "REG-CORE-FLAGGED-RENAME-INJECTION-DETERMINISM"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "internal-only; no user workflow or control changed",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -54,6 +67,11 @@
       "regressions": [
         "REG-DUP6-MANAGED-QUERY-PROJECTION-REUSE"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "performance-only; the user workflow and controls are unchanged",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -77,6 +95,14 @@
       "text": "**Task markers mean the same thing everywhere.** The editor, carry-forward, the sheet state/priority writers, and the rendered checkbox now share one leading-marker recognizer that is byte-faithful to the parser: a task written as `TODO<tab>x` no longer counts as open for carry-forward while rendering without a checkbox, cycling or setting state on an indented task replaces its marker instead of prepending a second one, and a bare `TODO` followed by continuation lines is no longer treated as a task the renderer cannot see.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/journals-tasks-scheduling.md",
+          "crates/tine-core/src/templates/capture-plan-day.md"
+        ]
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -98,6 +124,11 @@
       "text": "**`key:: value` property lines are recognized the same way by every tool.** Logbook insertion, managed template/content checks, rename, conflict handling and the read index now share the parser's exact property-line rule, so a dotted key like `logseq.order-list-type:: number` is treated as a block property everywhere (a logbook entry could previously be inserted above it), leading whitespace and Unicode keys behave identically, and `key::value` without a space is (as the parser already said) not a property.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -121,6 +152,15 @@
       "regressions": [
         "UI-INTERNAL-LINK-GESTURE-207"
       ],
+      "guide": {
+        "status": "current",
+        "reason": "The existing Guide already documents this restored interaction contract.",
+        "refs": [
+          "crates/tine-core/src/templates/pages-links-references-search.md",
+          "crates/tine-core/src/templates/find-and-revisit.md",
+          "crates/tine-core/src/templates/keep-context-visible.md"
+        ]
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -144,6 +184,13 @@
       "regressions": [
         "UI-SPLIT-PANE-LAST-TAB-CLOSE-207"
       ],
+      "guide": {
+        "status": "current",
+        "reason": "The existing Guide already documents this restored interaction contract.",
+        "refs": [
+          "crates/tine-core/src/templates/keep-context-visible.md"
+        ]
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -165,6 +212,11 @@
       "text": "**Search and conflict handling now use one contract across runtimes.** Page and block search agree on Unicode whitespace, bare Unicode tags, and the common linear-time regex subset; query-workspace saves and Direct conflict resolution classify bounded failure codes instead of matching error prose. The browser mock now also announces the graph rebind caused by changing the default home page.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -188,6 +240,11 @@
       "regressions": [
         "REG-DUP6-QUERY-EVALUATOR-MODE-PARITY"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -211,6 +268,11 @@
       "regressions": [
         "REG-DUP4-RECENCY-CONFIGURED-FORMAT"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -234,6 +296,11 @@
       "regressions": [
         "REG-DUP6-BACKLINK-TRUNCATION-FLAG"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -257,6 +324,11 @@
       "regressions": [
         "REG-DUP1-MANAGED-RENAME-FOLD"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -280,6 +352,11 @@
       "regressions": [
         "REG-DUP3-CONFIG-NESTED-SHADOW"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -303,6 +380,11 @@
       "regressions": [
         "REG-DUP5-ATOMIC-WRITE-POLICY"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -329,6 +411,14 @@
         "UI-FAVORITES-GROUPS-102",
         "UI-REFSOURCE-EXCLUSION-SHARED-001"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/where-things-are.md",
+          "crates/tine-core/src/templates/find-and-revisit.md"
+        ]
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -355,6 +445,14 @@
       "regressions": [
         "UI-REFERENCE-BATCH-EXPORT-348"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/find-and-revisit.md",
+          "crates/tine-core/src/templates/pages-links-references-search.md"
+        ]
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -378,6 +476,15 @@
       "regressions": [
         "UI-FAVORITES-GROUPS-102"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/where-things-are.md",
+          "crates/tine-core/src/templates/find-and-revisit.md",
+          "crates/tine-core/src/templates/tips.md"
+        ]
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -404,6 +511,14 @@
         "UI-FAVORITES-GROUPS-102",
         "REG-CONFIG-LIVE-RELOAD"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/where-things-are.md",
+          "crates/tine-core/src/templates/find-and-revisit.md"
+        ]
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -429,6 +544,13 @@
       "regressions": [
         "REG-CONFIG-LIVE-RELOAD"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/files-external-edits-backups.md"
+        ]
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -455,6 +577,13 @@
         "UI-DIAGNOSTIC-REPORT-343",
         "REG-DIAGNOSTIC-FLIGHT-RECORDER-343"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/troubleshooting-recovery.md"
+        ]
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -480,6 +609,13 @@
       "regressions": [
         "REG-RELEASE-WINDOWS-X86-275"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/platforms-and-mobile.md"
+        ]
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -503,6 +639,15 @@
       "regressions": [
         "UI-FAVORITES-GROUPS-102"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/where-things-are.md",
+          "crates/tine-core/src/templates/find-and-revisit.md",
+          "crates/tine-core/src/templates/tips.md"
+        ]
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -529,6 +674,13 @@
         "UI-REFFILTER-CHIPS-FOLLOW-TEXT-173",
         "UI-LINKED-REFERENCES-FILTER-001"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/pages-links-references-search.md"
+        ]
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -552,6 +704,15 @@
       "text": "**A journal day with more than one file is now resolved on the day itself.** These days — usually a leftover of changing the journal date format, which never overwrites the old file — used to reach you only as a sticky notice at startup pointing at Settings. They now join the conflict badge, the dock and the walk like every other conflict, and the day page offers the same side-by-side review: keep a line from either file, or keep both. Keeping both is what \"Merge\" did in Settings, so nothing was lost by moving it here; the other file goes to the recoverable trash once you apply. Opening, renaming and trashing an individual file are still offered, on the day and in Settings. Two files in different formats (a `.md` and an `.org` for one day) can't be folded together and say so instead of offering a choice that could not be applied. The startup notice is gone.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/files-external-edits-backups.md",
+          "crates/tine-core/src/templates/troubleshooting-recovery.md",
+          "crates/tine-core/src/templates/journals-tasks-scheduling.md"
+        ]
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -575,6 +736,13 @@
       "regressions": [
         "UI-EXPORT-CONTENT-PRESERVE-CHOICE-352"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/files-external-edits-backups.md"
+        ]
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -596,6 +764,11 @@
       "text": "**Future iOS/TestFlight builds now use Tine's application icon.** The generated Xcode project previously retained Tauri's template icon even though Tine's complete iOS icon set was tracked in the repository. Project preparation now installs that set before Xcode compiles the asset catalog, and the signed-IPA contract compares the packaged primary icon's pixels with Tine's source. The already-submitted `0.6.95.8` beta is unchanged.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -617,6 +790,11 @@
       "text": "**Dragging a favourite in the sidebar no longer selects its title.** The reorder drag is a pointer gesture, not a text gesture, but nothing suppressed selection, so the label smeared under the cursor. Applies to both reorderable sidebar lists.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -641,6 +819,13 @@
         "UI-REFFILTER-CHIPS-FOLLOW-TEXT-173",
         "UI-LINKED-REFERENCES-FILTER-001"
       ],
+      "guide": {
+        "status": "update",
+        "reason": "The v0.6.97 Guide sweep added or corrected the affected user workflow.",
+        "refs": [
+          "crates/tine-core/src/templates/pages-links-references-search.md"
+        ]
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -666,6 +851,11 @@
       "regressions": [
         "UI-ANDROID-PAGE-DELETE-HANDOFF-376"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -689,6 +879,11 @@
       "regressions": [
         "REG-DIRECT-WINDOWS-EXACT-WATCHER-CREATION-366"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -714,6 +909,11 @@
       "regressions": [
         "UI-BLOCK-EXTERNAL-RUNTIME-IDENTITY-SEPARATION-373"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -737,6 +937,11 @@
       "regressions": [
         "UI-UPDATER-FAILURE-SURFACE-241"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -760,6 +965,11 @@
       "regressions": [
         "UI-MOBILE-SELECTION-TOOLBAR-DOCK-375"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -783,6 +993,11 @@
       "regressions": [
         "UI-PANE-SCROLL-SLACK-369"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -806,6 +1021,11 @@
       "regressions": [
         "REG-CORE-TEST-COMPLETION-350"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This internal change adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -831,6 +1051,11 @@
       "regressions": [
         "REG-MANAGED-CLEAN-UUID-PROJECTION-001"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -856,6 +1081,11 @@
       "regressions": [
         "UI-THEMED-STARTUP-PAGE-READINESS-299"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -879,6 +1109,11 @@
       "regressions": [
         "UI-DIRECT-FILES-BLOCK-ZOOM-OWNER-354"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -900,6 +1135,11 @@
       "text": "**Page action control labels no longer join dragged text selections.** The journal carry-over buttons (\"Carry unfinished tasks → today\" and friends), the tag-table toggle, the guide copy button, and the ⋯ page-actions trigger are page chrome, not content: selecting across the page no longer copies their label text, while the buttons stay fully clickable and keyboard- focusable.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "not-applicable",
         "reason": "The changelog and focused regression evidence fully describe this patch behavior; no separate contract update is needed.",
@@ -923,6 +1163,11 @@
       "regressions": [
         "REG-SYNC-DIRECT-JOIN-RETAINED-AUTHORITY-001"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -949,6 +1194,11 @@
         "REG-DIRECT-RENAME-RETAINED-SHADOW-LIMIT-364",
         "REG-DELETE-PAGE-OFF-COMMAND-THREAD-AUDIT20260809"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -974,6 +1224,11 @@
       "regressions": [
         "REG-MANAGED-LOCAL-EDIT-PROVIDER-DELETE-ORDER"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -997,6 +1252,11 @@
       "text": "**A crash inside a Direct Files save can no longer leave a page invisible under hidden recovery names.** On the next checked open, one unambiguous stranded copy is restored without clobbering a live file. Ambiguous or superseded copies are retained or moved intact to recoverable conflict trash; lookalikes and files whose physical identity cannot be proved are untouched.",
       "userVisible": true,
       "regressions": [],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -1022,6 +1282,11 @@
       "regressions": [
         "REG-DIRECT-SAVE-WHOLE-GRAPH-REPARSE-267"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",
@@ -1047,6 +1312,11 @@
       "regressions": [
         "REG-DIRECT-SAVE-KEEPS-PAGE-INVENTORY-AUDIT20260809"
       ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This fix restores the already documented behavior and adds no user workflow or control.",
+        "refs": []
+      },
       "docs": {
         "status": "current",
         "reason": "The existing contract documents the affected behavior and its safety or compatibility boundary.",

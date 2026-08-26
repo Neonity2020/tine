@@ -51,6 +51,38 @@ export function validateDisposition(owner, value, problems) {
   if (value.status === "update" && value.refs?.length === 0) problems.push(`${owner}: update must reference changed files`);
 }
 
+const guideNotApplicableReasons = ["performance-only", "packaging-only", "internal-only"];
+
+export function validateGuideDisposition(root, owner, item, problems) {
+  const value = item.guide;
+  validateDisposition(`${owner} Guide`, value, problems);
+  if (!value || !dispositionStatuses.has(value.status)) return;
+
+  if (value.status === "update" || value.status === "current") {
+    const refs = Array.isArray(value.refs) ? value.refs : [];
+    if (refs.length === 0) problems.push(`${owner} Guide: ${value.status} must reference canonical Guide templates`);
+    for (const ref of refs) {
+      if (!/^crates\/tine-core\/src\/templates\/[^/]+\.md$/.test(ref)) {
+        problems.push(`${owner} Guide: ${ref} is not a canonical Guide template`);
+      } else if (!fs.existsSync(path.join(root, ref))) {
+        problems.push(`${owner} Guide: missing template ${ref}`);
+      }
+    }
+  }
+
+  if (!item.userVisible || value.status !== "not-applicable") return;
+  if (item.section === "Added") {
+    problems.push(`${owner} Guide: a user-visible Added item must be update, current, or consult`);
+    return;
+  }
+  const reason = typeof value.reason === "string" ? value.reason : "";
+  if (item.section === "Changed" && !guideNotApplicableReasons.some((exception) => reason.includes(exception))) {
+    problems.push(
+      `${owner} Guide: a user-visible Changed opt-out must name performance-only, packaging-only, or internal-only`,
+    );
+  }
+}
+
 export function auditableSourceFingerprint(root) {
   const pluginRoots = ["plugin-sdk", "community-plugins"];
   const roots = ["src", "src-tauri/src", "crates", "fixtures", ...pluginRoots];

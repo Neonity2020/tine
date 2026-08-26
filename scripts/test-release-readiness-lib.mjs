@@ -4,7 +4,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { auditableSourceFingerprint, changelogItems, releaseSection } from "./release-readiness-lib.mjs";
+import {
+  auditableSourceFingerprint,
+  changelogItems,
+  releaseSection,
+  validateGuideDisposition,
+} from "./release-readiness-lib.mjs";
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "tine-release-readiness-test-"));
 
@@ -30,6 +35,82 @@ assert.deepEqual(
   ["Experimental ZIP package.", "The item after ZIP must remain in the release."],
   "an uppercase Z inside release prose must not truncate the section",
 );
+
+const guideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "tine-guide-disposition-test-"));
+try {
+  const template = "crates/tine-core/src/templates/guide.md";
+  fs.mkdirSync(path.dirname(path.join(guideRoot, template)), { recursive: true });
+  fs.writeFileSync(path.join(guideRoot, template), "- # Guide\n");
+
+  const coveredProblems = [];
+  validateGuideDisposition(
+    guideRoot,
+    "covered item",
+    {
+      section: "Added",
+      userVisible: true,
+      guide: { status: "update", reason: "Guide updated", refs: [template] },
+    },
+    coveredProblems,
+  );
+  assert.deepEqual(coveredProblems, []);
+
+  const contractProblems = [];
+  validateGuideDisposition(
+    guideRoot,
+    "contract item",
+    {
+      section: "Added",
+      userVisible: true,
+      guide: { status: "current", reason: "Contract covers it", refs: ["docs/contracts/example.md"] },
+    },
+    contractProblems,
+  );
+  assert.ok(contractProblems.some((problem) => problem.includes("not a canonical Guide template")));
+
+  const missingAddedProblems = [];
+  validateGuideDisposition(
+    guideRoot,
+    "missing Added item",
+    {
+      section: "Added",
+      userVisible: true,
+      guide: { status: "not-applicable", reason: "Changelog is enough", refs: [] },
+    },
+    missingAddedProblems,
+  );
+  assert.ok(missingAddedProblems.some((problem) => problem.includes("user-visible Added")));
+
+  const performanceProblems = [];
+  validateGuideDisposition(
+    guideRoot,
+    "performance change",
+    {
+      section: "Changed",
+      userVisible: true,
+      guide: { status: "not-applicable", reason: "performance-only; no workflow changed", refs: [] },
+    },
+    performanceProblems,
+  );
+  assert.deepEqual(performanceProblems, []);
+
+  const malformedProblems = [];
+  validateGuideDisposition(
+    guideRoot,
+    "malformed Guide item",
+    {
+      section: "Changed",
+      userVisible: true,
+      guide: { status: "current", reason: null, refs: null },
+    },
+    malformedProblems,
+  );
+  assert.ok(malformedProblems.some((problem) => problem.includes("missing reason")));
+  assert.ok(malformedProblems.some((problem) => problem.includes("refs must be an array")));
+  assert.ok(malformedProblems.some((problem) => problem.includes("must reference canonical Guide templates")));
+} finally {
+  fs.rmSync(guideRoot, { recursive: true, force: true });
+}
 
 function write(relative, contents) {
   const absolute = path.join(temporary, relative);

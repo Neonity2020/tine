@@ -9,6 +9,7 @@ import {
   normalizeItemText,
   releaseSection,
   validateDisposition,
+  validateGuideDisposition,
 } from "./release-readiness-lib.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -43,7 +44,7 @@ for (const file of fs.existsSync(changelogsDir) ? fs.readdirSync(changelogsDir) 
 
 if (section && fs.existsSync(impactPath)) {
   const impact = JSON.parse(fs.readFileSync(impactPath, "utf8"));
-  if (impact.schemaVersion !== 1) problems.push("impact schemaVersion must be 1");
+  if (impact.schemaVersion !== 2) problems.push("impact schemaVersion must be 2");
   if (impact.version !== version) problems.push(`impact version ${impact.version} does not match ${version}`);
   if (!/^v\d+\.\d+\.\d+$/.test(impact.baseTag ?? "")) problems.push("impact baseTag is invalid");
   if (!Array.isArray(impact.items)) problems.push("impact items must be an array");
@@ -57,10 +58,11 @@ if (section && fs.existsSync(impactPath)) {
       if (typeof item.userVisible !== "boolean") problems.push(`${owner}: userVisible must be boolean`);
       if (!Array.isArray(item.regressions)) problems.push(`${owner}: regressions must be an array`);
       else for (const id of item.regressions) if (!catalogIds.has(id)) problems.push(`${owner}: unknown regression ${id}`);
+      validateGuideDisposition(root, owner, item, problems);
       validateDisposition(`${owner} docs`, item.docs, problems);
       validateDisposition(`${owner} website`, item.website, problems);
       validateDisposition(`${owner} blog`, item.blog, problems);
-      if ([item.docs, item.website, item.blog].some((value) => value?.status === "consult")) {
+      if ([item.guide, item.docs, item.website, item.blog].some((value) => value?.status === "consult")) {
         problems.push(`${owner}: unresolved consult disposition blocks release`);
       }
     }
