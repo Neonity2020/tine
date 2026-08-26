@@ -58,9 +58,16 @@ Run **Actions → iOS TestFlight → Run workflow** and choose one action:
 - `validate`: also ask App Store Connect to validate the IPA;
 - `upload`: validate and upload it for TestFlight processing.
 
-The build number is the unique GitHub Actions run number. Re-running the same
-workflow therefore produces a new App Store build without changing Tine's user
-version. The workflow verifies the bundle ID, `TineOutline` display name,
+The workflow action named `upload` is only the transport/processing step. In
+maintainer conversation, **"upload it to TestFlight" means the complete external
+tester delivery below**: upload, prepare, submit, wait for approval when Apple
+requires it, and publish the existing tester link. If only the transport step
+is wanted, say "upload the IPA to App Store Connect only."
+
+The build number contains the unique GitHub Actions run number, prefixed by the
+Tine version (for example `0.6.97.16`). Re-running the same workflow therefore
+produces a new App Store build without changing Tine's user version. The
+workflow verifies the bundle ID, `TineOutline` display name,
 encryption declaration, privacy manifest, provisioning profile, team, and code
 signature before it can validate or upload anything.
 
@@ -113,6 +120,29 @@ enables a public link capped at 100 testers and writes it to the workflow
 summary. The optional `APPLE_REVIEW_CONTACT_PHONE` secret supplies Apple's
 required private review telephone number when it is not already recorded in
 App Store Connect.
+
+For the CLI, the end-to-end maintainer sequence is:
+
+```bash
+# Build, validate, and upload the IPA. Use the intended tag or commit ref.
+gh workflow run ios-testflight.yml --ref <ref> -f action=upload
+
+# After that run succeeds, administer Apple's full CFBundleVersion. The value
+# is version-prefixed (for example 0.6.97.16), not merely the Actions run number.
+gh workflow run ios-testflight-admin.yml --ref master \
+  -f action=prepare -f build_number=<full-CFBundleVersion>
+gh workflow run ios-testflight-admin.yml --ref master \
+  -f action=submit -f build_number=<full-CFBundleVersion>
+
+# Once inspect reports APPROVED, make that exact build available at the
+# existing public tester link.
+gh workflow run ios-testflight-admin.yml --ref master \
+  -f action=publish-link -f build_number=<full-CFBundleVersion>
+```
+
+Wait for each run and inspect the exact build between stages. Completion means
+the selected build is available to testers through the public link; a green
+IPA upload or a `VALID` processing state alone is not completion.
 
 ## Integration gates
 

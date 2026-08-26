@@ -14,7 +14,7 @@ on:
           - submit
           - publish-link
       build_number:
-        description: CFBundleVersion to administer (blank selects the latest upload)
+        description: Full CFBundleVersion, e.g. 0.6.97.16, not run number 16 (blank selects latest)
         required: false
         type: string
 
