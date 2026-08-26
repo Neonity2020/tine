@@ -16,6 +16,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Android page links now open their page menu consistently on long-press**
+  (GH #207). Body wiki links, links and page headers in Linked References, and
+  page results in search now distinguish Tine's deliberate hold from the
+  browser's native text-selection gesture. Quick taps, scrolling, and desktop
+  click gestures are unchanged.
+
 - **The keyboard-shortcut recorder now captures Control on macOS** (GH #378).
   Physical Control is recorded as `ctrl`, while portable `mod` remains Command
   on macOS and Control on Windows/Linux.

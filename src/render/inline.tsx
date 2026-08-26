@@ -366,7 +366,7 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
           if (internalLinkAuxClick(e, () => openPageInNewTab(targetName(), kind()))) e.stopPropagation();
         }}
         onContextMenu={(e) => {
-          if (!shouldOpenTextContextMenu(e.target)) return;
+          if (!shouldOpenTextContextMenu(e)) return;
           e.preventDefault();
           e.stopPropagation();
           if (!isGuidePageName(targetName())) openPageContextMenu(e.clientX, e.clientY, targetName());

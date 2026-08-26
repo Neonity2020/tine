@@ -8343,6 +8343,33 @@
     "failBefore": "proven"
    },
    "notes": "The single Settings search affordance kept rendering the global settings index on the shortcuts tab, while the shortcut rows ignored its query. The contextual search now matches command labels, ids, and effective bindings (plus built-in labels, ids, bindings, and details), retains their normal scope groups, and renders a shortcut-specific empty state without adding a second search box."
+  },
+  {
+   "id": "UI-PAGE-LINK-LONG-PRESS-207",
+   "title": "Android long-press opens the page context menu for body links, reference links and headers, and page search results",
+   "family": "page-link-gestures",
+   "sources": {
+    "issues": [
+     207
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/render/longPress.test.tsx::fires one contextmenu after a still hold through the delay",
+     "src/render/PageRefLongPress.test.tsx::page-ref long-press gesture (GH #231)",
+     "src/components/linkGestureSurfaces.test.tsx::linked-reference page header suppresses the middle-mousedown default",
+     "src/components/QuickSwitcher.modifiedClicks.test.tsx::opens a page result's context menu on a still touch hold (GH #207)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "The shared touch recognizer emitted a synthetic contextmenu, but the mobile text-selection policy rejected it because tests exercised desktop policy. Reference group headers and quick-switch page rows also lacked the recognizer. Synthetic Tine-owned holds are now distinguished from native selection events, and the same long-press contract is attached across the reported page-link surfaces without changing quick taps, scrolling, desktop right-click, or middle/modified clicks."
   }
  ]
 }

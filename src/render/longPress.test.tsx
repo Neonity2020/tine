@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createLongPress, LONG_PRESS_DELAY, LONG_PRESS_MOVE_TOLERANCE } from "./longPress";
+import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 
 // GH #231: a deliberate long-press on a link must surface the same context
 // menu desktop right-click gives. The recognizer dispatches a SYNTHETIC
@@ -50,6 +51,8 @@ describe("createLongPress", () => {
     expect(heard).toHaveLength(1);
     expect(heard[0].clientX).toBe(40);
     expect(heard[0].clientY).toBe(60);
+    expect(shouldOpenTextContextMenu(heard[0], true)).toBe(true);
+    expect(handlers.consumeClick()).toBe(true);
     // Exactly once: releasing late must not re-fire anything.
     el.dispatchEvent(pointer("pointerup", 40, 60));
     expect(handlers.consumeClick()).toBe(true);

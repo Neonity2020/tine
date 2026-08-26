@@ -21,6 +21,7 @@ import {
 import { pageIdentityKey } from "../pageIdentity";
 import { mergeReferenceGroups } from "../lib/referenceGroups";
 import { ReferenceExportChooser } from "./ReferenceExportChooser";
+import { createLongPress } from "../render/longPress";
 
 // One identity fold for chips, filters, and group merging (DUP-2/DUP-8): the
 // old private `norm` (trim+toLowerCase) split NFC/NFD and boundary-slash
@@ -482,6 +483,9 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
           <For each={shown().map(groupKey)}>
             {(key) => {
               const group = () => shownByKey().get(key)!;
+              let pageButton: HTMLButtonElement | undefined;
+              const longPress = createLongPress(() => pageButton);
+              onCleanup(longPress.dispose);
               return (
               <div class="reference-group">
                 <div class="reference-group-header">
@@ -495,18 +499,28 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                     {groupCollapsed(group()) ? "▸" : "▾"}
                   </button>
                   <button
+                    ref={pageButton}
                     type="button"
                     class="reference-page"
                     onMouseDown={internalLinkMouseDown}
                     onClick={(e) => {
+                      if (longPress.consumeClick()) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        return;
+                      }
                       const dest = internalLinkDest(e);
                       if (dest === "sidebar") openPageInSidebar(group().page, group().kind);
                       else if (dest === "background") openPageInNewTab(group().page, group().kind);
                       else openPage(group().page, group().kind);
                     }}
+                    onPointerDown={longPress.onPointerDown}
+                    onPointerMove={longPress.onPointerMove}
+                    onPointerUp={longPress.onPointerUp}
+                    onPointerCancel={longPress.onPointerCancel}
                     onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(group().page, group().kind))}
                     onContextMenu={(e) => {
-                      if (!shouldOpenTextContextMenu(e.target)) return;
+                      if (!shouldOpenTextContextMenu(e)) return;
                       e.preventDefault();
                       openPageContextMenu(e.clientX, e.clientY, group().page, group().kind);
                     }}
