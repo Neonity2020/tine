@@ -17917,7 +17917,7 @@ impl Graph {
             self.managed_optional_file_identity(write, &target.absolute_path)?,
         )?;
         let (file, current) =
-            open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+            open_and_read_projection_regular_for_sync(parent.final_dir(), &target.filename)?;
         if current != expected_target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -18594,7 +18594,7 @@ impl Graph {
             projection_late_collision_hook()?;
             validate_retirement_boundary()?;
             let (displaced_file, displaced) =
-                open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+                open_and_read_projection_regular_for_sync(parent.final_dir(), &target.filename)?;
             let displaced_identity = canonical_projection_file_resource_id(&displaced_file)?;
             if displaced != expected_base {
                 return Err(io::Error::new(
@@ -18617,7 +18617,7 @@ impl Graph {
             // foreign replacement remains live rather than being displaced by
             // a tombstone authored against the old inode.
             let (live_file, live) =
-                open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+                open_and_read_projection_regular_for_sync(parent.final_dir(), &target.filename)?;
             let live_identity = canonical_projection_file_resource_id(&live_file)?;
             if live != expected_base || live_identity != displaced_identity {
                 return Err(io::Error::new(
@@ -19614,7 +19614,7 @@ impl Graph {
         )?;
 
         let (file, current) =
-            open_and_read_projection_regular(parent.final_dir(), &target_path.filename)?;
+            open_and_read_projection_regular_for_sync(parent.final_dir(), &target_path.filename)?;
         if current != expected_target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -24551,12 +24551,27 @@ fn open_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<(fs::Fi
     open_and_read_projection_regular_with_limit(dir, name, MAX_PROJECTION_EVIDENCE_BYTES)
 }
 
+fn open_and_read_projection_regular_for_sync(
+    dir: &Dir,
+    name: &str,
+) -> io::Result<(fs::File, Vec<u8>)> {
+    let file = open_projection_file_nofollow_for_sync(dir, name)?;
+    read_open_projection_regular_with_limit(file, MAX_PROJECTION_EVIDENCE_BYTES)
+}
+
 fn open_and_read_projection_regular_with_limit(
     dir: &Dir,
     name: &str,
     limit: u64,
 ) -> io::Result<(fs::File, Vec<u8>)> {
-    let mut file = open_projection_file_nofollow(dir, name)?;
+    let file = open_projection_file_nofollow(dir, name)?;
+    read_open_projection_regular_with_limit(file, limit)
+}
+
+fn read_open_projection_regular_with_limit(
+    mut file: fs::File,
+    limit: u64,
+) -> io::Result<(fs::File, Vec<u8>)> {
     let len = file.metadata()?.len();
     if len > limit {
         return Err(io::Error::new(
@@ -31086,7 +31101,7 @@ fn validate_projection_recovery_object_exact(
     expected_identity: ContentDigest,
 ) -> io::Result<()> {
     let (recovery_file, recovery_bytes) =
-        open_and_read_projection_regular(parent.final_dir(), recovery)?;
+        open_and_read_projection_regular_for_sync(parent.final_dir(), recovery)?;
     let recovery_identity = canonical_projection_file_resource_id(&recovery_file)?;
     if recovery_identity != expected_identity {
         return Err(io::Error::new(
