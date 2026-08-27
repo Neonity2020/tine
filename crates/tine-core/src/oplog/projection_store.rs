@@ -1928,6 +1928,9 @@ impl ProjectionReceiptStore {
     /// new markers are appended to that same inactive round. The active round
     /// flips only after it is empty, so no retained prefix can be revisited
     /// until every marker that shared its round has received a bounded visit.
+    /// The flip is durable, so it is elided when BOTH rounds are empty: there
+    /// is then nothing to make reachable and the write would cost a barrier per
+    /// call on the ordinary save path, where the queue is empty.
     pub(crate) fn pending_projection_cleanup_bounded(
         &self,
         max_entries: usize,
@@ -1946,6 +1949,26 @@ impl ProjectionReceiptStore {
         let mut first = entries.next().transpose()?;
         if first.is_none() {
             drop(entries);
+            // An empty active round normally means "flip, then drain whatever
+            // the other round retained". When the inactive round is empty too,
+            // the entire queue is empty: the flip has nothing to make
+            // reachable, yet it still writes the round state durably and
+            // barriers the namespace directory. That is the ordinary case —
+            // every accepted save enters this function twice with nothing
+            // queued — so peek the inactive round first. The peek reads a
+            // directory and writes nothing, and it uses the same entry
+            // semantics as the enumerator below: a round holding only
+            // removable temporary entries is NOT empty here, so it falls
+            // through to the flip and the existing temp-removal path rather
+            // than inventing a second cleanup route.
+            if queue.rounds[1 - active]
+                .entries()?
+                .next()
+                .transpose()?
+                .is_none()
+            {
+                return Ok(Vec::new());
+            }
             flip_pending_cleanup_round(namespace, &queue)?;
             queue = open_pending_cleanup_rounds(
                 namespace,
@@ -6010,6 +6033,103 @@ mod tests {
         assert!(fixture.store.pending_projection_cleanup_bounded(1).is_err());
         assert_eq!(projection_store_test_counters().pending_cleanup_entries, 1);
         assert_eq!(fs::read(unknown).unwrap(), b"not a canonical marker");
+    }
+
+    /// The durable round flip is real work when the inactive round retains
+    /// markers, and pure cost when it does not. Every accepted save enters
+    /// this function twice with an entirely empty queue, so the both-empty
+    /// case must write nothing and take no barrier — while the
+    /// inactive-non-empty case must still flip and drain.
+    #[test]
+    fn an_empty_pending_cleanup_queue_elides_the_durable_round_flip() {
+        let fixture = Fixture::new("pending-cleanup-empty-queue-elides-flip");
+        let read_state = |store: &ProjectionReceiptStore| {
+            let namespace = &store.namespaces.pending_cleanup;
+            let queue = open_pending_cleanup_rounds(
+                &namespace.capability,
+                store.store_id,
+                namespace.identity,
+            )
+            .unwrap();
+            (queue.state.active_round, queue.state_bytes)
+        };
+
+        let before = read_state(&fixture.store);
+        let session = crate::durability_counters::BarrierSession::begin();
+        assert!(fixture
+            .store
+            .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+            .unwrap()
+            .is_empty());
+        let counts = session.counts();
+        crate::durability_counters::BarrierSession::detach_current_thread();
+        assert_eq!(
+            counts.total(),
+            0,
+            "an entirely empty cleanup queue took durability barriers: {}",
+            counts.report()
+        );
+        assert_eq!(
+            read_state(&fixture.store),
+            before,
+            "an entirely empty cleanup queue rewrote the durable round state"
+        );
+
+        let path = ManagedPath::parse("pages/elision.md").unwrap();
+        fs::write(fixture.graph_root.join(path.as_str()), b"- base\n").unwrap();
+        let target = b"- target\n";
+        let intent = ProjectionIntent::new(
+            fixture.store.workspace_id(),
+            PageId::from_uuid(Uuid::from_u128(70_001)),
+            path,
+            FrontierV2::default(),
+            Vec::new(),
+            ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+            BlobDescription::of(target),
+            Vec::new(),
+        )
+        .unwrap();
+        fixture
+            .store
+            .publish_intent(&intent, Some(b"- base\n"))
+            .unwrap();
+        let reservation = fixture.store.reserve_attempt(&intent).unwrap();
+        let mut authority = fixture
+            .store
+            .begin_mutation(&intent, Some(&reservation))
+            .unwrap();
+        let proof = fixture
+            .graph
+            .write_page_projection(
+                intent.path().as_str(),
+                Some(b"- base\n"),
+                target,
+                &mut authority,
+            )
+            .unwrap();
+        fixture
+            .store
+            .publish_completion(authority, &intent, &proof)
+            .unwrap();
+
+        // `publish_pending_cleanup_marker` appends to the INACTIVE round, so
+        // the active round is still empty and the flip is now doing the work
+        // it exists for: making that marker reachable. It must still happen,
+        // and the entry must drain in the same pass.
+        assert_eq!(
+            fixture
+                .store
+                .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+                .unwrap()
+                .len(),
+            1,
+            "a non-empty inactive round did not become reachable and drain"
+        );
+        assert_ne!(
+            read_state(&fixture.store).0,
+            before.0,
+            "the durable flip was elided while the inactive round held a marker"
+        );
     }
 
     #[test]

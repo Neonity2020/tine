@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Saving a page performs fewer disk-durability round trips** (28 → 25
+  core-initiated barriers per accepted single-block save; 77 → 74 for a
+  cross-page move). Three barriers defended no failure Tine's threat model
+  covers: a re-flush of a file that was already flushed before publication, a
+  durable queue-state write on an empty cleanup queue, and a flush of a file
+  about to be moved aside whose exact bytes are already recorded. Edits feel the
+  difference most on slow, networked, or synced filesystems.
+
 ### Added
 
 - **Keyboard Shortcuts can now be searched in place** (GH #380). The existing
