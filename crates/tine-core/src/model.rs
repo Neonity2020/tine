@@ -4085,7 +4085,7 @@ thread_local! {
     static MANAGED_WRITE_AFTER_RETIRE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static JOURNAL_PROJECTION_BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static JOURNAL_PROJECTION_AFTER_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static JOURNAL_PROJECTION_AFTER_FILE_SYNC: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static JOURNAL_PROJECTION_AFTER_TARGET_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
@@ -5007,15 +5007,15 @@ fn journal_projection_after_publish_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn journal_projection_after_file_sync_hook() -> io::Result<()> {
-    JOURNAL_PROJECTION_AFTER_FILE_SYNC.with(|hook| match hook.borrow_mut().take() {
+fn journal_projection_after_target_reread_hook() -> io::Result<()> {
+    JOURNAL_PROJECTION_AFTER_TARGET_REREAD.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn journal_projection_after_file_sync_hook() -> io::Result<()> {
+fn journal_projection_after_target_reread_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -21327,8 +21327,7 @@ impl Graph {
                 "committed journal target changed before durability proof",
             ));
         }
-        barrier_sync_all(&file)?;
-        journal_projection_after_file_sync_hook()?;
+        journal_projection_after_target_reread_hook()?;
         sync_reconstructible_projection_chain(&target.chain)?;
         let rebound = self.managed_target(write, &plan.path, false)?;
         if canonical_projection_directory_resource_id(rebound.parent())?
@@ -33168,9 +33167,9 @@ mod tests {
                         Err(injected_journal_projection_cut("after publish"))
                     }));
                 }),
-                2 => JOURNAL_PROJECTION_AFTER_FILE_SYNC.with(|hook| {
+                2 => JOURNAL_PROJECTION_AFTER_TARGET_REREAD.with(|hook| {
                     *hook.borrow_mut() = Some(Box::new(|| {
-                        Err(injected_journal_projection_cut("after file sync"))
+                        Err(injected_journal_projection_cut("after target reread"))
                     }));
                 }),
                 3 => FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(true)),
