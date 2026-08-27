@@ -17,7 +17,12 @@ import { AudioOverlay } from "./components/AudioOverlay";
 import { CalendarJump } from "./components/CalendarJump";
 import { ConflictBar } from "./components/ConflictBar";
 import { RightSidebar } from "./components/RightSidebar";
-import { Settings } from "./components/Settings";
+// Settings pulls in the plugin/theme catalogues, backup controls, and every
+// settings tab. Most launches never open it, so keep that work out of the
+// startup bundle and fetch it only when the settings surface is requested.
+const Settings = lazy(() =>
+  import("./components/Settings").then((m) => ({ default: m.Settings }))
+);
 import { HelpPopup } from "./components/HelpShortcuts";
 import { DatePicker } from "./components/DatePicker";
 import { FormulaEditor } from "./components/FormulaEditor";
@@ -60,6 +65,7 @@ import {
   firstLoadDone,
   setFirstLoadDone,
   openSettings,
+  settingsOpen,
   welcomeOpen,
   closeWelcome,
   shortcutOverrides,
@@ -1671,7 +1677,11 @@ export function App(): JSX.Element {
       <PageProps />
       <ExportModal />
       <PdfExportDialog />
-      <Settings />
+      <Show when={settingsOpen()}>
+        <Suspense>
+          <Settings />
+        </Suspense>
+      </Show>
       <HelpPopup />
       {/* First-run onboarding: covers the (empty) app when no graph is configured.
           Rendered before Toasts so a "couldn't create graph" toast still shows on top. */}
