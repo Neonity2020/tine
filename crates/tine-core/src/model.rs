@@ -18119,6 +18119,7 @@ impl Graph {
                 let mut unsafe_published_state = false;
                 let mut recovery_name = None;
                 let mut recovery_expected = None;
+                let mut projection_stage = "create staged recovery";
                 let mut result = (|| {
                     let staged_name = create_projection_staged_recovery(
                         parent.final_dir(),
@@ -18128,6 +18129,7 @@ impl Graph {
                     )?;
                     let mut publish_name = None;
                     let result = (|| {
+                        projection_stage = "last-moment projection validation";
                         projection_last_moment_hook(&target_path.absolute_path)?;
                         projection_publication_race_hook(&target_path.absolute_path)?;
                         projection_late_collision_hook()?;
@@ -18142,6 +18144,7 @@ impl Graph {
                             )?,
                         )?;
                         if let Some(expected_base) = expected_base.filter(|_| !resumed_retirement) {
+                            projection_stage = "capture displaced projection";
                             let retired = reservation.recovery_filename().to_owned();
                             let (displaced_file, displaced) =
                                 open_and_read_projection_regular(
@@ -18166,6 +18169,7 @@ impl Graph {
                             projection_recovery_after_bound_capture_hook(
                                 &target_path.absolute_path,
                             )?;
+                            projection_stage = "retire displaced projection";
                             retire_projection_target(
                                 parent.final_dir(),
                                 &target_path.filename,
@@ -18181,6 +18185,7 @@ impl Graph {
                             // `T` is absent, `recovery(i)` holds the exact
                             // precondition, and nothing has been staged yet.
                             projection_after_displacement_hook(&target_path.absolute_path)?;
+                            projection_stage = "validate retired projection";
                             validate_projection_recovery_object_exact(
                                 &parent,
                                 &retired,
@@ -18188,6 +18193,7 @@ impl Graph {
                                 displaced_identity,
                             )?;
                             if let Some(publisher) = evidence_publisher {
+                                projection_stage = "publish projection recovery evidence";
                                 publisher.publish(
                                     &recovery_expected
                                         .as_ref()
@@ -18199,6 +18205,7 @@ impl Graph {
                                 projection_after_retire_hook(&target_path.absolute_path),
                                 projection_after_retire_collision_hook(),
                             );
+                            projection_stage = "revalidate retired projection";
                             preflight_reconstructible_projection_chain(&parent.chain)?;
                             let validation = (|| {
                                 self.ensure_projection_parent_binding(&parent, &target_path)?;
@@ -18228,6 +18235,7 @@ impl Graph {
                             combine_projection_hook_validation(hooks, validation)?;
                         }
 
+                        projection_stage = "prepare replacement projection";
                         self.ensure_projection_parent_binding(&parent, &target_path)?;
                         self.ensure_projection_target_shape(&parent, &target_path)?;
                         let publication = create_projection_temp(
@@ -18236,6 +18244,7 @@ impl Graph {
                             target,
                         )?;
                         publish_name = Some(publication.clone());
+                        projection_stage = "publish replacement projection";
                         rename_reconstructible_projection_noreplace(
                             parent.final_dir(),
                             &publication,
@@ -18244,6 +18253,7 @@ impl Graph {
                         publish_name = None;
                         published = true;
                         mutated = true;
+                        projection_stage = "synchronize replacement projection";
                         sync_reconstructible_projection_chain(&parent.chain)?;
                         let hooks = combine_projection_hook_results(
                             projection_post_publish_hook(&target_path.absolute_path),
@@ -18279,8 +18289,10 @@ impl Graph {
                         if validation.is_err() {
                             unsafe_published_state = true;
                         }
+                        projection_stage = "validate published projection";
                         combine_projection_hook_validation(hooks, validation)?;
 
+                        projection_stage = "collect projection recovery evidence";
                         let mut recovery_evidence = self.projection_recovery_evidence_exact(
                             &parent,
                             &target_path,
@@ -18315,6 +18327,7 @@ impl Graph {
                                 "projection reread is not valid UTF-8",
                             )
                         })?;
+                        projection_stage = "cache published projection";
                         self.cache_projection_page_text(
                             write,
                             &target_path.absolute_path,
@@ -18325,7 +18338,14 @@ impl Graph {
                             final_reread,
                             recovery_evidence,
                         ))
-                    })();
+                    })()
+                    .map_err(|error| {
+                        projection_platform_error(
+                            "managed projection transaction",
+                            projection_stage,
+                            error,
+                        )
+                    });
                     if let Some(publication) = publish_name.as_deref() {
                         let _ = parent.final_dir().remove_file(publication);
                     }
