@@ -264,8 +264,9 @@ and manifest tail.
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
-| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v6 and versioned rows | derived receipts and diagnostics |
-| `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | receipt cleanup | receipt cleanup | bounded cleanup queue | disposable maintenance state |
+| `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and clean open | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
+| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
+| `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests; losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
@@ -694,10 +695,11 @@ target are never repaired by this route; they remain external reconciliation or
 refusal. Once any manifest head exists for a path it also supersedes lazy
 genesis as predecessor authority, so an exact-byte mismatch cannot fall through
 to a baseline capsule (and a post-activation page can never be looked up there).
-The clean runtime has no completed-path index: a receiver-local completion that
-belongs to a superseded source batch remains durable historical receipt evidence
-but is not required to replay as the later merged point authority merely to
-perform a nonexistent index update.
+The clean runtime has no persistent projection-head or completed-*path* index.
+It does retain the intent-keyed own-endpoint completion index in §3.2b; a
+receiver-local completion that belongs to a superseded source batch remains
+durable historical receipt evidence and does not update that local half merely
+to replay as a later merged point authority.
 
 File synchronizers deliver the visible Markdown/Org projection and the hidden
 provider history independently. Before classifying concurrent semantic edits,
@@ -996,6 +998,19 @@ the only stores carrying a pre-(c) claim are development stores, and the 0.7
 blank-slate policy applies: refuse with a named remedy rather than build
 migration machinery for records that exist on no user's disk.
 
+**Why packet 2c does not move it again.** Packet 2c retires only the
+own-endpoint facet of the receipt protocol. The foreign receiver namespaces,
+record formats, and recovery protocol remain live and unchanged, so the
+wholesale-retirement premise for a `TINEPR7` claim is false. A store written by
+a pre-2c `(c)` build differs only by possibly retaining own-endpoint receipt
+artifacts. Current code neither authors nor consults those artifacts as
+authority: it reports their validated names, leaves their bytes untouched, and
+recovers own work exclusively from the durable turn/journal plus the local
+completion index. Refusing `TINEPR6` would reactivate an intermediate
+development store and could lose undrained frames without adding safety. The
+real-store recovery-equivalence oracle covers every specified crash cut for
+exactly this transition.
+
 | Claim observed | Response |
 | --- | --- |
 | current magic, current version, exactly `STORE_CLAIM_LEN` bytes, regular file | proceed to the full in-place validation |
@@ -1271,9 +1286,12 @@ reports states whose in-scope scenario is not disk corruption
 local authoring still appends its semantic managed-local frame and the drain
 views that frame as a turn; ingress-local, ingress-foreign, terminal-local,
 terminal-foreign and superseded-repair producers append description-only
-records to the projection-turn journal. The turn-level executor still publishes
-and recovers projection receipts as redundant evidence. No replay decision
-branches on whether a receipt-backed operation came from either turn domain.
+records to the projection-turn journal. The common own-endpoint executor does
+not publish or recover projection receipts: its only recovery authority is the
+turn/journal and its only durable completion suppression is the local completion
+index. The foreign receiver executor continues to publish and recover the full
+receipt protocol, including base bytes and records, attempts, mutation
+authority, completion, pending cleanup, and forensic evidence.
 
 **Cold-open order is part of the write-safety contract.** After retained
 authority and archive/SQLite reconstruction, startup opens both local journals
@@ -1282,6 +1300,63 @@ managed-local domain first, then projection turns, recomputes terminal work,
 and probes each page for exact current bytes before appending a terminal turn.
 A journal that cannot open therefore refuses before terminal graph mutation;
 a completed-and-reclaimed terminal turn is not recreated on the next open.
+
+### 3.2b Own-endpoint completion index and `DeferredAbsence`
+
+Every successful own-endpoint manifested projection passes through the common
+executor. Immediately after the graph mutation and exact-identity in-turn
+cleanup have completed, that seam stages one local-completion value in the
+engine: exact `ProjectionIntentId`,
+page id, path, `attempted | completed` state, `Present | Absent` target kind,
+and post-frontier. The intent id binds page, path, frontier, precondition and
+target; lookup is never by bare path. A completion by page P at X therefore
+cannot suppress a later creation by page Q at X.
+
+The engine coalesces staged entries into immutable generation-named objects at
+`archive/operations/sweeps/local-completion-index-v1/`. A flush installs one
+delta, and every `N = max(256, 2 × pages-at-compaction)` deltas the same staged
+publication also installs a full-map compaction. Compaction retains the latest
+entry for each current live `(page, path)` and every exact intent still named by
+an uncheckpointed foreground frame or unretired projection continuation;
+superseded objects are pruned under the workspace lease. Packet C-2 does not
+merge receiver receipt history into pruning: receiver completions remain
+receiver-only evidence. Before a later merged map can expose that history,
+its pruning rule must additionally retain a maximal local entry above receiver
+history for the same key.
+
+Open performs one names-only enumeration. A compaction records the count and
+set digest of covered delta filenames; a current horizon reads that compaction
+plus only newer delta names. Extra names are behind-truth and are read as the
+delta. A torn or invalid summary chain rebuilds from valid retained delta
+objects, so this disposable cache adds no durable refusal.
+
+The coalesced O-C5 flush points are actor idle, clean shutdown, lease release,
+and the earlier of 60 seconds after the first buffered entry or 64 projecting
+turns. The first-entry deadline participates in the actor's receive timeout,
+including an otherwise quiet graph. Cold-open repair flushes synchronously at
+the repair-to-assembly boundary; every error exit after executing a projection
+uses an engine-plus-lease scope guard to attempt the same flush before unlock.
+`stop_without_clean_drain`, last-handle drop, and a failed guarded flush are
+crash-equivalent releases, not clean flush points.
+
+For an own-endpoint `Present` replay whose file is absent, a captured Present
+base proves update-shaped work and an exact matching completed intent proves a
+previously executed creation. Either case returns `DeferredAbsence`: finished
+without mutation, continuation retired, no completion/index entry written, and
+the Present terminal head left untouched. Foreground archive publication,
+engine admission, SQLite projection, checkpointing, and ordinary startup or
+differs-scan reconciliation continue; C-2 deliberately authors no sweep record.
+Absent-precondition work with no exact matching entry creates as before.
+
+O-C5 accepts two bounded residuals. A crash after own-endpoint execution but
+before its coalesced flush can lose at most the 60-second/64-turn suffix, so a
+later replay may recreate that user's own just-accepted save; current-state
+authorization prevents stale or foreign bytes from using this route. Once a
+receiver/local merged map exists, a crash-lost local Absent entry can instead
+make older receiver Present evidence win conservatively and route a later
+foreign recreation through deletion disposition. That second residual is not
+observable in C-2 because receiver evidence is not yet consulted by this local
+half, but the merged-map packet must preserve and document it.
 
 ### 2.10a Durability barriers by artifact class
 
@@ -1410,11 +1485,18 @@ detect corruption either. Three such helpers existed on the managed projection
 paths and fired three times per save and eight times per cross-page move; they
 are deleted, and no read path may reintroduce one. See the `MS-REF-` note below.
 
-**Invariant — a projection operation flushes one directory, the one whose
-entries it changed.** `model::sync_projection_chain_with_class` — the single
-place every projection directory barrier passes through, for Direct Files and
-managed storage alike — flushes `chain.last()` and nothing above it. The
-argument has two halves and they are exhaustive:
+**Invariant — managed projection takes one directory barrier per turn per leaf
+directory.** A projection turn defers reconstructible graph-directory barriers
+until its final name change, deduplicates them by opened leaf-directory
+identity, and flushes each distinct leaf exactly once before checkpoint. File
+barriers remain one per distinct staged inode. Strict private-authority and
+conflict-trash barriers are not coalesced into this reconstructible point.
+
+This collapse is managed-class-conditional. Direct Files does not execute a
+projection turn and its publication barriers are unchanged; the same
+`sync_projection_chain_with_class` primitive still flushes `chain.last()` and
+nothing above it immediately. The leaf-only argument has two halves and they
+are exhaustive:
 
 * An ancestor **Tine created during this operation** is made durable when it is
   created, not afterwards: `model::create_projection_chain_component` is the
@@ -1448,16 +1530,44 @@ Enforced by
 `model::tests::a_projection_operation_flushes_one_directory_whatever_its_depth`
 (chain depth must not change the barrier count) and
 `model::tests::a_created_projection_ancestor_costs_exactly_one_extra_barrier`
-(each created ancestor still costs its own barrier, exactly once).
+(each created ancestor still costs its own barrier, exactly once), plus
+`model::tests::a_same_directory_move_takes_one_directory_barrier` and
+`model::tests::managed_barrier_collapse_does_not_change_direct_files_retire_publish_barriers` for the
+turn boundary and the class guard.
 
 **The budget, and where it stands.** `crate::durability_counters` counts every
 barrier `tine-core` initiates and
 `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 asserts the per-operation totals against
-`MANAGED_SAVE_BARRIER_BUDGET` = **25** and `MANAGED_MOVE_BARRIER_BUDGET` =
-**74**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+`MANAGED_SAVE_BARRIER_BUDGET` = **10** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**13**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
 appends and SQLite file-set publication are not reachable from this crate and
 are excluded (measured at three more per save, four per move).
+
+The packet-2b collapse reduced the complete packet-2b-pre ledgers from 35 to 29
+for a save and from 112 to 87 for a cross-page move. Packet C-2 adds exactly
+one coalesced local-completion chain install when this fixture reaches idle:
+one directory barrier plus one staged-publication filesystem barrier for the
+whole operation, never per page. Packet 2c removes own-endpoint receipt
+publication from that executor. The final exact attribution is: save foreground
+`file_fsync=1 dir_fsync=2 syncfs=0 total=3`, save total
+`file_fsync=2 dir_fsync=6 syncfs=2 total=10`; move foreground is zero and move
+total is `file_fsync=6 dir_fsync=5 syncfs=2 total=13`. These are exact-equality
+assertions, not ceilings: either upward or downward drift requires a new
+attribution before the pin moves. The packet-2b removed 6/25 directory barriers were repeated
+`SharedReconstructibleProjection` barriers within turns; no strict authority or
+quarantine barrier was removed.
+
+The 2026-08-27 counter-completeness sweep raised those enforced numbers from
+25/74 without adding or moving a single durability syscall. This is measurement
+visibility, not a latency regression: the save fixture made five previously
+unattributed own-endpoint projection-receipt publications visible (five file +
+five directory barriers); the move fixture made sixteen such publication
+pairs, five mutation-authority replacement file barriers, and one clean-
+foreground retirement directory barrier visible. Packet 2c removes those own-
+endpoint barriers; the retained foreign receiver protocol remains outside the
+save/move fixtures. The exact ledgers and the source guard reject unreviewed
+barrier drift or any future raw barrier outside the counted wrappers.
 
 **Barriers with no in-scope scenario are deleted, not budgeted.** Three
 mechanisms left the count on 2026-08-27 (save 28 → 25, move 77 → 74), each
@@ -1485,29 +1595,30 @@ because no in-scope failure needed it, not because it was expensive:
 Enforced by `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 and `oplog::projection_store::tests::an_empty_pending_cleanup_queue_elides_the_durable_round_flip`.
 
-The cost-model audit's target is 3 and 5. The gap is stated here rather than
-hidden, and it is in two places that this contract does not yet cover:
+The cost-model audit's target is 3 and 5. The remaining gap is stated here
+rather than hidden:
 
-* The **projection receipt store** publishes five artifacts per intent (base,
-  intent, attempt reservation, mutation authority, completion) = 10 barriers per
-  projected page, plus one forensic-evidence record and one pending-cleanup
-  marker for each recovery file a projection displaces. It published *nine*
+* The **foreign receiver projection receipt store** publishes five artifacts
+  per intent (base, intent, attempt reservation, mutation authority, completion)
+  = 10 barriers per received page, plus one forensic-evidence record and one
+  pending-cleanup marker for each recovery file a projection displaces. It
+  published *nine*
   before the 2026-08-26 refusal census cut the four per-intent namespace
   bindings; the survivors each name an in-scope crash/torn-write scenario and
   are recorded in the census
   (`specs/notes/2026-08-26-p-census-receipt.md`). They are still published one
   at a time: each is separated from the next by a read-back of the artifact just
   published, so staging them behind one barrier would have to carry the staged
-  bytes in memory as well. Collapsing that is the next step, not this one.
-* The **projection directory chain** is still entered about six times per
-  foreground save. Each entry now costs exactly one barrier instead of one per
-  chain level — the 2026-08-26 chain-flush cut, measured on the fixture as
-  foreground 14 → 8 and per-save total 37 → 28, cross-page move 93 → 77, before
-  the 2026-08-27 removals above took those totals to 25 and 74 — but six entries
-  is still six barriers, and collapsing *those* means changing the
-  publication protocol rather than the barrier rule. That is the user-visible
-  Markdown write path, whose temp + fsync + rename + base-revision guard + lock
-  semantics are deliberately untouched.
+  bytes in memory as well. This cost belongs to foreign ingress, not the local
+  save/move ledgers; packet C-3 consumes the receiver history without weakening
+  this protocol.
+
+The remaining save/move gap is no longer receipt publication or repeated
+managed graph directory barriers; it is the turn/journal, graph publication,
+archive, and coalesced completion-index work shown by the exact 10/13 ledgers.
+Direct Files' user-visible Markdown publication keeps its
+temp + fsync + rename + base-revision guard + lock and immediate directory
+barriers unchanged.
 
 ### 2.10b No-clobber publication when the filesystem has no rename flags
 
@@ -1919,6 +2030,85 @@ journey boundary by
 `sync_runtime::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem`
 and
 `…::android_managed_storage_journey_holds_one_page_on_a_normalizing_graph_filesystem`.
+
+### 2.10e Projection-turn identities and graph names
+
+Every managed projection name is derived from its durable turn record, not from
+receipt-store or process identity. Derivation scheme 1 hashes the domain tag
+`tine/projection-turn/v1\0`, the big-endian scheme number, workspace, lineage,
+device, endpoint, one-byte sequence domain and big-endian sequence into the
+32-byte `turn_id`. For page index `i`, it hashes
+`tine/projection-attempt/v2\0 || turn_id || u32_be(i) || page_id`, takes the
+first 16 bytes, and applies the RFC 9562 UUID version-8 and variant masks. The
+three graph names are then:
+
+```
+.{target}.{attempt_id.simple()}.projection.recovery
+.{target}.{attempt_id.simple()}.projection.staged
+.{target}.{attempt_id.simple()}.projection.withdrawn
+```
+
+Integers are big-endian and `simple()` is lowercase hexadecimal without
+hyphens. A foreign receiver receipt reservation records this supplied attempt
+id; it does not derive another one, and receiver recovery resumes its retained
+durable reservation or mutation authority. Own-endpoint replay never reads that
+namespace: every attempt id comes directly from the turn. Packet-2a/2b own-
+endpoint residue is inert, is reported by validated names only, and is neither
+resumed nor deleted. This is I2a: an undrained own turn can enumerate every
+graph name its executor may have left behind without receipt evidence.
+
+The live scheme list is `LIVE_PROJECTION_TURN_DERIVATION_SCHEMES`; an unknown
+scheme is a protocol refusal, never guessed. The byte-level derivation is
+enforced by `oplog::projection_turn_journal::tests`; the real-store recovery-
+equivalence oracle proves turn-only own recovery over every specified crash cut
+while the foreign receiver protocol remains unchanged.
+
+### 2.10f The interrupted-publication recovery walk
+
+Editor publication is the deliberate exception to derivable graph names (I2b).
+It is shared with Direct Files and uses process-scoped recovery names. New
+managed names carry four fields,
+`.{target}.{pid}.{seq}.{turn8}.editor-recovery`; the parser accepts that exact
+shape and the three-field legacy shape. It is a parser, not a suffix glob: the
+leading dot, numeric process fields, hexadecimal turn field when present,
+known suffix, and text-extension target must all validate.
+
+Every checked graph open performs one bounded, no-follow
+interrupted-publication walk before either journal is opened or replayed. The
+walk uses the retained managed-text inventory limits, reads no document
+contents, restores a sole claimant over a missing live name with no-replace,
+and moves every competing claimant to conflict trash. Traversal, bounds,
+permission, and unsafe-entry errors propagate through `open_checked`; they may
+not be converted into an empty result. This is I2c: a failed walk refuses
+activation before replay can publish onto an incompletely recovered tree.
+
+`model::tests::checked_open_fails_closed_when_the_recovery_name_walk_exceeds_its_bound`,
+`model::tests::editor_recovery_names_accept_legacy_and_turn_derived_shapes`, and
+`sync_runtime::tests::the_open_time_recovery_walk_precedes_every_journal_replay`
+enforce the bounds, grammar, API propagation, and source ordering.
+
+### 2.10g Retain-never-delete recovery
+
+Recovery may unlink a graph-tree object only inside the live turn that captured
+both its bytes and its exact open-file identity, and only while both still
+match. A reopened process has no such capability. Anything unbound, changed,
+occupied, or merely byte-identical under another identity is moved intact to
+`.trash/conflicts/`; it is never treated as scratch and unlinked.
+
+Quarantine is itself a durability protocol. It validates a no-follow,
+single-link source, renames no-replace into strict `PrivateDurableAuthority`
+conflict trash, flushes the destination chain first and the source chain second,
+then reopens and verifies identity. Created ancestors are flushed eagerly. A
+hard-link, folded-name, or other refusal leaves the source in place. On the
+foreign receiver path, its durable pending-cleanup receipt records the residue.
+On the own-endpoint path, the in-turn exact-identity capability refuses before
+the local completion is staged, so the owning journal turn cannot checkpoint
+and discard the debt. Thus every derived or discovered leftover is restored,
+quarantined, or reported in place before its turn checkpoints.
+
+The crash and external-race coverage lives in the packet-2b C3-C6, R2-R5 and
+X5-X6 tests, including occupied staged-name quarantine, in-turn exact-identity
+retirement, post-crash retention, and hard-link refusal.
 
 ## 4. Concord base ledger (Direct Files)
 

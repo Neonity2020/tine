@@ -1654,6 +1654,36 @@ impl ObjectStore {
         self.capability.try_clone()
     }
 
+    /// Duplicate the retained archive capability for a lease-owned private
+    /// derived namespace. The caller never reopens `root_path`, so an archive
+    /// rename cannot redirect completion-index reads or writes.
+    pub(crate) fn private_derived_root_capability(&self) -> std::io::Result<Dir> {
+        self.capability.try_clone()
+    }
+
+    /// Install one coalesced group of immutable private derived objects with
+    /// the archive batch protocol: data first, final names second, and one
+    /// directory barrier for the shared namespace.
+    pub(crate) fn publish_coalesced_private_derived(
+        &self,
+        namespace: &Dir,
+        artifacts: &[(&str, &[u8], u64)],
+        collision_kind: &'static str,
+    ) -> Result<(), StoreError> {
+        let mut publication = ArchiveBatchPublication::new(&self.capability)?;
+        let namespace_index = publication.namespace(namespace)?;
+        for (name, bytes, limit) in artifacts {
+            publication.stage(
+                namespace_index,
+                name,
+                bytes,
+                *limit,
+                Collision::Exact(collision_kind),
+            )?;
+        }
+        publication.commit()
+    }
+
     /// Duplicate this store directly from its retained no-follow archive-root
     /// capability.
     ///
@@ -2623,7 +2653,7 @@ impl ObjectStore {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         let file = run.open_with(BLOCK_CLAIM_INDEX_FILE, &options)?.into_std();
-        file.sync_all()?;
+        crate::durability_counters::sync_file(&file)?;
         sync_dir_required(&run)?;
         Ok(BlockClaimIndexStore {
             backing: BlockClaimIndexBacking::Standalone(Mutex::new(file)),
@@ -5472,7 +5502,7 @@ impl DurableEngineHistoryStore {
         let mut temp = self.control.open_with(&temp_name, &options)?;
         let result = (|| {
             temp.write_all(replacement.to_string().as_bytes())?;
-            temp.sync_all()?;
+            crate::durability_counters::sync_file(&temp)?;
             drop(temp);
             #[cfg(test)]
             ENGINE_HISTORY_FAIL_BEFORE_HEAD_SWAP.with(|fail| {
@@ -7067,8 +7097,7 @@ impl ArchiveBatchPublication {
                         &self.namespaces[artifact.namespace],
                         &artifact.temp_name,
                     )?;
-                    crate::durability_counters::note(crate::durability_counters::Barrier::File);
-                    file.sync_all()?;
+                    crate::durability_counters::sync_file(&file)?;
                 }
                 Ok(())
             }
@@ -7318,7 +7347,7 @@ fn open_engine_history_transition_lock(root: &Dir) -> Result<fs::File, StoreErro
             "engine history transition lock is not a regular no-follow file".into(),
         ));
     }
-    file.sync_all()?;
+    crate::durability_counters::sync_file(&file)?;
     sync_dir_required(root)?;
     Ok(file)
 }
@@ -7344,7 +7373,7 @@ fn open_engine_history_transition_lock(root: &Dir) -> Result<fs::File, StoreErro
             "engine history transition lock is not a regular no-follow file".into(),
         ));
     }
-    file.sync_all()?;
+    crate::durability_counters::sync_file(&file)?;
     sync_dir_required(root)?;
     Ok(file)
 }

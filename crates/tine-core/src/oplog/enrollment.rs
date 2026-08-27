@@ -2516,7 +2516,7 @@ pub(crate) fn create_legacy_initial_enrollment_for_test(
     directories.enrollment.remove_file(AUTHORITY_FILE)?;
     let mut authority_file = create_new_regular(&directories.enrollment, AUTHORITY_FILE)?;
     authority_file.write_all(&authority_bytes)?;
-    authority_file.sync_all()?;
+    crate::durability_counters::sync_file(&authority_file)?;
     let authority_identity = authoritative_file_identity(&authority_file)?;
     let material = EnrollmentAuthorityMaterial::from_claim(
         legacy_claim,
@@ -2548,10 +2548,10 @@ pub(crate) fn create_legacy_initial_enrollment_for_test(
     let mut record_file =
         create_new_regular(&directories.records, &format!("{digest}{RECORD_SUFFIX}"))?;
     record_file.write_all(&record_bytes)?;
-    record_file.sync_all()?;
+    crate::durability_counters::sync_file(&record_file)?;
     let mut head_file = create_new_regular(&directories.enrollment, HEAD_FILE)?;
     head_file.write_all(format!("{digest}\n").as_bytes())?;
-    head_file.sync_all()?;
+    crate::durability_counters::sync_file(&head_file)?;
     sync_dir_required(&directories.records)
         .map_err(|error| EnrollmentError::Durability(error.to_string()))?;
     sync_dir_required(&directories.enrollment)
@@ -4651,7 +4651,7 @@ fn persist_record_and_head(
     temp.write_all(format!("{digest}\n").as_bytes())?;
     inject_crash_cut(cut, CommitCut::AfterHeadWrite, "after_head_write")?;
     lease.validate_current()?;
-    temp.sync_all()?;
+    crate::durability_counters::sync_file(&temp)?;
     inject_crash_cut(cut, CommitCut::AfterHeadFileSync, "after_head_file_sync")?;
 
     lease.validate_current()?;
@@ -5199,7 +5199,7 @@ fn publish_record(
     temp.write_all(bytes)?;
     inject_crash_cut(cut, CommitCut::AfterRecordWrite, "after_record_write")?;
     lease.validate_current()?;
-    temp.sync_all()?;
+    crate::durability_counters::sync_file(&temp)?;
     inject_crash_cut(
         cut,
         CommitCut::AfterRecordFileSync,
@@ -5813,7 +5813,7 @@ fn provision_or_resume_enrollment_authority(
     let mut temp = create_new_regular(&directories.enrollment, &temp_name)?;
     validate_authoritative_file(&temp, "enrollment authority temporary file")?;
     temp.write_all(&bytes)?;
-    temp.sync_all()?;
+    crate::durability_counters::sync_file(&temp)?;
     lease.validate_current()?;
     rename_noreplace(&directories.enrollment, &temp_name, AUTHORITY_FILE)?;
     sync_dir_required(&directories.enrollment)

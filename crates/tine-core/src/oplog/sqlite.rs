@@ -7794,7 +7794,7 @@ fn write_durable_marker(directory: &Path, name: &str) -> Result<(), ProjectionEr
         .create_new(true)
         .open(&marker)?;
     writeln!(file, "pid={}", std::process::id())?;
-    file.sync_all()?;
+    crate::durability_counters::sync_file(&file)?;
     sync_directory(directory)?;
     let parent = directory
         .parent()

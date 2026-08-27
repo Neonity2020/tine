@@ -598,8 +598,7 @@ impl ProviderRuntime {
             staged
                 .write_all(&expected)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            staged
-                .sync_all()
+            crate::durability_counters::sync_file(&staged.file)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
             validate_provider_file_bytes(&mut staged, &expected, &location.path)?;
             record.staging_identity = Some(provider_identity_record(provider_file_identity(
@@ -661,8 +660,7 @@ impl ProviderRuntime {
                     staged
                         .write_all(&expected)
                         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                    staged
-                        .sync_all()
+                    crate::durability_counters::sync_file(&staged.file)
                         .map_err(|error| ScenarioError::Io(error.to_string()))?;
                     validate_provider_file_bytes(&mut staged, &expected, &location.path)?;
                     record.staging_identity = Some(provider_identity_record(
@@ -1483,7 +1481,7 @@ impl SharedProviderTransport {
         let mut file = create_local_file_exclusive(&self.pending_publication, &name)?;
         file.write_all(&bytes)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        file.sync_all()
+        crate::durability_counters::sync_file(&file)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
         validate_local_file_bytes(&mut file, &bytes, &name)?;
         sync_provider_directory(&self.pending_publication)
@@ -1907,7 +1905,7 @@ impl ProviderRetryJournal {
                         create_provider_authority_key_exclusive(&directory, "authority.key")?;
                     file.write_all(&key)
                         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                    file.sync_all()
+                    crate::durability_counters::sync_file(&file)
                         .map_err(|error| ScenarioError::Io(error.to_string()))?;
                     validate_local_file_bytes(&mut file, &key, "authority.key")?;
                     sync_provider_directory(&directory)?;
@@ -1936,7 +1934,7 @@ impl ProviderRetryJournal {
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 outer
                     .write_all(&authority_record_bytes)
-                    .and_then(|()| outer.sync_all())
+                    .and_then(|()| crate::durability_counters::sync_file(&outer))
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 validate_local_file_bytes(
                     &mut outer,
@@ -3672,7 +3670,7 @@ impl ProviderRetryJournal {
                 let mut file = create_local_file_exclusive(&self.blobs, &creating_name)?;
                 file.write_all(blob)
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                file.sync_all()
+                crate::durability_counters::sync_file(&file)
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 validate_local_file_bytes(&mut file, blob, &creating_name)?;
                 sync_provider_directory(&self.blobs)?;
@@ -3682,8 +3680,7 @@ impl ProviderRetryJournal {
             provisional
                 .write_all(&record_bytes)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            provisional
-                .sync_all()
+            crate::durability_counters::sync_file(&provisional)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
             validate_local_file_bytes(&mut provisional, &record_bytes, &provisional_name)?;
             sync_provider_directory(&self.records)?;
@@ -3701,7 +3698,7 @@ impl ProviderRetryJournal {
             let mut file = create_local_file_exclusive(&self.records, &record_name)?;
             file.write_all(&record_bytes)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            file.sync_all()
+            crate::durability_counters::sync_file(&file)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
             validate_local_file_bytes(&mut file, &record_bytes, &record_name)?;
             sync_provider_directory(&self.records)?;
@@ -3728,8 +3725,7 @@ impl ProviderRetryJournal {
         temporary
             .write_all(&bytes)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        temporary
-            .sync_all()
+        crate::durability_counters::sync_file(&temporary)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
         validate_local_file_bytes(&mut temporary, &bytes, &temporary_name)?;
         sync_provider_directory(&self.records)?;
@@ -3806,8 +3802,7 @@ impl ProviderRetryJournal {
             update
                 .write_all(&completion_bytes)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            update
-                .sync_all()
+            crate::durability_counters::sync_file(&update)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
             validate_local_file_bytes(&mut update, &completion_bytes, &update_name)?;
             sync_provider_directory(&self.completed)?;
@@ -4029,8 +4024,7 @@ fn run_provider_rename_with(
         staged
             .write_all(&expected)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        staged
-            .sync_all()
+        crate::durability_counters::sync_file(&staged.file)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
         validate_provider_file_bytes(&mut staged, &expected, to_path)?;
         record.staging_identity = Some(provider_identity_record(provider_file_identity(
@@ -4601,8 +4595,7 @@ fn reconcile_provider_retirement(
                     diagnostic_name,
                     diagnostic_path,
                 )?;
-                placeholder
-                    .sync_all()
+                crate::durability_counters::sync_file(&placeholder)
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
                 record.staging_identity = Some(provider_identity_record(provider_file_identity(
                     &placeholder,
@@ -5936,7 +5929,7 @@ fn publish_journal_destination(
         .set_len(0)
         .and_then(|()| destination.seek(SeekFrom::Start(0)).map(|_| ()))
         .and_then(|()| destination.write_all(expected))
-        .and_then(|()| destination.sync_all())
+        .and_then(|()| crate::durability_counters::sync_file(&destination))
         .map_err(|error| ScenarioError::Io(error.to_string()))?;
     validate_provider_open_file_bytes(&mut destination, expected, destination_path)?;
     provider_publication_after_publish_hook()?;

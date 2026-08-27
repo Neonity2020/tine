@@ -279,6 +279,7 @@
 use crate::model::Graph;
 #[cfg(test)]
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -289,7 +290,7 @@ use super::object_store::StoreError;
 use super::sqlite::{
     LeasedWorkspaceProjection, ProjectionError, SqliteFrontier, TailOverlay, WorkspaceLeaseIdentity,
 };
-use super::{DeviceId, ProjectionEndpointBinding, SessionId, WorkspaceId};
+use super::{DeviceId, ProjectionEndpointBinding, ProjectionIntentId, SessionId, WorkspaceId};
 
 /// A private seal. Sibling modules can name the sealed types but can never
 /// construct one, because this module is the only place `Seal` is reachable.
@@ -970,6 +971,14 @@ impl CleanLocalRuntime {
 
     pub(crate) fn engine(&self) -> &ShardedHotEngine {
         &self.engine
+    }
+
+    pub(crate) fn flush_local_projection_completions(
+        &mut self,
+        retained_intents: BTreeSet<ProjectionIntentId>,
+    ) -> Result<bool, EngineError> {
+        self.engine
+            .flush_local_projection_completions(retained_intents)
     }
 
     pub(crate) const fn database(&self) -> &SqliteFrontier {

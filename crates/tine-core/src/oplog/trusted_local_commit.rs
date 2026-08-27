@@ -604,6 +604,20 @@ impl TrustedLocalCommitCoordinator {
         #[cfg(test)]
         note_commit_stage(|timings| timings.prepared_record = prepared_started.elapsed());
 
+        let turn = super::local_journal_drain::projection_turn_from_managed_local_record(
+            prepared
+                .record()
+                .prepared_batch()
+                .manifest()
+                .author_device_id()
+                .as_uuid(),
+            engine.lineage_digest(),
+            prepared.record(),
+        )
+        .map_err(|error| TrustedLocalCommitError::InvalidPreparedInput(error.to_string()))?;
+        let turn_id = turn.turn_id();
+        let turn_short_id = [turn_id[0], turn_id[1], turn_id[2], turn_id[3]];
+
         #[cfg(test)]
         let graph_started = Instant::now();
         let graph_outcome = match graph.commit_existing_page_with_journal_evidence(
@@ -612,6 +626,7 @@ impl TrustedLocalCommitCoordinator {
             expected_base,
             exact_target,
             response_evidence.as_ref(),
+            turn_short_id,
             || append_managed_local_record(journal, &prepared),
         ) {
             Ok(outcome) => outcome,

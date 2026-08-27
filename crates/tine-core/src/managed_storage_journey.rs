@@ -160,18 +160,18 @@ fn write_journey_file(target: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::create_dir_all(parent)?;
         let mut file = fs::File::create(target)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        crate::durability_counters::sync_file(&file)?;
         sync_journey_directory(parent)
     } else {
         let mut file = fs::File::create(target)?;
         file.write_all(bytes)?;
-        file.sync_all()
+        crate::durability_counters::sync_file(&file)
     }
 }
 
 #[cfg(unix)]
 fn sync_journey_directory(directory: &Path) -> io::Result<()> {
-    fs::File::open(directory)?.sync_all()
+    crate::durability_counters::sync_directory(&fs::File::open(directory)?)
 }
 
 #[cfg(not(unix))]

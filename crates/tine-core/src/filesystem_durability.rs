@@ -265,7 +265,7 @@ pub(crate) fn sync_regular_file(path: &Path) -> io::Result<()> {
     // FlushFileBuffers requires a write-capable handle on Windows.
     #[cfg(windows)]
     options.write(true);
-    options.open(path)?.sync_all()
+    crate::durability_counters::sync_file(&options.open(path)?)
 }
 
 #[cfg(test)]

@@ -1475,7 +1475,6 @@ fn resume_clean_published(
         fault(OperationalFaultPoint::BeforeProjection)?;
         super::projection::execute_clean_manifested_projection_work_under_handoff(
             graph,
-            receipts,
             database,
             engine,
             &work,
@@ -1784,14 +1783,13 @@ mod tests {
     use crate::oplog::object_store::{
         fail_next_engine_history_head_swap, fail_next_publish_after_objects,
     };
-    use crate::oplog::projection::fail_next_formatting_adoption_after_intent_for_harness;
     use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
-        recover_incomplete_projections, write_projection_exact, AnnotatedProjectionBase,
-        ApplicationRuntimeRoot, BlockId, BlockLocation, DeviceId, DocumentId, LineageDigest,
-        LogicalPageName, ManagedPath, ManagedTextKind, ManifestProjectionPrecondition,
-        ManifestedProjectionIntent, ObjectKind, OperationTransaction, PageId, ProjectionClaim,
-        ProjectionEndpointId, SemanticOperation, TAIL_MAX_BYTES,
+        recover_incomplete_projections, AnnotatedProjectionBase, ApplicationRuntimeRoot, BlockId,
+        BlockLocation, DeviceId, DocumentId, LineageDigest, LogicalPageName, ManagedPath,
+        ManagedTextKind, ManifestProjectionPrecondition, ManifestedProjectionIntent, ObjectKind,
+        OperationTransaction, PageId, ProjectionClaim, ProjectionEndpointId, SemanticOperation,
+        TAIL_MAX_BYTES,
     };
 
     struct TestRoot(PathBuf);

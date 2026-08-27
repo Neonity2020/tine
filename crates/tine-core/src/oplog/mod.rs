@@ -33,6 +33,7 @@ pub mod import;
 mod import_integration_tests;
 pub(crate) mod lazy_genesis;
 pub(crate) mod local_active;
+pub(crate) mod local_completion_index;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_journal_drain;
 #[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
@@ -161,8 +162,7 @@ pub use portable_path_index::{
 };
 pub use projection::{
     derive_receiver_local_projection, plan_projection, recover_incomplete_projections,
-    write_projection_exact, PolicyGeneratedAnchor, ProjectionError, ProjectionPlan,
-    ProjectionWrite,
+    PolicyGeneratedAnchor, ProjectionError, ProjectionPlan, ProjectionWrite,
 };
 pub use projection_manifest::{
     annotated_base_document_id, projection_intent_document_id, AnnotatedProjectionBase,
