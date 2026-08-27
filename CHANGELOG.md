@@ -27,6 +27,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   iteratively instead of consuming the native stack. Native and browser-WASM
   consumers use the same released parser and serialization contract.
 
+- **Startup no longer loads the complete Settings implementation before the
+  first page appears.** Settings and its plugin, theme, backup, and diagnostics
+  controls now load only when opened; the small journal-conflict row shared with
+  Concord remains available independently. Native startup is back within the
+  immutable v0.4.7 performance budget.
+
 - **Managed storage's private receipt-store format has been bumped**
   (development only). Projection records now carry an explicit target-kind
   discriminant, so a private store created by an earlier build is refused with a

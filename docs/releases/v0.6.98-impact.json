@@ -64,6 +64,37 @@
     },
     {
       "section": "Changed",
+      "text": "**Startup no longer loads the complete Settings implementation before the first page appears.** Settings and its plugin, theme, backup, and diagnostics controls now load only when opened; the small journal-conflict row shared with Concord remains available independently. Native startup is back within the immutable v0.4.7 performance budget.",
+      "userVisible": true,
+      "regressions": [
+        "UI-DESKTOP-STABLE-STARTUP-001"
+      ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "performance-only; the Settings workflow and controls are unchanged",
+        "refs": []
+      },
+      "docs": {
+        "status": "current",
+        "reason": "The release startup contract and immutable baseline already document this performance boundary.",
+        "refs": [
+          "docs/RELEASE-CHECKLIST.md",
+          "docs/UI-REGRESSION-TESTING.md"
+        ]
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This startup optimization does not change the public website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the changelog carries the relevant release detail.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Changed",
       "text": "**Managed storage's private receipt-store format has been bumped** (development only). Projection records now carry an explicit target-kind discriminant, so a private store created by an earlier build is refused with a named notice telling you to re-activate managed storage for that graph. Your Markdown files are untouched by the refusal — the check runs before anything can modify the graph. Managed storage has not shipped, so no released build can have created such a store; this affects development machines only.",
       "userVisible": false,
       "regressions": [],

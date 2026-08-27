@@ -25,7 +25,7 @@ import {
 } from "solid-js";
 import { backend } from "../backend";
 import { openFile } from "../router";
-import { ConflictFileRow } from "./Settings";
+import { ConflictFileRow } from "./JournalConflictFileRow";
 import {
   clearConflict,
   conflictQueue,

@@ -127,6 +127,7 @@ const coreWindowsTests = [
   "model::tests::windows_directory_durability_limit_does_not_block_save_or_rename",
   "model::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt",
   "model::tests::windows_direct_publication_receipt_requires_revision_and_file_identity",
+  "model::tests::windows_ambiguous_callback_cannot_interrupt_inflight_direct_creation",
   "model::tests::checked_open_accepts_an_approved_windows_assets_junction",
   "model::tests::projection_windows_held_handle_link_count_tracks_one_and_two_links",
   "model::tests::windows_live_graph_root_move_is_denied_without_rebinding",
@@ -166,9 +167,9 @@ assert.deepEqual(
     listedInventory("tine-core", coreSmokeTests)
   ),
   {
-    coreTestCount: 30,
-    coreSmokeTestCount: 29,
-    windowsNamedCount: 14,
+    coreTestCount: 31,
+    coreSmokeTestCount: 30,
+    windowsNamedCount: 15,
     bootstrapWitnessCount: 8,
   }
 );

@@ -118,6 +118,7 @@ import { dbg } from "../debug";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry, SparseV2ActivationProgress, SparseV2AdoptionResult, SparseV2CancelResult, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import { storageTransitionRuntime } from "../storageTransitionRuntime";
+import { ConflictFileRow } from "./JournalConflictFileRow";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -3328,108 +3329,6 @@ export function SettingsConflictPanels(): JSX.Element {
 // navigates to THIS specific file (editable, saves back to itself), Merge folds a
 // stray into the canonical day, Rename rescues it as a normal page, Trash removes
 // the redundant one (recoverable).
-/** One file of a duplicate journal day, with its reconcile actions.
- *
- *  Exported because the in-page conflict panel renders the same rows: one
- *  renderer, not two that drift apart. `parentLayerId` exists only so the
- *  transient layers (the content preview, the rename box) attach to whichever
- *  surface is hosting the row. */
-export function ConflictFileRow(props: {
-  file: JournalFile;
-  onOpen: () => void;
-  onMerge?: () => void;
-  onRename: (newName: string) => void;
-  onTrash: () => void;
-  parentLayerId?: string;
-}): JSX.Element {
-  const rowLayerId = `journal-conflict-${props.file.path}`;
-  let renameRoot: HTMLDivElement | undefined;
-  let contentRoot: HTMLPreElement | undefined;
-  const [open, setOpen] = createSignal(false);
-  const [renaming, setRenaming] = createSignal(false);
-  const [newName, setNewName] = createSignal("");
-  const [content] = createResource(
-    () => (open() ? props.file.name : null),
-    async (name) => (name ? backend().readJournalFile(name).catch((e) => `(couldn’t read: ${String(e)})`) : "")
-  );
-  const submitRename = () => {
-    const n = newName().trim();
-    if (n) props.onRename(n);
-    setRenaming(false);
-    setNewName("");
-  };
-  createEffect(() => {
-    if (!open()) return;
-    const unregister = registerTransientLayer({
-      id: `${rowLayerId}-content`,
-      parentId: props.parentLayerId ?? "settings",
-      root: () => contentRoot ?? null,
-      dismiss: () => { setOpen(false); return true; },
-    });
-    onCleanup(unregister);
-  });
-  createEffect(() => {
-    if (!renaming()) return;
-    const unregister = registerTransientLayer({
-      id: `${rowLayerId}-rename`,
-      parentId: props.parentLayerId ?? "settings",
-      root: () => renameRoot ?? null,
-      dismiss: () => { setRenaming(false); setNewName(""); return true; },
-    });
-    onCleanup(unregister);
-  });
-  return (
-    <>
-      <div class="journal-conflict-row" data-journal-conflict={props.file.path}>
-        <button class="settings-asset-name mono" title="Show this file's contents" onClick={() => setOpen(!open())}>
-          {open() ? "▾ " : "▸ "}
-          {props.file.name}
-          <Show when={props.file.canonical}>
-            <span class="journal-conflict-keep"> · canonical</span>
-          </Show>
-        </button>
-        <span class="journal-conflict-actions">
-          <button class="settings-btn" title="Open this exact file (editable)" onClick={props.onOpen}>
-            Open
-          </button>
-          <Show when={props.onMerge}>
-            <button class="settings-btn" title="Append this file's blocks to the canonical day, then trash it" onClick={props.onMerge}>
-              Merge
-            </button>
-          </Show>
-          <button class="settings-btn" title="Move this file to a uniquely-named page" onClick={() => { setRenaming(true); setNewName(""); }}>
-            Rename…
-          </button>
-          <button class="settings-btn settings-btn-danger" onClick={props.onTrash}>
-            Trash
-          </button>
-        </span>
-      </div>
-      <div class="journal-conflict-preview">{props.file.preview}</div>
-      <Show when={renaming()}>
-        <div ref={renameRoot} class="journal-conflict-rename">
-          <input
-            class="settings-input"
-            placeholder="New page name"
-            value={newName()}
-            onInput={(e) => setNewName(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.isComposing || e.keyCode === 229) return;
-              if (e.key === "Enter") submitRename();
-              else if (e.key === "Escape") setRenaming(false);
-            }}
-          />
-          <button class="settings-btn" onClick={submitRename}>Save</button>
-          <button class="settings-btn" onClick={() => setRenaming(false)}>Cancel</button>
-        </div>
-      </Show>
-      <Show when={open()}>
-        <pre ref={contentRoot} class="journal-conflict-content">{content.loading ? "…" : content() || "(empty file)"}</pre>
-      </Show>
-    </>
-  );
-}
-
 // Duplicate journal days: a date that resolves to >1 file (e.g. a date-stem file
 // plus a title-named one, usually from a date-format change). Tine never
 // auto-merges, so list each file with reconcile actions (Open/Merge/Rename/Trash).

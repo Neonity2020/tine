@@ -613,7 +613,7 @@ mod tests {
         );
         assert_eq!(
             corpus.provenance.revision,
-            "c79cb059da5b4360ebde2e5fd953fa1f43ddabc3"
+            "74b9e62e04d6c4645bed1d68d97be1464ef101b7"
         );
         assert!(corpus.provenance.selection.contains("tracked public cases"));
         assert_eq!(corpus.cases.len(), 1_895);
