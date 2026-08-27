@@ -7077,6 +7077,19 @@ impl Graph {
     /// Record a relevant raw watcher callback without touching graph bytes.
     /// Returns the epoch the callback published.
     pub fn note_graph_text_external_observation(&self) -> GraphTextExternalObservationTicket {
+        // A native callback may arrive after an atomic temporary-name event but
+        // before the publishing writer has completed its final reread and
+        // ownership receipt.  Raising the graph-wide frontier before taking the
+        // writer's identity authority makes that writer reject its own create
+        // (the Windows failure reported again in GH #374).  Linearize the epoch
+        // itself with graph-text publication: a callback which overlaps a Tine
+        // write waits, then the ordinary debounced reconciliation decides
+        // whether anything external actually changed.
+        //
+        // Failing to acquire a binding is already a fail-closed state for every
+        // writer.  Keep publishing the epoch in that case so the watcher cannot
+        // accidentally make the situation less conservative.
+        let _identity = self.lock_graph_text_identity_mutation().ok();
         let epoch = self
             .external_observation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -7167,6 +7180,20 @@ impl Graph {
         Ok(Some(GraphTextIdentityPublicationGuard {
             _identity: identity,
         }))
+    }
+
+    /// Run one bounded, multi-document Tine operation without allowing a raw
+    /// native watcher callback or storage-mode handoff to split it between two
+    /// graph-text publications. Individual writes still take their ordinary
+    /// path locks and perform all exact validation; this only keeps their shared
+    /// resource authority contiguous (the Guide copy is the first caller).
+    pub(crate) fn with_graph_text_write_transaction<T>(
+        &self,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let _write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        operation()
     }
 
     #[cfg(test)]
@@ -13872,7 +13899,34 @@ impl Graph {
         *self.page_list_cache.write().unwrap() = None;
         *self.find_entry_cache.write().unwrap() = None;
         let entry = self.graph_inventory_entry(&path)?.ok_or_else(bad_path)?;
-        self.cache_upsert(entry, parse_doc(&path, &content), content_rev(&content));
+        let revision = content_rev(&content);
+        self.cache_upsert(entry, parse_doc(&path, &content), revision.clone());
+        // This path publishes graph text without passing through
+        // `commit_editor_write`, which normally records the exact final bytes
+        // and physical identity for the native watcher. Without the equivalent
+        // receipt here, the first page of a multi-page Guide copy looks like an
+        // external creation and raises the graph-wide admission frontier before
+        // the second page can be created (GH #391, and the same family as the
+        // negative Windows follow-up in GH #374).
+        let Some((reread, identity)) =
+            self.managed_read_optional_text_with_identity(&write, &path)?
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "created guide page disappeared before final publication",
+            ));
+        };
+        if reread != content || content_rev(&reread) != revision {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "created guide page changed before final publication",
+            ));
+        }
+        self.loaded_file_identities
+            .write()
+            .unwrap()
+            .insert(path.clone(), (revision.clone(), identity));
+        self.remember_exact_graph_text_state(&path, revision, identity);
         Ok(true)
     }
 
@@ -39573,6 +39627,56 @@ mod tests {
         assert!(
             observer.join().unwrap(),
             "after the writer releases its lock, exact bytes and identity must prove the self echo"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GH #374 negative follow-up.  The first fix serialized the exact-path
+    /// self-echo proof, but an ambiguous Windows callback still published its
+    /// graph-wide epoch *before* waiting for the same writer.  The create then
+    /// observed that premature epoch at its last pre-publication check and
+    /// refused its own save.  The callback frontier must wait behind the writer;
+    /// it may remain pending for the debounced reconciler only after the create
+    /// is durably complete.
+    #[test]
+    fn windows_ambiguous_callback_cannot_interrupt_inflight_direct_creation() {
+        let dir = scratch("windows-direct-ambiguous-callback-inflight");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Arc::new(Graph::open(&dir));
+        graph.warm_cache();
+        let page = direct_save_bench_new_page("Ambiguous Callback Publication");
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let writer_graph = Arc::clone(&graph);
+        let writer = std::thread::spawn(move || {
+            MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    paused_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                }));
+            });
+            writer_graph.save_page(&page, None)
+        });
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer reached its final pre-publication boundary");
+
+        let observer_graph = Arc::clone(&graph);
+        let observer =
+            std::thread::spawn(move || observer_graph.note_graph_text_external_observation());
+        wait_for_identity_mutation_waiter(&graph);
+        release_tx.send(()).unwrap();
+
+        writer
+            .join()
+            .unwrap()
+            .expect("an overlapping ambiguous callback must not interrupt Tine's create");
+        let observed = observer.join().unwrap();
+        assert!(
+            graph.acknowledge_graph_text_external_observations(observed),
+            "the callback still belongs to ordinary reconciliation after publication"
         );
         let _ = fs::remove_dir_all(&dir);
     }
