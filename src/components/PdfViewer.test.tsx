@@ -1468,4 +1468,9 @@ describe("PdfViewer released-OG themes and outline", () => {
     expect(css).toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-hl \{[^}]*mix-blend-mode: screen/s);
     expect(css).not.toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-hl-layer \{[^}]*filter:/s);
   });
+
+  it("keeps page geometry stable when offscreen PDF canvases are evicted", () => {
+    const css = readFileSync("src/styles/app.css", "utf8");
+    expect(css).toMatch(/\.pdf-page \{[^}]*flex:\s*0 0 auto;/s);
+  });
 });

@@ -26,6 +26,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Long PDFs no longer skip pages or overload the viewer during ordinary
+  scrolling.** Evicting an offscreen page's canvas could collapse its flex
+  wrapper, shrinking the document while it was being scrolled and making many
+  distant pages appear visible and render at once. Page placeholders now keep
+  stable geometry, so scrolling stays sequential and rendering remains local to
+  the viewport.
+
 - **Unlinked References now opens when a matching source page contains 10,000
   or more blocks** (GH #388). Managed storage was applying the whole-page
   editor payload limit before constructing the already-bounded reference
