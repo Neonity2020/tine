@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::io;
 
+use super::object_store::BatchInspection;
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlobDescription, BlockId,
     CleanTombstoneAuthorization, EngineError, LogseqIdentityOrigin, LogseqUuid,
@@ -27,9 +28,10 @@ use super::{
     MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore, PageId,
     ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
     ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
-    ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionWork,
-    ProjectionWorkTarget, ReceiptError, ShardedHotEngine, SqliteFrontier, StructuralLocator,
-    StructuralSpan, WorkspaceId,
+    ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionTurn,
+    ProjectionWork, ProjectionWorkTarget, ReceiptError, SequenceDomain, ShardedHotEngine,
+    SqliteFrontier, StructuralLocator, StructuralSpan, TurnOrigin, TurnPage, TurnPrecondition,
+    TurnTarget, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
@@ -61,6 +63,79 @@ thread_local! {
     /// predecessor replay: the latter remains a separate safety proof.
     static PREPARED_EDITOR_PROJECTION_INSTRUMENTATION: std::cell::Cell<PreparedEditorProjectionInstrumentation> =
         const { std::cell::Cell::new(PreparedEditorProjectionInstrumentation::ZERO) };
+    /// Deterministic production-executor cut used by the real-store recovery
+    /// equivalence oracle. `Some(n)` permits exactly `n` page completions and
+    /// then refuses before the turn can be checkpointed.
+    static TURN_REPLAY_PAGES_BEFORE_CUT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static TURN_REPLAY_PAGE_COMPLETIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[must_use = "the production turn-replay cut must remain scoped to one cold open"]
+pub(crate) struct TurnReplayCutScope {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl Drop for TurnReplayCutScope {
+    fn drop(&mut self) {
+        TURN_REPLAY_PAGES_BEFORE_CUT.with(|cut| cut.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cut_turn_replay_after_pages_for_test(pages: usize) -> TurnReplayCutScope {
+    let previous = TURN_REPLAY_PAGES_BEFORE_CUT.with(|cut| cut.replace(Some(pages)));
+    TurnReplayCutScope { previous }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_turn_replay_page_completions_for_test() {
+    TURN_REPLAY_PAGE_COMPLETIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn turn_replay_page_completions_for_test() -> usize {
+    TURN_REPLAY_PAGE_COMPLETIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn turn_replay_page_start_for_test() -> Result<(), ProjectionError> {
+    TURN_REPLAY_PAGES_BEFORE_CUT.with(|cut| match cut.get() {
+        Some(0) => Err(ProjectionError::Work(
+            "deterministic cut during production turn replay".into(),
+        )),
+        Some(remaining) => {
+            cut.set(Some(remaining - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn turn_replay_page_start_for_test() -> Result<(), ProjectionError> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn turn_replay_page_completed_for_test() {
+    TURN_REPLAY_PAGE_COMPLETIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+fn turn_replay_page_completed_for_test() {}
+
+#[cfg(test)]
+fn turn_replay_checkpoint_boundary_for_test() -> Result<(), ProjectionError> {
+    turn_replay_page_start_for_test()
+}
+
+#[cfg(not(test))]
+fn turn_replay_checkpoint_boundary_for_test() -> Result<(), ProjectionError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1800,6 +1875,7 @@ pub(crate) fn execute_clean_manifested_projection_work(
     work: &ProjectionWork,
 ) -> Result<(), ProjectionError> {
     execute_manifested_projection_work_with_runtime(graph, receipts, engine, projection, work, None)
+        .map(|_| ())
 }
 
 pub(crate) fn execute_clean_manifested_projection_work_under_handoff(
@@ -1818,6 +1894,446 @@ pub(crate) fn execute_clean_manifested_projection_work_under_handoff(
         work,
         Some(handoff),
     )
+    .map(|_| ())
+}
+
+/// Lower accepted manifest locators into the description-only page list stored
+/// by a projection-domain turn. Archive objects are durable before every A3-A7
+/// append, so this reads authority; it does not capture graph bytes.
+pub(crate) fn projection_turn_pages_for_work(
+    engine: &ShardedHotEngine,
+    work: &[ProjectionWork],
+) -> Result<Vec<TurnPage>, ProjectionError> {
+    let archive = engine.archive_store().ok_or_else(|| {
+        ProjectionError::Archive("projection turn has no accepted archive".into())
+    })?;
+    work.iter()
+        .map(|work| {
+            let decoded = decode_manifested_projection_work(archive, work)?;
+            let manifested = decoded.manifested();
+            let precondition = decoded
+                .annotated_base()
+                .map_or(TurnPrecondition::Absent, |base| TurnPrecondition::Base {
+                    description: base.description(),
+                    bytes: None,
+                    annotations: base.annotations().to_vec(),
+                });
+            let target = match manifested.target() {
+                ManifestProjectionTarget::Absent => TurnTarget::Absent,
+                ManifestProjectionTarget::Present {
+                    description,
+                    annotations,
+                    ..
+                } => TurnTarget::Present {
+                    description: *description,
+                    bytes: None,
+                    annotations: annotations.clone(),
+                },
+            };
+            Ok(TurnPage {
+                page_id: work.page_id(),
+                path: work.path().clone(),
+                precondition,
+                target,
+                frontier: work.post_frontier().clone(),
+                claim_evidence: manifested.claim_evidence().to_vec(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn projection_turn_pages_for_foreign_sources(
+    engine: &ShardedHotEngine,
+    sources: &[ManifestedProjectionIntent],
+) -> Result<Vec<TurnPage>, ProjectionError> {
+    sources
+        .iter()
+        .map(|source| {
+            let base = authenticated_source_layout_base(engine, source)?;
+            let precondition =
+                base.map_or(TurnPrecondition::Absent, |base| TurnPrecondition::Base {
+                    description: base.description(),
+                    bytes: None,
+                    annotations: base.annotations().to_vec(),
+                });
+            let target = match source.target() {
+                ManifestProjectionTarget::Absent => TurnTarget::Absent,
+                ManifestProjectionTarget::Present {
+                    description,
+                    annotations,
+                    ..
+                } => TurnTarget::Present {
+                    description: *description,
+                    bytes: None,
+                    annotations: annotations.clone(),
+                },
+            };
+            Ok(TurnPage {
+                page_id: source.page_id(),
+                path: source.path().clone(),
+                precondition,
+                target,
+                frontier: source.post_frontier().clone(),
+                claim_evidence: source.claim_evidence().to_vec(),
+            })
+        })
+        .collect()
+}
+
+/// Step-7's pre-append probe, using the same current-state authorization and
+/// renderer as replay. It is deliberately independent of receipt completion:
+/// a reclaimed completed turn must still deduplicate on the user's exact file.
+pub(crate) fn projection_work_is_already_exact(
+    graph: &Graph,
+    engine: &mut ShardedHotEngine,
+    projection: &SqliteFrontier,
+    work: &ProjectionWork,
+) -> Result<bool, ProjectionError> {
+    let current = graph
+        .read_projection_input(work.path())
+        .map_err(ProjectionError::Io)?;
+    if let Some(bytes) = current.as_deref() {
+        let description = BlobDescription::of(bytes);
+        if projection
+            .projection_baseline_matches(work.page_id(), work.path(), description)
+            .map_err(|error| ProjectionError::Work(error.to_string()))?
+        {
+            return Ok(true);
+        }
+    }
+    if matches!(work.target(), ProjectionWorkTarget::Absent) {
+        return Ok(current.is_none());
+    }
+    let claim_source = projection
+        .materialized_read()
+        .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    let authorized = engine
+        .authorize_clean_accepted_projection_write(work.page_id(), &claim_source)
+        .map_err(ProjectionError::Engine)?;
+    let plan = plan_projection(
+        engine.workspace_id(),
+        authorized.state(),
+        current.as_deref(),
+    )?;
+    let exact = current.as_deref() == Some(plan.target());
+    if exact {
+        projection
+            .bind_projection_baseline(
+                work.page_id(),
+                work.path(),
+                BlobDescription::of(plan.target()),
+            )
+            .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    }
+    Ok(exact)
+}
+
+/// Replay one complete turn in record order. Receipts remain published and
+/// recovered by the existing page executor; they are redundant evidence and
+/// never select a different path. Every page is re-derived from the current
+/// accepted projection head, so an old turn cannot overwrite newer history.
+pub(crate) fn replay_projection_turn(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    projection: &SqliteFrontier,
+    turn: &ProjectionTurn,
+    handoff: Option<&crate::model::PublishedHandoffLatch>,
+) -> Result<(), ProjectionError> {
+    let endpoint = engine
+        .projection_endpoint_binding()
+        .ok_or(ProjectionError::EndpointBindingMismatch)?;
+    if turn.workspace_id != engine.workspace_id()
+        || turn.endpoint_id != endpoint.endpoint_id()
+        || turn.domain == SequenceDomain::ProjectionTurn
+            && turn.device_id != endpoint.device_id().as_uuid()
+    {
+        return Err(ProjectionError::EndpointBindingMismatch);
+    }
+
+    if let Some(batch_id) = turn.origin.batch_id() {
+        match engine
+            .archive_store()
+            .ok_or_else(|| {
+                ProjectionError::Archive("projection turn has no accepted archive".into())
+            })?
+            .inspect_batch(batch_id)
+            .map_err(|error| ProjectionError::Archive(error.to_string()))?
+        {
+            BatchInspection::Ready(_) => {}
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                return Err(ProjectionError::Work(
+                    "projection turn origin batch is not complete".into(),
+                ));
+            }
+        }
+    }
+
+    if let TurnOrigin::SupersededRepair { page_id, observed } = &turn.origin {
+        let page = turn
+            .pages
+            .first()
+            .ok_or(ProjectionError::WorkIntentMismatch)?;
+        if page.page_id != *page_id || turn.pages.len() != 1 {
+            return Err(ProjectionError::WorkIntentMismatch);
+        }
+        let current = graph
+            .read_projection_input(&page.path)
+            .map_err(ProjectionError::Io)?;
+        let Some(current_bytes) = current.as_deref() else {
+            return Err(ProjectionError::WorkNotReady);
+        };
+        if BlobDescription::of(current_bytes) != *observed {
+            return Err(ProjectionError::GuardedConflict(io::Error::new(
+                io::ErrorKind::Other,
+                "superseded projection repair observed externally diverged bytes",
+            )));
+        }
+        if engine
+            .authorize_clean_superseded_projection_repair(&page.path, current_bytes)
+            .map_err(ProjectionError::Engine)?
+            != Some(*page_id)
+        {
+            return Err(ProjectionError::WorkNotReady);
+        }
+    }
+
+    let current = match turn.origin.batch_id() {
+        Some(batch_id) => engine
+            .clean_projection_work_for_batch(batch_id)
+            .map_err(ProjectionError::Engine)?,
+        None => engine
+            .clean_terminal_projection_work()
+            .map_err(ProjectionError::Engine)?,
+    };
+    for page in &turn.pages {
+        turn_replay_page_start_for_test()?;
+        if matches!(
+            turn.origin,
+            TurnOrigin::IngressForeign { .. } | TurnOrigin::TerminalForeign { .. }
+        ) {
+            let batch_id = turn
+                .origin
+                .batch_id()
+                .ok_or(ProjectionError::WorkIntentMismatch)?;
+            let archive = engine.archive_store().ok_or_else(|| {
+                ProjectionError::Archive("receiver turn has no accepted archive".into())
+            })?;
+            let batch = match archive
+                .inspect_batch(batch_id)
+                .map_err(|error| ProjectionError::Archive(error.to_string()))?
+            {
+                BatchInspection::Ready(batch) => batch,
+                BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                    return Err(ProjectionError::WorkNotReady);
+                }
+            };
+            let manifest_projection = super::projection_manifest::validate_projection_object_set(
+                batch.manifest(),
+                batch.objects(),
+            )
+            .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+            let source = manifest_projection
+                .intents()
+                .iter()
+                .find(|source| {
+                    source.page_id() == page.page_id
+                        && source.path() == &page.path
+                        && source.post_frontier() == &page.frontier
+                        && match (source.target(), &page.target) {
+                            (ManifestProjectionTarget::Absent, TurnTarget::Absent) => true,
+                            (
+                                ManifestProjectionTarget::Present { description, .. },
+                                TurnTarget::Present {
+                                    description: recorded,
+                                    ..
+                                },
+                            ) => description == recorded,
+                            _ => false,
+                        }
+                })
+                .ok_or(ProjectionError::WorkIntentMismatch)?;
+            let handoff = handoff.ok_or_else(|| {
+                ProjectionError::Work("receiver projection turn requires a handoff".into())
+            })?;
+            let completed = execute_receiver_local_projection_under_handoff(
+                graph,
+                receipts,
+                engine,
+                Some(projection),
+                source,
+                handoff,
+                true,
+            )?;
+            let Some(wrote) = completed else {
+                return Err(ProjectionError::WorkNotReady);
+            };
+            if !wrote {
+                let exact = graph
+                    .read_projection_input(&page.path)
+                    .map_err(ProjectionError::Io)?;
+                handoff
+                    .rebarrier_page_projection(graph, page.path.as_str(), exact.as_deref())
+                    .map_err(ProjectionError::Io)?;
+            }
+            if let Some(bytes) = graph
+                .read_projection_input(&page.path)
+                .map_err(ProjectionError::Io)?
+            {
+                projection
+                    .bind_projection_baseline(page.page_id, &page.path, BlobDescription::of(&bytes))
+                    .map_err(|error| ProjectionError::Work(error.to_string()))?;
+            }
+            turn_replay_page_completed_for_test();
+            continue;
+        }
+        let work = current
+            .iter()
+            .find(|work| {
+                work.page_id() == page.page_id
+                    && work.path() == &page.path
+                    && work.post_frontier() == &page.frontier
+                    && match (work.target(), &page.target) {
+                        (ProjectionWorkTarget::Absent, TurnTarget::Absent) => true,
+                        (
+                            ProjectionWorkTarget::Present(work_description),
+                            TurnTarget::Present {
+                                description: turn_description,
+                                ..
+                            },
+                        ) => work_description == *turn_description,
+                        _ => false,
+                    }
+            })
+            .ok_or(ProjectionError::WorkNotReady)?;
+        let observed = graph
+            .read_projection_input(work.path())
+            .map_err(ProjectionError::Io)?;
+        let still_recorded_target = match (&page.target, observed.as_deref()) {
+            (TurnTarget::Absent, None) => true,
+            (TurnTarget::Present { description, .. }, Some(bytes)) => {
+                BlobDescription::of(bytes) == *description
+            }
+            _ => false,
+        };
+        if !still_recorded_target
+            && projection_work_is_already_exact(graph, engine, projection, work)?
+        {
+            // A newer accepted frame/merge owns this path. Re-enrol its exact
+            // current bytes in this retry's barrier group, but do not ask the
+            // stale receipt intent to validate a successor precondition.
+            match handoff {
+                Some(handoff) => handoff
+                    .rebarrier_page_projection(graph, work.path().as_str(), observed.as_deref())
+                    .map_err(ProjectionError::Io)?,
+                None => graph
+                    .rebarrier_page_projection(work.path(), observed.as_deref())
+                    .map_err(ProjectionError::Io)?,
+            }
+            continue;
+        }
+        if work.endpoint_id() == endpoint.endpoint_id() {
+            let result = execute_manifested_projection_work_with_runtime(
+                graph, receipts, engine, projection, work, handoff,
+            );
+            if let Err(ProjectionError::WorkNotReady) = result {
+                if projection_work_is_already_exact(graph, engine, projection, work)? {
+                    let exact = graph
+                        .read_projection_input(work.path())
+                        .map_err(ProjectionError::Io)?;
+                    match handoff {
+                        Some(handoff) => handoff
+                            .rebarrier_page_projection(
+                                graph,
+                                work.path().as_str(),
+                                exact.as_deref(),
+                            )
+                            .map_err(ProjectionError::Io)?,
+                        None => graph
+                            .rebarrier_page_projection(work.path(), exact.as_deref())
+                            .map_err(ProjectionError::Io)?,
+                    }
+                    continue;
+                }
+                let observed = graph
+                    .read_projection_input(work.path())
+                    .map_err(ProjectionError::Io)?;
+                let Some(observed_bytes) = observed.as_deref() else {
+                    return Err(ProjectionError::WorkNotReady);
+                };
+                if engine
+                    .authorize_clean_superseded_projection_repair(work.path(), observed_bytes)
+                    .map_err(ProjectionError::Engine)?
+                    != Some(work.page_id())
+                {
+                    return Err(ProjectionError::WorkNotReady);
+                }
+                write_projection_exact_with_handoff(
+                    graph,
+                    receipts,
+                    engine,
+                    work.page_id(),
+                    observed.as_deref(),
+                    handoff,
+                )?;
+            } else if matches!(result?, ProjectionExecution::NeedsTurnRebarrier) {
+                let exact = graph
+                    .read_projection_input(work.path())
+                    .map_err(ProjectionError::Io)?;
+                match handoff {
+                    Some(handoff) => handoff
+                        .rebarrier_page_projection(graph, work.path().as_str(), exact.as_deref())
+                        .map_err(ProjectionError::Io)?,
+                    None => graph
+                        .rebarrier_page_projection(work.path(), exact.as_deref())
+                        .map_err(ProjectionError::Io)?,
+                }
+            }
+        } else {
+            let source = {
+                let archive = engine.archive_store().ok_or_else(|| {
+                    ProjectionError::Archive("receiver turn has no accepted archive".into())
+                })?;
+                decode_manifested_projection_work(archive, work)?
+                    .manifested()
+                    .clone()
+            };
+            let handoff = handoff.ok_or_else(|| {
+                ProjectionError::Work("receiver projection turn requires a handoff".into())
+            })?;
+            let completed = execute_receiver_local_projection_under_handoff(
+                graph,
+                receipts,
+                engine,
+                Some(projection),
+                &source,
+                handoff,
+                true,
+            )?;
+            let Some(wrote) = completed else {
+                return Err(ProjectionError::WorkNotReady);
+            };
+            if !wrote {
+                let exact = graph
+                    .read_projection_input(work.path())
+                    .map_err(ProjectionError::Io)?;
+                handoff
+                    .rebarrier_page_projection(graph, work.path().as_str(), exact.as_deref())
+                    .map_err(ProjectionError::Io)?;
+            }
+        }
+        if let Some(bytes) = graph
+            .read_projection_input(work.path())
+            .map_err(ProjectionError::Io)?
+        {
+            projection
+                .bind_projection_baseline(work.page_id(), work.path(), BlobDescription::of(&bytes))
+                .map_err(|error| ProjectionError::Work(error.to_string()))?;
+        }
+        turn_replay_page_completed_for_test();
+    }
+    turn_replay_checkpoint_boundary_for_test()?;
+    Ok(())
 }
 
 /// Read-only, content-addressed decoding of one exact accepted projection work
@@ -1979,7 +2495,7 @@ fn execute_manifested_projection_work_with_runtime(
     projection: &SqliteFrontier,
     work: &ProjectionWork,
     handoff: Option<&crate::model::PublishedHandoffLatch>,
-) -> Result<(), ProjectionError> {
+) -> Result<ProjectionExecution, ProjectionError> {
     let path = work.path().as_str().to_owned();
     execute_manifested_projection_work_located(graph, receipts, engine, projection, work, handoff)
         .map_err(|error| locate_projection_failure(&path, error))
@@ -1992,7 +2508,7 @@ fn execute_manifested_projection_work_located(
     projection: &SqliteFrontier,
     work: &ProjectionWork,
     handoff: Option<&crate::model::PublishedHandoffLatch>,
-) -> Result<(), ProjectionError> {
+) -> Result<ProjectionExecution, ProjectionError> {
     let trace = super::phase_trace_enabled();
     let total_started = trace.then(std::time::Instant::now);
     macro_rules! projection_phase {
@@ -2115,13 +2631,29 @@ fn execute_manifested_projection_work_located(
     .is_some()
     {
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
-        return Ok(());
+        return Ok(ProjectionExecution::NeedsTurnRebarrier);
     }
     let attempts = projection_phase!(
         "load_attempts",
         receipts.load_attempt_reservations(&local_attempt_intent)
     )?;
     let has_attempts = !attempts.is_empty();
+    // A deletion can crash after the target's absence is durable and before
+    // either its receipt completion or owning turn checkpoint is durable. The
+    // accepted turn is sufficient authority to confirm that already-exact
+    // absence; asking `recover_removed_page_projection` for the displaced base
+    // inode would make completion evidence a prerequisite for turn replay.
+    let deletion_is_already_exact = if target.is_none() {
+        projection_phase!(
+            "read_deleted_projection_input",
+            graph
+                .read_projection_input(work.path())
+                .map_err(ProjectionError::Io)
+        )?
+        .is_none()
+    } else {
+        false
+    };
     let recovery_result = if !has_attempts {
         None
     } else {
@@ -2142,6 +2674,11 @@ fn execute_manifested_projection_work_located(
                 &guarded_layout,
                 &mut authority,
             ),
+            (Some(handoff), None) if deletion_is_already_exact => handoff
+                .confirm_removed_page_projection(graph, manifested.path().as_str(), &mut authority),
+            (None, None) if deletion_is_already_exact => {
+                graph.confirm_removed_page_projection(manifested.path().as_str(), &mut authority)
+            }
             (Some(handoff), None) => {
                 let base = expected_base
                     .as_ref()
@@ -2324,7 +2861,13 @@ fn execute_manifested_projection_work_located(
             started.elapsed().as_secs_f64() * 1_000.0,
         );
     }
-    Ok(())
+    Ok(ProjectionExecution::BarrierTaken)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectionExecution {
+    BarrierTaken,
+    NeedsTurnRebarrier,
 }
 
 /// Publish intent/base evidence, invoke the singular guarded graph writer, and
@@ -2336,6 +2879,20 @@ pub fn write_projection_exact(
     page_id: PageId,
     expected_base: Option<&[u8]>,
 ) -> Result<ProjectionWrite, ProjectionError> {
+    write_projection_exact_with_handoff(graph, store, engine, page_id, expected_base, None)
+}
+
+/// Re-render a superseded accepted page without abandoning the projection
+/// turn's already-published graph-text reservation. The ordinary public entry
+/// point passes no handoff; turn replay must pass the latch that owns the turn.
+fn write_projection_exact_with_handoff(
+    graph: &Graph,
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    page_id: PageId,
+    expected_base: Option<&[u8]>,
+    handoff: Option<&crate::model::PublishedHandoffLatch>,
+) -> Result<ProjectionWrite, ProjectionError> {
     require_endpoint_authority(graph, store, engine)?;
     retire_pending_projection_recovery(graph, store)?;
     let authorization = engine.authorize_projection_write(page_id)?;
@@ -2343,13 +2900,23 @@ pub fn write_projection_exact(
     store.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
     let reservation = store.reserve_attempt(plan.intent())?;
     let mut authority = store.begin_mutation(plan.intent(), Some(&reservation))?;
-    let proof = graph.write_page_projection_with_layout(
-        plan.intent().path().as_str(),
-        expected_base,
-        plan.target(),
-        plan.guarded_layout(),
-        &mut authority,
-    )?;
+    let proof = match handoff {
+        Some(handoff) => handoff.write_page_projection_with_layout(
+            graph,
+            plan.intent().path().as_str(),
+            expected_base,
+            plan.target(),
+            plan.guarded_layout(),
+            &mut authority,
+        ),
+        None => graph.write_page_projection_with_layout(
+            plan.intent().path().as_str(),
+            expected_base,
+            plan.target(),
+            plan.guarded_layout(),
+            &mut authority,
+        ),
+    }?;
     let completion = store.publish_completion(authority, plan.intent(), &proof)?;
     retire_completed_projection_recovery(graph, store, plan.intent())?;
     record_completed_path(store, engine, page_id, plan.intent())?;

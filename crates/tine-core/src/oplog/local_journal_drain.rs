@@ -6,7 +6,7 @@
 //! archive, accepted-history, tail/SQLite, projection-receipt, authorship, and
 //! provider derivatives of that exact record.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use tine_storage::{LocalJournalError, LocalJournalFrame};
@@ -688,7 +688,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             "journal projection authority differs from the enrolled graph/receipt endpoint",
         );
     }
-    let mut projection_superseded = BTreeMap::new();
+    let mut projection_superseded = BTreeSet::new();
     for projection in record.projections() {
         let intent = projection.intent();
         let exact_target = intent.target().bytes();
@@ -740,7 +740,9 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             }
             Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
         };
-        projection_superseded.insert(intent.path().as_str().to_owned(), superseded);
+        if superseded {
+            projection_superseded.insert(intent.path().clone());
+        }
     }
 
     let archive = match engine
@@ -1037,43 +1039,52 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
             error.to_string(),
         );
     }
-    for projection in record.projections() {
-        let intent = projection.intent();
-        let exact_target = intent.target().bytes();
-        let expected_work = match exact_work(&record, projection, endpoint) {
-            Ok(work) => work,
-            Err(error) => return conflict(ManagedLocalDrainStage::ProjectionAdoption, error),
+    let mut turn = match projection_turn_from_managed_local_record(
+        frame.device_id(),
+        checkpoint.lineage_digest(),
+        &record,
+    ) {
+        Ok(turn) => turn,
+        Err(error) => {
+            return conflict(
+                ManagedLocalDrainStage::ProjectionAdoption,
+                error.to_string(),
+            )
+        }
+    };
+    // A later authenticated foreground frame for this path is itself queued
+    // and will replay as its own turn. The older record must not validate its
+    // stale receipt precondition against the newer editor publication.
+    turn.pages
+        .retain(|page| !projection_superseded.contains(&page.path));
+    if let Err(error) = crate::oplog::projection::replay_projection_turn(
+        graph, receipts, engine, database, &turn, None,
+    ) {
+        let conflicts = record.projections().iter().any(|projection| {
+            let intent = projection.intent();
+            let exact_target = intent.target().bytes();
+            matches!(
+                graph.read_projection_input(intent.path()),
+                Ok(Some(bytes))
+                    if exact_target.is_none_or(|target| bytes != target)
+                        && projection
+                            .precondition_base()
+                            .is_none_or(|base| bytes != base.bytes())
+            )
+        });
+        return if conflicts {
+            conflict(
+                ManagedLocalDrainStage::ProjectionAdoption,
+                error.to_string(),
+            )
+        } else {
+            pending_with_detail(
+                ManagedLocalDrainStage::ProjectionAdoption,
+                frame,
+                &record,
+                error.to_string(),
+            )
         };
-        if projection_superseded
-            .get(intent.path().as_str())
-            .copied()
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        if let Err(error) = crate::oplog::projection::execute_clean_manifested_projection_work(
-            graph,
-            receipts,
-            database,
-            engine,
-            &expected_work,
-        ) {
-            let current = graph.read_projection_input(intent.path());
-            let conflicts = matches!(current, Ok(Some(bytes)) if exact_target.is_none_or(|target| bytes != target) && projection.precondition_base().is_none_or(|base| bytes != base.bytes()));
-            return if conflicts {
-                conflict(
-                    ManagedLocalDrainStage::ProjectionAdoption,
-                    error.to_string(),
-                )
-            } else {
-                pending_with_detail(
-                    ManagedLocalDrainStage::ProjectionAdoption,
-                    frame,
-                    &record,
-                    error.to_string(),
-                )
-            };
-        }
     }
     work_done.projection_work_point_reads = record.projections().len();
     if drain_fault!(AfterProjectionAdoption) {

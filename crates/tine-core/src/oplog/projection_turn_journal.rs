@@ -27,11 +27,13 @@
 //! `tests::no_production_path_opens_or_appends_a_projection_turn` is the
 //! architectural fact that says so, and it fails the moment a caller appears.
 
+use std::collections::VecDeque;
+
 use cap_std::fs::Dir;
 use tine_storage::formats::LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION;
 use tine_storage::{
     ContentDigest, DurableDirectoryPublication, LineageDigest, LocalJournalError,
-    LocalJournalFrame, LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
+    LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
 };
 use uuid::Uuid;
 
@@ -40,7 +42,10 @@ use super::local_journal_drain::{
 };
 use super::object_store::{ensure_directory_nofollow, open_dir_nofollow, read_optional_regular};
 use super::sync_layout::MANAGED_LOCAL_JOURNAL_DIR;
-use super::{ProjectionEndpointId, ProjectionTurn, ProjectionTurnPayloadKind, WorkspaceId};
+use super::{
+    ProjectionEndpointId, ProjectionTurn, ProjectionTurnPayloadKind, SequenceDomain, TurnOrigin,
+    TurnPage, WorkspaceId, PROJECTION_TURN_DERIVATION_SCHEME_V1, PROJECTION_TURN_SCHEMA_VERSION,
+};
 
 /// Sibling of the foreground journal's `clean-workspace-…` directory, under the
 /// same namespace.
@@ -475,8 +480,9 @@ pub(crate) struct ProjectionTurnJournalState {
     pub(crate) selector_generation: u64,
     pub(crate) journal: LocalJournalSegmentV2<ProjectionTurnPayloadKind>,
     pub(crate) checkpoint: ProjectionTurnCheckpoint,
-    /// Frames strictly after the checkpoint: everything still owed.
-    pub(crate) frames: Vec<LocalJournalFrame<ProjectionTurnPayloadKind>>,
+    /// Turns strictly after the checkpoint: everything still owed. Open-time
+    /// frames are decoded once, while live appends enter the identical queue.
+    pending: VecDeque<ProjectionTurn>,
     /// Whether an older selector generation's anchor is still present.
     pub(crate) cleanup_pending: bool,
 }
@@ -488,7 +494,7 @@ impl std::fmt::Debug for ProjectionTurnJournalState {
             .field("selector_generation", &self.selector_generation)
             .field("next_sequence", &self.journal.next_sequence())
             .field("checkpoint", &self.checkpoint)
-            .field("undrained_frames", &self.frames.len())
+            .field("undrained_turns", &self.pending.len())
             .field("cleanup_pending", &self.cleanup_pending)
             .finish()
     }
@@ -499,13 +505,78 @@ impl ProjectionTurnJournalState {
     pub(crate) fn undrained_turns(
         &self,
     ) -> Result<Vec<ProjectionTurn>, ProjectionTurnJournalError> {
-        self.frames
+        Ok(self.pending.iter().cloned().collect())
+    }
+
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn front(&self) -> Option<&ProjectionTurn> {
+        self.pending.front()
+    }
+
+    pub(crate) fn retains_batch(&self, batch_id: super::BatchId) -> bool {
+        self.pending
             .iter()
-            .map(|frame| {
-                decode_projection_turn_frame(frame)
-                    .map_err(|error| ProjectionTurnJournalError::Invalid(error.to_string()))
-            })
-            .collect()
+            .any(|turn| turn.origin.batch_id() == Some(batch_id))
+    }
+
+    /// Append one projection-domain turn before any graph mutation it
+    /// authorizes. The segment supplies the sequence; all remaining bindings
+    /// come from the authenticated checkpoint opened for this endpoint.
+    pub(crate) fn append(
+        &mut self,
+        origin: TurnOrigin,
+        pages: Vec<TurnPage>,
+    ) -> Result<ProjectionTurn, ProjectionTurnJournalError> {
+        let turn = ProjectionTurn {
+            schema_version: PROJECTION_TURN_SCHEMA_VERSION,
+            derivation_scheme: PROJECTION_TURN_DERIVATION_SCHEME_V1,
+            workspace_id: self.checkpoint.workspace_id(),
+            lineage_digest: self.checkpoint.lineage_digest(),
+            device_id: self.checkpoint.device_id(),
+            endpoint_id: self.checkpoint.endpoint_id(),
+            sequence: self.journal.next_sequence(),
+            domain: SequenceDomain::ProjectionTurn,
+            origin,
+            pages,
+        };
+        let payload = turn
+            .encode()
+            .map_err(|error| ProjectionTurnJournalError::Invalid(error.to_string()))?;
+        self.journal
+            .append(ProjectionTurnPayloadKind::TurnV1, &payload)
+            .map_err(|error| {
+                ProjectionTurnJournalError::Invalid(format!(
+                    "projection turn append outcome is unknown: {error}"
+                ))
+            })?;
+        self.pending.push_back(turn.clone());
+        Ok(turn)
+    }
+
+    /// Advance exactly one independent projection-turn prefix. The durable
+    /// checkpoint is published before the in-memory queue forgets the turn.
+    pub(crate) fn checkpoint_front(&mut self) -> Result<ProjectionTurn, String> {
+        let turn = self
+            .pending
+            .front()
+            .ok_or_else(|| "projection turn checkpoint has no pending turn".to_owned())?;
+        if turn.sequence != self.checkpoint.next_sequence() {
+            return Err(format!(
+                "projection turn queue is out of order: expected {}, found {}",
+                self.checkpoint.next_sequence(),
+                turn.sequence
+            ));
+        }
+        let checkpoint = self.checkpoint.advanced_to(turn.sequence.saturating_add(1));
+        persist_projection_turn_checkpoint(&self.directory, &checkpoint)?;
+        self.checkpoint = checkpoint;
+        Ok(self
+            .pending
+            .pop_front()
+            .expect("checked projection turn front"))
     }
 }
 
@@ -669,13 +740,20 @@ pub(crate) fn open_projection_turn_journal(
         ));
     }
     let frames = recovered_frames.split_off(checkpointed);
+    let pending = frames
+        .iter()
+        .map(|frame| {
+            decode_projection_turn_frame(frame)
+                .map_err(|error| ProjectionTurnJournalError::Invalid(error.to_string()))
+        })
+        .collect::<Result<VecDeque<_>, _>>()?;
 
     Ok(ProjectionTurnJournalState {
         directory,
         selector_generation,
         journal,
         checkpoint,
-        frames,
+        pending,
         cleanup_pending: !anchors.is_empty(),
     })
 }
@@ -824,6 +902,7 @@ fn read_lineage_digest(bytes: &[u8], offset: usize) -> Result<LineageDigest, Str
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1175,7 +1254,7 @@ mod tests {
         let state = open(root.path()).unwrap();
         assert_eq!(state.checkpoint.next_sequence(), 0);
         assert_eq!(state.journal.next_sequence(), 0);
-        assert!(state.frames.is_empty());
+        assert!(state.pending.is_empty());
         assert!(!state.cleanup_pending);
         drop(state);
 
@@ -1335,34 +1414,233 @@ mod tests {
         drop(held);
     }
 
-    // ---- architectural facts ----------------------------------------------
+    // ---- supplemental receipt/turn state-machine model -------------------
+    //
+    // This cheap model checks schedule generation and expected state-machine
+    // agreement only. The §8.2 license is the real-store production-protocol
+    // oracle in `sync_runtime::tests`; a BTreeMap model cannot provide it.
 
-    /// Packet 1 ships alone: the turn machinery exists, and nothing in
-    /// production writes or reads a turn. When a producer lands (packet 2a),
-    /// this test is the reminder to update the contract with it.
-    #[test]
-    fn no_production_path_opens_or_appends_a_projection_turn() {
-        let sources: [(&str, &str); 4] = [
-            ("sync_runtime.rs", include_str!("../sync_runtime.rs")),
-            ("model.rs", include_str!("../model.rs")),
-            (
-                "oplog/operational_coordinator.rs",
-                include_str!("operational_coordinator.rs"),
-            ),
-            ("oplog/projection.rs", include_str!("projection.rs")),
-        ];
-        for (name, source) in sources {
-            for symbol in [
-                "open_projection_turn_journal",
-                "ProjectionTurnPayloadKind",
-                "persist_projection_turn_checkpoint",
-            ] {
-                assert!(
-                    !source.contains(symbol),
-                    "{name} references {symbol}: a turn producer has landed, so the \
-                     storage contract and this guard must be updated together"
+    #[derive(Clone, Debug)]
+    struct OracleCase {
+        feature: &'static str,
+        base: BTreeMap<&'static str, Option<&'static str>>,
+        target: BTreeMap<&'static str, Option<&'static str>>,
+        valid: bool,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct OracleSchedule {
+        written_prefix: usize,
+        completed_receipt_prefix: usize,
+        checkpointed: bool,
+        external_winner: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum OracleOutcome {
+        Converged(BTreeMap<&'static str, Option<&'static str>>),
+        GuardedConflict(BTreeMap<&'static str, Option<&'static str>>),
+        InvalidSemanticInput(BTreeMap<&'static str, Option<&'static str>>),
+    }
+
+    fn map(
+        entries: &[(&'static str, Option<&'static str>)],
+    ) -> BTreeMap<&'static str, Option<&'static str>> {
+        entries.iter().copied().collect()
+    }
+
+    fn oracle_corpus() -> Vec<OracleCase> {
+        vec![
+            OracleCase {
+                feature: "create",
+                base: map(&[("pages/Create.md", None)]),
+                target: map(&[("pages/Create.md", Some("- created\n"))]),
+                valid: true,
+            },
+            OracleCase {
+                feature: "edit",
+                base: map(&[("pages/Edit.md", Some("- before\n"))]),
+                target: map(&[("pages/Edit.md", Some("- after\n"))]),
+                valid: true,
+            },
+            OracleCase {
+                feature: "delete",
+                base: map(&[("pages/Delete.md", Some("- remove me\n"))]),
+                target: map(&[("pages/Delete.md", None)]),
+                valid: true,
+            },
+            OracleCase {
+                feature: "cross-page move",
+                base: map(&[
+                    ("pages/Move Source.md", Some("- movable\n")),
+                    ("pages/Move Target.md", Some("- target\n")),
+                ]),
+                target: map(&[
+                    ("pages/Move Source.md", Some("- source\n")),
+                    ("pages/Move Target.md", Some("- target\n- movable\n")),
+                ]),
+                valid: true,
+            },
+            OracleCase {
+                feature: "namespaced path",
+                base: map(&[("pages/team___plans.md", Some("- v1\n"))]),
+                target: map(&[("pages/team___plans.md", Some("- v2\n"))]),
+                valid: true,
+            },
+            OracleCase {
+                feature: "NFC-NFD twin",
+                base: map(&[
+                    ("pages/Café.md", Some("- composed\n")),
+                    ("pages/Cafe\u{301}.md", Some("- decomposed\n")),
+                ]),
+                target: map(&[
+                    ("pages/Café.md", Some("- composed edited\n")),
+                    ("pages/Cafe\u{301}.md", Some("- decomposed edited\n")),
+                ]),
+                valid: true,
+            },
+            OracleCase {
+                feature: "title property page",
+                base: map(&[("pages/slug.md", Some("title:: Display\n- old\n"))]),
+                target: map(&[("pages/slug.md", Some("title:: Display\n- new\n"))]),
+                valid: true,
+            },
+            OracleCase {
+                feature: "missing parent",
+                base: map(&[("pages/Missing Parent.md", Some("- child\n"))]),
+                target: map(&[("pages/Missing Parent.md", Some("- orphaned child\n"))]),
+                valid: false,
+            },
+        ]
+    }
+
+    fn schedule(seed: &mut u64, pages: usize) -> OracleSchedule {
+        let mut next = || {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        };
+        let written_prefix = (next() as usize) % (pages + 1);
+        let completed_receipt_prefix = (next() as usize) % (written_prefix + 1);
+        let checkpointed = written_prefix == pages && next() & 3 == 0;
+        OracleSchedule {
+            written_prefix,
+            completed_receipt_prefix,
+            checkpointed,
+            external_winner: !checkpointed && next() % 7 == 0,
+        }
+    }
+
+    fn crashed_graph(
+        case: &OracleCase,
+        schedule: OracleSchedule,
+    ) -> BTreeMap<&'static str, Option<&'static str>> {
+        let mut graph = case.base.clone();
+        for (path, target) in case.target.iter().take(schedule.written_prefix) {
+            graph.insert(path, *target);
+        }
+        if schedule.external_winner {
+            let path = *case.target.keys().next().unwrap();
+            graph.insert(path, Some("- external winner\n"));
+        }
+        graph
+    }
+
+    fn receipt_recovery(case: &OracleCase, schedule: OracleSchedule) -> OracleOutcome {
+        let mut graph = crashed_graph(case, schedule);
+        if !case.valid {
+            return OracleOutcome::InvalidSemanticInput(graph);
+        }
+        if schedule.checkpointed {
+            return OracleOutcome::Converged(graph);
+        }
+        for (index, (path, target)) in case.target.iter().enumerate() {
+            if index < schedule.completed_receipt_prefix && graph.get(path) == Some(target) {
+                continue;
+            }
+            let base = case.base.get(path).copied().flatten();
+            let current = graph.get(path).copied().flatten();
+            if current != base && current != *target {
+                return OracleOutcome::GuardedConflict(graph);
+            }
+            graph.insert(path, *target);
+        }
+        OracleOutcome::Converged(graph)
+    }
+
+    fn turn_recovery(case: &OracleCase, schedule: OracleSchedule) -> OracleOutcome {
+        let mut graph = crashed_graph(case, schedule);
+        if !case.valid {
+            return OracleOutcome::InvalidSemanticInput(graph);
+        }
+        if schedule.checkpointed {
+            return OracleOutcome::Converged(graph);
+        }
+        // Turn replay deliberately ignores receipt completion. It walks every
+        // page in record order, re-proves already-exact pages, and derives the
+        // desired bytes from the current accepted semantic target.
+        for (path, target) in &case.target {
+            let base = case.base.get(path).copied().flatten();
+            let current = graph.get(path).copied().flatten();
+            if current != base && current != *target {
+                return OracleOutcome::GuardedConflict(graph);
+            }
+            graph.insert(path, *target);
+        }
+        OracleOutcome::Converged(graph)
+    }
+
+    fn run_equivalence_oracle(schedules_per_case: usize) {
+        let mut seed = 0x2a20_2608_26d0_0d5eu64;
+        let corpus = oracle_corpus();
+        for case in &corpus {
+            for ordinal in 0..schedules_per_case {
+                let schedule = schedule(&mut seed, case.target.len());
+                assert_eq!(
+                    receipt_recovery(case, schedule),
+                    turn_recovery(case, schedule),
+                    "agreement failure for {} schedule {ordinal}: {schedule:?}",
+                    case.feature
                 );
             }
         }
+    }
+
+    #[test]
+    fn projection_recovery_state_machine_model_agreement_subset() {
+        run_equivalence_oracle(3);
+    }
+
+    #[test]
+    #[ignore = "full seeded 8-feature × 25-schedule agreement oracle"]
+    fn projection_recovery_state_machine_model_agreement_200_cases() {
+        run_equivalence_oracle(25);
+    }
+
+    // ---- architectural facts ----------------------------------------------
+
+    #[test]
+    fn every_projection_only_producer_reaches_the_projection_turn_journal() {
+        let runtime = include_str!("../sync_runtime.rs");
+        let coordinator = include_str!("operational_coordinator.rs");
+        let projection = include_str!("projection.rs");
+        for origin in [
+            "IngressLocal",
+            "IngressForeign",
+            "TerminalLocal",
+            "TerminalForeign",
+            "SupersededRepair",
+        ] {
+            assert!(
+                runtime.contains(origin) || coordinator.contains(origin),
+                "projection-only producer {origin} is not wired to production"
+            );
+        }
+        assert!(runtime.contains("open_projection_turn_journal"));
+        assert!(runtime.contains("drain_open_managed_local_journal"));
+        assert!(runtime.contains("drain_open_projection_turn_journal"));
+        assert!(projection.contains("replay_projection_turn"));
+        assert!(coordinator.contains("turns.append(origin, pages)"));
     }
 }

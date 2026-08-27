@@ -20,6 +20,7 @@ use super::local_active::{
     CleanRuntimeSession, LocalRuntimeAdmission, RuntimePromotionError, RuntimeRevocation,
     WorkspaceAuthorityBoundary, WorkspaceAuthorityRefusal,
 };
+use super::projection_turn_journal::ProjectionTurnJournalState;
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
     ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, LineageDigest, ObjectStore,
@@ -464,6 +465,7 @@ pub(crate) struct CleanPublishedContinuation {
     batch_id: BatchId,
     identity: super::sqlite::PreparedSqliteIdentityTransition,
     failure: OperationalCoordinatorError,
+    projection_turn_ingress: bool,
 }
 
 impl CleanPublishedContinuation {
@@ -473,6 +475,10 @@ impl CleanPublishedContinuation {
 
     pub(crate) fn failure(&self) -> &OperationalCoordinatorError {
         &self.failure
+    }
+
+    pub(crate) const fn projection_turn_ingress(&self) -> bool {
+        self.projection_turn_ingress
     }
 }
 
@@ -563,6 +569,7 @@ fn execute_clean_local_inner(
                     batch_id,
                     identity,
                     failure,
+                    projection_turn_ingress: false,
                 },
             ));
         }
@@ -578,6 +585,7 @@ fn execute_clean_local_inner(
         guard: published,
         batch_id,
         identity,
+        projection_turn_ingress: false,
         failure: OperationalCoordinatorError::new(
             OperationalPhase::SqliteDrain,
             "durable clean operation is awaiting derived-state application",
@@ -587,7 +595,15 @@ fn execute_clean_local_inner(
         continuation.failure = error;
         return Ok(CleanLocalMutationState::DurablePending(continuation));
     }
-    match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+    match resume_clean_published(
+        &admission,
+        graph,
+        receipts,
+        engine,
+        database,
+        &continuation,
+        None,
+    ) {
         Ok(()) => {
             continuation.guard.complete();
             Ok(CleanLocalMutationState::Complete(batch_id))
@@ -641,7 +657,33 @@ impl OperationalCoordinator {
         session: &mut CleanRuntimeSession<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+        continuation: CleanPublishedContinuation,
+    ) -> CleanLocalMutationState {
+        Self::retry_clean_local_inner(session, graph, receipts, continuation, None)
+    }
+
+    pub(crate) fn retry_clean_local_with_turns(
+        session: &mut CleanRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        continuation: CleanPublishedContinuation,
+        projection_turns: &mut ProjectionTurnJournalState,
+    ) -> CleanLocalMutationState {
+        Self::retry_clean_local_inner(
+            session,
+            graph,
+            receipts,
+            continuation,
+            Some(projection_turns),
+        )
+    }
+
+    fn retry_clean_local_inner(
+        session: &mut CleanRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
         mut continuation: CleanPublishedContinuation,
+        projection_turns: Option<&mut ProjectionTurnJournalState>,
     ) -> CleanLocalMutationState {
         let (admission, engine, database) = match session.parts() {
             Ok(parts) => parts,
@@ -651,7 +693,15 @@ impl OperationalCoordinator {
                 return CleanLocalMutationState::DurablePending(continuation);
             }
         };
-        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+        match resume_clean_published(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            &continuation,
+            projection_turns,
+        ) {
             Ok(()) => {
                 let batch_id = continuation.batch_id;
                 continuation.guard.complete();
@@ -672,6 +722,7 @@ impl OperationalCoordinator {
         session: &mut CleanRuntimeSession<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+        projection_turns: &mut ProjectionTurnJournalState,
         prepared: &PreparedBatch,
     ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
         let (admission, engine, database) = session.parts().map_err(|refusal| {
@@ -736,6 +787,7 @@ impl OperationalCoordinator {
                         batch_id,
                         identity,
                         failure,
+                        projection_turn_ingress: true,
                     },
                 ));
             }
@@ -751,6 +803,7 @@ impl OperationalCoordinator {
             guard: published,
             batch_id,
             identity,
+            projection_turn_ingress: true,
             failure: OperationalCoordinatorError::new(
                 OperationalPhase::SqliteDrain,
                 "durable clean provider operation is awaiting derived-state application",
@@ -761,7 +814,15 @@ impl OperationalCoordinator {
             continuation.failure = error;
             return Ok(CleanLocalMutationState::DurablePending(continuation));
         }
-        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+        match resume_clean_published(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            &continuation,
+            Some(projection_turns),
+        ) {
             Ok(()) => {
                 continuation.guard.complete();
                 Ok(CleanLocalMutationState::Complete(batch_id))
@@ -915,6 +976,7 @@ impl OperationalCoordinator {
                         batch_id,
                         identity,
                         failure,
+                        projection_turn_ingress: false,
                     },
                 ));
             }
@@ -930,6 +992,7 @@ impl OperationalCoordinator {
             guard: published,
             batch_id,
             identity,
+            projection_turn_ingress: false,
             failure: OperationalCoordinatorError::new(
                 OperationalPhase::SqliteDrain,
                 "durable clean external operation is awaiting derived-state application",
@@ -939,7 +1002,15 @@ impl OperationalCoordinator {
             continuation.failure = error;
             return Ok(CleanExternalMutationState::DurablePending(continuation));
         }
-        match resume_clean_published(&admission, graph, receipts, engine, database, &continuation) {
+        match resume_clean_published(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            &continuation,
+            None,
+        ) {
             Ok(()) => {
                 continuation.guard.complete();
                 Ok(CleanExternalMutationState::Complete(batch_id))
@@ -1204,6 +1275,7 @@ fn resume_clean_published(
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
     continuation: &CleanPublishedContinuation,
+    projection_turns: Option<&mut ProjectionTurnJournalState>,
 ) -> Result<(), OperationalCoordinatorError> {
     authorize_coordinator(admission, graph, engine)?;
     let event = AcceptedBatchEvent::from_accepted(
@@ -1252,6 +1324,137 @@ fn resume_clean_published(
             OperationalPhase::SqliteDrain,
             "clean SQLite frontier is neither before nor after the durable operation",
         ));
+    }
+
+    if continuation.projection_turn_ingress {
+        let turns = projection_turns.ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::ProjectionDrain,
+                "clean provider continuation has no projection-turn journal",
+            )
+        })?;
+        let work = engine
+            .clean_projection_work_for_batch(continuation.batch_id)
+            .map_err(|error| {
+                OperationalCoordinatorError::retained_block(
+                    OperationalPhase::ProjectionDrain,
+                    error.to_string(),
+                    RetainedBlockReason::PublishedAuthentication,
+                )
+            })?;
+        if !turns.retains_batch(continuation.batch_id) {
+            let receiver = engine
+                .projection_endpoint_binding()
+                .ok_or_else(|| {
+                    OperationalCoordinatorError::new(
+                        OperationalPhase::ProjectionDrain,
+                        "clean provider receiver has no enrolled projection endpoint",
+                    )
+                })?
+                .endpoint_id();
+            let archive = engine.archive_store().ok_or_else(|| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    "clean provider continuation has no accepted archive",
+                )
+            })?;
+            let batch = match archive
+                .inspect_batch(continuation.batch_id)
+                .map_err(|error| {
+                    OperationalCoordinatorError::new(
+                        OperationalPhase::ProjectionDrain,
+                        error.to_string(),
+                    )
+                })? {
+                BatchInspection::Ready(batch) => batch,
+                BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                    return Err(OperationalCoordinatorError::new(
+                        OperationalPhase::ProjectionDrain,
+                        "clean provider continuation batch is incomplete",
+                    ));
+                }
+            };
+            let projection = super::projection_manifest::validate_projection_object_set(
+                batch.manifest(),
+                batch.objects(),
+            )
+            .map_err(|error| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    error.to_string(),
+                )
+            })?;
+            let foreign = projection
+                .intents()
+                .iter()
+                .filter(|source| source.source_endpoint_id() != receiver)
+                .cloned()
+                .collect::<Vec<_>>();
+            let (origin, pages) = if let Some(source) = foreign.first() {
+                (
+                    super::TurnOrigin::IngressForeign {
+                        batch_id: continuation.batch_id,
+                        source_endpoint_id: source.source_endpoint_id(),
+                    },
+                    super::projection::projection_turn_pages_for_foreign_sources(engine, &foreign)
+                        .map_err(|error| {
+                            OperationalCoordinatorError::new(
+                                OperationalPhase::ProjectionDrain,
+                                error.to_string(),
+                            )
+                        })?,
+                )
+            } else {
+                (
+                    super::TurnOrigin::IngressLocal {
+                        batch_id: continuation.batch_id,
+                    },
+                    super::projection::projection_turn_pages_for_work(engine, &work).map_err(
+                        |error| {
+                            OperationalCoordinatorError::new(
+                                OperationalPhase::ProjectionDrain,
+                                error.to_string(),
+                            )
+                        },
+                    )?,
+                )
+            };
+            if !pages.is_empty() {
+                turns.append(origin, pages).map_err(|error| {
+                    OperationalCoordinatorError::new(
+                        OperationalPhase::ProjectionDrain,
+                        error.to_string(),
+                    )
+                })?;
+            }
+        }
+        while let Some(turn) = turns.front().cloned() {
+            reprove_workspace_authority(
+                admission,
+                WorkspaceAuthorityBoundary::ProjectionDrain,
+                OperationalPhase::ProjectionDrain,
+            )?;
+            fault(OperationalFaultPoint::BeforeProjection)?;
+            super::projection::replay_projection_turn(
+                graph,
+                receipts,
+                engine,
+                database,
+                &turn,
+                Some(&continuation.guard),
+            )
+            .map_err(|error| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    error.to_string(),
+                )
+            })?;
+            turns.checkpoint_front().map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error)
+            })?;
+            fault(OperationalFaultPoint::AfterProjection)?;
+        }
+        return Ok(());
     }
 
     for work in engine

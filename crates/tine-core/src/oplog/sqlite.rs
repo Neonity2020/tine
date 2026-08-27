@@ -50,8 +50,7 @@ use cap_std::fs::MetadataExt as CapMetadataExt;
 use cap_std::fs::OpenOptions as CapOpenOptions;
 use cap_std::{ambient_authority, fs::Dir as CapDir};
 use fs2::FileExt as _;
-#[cfg(test)]
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tine_storage::sqlite::{
     self as storage_frontier, PhysicalFileCheckpoint, PhysicalSqliteDatabase, SqliteFileSet,
@@ -94,13 +93,13 @@ use super::sync_layout::{
     SQLITE_WORKSPACES_DIR as SQLITE_WORKSPACE_LEASE_NAMESPACE,
 };
 use super::{
-    BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
-    DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName, LogseqUuid,
-    LogseqUuidResolution, ObjectKind, ObjectStore, OperationBatch, PageId, PageState,
-    PreparedBatch, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticEffect, SemanticEffectDigest,
-    ShardedHotEngine, ValidatedBatch, WorkspaceId, WorkspaceStatus, MANAGED_ENTITY_SET_VERSION,
-    MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
-    OPLOG_PROTOCOL_VERSION,
+    BatchCausalDot, BatchId, BatchInspection, BlobDescription, BlockId, CausalPeerId,
+    ContentDigest, DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName,
+    LogseqUuid, LogseqUuidResolution, ManagedPath, ObjectKind, ObjectStore, OperationBatch, PageId,
+    PageState, PreparedBatch, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticEffect,
+    SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId, WorkspaceStatus,
+    MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION,
+    OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = tine_storage::formats::SQLITE_APPLICATION_ID;
@@ -109,6 +108,13 @@ pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
 const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+
+fn encode_projection_baseline(description: BlobDescription) -> [u8; 40] {
+    let mut encoded = [0_u8; 40];
+    encoded[..32].copy_from_slice(description.sha256());
+    encoded[32..].copy_from_slice(&description.byte_length().to_be_bytes());
+    encoded
+}
 /// Bounded current-path catalog page size for terminal construction. The rows
 /// are drained into materialization chunks, so this only caps how many
 /// authenticated catalog rows the builder owns at once.
@@ -4805,6 +4811,99 @@ impl SqliteFrontier {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Ensure the disposable projection-baseline acceleration exists. This is
+    /// deliberately outside the authenticated materialization schema: loss or
+    /// rebuild costs one render-and-bind, never authority or a graph rewrite.
+    pub(crate) fn ensure_projection_baseline_digest_column(&self) -> Result<(), ProjectionError> {
+        let connection = Connection::open(&self.path)
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS projection_baselines (\
+                    page_id TEXT PRIMARY KEY NOT NULL, \
+                    path TEXT NOT NULL, \
+                    projection_baseline_digest BLOB NOT NULL, \
+                    accepted_frontier_digest BLOB NOT NULL\
+                ) STRICT;",
+            )
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+    }
+
+    pub(crate) fn projection_baseline_matches(
+        &self,
+        page_id: PageId,
+        path: &ManagedPath,
+        description: BlobDescription,
+    ) -> Result<bool, ProjectionError> {
+        let connection = Connection::open(&self.path)
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        let baseline = encode_projection_baseline(description);
+        let matched = connection
+            .query_row(
+                "SELECT 1 FROM projection_baselines \
+                 WHERE page_id = ?1 AND path = ?2 \
+                   AND projection_baseline_digest = ?3 \
+                   AND accepted_frontier_digest = ?4",
+                params![
+                    page_id.to_string(),
+                    path.as_str(),
+                    baseline,
+                    &self.required_frontier_digest.as_bytes()[..]
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?
+            .is_some();
+        Ok(matched)
+    }
+
+    pub(crate) fn bind_projection_baseline(
+        &self,
+        page_id: PageId,
+        path: &ManagedPath,
+        description: BlobDescription,
+    ) -> Result<(), ProjectionError> {
+        let connection = Connection::open(&self.path)
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        connection
+            .execute(
+                "INSERT INTO projection_baselines \
+                    (page_id, path, projection_baseline_digest, accepted_frontier_digest) \
+                    VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(page_id) DO UPDATE SET \
+                    path = excluded.path, \
+                    projection_baseline_digest = excluded.projection_baseline_digest, \
+                    accepted_frontier_digest = excluded.accepted_frontier_digest",
+                params![
+                    page_id.to_string(),
+                    path.as_str(),
+                    encode_projection_baseline(description),
+                    &self.required_frontier_digest.as_bytes()[..]
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_projection_baselines_for_test(&self) {
+        let connection = Connection::open(&self.path).unwrap();
+        connection
+            .execute("DELETE FROM projection_baselines", [])
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_baseline_count_for_test(&self) -> u64 {
+        let connection = Connection::open(&self.path).unwrap();
+        connection
+            .query_row("SELECT count(*) FROM projection_baselines", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 
     pub const fn claim(&self) -> ProjectionClaim {
