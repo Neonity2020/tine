@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.98] - 2026-08-27
+
 ### Changed
 
 - **Managed-storage projection recovery is prepared for cheaper durable
@@ -18,6 +20,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   turns, and a disposable per-page SQLite digest avoids rendering an unchanged
   page merely to prove it needs no terminal repair. Durability-barrier budgets
   remain 25 for a save and 74 for a cross-page move.
+
+- **The shared parser is updated to lsdoc v0.5.6.** Raw HTML recognition now
+  indexes every supported tag in one source pass, static HTML export renders
+  safe Hiccup vectors as markup, and deeply nested projections serialize
+  iteratively instead of consuming the native stack. Native and browser-WASM
+  consumers use the same released parser and serialization contract.
 
 - **Managed storage's private receipt-store format has been bumped**
   (development only). Projection records now carry an explicit target-kind
@@ -3930,7 +3938,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.90...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.98...HEAD
+[0.6.98]: https://github.com/martinkoutecky/tine/compare/v0.6.97...v0.6.98
 [0.6.90]: https://github.com/martinkoutecky/tine/compare/v0.6.5...v0.6.90
 [0.6.0]: https://github.com/martinkoutecky/tine/compare/v0.5.10...v0.6.0
 [0.5.10]: https://github.com/martinkoutecky/tine/compare/v0.5.9...v0.5.10

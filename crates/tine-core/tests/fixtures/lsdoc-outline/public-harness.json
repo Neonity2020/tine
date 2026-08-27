@@ -2,7 +2,7 @@
   "schema": 1,
   "provenance": {
     "repository": "https://github.com/martinkoutecky/lsdoc",
-    "revision": "c79cb059da5b4360ebde2e5fd953fa1f43ddabc3",
+    "revision": "74b9e62e04d6c4645bed1d68d97be1464ef101b7",
     "sources": [
       "harness/corpus.json",
       "harness/corpus.blockgate.json",
