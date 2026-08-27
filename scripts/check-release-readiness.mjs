@@ -14,6 +14,10 @@ import {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const version = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8")).version;
+const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const packageLock = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
+const cargoToml = fs.readFileSync(path.join(root, "Cargo.toml"), "utf8");
+const cargoLock = fs.readFileSync(path.join(root, "Cargo.lock"), "utf8");
 const changelog = fs.readFileSync(path.join(root, "CHANGELOG.md"), "utf8");
 const section = releaseSection(changelog, version);
 const impactPath = path.join(root, `docs/releases/v${version}-impact.json`);
@@ -24,6 +28,23 @@ for (const inventory of regressionIndex.inventories ?? []) {
   for (const entry of catalog.entries ?? []) catalogIds.add(entry.id);
 }
 const problems = [];
+
+const workspaceVersion = /^version = "([^"]+)"$/m.exec(cargoToml)?.[1];
+const releaseVersions = new Map([
+  ["package.json", packageJson.version],
+  ["package-lock.json", packageLock.version],
+  ["package-lock.json root package", packageLock.packages?.[""]?.version],
+  ["Cargo.toml workspace", workspaceVersion],
+]);
+for (const packageBlock of cargoLock.split("[[package]]")) {
+  const name = /^name = "([^"]+)"$/m.exec(packageBlock)?.[1];
+  if (name === "tine" || name === "tine-core") {
+    releaseVersions.set(`Cargo.lock ${name}`, /^version = "([^"]+)"$/m.exec(packageBlock)?.[1]);
+  }
+}
+for (const [source, found] of releaseVersions) {
+  if (found !== version) problems.push(`${source} version ${found ?? "missing"} does not match ${version}`);
+}
 
 if (!section) problems.push(`CHANGELOG.md has no released section for ${version}`);
 if (!fs.existsSync(impactPath)) problems.push(`missing docs/releases/v${version}-impact.json`);

@@ -20,6 +20,15 @@ const conf = JSON.parse(confText) as {
   bundle?: { android?: { versionCode?: number } };
 };
 
+const packageJson = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+) as { version: string };
+const packageLock = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../package-lock.json", import.meta.url)), "utf8"),
+) as { version: string; packages?: Record<string, { version?: string }> };
+const cargoToml = readFileSync(fileURLToPath(new URL("../Cargo.toml", import.meta.url)), "utf8");
+const cargoLock = readFileSync(fileURLToPath(new URL("../Cargo.lock", import.meta.url)), "utf8");
+
 function deriveVersionCode(version: string): number {
   const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
   if (!m) throw new Error(`unexpected version string: ${version}`);
@@ -28,6 +37,20 @@ function deriveVersionCode(version: string): number {
 }
 
 describe("Android versionCode (F-Droid autoupdate)", () => {
+  it("keeps every shipped package surface on one release version", () => {
+    expect(packageJson.version).toBe(conf.version);
+    expect(packageLock.version).toBe(conf.version);
+    expect(packageLock.packages?.[""]?.version).toBe(conf.version);
+    expect(/^version = "([^"]+)"$/m.exec(cargoToml)?.[1]).toBe(conf.version);
+
+    for (const packageBlock of cargoLock.split("[[package]]")) {
+      const name = /^name = "([^"]+)"$/m.exec(packageBlock)?.[1];
+      if (name === "tine" || name === "tine-core") {
+        expect(/^version = "([^"]+)"$/m.exec(packageBlock)?.[1], `Cargo.lock ${name}`).toBe(conf.version);
+      }
+    }
+  });
+
   it("matches Tauri's semver-derived versionCode", () => {
     const explicit = conf.bundle?.android?.versionCode;
     expect(explicit, "bundle.android.versionCode must be set for F-Droid").toBeTypeOf("number");
