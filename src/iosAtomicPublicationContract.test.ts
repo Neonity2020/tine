@@ -23,4 +23,10 @@ describe("iOS atomic publication platform boundary", () => {
     );
     expect(platformGate).toContain('target_os = "ios"');
   });
+
+  it("exercises Guide copy inside the iOS Simulator rather than only launching the app", () => {
+    const workflow = readFileSync(".github/workflows/ios-probe.yml", "utf8");
+    expect(workflow).toContain("--tine-ci-copy-guide");
+    expect(workflow).toContain('tine-guide___Tine Guide.md');
+  });
 });

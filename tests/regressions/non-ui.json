@@ -425,12 +425,13 @@
    "coverage": {
     "tests": [
      "src/iosAtomicPublicationContract.test.ts",
-     "crates/tine-core/src/onboarding.rs"
+     "crates/tine-core/src/onboarding.rs",
+     ".github/workflows/ios-probe.yml"
     ],
     "scenario": "ios.guide-copy-atomic-publication",
     "failBefore": "proven"
    },
-   "notes": "A physical iPhone running the first public TestFlight beta reached the bundled Guide but Copy the guide into your graph failed because model.rs selected renameatx_np(RENAME_EXCL) only for macOS and compiled iOS into the unsupported fallback. The correction applies the Darwin primitive to iOS across graph projection, managed no-clobber moves, enrollment publication, and cleanup-marker rotation; the contract test fails if a macOS-only atomic-publication branch returns."
+   "notes": "A physical iPhone running the first public TestFlight beta reached the bundled Guide but Copy the guide into your graph failed because model.rs selected renameatx_np(RENAME_EXCL) only for macOS and compiled iOS into the unsupported fallback. The correction applies the Darwin primitive to iOS across graph projection, managed no-clobber moves, enrollment publication, and cleanup-marker rotation. The contract test fails if a macOS-only atomic-publication branch returns, while the manual iOS probe invokes the real bound-graph Guide-copy backend inside the Simulator and requires the copied index page to exist."
   },
   {
    "id": "REG-IOS-APP-ICON-OPAQUE-001",

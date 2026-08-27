@@ -154,11 +154,12 @@ jobs:
           printf '%s\n' '- The iOS local-container smoke graph is open and writable.' > "$GRAPH/pages/ci-ios-smoke.md"
 
           SIMCTL_CHILD_RUST_LOG=info xcrun simctl launch --terminate-running-process \
-            "$DEVICE_UDID" page.tine.Tine "$GRAPH"
+            "$DEVICE_UDID" page.tine.Tine "$GRAPH" --tine-ci-copy-guide
           sleep 20
 
           test -f "$APP_DATA/Documents/.tine-container"
           test -s "$GRAPH/journals/$JOURNAL_FILE"
+          test -s "$GRAPH/pages/tine-guide___Tine Guide.md"
           xcrun simctl io "$DEVICE_UDID" screenshot --type=png artifacts/ios-smoke.png
           test -s artifacts/ios-smoke.png
           xcrun simctl spawn "$DEVICE_UDID" log show --last 2m --style compact \
