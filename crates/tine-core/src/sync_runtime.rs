@@ -5194,7 +5194,11 @@ impl CleanRuntimeActorCore {
         turns: &mut ProjectionTurnJournalState,
         path: &ManagedPath,
     ) -> Result<bool, CleanActorMutationFailure> {
-        if turns.pending_count() != 0 {
+        // A provider continuation may own the published graph-text latch
+        // before it has appended its turn (for example, after manifest commit
+        // and before projection drain). Do not let the conflict lane append an
+        // orphan turn and try to mint a competing latch in that window.
+        if self.pending.is_some() || turns.pending_count() != 0 {
             return Ok(false);
         }
         let observed =
@@ -5915,8 +5919,12 @@ fn drain_open_projection_turn_journal(
 ) -> Result<(), String> {
     while let Some(turn) = turns.front().cloned() {
         let endpoint = runtime.endpoint();
+        // A previous replay attempt may have crossed publication and dropped
+        // its process-local latch value while deliberately leaving the writer
+        // gate held. The durable turn authenticates the owed replay; adopt
+        // that held reservation instead of minting a competing one.
         let handoff = graph
-            .mint_handoff_safe(runtime.engine().workspace_id(), endpoint)
+            .reconstruct_published_handoff_safe(runtime.engine().workspace_id(), endpoint)
             .map_err(display)?;
         handoff
             .verify_binding(graph, runtime.engine().workspace_id(), endpoint)

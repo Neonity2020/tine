@@ -2268,12 +2268,13 @@ pub(crate) fn replay_projection_turn(
                 {
                     return Err(ProjectionError::WorkNotReady);
                 }
-                write_projection_exact(
+                write_projection_exact_with_handoff(
                     graph,
                     receipts,
                     engine,
                     work.page_id(),
                     observed.as_deref(),
+                    handoff,
                 )?;
             } else if matches!(result?, ProjectionExecution::NeedsTurnRebarrier) {
                 let exact = graph
@@ -2878,6 +2879,20 @@ pub fn write_projection_exact(
     page_id: PageId,
     expected_base: Option<&[u8]>,
 ) -> Result<ProjectionWrite, ProjectionError> {
+    write_projection_exact_with_handoff(graph, store, engine, page_id, expected_base, None)
+}
+
+/// Re-render a superseded accepted page without abandoning the projection
+/// turn's already-published graph-text reservation. The ordinary public entry
+/// point passes no handoff; turn replay must pass the latch that owns the turn.
+fn write_projection_exact_with_handoff(
+    graph: &Graph,
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    page_id: PageId,
+    expected_base: Option<&[u8]>,
+    handoff: Option<&crate::model::PublishedHandoffLatch>,
+) -> Result<ProjectionWrite, ProjectionError> {
     require_endpoint_authority(graph, store, engine)?;
     retire_pending_projection_recovery(graph, store)?;
     let authorization = engine.authorize_projection_write(page_id)?;
@@ -2885,13 +2900,23 @@ pub fn write_projection_exact(
     store.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
     let reservation = store.reserve_attempt(plan.intent())?;
     let mut authority = store.begin_mutation(plan.intent(), Some(&reservation))?;
-    let proof = graph.write_page_projection_with_layout(
-        plan.intent().path().as_str(),
-        expected_base,
-        plan.target(),
-        plan.guarded_layout(),
-        &mut authority,
-    )?;
+    let proof = match handoff {
+        Some(handoff) => handoff.write_page_projection_with_layout(
+            graph,
+            plan.intent().path().as_str(),
+            expected_base,
+            plan.target(),
+            plan.guarded_layout(),
+            &mut authority,
+        ),
+        None => graph.write_page_projection_with_layout(
+            plan.intent().path().as_str(),
+            expected_base,
+            plan.target(),
+            plan.guarded_layout(),
+            &mut authority,
+        ),
+    }?;
     let completion = store.publish_completion(authority, plan.intent(), &proof)?;
     retire_completed_projection_recovery(graph, store, plan.intent())?;
     record_completed_path(store, engine, page_id, plan.intent())?;
