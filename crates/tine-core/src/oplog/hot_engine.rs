@@ -20,6 +20,7 @@ use tine_storage::{
 };
 use uuid::Uuid;
 
+use super::absence_decision::{AbsenceCompletionAnchor, AbsenceDecision, AbsenceDecisionMap};
 use super::bootstrap_import::{
     BootstrapImportPartEvidenceV1, BootstrapPartDescriptorV1, BootstrapPartitionProfileV1,
     BootstrapProfileDigestV1, MAX_OPERATIONS_PER_BOOTSTRAP_PART,
@@ -8484,6 +8485,9 @@ pub struct ShardedHotEngine {
     /// chain is durable; this engine-owned value also owns the coalescing
     /// buffer from cold repair through actor shutdown.
     local_completion_index: Option<LocalCompletionIndex>,
+    /// Disposable per-open merge of receiver receipt history with the local
+    /// completion half. Durable truth remains in those two stores.
+    absence_decision_map: RefCell<Option<AbsenceDecisionMap>>,
     projection_endpoint: Option<ProjectionEndpointBinding>,
     projection_receipt_store_id: Option<super::ProjectionReceiptStoreId>,
     /// Latest source-endpoint projection row per exact path for the clean
@@ -8740,6 +8744,7 @@ impl ShardedHotEngine {
             transient_effective_view_order: VecDeque::new(),
             archive_store: None,
             local_completion_index: None,
+            absence_decision_map: RefCell::new(None),
             projection_endpoint: None,
             projection_receipt_store_id: None,
             clean_projection_heads: BTreeMap::new(),
@@ -9898,6 +9903,92 @@ impl ShardedHotEngine {
             .is_some_and(|index| index.contains_completed(intent_id)))
     }
 
+    /// Materialize the receiver/own absence-decision map after old own receipt
+    /// ids have been registered as inert. The validated receiver catalog is
+    /// read exactly once per managed open.
+    pub(crate) fn open_absence_decision_map(
+        &self,
+        receipts: &ProjectionReceiptStore,
+    ) -> Result<(), EngineError> {
+        if self.absence_decision_map.borrow().is_some() {
+            return Ok(());
+        }
+        let catalog = receipts
+            .validated_catalog()
+            .map_err(|error| EngineError::Receipt(error.to_string()))?;
+        let mut map = AbsenceDecisionMap::default();
+        for entry in catalog {
+            if entry.completion.is_some() {
+                map.record_receiver_completion(&entry.intent)
+                    .map_err(|error| EngineError::Receipt(error.to_string()))?;
+            } else {
+                map.record_receiver_intent(&entry.intent)
+                    .map_err(|error| EngineError::Receipt(error.to_string()))?;
+            }
+        }
+        for entry in self
+            .local_completion_index
+            .as_ref()
+            .map_or_else(Vec::new, LocalCompletionIndex::completed_entries)
+        {
+            map.record_local_completion(AbsenceCompletionAnchor {
+                intent_id: entry.intent_id,
+                page_id: entry.page_id,
+                path: entry.path,
+                target_kind: entry.target_kind,
+                frontier: entry.post_frontier,
+            });
+        }
+        *self.absence_decision_map.borrow_mut() = Some(map);
+        Ok(())
+    }
+
+    pub(crate) fn receiver_absence_decision(
+        &self,
+        page_id: PageId,
+        path: &ManagedPath,
+    ) -> AbsenceDecision {
+        self.absence_decision_map
+            .borrow()
+            .as_ref()
+            .map_or(AbsenceDecision::Create, |map| map.decision(page_id, path))
+    }
+
+    pub(crate) fn incomplete_receiver_projection_intents(
+        &self,
+        page_id: PageId,
+        path: &ManagedPath,
+    ) -> Vec<ProjectionIntent> {
+        self.absence_decision_map
+            .borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |map| {
+                map.incomplete_receiver_intents(page_id, path)
+            })
+    }
+
+    pub(crate) fn note_receiver_projection_intent(
+        &self,
+        intent: &ProjectionIntent,
+    ) -> Result<(), EngineError> {
+        if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
+            map.record_receiver_intent(intent)
+                .map_err(|error| EngineError::Receipt(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn note_receiver_projection_completion(
+        &self,
+        intent: &ProjectionIntent,
+    ) -> Result<(), EngineError> {
+        if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
+            map.record_receiver_completion(intent)
+                .map_err(|error| EngineError::Receipt(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn local_completed_projection_intent_ids(&self) -> BTreeSet<ProjectionIntentId> {
         self.local_completion_index
             .as_ref()
@@ -9908,13 +9999,23 @@ impl ShardedHotEngine {
         &mut self,
         intent: &ProjectionIntent,
     ) -> Result<bool, EngineError> {
-        self.local_completion_index
+        let staged = self
+            .local_completion_index
             .as_mut()
             .map_or(Ok(false), |index| {
                 index
                     .stage_completed(intent)
                     .map_err(|error| EngineError::Archive(error.to_string()))
-            })
+            })?;
+        if staged {
+            if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
+                map.record_local_completion(
+                    AbsenceCompletionAnchor::from_intent(intent)
+                        .map_err(|error| EngineError::Receipt(error.to_string()))?,
+                );
+            }
+        }
+        Ok(staged)
     }
 
     pub(crate) fn local_completion_flush_due(&self, now: Instant) -> bool {
@@ -9967,6 +10068,16 @@ impl ShardedHotEngine {
         let pruning = LocalCompletionPruningContext {
             live_page_paths,
             retained_intents,
+            receiver_history_paths: self
+                .absence_decision_map
+                .borrow()
+                .as_ref()
+                .map_or_else(BTreeSet::new, AbsenceDecisionMap::receiver_history_paths),
+            receiver_completions: self
+                .absence_decision_map
+                .borrow()
+                .as_ref()
+                .map_or_else(Vec::new, AbsenceDecisionMap::receiver_completion_anchors),
         };
         self.local_completion_index
             .as_mut()

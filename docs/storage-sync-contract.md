@@ -264,8 +264,8 @@ and manifest tail.
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
-| `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and clean open | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
-| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
+| `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
+| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests; losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
@@ -1062,9 +1062,8 @@ Two constraints hold today, and both are tested:
   identity input — while `matches_replay_except_frontier` and a completion's
   binding to its intent both compare it.
 
-The consumer of this field — the absence-decision map — is a later packet.
-Nothing reads `target_kind` to make a decision yet, and nothing may infer
-absence from byte length once it does.
+The absence-decision map reads this field directly from both completion halves.
+Nothing may infer absence from byte length.
 
 ### 3.2 Clean-runtime save settlement
 
@@ -1301,7 +1300,7 @@ and probes each page for exact current bytes before appending a terminal turn.
 A journal that cannot open therefore refuses before terminal graph mutation;
 a completed-and-reclaimed terminal turn is not recreated on the next open.
 
-### 3.2b Own-endpoint completion index and `DeferredAbsence`
+### 3.2b Device-wide absence-decision map and `DeferredAbsence`
 
 Every successful own-endpoint manifested projection passes through the common
 executor. Immediately after the graph mutation and exact-identity in-turn
@@ -1315,14 +1314,16 @@ cannot suppress a later creation by page Q at X.
 The engine coalesces staged entries into immutable generation-named objects at
 `archive/operations/sweeps/local-completion-index-v1/`. A flush installs one
 delta, and every `N = max(256, 2 × pages-at-compaction)` deltas the same staged
-publication also installs a full-map compaction. Compaction retains the latest
-entry for each current live `(page, path)` and every exact intent still named by
-an uncheckpointed foreground frame or unretired projection continuation;
-superseded objects are pruned under the workspace lease. Packet C-2 does not
-merge receiver receipt history into pruning: receiver completions remain
-receiver-only evidence. Before a later merged map can expose that history,
-its pruning rule must additionally retain a maximal local entry above receiver
-history for the same key.
+publication also installs a full-map compaction. Compaction retains every exact
+intent still named by an uncheckpointed foreground frame or unretired
+projection continuation. An unreferenced local entry may be pruned only when
+either a later retained completion at the same `(page, path)` in the local or
+receiver half strictly dominates its frontier, or the receiver store retains no
+record at all for that key. Thus a local Absent completion that is the merged
+map's current answer is never removed while older receiver Present history
+remains beneath it; removing it would mis-defer a legitimate recreation.
+Superseded objects are pruned under the workspace lease subject to the same
+R16-C2 rule.
 
 Open performs one names-only enumeration. A compaction records the count and
 set digest of covered delta filenames; a current horizon reads that compaction
@@ -1348,15 +1349,46 @@ engine admission, SQLite projection, checkpointing, and ordinary startup or
 differs-scan reconciliation continue; C-2 deliberately authors no sweep record.
 Absent-precondition work with no exact matching entry creates as before.
 
+Foreign replay builds a disposable absence-decision map once per managed open
+from one validated receiver-catalog pass plus the local completion index. The
+map is keyed by `(page, path)`. Its answer is the frontier-maximal completion
+across both halves; a defensive incomparable maximal set with mixed target
+kinds chooses the reversible Present/defer direction.
+
+The receiver executor consults that answer only after a fresh,
+capability-bound reread of the target path and before publishing a new intent:
+
+* maximal Present plus disk absence returns `DeferredAbsence`;
+* maximal Absent, or no completion in either half, preserves today's create;
+* a present disk file whose bytes mismatch keeps today's conflict flow.
+
+Exact-intent completion suppression remains a fast path only while disk still
+matches the recorded target. Disk absence always reaches the map, including a
+re-derived creation-shaped intent that finds its old completion.
+
+Retained incomplete receiver intents keep today's phase-driven protocol on the
+original precondition: re-authorization, exact recovery, then the existing
+evidence-gated fallback. Only an exhausted terminal is remapped, and only by a
+second fresh capability-bound reread: disk absence defers; a present byte
+mismatch remains the existing conflict. The phases, not an attempt-present
+shortcut, decide recovery.
+
+A receiver `DeferredAbsence` is finished without mutation: its continuation
+retires, no completion or local-index entry is written, and its Present
+terminal head stays untouched. Its provenance is `replay-deferred`. Packet C-3
+authors no sweep record; the ordinary startup/differs scan is the durable
+observation backstop. Packet C-4 consumes these observations in its
+coalescer/tiers.
+
 O-C5 accepts two bounded residuals. A crash after own-endpoint execution but
 before its coalesced flush can lose at most the 60-second/64-turn suffix, so a
 later replay may recreate that user's own just-accepted save; current-state
 authorization prevents stale or foreign bytes from using this route. Once a
-receiver/local merged map exists, a crash-lost local Absent entry can instead
-make older receiver Present evidence win conservatively and route a later
-foreign recreation through deletion disposition. That second residual is not
-observable in C-2 because receiver evidence is not yet consulted by this local
-half, but the merged-map packet must preserve and document it.
+local Absent completion has executed, the same crash window can lose its index
+entry and expose an older retained receiver Present completion. A later foreign
+recreation then mis-defers conservatively instead of projecting. The O-C5 cap
+bounds this second residual too; it never resurrects content and never silently
+loses it, because the downstream sweep retains the recoverable disposition.
 
 ### 2.10a Durability barriers by artifact class
 

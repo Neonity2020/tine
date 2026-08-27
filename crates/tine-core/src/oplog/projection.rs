@@ -23,7 +23,7 @@ use std::io;
 use super::object_store::BatchInspection;
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlobDescription, BlockId,
-    CleanTombstoneAuthorization, EngineError, LogseqIdentityOrigin, LogseqUuid,
+    CleanTombstoneAuthorization, EngineError, LogseqIdentityOrigin, LogseqUuid, ManagedPath,
     ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
     MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore, PageId,
     ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
@@ -1625,7 +1625,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
     source: &ManifestedProjectionIntent,
     handoff: &crate::model::PublishedHandoffLatch,
     allow_mutation: bool,
-) -> Result<Option<bool>, ProjectionError> {
+) -> Result<Option<ProjectionExecution>, ProjectionError> {
     require_endpoint_authority(graph, receipts, engine)?;
     retire_pending_projection_recovery(graph, receipts, Some(handoff))?;
     let endpoint = engine
@@ -1647,7 +1647,9 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         })?;
         match engine.authorize_clean_projection_tombstone(projection, source)? {
             CleanTombstoneAuthorization::Authorized(authorization) => Some(*authorization),
-            CleanTombstoneAuthorization::Superseded(_) => return Ok(Some(false)),
+            CleanTombstoneAuthorization::Superseded(_) => {
+                return Ok(Some(ProjectionExecution::NeedsTurnRebarrier));
+            }
             CleanTombstoneAuthorization::Deferred(_) => return Ok(None),
         }
     } else {
@@ -1705,7 +1707,39 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
                 .map(AnnotatedProjectionBase::annotations),
         )?
     };
+
+    if !source_absent {
+        let matching_incomplete = engine
+            .incomplete_receiver_projection_intents(plan.intent().page_id(), plan.intent().path())
+            .into_iter()
+            .filter(|intent| receiver_projection_work_state_matches(intent, plan.intent()))
+            .collect::<Vec<_>>();
+        match matching_incomplete.as_slice() {
+            [] => {}
+            [intent] => {
+                return recover_receiver_incomplete_projection_under_handoff(
+                    graph, receipts, engine, intent, handoff,
+                )
+                .map(Some);
+            }
+            _ => return Err(ProjectionError::RecoveryIntentMismatch),
+        }
+    }
+
+    // The absence gate is keyed by the fresh capability-bound read above and
+    // runs before intent publication. It applies whether exact suppression
+    // would hit (creation-shaped replay) or miss (the precondition key switch).
+    if !source_absent
+        && local_base.is_none()
+        && engine.receiver_absence_decision(plan.intent().page_id(), plan.intent().path())
+            == super::absence_decision::AbsenceDecision::DeferredAbsence
+    {
+        return Ok(Some(ProjectionExecution::DeferredAbsence));
+    }
     receipts.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
+    engine
+        .note_receiver_projection_intent(plan.intent())
+        .map_err(ProjectionError::Engine)?;
     let already_complete = receipts.load_completion(plan.intent())?.is_some();
     if !already_complete && !allow_mutation {
         return Ok(None);
@@ -1774,6 +1808,9 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             )?
         };
         receipts.publish_completion(authority, plan.intent(), &proof)?;
+        engine
+            .note_receiver_projection_completion(plan.intent())
+            .map_err(ProjectionError::Engine)?;
     }
     retire_completed_projection_recovery(graph, receipts, plan.intent(), Some(handoff))?;
     match tombstone_authorization {
@@ -1800,7 +1837,178 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             }
         }
     }
-    Ok(Some(!already_complete))
+    Ok(Some(if already_complete {
+        ProjectionExecution::NeedsTurnRebarrier
+    } else {
+        ProjectionExecution::BarrierTaken
+    }))
+}
+
+fn receiver_projection_work_state_matches(
+    retained: &ProjectionIntent,
+    replay: &ProjectionIntent,
+) -> bool {
+    retained.workspace_id() == replay.workspace_id()
+        && retained.page_id() == replay.page_id()
+        && retained.path() == replay.path()
+        && retained.frontier() == replay.frontier()
+        && retained.claim_evidence() == replay.claim_evidence()
+        && retained.target_kind() == replay.target_kind()
+}
+
+/// Resume the retained receiver protocol on its ORIGINAL intent. In
+/// particular, a fresh disk-None read must not publish a second Absent-keyed
+/// intent and bypass the Base-keyed attempt that already owns recovery.
+fn recover_receiver_incomplete_projection_under_handoff(
+    graph: &Graph,
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    intent: &ProjectionIntent,
+    handoff: &crate::model::PublishedHandoffLatch,
+) -> Result<ProjectionExecution, ProjectionError> {
+    let authorization = engine.authorize_projection_recovery(
+        intent.page_id(),
+        intent.frontier(),
+        intent.claim_evidence(),
+    )?;
+    let base = store.load_base(intent)?;
+    let expected_base = base.as_ref().map(BaseBlob::bytes);
+    let formatting_adoption =
+        expected_base.is_some_and(|bytes| super::BlobDescription::of(bytes) == intent.target());
+    let plan = if formatting_adoption {
+        plan_projection_with_layout_annotations(
+            engine.workspace_id(),
+            authorization.state(),
+            expected_base,
+            Some(intent.annotations()),
+        )?
+    } else {
+        plan_projection(engine.workspace_id(), authorization.state(), expected_base)?
+    };
+    if plan.intent() != intent {
+        return Err(ProjectionError::RecoveryIntentMismatch);
+    }
+
+    let attempts = store.load_attempt_reservations(intent)?;
+    let recovered = if attempts.is_empty() {
+        None
+    } else {
+        let mut authority = store.begin_mutation(intent, None)?;
+        let result = handoff.recover_page_projection_with_layout(
+            graph,
+            intent.path().as_str(),
+            expected_base,
+            plan.target(),
+            plan.guarded_layout(),
+            &mut authority,
+        );
+        Some((result, authority))
+    };
+
+    let (proof, authority) = match recovered {
+        Some((Ok(proof), authority)) => (proof, authority),
+        Some((Err(error), authority))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
+            ) =>
+        {
+            authority.release_failed_recovery()?;
+            let reservation = store.reserve_fallback_attempt(intent)?;
+            let mut fallback = store.begin_mutation(intent, Some(&reservation))?;
+            match handoff.write_page_projection_with_layout(
+                graph,
+                intent.path().as_str(),
+                expected_base,
+                plan.target(),
+                plan.guarded_layout(),
+                &mut fallback,
+            ) {
+                Ok(proof) => (proof, fallback),
+                Err(error) => {
+                    return receiver_recovery_terminal_disposition(graph, intent.path(), error);
+                }
+            }
+        }
+        Some((Err(error), _)) => return Err(error.into()),
+        None => {
+            // Preserve today's attempt-free recovery phase: first ask the
+            // exact recovery primitive to prove or finish the original
+            // protocol, and only its evidence-gated terminal may reserve the
+            // fallback writer.
+            let mut recovery = store.begin_mutation(intent, None)?;
+            match handoff.recover_page_projection_with_layout(
+                graph,
+                intent.path().as_str(),
+                expected_base,
+                plan.target(),
+                plan.guarded_layout(),
+                &mut recovery,
+            ) {
+                Ok(proof) => (proof, recovery),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    recovery.release_failed_recovery()?;
+                    let reservation = store.reserve_fallback_attempt(intent)?;
+                    let mut fallback = store.begin_mutation(intent, Some(&reservation))?;
+                    match handoff.write_page_projection_with_layout(
+                        graph,
+                        intent.path().as_str(),
+                        expected_base,
+                        plan.target(),
+                        plan.guarded_layout(),
+                        &mut fallback,
+                    ) {
+                        Ok(proof) => (proof, fallback),
+                        Err(error) => {
+                            return receiver_recovery_terminal_disposition(
+                                graph,
+                                intent.path(),
+                                error,
+                            );
+                        }
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+
+    store.reconstruct_completion(authority, intent, plan.target(), &proof)?;
+    engine
+        .note_receiver_projection_completion(intent)
+        .map_err(ProjectionError::Engine)?;
+    retire_completed_projection_recovery(graph, store, intent, Some(handoff))?;
+    let recorded = if formatting_adoption {
+        record_adopted_formatting_path(store, engine, intent.page_id(), intent)
+    } else {
+        record_completed_path(store, engine, intent.page_id(), intent)
+    };
+    match recorded {
+        Ok(()) | Err(ProjectionError::RecoveryIntentMismatch) => {}
+        Err(error) => return Err(error),
+    }
+    debug_assert_eq!(authorization.state().page.page_id, intent.page_id());
+    Ok(ProjectionExecution::BarrierTaken)
+}
+
+/// R11-C2: both disk absence and a present byte mismatch can arrive as the
+/// same guarded conflict. Only a fresh capability-bound reread may remap the
+/// exhausted receiver recovery terminal.
+fn receiver_recovery_terminal_disposition(
+    graph: &Graph,
+    path: &ManagedPath,
+    error: io::Error,
+) -> Result<ProjectionExecution, ProjectionError> {
+    if graph.read_projection_input(path)?.is_none() {
+        Ok(ProjectionExecution::DeferredAbsence)
+    } else {
+        Err(error.into())
+    }
 }
 
 /// Plan one clean-runtime receiver-local deletion.
@@ -2203,10 +2411,10 @@ pub(crate) fn replay_projection_turn(
                     handoff,
                     true,
                 )?;
-                let Some(wrote) = completed else {
+                let Some(execution) = completed else {
                     return Err(ProjectionError::WorkNotReady);
                 };
-                if !wrote {
+                if execution == ProjectionExecution::NeedsTurnRebarrier {
                     let exact = graph
                         .read_projection_input(&page.path)
                         .map_err(ProjectionError::Io)?;
@@ -2355,10 +2563,10 @@ pub(crate) fn replay_projection_turn(
                     handoff,
                     true,
                 )?;
-                let Some(wrote) = completed else {
+                let Some(execution) = completed else {
                     return Err(ProjectionError::WorkNotReady);
                 };
-                if !wrote {
+                if execution == ProjectionExecution::NeedsTurnRebarrier {
                     let exact = graph
                         .read_projection_input(work.path())
                         .map_err(ProjectionError::Io)?;
@@ -2895,7 +3103,7 @@ fn execute_manifested_projection_work_located(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProjectionExecution {
+pub(crate) enum ProjectionExecution {
     BarrierTaken,
     NeedsTurnRebarrier,
     /// Finished without mutation: the continuation retires, no completion is
@@ -5542,5 +5750,33 @@ mod tests {
         assert!(fail_during_manifested_projection_for_harness().is_err());
         drop(fault_scope);
         assert!(fail_during_manifested_projection_for_harness().is_ok());
+    }
+
+    #[test]
+    fn receiver_recovery_terminal_remap_reads_disk_shape_not_error_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-receiver-recovery-terminal-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let graph = Graph::open(&root);
+        let path = ManagedPath::parse("terminal-remap.md").unwrap();
+        let deferred = receiver_recovery_terminal_disposition(
+            &graph,
+            &path,
+            io::Error::new(io::ErrorKind::AlreadyExists, "collapsed guarded conflict"),
+        )
+        .unwrap();
+        assert_eq!(deferred, ProjectionExecution::DeferredAbsence);
+
+        std::fs::write(root.join(path.as_str()), b"external winner\n").unwrap();
+        let mismatch = receiver_recovery_terminal_disposition(
+            &graph,
+            &path,
+            io::Error::new(io::ErrorKind::AlreadyExists, "collapsed guarded conflict"),
+        )
+        .unwrap_err();
+        assert!(matches!(mismatch, ProjectionError::Io(_)));
+        crate::test_support::remove_dir_all(&root);
     }
 }

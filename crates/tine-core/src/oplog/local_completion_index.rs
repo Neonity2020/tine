@@ -7,6 +7,9 @@ use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::absence_decision::{
+    frontier_strictly_dominates, AbsenceCompletionAnchor, AbsenceDecisionKey,
+};
 use super::object_store::{
     ensure_directory_nofollow, open_dir_nofollow, read_optional_regular, require_regular_entry,
     sync_dir_required,
@@ -130,6 +133,8 @@ pub(crate) struct LocalCompletionFlushStats {
 pub(crate) struct LocalCompletionPruningContext {
     pub(crate) live_page_paths: BTreeSet<(PageId, ManagedPath)>,
     pub(crate) retained_intents: BTreeSet<ProjectionIntentId>,
+    pub(crate) receiver_history_paths: BTreeSet<AbsenceDecisionKey>,
+    pub(crate) receiver_completions: Vec<AbsenceCompletionAnchor>,
 }
 
 #[derive(Debug)]
@@ -253,6 +258,20 @@ impl LocalCompletionIndex {
                     .iter()
                     .filter(|(_, entry)| entry.state == LocalCompletionState::Completed)
                     .map(|(intent_id, _)| *intent_id),
+            )
+            .collect()
+    }
+
+    pub(crate) fn completed_entries(&self) -> Vec<LocalCompletionEntry> {
+        self.entries
+            .values()
+            .filter(|stored| stored.entry.state == LocalCompletionState::Completed)
+            .map(|stored| stored.entry.clone())
+            .chain(
+                self.buffered
+                    .values()
+                    .filter(|entry| entry.state == LocalCompletionState::Completed)
+                    .cloned(),
             )
             .collect()
     }
@@ -801,8 +820,41 @@ fn prune_entries(
         .into_values()
         .map(|(intent_id, _)| intent_id)
         .collect::<BTreeSet<_>>();
-    entries.retain(|intent_id, _| {
-        latest.contains(intent_id) || pruning.retained_intents.contains(intent_id)
+    let local_entries = entries
+        .values()
+        .map(|stored| {
+            (
+                (stored.entry.page_id, stored.entry.path.clone()),
+                stored.entry.intent_id,
+                stored.entry.post_frontier.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.retain(|intent_id, stored| {
+        if latest.contains(intent_id) || pruning.retained_intents.contains(intent_id) {
+            return true;
+        }
+        let key = (stored.entry.page_id, stored.entry.path.clone());
+        if !pruning.receiver_history_paths.contains(&key) {
+            return false;
+        }
+        let dominated_by_local =
+            local_entries
+                .iter()
+                .any(|(other_key, other_id, other_frontier)| {
+                    other_key == &key
+                        && other_id != intent_id
+                        && frontier_strictly_dominates(other_frontier, &stored.entry.post_frontier)
+                });
+        let dominated_by_receiver = pruning.receiver_completions.iter().any(|receiver| {
+            receiver.page_id == stored.entry.page_id
+                && receiver.path == stored.entry.path
+                && frontier_strictly_dominates(&receiver.frontier, &stored.entry.post_frontier)
+        });
+        // R16-C2: while receiver history exists underneath this key, retain
+        // every locally maximal answer. Pruning it could expose an older
+        // receiver Present completion and mis-defer a legitimate recreation.
+        !(dominated_by_local || dominated_by_receiver)
     });
 }
 
@@ -856,7 +908,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::oplog::{BlobDescription, ProjectionPrecondition};
+    use crate::oplog::{
+        absence_decision::{AbsenceDecision, AbsenceDecisionMap},
+        BlobDescription, CrdtPeerCounter, CrdtPeerId, DocumentDependencies, DocumentId,
+        ProjectionPrecondition,
+    };
 
     struct TestDir(PathBuf);
 
@@ -902,6 +958,37 @@ mod tests {
         .unwrap()
     }
 
+    fn ordered_intent(
+        page: u128,
+        path: &str,
+        version: u64,
+        target_kind: ProjectionTargetKind,
+    ) -> ProjectionIntent {
+        let frontier = FrontierV2::new(vec![DocumentDependencies::new(
+            DocumentId::from_uuid(Uuid::from_u128(0xc2_1002)),
+            vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(17), version)],
+            Vec::new(),
+        )
+        .unwrap()])
+        .unwrap();
+        ProjectionIntent::new(
+            workspace(),
+            PageId::from_uuid(Uuid::from_u128(page)),
+            ManagedPath::parse(path).unwrap(),
+            frontier,
+            Vec::new(),
+            ProjectionPrecondition::Absent,
+            target_kind,
+            if target_kind == ProjectionTargetKind::Absent {
+                BlobDescription::of(&[])
+            } else {
+                BlobDescription::of(format!("ordered completion {version}").as_bytes())
+            },
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     fn fixture(label: &str) -> (TestDir, ObjectStore, LocalCompletionIndex) {
         let root = TestDir::new(label);
         let store = ObjectStore::open(&root.path().join("operations"), workspace()).unwrap();
@@ -916,6 +1003,7 @@ mod tests {
                 .map(|intent| (intent.page_id(), intent.path().clone()))
                 .collect(),
             retained_intents: BTreeSet::new(),
+            ..LocalCompletionPruningContext::default()
         }
     }
 
@@ -1046,6 +1134,52 @@ mod tests {
         index.flush(1, &live(&[&newest])).unwrap();
         assert_eq!(index.entry_count_for_test(), 1);
         assert!(index.contains_completed(newest.id().unwrap()));
+    }
+
+    #[test]
+    fn receiver_history_keeps_the_local_absent_answer_needed_for_recreation() {
+        let (_root, _store, mut index) = fixture("receiver-history-recreation");
+        index.force_compaction_threshold_for_test(1);
+        let receiver_present = ordered_intent(
+            0xc2_1550,
+            "receiver-history.md",
+            1,
+            ProjectionTargetKind::Present,
+        );
+        let local_absent = ordered_intent(
+            0xc2_1550,
+            "receiver-history.md",
+            2,
+            ProjectionTargetKind::Absent,
+        );
+        index.stage_completed(&local_absent).unwrap();
+        let receiver_anchor = AbsenceCompletionAnchor::from_intent(&receiver_present).unwrap();
+        let pruning = LocalCompletionPruningContext {
+            receiver_history_paths: [receiver_anchor.key()].into_iter().collect(),
+            receiver_completions: vec![receiver_anchor.clone()],
+            ..LocalCompletionPruningContext::default()
+        };
+        index.flush(0, &pruning).unwrap();
+        assert_eq!(index.entry_count_for_test(), 1);
+
+        let mut merged = AbsenceDecisionMap::default();
+        merged
+            .record_receiver_completion(&receiver_present)
+            .unwrap();
+        for entry in index.completed_entries() {
+            merged.record_local_completion(AbsenceCompletionAnchor {
+                intent_id: entry.intent_id,
+                page_id: entry.page_id,
+                path: entry.path,
+                target_kind: entry.target_kind,
+                frontier: entry.post_frontier,
+            });
+        }
+        assert_eq!(
+            merged.decision(local_absent.page_id(), local_absent.path()),
+            AbsenceDecision::Create,
+            "pruning the local Absent row would expose the older receiver Present completion"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! Immutable operation/object bytes are authoritative; SQLite, scratch, and
 //! projection-work state are disposable derived data.
 
+pub(crate) mod absence_decision;
 pub mod batch;
 #[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod bootstrap_import;

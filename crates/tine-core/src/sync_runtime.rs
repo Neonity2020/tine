@@ -6206,6 +6206,10 @@ fn activate_clean_runtime_resources_retaining_archive(
         binding.device_id().as_uuid(),
     )
     .map_err(display)?;
+    runtime
+        .engine()
+        .open_absence_decision_map(&receipts)
+        .map_err(display)?;
     Ok(CleanRuntimeResources {
         graph,
         receipts,
@@ -6427,6 +6431,11 @@ fn open_clean_runtime_resources_with_progress(
             retired_receipt_artifacts.join(", ")
         );
     }
+    completion_guard
+        .runtime_mut()
+        .engine()
+        .open_absence_decision_map(&receipts)
+        .map_err(display)?;
     completion_guard.retain(retained_own_intents);
     let recovered_provider_batches = drain_open_managed_local_journal(
         &graph,
@@ -28763,6 +28772,17 @@ mod tests {
                 );
             }
         }
+        run_receiver_absence_decision_oracle();
+    }
+
+    /// The permanent real-store oracle owns the three receiver decisions as
+    /// well as the turn-only crash matrix above. Keep these as shared cases so
+    /// the focused tests and both oracle sizes execute byte-for-byte identical
+    /// schedules.
+    fn run_receiver_absence_decision_oracle() {
+        receiver_without_completion_creates_first_projection_case();
+        receiver_completion_defers_closed_window_external_deletion_case();
+        receiver_incomplete_update_maps_absent_terminal_to_deferral_case();
     }
 
     #[test]
@@ -35692,6 +35712,221 @@ mod tests {
                 .any(|entry| entry.completion.is_some()),
             "the foreign receiver path must retain its durable completion protocol"
         );
+    }
+
+    fn receiver_without_completion_creates_first_projection_case() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("receiver-no-completion-create", 0xc3_1f00);
+        let path = "notes/receiver-no-completion-create.md";
+        let (batch_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xc3_1f20,
+            "Receiver No Completion Create",
+            path,
+            "first receiver projection",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, batch_id);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- first receiver projection\n",
+            "a receiver key with no completion must retain today's create behavior"
+        );
+        assert!(!receiver_handle.status().unwrap().has_runnable_work());
+        let archive = ObjectStore::open(
+            &clean_operation_archive_directory(&receiver.request.archive_root),
+            receiver.request.identities.workspace_id,
+        )
+        .unwrap();
+        assert!(matches!(
+            archive.inspect_batch(batch_id).unwrap(),
+            crate::oplog::BatchInspection::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn receiver_without_completion_creates_first_projection() {
+        receiver_without_completion_creates_first_projection_case();
+    }
+
+    /// Packet C-3's mandatory receiver schedule. A receiver completion is
+    /// device-local evidence that Tine wrote this path; a later closed-window
+    /// absence belongs to external observation, not replay authorization.
+    fn receiver_completion_defers_closed_window_external_deletion_case() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("receiver-completion-absence-map", 0xc3_2000);
+        let path = "notes/receiver-completion-absence-map.md";
+        let (create_batch, _page_id, block_id, document_id) = submit_shared_page(
+            &initiator_handle,
+            0xc3_2020,
+            "Receiver Completion Absence Map",
+            path,
+            "receiver bytes must not resurrect",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        let batch_id = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: document_id,
+                },
+                content: "receiver updated bytes must not resurrect".into(),
+            }],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, batch_id);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- receiver updated bytes must not resurrect\n"
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        fs::remove_file(receiver.graph_root.join(path)).unwrap();
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        drive_initial_feed(&reopened);
+        drive_like_the_production_scheduler(&reopened);
+        assert!(
+            !receiver.graph_root.join(path).exists(),
+            "receiver replay resurrected a file removed while Tine was closed: {:?}",
+            reopened.status().unwrap()
+        );
+        assert!(
+            !reopened.status().unwrap().has_runnable_work(),
+            "the deferred receiver continuation did not drain to idle"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let second = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        drive_initial_feed(&second);
+        drive_like_the_production_scheduler(&second);
+        assert!(
+            !receiver.graph_root.join(path).exists(),
+            "a second reopen resurrected the deferred receiver projection"
+        );
+        let archive = ObjectStore::open(
+            &clean_operation_archive_directory(&receiver.request.archive_root),
+            receiver.request.identities.workspace_id,
+        )
+        .unwrap();
+        assert!(matches!(
+            archive.inspect_batch(batch_id).unwrap(),
+            crate::oplog::BatchInspection::Ready(_)
+        ));
+        assert!(matches!(
+            second.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn receiver_completion_defers_closed_window_external_deletion_and_stays_archive_durable() {
+        receiver_completion_defers_closed_window_external_deletion_case();
+    }
+
+    fn receiver_incomplete_update_maps_absent_terminal_to_deferral_case() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("receiver-incomplete-absence-terminal", 0xc3_2100);
+        let path = "notes/receiver-incomplete-absence-terminal.md";
+        let (create_batch, _page_id, block_id, document_id) = submit_shared_page(
+            &initiator_handle,
+            0xc3_2120,
+            "Receiver Incomplete Absence Terminal",
+            path,
+            "receiver recovery base",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        let update_batch = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: document_id,
+                },
+                content: "receiver recovery target".into(),
+            }],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, update_batch);
+        settle_shared_provider(&initiator_handle);
+        deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- receiver recovery target\n"
+        );
+        assert!(matches!(
+            receiver_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        assert!(
+            withhold_receipt_completions(&receiver.request.receipt_root) >= 2,
+            "the crash fixture needs retained creation and update protocols"
+        );
+        let graph = Graph::open_checked(&receiver.graph_root).unwrap();
+        let endpoint = ProjectionEndpointBinding {
+            endpoint_id: receiver.request.identities.endpoint_id,
+            device_id: receiver.request.identities.device_id,
+            graph_resource_id: graph.canonical_resource_id().unwrap(),
+        };
+        drop(graph);
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &receiver.request.receipt_root,
+            receiver.request.identities.workspace_id,
+            endpoint,
+        )
+        .unwrap();
+        let incomplete_update = receipts
+            .incomplete_intents()
+            .unwrap()
+            .into_iter()
+            .find(|intent| {
+                intent.path().as_str() == path
+                    && matches!(
+                        intent.precondition(),
+                        crate::oplog::ProjectionPrecondition::Base(_)
+                    )
+                    && intent.target_kind() == crate::oplog::ProjectionTargetKind::Present
+            })
+            .expect("the receiver update retains its original Base-keyed intent");
+        assert!(
+            !receipts
+                .load_attempt_reservations(&incomplete_update)
+                .unwrap()
+                .is_empty(),
+            "the terminal fixture must exercise retained attempt recovery"
+        );
+        drop(receipts);
+
+        fs::remove_file(receiver.graph_root.join(path)).unwrap();
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        drive_initial_feed(&reopened);
+        drive_like_the_production_scheduler(&reopened);
+        assert!(
+            !receiver.graph_root.join(path).exists(),
+            "incomplete receiver recovery recreated an externally absent target"
+        );
+        assert!(!reopened.status().unwrap().has_runnable_work());
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn receiver_incomplete_update_maps_only_an_absent_recovery_terminal_to_deferral() {
+        receiver_incomplete_update_maps_absent_terminal_to_deferral_case();
     }
 
     /// One ordinary local external admission on the RECEIVING device, on a page
@@ -43022,6 +43257,7 @@ mod tests {
             .into_iter()
             .collect(),
             retained_intents: BTreeSet::new(),
+            ..crate::oplog::local_completion_index::LocalCompletionPruningContext::default()
         };
 
         let mut index = crate::oplog::local_completion_index::LocalCompletionIndex::open(
