@@ -1121,6 +1121,90 @@ turns on a permanent failure buys no chance of settling and charges the whole
 cost to the user's save. Any change of phase or detail counts as progress and
 keeps the loop running to the budget.
 
+### 3.2a Projection turns and the second local journal
+
+A **projection turn** is one authoritative unit of graph-tree publication work.
+A durable turn is the whole authority for the names its replay may create and
+for the pages it may publish. Turns are `oplog::hot_engine::ProjectionTurn`.
+
+**Two sequence domains, two physical segments.** Managed-local append requires
+its physical journal sequence to equal the hot semantic overlay's next
+sequence, and only applying a *semantic* managed-local record advances that
+overlay. A projection-only record placed in the foreground journal would
+therefore consume a physical sequence with no semantic transition: it could
+never drain, and the next ordinary save would fail the equality check. So:
+
+| Domain | Segment | Counter | Producers |
+| --- | --- | --- | --- |
+| `ManagedLocal` | the foreground journal, `managed-local-journal/clean-workspace-{workspace}-{lineage}/` | the hot overlay's sequence, physical == semantic | foreground local authoring |
+| `ProjectionTurn` | the projection-turn journal, `managed-local-journal/projection-turns-{workspace}-{lineage}/` | its own monotonic counter, which never meets the other | ingress, terminal repair, superseded repair |
+
+Both use the same `LocalJournalSegmentV2` type and both checkpoint
+independently. Projection-turn **anchors are keyed by endpoint** (
+`endpoint-{endpoint}-selector-{generation:020}.anchor-v2`), from store creation:
+one grammar, no dual format, because a pre-(c) private store never reaches
+journal selection — the receipt-store claim precheck refuses it first.
+
+**Projection-domain turns carry authorization and names, not bytes.** Only
+`ManagedLocal`-domain pages may carry precondition/target bytes, because the
+foreground frame already carries that material. Projection-domain replay
+re-derives the current bytes from the accepted state *at replay time*, so a turn
+recorded before a newer merge simply publishes the newer render.
+
+#### Projection turn derivation schemes
+
+Every name a turn's replay may create is derived from the record alone. The
+`derivation_scheme` field is both a field and a hash input, so a build never
+re-derives with a scheme other than the one the record names, and a scheme
+implementation is never deleted while any on-disk record may reference it.
+
+| Scheme | Status | `turn_id` domain separator | Attempt-id domain separator |
+| --- | --- | --- | --- |
+| `derivation_scheme` = **1** | live | `tine/projection-turn/v1\0` | `tine/projection-attempt/v2\0` |
+
+Count of live projection-turn derivation schemes: **1**.
+
+`turn_id` is `SHA-256` over the domain separator, big-endian
+`derivation_scheme`, workspace UUID, lineage digest, device UUID, endpoint
+UUID, the one-byte sequence-domain discriminant (`0` = `ManagedLocal`,
+`1` = `ProjectionTurn`) and the big-endian sequence. `attempt_id(i)` is an
+RFC 9562 version-8 UUID over `turn_id`, the big-endian page index and the page
+UUID. The receipt-store resource id deliberately does not participate, so a
+turn's identity is a function of the record and nothing else. A record naming a
+scheme this build cannot evaluate is `MS-REF-PROTOCOL-INCOMPATIBLE`: the record
+is preserved, the turn is not replayed, and the page is reported. It is never
+treated as absent.
+
+#### Torn versus corrupt: the local-journal WAL rule
+
+The discriminator is the segment's **durable frontier**, not a heuristic.
+`LocalJournalSegmentV2` file-flushes a frame and durably publishes the successor
+frontier before append returns, and open validates every byte inside the
+committed frontier while truncating only bytes beyond it.
+
+| Case | Classification | Action |
+| --- | --- | --- |
+| bytes beyond the durable frontier | the append never returned, so by turn-before-mutation no graph mutation for those bytes can have started | the segment truncates them; nothing is owed; no residue probe exists or is needed |
+| any invalid frame at or below the frontier, tail or interior, checkpointed or not | `MS-REF-DISK-CORRUPT` — a disk/media error damaged an authoritative record whose effects may exist | refuse activation; retain the segment bytes as evidence; report the component. Never truncate, never skip |
+
+Open failures are classified **per variant**, because `open_selected` also
+reports states whose in-scope scenario is not disk corruption
+(`oplog::local_journal_drain::LocalJournalOpenRefusal`):
+
+| Open failure | In-scope scenario | Refusal |
+| --- | --- | --- |
+| corrupt frame, frontier violation, device/sequence binding failure | disk or media error damaged an authoritative record | `MS-REF-DISK-CORRUPT`, evidence retained |
+| segment already open, prepared artifact exists | an honest second Tine instance holds the segment | the existing concurrent-instance refusal; nothing is corrupt |
+| unsafe segment name, unsupported durable replacement | the journal namespace holds an entry this platform cannot safely open | the existing unsafe-filesystem refusal |
+| I/O or capability failure | transient storage unavailability | retryable; asserts nothing about record integrity |
+
+**Current status.** The turn record, the projection-turn journal and this
+classification exist; **no production path writes or reads a turn yet**. That is
+an architectural fact, enforced by
+`oplog::projection_turn_journal::tests::no_production_path_opens_or_appends_a_projection_turn`,
+not by this sentence. The producer conversion updates this section in the same
+commit that lands it.
+
 ### 2.10a Durability barriers by artifact class
 
 Platform durability policy is stated **per artifact class**, never globally.

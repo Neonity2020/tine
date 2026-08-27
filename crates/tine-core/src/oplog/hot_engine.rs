@@ -13,6 +13,7 @@ use loro::{
     UpdateOptions, ValueOrContainer, VersionVector,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tine_storage::{
     LocalJournalAppend, LocalJournalAppendError, LocalJournalError, LocalJournalFrame,
     LocalJournalSegment,
@@ -7692,6 +7693,385 @@ fn managed_local_record_from_prepared(
         semantic_effect,
         crdt_updates,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Projection turn record (journal-universal durability design v4, §3.2–§3.6).
+//
+// NOTHING IN PRODUCTION WRITES OR READS A TURN YET. This section defines the
+// record, its canonical encoding, its two sequence domains and the byte-level
+// name derivation so the later producer conversion has one authority to move
+// to. The architectural fact that no producer is wired is asserted by
+// `oplog::projection_turn_journal::tests::no_production_path_appends_a_turn`.
+// ---------------------------------------------------------------------------
+
+/// On-disk format tag of [`ProjectionTurn`].
+pub(crate) const PROJECTION_TURN_SCHEMA_VERSION: u32 = 1;
+
+/// The only derivation scheme a build may mint records under (§3.5).
+pub(crate) const PROJECTION_TURN_DERIVATION_SCHEME_V1: u32 = 1;
+
+/// Every derivation scheme this build can still *evaluate*.
+///
+/// A scheme implementation is never deleted while any on-disk record may name
+/// it, so this array only grows. It is asserted against the storage contract by
+/// `the_contract_lists_every_live_derivation_scheme`.
+pub(crate) const LIVE_PROJECTION_TURN_DERIVATION_SCHEMES: &[u32] =
+    &[PROJECTION_TURN_DERIVATION_SCHEME_V1];
+
+/// Which monotonic counter a turn's `sequence` belongs to (§3.6).
+///
+/// The two domains are incomparable by construction: the managed-local journal
+/// keeps its physical == semantic sequence equality because nothing else
+/// appends to it, and projection-only turns live in their own segment with
+/// their own counter. The discriminant byte is a hash input of `turn_id`, so
+/// the same sequence in the two domains can never derive the same names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SequenceDomain {
+    ManagedLocal,
+    ProjectionTurn,
+}
+
+impl SequenceDomain {
+    /// The byte mixed into `turn_id`. Fixed by §3.5; never reordered.
+    pub(crate) const fn derivation_byte(self) -> u8 {
+        match self {
+            Self::ManagedLocal => 0,
+            Self::ProjectionTurn => 1,
+        }
+    }
+}
+
+/// The only payload discriminator used by the projection-turn journal.
+///
+/// It deliberately does not reuse [`ManagedLocalJournalPayloadKind`]: the two
+/// segments are physically separate and a frame of one kind must never decode
+/// as the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionTurnPayloadKind {
+    TurnV1,
+}
+
+/// Who authored the turn, and the accepted work that authorizes its replay.
+///
+/// Replay re-derives bytes from the accepted state at replay time (§3.2), so
+/// the origin carries authorization and identity only — never rendered bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TurnOrigin {
+    /// A1/A1b/A2 — foreground local authoring.
+    LocalBatch { batch_id: BatchId },
+    /// A3 — locally authored ingress.
+    IngressLocal { batch_id: BatchId },
+    /// A4 — ingress of a foreign endpoint's batch.
+    IngressForeign {
+        batch_id: BatchId,
+        source_endpoint_id: ProjectionEndpointId,
+    },
+    /// A5 — terminal repair of own-endpoint work.
+    TerminalLocal { batch_id: BatchId },
+    /// A6 — terminal repair of a foreign endpoint's work.
+    TerminalForeign {
+        batch_id: BatchId,
+        source_endpoint_id: ProjectionEndpointId,
+    },
+    /// A7 — superseded-projection repair. The observed description is
+    /// authorization evidence; the bytes published come from the replay-time
+    /// accepted state, never from this record.
+    SupersededRepair {
+        page_id: PageId,
+        observed: BlobDescription,
+    },
+}
+
+impl TurnOrigin {
+    pub(crate) const fn batch_id(&self) -> Option<BatchId> {
+        match self {
+            Self::LocalBatch { batch_id }
+            | Self::IngressLocal { batch_id }
+            | Self::IngressForeign { batch_id, .. }
+            | Self::TerminalLocal { batch_id }
+            | Self::TerminalForeign { batch_id, .. } => Some(*batch_id),
+            Self::SupersededRepair { .. } => None,
+        }
+    }
+}
+
+/// The turn's view of a page's prior on-disk state.
+///
+/// `bytes` is populated only in the `ManagedLocal` domain, where the frame
+/// already carries the full material today
+/// (`ManagedLocalProjection::precondition_base`). Projection-domain turns carry
+/// descriptions only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TurnPrecondition {
+    Absent,
+    Base {
+        description: BlobDescription,
+        bytes: Option<Vec<u8>>,
+        annotations: Vec<AnnotatedIdentity>,
+    },
+}
+
+/// The turn's view of the state the page must reach.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TurnTarget {
+    Absent,
+    Present {
+        description: BlobDescription,
+        bytes: Option<Vec<u8>>,
+        annotations: Vec<AnnotatedIdentity>,
+    },
+}
+
+/// One page of a turn. The index of this entry in `ProjectionTurn::pages` is a
+/// derivation input, so the order is part of the record's meaning.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TurnPage {
+    pub(crate) page_id: PageId,
+    pub(crate) path: ManagedPath,
+    pub(crate) precondition: TurnPrecondition,
+    pub(crate) target: TurnTarget,
+    pub(crate) frontier: FrontierV2,
+    pub(crate) claim_evidence: Vec<ProjectionClaimEvidence>,
+}
+
+/// One authoritative unit of graph-tree publication work.
+///
+/// A durable turn is the whole authority for the names its replay may create
+/// and for the pages it may publish. It replaces the receipt store's
+/// `bases/`, `intents/`, `attempts/`, `*.mutation-authority`, `completions/`
+/// and `forensics/pending-cleanup/` artifacts (§3.3).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionTurn {
+    pub(crate) schema_version: u32,
+    pub(crate) derivation_scheme: u32,
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) lineage_digest: LineageDigest,
+    pub(crate) device_id: Uuid,
+    pub(crate) endpoint_id: ProjectionEndpointId,
+    pub(crate) sequence: u64,
+    pub(crate) domain: SequenceDomain,
+    pub(crate) origin: TurnOrigin,
+    pub(crate) pages: Vec<TurnPage>,
+}
+
+/// A turn that could not be produced, decoded or authenticated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectionTurnError {
+    /// Non-canonical, undecodable or self-inconsistent bytes for a record that
+    /// is inside the segment's durable frontier: `MS-REF-DISK-CORRUPT`.
+    CorruptPayload(String),
+    /// A well-formed record naming a derivation scheme this build cannot
+    /// evaluate: `MS-REF-PROTOCOL-INCOMPATIBLE`. The record is preserved and
+    /// the turn is never treated as absent.
+    UnknownDerivationScheme(u32),
+    /// A well-formed record of a future on-disk schema.
+    UnknownSchemaVersion(u32),
+}
+
+impl fmt::Display for ProjectionTurnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CorruptPayload(error) => write!(f, "corrupt projection turn: {error}"),
+            Self::UnknownDerivationScheme(scheme) => write!(
+                f,
+                "projection turn names derivation scheme {scheme}, which this build cannot evaluate"
+            ),
+            Self::UnknownSchemaVersion(version) => {
+                write!(f, "unknown projection turn schema {version}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjectionTurnError {}
+
+impl ProjectionTurn {
+    /// Canonical postcard bytes. Matches the managed-local record's own
+    /// canonical-encoding discipline (`decode_managed_local_payload`).
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, ProjectionTurnError> {
+        self.validate()?;
+        postcard::to_allocvec(self)
+            .map_err(|error| ProjectionTurnError::CorruptPayload(error.to_string()))
+    }
+
+    /// Decode and authenticate one turn payload against its frame binding.
+    ///
+    /// The frame/payload sequence-equality check the managed-local decoder
+    /// performs today is retained (§3.5 "Decoder binding"): a turn whose
+    /// envelope sequence and payload sequence disagree is corruption, never a
+    /// decode-to-absent.
+    pub(crate) fn decode(
+        bytes: &[u8],
+        frame_device_id: Uuid,
+        frame_sequence: u64,
+    ) -> Result<Self, ProjectionTurnError> {
+        let turn: Self = postcard::from_bytes(bytes)
+            .map_err(|error| ProjectionTurnError::CorruptPayload(error.to_string()))?;
+        let canonical = postcard::to_allocvec(&turn)
+            .map_err(|error| ProjectionTurnError::CorruptPayload(error.to_string()))?;
+        if canonical != bytes {
+            return Err(ProjectionTurnError::CorruptPayload(
+                "projection turn payload is not canonical".into(),
+            ));
+        }
+        if turn.schema_version != PROJECTION_TURN_SCHEMA_VERSION {
+            return Err(ProjectionTurnError::UnknownSchemaVersion(
+                turn.schema_version,
+            ));
+        }
+        if !LIVE_PROJECTION_TURN_DERIVATION_SCHEMES.contains(&turn.derivation_scheme) {
+            return Err(ProjectionTurnError::UnknownDerivationScheme(
+                turn.derivation_scheme,
+            ));
+        }
+        if turn.sequence != frame_sequence {
+            return Err(ProjectionTurnError::CorruptPayload(
+                "frame and turn sequences differ".into(),
+            ));
+        }
+        if turn.device_id != frame_device_id {
+            return Err(ProjectionTurnError::CorruptPayload(
+                "turn device differs from journal segment device".into(),
+            ));
+        }
+        turn.validate()?;
+        Ok(turn)
+    }
+
+    fn validate(&self) -> Result<(), ProjectionTurnError> {
+        if self.schema_version != PROJECTION_TURN_SCHEMA_VERSION {
+            return Err(ProjectionTurnError::UnknownSchemaVersion(
+                self.schema_version,
+            ));
+        }
+        if !LIVE_PROJECTION_TURN_DERIVATION_SCHEMES.contains(&self.derivation_scheme) {
+            return Err(ProjectionTurnError::UnknownDerivationScheme(
+                self.derivation_scheme,
+            ));
+        }
+        if self.pages.is_empty() {
+            return Err(ProjectionTurnError::CorruptPayload(
+                "a projection turn names at least one page".into(),
+            ));
+        }
+        for page in &self.pages {
+            let carries_bytes =
+                matches!(
+                    &page.precondition,
+                    TurnPrecondition::Base { bytes: Some(_), .. }
+                ) || matches!(&page.target, TurnTarget::Present { bytes: Some(_), .. });
+            if carries_bytes && self.domain != SequenceDomain::ManagedLocal {
+                return Err(ProjectionTurnError::CorruptPayload(
+                    "projection-domain turns carry descriptions, never bytes".into(),
+                ));
+            }
+            if let TurnPrecondition::Base {
+                description,
+                bytes: Some(bytes),
+                ..
+            } = &page.precondition
+            {
+                if BlobDescription::of(bytes) != *description {
+                    return Err(ProjectionTurnError::CorruptPayload(
+                        "turn precondition bytes do not match their description".into(),
+                    ));
+                }
+            }
+            if let TurnTarget::Present {
+                description,
+                bytes: Some(bytes),
+                ..
+            } = &page.target
+            {
+                if BlobDescription::of(bytes) != *description {
+                    return Err(ProjectionTurnError::CorruptPayload(
+                        "turn target bytes do not match their description".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// §3.5's `turn_id`. A pure function of the record's own fields; the
+    /// receipt-store resource id deliberately does not participate, so the
+    /// identity is reproducible from the record alone.
+    pub(crate) fn turn_id(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tine/projection-turn/v1\0");
+        hasher.update(self.derivation_scheme.to_be_bytes());
+        hasher.update(self.workspace_id.as_uuid().as_bytes());
+        hasher.update(self.lineage_digest.as_bytes());
+        hasher.update(self.device_id.as_bytes());
+        hasher.update(self.endpoint_id.as_uuid().as_bytes());
+        hasher.update([self.domain.derivation_byte()]);
+        hasher.update(self.sequence.to_be_bytes());
+        hasher.finalize().into()
+    }
+
+    /// §3.5's `attempt_id(i)`, the per-page deterministic name seed.
+    pub(crate) fn attempt_id(&self, index: usize) -> Option<Uuid> {
+        let page = self.pages.get(index)?;
+        Some(projection_turn_attempt_id(
+            self.turn_id(),
+            u32::try_from(index).ok()?,
+            page.page_id,
+        ))
+    }
+}
+
+/// RFC 9562 UUIDv8 derived exactly as §3.5 specifies, following the existing
+/// pattern at `oplog/projection_store.rs` (SHA-256, first 16 bytes, version and
+/// variant masked).
+pub(crate) fn projection_turn_attempt_id(turn_id: [u8; 32], index: u32, page_id: PageId) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tine/projection-attempt/v2\0");
+    hasher.update(turn_id);
+    hasher.update(index.to_be_bytes());
+    hasher.update(page_id.as_uuid().as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+/// The displaced pre-image's name, replacing today's random-UUID and
+/// PID-scoped W2 names.
+pub(crate) fn projection_turn_recovery_filename(target_filename: &str, attempt_id: Uuid) -> String {
+    format!(
+        ".{target_filename}.{}.projection.recovery",
+        attempt_id.simple()
+    )
+}
+
+/// The staged replacement's name, replacing today's PID + process-local
+/// atomic `.projection.tmp`.
+pub(crate) fn projection_turn_staged_filename(target_filename: &str, attempt_id: Uuid) -> String {
+    format!(
+        ".{target_filename}.{}.projection.staged",
+        attempt_id.simple()
+    )
+}
+
+/// The withdrawal name, replacing today's random UUID.
+pub(crate) fn projection_turn_withdrawn_filename(
+    target_filename: &str,
+    attempt_id: Uuid,
+) -> String {
+    format!(
+        ".{target_filename}.{}.projection.withdrawn",
+        attempt_id.simple()
+    )
 }
 
 #[derive(Clone, Debug)]

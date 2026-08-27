@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use tine_storage::LocalJournalFrame;
+use tine_storage::{LocalJournalError, LocalJournalFrame};
 use uuid::Uuid;
 
 use crate::model::Graph;
@@ -20,9 +20,11 @@ use crate::oplog::object_store::{BatchInspection, StoreError};
 use crate::oplog::{
     decode_managed_local_record, AcceptedBatchEvent, BatchDisposition, BatchId, ContentDigest,
     DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath,
-    ManifestObjectRef, ObjectStore, PageId, ProjectionEndpointBinding, ProjectionReceiptStore,
-    ProjectionWork, ProjectionWorkTarget, RebuildSource, ShardedHotEngine, SqliteFrontier,
-    TailOverlay, WorkspaceId,
+    ManifestObjectRef, ManifestProjectionTarget, ObjectStore, PageId, ProjectionEndpointBinding,
+    ProjectionReceiptStore, ProjectionTurn, ProjectionTurnError, ProjectionTurnPayloadKind,
+    ProjectionWork, ProjectionWorkTarget, RebuildSource, SequenceDomain, ShardedHotEngine,
+    SqliteFrontier, TailOverlay, TurnOrigin, TurnPage, TurnPrecondition, TurnTarget, WorkspaceId,
+    PROJECTION_TURN_DERIVATION_SCHEME_V1, PROJECTION_TURN_SCHEMA_VERSION,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -1181,4 +1183,239 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         timings.total = drain_started.elapsed();
     });
     outcome
+}
+
+// ---------------------------------------------------------------------------
+// Torn versus corrupt: the WAL rule (journal-universal durability design §3.4).
+//
+// The discriminator is NOT invented here. `LocalJournalSegmentV2` maintains a
+// durable frontier: append file-flushes the frame and durably publishes the
+// successor frontier before returning, open validates every byte inside the
+// committed frontier and truncates only bytes beyond it. So:
+//
+// * bytes BEYOND the durable frontier -- the append never returned. By the
+//   turn-before-mutation invariant, no graph mutation for those bytes can have
+//   started. The segment truncates them; nothing is owed; there is no residue
+//   probe because none is needed.
+// * any invalid frame AT OR BELOW the frontier, tail or interior -- a disk or
+//   media error damaged an authoritative record whose effects may exist.
+//   Refuse activation, retain the segment bytes as evidence, report the
+//   component. Never truncate, never skip.
+//
+// The first case never reaches this module: the segment handles it silently and
+// reports it as `discarded_tail_bytes`. The second arrives as an open error,
+// and mapping every open error to one code would be wrong -- `open_selected`
+// also reports an honest concurrent instance and an unsafe filesystem, whose
+// in-scope scenarios are different and whose refusals already exist. The
+// mapping below is therefore per-variant, and each arm names its scenario.
+// ---------------------------------------------------------------------------
+
+/// A local-journal segment that could not be opened, classified by the in-scope
+/// failure it actually names (the refusal-scenario rule).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalJournalOpenRefusal {
+    /// `MS-REF-DISK-CORRUPT`. In-scope scenario: a disk/media error damaged an
+    /// authoritative record inside the durable frontier, whose graph effects
+    /// may already exist. Retain the segment bytes as evidence; never truncate.
+    DiskCorrupt(String),
+    /// In-scope scenario: an honest second Tine instance holds the segment.
+    /// The existing concurrent-instance refusal applies; nothing is corrupt.
+    ConcurrentInstance(String),
+    /// In-scope scenario: the journal namespace contains an entry this
+    /// platform cannot safely open (symlink, non-regular file, unsafe name).
+    UnsafeFilesystem(String),
+    /// In-scope scenario: a transient I/O or capability failure. Retryable;
+    /// asserts nothing about the record's integrity.
+    Unavailable(String),
+}
+
+impl LocalJournalOpenRefusal {
+    /// The contract refusal code this classification maps to, or `None` where
+    /// the existing (non-corruption) refusal owns the message.
+    pub(crate) const fn refusal_code(&self) -> Option<&'static str> {
+        match self {
+            Self::DiskCorrupt(_) => Some("MS-REF-DISK-CORRUPT"),
+            Self::ConcurrentInstance(_) | Self::UnsafeFilesystem(_) | Self::Unavailable(_) => None,
+        }
+    }
+
+    pub(crate) const fn retains_evidence(&self) -> bool {
+        matches!(self, Self::DiskCorrupt(_))
+    }
+
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            Self::DiskCorrupt(detail)
+            | Self::ConcurrentInstance(detail)
+            | Self::UnsafeFilesystem(detail)
+            | Self::Unavailable(detail) => detail,
+        }
+    }
+}
+
+impl std::fmt::Display for LocalJournalOpenRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DiskCorrupt(detail) => write!(
+                formatter,
+                "MS-REF-DISK-CORRUPT: an authoritative journal record inside the durable \
+                 frontier is damaged and its bytes are retained as evidence: {detail}"
+            ),
+            Self::ConcurrentInstance(detail) => write!(
+                formatter,
+                "another Tine instance already holds this local journal segment: {detail}"
+            ),
+            Self::UnsafeFilesystem(detail) => write!(
+                formatter,
+                "the local journal namespace contains an entry that cannot be safely opened: \
+                 {detail}"
+            ),
+            Self::Unavailable(detail) => {
+                write!(formatter, "the local journal is unavailable: {detail}")
+            }
+        }
+    }
+}
+
+/// Per-variant mapping of a `LocalJournalSegmentV2::open_selected` failure.
+///
+/// This deliberately does not collapse to "any open error is corruption": a
+/// check with the wrong scenario is a future availability bug, not hardening.
+pub(crate) fn classify_local_journal_open_error(
+    error: &LocalJournalError,
+) -> LocalJournalOpenRefusal {
+    let detail = error.to_string();
+    match error {
+        // Every one of these is reported by the committed-prefix scan, i.e.
+        // strictly at or below the durable frontier. Bytes beyond the frontier
+        // are truncated by the segment and never surface as an error at all.
+        LocalJournalError::CorruptSegment { .. }
+        | LocalJournalError::SegmentDeviceMismatch { .. }
+        | LocalJournalError::SegmentSequenceGap { .. }
+        | LocalJournalError::ChecksumMismatch
+        | LocalJournalError::PayloadDigestMismatch
+        | LocalJournalError::InvalidFrameMagic
+        | LocalJournalError::NonCanonicalFrameHeader
+        | LocalJournalError::TruncatedFrame
+        | LocalJournalError::FrameLengthMismatch { .. }
+        | LocalJournalError::LengthOverflow
+        | LocalJournalError::FrameTooLarge(_)
+        | LocalJournalError::FrameHeaderTooLarge(_)
+        | LocalJournalError::SegmentTooLarge(_)
+        | LocalJournalError::UnknownFrameSchemaVersion { .. }
+        | LocalJournalError::AmbiguousLegacySuffix { .. }
+        | LocalJournalError::Decode(_)
+        | LocalJournalError::SequenceExhausted => LocalJournalOpenRefusal::DiskCorrupt(detail),
+        LocalJournalError::SegmentAlreadyOpen(_) | LocalJournalError::PreparedArtifactExists(_) => {
+            LocalJournalOpenRefusal::ConcurrentInstance(detail)
+        }
+        LocalJournalError::UnsafeSegmentName(_)
+        | LocalJournalError::UnsupportedDurableReplacement => {
+            LocalJournalOpenRefusal::UnsafeFilesystem(detail)
+        }
+        LocalJournalError::Io(_)
+        | LocalJournalError::Encode(_)
+        | LocalJournalError::SegmentPoisoned => LocalJournalOpenRefusal::Unavailable(detail),
+    }
+}
+
+/// Decode a projection-turn frame.
+///
+/// One of the two producers of the single [`ProjectionTurn`] view; the sibling
+/// below reads a managed-local frame. Recovery therefore has one record shape
+/// to reason about regardless of which physical segment carried it.
+pub(crate) fn decode_projection_turn_frame(
+    frame: &LocalJournalFrame<ProjectionTurnPayloadKind>,
+) -> Result<ProjectionTurn, ProjectionTurnError> {
+    if frame.payload_kind() != ProjectionTurnPayloadKind::TurnV1 {
+        return Err(ProjectionTurnError::CorruptPayload(
+            "unknown projection turn payload kind".into(),
+        ));
+    }
+    ProjectionTurn::decode(frame.payload(), frame.device_id(), frame.sequence())
+}
+
+/// Project one already-authenticated managed-local frame into the same
+/// [`ProjectionTurn`] view.
+///
+/// For A1/A2 this is a re-shape of material the frame already carries
+/// (`ManagedLocalProjection::precondition_base`/`render_base`), not a size
+/// increase, and it is why the foreground journal needs no second record kind.
+/// `lineage_digest` is a binding input for the same reason the drain
+/// checkpoint takes one: the frame does not carry it.
+pub(crate) fn projection_turn_from_managed_local_frame(
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    lineage_digest: LineageDigest,
+) -> Result<ProjectionTurn, ProjectionTurnError> {
+    let record = decode_managed_local_record(frame)
+        .map_err(|error| ProjectionTurnError::CorruptPayload(error.to_string()))?;
+    projection_turn_from_managed_local_record(frame.device_id(), lineage_digest, &record)
+}
+
+pub(crate) fn projection_turn_from_managed_local_record(
+    device_id: Uuid,
+    lineage_digest: LineageDigest,
+    record: &ManagedLocalRecord,
+) -> Result<ProjectionTurn, ProjectionTurnError> {
+    let first = record.projections().first().ok_or_else(|| {
+        ProjectionTurnError::CorruptPayload(
+            "a managed-local record retains at least one projection".into(),
+        )
+    })?;
+    let workspace_id = first.intent().workspace_id();
+    let endpoint_id = first.intent().source_endpoint_id();
+    let mut pages = Vec::with_capacity(record.projections().len());
+    for projection in record.projections() {
+        let intent = projection.intent();
+        if intent.workspace_id() != workspace_id || intent.source_endpoint_id() != endpoint_id {
+            return Err(ProjectionTurnError::CorruptPayload(
+                "one managed-local record spans two workspaces or endpoints".into(),
+            ));
+        }
+        let precondition = match projection.precondition_base() {
+            None => TurnPrecondition::Absent,
+            Some(base) => TurnPrecondition::Base {
+                description: base.description(),
+                bytes: Some(base.bytes().to_vec()),
+                annotations: base.annotations().to_vec(),
+            },
+        };
+        let target = match intent.target() {
+            ManifestProjectionTarget::Absent => TurnTarget::Absent,
+            ManifestProjectionTarget::Present {
+                description,
+                bytes,
+                annotations,
+            } => TurnTarget::Present {
+                description: *description,
+                bytes: Some(bytes.clone()),
+                annotations: annotations.clone(),
+            },
+        };
+        pages.push(TurnPage {
+            page_id: intent.page_id(),
+            path: intent.path().clone(),
+            precondition,
+            target,
+            frontier: intent.post_frontier().clone(),
+            claim_evidence: intent.claim_evidence().to_vec(),
+        });
+    }
+    let turn = ProjectionTurn {
+        schema_version: PROJECTION_TURN_SCHEMA_VERSION,
+        derivation_scheme: PROJECTION_TURN_DERIVATION_SCHEME_V1,
+        workspace_id,
+        lineage_digest,
+        device_id,
+        endpoint_id,
+        sequence: record.sequence(),
+        domain: SequenceDomain::ManagedLocal,
+        origin: TurnOrigin::LocalBatch {
+            batch_id: record.prepared_batch().manifest().batch_id(),
+        },
+        pages,
+    };
+    // Encoding revalidates every structural invariant of the record.
+    turn.encode()?;
+    Ok(turn)
 }

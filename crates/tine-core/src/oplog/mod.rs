@@ -48,6 +48,7 @@ pub mod projection;
 mod projection_integration_tests;
 pub mod projection_manifest;
 pub mod projection_store;
+pub(crate) mod projection_turn_journal;
 pub mod projection_work;
 pub mod receipt;
 pub mod reference_catalog;
@@ -102,9 +103,14 @@ pub use batch::{
     OPLOG_PROTOCOL_VERSION,
 };
 pub(crate) use hot_engine::{
-    append_managed_local_record, CleanTombstoneAuthorization, CleanTombstoneDeferral,
-    CleanTombstoneSupersession, ManagedLocalAppendError, ManagedLocalAppendProof,
-    ManagedLocalJournalAppend, ProjectionTombstoneAuthorization,
+    append_managed_local_record, projection_turn_attempt_id, projection_turn_recovery_filename,
+    projection_turn_staged_filename, projection_turn_withdrawn_filename,
+    CleanTombstoneAuthorization, CleanTombstoneDeferral, CleanTombstoneSupersession,
+    ManagedLocalAppendError, ManagedLocalAppendProof, ManagedLocalJournalAppend,
+    ProjectionTombstoneAuthorization, ProjectionTurn, ProjectionTurnError,
+    ProjectionTurnPayloadKind, SequenceDomain, TurnOrigin, TurnPage, TurnPrecondition, TurnTarget,
+    LIVE_PROJECTION_TURN_DERIVATION_SCHEMES, PROJECTION_TURN_DERIVATION_SCHEME_V1,
+    PROJECTION_TURN_SCHEMA_VERSION,
 };
 pub use hot_engine::{
     decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence, AuthorBatch,
