@@ -1022,6 +1022,7 @@ fn projection_plan_from_rendered(
         state.frontier.clone(),
         state.claim_evidence.clone(),
         precondition,
+        super::ProjectionTargetKind::Present,
         super::BlobDescription::of(&rendered.target),
         rendered.annotations,
     )?;
@@ -1148,6 +1149,7 @@ fn plan_exact_source_projection(
         state.frontier.clone(),
         state.claim_evidence.clone(),
         ProjectionPrecondition::Base(description),
+        super::ProjectionTargetKind::Present,
         description,
         annotations.clone(),
     )
@@ -1763,6 +1765,8 @@ fn receiver_clean_tombstone_plan(
             authorization.frontier().clone(),
             Vec::new(),
             precondition,
+            // A receiver-local tombstone projects the page's absence.
+            super::ProjectionTargetKind::Absent,
             super::BlobDescription::of(&[]),
             Vec::new(),
         )
@@ -1935,6 +1939,11 @@ pub(crate) fn decode_manifested_projection_work(
             .map_or(ProjectionPrecondition::Absent, |base| {
                 ProjectionPrecondition::Base(base.description())
             }),
+        // The manifested target's own discriminant, never its byte length.
+        match manifested.target() {
+            ManifestProjectionTarget::Absent => super::ProjectionTargetKind::Absent,
+            ManifestProjectionTarget::Present { .. } => super::ProjectionTargetKind::Present,
+        },
         description,
         annotations,
     )?;

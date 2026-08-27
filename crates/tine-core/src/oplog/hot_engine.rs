@@ -75,8 +75,9 @@ use super::{
     OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
     PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
     ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionIntentId,
-    ProjectionPrecondition, ProjectionReceiptStore, ProjectionWork, ProjectionWorkTarget,
-    SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
+    ProjectionPrecondition, ProjectionReceiptStore, ProjectionTargetKind, ProjectionWork,
+    ProjectionWorkTarget, SemanticEffect, SemanticEffectDigest, SemanticError, SessionId,
+    ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -16609,6 +16610,10 @@ impl ShardedHotEngine {
                 before.frontier.clone(),
                 before.claim_evidence.clone(),
                 ProjectionPrecondition::Base(description),
+                // A managed-local predecessor is always a rendered file: the
+                // `ManifestProjectionTarget::Present` destructuring above is
+                // what reached this arm.
+                ProjectionTargetKind::Present,
                 description,
                 annotations.clone(),
             )

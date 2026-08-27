@@ -5929,6 +5929,14 @@ fn open_clean_runtime_resources_with_progress(
     else {
         return Ok(None);
     };
+    // (c) §1: the claim precheck is the HEAD of the clean cold open, before
+    // `Graph::open_checked` -- which is not read-only, because its publication
+    // recovery renames graph files and moves artifacts to `.trash/`. Clean
+    // authority discovery has just returned Some, so the store is
+    // authoritative and its claim provably predates the authority marker. A
+    // fresh store never reaches this line. The full in-place validation inside
+    // the receipt-store open below stays as defense in depth.
+    ProjectionReceiptStore::precheck_authoritative_claim(&request.receipt_root).map_err(display)?;
     let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
@@ -23359,6 +23367,195 @@ mod tests {
             !window.contains("#[cfg(test)]"),
             "supersession is unconditional: no build may keep a pre-0.7 actor start here"
         );
+    }
+
+    /// Plant the state the (c) §6 gate calls for: a live page name missing with
+    /// its valid claim twin beside it. `Graph::open_checked`'s publication
+    /// recovery restores exactly this shape, so it is what proves the claim
+    /// precheck ran BEFORE any graph mutation could begin.
+    fn plant_pending_publication_artifact(graph_root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        let live = graph_root.join("pages").join("Precheck.md");
+        fs::create_dir_all(live.parent().unwrap()).unwrap();
+        let claim = live
+            .parent()
+            .unwrap()
+            .join(".Precheck.md.4242.1.editor-recovery");
+        let bytes = b"- pending publication\n".to_vec();
+        fs::write(&claim, &bytes).unwrap();
+        assert!(!live.exists());
+        (live, claim, bytes)
+    }
+
+    fn store_claim_path(request: &SyncLocalActivationRequest) -> PathBuf {
+        request.receipt_root.join("projection-receipts.claim")
+    }
+
+    /// A store this build cannot serve is refused at the HEAD of the clean cold
+    /// open, before `Graph::open_checked` can rename a single graph file.
+    ///
+    /// In-scope scenario: an honest pre-(c) private store meets a (c) build.
+    /// Recovery is re-activation; the user's Markdown is untouched, and this
+    /// asserts that literally -- the whole graph tree is byte-identical after
+    /// the refused open.
+    #[test]
+    fn a_pre_c_private_store_is_refused_before_any_graph_mutation() {
+        let fixture = ActivationFixture::nested_unicode("precheck-pre-c-store", 0xc1a0);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("precheck fixture activates");
+        drive_initial_feed(&handle);
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        // A pre-(c) claim: the prior magic family, recognized and refused.
+        let claim_path = store_claim_path(&fixture.request);
+        let mut claim = Vec::new();
+        claim.extend_from_slice(b"TINEPR5\0");
+        claim.extend_from_slice(&5_u32.to_be_bytes());
+        claim.extend_from_slice(&[0_u8; 32]);
+        claim.extend_from_slice(fixture.request.identities.workspace_id.as_uuid().as_bytes());
+        claim.extend_from_slice(&[0_u8; 1 + 16 + 16 + 32 + 5 * 32]);
+        fs::write(&claim_path, &claim).unwrap();
+
+        let (live, artifact, artifact_bytes) =
+            plant_pending_publication_artifact(&fixture.graph_root);
+        let before = user_graph_bytes(&fixture.graph_root);
+
+        let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert!(result.handle.is_none());
+        let SyncRuntimeOpenStatus::OpenRefused { detail } = &result.status else {
+            panic!("a pre-(c) store must surface a managed-open refusal: {result:?}");
+        };
+        assert!(
+            detail.contains("re-activate") && detail.contains("Markdown"),
+            "the refusal must name its remedy: {detail}"
+        );
+        assert_eq!(
+            result.status.durable_refusal_scenario(),
+            Some(ManagedStorageRefusalScenario::ProtocolIncompatible),
+            "a refused pre-(c) store is a durable refusal, not a retryable one"
+        );
+        assert!(
+            !matches!(result.status, SyncRuntimeOpenStatus::SupersededLegacyState),
+            "the (c) refusal must never become a silent Direct-Files fall-through"
+        );
+
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            before,
+            "a refused open must not change one byte of the user's graph"
+        );
+        assert!(
+            !live.exists(),
+            "publication recovery must not have run: the live name is still absent"
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), artifact_bytes);
+        assert_eq!(fs::read(&claim_path).unwrap(), claim);
+    }
+
+    /// R21-C1: a current-magic header on a truncated claim body must not pass.
+    /// A magic-only precheck would let it through, and graph publication
+    /// recovery would then run before the in-place length check ever fired.
+    #[test]
+    fn a_torn_store_claim_is_refused_before_any_graph_mutation() {
+        let fixture = ActivationFixture::nested_unicode("precheck-torn-claim", 0xc1a1);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("precheck fixture activates");
+        drive_initial_feed(&handle);
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let claim_path = store_claim_path(&fixture.request);
+        let full = fs::read(&claim_path).unwrap();
+        assert!(full.len() > 12, "a current claim is longer than its header");
+        let torn = full[..full.len() - 1].to_vec();
+        fs::write(&claim_path, &torn).unwrap();
+
+        let (live, artifact, artifact_bytes) =
+            plant_pending_publication_artifact(&fixture.graph_root);
+        let before = user_graph_bytes(&fixture.graph_root);
+
+        let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert!(result.handle.is_none());
+        assert!(
+            matches!(result.status, SyncRuntimeOpenStatus::OpenRefused { .. }),
+            "a torn claim must surface a managed-open refusal: {result:?}"
+        );
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            before,
+            "a refused open must not change one byte of the user's graph"
+        );
+        assert!(!live.exists());
+        assert_eq!(fs::read(&artifact).unwrap(), artifact_bytes);
+        assert_eq!(fs::read(&claim_path).unwrap(), torn);
+    }
+
+    /// The claim provably predates the activation authority marker, so a
+    /// populated claimless private store on an authoritative graph is broken,
+    /// not initializable. It is refused before any graph mutation too.
+    #[test]
+    fn a_claimless_populated_private_store_is_refused_before_any_graph_mutation() {
+        let fixture = ActivationFixture::nested_unicode("precheck-claimless", 0xc1a2);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("precheck fixture activates");
+        drive_initial_feed(&handle);
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        fs::remove_file(store_claim_path(&fixture.request)).unwrap();
+        let (live, _, _) = plant_pending_publication_artifact(&fixture.graph_root);
+        let before = user_graph_bytes(&fixture.graph_root);
+
+        let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert!(result.handle.is_none());
+        assert!(
+            matches!(result.status, SyncRuntimeOpenStatus::OpenRefused { .. }),
+            "a claimless populated store must be refused: {result:?}"
+        );
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+        assert!(!live.exists());
+    }
+
+    /// The precheck is not a new gate on ordinary use: a fresh store has no
+    /// claim to check, activation initializes it exactly as before, and the
+    /// next cold open serves normally.
+    #[test]
+    fn the_claim_precheck_leaves_fresh_activation_and_ordinary_reopen_unaffected() {
+        let fixture = ActivationFixture::nested_unicode("precheck-fresh", 0xc1a3);
+        assert!(!store_claim_path(&fixture.request).exists());
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("fresh activation is unaffected");
+        drive_initial_feed(&handle);
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let claim = fs::read(store_claim_path(&fixture.request)).unwrap();
+        assert!(
+            claim.starts_with(b"TINEPR6\0"),
+            "a freshly initialized store carries the current claim magic"
+        );
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     /// Behavior half of the blank-slate ruling: damaged pre-0.7 residue

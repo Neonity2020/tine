@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Managed storage's private receipt-store format has been bumped**
+  (development only). Projection records now carry an explicit target-kind
+  discriminant, so a private store created by an earlier build is refused with a
+  named notice telling you to re-activate managed storage for that graph. Your
+  Markdown files are untouched by the refusal — the check runs before anything
+  can modify the graph. Managed storage has not shipped, so no released build
+  can have created such a store; this affects development machines only.
+
 - **Saving a page performs fewer disk-durability round trips** (28 → 25
   core-initiated barriers per accepted single-block save; 77 → 74 for a
   cross-page move). Three barriers defended no failure Tine's threat model

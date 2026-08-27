@@ -42981,6 +42981,7 @@ mod tests {
             crate::oplog::FrontierV2::default(),
             Vec::new(),
             crate::oplog::ProjectionPrecondition::Base(BlobDescription::of(base)),
+            crate::oplog::ProjectionTargetKind::Absent,
             BlobDescription::of(&[]),
             Vec::new(),
         )
@@ -43041,6 +43042,7 @@ mod tests {
                 crate::oplog::FrontierV2::default(),
                 Vec::new(),
                 crate::oplog::ProjectionPrecondition::Base(BlobDescription::of(base)),
+                crate::oplog::ProjectionTargetKind::Present,
                 BlobDescription::of(target),
                 Vec::new(),
             )
@@ -50017,6 +50019,7 @@ mod tests {
             crate::oplog::FrontierV2::default(),
             Vec::new(),
             crate::oplog::ProjectionPrecondition::Absent,
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(present_target),
             Vec::new(),
         )
@@ -50047,6 +50050,7 @@ mod tests {
             crate::oplog::FrontierV2::default(),
             Vec::new(),
             crate::oplog::ProjectionPrecondition::Base(BlobDescription::of(removed_base)),
+            crate::oplog::ProjectionTargetKind::Absent,
             BlobDescription::of(&[]),
             Vec::new(),
         )

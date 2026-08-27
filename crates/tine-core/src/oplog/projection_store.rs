@@ -5,7 +5,7 @@ use std::fmt;
 #[cfg(target_os = "android")]
 use std::fs;
 use std::fs::File;
-use std::io::{self, ErrorKind, Read as _, Write as _};
+use std::io::{self, ErrorKind, Read, Write as _};
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
@@ -59,12 +59,24 @@ const PENDING_CLEANUP_ROUND_DIRS: [&str; 2] = [
     PROJECTION_CLEANUP_ROUND_1_DIR,
 ];
 
-const STORE_CLAIM_MAGIC: &[u8; 8] = b"TINEPR5\0";
-const PRIOR_STORE_CLAIM_MAGICS: [&[u8; 8]; 2] = [b"TINEPR4\0", b"TINEPR3\0"];
+/// The current private receipt-store claim.
+///
+/// Sub-design (c) §1 (v19): the record format now carries an explicit
+/// target-kind discriminant, and the 0.7 blank-slate decision says pre-(c)
+/// stores are refused rather than migrated. The claim version IS that
+/// transition -- there is no dual acceptance, no legacy classification, and no
+/// migration apparatus. A pre-(c) magic falls into the store's existing
+/// recognized-and-refused convention below, carrying the re-activation remedy;
+/// the user's Markdown is untouched.
+const STORE_CLAIM_MAGIC: &[u8; 8] = b"TINEPR6\0";
+const PRIOR_STORE_CLAIM_MAGICS: [&[u8; 8]; 3] = [b"TINEPR5\0", b"TINEPR4\0", b"TINEPR3\0"];
 const STORE_INIT_MAGIC: &[u8; 8] = b"TINEPI5\0";
-const STORE_CLAIM_VERSION: u32 = 5;
+const STORE_CLAIM_VERSION: u32 = 6;
 const STORE_CLAIM_BASE_LEN: usize = STORE_CLAIM_MAGIC.len() + 4 + 32 + 16 + 1 + 16 + 16 + 32;
-const STORE_CLAIM_LEN: usize = STORE_CLAIM_BASE_LEN + 5 * 32;
+/// The version-specific claim envelope length. A current-magic claim of any
+/// other length is malformed, never a shorter older format: this is what the
+/// cold-open precheck holds a claim to before anything can mutate the graph.
+pub(crate) const STORE_CLAIM_LEN: usize = STORE_CLAIM_BASE_LEN + 5 * 32;
 const STORE_INIT_LEN: usize = STORE_CLAIM_BASE_LEN;
 pub(crate) const MAX_PROJECTION_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_PROJECTION_CATALOG_BYTES: u64 = 512 * 1024 * 1024;
@@ -1046,6 +1058,86 @@ pub(crate) struct ProjectionCatalogEntry {
 impl ProjectionReceiptStore {
     pub fn open(root: &Path, workspace_id: WorkspaceId) -> Result<Self, ProjectionStoreError> {
         Self::open_with_binding(root, workspace_id, None)
+    }
+
+    /// Refuse an unusable private receipt store BEFORE anything can touch the
+    /// user's graph tree.
+    ///
+    /// Sub-design (c) §1 (R20-C1/R21-C1). The store's full claim validation is
+    /// already the first thing `open` does, and it is kept as defense in depth
+    /// — but on the clean cold-open path it runs *after* `Graph::open_checked`,
+    /// whose publication recovery renames graph files and moves artifacts to
+    /// `.trash/`. A store this build cannot serve must not get that far.
+    ///
+    /// In-scope scenario: an honest pre-(c) private store meets a (c) build
+    /// (Martin's own dev devices). Recovery is re-activation; the Markdown is
+    /// intact and untouched. The torn-claim arm additionally covers an
+    /// interrupted or truncated write of the claim itself: a current-magic
+    /// header on a short body must not pass, or graph recovery runs before the
+    /// in-place length check ever fires.
+    ///
+    /// The precheck is read-only and mutates nothing on any path. It applies
+    /// only to a store the caller has already proven authoritative; a fresh
+    /// store has no claim to check and initializes exactly as today.
+    pub(crate) fn precheck_authoritative_claim(root: &Path) -> Result<(), ProjectionStoreError> {
+        let capability = match Dir::open_ambient_dir(root, ambient_authority()) {
+            Ok(capability) => capability,
+            // No private store directory at all: nothing to refuse, and
+            // initialization owns the state.
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ProjectionStoreError::from(StoreError::Io(error))
+                    .at("open private receipt store for claim precheck"))
+            }
+        };
+        let metadata = match capability.symlink_metadata(STORE_CLAIM_FILE) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(ProjectionStoreError::from(StoreError::Io(error))
+                    .at("read private receipt store claim"))
+            }
+        };
+        let Some(metadata) = metadata else {
+            // A claimless store root. The claim provably predates the
+            // activation authority marker, so on an authoritative store a
+            // populated claimless root is the in-place claimless-nonempty
+            // refusal, reached one step earlier. An empty or absent root is
+            // left to initialization exactly as today.
+            if capability
+                .entries()
+                .map_err(|error| {
+                    ProjectionStoreError::from(StoreError::Io(error))
+                        .at("enumerate private receipt store for claim precheck")
+                })?
+                .next()
+                .transpose()
+                .map_err(|error| {
+                    ProjectionStoreError::from(StoreError::Io(error))
+                        .at("enumerate private receipt store for claim precheck")
+                })?
+                .is_some()
+            {
+                return Err(ProjectionStoreError::ClaimlessNonemptyStore);
+            }
+            return Ok(());
+        };
+        if !metadata.is_file() {
+            return Err(ProjectionStoreError::MalformedStoreClaim);
+        }
+        let mut bytes = vec![0_u8; STORE_CLAIM_LEN + 1];
+        let read = {
+            let mut file = capability.open(STORE_CLAIM_FILE).map_err(|error| {
+                ProjectionStoreError::from(StoreError::Io(error))
+                    .at("read private receipt store claim")
+            })?;
+            read_claim_prefix(&mut file, &mut bytes).map_err(|error| {
+                ProjectionStoreError::from(StoreError::Io(error))
+                    .at("read private receipt store claim")
+            })?
+        };
+        bytes.truncate(read);
+        classify_precheck_claim(&bytes)
     }
 
     /// Open a receipt namespace durably enrolled to one endpoint and one exact
@@ -3143,9 +3235,16 @@ impl fmt::Display for ProjectionStoreError {
             Self::UnknownStoreVersion(version) => {
                 write!(f, "unknown projection store version {version}")
             }
+            // The remedy is part of the error, not of a caller's prose: this
+            // string is what the managed-open failure channel carries to the
+            // user, and the whole point of the (c) blank-slate transition is
+            // that the user is told exactly how to proceed.
             Self::UpgradeRequired { found, current } => write!(
                 f,
-                "projection receipt store version {found} requires upgrade to {current}"
+                "projection receipt store version {found} requires upgrade to {current}: \
+                 re-activate managed storage for this graph; your Markdown files are intact \
+                 and are not modified by this refusal [{}]",
+                crate::oplog::refusal::ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
             ),
             Self::MalformedStoreClaim => f.write_str("malformed projection store claim"),
             Self::ClaimlessNonemptyStore => {
@@ -3367,6 +3466,93 @@ mod catalog_limit_tests {
             })
         ));
     }
+}
+
+/// The current claim magic as the contract spells it (an escaped trailing NUL).
+#[cfg(test)]
+pub(crate) fn store_claim_magic_display() -> String {
+    display_claim_magic(STORE_CLAIM_MAGIC)
+}
+
+#[cfg(test)]
+pub(crate) const fn store_claim_version() -> u32 {
+    STORE_CLAIM_VERSION
+}
+
+#[cfg(test)]
+pub(crate) fn prior_store_claim_magics_display() -> Vec<String> {
+    PRIOR_STORE_CLAIM_MAGICS
+        .iter()
+        .map(|magic| display_claim_magic(magic))
+        .collect()
+}
+
+#[cfg(test)]
+fn display_claim_magic(magic: &[u8; 8]) -> String {
+    let text = std::str::from_utf8(&magic[..7]).expect("claim magic is ASCII");
+    assert_eq!(magic[7], 0, "a claim magic ends in one NUL byte");
+    format!("{text}\\0")
+}
+
+fn read_claim_prefix(file: &mut impl Read, bytes: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// The precheck's decision, split out so it can be exercised on bytes alone.
+///
+/// It deliberately answers only the questions that can be answered without the
+/// store id, workspace or endpoint: magic family, version, and the exact
+/// version-specific envelope length. Everything else stays with `validate_claim`
+/// at the in-place boundary.
+fn classify_precheck_claim(bytes: &[u8]) -> Result<(), ProjectionStoreError> {
+    for magic in PRIOR_STORE_CLAIM_MAGICS {
+        if bytes.len() >= magic.len() + 4 && &bytes[..magic.len()] == magic {
+            let version = u32::from_be_bytes(
+                bytes[magic.len()..magic.len() + 4]
+                    .try_into()
+                    .expect("prior claim version slice"),
+            );
+            return Err(ProjectionStoreError::UpgradeRequired {
+                found: version,
+                current: STORE_CLAIM_VERSION,
+            });
+        }
+    }
+    if bytes.len() < STORE_CLAIM_MAGIC.len() + 4
+        || &bytes[..STORE_CLAIM_MAGIC.len()] != STORE_CLAIM_MAGIC
+    {
+        return Err(ProjectionStoreError::MalformedStoreClaim);
+    }
+    let version = u32::from_be_bytes(
+        bytes[STORE_CLAIM_MAGIC.len()..STORE_CLAIM_MAGIC.len() + 4]
+            .try_into()
+            .expect("claim version slice"),
+    );
+    if version < STORE_CLAIM_VERSION {
+        return Err(ProjectionStoreError::UpgradeRequired {
+            found: version,
+            current: STORE_CLAIM_VERSION,
+        });
+    }
+    if version > STORE_CLAIM_VERSION {
+        return Err(ProjectionStoreError::UnknownStoreVersion(version));
+    }
+    // R21-C1: a current-magic header on a truncated -- or over-long -- body
+    // must not pass. Without this, graph publication recovery runs before the
+    // in-place length check ever fires.
+    if bytes.len() != STORE_CLAIM_LEN {
+        return Err(ProjectionStoreError::MalformedStoreClaim);
+    }
+    Ok(())
 }
 
 fn validate_claim(
@@ -4483,6 +4669,7 @@ mod tests {
                 base.map_or(ProjectionPrecondition::Absent, |base| {
                     ProjectionPrecondition::Base(BlobDescription::of(base))
                 }),
+                crate::oplog::ProjectionTargetKind::Present,
                 BlobDescription::of(&target),
                 Vec::new(),
             )
@@ -5482,6 +5669,7 @@ mod tests {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Absent,
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(&second_target),
             Vec::new(),
         )
@@ -5583,6 +5771,7 @@ mod tests {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Absent,
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(&second_target),
             Vec::new(),
         )
@@ -6166,6 +6355,7 @@ mod tests {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(target),
             Vec::new(),
         )
@@ -6228,6 +6418,7 @@ mod tests {
                 FrontierV2::default(),
                 Vec::new(),
                 ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+                crate::oplog::ProjectionTargetKind::Present,
                 BlobDescription::of(&target),
                 Vec::new(),
             )
@@ -6342,6 +6533,7 @@ mod tests {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(target),
             Vec::new(),
         )
@@ -6849,6 +7041,7 @@ mod tests {
                 FrontierV2::default(),
                 Vec::new(),
                 ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+                crate::oplog::ProjectionTargetKind::Present,
                 BlobDescription::of(&target),
                 Vec::new(),
             )
@@ -6968,6 +7161,7 @@ mod tests {
                 FrontierV2::default(),
                 Vec::new(),
                 ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+                crate::oplog::ProjectionTargetKind::Present,
                 BlobDescription::of(&target),
                 Vec::new(),
             )
@@ -7031,6 +7225,7 @@ mod tests {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Base(BlobDescription::of(b"- later base\n")),
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(later_target),
             Vec::new(),
         )

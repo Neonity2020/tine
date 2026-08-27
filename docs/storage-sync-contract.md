@@ -264,7 +264,7 @@ and manifest tail.
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
-| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v5 and versioned rows | derived receipts and diagnostics |
+| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v6 and versioned rows | derived receipts and diagnostics |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | receipt cleanup | receipt cleanup | bounded cleanup queue | disposable maintenance state |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
@@ -981,6 +981,74 @@ reads the production source and fails on any new bare construction, and on a
 collapse of the named-stage inventory. This closes the gap that left the
 Android post-activation save reporting `debug_detail="none"` with no stage — a
 refusal that could have come from any of 131 unnamed sites.
+
+### 3.1a The private receipt-store claim, and when it is checked
+
+`receipts/projection-receipts.claim` versions the private receipt store by
+magic. The current claim is **`TINEPR6\0`, `STORE_CLAIM_VERSION` = 6**. Every
+prior magic — `TINEPR5\0`, `TINEPR4\0`, `TINEPR3\0` — is *recognized and
+refused*, never migrated and never dually accepted.
+
+**Why the version moved to 6.** The intent and completion records now carry an
+explicit target-kind discriminant (below). Managed storage has not shipped, so
+the only stores carrying a pre-(c) claim are development stores, and the 0.7
+blank-slate policy applies: refuse with a named remedy rather than build
+migration machinery for records that exist on no user's disk.
+
+| Claim observed | Response |
+| --- | --- |
+| current magic, current version, exactly `STORE_CLAIM_LEN` bytes, regular file | proceed to the full in-place validation |
+| current magic, any other length, or a non-regular file | `MalformedStoreClaim`, refuse, zero mutation |
+| a prior magic, or a version below the current one | `UpgradeRequired`, refuse, zero mutation, remedy named in the error: re-activate managed storage; the Markdown is intact and untouched |
+| a version above the current one | `UnknownStoreVersion`, refuse, zero mutation |
+| absent, on a populated store root | `ClaimlessNonemptyStore`, refuse, zero mutation |
+| absent, on an absent or empty store root | initialization owns it; this is a fresh store |
+
+**Refusal scenario** (§3.1 rule): `MS-REF-PROTOCOL-INCOMPATIBLE`. The in-scope
+failure is an honest pre-(c) private store meeting a (c) build — a real state on
+a developer's own devices, reachable with no attacker and no corruption. The
+recovery is re-activation, and the refusal says so in its own message rather
+than leaving the remedy to a caller's prose.
+
+**Where the check runs, and why there.** The full validation has always been the
+first thing the receipt store's `open` does, and it stays there as defense in
+depth. But on the clean cold-open path that `open` happens *after*
+`Graph::open_checked`, and `Graph::open_checked` is **not read-only**: its
+publication recovery renames graph files and moves artifacts to `.trash/`. A
+store this build cannot serve must not get that far. So a read-only **claim
+precheck** — `ProjectionReceiptStore::precheck_authoritative_claim` — runs at the
+HEAD of the clean cold open, immediately after clean-authority discovery returns
+and before any other step. It applies only to an authoritative store, where the
+claim provably predates the authority marker; a fresh store has no claim and
+initializes exactly as before.
+
+The precheck holds a current-magic claim to the **exact** version-specific
+envelope length. A magic-only check would pass a truncated claim, and graph
+publication recovery would then run before the in-place length check ever fired.
+
+A refusal propagates through the managed-open failure channel as a named notice
+(`OpenRefused`, carrying the scenario marker). It is never the silent
+Direct-Files fall-through, which is reserved for superseded outer Tauri
+bindings, and the (c) transition does not bump the outer Tauri binding schema.
+
+#### Explicit target kind on intent and completion records
+
+An absent target flattens to the empty blob description, so byte length cannot
+tell "this page renders to nothing" apart from "this page must not exist". Both
+`ProjectionIntent` and `ProjectionCompletion` therefore carry an explicit
+`target_kind` (`present` | `absent`) in their canonical encoding, from store
+creation. There are no legacy records to classify.
+
+Two constraints hold today, and both are tested:
+
+* a record declaring an absent target may not declare target bytes;
+* `ProjectionIntent::id()` is **unchanged** — the kind is a stored field, not an
+  identity input — while `matches_replay_except_frontier` and a completion's
+  binding to its intent both compare it.
+
+The consumer of this field — the absence-decision map — is a later packet.
+Nothing reads `target_kind` to make a decision yet, and nothing may infer
+absence from byte length once it does.
 
 ### 3.2 Clean-runtime save settlement
 

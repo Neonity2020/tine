@@ -183,10 +183,11 @@ pub use receipt::{
     DocumentDependencies, FrontierV2, ImportInventoryEntry, ImportInventoryState, ImportLocator,
     LogicalCompletionId, ManagedPath, ManagedTextKind, PortablePathKey, PortablePathKeyDigest,
     ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletion, ProjectionIntent,
-    ProjectionIntentId, ProjectionPrecondition, ReceiptError, StructuralLocator, StructuralSpan,
-    DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION, PORTABLE_PATH_CASE_FOLD_UNICODE_VERSION,
-    PORTABLE_PATH_KEY_VERSION, PORTABLE_PATH_NORMALIZATION_UNICODE_VERSION,
-    PROJECTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION,
+    ProjectionIntentId, ProjectionPrecondition, ProjectionTargetKind, ReceiptError,
+    StructuralLocator, StructuralSpan, DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION,
+    PORTABLE_PATH_CASE_FOLD_UNICODE_VERSION, PORTABLE_PATH_KEY_VERSION,
+    PORTABLE_PATH_NORMALIZATION_UNICODE_VERSION, PROJECTION_POLICY_VERSION,
+    PROJECTION_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION,
 };
 pub use reference_catalog::{
     BlockReferenceFactV1, BlockReferenceKindV1, PageNameReferenceFactV1, PageReferenceKindV1,

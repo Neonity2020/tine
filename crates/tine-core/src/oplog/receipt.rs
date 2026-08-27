@@ -71,6 +71,7 @@ pub enum ReceiptError {
     CompletionTargetMismatch,
     CompletionIntentMismatch,
     CompletionIdentityMismatch,
+    AbsentTargetCarriesBytes,
 }
 
 impl fmt::Display for ReceiptError {
@@ -192,6 +193,9 @@ impl fmt::Display for ReceiptError {
             }
             Self::CompletionIdentityMismatch => {
                 f.write_str("projection completion semantic identity does not match its evidence")
+            }
+            Self::AbsentTargetCarriesBytes => {
+                f.write_str("a projection record with an absent target declares target bytes")
             }
         }
     }
@@ -1082,6 +1086,31 @@ impl ProjectionClaimEvidence {
     }
 }
 
+/// Whether a projection's target is a rendered file or the page's absence.
+///
+/// Sub-design (c) §1 (v19): the record carries this discriminant explicitly,
+/// from store creation. An absent target flattens to the empty blob
+/// description, and byte length cannot tell "this page renders to nothing"
+/// apart from "this page must not exist" -- so a consumer that has to answer
+/// "what did this device last leave on disk here?" cannot be built on the
+/// description alone. There are no legacy records to classify: pre-(c) private
+/// stores are refused at the receipt-store claim, not migrated.
+///
+/// Packet 1 lands the encoding and its accessors only. The consumer -- the
+/// absence-decision map -- is packet C-3.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionTargetKind {
+    Present,
+    Absent,
+}
+
+impl ProjectionTargetKind {
+    pub const fn is_absent(self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProjectionIntent {
     receipt_schema_version: u32,
@@ -1095,6 +1124,7 @@ pub struct ProjectionIntent {
     frontier: FrontierV2,
     claim_evidence: Vec<ProjectionClaimEvidence>,
     precondition: ProjectionPrecondition,
+    target_kind: ProjectionTargetKind,
     target: BlobDescription,
     annotations: Vec<AnnotatedIdentity>,
 }
@@ -1113,6 +1143,7 @@ struct ProjectionIntentWire {
     frontier: FrontierV2,
     claim_evidence: Vec<ProjectionClaimEvidence>,
     precondition: ProjectionPrecondition,
+    target_kind: ProjectionTargetKind,
     target: BlobDescription,
     annotations: Vec<AnnotatedIdentity>,
 }
@@ -1126,6 +1157,7 @@ impl ProjectionIntent {
         frontier: FrontierV2,
         mut claim_evidence: Vec<ProjectionClaimEvidence>,
         precondition: ProjectionPrecondition,
+        target_kind: ProjectionTargetKind,
         target: BlobDescription,
         mut annotations: Vec<AnnotatedIdentity>,
     ) -> Result<Self, ReceiptError> {
@@ -1143,6 +1175,7 @@ impl ProjectionIntent {
             frontier,
             claim_evidence,
             precondition,
+            target_kind,
             target,
             annotations,
         };
@@ -1249,6 +1282,11 @@ impl ProjectionIntent {
         &self.precondition
     }
 
+    /// The explicit target discriminant. Never infer it from byte length.
+    pub const fn target_kind(&self) -> ProjectionTargetKind {
+        self.target_kind
+    }
+
     pub const fn target(&self) -> BlobDescription {
         self.target
     }
@@ -1275,6 +1313,7 @@ impl ProjectionIntent {
             && self.policy == replay.policy
             && self.claim_evidence == replay.claim_evidence
             && self.precondition == replay.precondition
+            && self.target_kind == replay.target_kind
             && self.target == replay.target
             && self.annotations == replay.annotations
     }
@@ -1292,6 +1331,7 @@ impl ProjectionIntent {
             frontier: wire.frontier,
             claim_evidence: wire.claim_evidence,
             precondition: wire.precondition,
+            target_kind: wire.target_kind,
             target: wire.target,
             annotations: wire.annotations,
         };
@@ -1307,6 +1347,9 @@ impl ProjectionIntent {
             self.managed_entity_set_version,
         )?;
         self.frontier.validate()?;
+        if self.target_kind.is_absent() && self.target != BlobDescription::of(&[]) {
+            return Err(ReceiptError::AbsentTargetCarriesBytes);
+        }
         validate_annotations(&self.annotations, self.target.byte_length)?;
         if !is_strictly_sorted_by_key(&self.claim_evidence, |evidence| evidence.logseq_uuid) {
             return Err(ReceiptError::NonCanonicalProjectionClaimEvidence);
@@ -1505,6 +1548,7 @@ pub struct ProjectionCompletion {
     workspace_id: WorkspaceId,
     page_id: PageId,
     path: ManagedPath,
+    target_kind: ProjectionTargetKind,
     target: BlobDescription,
 }
 
@@ -1520,6 +1564,7 @@ struct ProjectionCompletionWire {
     workspace_id: WorkspaceId,
     page_id: PageId,
     path: ManagedPath,
+    target_kind: ProjectionTargetKind,
     target: BlobDescription,
 }
 
@@ -1543,6 +1588,7 @@ impl ProjectionCompletion {
             workspace_id: intent.workspace_id,
             page_id: intent.page_id,
             path: intent.path.clone(),
+            target_kind: intent.target_kind,
             target: observed,
         })
     }
@@ -1567,6 +1613,7 @@ impl ProjectionCompletion {
             || self.workspace_id != intent.workspace_id
             || self.page_id != intent.page_id
             || self.path != intent.path
+            || self.target_kind != intent.target_kind
             || self.target != intent.target
         {
             return Err(ReceiptError::CompletionIntentMismatch);
@@ -1580,6 +1627,21 @@ impl ProjectionCompletion {
 
     pub const fn logical_completion_id(&self) -> LogicalCompletionId {
         self.logical_completion_id
+    }
+
+    /// The explicit target discriminant this completion recorded. Never infer
+    /// it from byte length: an absent target and a page that renders to zero
+    /// bytes share one description.
+    pub const fn target_kind(&self) -> ProjectionTargetKind {
+        self.target_kind
+    }
+
+    pub const fn path(&self) -> &ManagedPath {
+        &self.path
+    }
+
+    pub const fn page_id(&self) -> PageId {
+        self.page_id
     }
 
     fn from_wire(wire: ProjectionCompletionWire) -> Result<Self, ReceiptError> {
@@ -1599,8 +1661,12 @@ impl ProjectionCompletion {
             workspace_id: wire.workspace_id,
             page_id: wire.page_id,
             path: wire.path,
+            target_kind: wire.target_kind,
             target: wire.target,
         };
+        if completion.target_kind.is_absent() && completion.target != BlobDescription::of(&[]) {
+            return Err(ReceiptError::AbsentTargetCarriesBytes);
+        }
         if completion.logical_completion_id
             != logical_completion_id(completion.intent_id, completion.target)
         {
@@ -2166,6 +2232,7 @@ mod tests {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+            crate::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(b"- target\n"),
             Vec::new(),
         )

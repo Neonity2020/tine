@@ -107,6 +107,7 @@ fn intent_with_frontier(frontier: FrontierV2) -> ProjectionIntent {
         frontier,
         claim_evidence,
         ProjectionPrecondition::Base(BlobDescription::of(&base)),
+        tine_core::oplog::ProjectionTargetKind::Present,
         BlobDescription::of(target),
         vec![
             annotation(
@@ -221,6 +222,7 @@ fn intent_wire_size_does_not_scale_with_base_byte_length() {
             FrontierV2::default(),
             Vec::new(),
             ProjectionPrecondition::Base(description),
+            tine_core::oplog::ProjectionTargetKind::Present,
             BlobDescription::of(b"- target\n"),
             Vec::new(),
         )
@@ -328,6 +330,7 @@ fn malformed_and_duplicate_identity_evidence_is_rejected() {
         FrontierV2::default(),
         Vec::new(),
         ProjectionPrecondition::Absent,
+        tine_core::oplog::ProjectionTargetKind::Present,
         BlobDescription::of(target),
         vec![
             annotation(&[0], 0, 4, 1, Some(1)),
@@ -344,6 +347,7 @@ fn malformed_and_duplicate_identity_evidence_is_rejected() {
         FrontierV2::default(),
         Vec::new(),
         ProjectionPrecondition::Absent,
+        tine_core::oplog::ProjectionTargetKind::Present,
         BlobDescription::of(target),
         vec![
             annotation(&[0], 0, 4, 1, common_uuid),
@@ -363,6 +367,7 @@ fn malformed_and_duplicate_identity_evidence_is_rejected() {
         FrontierV2::default(),
         Vec::new(),
         ProjectionPrecondition::Absent,
+        tine_core::oplog::ProjectionTargetKind::Present,
         BlobDescription::of(target),
         vec![
             annotation(&[0], 0, 4, 1, Some(1)),
@@ -510,6 +515,7 @@ fn frontier_decode_recomputes_causal_digest_and_rejects_malformed_entries() {
         .unwrap(),
         Vec::new(),
         ProjectionPrecondition::Absent,
+        tine_core::oplog::ProjectionTargetKind::Absent,
         BlobDescription::of(b""),
         vec![],
     )
@@ -552,6 +558,7 @@ fn base_blob_and_target_consistency_is_validated() {
         FrontierV2::default(),
         Vec::new(),
         ProjectionPrecondition::Absent,
+        tine_core::oplog::ProjectionTargetKind::Present,
         BlobDescription::of(b"short"),
         vec![annotation(&[0], 0, 6, 1, None)],
     )
@@ -648,6 +655,7 @@ fn import_derivation_rejects_noncanonical_evidence() {
         FrontierV2::default(),
         Vec::new(),
         ProjectionPrecondition::Absent,
+        tine_core::oplog::ProjectionTargetKind::Present,
         BlobDescription::of(b"b"),
         vec![],
     )
