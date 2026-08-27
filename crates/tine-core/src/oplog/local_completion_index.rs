@@ -919,7 +919,8 @@ mod tests {
     #[test]
     fn sixty_four_projecting_entries_reach_the_busy_graph_cap() {
         let (_root, _store, mut index) = fixture("turn-cap");
-        for ordinal in 0..LOCAL_COMPLETION_PROJECTING_TURN_CAP {
+        assert_eq!(LOCAL_COMPLETION_PROJECTING_TURN_CAP, 64);
+        for ordinal in 0..64 {
             let intent = intent(
                 0xc2_1200 + u128::from(ordinal),
                 &format!("cap-{ordinal}.md"),

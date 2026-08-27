@@ -29650,6 +29650,7 @@ mod tests {
             SyncShutdownOutcome::Safe(_)
         ));
 
+        assert!(withhold_receipt_completions(&fixture.request.receipt_root) > 0);
         fs::remove_file(fixture.graph_root.join(path.as_str())).unwrap();
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
         let ticks = drain_until_settled(&reopened);
@@ -29746,6 +29747,7 @@ mod tests {
         assert!(error.contains("deterministic cut during production turn replay"));
         assert!(fixture.graph_root.join(path.as_str()).is_file());
 
+        assert!(withhold_receipt_completions(&fixture.request.receipt_root) > 0);
         fs::remove_file(fixture.graph_root.join(path.as_str())).unwrap();
         let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
             .unwrap()
