@@ -17957,7 +17957,6 @@ impl Graph {
                                     "projection precondition changed before displacement",
                                 ));
                             }
-                            barrier_sync_all(&displaced_file)?;
                             drop(displaced_file);
                             let captured = ProjectionRecoveryEvidence::new_bound(
                                 &target_path.relative_path,

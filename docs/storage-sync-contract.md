@@ -1292,10 +1292,36 @@ Enforced by
 barrier `tine-core` initiates and
 `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 asserts the per-operation totals against
-`MANAGED_SAVE_BARRIER_BUDGET` = **28** and `MANAGED_MOVE_BARRIER_BUDGET` =
-**77**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+`MANAGED_SAVE_BARRIER_BUDGET` = **25** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**74**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
 appends and SQLite file-set publication are not reachable from this crate and
 are excluded (measured at three more per save, four per move).
+
+**Barriers with no in-scope scenario are deleted, not budgeted.** Three
+mechanisms left the count on 2026-08-27 (save 28 → 25, move 77 → 74), each
+because no in-scope failure needed it, not because it was expensive:
+
+* The **post-publication re-`fsync` of the committed journal target** (one per
+  save). The published inode is the staged inode, already flushed before the
+  no-replace rename; re-syncing it proves nothing the staging barrier did not.
+  The reread and identity refusals around it stay — they are preconditions.
+* The **pending-cleanup round flip on an empty queue** (two directory barriers
+  per save; one per projected page on a move, when that page's queue is empty).
+  `ProjectionReceiptStore::pending_projection_cleanup_bounded` flipped the round
+  state durably whenever the *active* round was empty. When the *whole* queue is
+  empty — the ordinary save — the flip makes nothing reachable. It is now elided
+  when both rounds are empty and unchanged otherwise, including the case that
+  motivates it: new markers are appended to the inactive round, so an empty
+  active round with a retained inactive round still flips.
+* The **displaced-file pre-`fsync`** (one per projected page displaced; two per
+  cross-page move, none on an ordinary save). The file was about to be moved
+  aside and its exact pre-image is already durable in the recovery record by the
+  ancestor-chain argument above. The identity capture, the
+  `displaced != expected_base` refusal, the bound evidence capture and the
+  retirement all stay.
+
+Enforced by `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
+and `oplog::projection_store::tests::an_empty_pending_cleanup_queue_elides_the_durable_round_flip`.
 
 The cost-model audit's target is 3 and 5. The gap is stated here rather than
 hidden, and it is in two places that this contract does not yet cover:
@@ -1314,8 +1340,9 @@ hidden, and it is in two places that this contract does not yet cover:
 * The **projection directory chain** is still entered about six times per
   foreground save. Each entry now costs exactly one barrier instead of one per
   chain level — the 2026-08-26 chain-flush cut, measured on the fixture as
-  foreground 14 → 8 and per-save total 37 → 28, cross-page move 93 → 77 — but
-  six entries is still six barriers, and collapsing *those* means changing the
+  foreground 14 → 8 and per-save total 37 → 28, cross-page move 93 → 77, before
+  the 2026-08-27 removals above took those totals to 25 and 74 — but six entries
+  is still six barriers, and collapsing *those* means changing the
   publication protocol rather than the barrier rule. That is the user-visible
   Markdown write path, whose temp + fsync + rename + base-revision guard + lock
   semantics are deliberately untouched.
