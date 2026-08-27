@@ -523,7 +523,7 @@
     "scenario": "topbar.responsive-workspace-overflow",
     "failBefore": "proven"
    },
-   "notes": "GH #205. The full workspace label moved from the no-wrap toolbar to a sidebar header; the toolbar retains only a compact W fallback when that sidebar is not mounted. A topbar inline-size container query keeps sidebar, search, Settings, and native window controls visible while calendar, journals, theme, right sidebar, and history actions use one transient-layer overflow menu below the available-width threshold. The threshold is 460px inline-size, chosen so the fixed clusters (which need ~364px) stay visible whenever they fit \u2014 the earlier 760px value over-collapsed and hid actions with the toolbar half empty. Follow-up (2026-07-21, reporter Louis-15): the single 460px breakpoint collapsed navigation and optional actions together, so Back/Forward were only reachable through the overflow menu on a phone. Split into two tiers per Martin's priority (navigation > right-side actions > tabs): 460px collapses optional actions only, a 300px floor additionally collapses Back/Forward, and the menu hides its duplicated Back/Forward between the tiers. Verified with the Chromium screenshot harness at 900/440/390/280px (fail-before: 0 navigation actions visible at 440px). The topbar also gained position:relative; z-index:45 as stacking hardening for a reporter-only Windows transparent-dropdown report that does NOT reproduce in Chromium \u2014 not a claimed fix."
+   "notes": "GH #205. The full workspace label moved from the no-wrap toolbar to a sidebar header; the toolbar retains only a compact W fallback when that sidebar is not mounted. A topbar inline-size container query keeps sidebar, search, Settings, and native window controls visible while calendar, journals, theme, right sidebar, and history actions use one transient-layer overflow menu below the available-width threshold. Follow-up (2026-07-21, reporter Louis-15): Back/Forward gained a higher-priority tier and remain inline until the 300px floor. Follow-up (2026-08-27, Martin): the 460px desktop threshold still hid four frequent actions on a 390px Android toolbar even though no custom window controls occupied the row. Fit is now conditional on the real cluster: frameless desktop windows retain the 460px content-box tier because they carry Minimize/Maximize/Close, while phone/system-frame toolbars keep all actions through a measured 345px content-box floor (390px viewport including padding). Chromium geometry proves no clipping and the expected direct/overflow sets at 900, system-frame 440, phone 390, custom-frame 440, 360, and 280px. The topbar also retains position:relative; z-index:45 as stacking hardening for a reporter-only Windows transparent-dropdown report that does NOT reproduce in Chromium \u2014 not a claimed fix."
   },
   {
    "id": "UI-TOPBAR-OVERFLOW-OUTSIDE-DISMISS-205",
@@ -8467,6 +8467,55 @@
     "failBefore": "proven"
    },
    "notes": "The shared touch recognizer emitted a synthetic contextmenu, but the mobile text-selection policy rejected it because tests exercised desktop policy. Reference group headers and quick-switch page rows also lacked the recognizer. Synthetic Tine-owned holds are now distinguished from native selection events, and the same long-press contract is attached across the reported page-link surfaces without changing quick taps, scrolling, desktop right-click, or middle/modified clicks."
+  },
+  {
+   "id": "UI-LONG-PAGE-EDIT-HEIGHT-STABILITY-390",
+   "title": "A naturally overflowing page keeps the same scroll geometry while blocks enter and leave edit mode",
+   "family": "page-geometry",
+   "sources": {
+    "issues": [
+     390
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "browser",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "scripts/shot-pane-slack.mjs"
+    ],
+    "scenario": "page.long-edit-height-stability",
+    "failBefore": "proven"
+   },
+   "notes": "GH #390. The pane's 40%-height end slack was selected with :has(.block-editor), so a click on a long page changed its measured scrollHeight from 2310 to 2496px and Escape changed it back. PaneScroller now measures the natural inner column with ResizeObserver and applies the same pane-relative slack for the whole lifetime of an overflowing page; fitting dashboard panes retain zero artificial range. The deterministic Chromium journey measures 2496px in read, edit, and read-again states while preserving the 40% reachable tail."
+  },
+  {
+   "id": "UI-BLOCK-MOUSEDOWN-EDIT-368",
+   "title": "A primary mouse-down on rendered block text mounts and focuses the editor before mouse-up",
+   "family": "click-caret",
+   "sources": {
+    "issues": [
+     368
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/Block.mouseDownEdit.test.tsx",
+     "scripts/e2e-clickcaret-repro.mjs"
+    ],
+    "scenario": "caret.mousedown-edit-before-mouseup",
+    "failBefore": "proven"
+   },
+   "notes": "GH #368. Tine deliberately waited for mouseup to distinguish click from rendered-text drag, unlike OG Logseq's block-content-on-mouse-down path. The editor now mounts and focuses during primary mousedown at the already-mapped source offset. Continuing within the block creates a raw-editor text selection from a metric-matched mirror; crossing a block ends edit and escalates to the existing outline selection. Modified clicks and interactive targets still return before edit admission."
   },
   {
    "id": "UI-PDF-LONG-SCROLL-GEOMETRY-20260827",

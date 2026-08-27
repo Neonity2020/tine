@@ -181,8 +181,24 @@ try {
   const raw1 = "**bold** start then a -> b and x -- y here\nmore -- dashed text line";
   const raw5 = "before `a literal block` after";
 
-  console.log("\n=== BUG 1a: click inside bold (line 1) of multiline block 0 ===");
+  console.log("\n=== GH #368: editor exists after pointerDown, before pointerUp ===");
   let p = await charPoint(0, "bold", 2);
+  requirePoint(p, "mousedown timing point");
+  await browser.performActions([{
+    type: "pointer", id: "mouse", parameters: { pointerType: "mouse" },
+    actions: [
+      { type: "pointerMove", duration: 0, x: Math.floor(p.x), y: Math.round(p.y) },
+      { type: "pointerDown", button: 0 },
+    ],
+  }]);
+  await sleep(100);
+  expectEditor(await probe("pointer still held"), 0, raw0.indexOf("bold") + 2, "mousedown edit timing");
+  await browser.releaseActions();
+  await sleep(200);
+  await browser.keys(["Escape"]); await sleep(300);
+
+  console.log("\n=== BUG 1a: click inside bold (line 1) of multiline block 0 ===");
+  p = await charPoint(0, "bold", 2);
   console.log("point:", JSON.stringify(p));
   requirePoint(p, "bold point"); await realClick(p.x, p.y);
   expectEditor(await probe("bold+2 → expect sel=4"), 0, raw0.indexOf("bold") + 2, "bold click");
@@ -255,14 +271,21 @@ try {
     await sleep(600);
   };
 
-  console.log("\n=== DRAG 1: within block 0, 'second' → 'here' (text selection, no edit) ===");
+  console.log("\n=== DRAG 1: within block 0, 'second' → 'here' (raw editor text selection) ===");
   const d1a = await charPoint(0, "second", 0);
   const d1b = await charPoint(0, "here", 3);
   console.log("from", JSON.stringify(d1a), "to", JSON.stringify(d1b));
   requirePoint(d1a, "drag-1 start"); requirePoint(d1b, "drag-1 end");
   await realDrag(d1a.x, d1a.y, d1b.x, d1b.y);
   const dragText = await probe("in-block drag");
-  if (dragText.isEditor || dragText.textSel.length < 3 || dragText.selBlocks !== 0) throw new Error("in-block drag did not remain a text selection");
+  if (!dragText.isEditor || dragText.selBlocks !== 0) throw new Error("in-block drag did not remain an editor text selection");
+  const selectedEditorText = await browser.execute(() => {
+    const active = document.activeElement;
+    return active instanceof HTMLTextAreaElement
+      ? active.value.slice(active.selectionStart, active.selectionEnd)
+      : "";
+  });
+  if (selectedEditorText.length < 3) throw new Error(`in-block editor drag selected too little text: ${JSON.stringify(selectedEditorText)}`);
   await browser.keys(["Escape"]); await sleep(300);
   await browser.execute(() => window.getSelection()?.removeAllRanges());
 

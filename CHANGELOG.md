@@ -34,6 +34,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Long pages no longer grow and shrink when a block enters or leaves edit
+  mode** (GH #390). Pane-relative end-of-page breathing room is now derived
+  from whether the page content naturally overflows, rather than from the
+  transient presence of a textarea, so its scroll geometry stays stable.
+
+- **A held mouse click now shows the block caret on mouse-down, matching
+  Logseq** (GH #368). Exact rendered-text caret placement still applies, and a
+  drag can still select text in the editor or escalate across blocks.
+
+- **Android and system-decorated windows keep frequent top-bar actions directly
+  visible whenever they fit** (GH #205). The overflow threshold now accounts
+  for whether Tine's three custom window controls actually occupy the row, so a
+  390px phone no longer hides calendar, journals, theme, and right sidebar in
+  the `...` menu while leaving usable space.
+
 - **Copying the in-app Guide no longer stops after its first page** (GH #391).
   Guide pages now carry the same completed-write receipt as ordinary Direct
   Files edits, so Tine's native watcher recognizes its own multi-page copy

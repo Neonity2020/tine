@@ -49,6 +49,35 @@ function buildMirror(ta: HTMLTextAreaElement): HTMLDivElement {
   return div;
 }
 
+/** Map a viewport point to the nearest caret offset in a textarea. Used only
+ *  after a rendered-block mousedown has already swapped in the editor and the
+ *  user continues dragging: the original rendered DOM no longer exists, so the
+ *  browser cannot extend its native selection. One mirror pass preserves the
+ *  same wrapping/font metrics and gives the gesture a raw-editor selection.
+ *  Returns null in no-layout environments. */
+export function textareaCaretPoints(ta: HTMLTextAreaElement): Array<{ x: number; y: number }> | null {
+  if (typeof document === "undefined") return null;
+  const div = buildMirror(ta);
+  document.body.appendChild(div);
+  try {
+    const points: Array<{ x: number; y: number }> = [];
+    for (let offset = 0; offset <= ta.value.length; offset++) {
+      const marker = document.createElement("span");
+      marker.textContent = "\u200b";
+      marker.dataset.caretOffset = String(offset);
+      div.appendChild(marker);
+      if (offset < ta.value.length) div.appendChild(document.createTextNode(ta.value[offset]));
+    }
+    if (!div.offsetHeight) return null;
+    for (const marker of div.querySelectorAll<HTMLElement>("[data-caret-offset]")) {
+      points.push({ x: marker.offsetLeft, y: marker.offsetTop });
+    }
+    return points;
+  } finally {
+    document.body.removeChild(div);
+  }
+}
+
 function camelToKebab(s: string): string {
   return s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
 }
