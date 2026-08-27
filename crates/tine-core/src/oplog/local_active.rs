@@ -942,6 +942,10 @@ impl CleanLocalRuntime {
             ));
         }
         projection
+            .database()
+            .ensure_projection_baseline_digest_column()
+            .map_err(RuntimePromotionError::Sqlite)?;
+        projection
             .revalidate_workspace_lease_identity()
             .map_err(RuntimePromotionError::Sqlite)?;
         let engine_frontier = engine

@@ -105,6 +105,9 @@ use crate::oplog::projection::{
 };
 use crate::oplog::projection::{render_requested_page_document, PreparedEditorProjection};
 use crate::oplog::projection_store::ProjectionReceiptStore;
+use crate::oplog::projection_turn_journal::{
+    open_projection_turn_journal, ProjectionTurnJournalState,
+};
 #[cfg(test)]
 use crate::oplog::sqlite::{
     reset_full_digest_scan_instrumentation, reset_projection_open_test_observation,
@@ -4890,6 +4893,9 @@ struct CleanRuntimeResources {
     graph: Graph,
     receipts: ProjectionReceiptStore,
     runtime: CleanLocalRuntime,
+    managed_local: ManagedLocalRuntimeState,
+    projection_turns: ProjectionTurnJournalState,
+    recovered_provider_batches: Vec<BatchId>,
 }
 
 /// Actor-owned clean runtime core.
@@ -5182,11 +5188,15 @@ impl CleanRuntimeActorCore {
     /// The projection writer still guards the exact observed bytes, so a real
     /// external edit races or refuses instead of being overwritten.
     fn repair_superseded_projection(
-        &self,
+        &mut self,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+        turns: &mut ProjectionTurnJournalState,
         path: &ManagedPath,
     ) -> Result<bool, CleanActorMutationFailure> {
+        if turns.pending_count() != 0 {
+            return Ok(false);
+        }
         let observed =
             graph
                 .read_projection_input(path)
@@ -5207,17 +5217,41 @@ impl CleanRuntimeActorCore {
         else {
             return Ok(false);
         };
-        crate::oplog::projection::write_projection_exact(
-            graph,
-            receipts,
-            engine,
-            page_id,
-            Some(&observed),
-        )
-        .map_err(|error| CleanActorMutationFailure {
-            phase: OperationalPhase::ProjectionDrain,
-            detail: error.to_string(),
-        })?;
+        let work = engine
+            .clean_terminal_projection_work()
+            .map_err(|error| CleanActorMutationFailure {
+                phase: OperationalPhase::ProjectionDrain,
+                detail: error.to_string(),
+            })?
+            .into_iter()
+            .find(|work| work.page_id() == page_id && work.path() == path)
+            .ok_or_else(|| CleanActorMutationFailure {
+                phase: OperationalPhase::ProjectionDrain,
+                detail: "superseded repair has no current accepted projection work".into(),
+            })?;
+        let pages = crate::oplog::projection::projection_turn_pages_for_work(engine, &[work])
+            .map_err(|error| CleanActorMutationFailure {
+                phase: OperationalPhase::ProjectionDrain,
+                detail: error.to_string(),
+            })?;
+        turns
+            .append(
+                crate::oplog::TurnOrigin::SupersededRepair {
+                    page_id,
+                    observed: BlobDescription::of(&observed),
+                },
+                pages,
+            )
+            .map_err(|error| CleanActorMutationFailure {
+                phase: OperationalPhase::ProjectionDrain,
+                detail: error.to_string(),
+            })?;
+        drain_open_projection_turn_journal(graph, receipts, &mut self.runtime, turns).map_err(
+            |error| CleanActorMutationFailure {
+                phase: OperationalPhase::ProjectionDrain,
+                detail: error,
+            },
+        )?;
         Ok(true)
     }
 
@@ -5259,6 +5293,7 @@ impl CleanRuntimeActorCore {
         &mut self,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+        projection_turns: &mut ProjectionTurnJournalState,
         prepared: &PreparedBatch,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
@@ -5274,8 +5309,14 @@ impl CleanRuntimeActorCore {
                     detail: error.to_string(),
                 }
             })?;
-            OperationalCoordinator::ingest_clean_prepared(&mut session, graph, receipts, prepared)
-                .map_err(CleanActorMutationFailure::from)?
+            OperationalCoordinator::ingest_clean_prepared(
+                &mut session,
+                graph,
+                receipts,
+                projection_turns,
+                prepared,
+            )
+            .map_err(CleanActorMutationFailure::from)?
         };
         let outcome = self.retain_outcome(state);
         self.provider_change_pending_notification = Some(match &outcome {
@@ -5309,6 +5350,24 @@ impl CleanRuntimeActorCore {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
     ) -> Option<CleanActorMutationOutcome> {
+        self.retry_pending_inner(graph, receipts, None)
+    }
+
+    fn retry_pending_with_turns(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        projection_turns: &mut ProjectionTurnJournalState,
+    ) -> Option<CleanActorMutationOutcome> {
+        self.retry_pending_inner(graph, receipts, Some(projection_turns))
+    }
+
+    fn retry_pending_inner(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        projection_turns: Option<&mut ProjectionTurnJournalState>,
+    ) -> Option<CleanActorMutationOutcome> {
         // Escalation never stops the retries: an identical detail string three
         // times is not proof the failure is deterministic (a transient
         // filesystem condition can repeat verbatim), so every tick still
@@ -5317,6 +5376,21 @@ impl CleanRuntimeActorCore {
         // pending retry.
         let pending = self.pending.take()?;
         let state = match self.runtime.admit_clean_derived_recovery(graph) {
+            Ok(mut session) if pending.projection_turn_ingress() => match projection_turns {
+                Some(turns) => OperationalCoordinator::retry_clean_local_with_turns(
+                    &mut session,
+                    graph,
+                    receipts,
+                    pending,
+                    turns,
+                ),
+                None => OperationalCoordinator::retry_clean_local(
+                    &mut session,
+                    graph,
+                    receipts,
+                    pending,
+                ),
+            },
             Ok(mut session) => {
                 OperationalCoordinator::retry_clean_local(&mut session, graph, receipts, pending)
             }
@@ -5725,6 +5799,200 @@ fn clean_operation_archive_directory(archive_root: &Path) -> PathBuf {
     archive_root.join(CLEAN_OPERATION_ARCHIVE_DIRECTORY)
 }
 
+/// Complete the managed-local queue during cold open, before any
+/// projection-only turn is considered. This is the semantic queue: draining it
+/// first ensures current accepted state includes every durable foreground frame
+/// before projection turns re-derive their pages.
+fn drain_open_managed_local_journal(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    runtime: &mut CleanLocalRuntime,
+    managed: &mut ManagedLocalRuntimeState,
+) -> Result<Vec<BatchId>, String> {
+    let mut recovered_batches = Vec::new();
+    while let Some(frame) = managed.frames.front().cloned() {
+        let record = crate::oplog::decode_managed_local_record(&frame).map_err(|error| {
+            format!(
+                "clean foreground journal record {}:{} is invalid: {error}",
+                frame.device_id(),
+                frame.sequence()
+            )
+        })?;
+        let batch_id = record.prepared_batch().manifest().batch_id();
+        let mut publisher = ManagedLocalPublisherAttempt {
+            batch_id,
+            authorship_complete: true,
+            provider_complete: true,
+            requested_authorship: None,
+            requested_provider: None,
+        };
+        let outcome = {
+            let mut session = runtime
+                .admit_clean_derived_recovery(graph)
+                .map_err(|error| format!("clean foreground open admission failed: {error}"))?;
+            let (admission, engine, database) = session
+                .parts()
+                .map_err(|error| format!("clean foreground open lost authority: {error}"))?;
+            resume_clean_managed_local_journal_drain(
+                &admission,
+                graph,
+                receipts,
+                engine,
+                database,
+                &frame,
+                Some(&managed.pending_index),
+                &managed.checkpoint,
+                managed.continuation.as_ref(),
+                &mut publisher,
+            )
+        };
+        match outcome {
+            ManagedLocalDrainOutcome::Complete(completion) => {
+                persist_clean_foreground_checkpoint(&managed.directory, &completion.checkpoint)?;
+                if managed.frames.front().map(LocalJournalFrame::sequence)
+                    != Some(completion.sequence)
+                {
+                    return Err(
+                        "clean foreground open completion does not name the queue front".into(),
+                    );
+                }
+                managed.checkpoint = completion.checkpoint;
+                managed.checkpoint_batch_id = Some(completion.batch_id);
+                managed.frames.pop_front();
+                managed.pending_index.remove(&record)?;
+                for projection in record.projections() {
+                    if managed
+                        .latest_projection_frames
+                        .get(projection.intent().path().as_str())
+                        .is_some_and(|latest| latest.sequence() == completion.sequence)
+                    {
+                        managed
+                            .latest_projection_frames
+                            .remove(projection.intent().path().as_str());
+                        managed.retire_latest_task_query_overlay(
+                            projection.intent().path(),
+                            completion.sequence,
+                        );
+                    }
+                }
+                managed.continuation = None;
+                managed.last_failure = None;
+                recovered_batches.push(completion.batch_id);
+            }
+            ManagedLocalDrainOutcome::Pending(continuation) => {
+                managed.continuation = Some(continuation);
+            }
+            ManagedLocalDrainOutcome::Blocked(block) => {
+                return Err(format!(
+                    "clean foreground open blocked at {:?}: {}",
+                    block.stage, block.detail
+                ));
+            }
+            ManagedLocalDrainOutcome::Conflict(failure)
+            | ManagedLocalDrainOutcome::RecoveryRequired(failure) => {
+                return Err(format!(
+                    "clean foreground open failed at {:?}: {}",
+                    failure.stage, failure.detail
+                ));
+            }
+        }
+    }
+
+    let accepted = runtime.engine().accepted_frontier_root().map_err(display)?;
+    let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
+    let (_, engine, _) = session.parts().map_err(display)?;
+    engine
+        .collapse_managed_local_prefix(&accepted)
+        .map_err(display)?;
+    Ok(recovered_batches)
+}
+
+fn drain_open_projection_turn_journal(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    runtime: &mut CleanLocalRuntime,
+    turns: &mut ProjectionTurnJournalState,
+) -> Result<(), String> {
+    while let Some(turn) = turns.front().cloned() {
+        let endpoint = runtime.endpoint();
+        let handoff = graph
+            .mint_handoff_safe(runtime.engine().workspace_id(), endpoint)
+            .map_err(display)?;
+        handoff
+            .verify_binding(graph, runtime.engine().workspace_id(), endpoint)
+            .map_err(display)?;
+        let published = handoff.into_publisher_guard().into_published_latch();
+        {
+            let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
+            let (_, engine, database) = session.parts().map_err(display)?;
+            crate::oplog::projection::replay_projection_turn(
+                graph,
+                receipts,
+                engine,
+                database,
+                &turn,
+                Some(&published),
+            )
+            .map_err(display)?;
+        }
+        turns.checkpoint_front()?;
+        published.complete();
+    }
+    Ok(())
+}
+
+fn append_and_replay_terminal_projection_turns(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    runtime: &mut CleanLocalRuntime,
+    turns: &mut ProjectionTurnJournalState,
+) -> Result<(), String> {
+    let endpoint = runtime.endpoint();
+    let terminal_work = runtime
+        .engine()
+        .clean_terminal_projection_work()
+        .map_err(display)?;
+    let mut groups: Vec<(crate::oplog::TurnOrigin, Vec<crate::oplog::ProjectionWork>)> = Vec::new();
+    for work in terminal_work {
+        let already_exact = {
+            let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
+            let (_, engine, database) = session.parts().map_err(display)?;
+            crate::oplog::projection::projection_work_is_already_exact(
+                graph, engine, database, &work,
+            )
+            .map_err(display)?
+        };
+        if already_exact {
+            continue;
+        }
+        let origin = if work.endpoint_id() == endpoint.endpoint_id() {
+            crate::oplog::TurnOrigin::TerminalLocal {
+                batch_id: work.batch_id(),
+            }
+        } else {
+            crate::oplog::TurnOrigin::TerminalForeign {
+                batch_id: work.batch_id(),
+                source_endpoint_id: work.endpoint_id(),
+            }
+        };
+        if let Some((_, grouped)) = groups
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == origin)
+        {
+            grouped.push(work);
+        } else {
+            groups.push((origin, vec![work]));
+        }
+    }
+    for (origin, work) in groups {
+        let pages =
+            crate::oplog::projection::projection_turn_pages_for_work(runtime.engine(), &work)
+                .map_err(display)?;
+        turns.append(origin, pages).map_err(display)?;
+    }
+    drain_open_projection_turn_journal(graph, receipts, runtime, turns)
+}
+
 /// Construct the production clean runtime, retracting the disposable archive if
 /// the attempt refuses before any authority exists.
 ///
@@ -5878,17 +6146,37 @@ fn activate_clean_runtime_resources_retaining_archive(
         projection,
     )
     .map_err(|(_, error)| display(error))?;
-    let runtime = CleanLocalRuntime::from_open_parts(
+    let mut runtime = CleanLocalRuntime::from_open_parts(
         request.identities.session_id,
         endpoint,
         engine,
         projection,
     )
     .map_err(display)?;
+    ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
+        .map_err(display)?;
+    let binding = ActorRuntimeBinding::from_clean(&request.identities, endpoint, &receipts);
+    let managed_local = open_clean_foreground_journal(
+        &request.application_runtime_root,
+        &binding,
+        &graph,
+        &mut runtime,
+    )?;
+    let projection_turns = open_projection_turn_journal(
+        &request.application_runtime_root,
+        binding.workspace_id(),
+        binding.lineage_digest(),
+        binding.endpoint_id,
+        binding.device_id().as_uuid(),
+    )
+    .map_err(display)?;
     Ok(CleanRuntimeResources {
         graph,
         receipts,
         runtime,
+        managed_local,
+        projection_turns,
+        recovered_provider_batches: Vec::new(),
     })
 }
 
@@ -6019,81 +6307,45 @@ fn open_clean_runtime_resources_with_progress(
     let endpoint = engine
         .projection_endpoint_binding()
         .ok_or_else(|| "clean runtime has no projection endpoint".to_owned())?;
-    let terminal_work = engine.clean_terminal_projection_work().map_err(display)?;
+    let mut runtime =
+        CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
+            .map_err(display)?;
+    let binding = ActorRuntimeBinding::from_clean(identities, endpoint, &receipts);
+    // §4.7 steps 5-6: both journals become available before terminal work can
+    // mutate the graph; the semantic managed-local queue drains first.
+    let mut managed_local = open_clean_foreground_journal(
+        &request.application_runtime_root,
+        &binding,
+        &graph,
+        &mut runtime,
+    )?;
+    let mut projection_turns = open_projection_turn_journal(
+        &request.application_runtime_root,
+        binding.workspace_id(),
+        binding.lineage_digest(),
+        binding.endpoint_id,
+        binding.device_id().as_uuid(),
+    )
+    .map_err(display)?;
+    let recovered_provider_batches =
+        drain_open_managed_local_journal(&graph, &receipts, &mut runtime, &mut managed_local)?;
+    drain_open_projection_turn_journal(&graph, &receipts, &mut runtime, &mut projection_turns)?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeProjectionRepair,
     });
-    let receiver_local = terminal_work
-        .iter()
-        .filter(|work| work.endpoint_id() != endpoint.endpoint_id())
-        .collect::<Vec<_>>();
-    for work in terminal_work
-        .iter()
-        .filter(|work| work.endpoint_id() == endpoint.endpoint_id())
-    {
-        let executed = crate::oplog::projection::execute_clean_manifested_projection_work(
-            &graph,
-            &receipts,
-            projection.database(),
-            &mut engine,
-            work,
-        );
-        match executed {
-            Ok(()) => {}
-            Err(crate::oplog::ProjectionError::WorkNotReady)
-                if engine
-                    .accepted_batch_projection_is_superseded(work.batch_id())
-                    .map_err(display)? =>
-            {
-                // This endpoint's recorded rendering was superseded by a
-                // concurrently accepted history, so the merge decides the page
-                // now and the recorded bytes must not be replayed verbatim.
-                // Skip instead of refusing to open: reopen always seeds a
-                // clean full scan, and the receipt store re-projects any page
-                // whose disk bytes are an earlier receipted render (GH #351).
-            }
-            Err(error) => return Err(display(error)),
-        }
-    }
-    let foreign = receiver_local;
-    if !foreign.is_empty() {
-        let handoff = graph
-            .mint_handoff_safe(identities.workspace_id, endpoint)
-            .map_err(display)?;
-        handoff
-            .verify_binding(&graph, identities.workspace_id, endpoint)
-            .map_err(display)?;
-        let published = handoff.into_publisher_guard().into_published_latch();
-        for work in foreign {
-            let source = {
-                let archive = engine
-                    .archive_store()
-                    .ok_or_else(|| "clean runtime has no operation archive".to_owned())?;
-                crate::oplog::projection::decode_manifested_projection_work(archive, work)
-                    .map_err(display)?
-                    .manifested()
-                    .clone()
-            };
-            crate::oplog::projection::execute_receiver_local_projection_under_handoff(
-                &graph,
-                &receipts,
-                &engine,
-                Some(projection.database()),
-                &source,
-                &published,
-                true,
-            )
-            .map_err(display)?;
-        }
-        published.complete();
-    }
-    let runtime =
-        CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
-            .map_err(display)?;
+    append_and_replay_terminal_projection_turns(
+        &graph,
+        &receipts,
+        &mut runtime,
+        &mut projection_turns,
+    )?;
     Ok(Some(CleanRuntimeResources {
         graph,
         receipts,
         runtime,
+        managed_local,
+        projection_turns,
+        recovered_provider_batches,
     }))
 }
 
@@ -11079,6 +11331,7 @@ struct RuntimeActor {
     /// reconstructed graph-text latch has been consumed into the exact feed.
     correlated_move_feed_handoffs: BTreeSet<BatchId>,
     managed_local: Option<ManagedLocalRuntimeState>,
+    projection_turns: Option<ProjectionTurnJournalState>,
     move_episode_directory: Dir,
     #[cfg(test)]
     fail_next_move_episode_publication_after_write: bool,
@@ -11315,7 +11568,10 @@ impl RuntimeActor {
         let CleanRuntimeResources {
             graph,
             receipts,
-            mut runtime,
+            runtime,
+            managed_local,
+            projection_turns,
+            recovered_provider_batches,
         } = resources;
         if runtime.session_id() != identities.session_id
             || runtime.endpoint().endpoint_id() != identities.endpoint_id
@@ -11375,24 +11631,19 @@ impl RuntimeActor {
         } else {
             None
         };
-        let managed_local = open_clean_foreground_journal(
-            &request.application_runtime_root,
-            &binding,
-            &graph,
-            &mut runtime,
-        )?;
         let clean = CleanRuntimeActorCore::new(
             runtime,
             recovery == SyncRuntimeRecovery::CleanManifestReplay,
         );
         let last_watcher = clean.watcher_status();
-        Ok(Self {
+        let mut actor = Self {
             graph,
             receipts,
             clean: Some(clean),
             local_mutation: None,
             correlated_move_feed_handoffs: BTreeSet::new(),
             managed_local: Some(managed_local),
+            projection_turns: Some(projection_turns),
             move_episode_directory,
             #[cfg(test)]
             fail_next_move_episode_publication_after_write: false,
@@ -11485,7 +11736,11 @@ impl RuntimeActor {
             provider_recovery_backfill_cursor: None,
             pending_join: None,
             _not_send_or_sync: PhantomData,
-        })
+        };
+        for batch_id in recovered_provider_batches {
+            actor.queue_clean_provider_publication(batch_id);
+        }
+        Ok(actor)
     }
 
     #[cfg(test)]
@@ -17457,11 +17712,15 @@ impl RuntimeActor {
         let mut previous_failure: Option<(SyncLocalMutationPhase, String)> = None;
         let mut spent = MAX_EDITOR_SETTLE_TURNS;
         for turn in 0..MAX_EDITOR_SETTLE_TURNS {
+            let turns = self
+                .projection_turns
+                .as_mut()
+                .expect("clean settlement retains its projection-turn journal");
             let outcome = self
                 .clean
                 .as_mut()
                 .expect("clean settlement retains its clean actor")
-                .retry_pending(&self.graph, &self.receipts);
+                .retry_pending_with_turns(&self.graph, &self.receipts, turns);
             match outcome {
                 // No continuation remains. `DurablePending` reported a durable
                 // manifest commit, so the batch is durable and its derived
@@ -17541,11 +17800,15 @@ impl RuntimeActor {
         // Same permanent-failure stop as `settle_clean_retained_publication`.
         let mut previous_failure: Option<(OperationalPhase, String)> = None;
         for turn in 0..MAX_EDITOR_SETTLE_TURNS {
+            let turns = self
+                .projection_turns
+                .as_mut()
+                .expect("clean settlement retains its projection-turn journal");
             let outcome = self
                 .clean
                 .as_mut()
                 .expect("clean settlement retains its clean actor")
-                .retry_pending(&self.graph, &self.receipts);
+                .retry_pending_with_turns(&self.graph, &self.receipts, turns);
             match outcome {
                 None => return (turn, true),
                 Some(CleanActorMutationOutcome::Durable(batch_id)) => {
@@ -19435,11 +19698,15 @@ impl RuntimeActor {
         if let Some(outcome) = self.tick_clean_foreground_derivative() {
             return outcome;
         }
+        let turns = self
+            .projection_turns
+            .as_mut()
+            .expect("clean tick retains its projection-turn journal");
         let clean = self
             .clean
             .as_mut()
             .expect("clean tick is routed only to a clean actor");
-        if let Some(outcome) = clean.retry_pending(&self.graph, &self.receipts) {
+        if let Some(outcome) = clean.retry_pending_with_turns(&self.graph, &self.receipts, turns) {
             match outcome {
                 CleanActorMutationOutcome::Durable(batch_id)
                     if clean.provider_change_pending_notification == Some(batch_id) =>
@@ -19481,6 +19748,23 @@ impl RuntimeActor {
                     ));
                 }
             }
+        }
+        // A retained provider continuation owns a published handoff latch and
+        // must replay its own turn above. Only orphaned/reopened turns reach
+        // this generic drain, which mints a fresh handoff.
+        if turns.pending_count() != 0 {
+            return match drain_open_projection_turn_journal(
+                &self.graph,
+                &self.receipts,
+                &mut clean.runtime,
+                turns,
+            ) {
+                Ok(()) => SyncRuntimeTick::Recovering,
+                Err(error) if error.contains("reserved for external reconciliation") => {
+                    SyncRuntimeTick::Recovering
+                }
+                Err(error) => SyncRuntimeTick::RecoveryBlocked(error),
+            };
         }
         if let Some(batch_id) = clean.provider_change_pending_notification.take() {
             // A serialized application request may have completed the retained
@@ -19975,10 +20259,21 @@ impl RuntimeActor {
             // authenticated manifest rendering; repair only that proven case
             // before redrafting. Unknown/external bytes remain untouched.
             _ => {
-                self.clean
-                    .as_ref()
-                    .expect("clean conflict resolution runs only in a clean actor")
-                    .repair_superseded_projection(&self.graph, &self.receipts, &reconciliation_path)
+                let clean = self
+                    .clean
+                    .as_mut()
+                    .expect("clean conflict resolution runs only in a clean actor");
+                let turns = self
+                    .projection_turns
+                    .as_mut()
+                    .expect("clean conflict resolution retains its projection-turn journal");
+                clean
+                    .repair_superseded_projection(
+                        &self.graph,
+                        &self.receipts,
+                        turns,
+                        &reconciliation_path,
+                    )
                     .ok();
                 None
             }
@@ -20435,11 +20730,15 @@ impl RuntimeActor {
                 Ok(prepared) => prepared,
                 Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
             };
+            let turns = self
+                .projection_turns
+                .as_mut()
+                .expect("clean provider work retains its projection-turn journal");
             let outcome = self
                 .clean
                 .as_mut()
                 .expect("clean provider work requires clean actor")
-                .execute_provider(&self.graph, &self.receipts, &prepared);
+                .execute_provider(&self.graph, &self.receipts, turns, &prepared);
             return match outcome {
                 Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
                     self.provider_direct_manifests.pop_front();
@@ -20876,6 +21175,11 @@ impl RuntimeActor {
             return Err(error);
         }
 
+        // The installed shared authority reopens the same device-keyed journal
+        // namespaces. Release the pre-install holders before step 5 acquires
+        // both journals for the replacement runtime.
+        drop(self.managed_local.take());
+        drop(self.projection_turns.take());
         let resources = open_clean_runtime_resources(&request)
             .and_then(|resources| {
                 resources.ok_or_else(|| {
@@ -20892,6 +21196,9 @@ impl RuntimeActor {
             graph,
             receipts,
             runtime,
+            managed_local,
+            projection_turns,
+            recovered_provider_batches,
         } = resources;
         self.graph = graph;
         self.receipts = receipts;
@@ -20906,6 +21213,11 @@ impl RuntimeActor {
         // reconstructed merged history, leaving its disk projection stale
         // until a scan reconciles it (GH #351 audit finding 1).
         self.clean = Some(CleanRuntimeActorCore::new(runtime, true));
+        self.managed_local = Some(managed_local);
+        self.projection_turns = Some(projection_turns);
+        for batch_id in recovered_provider_batches {
+            self.queue_clean_provider_publication(batch_id);
+        }
         self.last_watcher = self
             .clean
             .as_ref()
@@ -24452,7 +24764,13 @@ mod tests {
         let workspace_directories = fs::read_dir(&namespace)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.is_dir())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("clean-workspace-"))
+            })
             .collect::<Vec<_>>();
         assert_eq!(workspace_directories.len(), 1);
         workspace_directories.into_iter().next().unwrap()
@@ -26236,14 +26554,10 @@ mod tests {
 
         let reopened = active_handle(SyncRuntimeHandle::open(request));
         let overlay = reopened.managed_task_query_overlay_snapshot().unwrap();
-        assert!(matches!(
-            overlay.entries.as_slice(),
-            [ManagedTaskQueryOverlayEntrySnapshot {
-                path: recovered_path,
-                state: ManagedTaskQueryOverlayStateSnapshot::Incomplete,
-                ..
-            }] if recovered_path == &path
-        ));
+        assert!(
+            overlay.entries.is_empty(),
+            "cold open now drains the semantic journal before actor handoff: {overlay:?}"
+        );
 
         reopened
             .reset_managed_application_query_instrumentation()
@@ -26270,13 +26584,9 @@ mod tests {
             .managed_application_query_instrumentation()
             .unwrap();
         assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
-        assert_eq!(counters.sparse_completions, 0, "{counters:?}");
-        assert_eq!(counters.sparse_fallbacks, 1, "{counters:?}");
-        assert_eq!(
-            counters.sparse_fallback_reason,
-            Some(ManagedSparseTaskQueryFallback::OverlayIncomplete),
-            "{counters:?}"
-        );
+        assert_eq!(counters.sparse_completions, 1, "{counters:?}");
+        assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
+        assert_eq!(counters.sparse_fallback_reason, None, "{counters:?}");
 
         drain_managed_local(&reopened);
         assert!(matches!(
@@ -27510,6 +27820,130 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_completed_terminal_turn_appends_no_duplicate() {
+        let fixture = ActivationFixture::nested_unicode("terminal-turn-dedup", 0xa171);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let mut resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let path = ManagedPath::parse("Root.md".to_owned()).unwrap();
+        let owner = resources
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&path, 2)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let page = resources
+            .runtime
+            .engine()
+            .materialize_page(owner.page_id)
+            .unwrap();
+        let block = page.blocks.first().unwrap();
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+            },
+            content: "terminal turn dedup target".into(),
+        }])
+        .unwrap();
+        let fault =
+            crate::oplog::projection::fail_next_manifested_projection_during_write_for_harness();
+        let state = {
+            let mut session = resources
+                .runtime
+                .admit_clean_mutation(&resources.graph)
+                .unwrap();
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &resources.graph,
+                &resources.receipts,
+                &transaction,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            state,
+            crate::oplog::operational_coordinator::CleanLocalMutationState::DurablePending(_)
+        ));
+        drop(state);
+        drop(fault);
+        drop(resources);
+
+        let first = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .unwrap();
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("terminal turn dedup target"));
+        let after_completed = first.projection_turns.journal.next_sequence();
+        assert_eq!(after_completed, 1, "terminal repair appended one turn");
+        assert_eq!(first.projection_turns.pending_count(), 0);
+        assert_eq!(
+            first
+                .runtime
+                .database()
+                .projection_baseline_count_for_test(),
+            1
+        );
+        first
+            .runtime
+            .database()
+            .clear_projection_baselines_for_test();
+        drop(first);
+
+        let second = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.projection_turns.journal.next_sequence(),
+            after_completed,
+            "the step-7 exact probe must suppress a duplicate terminal turn"
+        );
+        assert_eq!(
+            second
+                .runtime
+                .database()
+                .projection_baseline_count_for_test(),
+            1,
+            "loss of the disposable baseline must cause one no-op re-bind"
+        );
+    }
+
+    #[test]
+    fn a_journal_that_cannot_open_refuses_activation_before_any_graph_mutation() {
+        let fixture = ActivationFixture::nested_unicode("turn-open-refusal", 0xa172);
+        let before = user_graph_bytes(&fixture.graph_root);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let CleanRuntimeResources {
+            graph,
+            receipts,
+            runtime,
+            managed_local,
+            projection_turns,
+            recovered_provider_batches: _,
+        } = resources;
+        drop(managed_local);
+        drop(runtime);
+        drop(receipts);
+        drop(graph);
+        let error = match open_clean_runtime_resources(&reopen_request(&fixture.request)) {
+            Err(error) => error,
+            Ok(_) => panic!("projection-turn journal unexpectedly opened twice"),
+        };
+        assert!(
+            error.contains("projection turn") || error.contains("already open"),
+            "unexpected refusal: {error}"
+        );
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+        drop(projection_turns);
+    }
+
+    #[test]
     fn clean_actor_core_retains_one_manifested_save_until_projection_finishes() {
         let fixture = ActivationFixture::nested_unicode("clean-actor-save", 0xa175);
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
@@ -27519,7 +27953,11 @@ mod tests {
             graph,
             receipts,
             runtime,
+            managed_local,
+            projection_turns,
+            recovered_provider_batches: _,
         } = resources;
+        drop((managed_local, projection_turns));
         let mut actor = CleanRuntimeActorCore::new(runtime, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
@@ -27623,7 +28061,11 @@ mod tests {
             graph,
             receipts,
             runtime,
+            managed_local,
+            projection_turns,
+            recovered_provider_batches: _,
         } = resources;
+        drop((managed_local, projection_turns));
         let accepted_before = runtime.engine().accepted_batch_count().unwrap();
         let mut actor = CleanRuntimeActorCore::new(runtime, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -27671,7 +28113,11 @@ mod tests {
             graph,
             receipts,
             runtime,
+            managed_local,
+            projection_turns,
+            recovered_provider_batches: _,
         } = reopened;
+        drop((managed_local, projection_turns));
         assert_eq!(
             runtime.engine().accepted_batch_count().unwrap(),
             accepted_before,
@@ -27770,7 +28216,11 @@ mod tests {
                 graph,
                 receipts,
                 runtime,
+                managed_local,
+                projection_turns,
+                recovered_provider_batches: _,
             } = resources;
+            drop((managed_local, projection_turns));
             let accepted_before = runtime.engine().accepted_batch_count().unwrap();
             let mut actor = CleanRuntimeActorCore::new(runtime, false);
             let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -27869,7 +28319,11 @@ mod tests {
                 graph,
                 receipts,
                 runtime,
+                managed_local,
+                projection_turns,
+                recovered_provider_batches: _,
             } = reopened;
+            drop((managed_local, projection_turns));
             let mut actor = CleanRuntimeActorCore::new(runtime, false);
             let retry = edit(&mut actor);
             let repaired = actor.execute_local(&graph, &receipts, &retry);
@@ -28048,7 +28502,11 @@ mod tests {
             graph,
             receipts,
             runtime,
+            managed_local,
+            projection_turns,
+            recovered_provider_batches: _,
         } = resources;
+        drop((managed_local, projection_turns));
         let mut actor = CleanRuntimeActorCore::new(runtime, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
@@ -40776,7 +41234,8 @@ mod tests {
     /// in two shapes (journal-universal durability design §3.2/§3.6). The drain
     /// projects the foreground frame into the `ProjectionTurn` view so recovery
     /// has one record shape to reason about, whichever physical segment carried
-    /// it. Nothing in production consumes the view yet.
+    /// it. The production managed-local drain feeds this view to the same
+    /// turn-level executor used by the independent projection journal.
     #[test]
     fn a_foreground_journal_frame_projects_into_the_same_projection_turn_view() {
         let fixture = ActivationFixture::nested_unicode("frame-as-turn", 0xa1c1);

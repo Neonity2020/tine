@@ -2139,6 +2139,19 @@ impl PublishedHandoffLatch {
         Ok(permit)
     }
 
+    /// Re-enrol an already exact page in this turn's directory durability
+    /// group without publishing it again. A retained turn may have completed
+    /// this page before a crash, while another page in the same turn did not.
+    pub(crate) fn rebarrier_page_projection(
+        &self,
+        graph: &Graph,
+        relative_path: &str,
+        expected_target: Option<&[u8]>,
+    ) -> io::Result<()> {
+        let write = self.admit_projection_writer(graph)?;
+        graph.rebarrier_page_projection_with_writer(&write, relative_path, expected_target)
+    }
+
     #[cfg(test)]
     pub(crate) fn write_page_projection(
         &self,
@@ -9821,6 +9834,56 @@ impl Graph {
         self.ensure_projection_parent_binding(&parent, &target)?;
         self.ensure_projection_target_shape(&parent, &target)?;
         read_projection_optional(parent.final_dir(), &target.filename)
+    }
+
+    /// Re-take the reconstructible projection's leaf-directory barrier after
+    /// proving that the path is still exactly the state replay observed. This
+    /// performs no rename, write, removal, or receipt transition.
+    pub(crate) fn rebarrier_page_projection(
+        &self,
+        path: &ManagedPath,
+        expected_target: Option<&[u8]>,
+    ) -> io::Result<()> {
+        let write = self.admit_retained_managed_text_writer()?;
+        self.rebarrier_page_projection_with_writer(&write, path.as_str(), expected_target)
+    }
+
+    fn rebarrier_page_projection_with_writer(
+        &self,
+        write: &ManagedTextWritePermit,
+        relative_path: &str,
+        expected_target: Option<&[u8]>,
+    ) -> io::Result<()> {
+        require_projection_platform()?;
+        let target = self.projection_page_target(relative_path)?;
+        let lock = self.page_lock(&target.absolute_path);
+        let _guard = lock.lock().unwrap();
+        let parent = self.projection_parent(&target, false)?;
+        self.ensure_projection_parent_binding(&parent, &target)?;
+        self.ensure_projection_target_shape(&parent, &target)?;
+        self.validate_current_graph_text_collision(
+            write,
+            &target.absolute_path,
+            self.managed_optional_file_identity(write, &target.absolute_path)?,
+        )?;
+        let before = read_projection_optional(parent.final_dir(), &target.filename)?;
+        if before.as_deref() != expected_target {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "projection changed before turn rebarrier",
+            ));
+        }
+        sync_reconstructible_projection_chain(&parent.chain)?;
+        self.ensure_projection_parent_binding(&parent, &target)?;
+        self.ensure_projection_target_shape(&parent, &target)?;
+        let after = read_projection_optional(parent.final_dir(), &target.filename)?;
+        if after.as_deref() != expected_target {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "projection changed during turn rebarrier",
+            ));
+        }
+        Ok(())
     }
 
     /// Capture the exact managed page bytes and refresh the same file-identity

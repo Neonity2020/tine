@@ -7845,9 +7845,10 @@ pub(crate) struct TurnPage {
 /// One authoritative unit of graph-tree publication work.
 ///
 /// A durable turn is the whole authority for the names its replay may create
-/// and for the pages it may publish. It replaces the receipt store's
-/// `bases/`, `intents/`, `attempts/`, `*.mutation-authority`, `completions/`
-/// and `forensics/pending-cleanup/` artifacts (§3.3).
+/// and for the pages it may publish. During the universal-turn transition the
+/// receipt store's `bases/`, `intents/`, `attempts/`, mutation authorities,
+/// completions and cleanup artifacts remain published and recovered as
+/// redundant evidence; replay never branches on turn-backedness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectionTurn {
