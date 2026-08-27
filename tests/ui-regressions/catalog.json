@@ -8503,13 +8503,17 @@
     "all"
    ],
    "layer": "native",
-   "status": "fixing",
+   "status": "covered",
    "coverage": {
-    "tests": [],
+    "tests": [
+     "src/components/PdfViewer.test.tsx::runs one viewport raster at a time and drops queued pages that leave the prefetch region",
+     "src/components/PdfViewer.test.tsx::keeps the previous page bitmap visible until a zoom replacement finishes",
+     "scripts/e2e-pdf-scroll-resources.mjs"
+    ],
     "scenario": "pdf.long-document-scroll-resources",
     "failBefore": "proven"
    },
-   "notes": "Martin's 2026-08-27 report and controlled real-app run used a 34-page mathematical thesis without committing it. The current full-page viewer lets every observer callback start its own raster task, retains no global priority or concurrency boundary, and resizes the displayed canvas before a sharper zoom render completes. Rapid zoom/scroll reached about 771 MiB proportional memory and caused visible stalls. The bounded first stage adds one viewport-prioritized render scheduler, cancels irrelevant work, suppresses speculative work during fast scrolling, retains the prior bitmap until its replacement is complete, and defers text-layer work until scrolling settles. Exact memory, frame timing, prefetch distance, and DOM shape are diagnostic rather than user contracts. The longer-term tiled/PDF.js-viewer architecture is tracked separately in GH #393."
+   "notes": "Martin's 2026-08-27 report and controlled real-app run used a public 45-page mathematical thesis supplied outside the repository; the file was never committed. The previous full-page viewer let every observer callback start its own raster task, retained no global priority or concurrency boundary, and resized the displayed canvas before a sharper zoom render completed. Rapid zoom/scroll reached about 771 MiB proportional memory and caused visible stalls. The bounded first stage adds one viewport-prioritized render scheduler, cancels irrelevant work, suppresses speculative work during fast scrolling, retains the prior bitmap until its replacement is complete, and defers text-layer work until scrolling settles. Exact-head real-app evidence observed one active raster at most, queue depth one, one obsolete render cancelled, and a 24 ms worst frame gap in the synthetic rapid-scroll journey. The supplied thesis still reached about 1.07 GiB RSS at high zoom, so bitmap-memory reduction is explicitly not claimed here. Exact memory, frame timing, prefetch distance, and DOM shape are diagnostic rather than user contracts. The longer-term tiled/PDF.js-viewer architecture is tracked separately in GH #393."
   }
  ]
 }
