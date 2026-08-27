@@ -26,6 +26,7 @@ const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4631);
 const TMP = path.join(os.tmpdir(), `tine-pdf-scroll-resources-${process.pid}`);
 const GRAPH = path.join(TMP, "graph");
 const ARTIFACTS = process.env.E2E_ARTIFACT_DIR || TMP;
+const APP_REAL = fs.realpathSync(APP);
 
 function makeLongPdf() {
   const pageIds = Array.from({ length: PAGE_COUNT }, (_, index) => 4 + index * 2);
@@ -103,8 +104,46 @@ async function click(browser, selector) {
   await target.click();
 }
 
+function appMemory() {
+  const rows = [];
+  for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const status = fs.readFileSync(`/proc/${entry}/status`, "utf8");
+      let exe = "";
+      let smaps = "";
+      try { exe = fs.readlinkSync(`/proc/${entry}/exe`); } catch {}
+      try { smaps = fs.readFileSync(`/proc/${entry}/smaps_rollup`, "utf8"); } catch {}
+      rows.push({
+        pid: Number(entry),
+        ppid: Number(status.match(/^PPid:\s+(\d+)$/m)?.[1] || 0),
+        exe,
+        rssKiB: Number(status.match(/^VmRSS:\s+(\d+)\s+kB$/m)?.[1] || 0),
+        pssKiB: Number(smaps.match(/^Pss:\s+(\d+)\s+kB$/m)?.[1] || 0),
+      });
+    } catch {}
+  }
+  const owned = new Set(rows.filter((row) => row.exe === APP_REAL).map((row) => row.pid));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if (owned.has(row.ppid) && !owned.has(row.pid)) {
+        owned.add(row.pid);
+        changed = true;
+      }
+    }
+  }
+  const appRows = rows.filter((row) => owned.has(row.pid));
+  return {
+    rssKiB: appRows.reduce((total, row) => total + row.rssKiB, 0),
+    pssKiB: appRows.reduce((total, row) => total + row.pssKiB, 0),
+    processCount: appRows.length,
+  };
+}
+
 async function sample(browser) {
-  return browser.execute(() => {
+  const dom = await browser.execute(() => {
     const scroll = document.querySelector(".pdf-scroll");
     if (!(scroll instanceof HTMLElement)) return null;
     const viewport = scroll.getBoundingClientRect();
@@ -126,8 +165,15 @@ async function sample(browser) {
       visible: pages.filter((page) => page.visible).map((page) => page.page),
       canvasCount: pages.filter((page) => page.canvasPixels > 0).length,
       canvasPixels: pages.reduce((total, page) => total + page.canvasPixels, 0),
+      activeRenders: Number(scroll.dataset.activeRenders || 0),
+      queuedRenders: Number(scroll.dataset.queuedRenders || 0),
+      maxQueuedRenders: Number(scroll.dataset.maxQueuedRenders || 0),
+      cancelledRenders: Number(scroll.dataset.cancelledRenders || 0),
+      fastScrolling: scroll.dataset.fastScrolling === "true",
+      frameDiag: window.__tinePdfFrameDiag ?? null,
     };
   });
+  return { ...dom, memory: appMemory() };
 }
 
 async function wheel(browser, deltaY, id) {
@@ -178,6 +224,18 @@ try {
     timeoutMsg: "long PDF did not become ready",
   });
 
+  await browser.execute(() => {
+    const state = window.__tinePdfFrameDiag = { frames: 0, maxGapMs: 0 };
+    let previous = performance.now();
+    const frame = (now) => {
+      state.frames += 1;
+      state.maxGapMs = Math.max(state.maxGapMs, now - previous);
+      previous = now;
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  });
+
   // Allow intersection callbacks, rendering, and cache eviction to settle.
   await sleep(2500);
   const ready = await sample(browser);
@@ -202,6 +260,32 @@ try {
     previousFirst = first;
   }
 
+  // Exercise the reported expensive shape: zoom first, then outrun page
+  // rasterization with a rapid wheel burst. Memory and frame gaps are evidence,
+  // not exact cross-machine gates; the semantic assertions are bounded work and
+  // a nonblank destination page after the burst settles.
+  for (let index = 0; index < 6; index += 1) {
+    await click(browser, 'button[title="Zoom in"]');
+  }
+  await sleep(500);
+  observations.push({ label: "zoom-settled", ...await sample(browser) });
+  for (let index = 0; index < 20; index += 1) {
+    await wheel(browser, 700, `rapid-${index}`);
+    await sleep(35);
+    observations.push({ label: `rapid-${index + 1}`, ...await sample(browser) });
+  }
+  await sleep(800);
+  const stress = await sample(browser);
+  observations.push({ label: "rapid-settled", ...stress });
+  assert(stress.activeRenders <= 1, "PDF scheduler admitted concurrent full-page renders", stress);
+  assert(stress.visible.length > 0, "rapid PDF scrolling lost the visible page", stress);
+  assert(
+    stress.pages.some((page) => page.visible && page.canvasPixels > 0),
+    "rapid PDF scrolling settled on a blank viewport",
+    stress,
+  );
+  assert(stress.canvasPixels <= 52_000_000, "PDF canvases exceeded the desktop budget after rapid zoom/scroll", stress.canvasPixels);
+
   fs.writeFileSync(path.join(ARTIFACTS, "pdf-scroll-resources.json"), `${JSON.stringify(observations, null, 2)}\n`);
   console.log(JSON.stringify({
     ok: true,
@@ -210,6 +294,10 @@ try {
     shortestPage,
     scrollHeight: ready.scrollHeight,
     finalVisible: observations.at(-1)?.visible,
+    finalMemory: stress.memory,
+    maxFrameGapMs: stress.frameDiag?.maxGapMs,
+    maxQueuedRenders: stress.maxQueuedRenders,
+    cancelledRenders: stress.cancelledRenders,
   }));
 } catch (error) {
   fs.writeFileSync(path.join(ARTIFACTS, "pdf-scroll-resources.json"), `${JSON.stringify(observations, null, 2)}\n`);

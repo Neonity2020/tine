@@ -346,6 +346,8 @@ export function PdfViewer(props: {
   const renderQueue = new Map<number, PdfRenderRequest>();
   let activeRender: PdfRenderRequest | null = null;
   let renderSequence = 0;
+  let maxQueuedRenders = 0;
+  let cancelledRenders = 0;
   // Ownership begins before getPage(): duplicate observer/navigation requests
   // can otherwise both pass the await and render into one canvas concurrently.
   const renderGeneration: Record<number, number> = {};
@@ -685,8 +687,11 @@ export function PdfViewer(props: {
 
   function updateRenderDiagnostics() {
     if (!scrollRef) return;
+    maxQueuedRenders = Math.max(maxQueuedRenders, renderQueue.size);
     scrollRef.dataset.activeRenders = activeRender ? "1" : "0";
     scrollRef.dataset.queuedRenders = String(renderQueue.size);
+    scrollRef.dataset.maxQueuedRenders = String(maxQueuedRenders);
+    scrollRef.dataset.cancelledRenders = String(cancelledRenders);
     scrollRef.dataset.fastScrolling = fastScrolling ? "true" : "false";
   }
 
@@ -743,6 +748,7 @@ export function PdfViewer(props: {
         return activeRender.promise;
       }
       activeRender.cancelled = true;
+      cancelledRenders += 1;
       tasks[n]?.cancel();
     }
 
@@ -753,6 +759,7 @@ export function PdfViewer(props: {
     }
     if (queued) {
       queued.cancelled = true;
+      cancelledRenders += 1;
       queued.resolve();
       renderQueue.delete(n);
     }
@@ -779,11 +786,13 @@ export function PdfViewer(props: {
     const queued = renderQueue.get(n);
     if (queued) {
       queued.cancelled = true;
+      cancelledRenders += 1;
       queued.resolve();
       renderQueue.delete(n);
     }
-    if (activeRender?.page === n && activeRender.priority !== PDF_RENDER_INTERACTIVE) {
+    if (activeRender?.page === n && !activeRender.cancelled && activeRender.priority !== PDF_RENDER_INTERACTIVE) {
       activeRender.cancelled = true;
+      cancelledRenders += 1;
       tasks[n]?.cancel();
     }
     updateRenderDiagnostics();
@@ -793,11 +802,13 @@ export function PdfViewer(props: {
     for (const [page, request] of renderQueue) {
       if (request.priority !== PDF_RENDER_PREFETCH) continue;
       request.cancelled = true;
+      cancelledRenders += 1;
       request.resolve();
       renderQueue.delete(page);
     }
-    if (activeRender?.priority === PDF_RENDER_PREFETCH) {
+    if (activeRender && !activeRender.cancelled && activeRender.priority === PDF_RENDER_PREFETCH) {
       activeRender.cancelled = true;
+      cancelledRenders += 1;
       tasks[activeRender.page]?.cancel();
     }
     updateRenderDiagnostics();
@@ -806,11 +817,13 @@ export function PdfViewer(props: {
   function cancelAllRenders() {
     for (const request of renderQueue.values()) {
       request.cancelled = true;
+      cancelledRenders += 1;
       request.resolve();
     }
     renderQueue.clear();
-    if (activeRender) {
+    if (activeRender && !activeRender.cancelled) {
       activeRender.cancelled = true;
+      cancelledRenders += 1;
       tasks[activeRender.page]?.cancel();
     }
     updateRenderDiagnostics();
