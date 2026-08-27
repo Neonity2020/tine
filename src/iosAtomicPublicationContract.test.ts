@@ -31,4 +31,11 @@ describe("iOS atomic publication platform boundary", () => {
     expect(workflow).toContain("'*Tine Guide.md'");
     expect(workflow).toContain("STALE_GRAPH");
   });
+
+  it("carries an iOS-rebased graph path across the Rust mobile-plugin bridge", () => {
+    const bridge = readFileSync("src-tauri/src/ios_folder_picker.rs", "utf8");
+    expect(bridge).toMatch(
+      /struct PrepareGraphFolderResult\s*\{[\s\S]*?path:\s*Option<String>/
+    );
+  });
 });

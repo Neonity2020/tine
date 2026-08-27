@@ -39,6 +39,10 @@ struct PrepareGraphFolderPayload<'a> {
 pub(crate) struct PrepareGraphFolderResult {
     status: String,
     location: Option<String>,
+    // Swift may rebase a remembered graph after iOS moves the app container.
+    // Keep the effective path in the bridge response; omitting this field makes
+    // serde silently discard it and sends the frontend back to the stale UUID.
+    path: Option<String>,
 }
 
 pub(crate) struct IosFolderPicker<R: Runtime>(PluginHandle<R>);
