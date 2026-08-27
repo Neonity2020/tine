@@ -1414,7 +1414,11 @@ mod tests {
         drop(held);
     }
 
-    // ---- §8.2 receipt/turn recovery-equivalence oracle -------------------
+    // ---- supplemental receipt/turn state-machine model -------------------
+    //
+    // This cheap model checks schedule generation and expected state-machine
+    // agreement only. The §8.2 license is the real-store production-protocol
+    // oracle in `sync_runtime::tests`; a BTreeMap model cannot provide it.
 
     #[derive(Clone, Debug)]
     struct OracleCase {
@@ -1604,13 +1608,13 @@ mod tests {
     }
 
     #[test]
-    fn projection_recovery_equivalence_oracle_agreement_subset() {
+    fn projection_recovery_state_machine_model_agreement_subset() {
         run_equivalence_oracle(3);
     }
 
     #[test]
     #[ignore = "full seeded 8-feature × 25-schedule agreement oracle"]
-    fn projection_recovery_equivalence_oracle_agreement_200_cases() {
+    fn projection_recovery_state_machine_model_agreement_200_cases() {
         run_equivalence_oracle(25);
     }
 

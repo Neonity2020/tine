@@ -63,6 +63,79 @@ thread_local! {
     /// predecessor replay: the latter remains a separate safety proof.
     static PREPARED_EDITOR_PROJECTION_INSTRUMENTATION: std::cell::Cell<PreparedEditorProjectionInstrumentation> =
         const { std::cell::Cell::new(PreparedEditorProjectionInstrumentation::ZERO) };
+    /// Deterministic production-executor cut used by the real-store recovery
+    /// equivalence oracle. `Some(n)` permits exactly `n` page completions and
+    /// then refuses before the turn can be checkpointed.
+    static TURN_REPLAY_PAGES_BEFORE_CUT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static TURN_REPLAY_PAGE_COMPLETIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[must_use = "the production turn-replay cut must remain scoped to one cold open"]
+pub(crate) struct TurnReplayCutScope {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl Drop for TurnReplayCutScope {
+    fn drop(&mut self) {
+        TURN_REPLAY_PAGES_BEFORE_CUT.with(|cut| cut.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cut_turn_replay_after_pages_for_test(pages: usize) -> TurnReplayCutScope {
+    let previous = TURN_REPLAY_PAGES_BEFORE_CUT.with(|cut| cut.replace(Some(pages)));
+    TurnReplayCutScope { previous }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_turn_replay_page_completions_for_test() {
+    TURN_REPLAY_PAGE_COMPLETIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn turn_replay_page_completions_for_test() -> usize {
+    TURN_REPLAY_PAGE_COMPLETIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn turn_replay_page_start_for_test() -> Result<(), ProjectionError> {
+    TURN_REPLAY_PAGES_BEFORE_CUT.with(|cut| match cut.get() {
+        Some(0) => Err(ProjectionError::Work(
+            "deterministic cut during production turn replay".into(),
+        )),
+        Some(remaining) => {
+            cut.set(Some(remaining - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn turn_replay_page_start_for_test() -> Result<(), ProjectionError> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn turn_replay_page_completed_for_test() {
+    TURN_REPLAY_PAGE_COMPLETIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+fn turn_replay_page_completed_for_test() {}
+
+#[cfg(test)]
+fn turn_replay_checkpoint_boundary_for_test() -> Result<(), ProjectionError> {
+    turn_replay_page_start_for_test()
+}
+
+#[cfg(not(test))]
+fn turn_replay_checkpoint_boundary_for_test() -> Result<(), ProjectionError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2034,6 +2107,7 @@ pub(crate) fn replay_projection_turn(
             .map_err(ProjectionError::Engine)?,
     };
     for page in &turn.pages {
+        turn_replay_page_start_for_test()?;
         if matches!(
             turn.origin,
             TurnOrigin::IngressForeign { .. } | TurnOrigin::TerminalForeign { .. }
@@ -2110,6 +2184,7 @@ pub(crate) fn replay_projection_turn(
                     .bind_projection_baseline(page.page_id, &page.path, BlobDescription::of(&bytes))
                     .map_err(|error| ProjectionError::Work(error.to_string()))?;
             }
+            turn_replay_page_completed_for_test();
             continue;
         }
         let work = current
@@ -2254,7 +2329,9 @@ pub(crate) fn replay_projection_turn(
                 .bind_projection_baseline(work.page_id(), work.path(), BlobDescription::of(&bytes))
                 .map_err(|error| ProjectionError::Work(error.to_string()))?;
         }
+        turn_replay_page_completed_for_test();
     }
+    turn_replay_checkpoint_boundary_for_test()?;
     Ok(())
 }
 
@@ -2560,6 +2637,22 @@ fn execute_manifested_projection_work_located(
         receipts.load_attempt_reservations(&local_attempt_intent)
     )?;
     let has_attempts = !attempts.is_empty();
+    // A deletion can crash after the target's absence is durable and before
+    // either its receipt completion or owning turn checkpoint is durable. The
+    // accepted turn is sufficient authority to confirm that already-exact
+    // absence; asking `recover_removed_page_projection` for the displaced base
+    // inode would make completion evidence a prerequisite for turn replay.
+    let deletion_is_already_exact = if target.is_none() {
+        projection_phase!(
+            "read_deleted_projection_input",
+            graph
+                .read_projection_input(work.path())
+                .map_err(ProjectionError::Io)
+        )?
+        .is_none()
+    } else {
+        false
+    };
     let recovery_result = if !has_attempts {
         None
     } else {
@@ -2580,6 +2673,11 @@ fn execute_manifested_projection_work_located(
                 &guarded_layout,
                 &mut authority,
             ),
+            (Some(handoff), None) if deletion_is_already_exact => handoff
+                .confirm_removed_page_projection(graph, manifested.path().as_str(), &mut authority),
+            (None, None) if deletion_is_already_exact => {
+                graph.confirm_removed_page_projection(manifested.path().as_str(), &mut authority)
+            }
             (Some(handoff), None) => {
                 let base = expected_base
                     .as_ref()

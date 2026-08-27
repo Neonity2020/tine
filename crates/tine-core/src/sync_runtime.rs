@@ -27943,6 +27943,618 @@ mod tests {
         drop(projection_turns);
     }
 
+    // ---- design §8.2: real-store production recovery equivalence --------
+
+    #[derive(Clone, Copy, Debug)]
+    enum RealStoreOracleFeature {
+        Create,
+        Edit,
+        Delete,
+        CrossPageMove,
+        NamespacedPath,
+        NfcNfdTwin,
+        TitlePropertyPage,
+        MissingParentRefusal,
+    }
+
+    impl RealStoreOracleFeature {
+        const ALL: [Self; 8] = [
+            Self::Create,
+            Self::Edit,
+            Self::Delete,
+            Self::CrossPageMove,
+            Self::NamespacedPath,
+            Self::NfcNfdTwin,
+            Self::TitlePropertyPage,
+            Self::MissingParentRefusal,
+        ];
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Create => "create",
+                Self::Edit => "edit",
+                Self::Delete => "delete",
+                Self::CrossPageMove => "cross-page-move",
+                Self::NamespacedPath => "namespaced-path",
+                Self::NfcNfdTwin => "nfc-nfd-twin",
+                Self::TitlePropertyPage => "title-property-page",
+                Self::MissingParentRefusal => "missing-parent-refusal",
+            }
+        }
+
+        const fn produces_turn(self) -> bool {
+            !matches!(self, Self::NfcNfdTwin | Self::MissingParentRefusal)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RealStoreTreeSnapshot {
+        directories: std::collections::BTreeSet<PathBuf>,
+        files: BTreeMap<PathBuf, Vec<u8>>,
+    }
+
+    fn snapshot_real_store_tree(root: &Path) -> RealStoreTreeSnapshot {
+        let mut directories = std::collections::BTreeSet::from([PathBuf::new()]);
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let mut entries = fs::read_dir(&directory)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let file_type = entry.file_type().unwrap();
+                let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                assert!(!file_type.is_symlink(), "oracle stores contain no symlinks");
+                if file_type.is_dir() {
+                    directories.insert(relative);
+                    pending.push(entry.path());
+                } else {
+                    assert!(
+                        file_type.is_file(),
+                        "oracle stores contain regular files only"
+                    );
+                    files.insert(relative, fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        RealStoreTreeSnapshot { directories, files }
+    }
+
+    /// Restore a cut in place instead of relocating it. Receipt namespaces and
+    /// the enrolled graph are bound to physical directory identities, so two
+    /// copied directory trees are not production-equivalent stores. Keeping
+    /// every directory present in the cut preserves those bindings while file
+    /// names and bytes return to the exact durable snapshot.
+    fn restore_real_store_tree(root: &Path, snapshot: &RealStoreTreeSnapshot) {
+        let current = snapshot_real_store_tree(root);
+        for path in current.files.keys() {
+            if !snapshot.files.contains_key(path) {
+                fs::remove_file(root.join(path)).unwrap();
+            }
+        }
+        let mut extra_directories = current
+            .directories
+            .difference(&snapshot.directories)
+            .cloned()
+            .collect::<Vec<_>>();
+        extra_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for path in extra_directories {
+            fs::remove_dir_all(root.join(path)).unwrap();
+        }
+        let mut directories = snapshot.directories.iter().cloned().collect::<Vec<_>>();
+        directories.sort_by_key(|path| path.components().count());
+        for path in directories {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        for (path, bytes) in &snapshot.files {
+            fs::write(root.join(path), bytes).unwrap();
+        }
+    }
+
+    fn oracle_page(
+        resources: &CleanRuntimeResources,
+        path: &str,
+    ) -> crate::oplog::MaterializedPage {
+        let path = ManagedPath::parse(path.to_owned()).unwrap();
+        let owner = resources
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&path, 2)
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| panic!("real-store oracle has no page at {path}"));
+        resources
+            .runtime
+            .engine()
+            .materialize_page(owner.page_id)
+            .unwrap()
+    }
+
+    fn real_store_oracle_fixture(feature: RealStoreOracleFeature, seed: u128) -> ActivationFixture {
+        let fixture = ActivationFixture::empty(feature.label(), seed);
+        let notes = fixture.graph_root.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        // Keep one unrelated baseline page in every case. The clean genesis
+        // format is intentionally non-empty; corpus features then contribute
+        // only their own accepted tail and projection turn.
+        fs::write(notes.join("Baseline.md"), b"- baseline\n").unwrap();
+        match feature {
+            RealStoreOracleFeature::Create => {}
+            RealStoreOracleFeature::Edit => {
+                fs::write(notes.join("Edit.md"), b"- before\n").unwrap();
+            }
+            RealStoreOracleFeature::Delete => {
+                fs::write(notes.join("Delete.md"), b"- remove me\n").unwrap();
+            }
+            RealStoreOracleFeature::CrossPageMove => {
+                fs::write(notes.join("Move Source.md"), b"- movable\n").unwrap();
+                fs::write(notes.join("Move Target.md"), b"- target\n").unwrap();
+            }
+            RealStoreOracleFeature::NamespacedPath => {
+                fs::write(notes.join("team___plans.md"), b"- v1\n").unwrap();
+            }
+            RealStoreOracleFeature::NfcNfdTwin => {
+                fs::write(notes.join("Cafe\u{301}.md"), b"- decomposed\n").unwrap();
+            }
+            RealStoreOracleFeature::TitlePropertyPage => {
+                fs::write(notes.join("slug.md"), b"title:: Display\n- old\n").unwrap();
+            }
+            RealStoreOracleFeature::MissingParentRefusal => {
+                fs::write(notes.join("Missing Parent.md"), b"- child\n").unwrap();
+            }
+        }
+        fixture
+    }
+
+    fn real_store_oracle_transaction(
+        feature: RealStoreOracleFeature,
+        resources: &CleanRuntimeResources,
+        seed: u128,
+    ) -> OperationTransaction {
+        let page_id = PageId::from_uuid(Uuid::from_u128(seed + 0x10));
+        let document_id = DocumentId::from_uuid(Uuid::from_u128(seed + 0x11));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(seed + 0x12));
+        let operations = match feature {
+            RealStoreOracleFeature::Create => vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id: document_id,
+                    name: LogicalPageName::parse("Create").unwrap(),
+                    path: ManagedPath::parse("notes/Create.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id: document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "created".into(),
+                },
+            ],
+            RealStoreOracleFeature::Edit => {
+                let page = oracle_page(resources, "notes/Edit.md");
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: page.blocks[0].block_id,
+                        home_document_id: page.blocks[0].home_document_id,
+                    },
+                    content: "after".into(),
+                }]
+            }
+            RealStoreOracleFeature::Delete => {
+                let page = oracle_page(resources, "notes/Delete.md");
+                vec![SemanticOperation::DeletePage {
+                    page_id: page.page_id,
+                }]
+            }
+            RealStoreOracleFeature::CrossPageMove => {
+                let source = oracle_page(resources, "notes/Move Source.md");
+                let target = oracle_page(resources, "notes/Move Target.md");
+                vec![SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id: source.blocks[0].block_id,
+                        home_document_id: source.blocks[0].home_document_id,
+                    },
+                    from_page_id: source.page_id,
+                    to_page_id: target.page_id,
+                    parent: None,
+                    order: "b".into(),
+                }]
+            }
+            RealStoreOracleFeature::NamespacedPath => {
+                let page = oracle_page(resources, "notes/team___plans.md");
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: page.blocks[0].block_id,
+                        home_document_id: page.blocks[0].home_document_id,
+                    },
+                    content: "v2".into(),
+                }]
+            }
+            RealStoreOracleFeature::NfcNfdTwin => vec![SemanticOperation::CreatePage {
+                page_id,
+                home_document_id: document_id,
+                name: LogicalPageName::parse("Café").unwrap(),
+                path: ManagedPath::parse("notes/Café.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }],
+            RealStoreOracleFeature::TitlePropertyPage => {
+                let page = oracle_page(resources, "notes/slug.md");
+                vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: page.blocks[0].block_id,
+                        home_document_id: page.blocks[0].home_document_id,
+                    },
+                    content: "new".into(),
+                }]
+            }
+            RealStoreOracleFeature::MissingParentRefusal => {
+                let page = oracle_page(resources, "notes/Missing Parent.md");
+                vec![SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id: page.home_document_id,
+                    },
+                    page_id: page.page_id,
+                    parent: Some(BlockId::from_uuid(Uuid::from_u128(seed + 0x13))),
+                    order: "b".into(),
+                    content: "must be refused".into(),
+                }]
+            }
+        };
+        OperationTransaction::new(operations).unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RealStoreOracleSchedule {
+        completed_pages: usize,
+        checkpointed: bool,
+    }
+
+    fn real_store_oracle_schedule(
+        seed: &mut u64,
+        feature_index: usize,
+        ordinal: usize,
+        pages: usize,
+    ) -> RealStoreOracleSchedule {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        match if ordinal < 3 {
+            (ordinal + feature_index) % 3
+        } else {
+            ordinal
+        } {
+            0 => RealStoreOracleSchedule {
+                completed_pages: 0,
+                checkpointed: false,
+            },
+            1 => RealStoreOracleSchedule {
+                completed_pages: pages,
+                checkpointed: false,
+            },
+            2 => RealStoreOracleSchedule {
+                completed_pages: pages,
+                checkpointed: true,
+            },
+            _ => {
+                let completed_pages = (*seed as usize) % (pages + 1);
+                RealStoreOracleSchedule {
+                    completed_pages,
+                    checkpointed: completed_pages == pages && (*seed >> 32) & 3 == 0,
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RealStoreOracleOutcome {
+        graph: BTreeMap<String, Vec<u8>>,
+        retained_recovery_bytes: Vec<Vec<u8>>,
+        accepted_batches: u64,
+        accepted_frontier: String,
+        accepted_projection_heads: Vec<crate::oplog::ProjectionWork>,
+    }
+
+    fn real_store_oracle_outcome(resources: &CleanRuntimeResources) -> RealStoreOracleOutcome {
+        let mut graph = user_graph_bytes(&resources.graph.root);
+        // Packet 2b owns conversion of today's nondeterministically named W3
+        // quarantine/conflict residues. They are intentionally user-visible
+        // retained evidence, not managed page names. Compare their exact byte
+        // multiset (so loss/duplication still fails) while comparing every
+        // ordinary graph-tree path and byte exactly.
+        let residue_paths = graph
+            .keys()
+            .filter(|path| {
+                path.rsplit('/').next().is_some_and(|name| {
+                    name.starts_with("Tine-recovery-") && name.ends_with(".projection-quarantine")
+                        || name.starts_with("Tine-recovered-")
+                            && name.ends_with(".projection-conflict")
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut retained_recovery_bytes = residue_paths
+            .into_iter()
+            .map(|path| graph.remove(&path).unwrap())
+            .collect::<Vec<_>>();
+        retained_recovery_bytes.sort();
+        RealStoreOracleOutcome {
+            graph,
+            retained_recovery_bytes,
+            accepted_batches: resources.runtime.engine().accepted_batch_count().unwrap(),
+            accepted_frontier: format!(
+                "{:?}",
+                resources.runtime.engine().accepted_frontier_root().unwrap()
+            ),
+            accepted_projection_heads: resources
+                .runtime
+                .engine()
+                .clean_terminal_projection_work()
+                .unwrap(),
+        }
+    }
+
+    fn assert_real_store_projection_heads_are_exact(
+        outcome: &RealStoreOracleOutcome,
+        feature: RealStoreOracleFeature,
+        ordinal: usize,
+    ) {
+        for work in &outcome.accepted_projection_heads {
+            let bytes = outcome.graph.get(work.path().as_str());
+            match work.target() {
+                crate::oplog::ProjectionWorkTarget::Absent => assert!(
+                    bytes.is_none(),
+                    "{} schedule {ordinal} retained deleted path {}",
+                    feature.label(),
+                    work.path()
+                ),
+                crate::oplog::ProjectionWorkTarget::Present(description) => assert_eq!(
+                    bytes.map(|bytes| BlobDescription::of(bytes)),
+                    Some(description),
+                    "{} schedule {ordinal} did not project accepted target {}",
+                    feature.label(),
+                    work.path()
+                ),
+            }
+        }
+    }
+
+    fn receipt_completion_count(receipt_root: &Path) -> usize {
+        let directory = receipt_root.join(crate::oplog::sync_layout::PROJECTION_COMPLETIONS_DIR);
+        fs::read_dir(directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("completion")
+            })
+            .count()
+    }
+
+    fn withhold_receipt_completions(receipt_root: &Path) -> usize {
+        let directory = receipt_root.join(crate::oplog::sync_layout::PROJECTION_COMPLETIONS_DIR);
+        let completions = fs::read_dir(directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("completion"))
+            .collect::<Vec<_>>();
+        for completion in &completions {
+            fs::remove_file(completion).unwrap();
+        }
+        completions.len()
+    }
+
+    fn run_real_store_recovery_equivalence_oracle(schedules_per_feature: usize) {
+        let mut schedule_seed = 0x2a20_2608_26d0_0d5eu64;
+        for (feature_index, feature) in RealStoreOracleFeature::ALL.into_iter().enumerate() {
+            let case_seed = 0x2a20_0000u128 + feature_index as u128 * 0x100;
+            let fixture = real_store_oracle_fixture(feature, case_seed);
+            let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+            let mut resources =
+                activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {})
+                    .unwrap_or_else(|error| {
+                        panic!("{} activation failed: {error}", feature.label())
+                    });
+            let transaction = real_store_oracle_transaction(feature, &resources, case_seed);
+            let result = if feature.produces_turn() {
+                fail_once_at(OperationalFaultPoint::BeforeProjection);
+                let mut session = resources
+                    .runtime
+                    .admit_clean_mutation(&resources.graph)
+                    .unwrap();
+                OperationalCoordinator::execute_clean_local(
+                    &mut session,
+                    &resources.graph,
+                    &resources.receipts,
+                    &transaction,
+                )
+            } else {
+                let mut session = resources
+                    .runtime
+                    .admit_clean_mutation(&resources.graph)
+                    .unwrap();
+                OperationalCoordinator::execute_clean_local(
+                    &mut session,
+                    &resources.graph,
+                    &resources.receipts,
+                    &transaction,
+                )
+            };
+            if feature.produces_turn() {
+                assert!(
+                    matches!(
+                        result,
+                        Ok(crate::oplog::operational_coordinator::CleanLocalMutationState::DurablePending(_))
+                    ),
+                    "{} did not reach a durable pre-projection cut",
+                    feature.label()
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{} must be semantically refused",
+                    feature.label()
+                );
+                assert_eq!(
+                    resources.runtime.engine().accepted_batch_count().unwrap(),
+                    0
+                );
+            }
+            // A durable-pending result owns the published handoff latch. A
+            // crash drops that in-memory continuation before the cold open.
+            drop(result);
+            let page_count = resources
+                .runtime
+                .engine()
+                .clean_terminal_projection_work()
+                .unwrap()
+                .len();
+            assert_eq!(
+                page_count > 0,
+                feature.produces_turn(),
+                "{}",
+                feature.label()
+            );
+            drop(resources);
+
+            let pre_recovery = snapshot_real_store_tree(&fixture.root);
+            let mut expected = None;
+
+            for ordinal in 0..schedules_per_feature {
+                restore_real_store_tree(&fixture.root, &pre_recovery);
+                let schedule = real_store_oracle_schedule(
+                    &mut schedule_seed,
+                    feature_index,
+                    ordinal,
+                    page_count,
+                );
+                if feature.produces_turn() && !schedule.checkpointed {
+                    let cut = crate::oplog::projection::cut_turn_replay_after_pages_for_test(
+                        schedule.completed_pages,
+                    );
+                    let interrupted =
+                        open_clean_runtime_resources(&reopen_request(&fixture.request));
+                    drop(cut);
+                    let error = match interrupted {
+                        Err(error) => error,
+                        Ok(_) => panic!(
+                            "{} schedule {ordinal} did not stop at {schedule:?}",
+                            feature.label()
+                        ),
+                    };
+                    assert!(
+                        error.contains("deterministic cut during production turn replay"),
+                        "{} schedule {ordinal} stopped elsewhere: {error}",
+                        feature.label()
+                    );
+                } else {
+                    let completed = open_clean_runtime_resources(&reopen_request(&fixture.request))
+                        .unwrap()
+                        .unwrap();
+                    drop(completed);
+                }
+                let cut_snapshot = snapshot_real_store_tree(&fixture.root);
+                let completions_at_cut = receipt_completion_count(&fixture.request.receipt_root);
+                if feature.produces_turn() {
+                    assert_eq!(
+                        completions_at_cut,
+                        schedule.completed_pages,
+                        "{} schedule {ordinal} is not the requested real receipt prefix",
+                        feature.label()
+                    );
+                }
+
+                crate::oplog::projection_store::reset_projection_store_test_counters();
+                let receipt_resources =
+                    open_clean_runtime_resources(&reopen_request(&fixture.request))
+                        .unwrap()
+                        .unwrap();
+                let receipt_outcome = real_store_oracle_outcome(&receipt_resources);
+                assert_eq!(receipt_resources.managed_local.pending_count(), 0);
+                assert_eq!(receipt_resources.projection_turns.pending_count(), 0);
+                let receipt_lookups =
+                    crate::oplog::projection_store::projection_store_test_counters()
+                        .completion_lookups;
+                drop(receipt_resources);
+
+                restore_real_store_tree(&fixture.root, &cut_snapshot);
+                let withheld = withhold_receipt_completions(&fixture.request.receipt_root);
+                assert_eq!(withheld, completions_at_cut);
+                crate::oplog::projection_store::reset_projection_store_test_counters();
+                crate::oplog::projection::reset_turn_replay_page_completions_for_test();
+                let turn_resources =
+                    open_clean_runtime_resources(&reopen_request(&fixture.request))
+                        .unwrap()
+                        .unwrap();
+                let turn_outcome = real_store_oracle_outcome(&turn_resources);
+                assert_eq!(turn_resources.managed_local.pending_count(), 0);
+                assert_eq!(turn_resources.projection_turns.pending_count(), 0);
+                let turn_replayed_pages =
+                    crate::oplog::projection::turn_replay_page_completions_for_test();
+                let turn_lookups = crate::oplog::projection_store::projection_store_test_counters()
+                    .completion_lookups;
+                drop(turn_resources);
+
+                assert_real_store_projection_heads_are_exact(&receipt_outcome, feature, ordinal);
+                assert_real_store_projection_heads_are_exact(&turn_outcome, feature, ordinal);
+
+                if feature.produces_turn() && !schedule.checkpointed {
+                    assert!(
+                        receipt_lookups >= page_count,
+                        "receipt side did not consult completions"
+                    );
+                    assert!(
+                        turn_lookups >= page_count,
+                        "turn side did not prove completions absent"
+                    );
+                    assert!(
+                        turn_replayed_pages >= page_count,
+                        "turn-only recovery skipped production replay for {} schedule {ordinal}",
+                        feature.label()
+                    );
+                }
+                let expected = expected.get_or_insert_with(|| receipt_outcome.clone());
+                assert_eq!(
+                    &receipt_outcome,
+                    expected,
+                    "receipt recovery differed for {} schedule {ordinal}: {schedule:?}",
+                    feature.label()
+                );
+                assert_eq!(
+                    &turn_outcome,
+                    expected,
+                    "turn-only recovery differed for {} schedule {ordinal}: {schedule:?}",
+                    feature.label()
+                );
+                assert_eq!(
+                    turn_outcome,
+                    receipt_outcome,
+                    "protocols differed for {} schedule {ordinal}: {schedule:?}",
+                    feature.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projection_recovery_equivalence_oracle_real_store_subset() {
+        run_real_store_recovery_equivalence_oracle(1);
+    }
+
+    #[test]
+    #[ignore = "full seeded 8-feature × 25-schedule real-store recovery oracle"]
+    fn projection_recovery_equivalence_oracle_real_store_200_cases() {
+        run_real_store_recovery_equivalence_oracle(25);
+    }
+
     #[test]
     fn clean_actor_core_retains_one_manifested_save_until_projection_finishes() {
         let fixture = ActivationFixture::nested_unicode("clean-actor-save", 0xa175);
