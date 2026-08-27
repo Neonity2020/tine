@@ -192,8 +192,23 @@ try {
 
   const copied = await clickButtonByText(".guide-copy-btn", /^Copy the guide into your graph$/);
   check("clicked Copy the guide into your graph on Guide index", copied);
+  await sleep(250);
+  const immediateNotices = await browser.execute(() =>
+    [...document.querySelectorAll(".toast")]
+      .map((element) => (element.textContent || "").trim())
+      .filter(Boolean),
+  );
+  console.log(`Guide copy immediate notices: ${JSON.stringify(immediateNotices)}`);
 
   for (let i = 0; i < 30 && (!copiedSheetsFile() || !copiedIndexFile()); i += 1) await sleep(250);
+  if (!copiedSheetsFile() || !copiedIndexFile()) {
+    const notices = await browser.execute(() =>
+      [...document.querySelectorAll(".toast, .notification, [role='alert']")]
+        .map((element) => (element.textContent || "").trim())
+        .filter(Boolean),
+    );
+    console.error(`Guide copy notices: ${JSON.stringify(notices)}`);
+  }
   const copiedFile = copiedSheetsFile();
   const copiedIndex = copiedIndexFile();
   check("copy writes the whole guide namespace under graph pages", copiedGuidePageFiles().length >= 6, graphFiles().join("\n"));

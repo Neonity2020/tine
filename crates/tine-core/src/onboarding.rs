@@ -262,28 +262,30 @@ pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopy
     // Name-only creation needs one current parsed identity snapshot. App-open
     // graphs already have it; keep this public operation correct for cold callers.
     graph.with_pages(|_| ());
-    let mut created_pages = Vec::new();
-    let mut skipped_pages = Vec::new();
-    for planned in plan.pages {
-        if graph.create_markdown_page_if_absent(&planned.name, &planned.markdown)? {
-            created_pages.push(planned.name);
-        } else {
-            skipped_pages.push(planned.name);
+    graph.with_graph_text_write_transaction(move || {
+        let mut created_pages = Vec::new();
+        let mut skipped_pages = Vec::new();
+        for planned in plan.pages {
+            if graph.create_markdown_page_if_absent(&planned.name, &planned.markdown)? {
+                created_pages.push(planned.name);
+            } else {
+                skipped_pages.push(planned.name);
+            }
         }
-    }
-    let mut copied_assets = Vec::new();
-    for asset in plan.assets {
-        if graph.create_asset_if_absent(&asset.name, asset.bytes)? {
-            copied_assets.push(asset.name);
+        let mut copied_assets = Vec::new();
+        for asset in plan.assets {
+            if graph.create_asset_if_absent(&asset.name, asset.bytes)? {
+                copied_assets.push(asset.name);
+            }
         }
-    }
-    let created = !created_pages.is_empty() || !copied_assets.is_empty();
-    Ok(GuideCopyResult {
-        name: plan.viewed_name,
-        created,
-        created_pages,
-        skipped_pages,
-        copied_assets,
+        let created = !created_pages.is_empty() || !copied_assets.is_empty();
+        Ok(GuideCopyResult {
+            name: plan.viewed_name,
+            created,
+            created_pages,
+            skipped_pages,
+            copied_assets,
+        })
     })
 }
 
@@ -1335,6 +1337,26 @@ mod tests {
             out.contains("[[Martin]] #demo #sheets-demo"),
             "non-guide refs must stay verbatim: {out}"
         );
+    }
+
+    #[test]
+    fn copied_guide_pages_are_owned_for_native_watcher_echoes() {
+        let dir = scratch("tine-guide-watcher-receipts");
+        let graph = Graph::open(&dir);
+
+        let copied = copy_guide_into_graph(&graph, "Tine Guide").unwrap();
+
+        assert!(!copied.created_pages.is_empty());
+        for name in copied.created_pages {
+            let entry = graph
+                .find_entry(&name, PageKind::Page)
+                .unwrap_or_else(|| panic!("missing copied Guide page {name}"));
+            assert!(
+                graph.exact_graph_text_event_matches_tine_state(&entry.path),
+                "the native watcher must recognize Tine's own Guide publication for {name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

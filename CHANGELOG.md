@@ -34,6 +34,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Copying the in-app Guide no longer stops after its first page** (GH #391).
+  Guide pages now carry the same completed-write receipt as ordinary Direct
+  Files edits, so Tine's native watcher recognizes its own multi-page copy
+  instead of treating page one as an external change that blocks page two.
+
+- **Creating pages on Windows no longer lets a filesystem callback interrupt
+  the very Tine write that caused it** (GH #374). The earlier v0.6.97 repair
+  proved exact file-event echoes, but an ambiguous Windows callback could still
+  raise the graph-wide external-change frontier before waiting for the active
+  writer. Callback admission now serializes behind graph-text publication;
+  genuine ambiguous or external changes still go through the normal debounced
+  reconciliation before later creations are admitted.
+
 - **Rapid scrolling and zooming no longer make PDF pages compete for the UI
   thread or flash blank while sharpening.** The reader now has one
   viewport-prioritized full-page render scheduler, drops obsolete prefetch work,
