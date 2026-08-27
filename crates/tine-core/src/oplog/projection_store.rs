@@ -1080,16 +1080,25 @@ impl ProjectionReceiptStore {
     /// only to a store the caller has already proven authoritative; a fresh
     /// store has no claim to check and initializes exactly as today.
     pub(crate) fn precheck_authoritative_claim(root: &Path) -> Result<(), ProjectionStoreError> {
-        let capability = match Dir::open_ambient_dir(root, ambient_authority()) {
-            Ok(capability) => capability,
-            // No private store directory at all: nothing to refuse, and
-            // initialization owns the state.
+        // No private store directory at all: nothing to refuse, and
+        // initialization owns the state.
+        match std::fs::symlink_metadata(root) {
+            Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 return Err(ProjectionStoreError::from(StoreError::Io(error))
-                    .at("open private receipt store for claim precheck"))
+                    .at("inspect private receipt store for claim precheck"))
             }
-        };
+        }
+        // Android app-private storage cannot take the hostile-replacement open
+        // flags; it uses the same checked opener the rest of this module does.
+        #[cfg(target_os = "android")]
+        let capability = open_android_private_directory(root)?;
+        #[cfg(not(target_os = "android"))]
+        let capability = Dir::open_ambient_dir(root, ambient_authority()).map_err(|error| {
+            ProjectionStoreError::from(StoreError::Io(error))
+                .at("open private receipt store for claim precheck")
+        })?;
         let metadata = match capability.symlink_metadata(STORE_CLAIM_FILE) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == ErrorKind::NotFound => None,
