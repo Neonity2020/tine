@@ -1307,6 +1307,7 @@ pub(crate) async fn copy_guide_into_graph(
     title: String,
     state: GraphContext<'_>,
 ) -> Result<tine_core::onboarding::GuideCopyResult, String> {
+    // managed-command-routing: managed
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         copy_guide_into_bound_graph(&app, &label, binding_generation, title)

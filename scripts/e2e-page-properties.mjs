@@ -344,6 +344,21 @@ async function drivePageHeaderArrowDown(expectedValue) {
   throw new Error(`E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown ${JSON.stringify(attempts)}`);
 }
 
+async function dismissUnrelatedAutocomplete() {
+  // Replacing text inside [[Prompt-Test]] legitimately opens page-reference
+  // autocomplete (including the always-present "Create new page" row).  While
+  // that popup is open, ArrowDown belongs to the popup, not cross-block caret
+  // navigation.  The materialization timing varies with runner load, so close
+  // it explicitly before exercising the independent page-header seam contract.
+  const popup = await browser.$(".autocomplete");
+  if (!(await popup.isExisting())) return;
+  await browser.keys(["Escape"]);
+  await browser.waitUntil(async () => !(await browser.$(".autocomplete").isExisting()), {
+    timeout: 2_000,
+    timeoutMsg: "page-reference autocomplete did not close before page-header ArrowDown",
+  });
+}
+
 async function replaceHeaderLikeUser(editor, replacement, selection = null) {
   // WebdriverIO's setValue() first clears the textarea as a separate WebDriver
   // command. Clearing an existing header and blurring is a real delete action,
@@ -488,6 +503,7 @@ try {
   if ((await headerEditor.getValue()) !== editedHeader) {
     throw new Error(`native page-header replacement did not preserve the intended value: ${JSON.stringify({ replacementTrace, actual: await headerEditor.getValue() })}`);
   }
+  await dismissUnrelatedAutocomplete();
   await drivePageHeaderArrowDown(editedHeader);
   await browser.execute(() => {
     const editor = document.querySelector(".page-blocks textarea.block-editor");

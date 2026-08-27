@@ -346,6 +346,9 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
 #[cfg(test)]
 const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("sparse_application_handle", ManagedRouted),
+    // Extracted wrappers may declare the same route explicitly rather than
+    // duplicating sparse/legacy dispatch solely for this source-level proof.
+    ("managed-command-routing: managed", ManagedRouted),
     ("legacy_graph(", LegacyOnly),
     ("legacy_graph_cloned(", LegacyOnly),
     ("with_config_graph(", ConfigWrite),
