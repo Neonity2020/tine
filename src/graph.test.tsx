@@ -182,6 +182,21 @@ describe("mobile graph folder picker", () => {
     expect(harness.api.loadGraph).toHaveBeenCalledWith(META.root);
   });
 
+  it("opens the rebased iOS container path after an app update", async () => {
+    const stale = "/var/mobile/Containers/Data/Application/OLD/Documents/template-graph";
+    const harness = await loadHarness(null, undefined, true, true, "ios");
+    harness.api.prepareGraphFolder.mockResolvedValue({
+      status: "ready",
+      location: "local",
+      path: META.root,
+    } as PreparedGraphFolder);
+
+    await expect(harness.loadGraphPath(stale)).resolves.toEqual({ kind: "loaded", root: META.root });
+    expect(harness.api.prepareGraphFolder).toHaveBeenCalledWith(stale);
+    expect(harness.api.inspectGraphAccess).toHaveBeenCalledWith(META.root);
+    expect(harness.api.loadGraph).toHaveBeenCalledWith(META.root);
+  });
+
   it("shows a clear refusal when iOS returns an outside-container folder", async () => {
     const harness = await loadHarness(
       null,

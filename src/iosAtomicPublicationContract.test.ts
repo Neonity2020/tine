@@ -27,6 +27,8 @@ describe("iOS atomic publication platform boundary", () => {
   it("exercises Guide copy inside the iOS Simulator rather than only launching the app", () => {
     const workflow = readFileSync(".github/workflows/ios-probe.yml", "utf8");
     expect(workflow).toContain("--tine-ci-copy-guide");
-    expect(workflow).toContain('tine-guide___Tine Guide.md');
+    expect(workflow).toContain("GUIDE_PAGE");
+    expect(workflow).toContain("'*Tine Guide.md'");
+    expect(workflow).toContain("STALE_GRAPH");
   });
 });

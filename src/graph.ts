@@ -92,6 +92,7 @@ export async function loadGraphPath(
   } = {}
 ): Promise<LoadGraphPathOutcome> {
   const startedAt = performance.now();
+  let graphPath = path;
   const ownsTransition = !options.transitionHeld;
   if (graphTransitioning() && ownsTransition && !options.supersedeCurrent) {
     return { kind: "aborted" };
@@ -106,12 +107,7 @@ export async function loadGraphPath(
     await Promise.resolve();
   }
   try {
-  console.info(`[tine] frontend graph open: begin path=${path ? "explicit" : "default"}`);
-  // Whether we're switching to a *different* graph than last time. Only then do
-  // we drop the persisted right-sidebar items; reopening the same graph at
-  // startup keeps them (and we prune stale block refs below).
-  const prev = graphMeta()?.root || persistedGraphPath();
-  const switching = !!prev && !!path && prev !== path;
+  console.info(`[tine] frontend graph open: begin path=${graphPath ? "explicit" : "default"}`);
   // Persist the current graph's pending edits BEFORE opening another graph —
   // otherwise the debounced save would either fire against the new graph or be
   // dropped by resetStore. No-op on first load (nothing dirty). If something
@@ -119,16 +115,15 @@ export async function loadGraphPath(
   // discard that edit — gated on whether a graph is actually loaded now, NOT on
   // the persisted path (which is empty on a TINE_GRAPH/CLI launch).
   const hadGraph = !!graphMeta();
-  const rebindsPdfOwner = hadGraph && (switching || options.forceRefresh === true);
   const flushed = await flushAll();
   if (hadGraph && !flushed) {
     pushToast("Some pages couldn't be saved — resolve conflicts before switching graphs.", "error");
     return { kind: "aborted" };
   }
   if (hadGraph) await flushSession();
-  if (path && (await platformKind()) === "ios") {
+  if (graphPath && (await platformKind()) === "ios") {
     try {
-      const prepared = await backend().prepareGraphFolder(path);
+      const prepared = await backend().prepareGraphFolder(graphPath);
       if (prepared.status !== "ready") {
         pushToast(
           "TineOutline can only open folders inside On My iPhone or iCloud Drive → TineOutline.",
@@ -137,12 +132,22 @@ export async function loadGraphPath(
         );
         return { kind: "aborted" };
       }
+      // iOS may move an app's data container during an update. The native
+      // boundary rebases a remembered Documents-relative graph onto the
+      // current container and returns the path that Rust must actually open.
+      graphPath = prepared.path ?? graphPath;
     } catch (error) {
       pushToast(`Couldn't prepare the iCloud graph. (${String(error)})`, "error", { sticky: true });
       return { kind: "aborted" };
     }
   }
-  if (!(await authorizeGraphAccess(path))) return { kind: "aborted" };
+  // Whether we're switching to a *different* graph than last time. Compute
+  // this after iOS path rebasing so a container relocation is not mistaken for
+  // a distinct workspace.
+  const prev = graphMeta()?.root || persistedGraphPath();
+  const switching = !!prev && !!graphPath && prev !== graphPath;
+  const rebindsPdfOwner = hadGraph && (switching || options.forceRefresh === true);
+  if (!(await authorizeGraphAccess(graphPath))) return { kind: "aborted" };
   // This is the last await before the backend graph binding can change.  Flush
   // delayed view state plus complete highlight/area mutations under A; only a
   // successful drain permits us to invalidate that authority and unmount it.
@@ -163,7 +168,7 @@ export async function loadGraphPath(
   const clearedManagedRuntime = hadGraph && (switching || options.forceRefresh === true);
   if (clearedManagedRuntime) managedStorageRuntime.clear();
   try {
-    result = await backend().loadGraph(path);
+    result = await backend().loadGraph(graphPath);
   } catch (error) {
     if (continuation !== graphLoadContinuation) return { kind: "aborted" };
     // load_graph failed before installing a replacement binding.  Publish a new
@@ -211,9 +216,9 @@ export async function loadGraphPath(
   // not a startup toast; these just derive the inventories.
   void refreshJournalConflicts();
   void refreshSyncConflicts();
-  if (path) {
+  if (graphPath) {
     try {
-      localStorage.setItem(GRAPH_KEY, path);
+      localStorage.setItem(GRAPH_KEY, graphPath);
     } catch {
       // ignore
     }
@@ -618,6 +623,7 @@ export async function createNewGraph(): Promise<LoadGraphPathOutcome> {
         );
         return { kind: "aborted" };
       }
+      dir = prepared.path ?? dir;
     } catch (error) {
       pushToast(`Couldn't prepare the iCloud location. (${String(error)})`, "error", { sticky: true });
       return { kind: "aborted" };

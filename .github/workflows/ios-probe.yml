@@ -43,6 +43,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          cache-on-failure: true
 
       - uses: actions/setup-node@v4
         with:
@@ -148,13 +149,25 @@ jobs:
           xcrun simctl install "$DEVICE_UDID" "$APP_PATH"
           APP_DATA="$(xcrun simctl get_app_container "$DEVICE_UDID" page.tine.Tine data)"
           GRAPH="$APP_DATA/Documents/CI Smoke Graph"
+          STALE_GRAPH="$(python3 - "$GRAPH" <<'PY'
+          import re
+          import sys
+          print(re.sub(
+              r"(/Containers/Data/Application/)[^/]+(/Documents/)",
+              r"\g<1>00000000-0000-4000-8000-000000000000\g<2>",
+              sys.argv[1],
+              count=1,
+          ))
+          PY
+          )"
+          test "$STALE_GRAPH" != "$GRAPH"
           JOURNAL_FILE="$(date +%Y_%m_%d).md"
           mkdir -p "$GRAPH/pages" "$GRAPH/journals"
           printf '%s\n' '- Tine is running on the iOS Simulator.' '- This graph lives in On My iPhone → Tine.' > "$GRAPH/journals/$JOURNAL_FILE"
           printf '%s\n' '- The iOS local-container smoke graph is open and writable.' > "$GRAPH/pages/ci-ios-smoke.md"
 
           SIMCTL_CHILD_RUST_LOG=info xcrun simctl launch --terminate-running-process \
-            "$DEVICE_UDID" page.tine.Tine "$GRAPH" --tine-ci-copy-guide
+            "$DEVICE_UDID" page.tine.Tine "$STALE_GRAPH" --tine-ci-copy-guide
           sleep 30
 
           find "$GRAPH" -type f -print | sort > artifacts/ios-graph-files.txt
@@ -164,7 +177,9 @@ jobs:
 
           test -f "$APP_DATA/Documents/.tine-container"
           test -s "$GRAPH/journals/$JOURNAL_FILE"
-          test -s "$GRAPH/pages/tine-guide___Tine Guide.md"
+          GUIDE_PAGE="$(find "$GRAPH/pages" -maxdepth 1 -type f -name '*Tine Guide.md' -print -quit)"
+          test -n "$GUIDE_PAGE"
+          test -s "$GUIDE_PAGE"
           test -s artifacts/ios-smoke.png
           xcrun simctl terminate "$DEVICE_UDID" page.tine.Tine
 
