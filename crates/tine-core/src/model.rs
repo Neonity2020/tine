@@ -4672,6 +4672,60 @@ fn projection_recovery_after_bound_capture_hook(_path: &Path) -> io::Result<()> 
     Ok(())
 }
 
+/// Cut the W2 publication strictly BETWEEN the displacement rename and the
+/// staged replacement, producing the "displaced, not yet published" state
+/// (journal-universal durability design §4.2 row C4, §4.6).
+///
+/// The pre-existing `projection_recovery_after_bound_capture_hook` fires
+/// BEFORE `retire_projection_target`, so it cannot produce that state at all,
+/// and `projection_after_retire_collision_hook` fires only after the recovery
+/// object has been validated and its evidence published. This hook is the
+/// earliest cut after the live name has moved, so the C4 state is reachable
+/// with and without durable evidence for the displacement.
+///
+/// PRODUCTION ARMS NOTHING: the non-test definition is a constant `Ok(())`.
+#[cfg(test)]
+type ProjectionAfterDisplacementHook = Box<dyn FnOnce() -> io::Result<()> + Send + 'static>;
+
+#[cfg(test)]
+fn projection_after_displacement_hooks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, ProjectionAfterDisplacementHook>>
+{
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, ProjectionAfterDisplacementHook>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_after_displacement_hook_for_test(
+    path: PathBuf,
+    hook: impl FnOnce() -> io::Result<()> + Send + 'static,
+) {
+    let replaced = projection_after_displacement_hooks()
+        .lock()
+        .unwrap()
+        .insert(path, Box::new(hook));
+    assert!(
+        replaced.is_none(),
+        "projection after-displacement hook already armed"
+    );
+}
+
+#[cfg(test)]
+fn projection_after_displacement_hook(path: &Path) -> io::Result<()> {
+    let hook = projection_after_displacement_hooks()
+        .lock()
+        .unwrap()
+        .remove(path);
+    hook.map_or(Ok(()), |hook| hook())
+}
+
+#[cfg(not(test))]
+fn projection_after_displacement_hook(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 // Keep the test fault at the narrow core Result boundary rather than adding a
 // test-only control surface to tine-storage.  Keying it by the deterministic
 // ambient return path keeps parallel runtime fixtures independent.
@@ -4960,6 +5014,17 @@ fn managed_write_before_mutation_hook() -> io::Result<()> {
     Ok(())
 }
 
+/// The editor writer's displacement fault point (journal-universal durability
+/// design §4.6, W1 / §4.3 row F3).
+///
+/// It fires strictly between the displacement rename `T -> .editor-recovery`
+/// and the publication rename `staged -> T`, so arming it produces the state
+/// F3 names: `T` absent, the `.editor-recovery` claim holding the precondition.
+/// The design lists a hook here as packet-1 work; the hook already existed with
+/// exactly that placement and semantics, so packet 1 documents and tests it
+/// rather than adding a second one at the same cut.
+///
+/// PRODUCTION ARMS NOTHING: the non-test definition is a constant `Ok(())`.
 #[cfg(test)]
 fn managed_write_after_retire_hook() -> io::Result<()> {
     MANAGED_WRITE_AFTER_RETIRE.with(|hook| match hook.borrow_mut().take() {
@@ -17976,6 +18041,12 @@ impl Graph {
                             recovery_name = Some(retired.clone());
                             recovery_expected =
                                 Some((displaced.clone(), displaced_identity, captured));
+                            // §4.6: the earliest cut after the live name has
+                            // moved -- before the recovery object is revalidated
+                            // and before its forensic evidence is published.
+                            // `T` is absent, `recovery(i)` holds the exact
+                            // precondition, and nothing has been staged yet.
+                            projection_after_displacement_hook(&target_path.absolute_path)?;
                             validate_projection_recovery_object_exact(
                                 &parent,
                                 &retired,
@@ -52193,6 +52264,61 @@ mod tests {
         graph
             .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
             .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// §4.6 / §4.3 F3: the editor writer's displacement fault point produces
+    /// "displaced, not yet published" — the live name gone, the
+    /// `.editor-recovery` claim holding the exact precondition.
+    #[test]
+    fn the_editor_displacement_hook_observes_the_unpublished_displaced_state() {
+        let (root, path, graph, page) = gh254_loaded("editor-displacement-hook");
+        let parent = path.parent().unwrap().to_path_buf();
+        let observed: std::sync::Arc<std::sync::Mutex<Option<(bool, Vec<(String, Vec<u8>)>)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorder = std::sync::Arc::clone(&observed);
+        MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+            let path = path.clone();
+            let parent = parent.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let mut claims = fs::read_dir(&parent)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .filter(|name| name.ends_with(".editor-recovery"))
+                    .map(|name| {
+                        let bytes = fs::read(parent.join(&name)).unwrap();
+                        (name, bytes)
+                    })
+                    .collect::<Vec<_>>();
+                claims.sort();
+                *recorder.lock().unwrap() = Some((path.exists(), claims));
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected displacement cut",
+                ))
+            }));
+        });
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+
+        let (target_present, claims) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the editor displacement hook must fire");
+        assert!(
+            !target_present,
+            "the live name must already be gone at the displacement cut"
+        );
+        assert_eq!(claims.len(), 1, "exactly one editor-recovery claim");
+        assert_eq!(
+            claims[0].1,
+            b"- loaded\n".to_vec(),
+            "the claim holds the exact precondition bytes"
+        );
+        // In-process the writer still restores; the crash disposition is W4's,
+        // and lands with the producer conversion.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- loaded\n");
         let _ = fs::remove_dir_all(root);
     }
 

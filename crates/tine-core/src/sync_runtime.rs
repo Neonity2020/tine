@@ -40575,6 +40575,83 @@ mod tests {
         }
     }
 
+    /// One managed-local frame and one projection turn are the same authority
+    /// in two shapes (journal-universal durability design §3.2/§3.6). The drain
+    /// projects the foreground frame into the `ProjectionTurn` view so recovery
+    /// has one record shape to reason about, whichever physical segment carried
+    /// it. Nothing in production consumes the view yet.
+    #[test]
+    fn a_foreground_journal_frame_projects_into_the_same_projection_turn_view() {
+        let fixture = ActivationFixture::nested_unicode("frame-as-turn", 0xa1c1);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("turn-view fixture activates");
+        drive_initial_feed(&handle);
+        drain_managed_local(&handle);
+
+        let request = simple_application_move_request(&handle, "Turn View");
+        let (page, revision) = load_application_exact(&handle, &request.source_path);
+        let _ = save_application_block_text(&handle, page, revision, "turn-view single-block edit");
+
+        let lineage_digest = fixture.request.identities.lineage_digest;
+        let open_request = reopen_request(&fixture.request);
+        let frames = managed_local_journal_frames(&open_request);
+        let frame = frames
+            .last()
+            .expect("an accepted save leaves at least one retained frame");
+        let record = crate::oplog::decode_managed_local_record(frame).unwrap();
+        let turn = crate::oplog::local_journal_drain::projection_turn_from_managed_local_frame(
+            frame,
+            lineage_digest,
+        )
+        .expect("a managed-local frame projects into a turn");
+
+        assert_eq!(turn.domain, crate::oplog::SequenceDomain::ManagedLocal);
+        assert_eq!(turn.sequence, frame.sequence());
+        assert_eq!(turn.device_id, frame.device_id());
+        assert_eq!(turn.lineage_digest, lineage_digest);
+        assert_eq!(
+            turn.origin,
+            crate::oplog::TurnOrigin::LocalBatch {
+                batch_id: record.prepared_batch().manifest().batch_id()
+            }
+        );
+        assert_eq!(turn.pages.len(), record.projections().len());
+        for (page, projection) in turn.pages.iter().zip(record.projections()) {
+            assert_eq!(&page.path, projection.intent().path());
+            assert_eq!(page.page_id, projection.intent().page_id());
+            match (&page.target, projection.intent().target()) {
+                (
+                    crate::oplog::TurnTarget::Present { bytes, .. },
+                    crate::oplog::ManifestProjectionTarget::Present {
+                        bytes: expected, ..
+                    },
+                ) => assert_eq!(bytes.as_deref(), Some(expected.as_slice())),
+                (
+                    crate::oplog::TurnTarget::Absent,
+                    crate::oplog::ManifestProjectionTarget::Absent,
+                ) => {}
+                (turn_target, intent_target) => {
+                    panic!("target kinds differ: {turn_target:?} versus {intent_target:?}")
+                }
+            }
+        }
+
+        // The projected view is itself a canonical record.
+        let bytes = turn.encode().unwrap();
+        assert_eq!(
+            crate::oplog::ProjectionTurn::decode(&bytes, frame.device_id(), frame.sequence())
+                .unwrap(),
+            turn
+        );
+
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
     #[test]
     fn managed_save_and_move_stay_within_their_barrier_budget() {
         let session = crate::durability_counters::BarrierSession::begin();

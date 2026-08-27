@@ -5745,6 +5745,87 @@ mod tests {
         assert_eq!(fs::read(&displaced).unwrap(), base);
     }
 
+    /// §4.6 / §4.2 row C4: the W2 displacement fault point produces
+    /// "displaced, not yet published" — the live name gone, the derived
+    /// recovery name holding the exact precondition, and nothing staged.
+    ///
+    /// This cut did not exist before packet 1:
+    /// `projection_recovery_after_bound_capture_hook` fires BEFORE the
+    /// displacement rename, so it cannot reach this state at all.
+    #[test]
+    fn the_projection_displacement_hook_observes_the_unpublished_displaced_state() {
+        let fixture = Fixture::new_replacement("projection-after-displacement-hook");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let target_path = fixture.graph_root.join(fixture.intent.path().as_str());
+        let parent = target_path.parent().unwrap().to_path_buf();
+        let recovery_path = parent.join(reservation.recovery_filename());
+
+        type Observation = (bool, bool, Vec<u8>, usize);
+        let observed: std::sync::Arc<std::sync::Mutex<Option<Observation>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorder = std::sync::Arc::clone(&observed);
+        let observed_target = target_path.clone();
+        let observed_recovery = recovery_path.clone();
+        let observed_parent = parent.clone();
+        crate::model::set_projection_after_displacement_hook_for_test(
+            target_path.clone(),
+            move || {
+                let staged = fs::read_dir(&observed_parent)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(".projection.tmp")
+                    })
+                    .count();
+                *recorder.lock().unwrap() = Some((
+                    observed_target.exists(),
+                    observed_recovery.exists(),
+                    fs::read(&observed_recovery).unwrap_or_default(),
+                    staged,
+                ));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected displacement cut",
+                ))
+            },
+        );
+
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        let error = fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+        drop(authority);
+
+        let (target_present, recovery_present, recovery_bytes, staged) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the projection displacement hook must fire");
+        assert!(
+            !target_present,
+            "the live name must already be gone at the displacement cut"
+        );
+        assert!(recovery_present, "the displaced pre-image must be retained");
+        assert_eq!(recovery_bytes, b"- base\n".to_vec());
+        assert_eq!(staged, 0, "nothing is staged yet at this cut");
+        // In-process the writer still restores. The crash disposition belongs to
+        // the recovery walk and lands with the producer conversion.
+        assert_eq!(fs::read(&target_path).unwrap(), b"- base\n".to_vec());
+    }
+
     #[test]
     fn pre_evidence_publication_same_byte_rebind_never_gains_cleanup_authority() {
         let fixture = Fixture::new_replacement("pre-evidence-same-byte-rebind");
