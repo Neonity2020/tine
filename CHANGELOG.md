@@ -33,6 +33,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   stable geometry, so scrolling stays sequential and rendering remains local to
   the viewport.
 
+- **F-Droid can rebuild Tine's browser parser from source again** (GH #392).
+  The logbook code shared with the small WASM wrapper had started reaching into
+  a tine-core-only module, while Tine's own release path kept using the already
+  generated WASM bundle. The property recognizer is now one dependency-free
+  source module shared by both crates. Pull requests and full release CI now
+  rebuild the WASM bundle from clean source. A daily monitor also files or
+  updates an Inbox issue when F-Droid's public auto-update pipeline reports a
+  new failure.
+
 - **Unlinked References now opens when a matching source page contains 10,000
   or more blocks** (GH #388). Managed storage was applying the whole-page
   editor payload limit before constructing the already-bounded reference

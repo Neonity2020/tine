@@ -14,6 +14,7 @@
     "test": "vitest run && vitest run --config vitest.render.config.ts && node scripts/test-deploy-profile.mjs",
     "test:render": "vitest run --config vitest.render.config.ts",
     "build:wasm": "node scripts/build-wasm.mjs",
+    "test:fdroid-monitor": "node --test scripts/fdroid-upstream-monitor.test.mjs",
     "check:lsdoc-oracle": "node scripts/check-lsdoc-oracle-sync.mjs && node scripts/check-lsdoc-oracle-behavior.mjs",
     "check:storage-pin": "node scripts/check-storage-pin.mjs",
     "test:storage-pin": "node scripts/test-storage-pin.mjs",
