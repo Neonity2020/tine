@@ -155,15 +155,17 @@ jobs:
 
           SIMCTL_CHILD_RUST_LOG=info xcrun simctl launch --terminate-running-process \
             "$DEVICE_UDID" page.tine.Tine "$GRAPH" --tine-ci-copy-guide
-          sleep 20
+          sleep 30
+
+          find "$GRAPH" -type f -print | sort > artifacts/ios-graph-files.txt
+          xcrun simctl spawn "$DEVICE_UDID" log show --last 2m --style compact \
+            --predicate 'process == "Tine"' > artifacts/tine-simulator.log || true
+          xcrun simctl io "$DEVICE_UDID" screenshot --type=png artifacts/ios-smoke.png
 
           test -f "$APP_DATA/Documents/.tine-container"
           test -s "$GRAPH/journals/$JOURNAL_FILE"
           test -s "$GRAPH/pages/tine-guide___Tine Guide.md"
-          xcrun simctl io "$DEVICE_UDID" screenshot --type=png artifacts/ios-smoke.png
           test -s artifacts/ios-smoke.png
-          xcrun simctl spawn "$DEVICE_UDID" log show --last 2m --style compact \
-            --predicate 'process == "Tine"' > artifacts/tine-simulator.log || true
           xcrun simctl terminate "$DEVICE_UDID" page.tine.Tine
 
       - name: Upload iOS Simulator smoke proof
@@ -175,3 +177,4 @@ jobs:
           path: |
             artifacts/ios-smoke.png
             artifacts/tine-simulator.log
+            artifacts/ios-graph-files.txt
