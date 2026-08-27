@@ -31,7 +31,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a tine-core-only module, while Tine's own release path kept using the already
   generated WASM bundle. The property recognizer is now one dependency-free
   source module shared by both crates. Pull requests and full release CI now
-  rebuild the WASM bundle from clean source.
+  rebuild the WASM bundle from clean source. A daily monitor also files or
+  updates an Inbox issue when F-Droid's public auto-update pipeline reports a
+  new failure.
 
 - **Unlinked References now opens when a matching source page contains 10,000
   or more blocks** (GH #388). Managed storage was applying the whole-page

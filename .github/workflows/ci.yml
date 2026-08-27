@@ -80,6 +80,7 @@ jobs:
           node scripts/test-release-pipeline.mjs
           node scripts/test-tine-core-nextest-contract.mjs
           node scripts/test-env-toolchain-fallback.mjs
+          npm run test:fdroid-monitor
 
       # The E2E harness's own unit tests. `e2e-file-poll.test.mjs` sat in the E2E
       # contract catalog from the day it was written with no runner behind it.
@@ -179,6 +180,7 @@ jobs:
           node scripts/test-release-pipeline.mjs
           node scripts/test-tine-core-nextest-contract.mjs
           node scripts/test-env-toolchain-fallback.mjs
+          npm run test:fdroid-monitor
 
       - name: E2E harness contract tests
         run: npm run test:e2e-harness

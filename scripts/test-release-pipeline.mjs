@@ -37,6 +37,10 @@ const iosIconVerifier = fs.readFileSync(
   "utf8"
 );
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
+const fdroidMonitorWorkflow = fs.readFileSync(
+  path.join(process.cwd(), ".github/workflows/fdroid-upstream-monitor.yml"),
+  "utf8"
+);
 const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
 const flatpakWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/flatpak.yml"), "utf8");
@@ -511,6 +515,10 @@ assert.match(
   /test:[\s\S]*?name: Full CI \/ Linux tests and release contracts[\s\S]*?tool: wasm-pack@0\.15\.0[\s\S]*?name: F-Droid clean-source WASM rebuild is current[\s\S]*?npm run build:wasm[\s\S]*?git diff --exit-code -- src\/render\/wasm/,
   "full release CI does not prove the F-Droid WASM source rebuild"
 );
+assert.match(fdroidMonitorWorkflow, /schedule:[\s\S]*?cron: "17 6 \* \* \*"/);
+assert.match(fdroidMonitorWorkflow, /node scripts\/fdroid-upstream-monitor\.mjs/);
+assert.match(fdroidMonitorWorkflow, /steps\.fdroid\.outputs\.state == 'failed'/);
+assert.match(fdroidMonitorWorkflow, /labels: \[label, "bug"\]/);
 for (const name of REQUIRED_FULL_CI_JOBS) {
   if (/Full CI \/ Linux tine-core nextest shard [1-4]\/4/.test(name)) continue;
   assert.ok(ciWorkflow.includes(`name: ${name}`), `CI workflow is missing stable evidence job ${name}`);
