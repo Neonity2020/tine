@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Managed-storage projection recovery is prepared for cheaper durable
+  publication.** Every projection-only producer now records one durable,
+  description-only turn before graph mutation, while foreground saves replay
+  through the same turn-level executor. Existing projection receipts remain as
+  redundant recovery evidence, startup drains semantic edits before projection
+  turns, and a disposable per-page SQLite digest avoids rendering an unchanged
+  page merely to prove it needs no terminal repair. Durability-barrier budgets
+  remain 25 for a save and 74 for a cross-page move.
+
 - **Managed storage's private receipt-store format has been bumped**
   (development only). Projection records now carry an explicit target-kind
   discriminant, so a private store created by an earlier build is refused with a

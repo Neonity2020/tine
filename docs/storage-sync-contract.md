@@ -266,7 +266,8 @@ and manifest tail.
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v6 and versioned rows | derived receipts and diagnostics |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | receipt cleanup | receipt cleanup | bounded cleanup queue | disposable maintenance state |
-| configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests |
+| configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests; losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
+| application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
 | device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
 
@@ -1266,12 +1267,21 @@ reports states whose in-scope scenario is not disk corruption
 | unsafe segment name, unsupported durable replacement | the journal namespace holds an entry this platform cannot safely open | the existing unsafe-filesystem refusal |
 | I/O or capability failure | transient storage unavailability | retryable; asserts nothing about record integrity |
 
-**Current status.** The turn record, the projection-turn journal and this
-classification exist; **no production path writes or reads a turn yet**. That is
-an architectural fact, enforced by
-`oplog::projection_turn_journal::tests::no_production_path_opens_or_appends_a_projection_turn`,
-not by this sentence. The producer conversion updates this section in the same
-commit that lands it.
+**Current status.** Production uses this record shape universally. Foreground
+local authoring still appends its semantic managed-local frame and the drain
+views that frame as a turn; ingress-local, ingress-foreign, terminal-local,
+terminal-foreign and superseded-repair producers append description-only
+records to the projection-turn journal. The turn-level executor still publishes
+and recovers projection receipts as redundant evidence. No replay decision
+branches on whether a receipt-backed operation came from either turn domain.
+
+**Cold-open order is part of the write-safety contract.** After retained
+authority and archive/SQLite reconstruction, startup opens both local journals
+before terminal projection can mutate the graph. It drains the semantic
+managed-local domain first, then projection turns, recomputes terminal work,
+and probes each page for exact current bytes before appending a terminal turn.
+A journal that cannot open therefore refuses before terminal graph mutation;
+a completed-and-reclaimed terminal turn is not recreated on the next open.
 
 ### 2.10a Durability barriers by artifact class
 
