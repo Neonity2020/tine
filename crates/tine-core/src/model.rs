@@ -4697,27 +4697,44 @@ fn projection_after_displacement_hooks(
     HOOK.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// How many after-displacement hooks are currently armed.
+///
+/// The map has to be global, because a test arms the hook from its own thread
+/// while the projection may run on the runtime actor thread. But this hook sits
+/// on EVERY displacing projection publication, and taking a process-wide mutex
+/// there serializes an otherwise parallel test suite -- enough, measurably, to
+/// change which unrelated tests win their own races. The counter keeps the
+/// unarmed path lock-free, which is what it is 99.99% of the time.
+#[cfg(test)]
+static PROJECTION_AFTER_DISPLACEMENT_ARMED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 pub(crate) fn set_projection_after_displacement_hook_for_test(
     path: PathBuf,
     hook: impl FnOnce() -> io::Result<()> + Send + 'static,
 ) {
-    let replaced = projection_after_displacement_hooks()
-        .lock()
-        .unwrap()
-        .insert(path, Box::new(hook));
+    let mut armed = projection_after_displacement_hooks().lock().unwrap();
+    let replaced = armed.insert(path, Box::new(hook));
     assert!(
         replaced.is_none(),
         "projection after-displacement hook already armed"
     );
+    PROJECTION_AFTER_DISPLACEMENT_ARMED.store(armed.len(), std::sync::atomic::Ordering::Release);
 }
 
 #[cfg(test)]
 fn projection_after_displacement_hook(path: &Path) -> io::Result<()> {
-    let hook = projection_after_displacement_hooks()
-        .lock()
-        .unwrap()
-        .remove(path);
+    if PROJECTION_AFTER_DISPLACEMENT_ARMED.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    let hook = {
+        let mut armed = projection_after_displacement_hooks().lock().unwrap();
+        let hook = armed.remove(path);
+        PROJECTION_AFTER_DISPLACEMENT_ARMED
+            .store(armed.len(), std::sync::atomic::Ordering::Release);
+        hook
+    };
     hook.map_or(Ok(()), |hook| hook())
 }
 
