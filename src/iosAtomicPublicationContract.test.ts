@@ -23,4 +23,19 @@ describe("iOS atomic publication platform boundary", () => {
     );
     expect(platformGate).toContain('target_os = "ios"');
   });
+
+  it("exercises Guide copy inside the iOS Simulator rather than only launching the app", () => {
+    const workflow = readFileSync(".github/workflows/ios-probe.yml", "utf8");
+    expect(workflow).toContain("--tine-ci-copy-guide");
+    expect(workflow).toContain("GUIDE_PAGE");
+    expect(workflow).toContain("'*Tine Guide.md'");
+    expect(workflow).toContain("STALE_GRAPH");
+  });
+
+  it("carries an iOS-rebased graph path across the Rust mobile-plugin bridge", () => {
+    const bridge = readFileSync("src-tauri/src/ios_folder_picker.rs", "utf8");
+    expect(bridge).toMatch(
+      /struct PrepareGraphFolderResult\s*\{[\s\S]*?path:\s*Option<String>/
+    );
+  });
 });

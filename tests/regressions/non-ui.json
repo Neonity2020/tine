@@ -425,12 +425,37 @@
    "coverage": {
     "tests": [
      "src/iosAtomicPublicationContract.test.ts",
-     "crates/tine-core/src/onboarding.rs"
+     "crates/tine-core/src/onboarding.rs",
+     ".github/workflows/ios-probe.yml"
     ],
     "scenario": "ios.guide-copy-atomic-publication",
     "failBefore": "proven"
    },
-   "notes": "A physical iPhone running the first public TestFlight beta reached the bundled Guide but Copy the guide into your graph failed because model.rs selected renameatx_np(RENAME_EXCL) only for macOS and compiled iOS into the unsupported fallback. The correction applies the Darwin primitive to iOS across graph projection, managed no-clobber moves, enrollment publication, and cleanup-marker rotation; the contract test fails if a macOS-only atomic-publication branch returns."
+   "notes": "A physical iPhone running the first public TestFlight beta reached the bundled Guide but Copy the guide into your graph failed because model.rs selected renameatx_np(RENAME_EXCL) only for macOS and compiled iOS into the unsupported fallback. The correction applies the Darwin primitive to iOS across graph projection, managed no-clobber moves, enrollment publication, and cleanup-marker rotation. The contract test fails if a macOS-only atomic-publication branch returns, while the manual iOS probe invokes the real bound-graph Guide-copy backend inside the Simulator and requires the copied index page to exist."
+  },
+  {
+   "id": "REG-IOS-CONTAINER-PATH-REBASE-001",
+   "title": "An iOS app update reopens a remembered local graph after the sandbox container UUID changes",
+   "family": "platform-compatibility",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "physical TestFlight update report 2026-08-27"
+   },
+   "platforms": [
+    "ios"
+   ],
+   "layer": "ios-native-bridge",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/graph.test.tsx",
+     ".github/workflows/ios-probe.yml"
+    ],
+    "scenario": "ios.remembered-local-graph-rebases-across-container-relocation",
+    "failBefore": "proven"
+   },
+   "notes": "The first TestFlight update retained an absolute Documents path containing the old app-container UUID. The current installation correctly refused that outside-container path, but startup rendered the generic superseded/cancelled recovery screen until all app data was cleared. The iOS bridge now recognizes only the exact local app-container path shape, rebases its Documents-relative suffix onto the current container when that directory exists, and returns the effective path that both Rust and frontend persistence adopt. The simulator launches with a deliberately stale UUID and must open the current graph and copy the bundled Guide into it."
   },
   {
    "id": "REG-IOS-APP-ICON-OPAQUE-001",

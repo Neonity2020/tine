@@ -1275,6 +1275,33 @@ pub(crate) fn guide_pages() -> Result<Vec<tine_core::onboarding::GuidePage>, Str
     tine_core::onboarding::bundled_guide_pages().map_err(|error| error.to_string())
 }
 
+pub(crate) fn copy_guide_into_bound_graph(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    title: String,
+) -> Result<tine_core::onboarding::GuideCopyResult, String> {
+    let state = app.state::<AppState>();
+    let slot = slot_for_bound_window(&state, label, Some(binding_generation))?;
+    match sparse_application_handle(&slot)? {
+        Some(handle) => match handle
+            .copy_application_guide(title)
+            .map_err(|error| error.to_string())?
+        {
+            SyncApplicationGuideCopyOutcome::Copied { result } => Ok(result),
+            SyncApplicationGuideCopyOutcome::Deferred { .. } => Err(
+                "Tine-managed storage is updating pages. Try copying the guide again when it finishes."
+                    .into(),
+            ),
+        },
+        None => {
+            let graph = slot.legacy_graph()?;
+            tine_core::onboarding::copy_guide_into_graph(&graph, &title)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn copy_guide_into_graph(
     title: String,
@@ -1282,25 +1309,7 @@ pub(crate) async fn copy_guide_into_graph(
 ) -> Result<tine_core::onboarding::GuideCopyResult, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        match sparse_application_handle(&slot)? {
-            Some(handle) => match handle
-                .copy_application_guide(title)
-                .map_err(|error| error.to_string())?
-            {
-                SyncApplicationGuideCopyOutcome::Copied { result } => Ok(result),
-                SyncApplicationGuideCopyOutcome::Deferred { .. } => Err(
-                    "Tine-managed storage is updating pages. Try copying the guide again when it finishes."
-                        .into(),
-                ),
-            },
-            None => {
-                let graph = slot.legacy_graph()?;
-                tine_core::onboarding::copy_guide_into_graph(&graph, &title)
-                    .map_err(|error| error.to_string())
-            }
-        }
+        copy_guide_into_bound_graph(&app, &label, binding_generation, title)
     })
     .await
     .map_err(|error| error.to_string())?

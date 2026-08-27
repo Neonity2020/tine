@@ -29,6 +29,7 @@ pub mod oplog;
 pub mod org;
 mod outline;
 pub mod pdf;
+mod property_line;
 pub mod publish;
 pub mod query;
 pub mod query_plan;

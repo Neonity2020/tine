@@ -450,6 +450,37 @@ pub(crate) async fn load_graph(
         return Err("graph window closed while storage was opening".into());
     }
 
+    // The iOS Simulator probe exercises the same bound-graph helper as the
+    // Guide button.  Keeping the hook simulator-only prevents a hidden launch
+    // argument from becoming product behavior on physical devices.
+    #[cfg(all(target_os = "ios", target_abi = "sim"))]
+    if std::env::args().any(|argument| argument == "--tine-ci-copy-guide") {
+        let binding_generation = match &result {
+            LoadGraphResult::Loaded {
+                binding_generation, ..
+            }
+            | LoadGraphResult::AlreadyCurrent {
+                binding_generation, ..
+            } => Some(*binding_generation),
+            LoadGraphResult::FocusedExisting { .. } => None,
+        }
+        .ok_or_else(|| "iOS Guide-copy probe did not retain the requested graph".to_string())?;
+        let worker_app = app.clone();
+        let worker_label = label.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::commands::copy_guide_into_bound_graph(
+                &worker_app,
+                &worker_label,
+                binding_generation,
+                "Tine Guide".to_string(),
+            )
+        })
+        .await
+        .map_err(|error| format!("iOS Guide-copy probe worker failed: {error}"))?
+        .map_err(|error| format!("iOS Guide-copy probe failed: {error}"))?;
+        crate::debug::diag("iOS Guide-copy probe completed".to_string());
+    }
+
     Ok(result)
 }
 

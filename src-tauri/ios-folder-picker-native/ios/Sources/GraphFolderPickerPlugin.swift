@@ -72,6 +72,37 @@ final class GraphFolderPickerPlugin: Plugin, UIDocumentPickerDelegate {
     return selectedPath == containerPath || selectedPath.hasPrefix(containerPath + "/")
   }
 
+  /// App updates may preserve Documents while changing the absolute sandbox
+  /// UUID. Recover only paths that have the exact iOS app-container shape and
+  /// whose Documents-relative target already exists in this installation.
+  private static func rebaseStaleLocalContainerPath(
+    _ selected: URL,
+    into documents: URL
+  ) -> URL? {
+    let components = selected.standardizedFileURL.pathComponents
+    guard components.count >= 6 else { return nil }
+
+    for index in 0...(components.count - 6) {
+      guard components[index] == "Containers",
+            components[index + 1] == "Data",
+            components[index + 2] == "Application",
+            UUID(uuidString: components[index + 3]) != nil,
+            components[index + 4] == "Documents" else { continue }
+
+      let relative = components.dropFirst(index + 5)
+      guard !relative.isEmpty else { return documents }
+      let candidate = relative.reduce(documents) { partial, component in
+        partial.appendingPathComponent(component, isDirectory: true)
+      }.standardizedFileURL.resolvingSymlinksInPath()
+      guard isInside(candidate, container: documents) else { return nil }
+      var isDirectory: ObjCBool = false
+      guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+            isDirectory.boolValue else { return nil }
+      return candidate
+    }
+    return nil
+  }
+
   private static func downloadUbiquitousContents(at root: URL) throws {
     let fileManager = FileManager.default
     if fileManager.isUbiquitousItem(at: root) {
@@ -174,13 +205,17 @@ final class GraphFolderPickerPlugin: Plugin, UIDocumentPickerDelegate {
             )
           }
           if Self.isInside(selected, container: local) {
-            invoke.resolve(["status": "ready", "location": "local"])
+            invoke.resolve(["status": "ready", "location": "local", "path": selected.path])
+            return
+          }
+          if let rebased = Self.rebaseStaleLocalContainerPath(selected, into: local) {
+            invoke.resolve(["status": "ready", "location": "local", "path": rebased.path])
             return
           }
           if let iCloud = try Self.prepareICloudDocumentsContainer(),
              Self.isInside(selected, container: iCloud) {
             try Self.downloadUbiquitousContents(at: selected)
-            invoke.resolve(["status": "ready", "location": "icloud"])
+            invoke.resolve(["status": "ready", "location": "icloud", "path": selected.path])
             return
           }
           invoke.resolve(["status": "refused"])

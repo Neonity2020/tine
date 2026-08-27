@@ -327,12 +327,12 @@ fn leading_properties_end(lines: &[&str], format: LogbookFormat) -> usize {
 }
 
 /// Whether a line is a Markdown block property — routed through the one shared
-/// recognizer (`doc::parse_property_line`, transcribed from lsdoc). The local
-/// copy had drifted: it rejected dotted keys (`logseq.order-list-type::`), so a
-/// logbook entry could be inserted ABOVE a property the read path treats as a
-/// block property (DUP-7).
+/// recognizer (`property_line::parse_property_line`, transcribed from lsdoc).
+/// The local copy had drifted: it rejected dotted keys
+/// (`logseq.order-list-type::`), so a logbook entry could be inserted ABOVE a
+/// property the read path treats as a block property (DUP-7).
 fn is_md_property_line(line: &str) -> bool {
-    crate::doc::parse_property_line(line).is_some()
+    crate::property_line::parse_property_line(line).is_some()
 }
 
 fn logbook_bounds<T: AsRef<str>>(lines: &[T]) -> Option<(usize, usize)> {

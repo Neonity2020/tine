@@ -9,6 +9,8 @@ use wasm_bindgen::prelude::*;
 
 #[path = "../../tine-core/src/logbook.rs"]
 mod logbook;
+#[path = "../../tine-core/src/property_line.rs"]
+mod property_line;
 #[path = "../../lsdoc-block-parse.rs"]
 mod lsdoc_block_parse;
 

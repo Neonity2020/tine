@@ -9632,6 +9632,11 @@ html.row-reorder-dragging * {
 
 .pdf-page {
   position: relative;
+  /* The scroll surface is a flex column. Canvas eviction must not let empty
+     offscreen wrappers flex-shrink: their stable footprint is the scroll
+     geometry, and collapsing it makes one wheel step skip many pages while
+     also causing the observer to render distant pages. */
+  flex: 0 0 auto;
   margin-inline: auto;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
   background: var(--pdf-page-bg);

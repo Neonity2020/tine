@@ -495,6 +495,22 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-pdf-scroll-resources.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A long PDF keeps stable page geometry as offscreen canvases are evicted, gentle scrolling visits consecutive pages, and opening it renders only a bounded neighborhood instead of the whole document.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Page dimensions, cache policy, prefetch distance, and the number of simultaneously visible pages may evolve while scroll order and bounded rendering remain intact."
+   ],
+   "nonRequirements": [
+    "Exact pixels, canvas count, process memory, frame duration, PDF contents, DOM nesting, or scrollbar styling."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-pdf-ownership.mjs": {
    "contracts": [
     {

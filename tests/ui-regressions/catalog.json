@@ -8467,6 +8467,29 @@
     "failBefore": "proven"
    },
    "notes": "The shared touch recognizer emitted a synthetic contextmenu, but the mobile text-selection policy rejected it because tests exercised desktop policy. Reference group headers and quick-switch page rows also lacked the recognizer. Synthetic Tine-owned holds are now distinguished from native selection events, and the same long-press contract is attached across the reported page-link surfaces without changing quick taps, scrolling, desktop right-click, or middle/modified clicks."
+  },
+  {
+   "id": "UI-PDF-LONG-SCROLL-GEOMETRY-20260827",
+   "title": "Long PDFs retain page geometry through canvas eviction so scrolling stays sequential and only nearby pages render",
+   "family": "pdf-render-lifecycle",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/PdfViewer.test.tsx::keeps page geometry stable when offscreen PDF canvases are evicted",
+     "scripts/e2e-pdf-scroll-resources.mjs"
+    ],
+    "scenario": "pdf.long-document-scroll-resources",
+    "failBefore": "proven"
+   },
+   "notes": "Martin's 2026-08-27 report reproduced in the real Tauri/WebKit app with a 34-page document. .pdf-scroll is a flex column, but .pdf-page retained the default flex-shrink value. Once the LRU removed an offscreen canvas, empty wrappers collapsed, scrollHeight fell from roughly 25,900 to 9,500 px, all 34 pages appeared intersecting, and gentle wheel steps jumped by about ten pages while every canvas rendered. Giving each wrapper a non-shrinking flex basis preserves the cheap placeholder geometry: the generated fail-before journey now opens with 2 canvases, keeps all page wrappers at least 682 px high and a 23,748 px scroll range, and advances sequentially. The supplied user PDF remains an external diagnostic fixture and is not committed."
   }
  ]
 }

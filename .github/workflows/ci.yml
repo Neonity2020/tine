@@ -61,6 +61,15 @@ jobs:
 
       - run: npm ci
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+
+      - name: F-Droid clean-source WASM rebuild is current
+        run: |
+          npm run build:wasm
+          git diff --exit-code -- src/render/wasm
+
       - name: Release and offline-source contract fixtures
         run: |
           node scripts/test-storage-pin.mjs
@@ -71,6 +80,7 @@ jobs:
           node scripts/test-release-pipeline.mjs
           node scripts/test-tine-core-nextest-contract.mjs
           node scripts/test-env-toolchain-fallback.mjs
+          npm run test:fdroid-monitor
 
       # The E2E harness's own unit tests. `e2e-file-poll.test.mjs` sat in the E2E
       # contract catalog from the day it was written with no runner behind it.
@@ -145,6 +155,15 @@ jobs:
 
       - run: npm ci
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+
+      - name: F-Droid clean-source WASM rebuild is current
+        run: |
+          npm run build:wasm
+          git diff --exit-code -- src/render/wasm
+
       - name: Flatpak offline npm sources are current
         run: node scripts/check-flatpak-node-sources.mjs
 
@@ -161,6 +180,7 @@ jobs:
           node scripts/test-release-pipeline.mjs
           node scripts/test-tine-core-nextest-contract.mjs
           node scripts/test-env-toolchain-fallback.mjs
+          npm run test:fdroid-monitor
 
       - name: E2E harness contract tests
         run: npm run test:e2e-harness
