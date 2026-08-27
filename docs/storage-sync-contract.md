@@ -264,6 +264,7 @@ and manifest tail.
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
+| `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and clean open | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v6 and versioned rows | derived receipts and diagnostics |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | receipt cleanup | receipt cleanup | bounded cleanup queue | disposable maintenance state |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests; losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
@@ -694,10 +695,11 @@ target are never repaired by this route; they remain external reconciliation or
 refusal. Once any manifest head exists for a path it also supersedes lazy
 genesis as predecessor authority, so an exact-byte mismatch cannot fall through
 to a baseline capsule (and a post-activation page can never be looked up there).
-The clean runtime has no completed-path index: a receiver-local completion that
-belongs to a superseded source batch remains durable historical receipt evidence
-but is not required to replay as the later merged point authority merely to
-perform a nonexistent index update.
+The clean runtime has no persistent projection-head or completed-*path* index.
+It does retain the intent-keyed own-endpoint completion index in §3.2b; a
+receiver-local completion that belongs to a superseded source batch remains
+durable historical receipt evidence and does not update that local half merely
+to replay as a later merged point authority.
 
 File synchronizers deliver the visible Markdown/Org projection and the hidden
 provider history independently. Before classifying concurrent semantic edits,
@@ -1282,6 +1284,62 @@ managed-local domain first, then projection turns, recomputes terminal work,
 and probes each page for exact current bytes before appending a terminal turn.
 A journal that cannot open therefore refuses before terminal graph mutation;
 a completed-and-reclaimed terminal turn is not recreated on the next open.
+
+### 3.2b Own-endpoint completion index and `DeferredAbsence`
+
+Every successful own-endpoint manifested projection passes through the common
+executor. Immediately after its receipt completion is published, that seam
+stages one local-completion value in the engine: exact `ProjectionIntentId`,
+page id, path, `attempted | completed` state, `Present | Absent` target kind,
+and post-frontier. The intent id binds page, path, frontier, precondition and
+target; lookup is never by bare path. A completion by page P at X therefore
+cannot suppress a later creation by page Q at X.
+
+The engine coalesces staged entries into immutable generation-named objects at
+`archive/operations/sweeps/local-completion-index-v1/`. A flush installs one
+delta, and every `N = max(256, 2 × pages-at-compaction)` deltas the same staged
+publication also installs a full-map compaction. Compaction retains the latest
+entry for each current live `(page, path)` and every exact intent still named by
+an uncheckpointed foreground frame or unretired projection continuation;
+superseded objects are pruned under the workspace lease. Packet C-2 does not
+merge receiver receipt history into pruning: receiver completions remain
+receiver-only evidence. Before a later merged map can expose that history,
+its pruning rule must additionally retain a maximal local entry above receiver
+history for the same key.
+
+Open performs one names-only enumeration. A compaction records the count and
+set digest of covered delta filenames; a current horizon reads that compaction
+plus only newer delta names. Extra names are behind-truth and are read as the
+delta. A torn or invalid summary chain rebuilds from valid retained delta
+objects, so this disposable cache adds no durable refusal.
+
+The coalesced O-C5 flush points are actor idle, clean shutdown, lease release,
+and the earlier of 60 seconds after the first buffered entry or 64 projecting
+turns. The first-entry deadline participates in the actor's receive timeout,
+including an otherwise quiet graph. Cold-open repair flushes synchronously at
+the repair-to-assembly boundary; every error exit after executing a projection
+uses an engine-plus-lease scope guard to attempt the same flush before unlock.
+`stop_without_clean_drain`, last-handle drop, and a failed guarded flush are
+crash-equivalent releases, not clean flush points.
+
+For an own-endpoint `Present` replay whose file is absent, a captured Present
+base proves update-shaped work and an exact matching completed intent proves a
+previously executed creation. Either case returns `DeferredAbsence`: finished
+without mutation, continuation retired, no completion/index entry written, and
+the Present terminal head left untouched. Foreground archive publication,
+engine admission, SQLite projection, checkpointing, and ordinary startup or
+differs-scan reconciliation continue; C-2 deliberately authors no sweep record.
+Absent-precondition work with no exact matching entry creates as before.
+
+O-C5 accepts two bounded residuals. A crash after own-endpoint execution but
+before its coalesced flush can lose at most the 60-second/64-turn suffix, so a
+later replay may recreate that user's own just-accepted save; current-state
+authorization prevents stale or foreign bytes from using this route. Once a
+receiver/local merged map exists, a crash-lost local Absent entry can instead
+make older receiver Present evidence win conservatively and route a later
+foreign recreation through deletion disposition. That second residual is not
+observable in C-2 because receiver evidence is not yet consulted by this local
+half, but the merged-map packet must preserve and document it.
 
 ### 2.10a Durability barriers by artifact class
 

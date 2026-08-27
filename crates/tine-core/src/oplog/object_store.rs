@@ -1654,6 +1654,36 @@ impl ObjectStore {
         self.capability.try_clone()
     }
 
+    /// Duplicate the retained archive capability for a lease-owned private
+    /// derived namespace. The caller never reopens `root_path`, so an archive
+    /// rename cannot redirect completion-index reads or writes.
+    pub(crate) fn private_derived_root_capability(&self) -> std::io::Result<Dir> {
+        self.capability.try_clone()
+    }
+
+    /// Install one coalesced group of immutable private derived objects with
+    /// the archive batch protocol: data first, final names second, and one
+    /// directory barrier for the shared namespace.
+    pub(crate) fn publish_coalesced_private_derived(
+        &self,
+        namespace: &Dir,
+        artifacts: &[(&str, &[u8], u64)],
+        collision_kind: &'static str,
+    ) -> Result<(), StoreError> {
+        let mut publication = ArchiveBatchPublication::new(&self.capability)?;
+        let namespace_index = publication.namespace(namespace)?;
+        for (name, bytes, limit) in artifacts {
+            publication.stage(
+                namespace_index,
+                name,
+                bytes,
+                *limit,
+                Collision::Exact(collision_kind),
+            )?;
+        }
+        publication.commit()
+    }
+
     /// Duplicate this store directly from its retained no-follow archive-root
     /// capability.
     ///

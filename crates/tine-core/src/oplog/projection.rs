@@ -1980,6 +1980,60 @@ pub(crate) fn projection_turn_pages_for_foreign_sources(
         .collect()
 }
 
+/// Exact local-half identities still referenced by an unretired projection
+/// continuation. Projection turns carry every semantic identity input even in
+/// the description-only domain, so this needs no graph or archive read.
+pub(crate) fn local_completion_intent_ids_for_turn(
+    turn: &ProjectionTurn,
+) -> Result<Vec<super::ProjectionIntentId>, ProjectionError> {
+    if matches!(
+        turn.origin,
+        TurnOrigin::IngressForeign { .. } | TurnOrigin::TerminalForeign { .. }
+    ) {
+        return Ok(Vec::new());
+    }
+    turn.pages
+        .iter()
+        .map(|page| {
+            let precondition = match &page.precondition {
+                TurnPrecondition::Absent => ProjectionPrecondition::Absent,
+                TurnPrecondition::Base { description, .. } => {
+                    ProjectionPrecondition::Base(*description)
+                }
+            };
+            let (target_kind, target, annotations) = match &page.target {
+                TurnTarget::Absent => (
+                    super::ProjectionTargetKind::Absent,
+                    super::BlobDescription::of(&[]),
+                    Vec::new(),
+                ),
+                TurnTarget::Present {
+                    description,
+                    annotations,
+                    ..
+                } => (
+                    super::ProjectionTargetKind::Present,
+                    *description,
+                    annotations.clone(),
+                ),
+            };
+            ProjectionIntent::new(
+                turn.workspace_id,
+                page.page_id,
+                page.path.clone(),
+                page.frontier.clone(),
+                page.claim_evidence.clone(),
+                precondition,
+                target_kind,
+                target,
+                annotations,
+            )?
+            .id()
+            .map_err(Into::into)
+        })
+        .collect()
+}
+
 /// Step-7's pre-append probe, using the same current-state authorization and
 /// renderer as replay. It is deliberately independent of receipt completion:
 /// a reclaimed completed turn must still deduplicate on the user's exact file.
@@ -2588,6 +2642,26 @@ fn execute_manifested_projection_work_located(
     let expected_base = decoded.annotated_base();
     let guarded_layout = decoded.guarded_layout();
     let local_attempt_intent = decoded.receiver_local_intent().clone();
+    // Own-endpoint replay-absence decision. A captured Present precondition is
+    // direct shape evidence that the file existed when this work was authored.
+    // An Absent precondition is creation-shaped and defers only when the exact
+    // intent already completed in the local half. Run before receipt intent
+    // publication so an idempotent defer authors no incomplete receipt.
+    let observed_before_intent = projection_phase!(
+        "read_replay_absence_input",
+        graph
+            .read_projection_input(work.path())
+            .map_err(ProjectionError::Io)
+    )?;
+    if target.is_some()
+        && observed_before_intent.is_none()
+        && (expected_base.is_some()
+            || engine
+                .local_projection_completed(local_attempt_intent.id()?)
+                .map_err(ProjectionError::Engine)?)
+    {
+        return Ok(ProjectionExecution::DeferredAbsence);
+    }
     if let Some(target) = target {
         let claim_source = projection_phase!(
             "uuid_claim_source",
@@ -2655,6 +2729,9 @@ fn execute_manifested_projection_work_located(
     )?
     .is_some()
     {
+        engine
+            .stage_local_projection_completion(&local_attempt_intent)
+            .map_err(ProjectionError::Engine)?;
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent, handoff)?;
         return Ok(ProjectionExecution::NeedsTurnRebarrier);
     }
@@ -2875,6 +2952,9 @@ fn execute_manifested_projection_work_located(
         "publish_completion",
         receipts.publish_completion(authority, &local_attempt_intent, &proof)
     )?;
+    engine
+        .stage_local_projection_completion(&local_attempt_intent)
+        .map_err(ProjectionError::Engine)?;
     projection_phase!(
         "retire_completed_recovery",
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent, handoff)
@@ -2893,6 +2973,10 @@ fn execute_manifested_projection_work_located(
 enum ProjectionExecution {
     BarrierTaken,
     NeedsTurnRebarrier,
+    /// Finished without mutation: the continuation retires, no completion is
+    /// authored, and the ordinary differs scan observes the untouched Present
+    /// terminal head against disk absence.
+    DeferredAbsence,
 }
 
 /// Publish intent/base evidence, invoke the singular guarded graph writer, and

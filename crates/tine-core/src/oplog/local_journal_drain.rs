@@ -692,6 +692,26 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     for projection in record.projections() {
         let intent = projection.intent();
         let exact_target = intent.target().bytes();
+        let completed_creation =
+            if exact_target.is_some() && projection.precondition_base().is_none() {
+                let intent_id = match projection
+                    .completion_intent()
+                    .and_then(|intent| intent.id())
+                {
+                    Ok(intent_id) => intent_id,
+                    Err(error) => {
+                        return conflict(ManagedLocalDrainStage::Authenticate, error.to_string())
+                    }
+                };
+                match engine.local_projection_completed(intent_id) {
+                    Ok(completed) => completed,
+                    Err(error) => {
+                        return recovery(ManagedLocalDrainStage::Authenticate, error.to_string())
+                    }
+                }
+            } else {
+                false
+            };
         let superseded = match graph.read_projection_input(intent.path()) {
             Ok(Some(current)) => {
                 let current_matches_target = exact_target.is_some_and(|target| current == target);
@@ -731,13 +751,18 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                     );
                 }
             }
-            Ok(None) if exact_target.is_none() || projection.precondition_base().is_none() => false,
+            Ok(None) if exact_target.is_none() => false,
             Ok(None) if graph.has_interrupted_publication_claimant(intent.path()) => {
                 return conflict(
                     ManagedLocalDrainStage::Authenticate,
                     "an unresolved publication artifact still claims the absent journal target",
                 )
             }
+            // A creation-shaped foreground projection has no captured base.
+            // Only the exact intent's completed local-half entry can prove it
+            // ran before the file disappeared; otherwise this is its first
+            // projection and must create as before.
+            Ok(None) if projection.precondition_base().is_none() => completed_creation,
             // W4 has already reconciled publication artifacts before any
             // journal replay. A claimant-free absence is therefore a real
             // external deletion, not a torn W1 window. Accept this older batch

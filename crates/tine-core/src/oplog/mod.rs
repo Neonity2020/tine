@@ -33,6 +33,7 @@ pub mod import;
 mod import_integration_tests;
 pub(crate) mod lazy_genesis;
 pub(crate) mod local_active;
+pub(crate) mod local_completion_index;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_journal_drain;
 #[allow(dead_code)] // mixed live/runtime and retained format-decoder surface

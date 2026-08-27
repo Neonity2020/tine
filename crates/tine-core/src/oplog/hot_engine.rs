@@ -31,6 +31,9 @@ use super::lazy_genesis::{
     LazyGenesisCandidate, LazyGenesisFrontierBindingV1, LazyGenesisPageInput,
     LazyGenesisProviderIndexV1,
 };
+#[cfg(test)]
+use super::local_completion_index::{LocalCompletionFlushStats, LocalCompletionOpenStats};
+use super::local_completion_index::{LocalCompletionIndex, LocalCompletionPruningContext};
 use super::object_store::{
     BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
     CompletedDetachedBootstrapPublication, ControlDirectoryIdentity,
@@ -7212,6 +7215,43 @@ impl ManagedLocalProjection {
     pub const fn render_base(&self) -> Option<&AnnotatedProjectionBase> {
         self.render_base.as_ref()
     }
+
+    /// Reconstruct the exact receipt/local-half identity carried by this
+    /// manifested projection. Every identity input is already authenticated by
+    /// the managed-local record; no graph or SQLite read participates.
+    pub(crate) fn completion_intent(&self) -> Result<ProjectionIntent, super::ReceiptError> {
+        let (target_kind, target, annotations) = match self.intent.target() {
+            ManifestProjectionTarget::Absent => (
+                ProjectionTargetKind::Absent,
+                BlobDescription::of(&[]),
+                Vec::new(),
+            ),
+            ManifestProjectionTarget::Present {
+                description,
+                annotations,
+                ..
+            } => (
+                ProjectionTargetKind::Present,
+                *description,
+                annotations.clone(),
+            ),
+        };
+        ProjectionIntent::new(
+            self.intent.workspace_id(),
+            self.intent.page_id(),
+            self.intent.path().clone(),
+            self.intent.post_frontier().clone(),
+            self.intent.claim_evidence().to_vec(),
+            self.precondition_base
+                .as_ref()
+                .map_or(ProjectionPrecondition::Absent, |base| {
+                    ProjectionPrecondition::Base(base.description())
+                }),
+            target_kind,
+            target,
+            annotations,
+        )
+    }
 }
 
 /// Canonically decoded managed-local record for replay and later expansion.
@@ -8440,6 +8480,10 @@ pub struct ShardedHotEngine {
     transient_effective_views: BTreeMap<BatchId, AuthenticatedEffectiveSemanticView>,
     transient_effective_view_order: VecDeque<BatchId>,
     archive_store: Option<Arc<ObjectStore>>,
+    /// Device-local own-endpoint projection completion evidence. The archive
+    /// chain is durable; this engine-owned value also owns the coalescing
+    /// buffer from cold repair through actor shutdown.
+    local_completion_index: Option<LocalCompletionIndex>,
     projection_endpoint: Option<ProjectionEndpointBinding>,
     projection_receipt_store_id: Option<super::ProjectionReceiptStoreId>,
     /// Latest source-endpoint projection row per exact path for the clean
@@ -8695,6 +8739,7 @@ impl ShardedHotEngine {
             transient_effective_views: BTreeMap::new(),
             transient_effective_view_order: VecDeque::new(),
             archive_store: None,
+            local_completion_index: None,
             projection_endpoint: None,
             projection_receipt_store_id: None,
             clean_projection_heads: BTreeMap::new(),
@@ -9808,6 +9853,146 @@ impl ShardedHotEngine {
     /// lifetime namespace.
     pub(crate) fn archive_store_capability(&self) -> Option<Arc<ObjectStore>> {
         self.archive_store.as_ref().map(Arc::clone)
+    }
+
+    /// Open the device-local own-endpoint completion chain while the caller
+    /// holds the workspace lease. This is separate from endpoint attachment so
+    /// generic archive reconstruction remains read-only before lease acquire.
+    pub(crate) fn open_local_completion_index(
+        &mut self,
+        store: &ObjectStore,
+    ) -> Result<(), EngineError> {
+        let endpoint = self.projection_endpoint.ok_or_else(|| {
+            EngineError::ProjectionWork(
+                "local completion index requires an attached projection endpoint".into(),
+            )
+        })?;
+        if self.local_completion_index.is_some()
+            || store.workspace_id() != self.workspace_id
+            || self.archive_store.as_deref().map(ObjectStore::workspace_id)
+                != Some(store.workspace_id())
+        {
+            return Err(EngineError::ProjectionWork(
+                "local completion index can only attach once to the retained workspace archive"
+                    .into(),
+            ));
+        }
+        self.local_completion_index = Some(
+            LocalCompletionIndex::open(store, endpoint.endpoint_id())
+                .map_err(|error| EngineError::Archive(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn local_projection_completed(
+        &self,
+        intent_id: ProjectionIntentId,
+    ) -> Result<bool, EngineError> {
+        self.local_completion_index
+            .as_ref()
+            .map(|index| index.contains_completed(intent_id))
+            .ok_or_else(|| EngineError::ProjectionWork("local completion index is not open".into()))
+    }
+
+    pub(crate) fn stage_local_projection_completion(
+        &mut self,
+        intent: &ProjectionIntent,
+    ) -> Result<bool, EngineError> {
+        self.local_completion_index
+            .as_mut()
+            .ok_or_else(|| {
+                EngineError::ProjectionWork("local completion index is not open".into())
+            })?
+            .stage_completed(intent)
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    pub(crate) fn local_completion_flush_due(&self, now: Instant) -> bool {
+        self.local_completion_index
+            .as_ref()
+            .is_some_and(|index| index.cap_due() || index.deadline_due(now))
+    }
+
+    pub(crate) fn local_completion_deadline_remaining(
+        &self,
+        now: Instant,
+    ) -> Option<std::time::Duration> {
+        self.local_completion_index
+            .as_ref()
+            .and_then(|index| index.deadline_remaining(now))
+    }
+
+    pub(crate) fn has_buffered_local_completions(&self) -> bool {
+        self.local_completion_index
+            .as_ref()
+            .is_some_and(LocalCompletionIndex::has_buffered)
+    }
+
+    pub(crate) fn flush_local_projection_completions(
+        &mut self,
+        retained_intents: BTreeSet<ProjectionIntentId>,
+    ) -> Result<bool, EngineError> {
+        if !self.has_buffered_local_completions() {
+            return Ok(false);
+        }
+        let observed = self
+            .local_completion_index
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::ProjectionWork("local completion index is not open".into())
+            })?
+            .observed_page_paths();
+        let mut live_page_paths = BTreeSet::new();
+        let mut live_pages = BTreeSet::new();
+        for (page_id, path) in observed {
+            match self.materialize_page(page_id) {
+                Ok(page) if page.path == path => {
+                    live_pages.insert(page_id);
+                    live_page_paths.insert((page_id, path));
+                }
+                Ok(_) | Err(EngineError::PageDeleted(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let pruning = LocalCompletionPruningContext {
+            live_page_paths,
+            retained_intents,
+        };
+        self.local_completion_index
+            .as_mut()
+            .expect("the local completion index was checked above")
+            .flush(live_pages.len(), &pruning)
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_completion_open_stats_for_test(&self) -> Option<LocalCompletionOpenStats> {
+        self.local_completion_index
+            .as_ref()
+            .map(|index| index.open_stats().clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_completion_flush_stats_for_test(
+        &self,
+    ) -> Option<LocalCompletionFlushStats> {
+        self.local_completion_index
+            .as_ref()
+            .map(|index| index.flush_stats().clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_local_completion_buffer_for_test(&mut self, age: std::time::Duration) {
+        if let Some(index) = self.local_completion_index.as_mut() {
+            index.age_buffer_for_test(age);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_completion_entry_count_for_test(&self) -> usize {
+        self.local_completion_index
+            .as_ref()
+            .map_or(0, LocalCompletionIndex::entry_count_for_test)
     }
 
     fn document_state_error(

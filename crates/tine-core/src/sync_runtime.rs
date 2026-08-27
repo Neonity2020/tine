@@ -5803,6 +5803,31 @@ fn clean_operation_archive_directory(archive_root: &Path) -> PathBuf {
     archive_root.join(CLEAN_OPERATION_ARCHIVE_DIRECTORY)
 }
 
+fn retained_local_completion_intents(
+    managed: &ManagedLocalRuntimeState,
+    turns: &ProjectionTurnJournalState,
+) -> Result<BTreeSet<crate::oplog::ProjectionIntentId>, String> {
+    let mut retained = BTreeSet::new();
+    for frame in &managed.frames {
+        let record = crate::oplog::decode_managed_local_record(frame).map_err(display)?;
+        for projection in record.projections() {
+            retained.insert(
+                projection
+                    .completion_intent()
+                    .and_then(|intent| intent.id())
+                    .map_err(display)?,
+            );
+        }
+    }
+    for turn in turns.undrained_turns().map_err(display)? {
+        retained.extend(
+            crate::oplog::projection::local_completion_intent_ids_for_turn(&turn)
+                .map_err(display)?,
+        );
+    }
+    Ok(retained)
+}
+
 /// Complete the managed-local queue during cold open, before any
 /// projection-only turn is considered. This is the semantic queue: draining it
 /// first ensures current accepted state includes every durable foreground frame
@@ -6154,6 +6179,9 @@ fn activate_clean_runtime_resources_retaining_archive(
         projection,
     )
     .map_err(|(_, error)| display(error))?;
+    engine
+        .open_local_completion_index(&store)
+        .map_err(display)?;
     let mut runtime = CleanLocalRuntime::from_open_parts(
         request.identities.session_id,
         endpoint,
@@ -6195,6 +6223,54 @@ fn open_clean_runtime_resources(
     request: &SyncRuntimeOpenRequest,
 ) -> Result<Option<CleanRuntimeResources>, String> {
     open_clean_runtime_resources_with_progress(request, &mut |_| {})
+}
+
+/// Own the engine and its lease together throughout cold repair. Drop flushes
+/// the post-execution buffer before `CleanLocalRuntime` releases its SQLite
+/// workspace lease, closing every `?` error exit without relying on local drop
+/// order.
+struct ColdOpenLocalCompletionGuard {
+    runtime: Option<CleanLocalRuntime>,
+    retained_intents: BTreeSet<crate::oplog::ProjectionIntentId>,
+}
+
+impl ColdOpenLocalCompletionGuard {
+    fn new(runtime: CleanLocalRuntime) -> Self {
+        Self {
+            runtime: Some(runtime),
+            retained_intents: BTreeSet::new(),
+        }
+    }
+
+    fn runtime_mut(&mut self) -> &mut CleanLocalRuntime {
+        self.runtime
+            .as_mut()
+            .expect("cold-open completion guard retains its runtime")
+    }
+
+    fn retain(&mut self, intents: BTreeSet<crate::oplog::ProjectionIntentId>) {
+        self.retained_intents.extend(intents);
+    }
+
+    fn finish(mut self) -> Result<CleanLocalRuntime, String> {
+        let retained = self.retained_intents.clone();
+        self.runtime_mut()
+            .flush_local_projection_completions(retained)
+            .map_err(display)?;
+        Ok(self
+            .runtime
+            .take()
+            .expect("finished cold-open completion guard retains its runtime"))
+    }
+}
+
+impl Drop for ColdOpenLocalCompletionGuard {
+    fn drop(&mut self) {
+        let retained = self.retained_intents.clone();
+        if let Some(runtime) = self.runtime.as_mut() {
+            let _ = runtime.flush_local_projection_completions(retained);
+        }
+    }
 }
 
 fn open_clean_runtime_resources_with_progress(
@@ -6312,20 +6388,24 @@ fn open_clean_runtime_resources_with_progress(
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
         .map_err(display)?;
+    engine
+        .open_local_completion_index(&store)
+        .map_err(display)?;
     let endpoint = engine
         .projection_endpoint_binding()
         .ok_or_else(|| "clean runtime has no projection endpoint".to_owned())?;
-    let mut runtime =
+    let runtime =
         CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
             .map_err(display)?;
     let binding = ActorRuntimeBinding::from_clean(identities, endpoint, &receipts);
+    let mut completion_guard = ColdOpenLocalCompletionGuard::new(runtime);
     // §4.7 steps 5-6: both journals become available before terminal work can
     // mutate the graph; the semantic managed-local queue drains first.
     let mut managed_local = open_clean_foreground_journal(
         &request.application_runtime_root,
         &binding,
         &graph,
-        &mut runtime,
+        completion_guard.runtime_mut(),
     )?;
     let mut projection_turns = open_projection_turn_journal(
         &request.application_runtime_root,
@@ -6335,18 +6415,34 @@ fn open_clean_runtime_resources_with_progress(
         binding.device_id().as_uuid(),
     )
     .map_err(display)?;
-    let recovered_provider_batches =
-        drain_open_managed_local_journal(&graph, &receipts, &mut runtime, &mut managed_local)?;
-    drain_open_projection_turn_journal(&graph, &receipts, &mut runtime, &mut projection_turns)?;
+    completion_guard.retain(retained_local_completion_intents(
+        &managed_local,
+        &projection_turns,
+    )?);
+    let recovered_provider_batches = drain_open_managed_local_journal(
+        &graph,
+        &receipts,
+        completion_guard.runtime_mut(),
+        &mut managed_local,
+    )?;
+    drain_open_projection_turn_journal(
+        &graph,
+        &receipts,
+        completion_guard.runtime_mut(),
+        &mut projection_turns,
+    )?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeProjectionRepair,
     });
     append_and_replay_terminal_projection_turns(
         &graph,
         &receipts,
-        &mut runtime,
+        completion_guard.runtime_mut(),
         &mut projection_turns,
     )?;
+    // Repair -> actor assembly boundary: the pre-actor window ends with zero
+    // buffered entries, independent of how long actor construction takes.
+    let runtime = completion_guard.finish()?;
     Ok(Some(CleanRuntimeResources {
         graph,
         receipts,
@@ -8906,18 +9002,27 @@ fn run_actor_loop(
     }
 
     loop {
-        let request = match receiver.recv_timeout(MANAGED_LOCAL_IDLE_TICK) {
+        let timeout = actor
+            .local_completion_deadline_remaining(Instant::now())
+            .map_or(MANAGED_LOCAL_IDLE_TICK, |remaining| {
+                MANAGED_LOCAL_IDLE_TICK.min(remaining)
+            });
+        let request = match receiver.recv_timeout(timeout) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if actor
                     .managed_local
                     .as_ref()
                     .is_some_and(|managed| managed.pending_count() != 0)
+                    || actor.local_completion_flush_due(Instant::now())
                 {
                     let tick = actor.tick();
                     actor.last_tick = Some(tick);
-                    *shared_status.write().unwrap() = actor.snapshot();
                 }
+                if let Err(error) = actor.flush_local_completions_if_required() {
+                    actor.terminal = Some(error);
+                }
+                *shared_status.write().unwrap() = actor.snapshot();
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -9266,6 +9371,9 @@ fn run_actor_loop(
                 }
             },
         };
+        if let Err(error) = actor.flush_local_completions_if_required() {
+            actor.terminal = Some(error);
+        }
         *shared_status.write().unwrap() = actor.snapshot();
         if should_stop {
             break;
@@ -11472,6 +11580,71 @@ impl RuntimeActor {
             return Ok(clean.runtime.engine());
         }
         Err(SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    fn local_completion_deadline_remaining(&self, now: Instant) -> Option<Duration> {
+        self.clean.as_ref().and_then(|clean| {
+            clean
+                .runtime
+                .engine()
+                .local_completion_deadline_remaining(now)
+        })
+    }
+
+    fn local_completion_flush_due(&self, now: Instant) -> bool {
+        self.clean
+            .as_ref()
+            .is_some_and(|clean| clean.runtime.engine().local_completion_flush_due(now))
+    }
+
+    fn local_completion_idle(&self) -> bool {
+        self.clean.as_ref().is_some_and(|clean| {
+            clean.pending.is_none()
+                && clean.full_scan.is_none()
+                && clean.completed_full_scan.is_none()
+                && !clean.watcher.pending()
+        }) && self
+            .managed_local
+            .as_ref()
+            .is_none_or(|managed| managed.pending_commit.is_none() && managed.frames.is_empty())
+            && self
+                .projection_turns
+                .as_ref()
+                .is_none_or(|turns| turns.pending_count() == 0)
+            && !self.provider_has_work()
+    }
+
+    fn flush_local_completions(&mut self) -> Result<bool, String> {
+        if !self
+            .clean
+            .as_ref()
+            .is_some_and(|clean| clean.runtime.engine().has_buffered_local_completions())
+        {
+            return Ok(false);
+        }
+        let retained = retained_local_completion_intents(
+            self.managed_local
+                .as_ref()
+                .ok_or_else(|| "clean actor has no managed-local journal".to_owned())?,
+            self.projection_turns
+                .as_ref()
+                .ok_or_else(|| "clean actor has no projection-turn journal".to_owned())?,
+        )?;
+        self.clean
+            .as_mut()
+            .ok_or_else(|| "clean actor has no local runtime".to_owned())?
+            .runtime
+            .flush_local_projection_completions(retained)
+            .map_err(display)
+    }
+
+    fn flush_local_completions_if_required(&mut self) -> Result<bool, String> {
+        let now = Instant::now();
+        if self.local_completion_flush_due(now) || self.local_completion_idle() {
+            self.flush_local_completions()
+        } else {
+            Ok(false)
+        }
     }
 
     fn active_database(&self) -> Result<&crate::oplog::SqliteFrontier, SyncRuntimeRequestError> {
@@ -20968,6 +21141,11 @@ impl RuntimeActor {
                     managed.pending_commit.is_none() && managed.frames.is_empty()
                 }) && !self.provider_has_work();
                 if settled {
+                    self.flush_local_completions().map_err(|error| {
+                        SyncRuntimeRequestError::ActorRefused(format!(
+                            "clean shutdown could not flush local projection completions: {error}"
+                        ))
+                    })?;
                     self.stopped_safe = true;
                     return Ok(SyncShutdownOutcome::Safe(self.snapshot()));
                 }
@@ -29443,6 +29621,294 @@ mod tests {
             "a later open resurrected the accepted foreground bytes"
         );
         assert!(!fixture.graph_root.join("Root.md").exists());
+    }
+
+    #[test]
+    fn local_creation_completion_defers_closed_window_deletion_and_commits_it_durably() {
+        let fixture = ActivationFixture::nested_unicode("local-completion-cold-defer", 0xc2001);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("C-2 activation opens");
+        drive_initial_feed(&handle);
+
+        let page_id = PageId::from_uuid(Uuid::from_u128(0xc2002));
+        let path = ManagedPath::parse("Local completion creation.md").unwrap();
+        let batch_id = submit_durable(
+            &handle,
+            vec![SemanticOperation::CreatePage {
+                page_id,
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xc2003)),
+                name: LogicalPageName::parse("Local completion creation").unwrap(),
+                path: path.clone(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        drain_until_settled(&handle);
+        assert!(fixture.graph_root.join(path.as_str()).is_file());
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        fs::remove_file(fixture.graph_root.join(path.as_str())).unwrap();
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        let ticks = drain_until_settled(&reopened);
+        assert!(
+            !fixture.graph_root.join(path.as_str()).exists(),
+            "the creation-shaped terminal row recreated an externally deleted file; ticks={ticks:?}"
+        );
+        assert!(matches!(
+            reopened
+                .query(SyncRuntimeQueryRequest::ResolvePage {
+                    path: path.as_str().into(),
+                    name: "Local completion creation".into(),
+                    page_kind: SyncPageKind::Page,
+                })
+                .unwrap(),
+            SyncRuntimeQueryReply::Page(None)
+        ));
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let second = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        drain_until_settled(&second);
+        assert!(matches!(
+            second
+                .query(SyncRuntimeQueryRequest::ResolvePage {
+                    path: path.as_str().into(),
+                    name: "Local completion creation".into(),
+                    page_kind: SyncPageKind::Page,
+                })
+                .unwrap(),
+            SyncRuntimeQueryReply::Page(None)
+        ));
+        let archive = ObjectStore::open(
+            &clean_operation_archive_directory(&fixture.request.archive_root),
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        assert!(matches!(
+            archive.inspect_batch(batch_id).unwrap(),
+            crate::oplog::BatchInspection::Ready(_)
+        ));
+        assert!(matches!(
+            second.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn cold_replay_error_exit_flushes_completion_before_lease_release() {
+        let fixture = ActivationFixture::nested_unicode("local-completion-cold-guard", 0xc2008);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let mut resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let page_id = PageId::from_uuid(Uuid::from_u128(0xc2009));
+        let path = ManagedPath::parse("Cold replay completion.md").unwrap();
+        let transaction = OperationTransaction::new(vec![SemanticOperation::CreatePage {
+            page_id,
+            home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xc200a)),
+            name: LogicalPageName::parse("Cold replay completion").unwrap(),
+            path: path.clone(),
+            kind: ManagedTextKind::Page,
+        }])
+        .unwrap();
+
+        fail_once_at(OperationalFaultPoint::BeforeProjection);
+        let result = {
+            let mut session = resources
+                .runtime
+                .admit_clean_mutation(&resources.graph)
+                .unwrap();
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                &resources.graph,
+                &resources.receipts,
+                &transaction,
+            )
+        };
+        assert!(matches!(
+            result,
+            Ok(crate::oplog::operational_coordinator::CleanLocalMutationState::DurablePending(_))
+        ));
+        drop(result);
+        drop(resources);
+
+        let cut = crate::oplog::projection::cut_turn_replay_after_pages_for_test(1);
+        let interrupted = open_clean_runtime_resources(&reopen_request(&fixture.request));
+        drop(cut);
+        let error = match interrupted {
+            Err(error) => error,
+            Ok(_) => panic!("cold replay did not stop after executing its page"),
+        };
+        assert!(error.contains("deterministic cut during production turn replay"));
+        assert!(fixture.graph_root.join(path.as_str()).is_file());
+
+        fs::remove_file(fixture.graph_root.join(path.as_str())).unwrap();
+        let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .expect("the exact cold-replay completion must defer its absent target");
+        assert_eq!(reopened.projection_turns.pending_count(), 0);
+        assert!(
+            !fixture.graph_root.join(path.as_str()).exists(),
+            "the scope-guarded completion was not durable before lease release"
+        );
+        drop(reopened);
+    }
+
+    #[test]
+    fn an_older_same_path_completion_cannot_defer_a_new_creation_intent() {
+        let fixture = ActivationFixture::nested_unicode("local-completion-exact-id", 0xc200d);
+        let path = ManagedPath::parse("Reused completion path.md").unwrap();
+        let first_page = PageId::from_uuid(Uuid::from_u128(0xc200e));
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let first = activated.handle.expect("C-2 activation opens");
+        drive_initial_feed(&first);
+        submit_durable(
+            &first,
+            vec![SemanticOperation::CreatePage {
+                page_id: first_page,
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xc200f)),
+                name: LogicalPageName::parse("First completion owner").unwrap(),
+                path: path.clone(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        drain_until_settled(&first);
+        assert!(matches!(
+            first.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let deleting = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        submit_durable(
+            &deleting,
+            vec![SemanticOperation::DeletePage {
+                page_id: first_page,
+            }],
+        );
+        drain_until_settled(&deleting);
+        assert!(!fixture.graph_root.join(path.as_str()).exists());
+        assert!(matches!(
+            deleting.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let second_page = PageId::from_uuid(Uuid::from_u128(0xc2013));
+        let creating = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        submit_durable(
+            &creating,
+            vec![SemanticOperation::CreatePage {
+                page_id: second_page,
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xc2014)),
+                name: LogicalPageName::parse("Second completion owner").unwrap(),
+                path: path.clone(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        let ticks = drain_until_settled(&creating);
+        assert!(
+            fixture.graph_root.join(path.as_str()).is_file(),
+            "a path-keyed stale completion deferred a distinct creation intent: {ticks:?}"
+        );
+        assert!(matches!(
+            creating.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn one_quiet_local_completion_flushes_through_the_actor_deadline_tick() {
+        let fixture = ActivationFixture::nested_unicode("local-completion-deadline", 0xc2010);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        )
+        .unwrap();
+        for _ in 0..128 {
+            if matches!(actor.tick(), SyncRuntimeTick::Idle) && !actor.last_watcher.pending {
+                break;
+            }
+        }
+
+        let outcome = actor.submit_local_mutation(
+            OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xc2011)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xc2012)),
+                name: LogicalPageName::parse("One quiet completion").unwrap(),
+                path: ManagedPath::parse("One quiet completion.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }])
+            .unwrap(),
+        );
+        assert!(matches!(
+            outcome,
+            SyncLocalMutationOutcome::Durable { .. }
+                | SyncLocalMutationOutcome::RetryableRetainedRecovery { .. }
+        ));
+        for _ in 0..128 {
+            if actor
+                .managed_local
+                .as_ref()
+                .is_some_and(|managed| managed.pending_count() == 0)
+            {
+                break;
+            }
+            actor.tick();
+        }
+        let engine = actor.clean.as_ref().unwrap().runtime.engine();
+        assert_eq!(engine.local_completion_entry_count_for_test(), 1);
+        assert!(engine.has_buffered_local_completions());
+
+        {
+            let graph = &actor.graph;
+            let clean = actor.clean.as_mut().unwrap();
+            let mut session = clean.runtime.admit_clean_mutation(graph).unwrap();
+            let (_, engine, _) = session.parts().unwrap();
+            engine.age_local_completion_buffer_for_test(
+                crate::oplog::local_completion_index::LOCAL_COMPLETION_FLUSH_AFTER,
+            );
+        }
+        assert_eq!(
+            actor.local_completion_deadline_remaining(Instant::now()),
+            Some(Duration::ZERO)
+        );
+        assert!(actor.local_completion_flush_due(Instant::now()));
+        assert!(actor.flush_local_completions_if_required().unwrap());
+        let engine = actor.clean.as_ref().unwrap().runtime.engine();
+        assert!(!engine.has_buffered_local_completions());
+        assert_eq!(
+            engine
+                .local_completion_flush_stats_for_test()
+                .unwrap()
+                .flushes,
+            1
+        );
+
+        let source = include_str!("sync_runtime.rs");
+        let loop_source = source
+            .split_once("fn run_actor_loop(")
+            .unwrap()
+            .1
+            .split_once("enum PendingLocalMutation")
+            .unwrap()
+            .0;
+        assert!(
+            loop_source
+                .find("local_completion_deadline_remaining")
+                .unwrap()
+                < loop_source.find("receiver.recv_timeout(timeout)").unwrap()
+        );
+        assert!(loop_source.contains("local_completion_flush_due(Instant::now())"));
     }
 
     #[test]
@@ -42298,6 +42764,99 @@ mod tests {
             session.counts().report()
         );
         crate::durability_counters::BarrierSession::detach_current_thread();
+    }
+
+    /// Measured C-2 freshness gate. The fixture copies the supplied corpus
+    /// before activation; the local completion objects are written only below
+    /// that disposable fixture.
+    #[test]
+    #[ignore = "manual gate: local-completion open cost on an anonymized corpus copy"]
+    fn local_completion_open_reads_only_the_summary_and_new_delta_on_a_real_copy() {
+        let source = real_graph_copy_source_from_env("TINE_MS_AUDIT_GRAPH_COPY");
+        let fixture = ActivationFixture::copied_graph("c2-open-cost", 0xc20c0, &source);
+        let (pages, _, _) = activation_source_counts(&fixture.graph_root);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("the C-2 map-cost fixture activates");
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let store = ObjectStore::open(
+            &clean_operation_archive_directory(&fixture.request.archive_root),
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        let first = crate::oplog::ProjectionIntent::new(
+            fixture.request.identities.workspace_id,
+            PageId::from_uuid(Uuid::from_u128(0xc20c1)),
+            ManagedPath::parse("C2 map cost first.md").unwrap(),
+            crate::oplog::FrontierV2::default(),
+            Vec::new(),
+            crate::oplog::ProjectionPrecondition::Absent,
+            crate::oplog::ProjectionTargetKind::Present,
+            BlobDescription::of(b"first map cost target"),
+            Vec::new(),
+        )
+        .unwrap();
+        let second = crate::oplog::ProjectionIntent::new(
+            fixture.request.identities.workspace_id,
+            PageId::from_uuid(Uuid::from_u128(0xc20c2)),
+            ManagedPath::parse("C2 map cost second.md").unwrap(),
+            crate::oplog::FrontierV2::default(),
+            Vec::new(),
+            crate::oplog::ProjectionPrecondition::Absent,
+            crate::oplog::ProjectionTargetKind::Present,
+            BlobDescription::of(b"second map cost target"),
+            Vec::new(),
+        )
+        .unwrap();
+        let live = crate::oplog::local_completion_index::LocalCompletionPruningContext {
+            live_page_paths: [
+                (first.page_id(), first.path().clone()),
+                (second.page_id(), second.path().clone()),
+            ]
+            .into_iter()
+            .collect(),
+            retained_intents: BTreeSet::new(),
+        };
+
+        let mut index = crate::oplog::local_completion_index::LocalCompletionIndex::open(
+            &store,
+            fixture.request.identities.endpoint_id,
+        )
+        .unwrap();
+        index.force_compaction_threshold_for_test(1);
+        index.stage_completed(&first).unwrap();
+        assert!(index.flush(pages, &live).unwrap());
+        drop(index);
+
+        let mut index = crate::oplog::local_completion_index::LocalCompletionIndex::open(
+            &store,
+            fixture.request.identities.endpoint_id,
+        )
+        .unwrap();
+        index.stage_completed(&second).unwrap();
+        assert!(index.flush(pages, &live).unwrap());
+        drop(index);
+
+        let index = crate::oplog::local_completion_index::LocalCompletionIndex::open(
+            &store,
+            fixture.request.identities.endpoint_id,
+        )
+        .unwrap();
+        let stats = index.open_stats();
+        eprintln!(
+            "local_completion_open_cost corpus_pages={pages} names={} content_reads={} new_delta_names=1 rebuilt={}",
+            stats.names_observed, stats.content_reads, stats.rebuilt
+        );
+        assert_eq!(stats.names_observed, 3);
+        assert_eq!(stats.content_reads, 2);
+        assert!(!stats.rebuilt);
     }
 
     /// The anonymized-corpus acceptance gate for the 2026-08-26 chain-flush cut
