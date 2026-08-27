@@ -13,7 +13,6 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
@@ -54,6 +53,25 @@ use super::{
 use crate::model::ProjectionRecoveryCleanup;
 use crate::model::{Graph, ProjectionRecoveryEvidence, ProjectionWriteProof};
 
+thread_local! {
+    /// The turn executor records the exact per-page name seed before entering
+    /// the retained receipt-backed writer. The store persists this value; it
+    /// never derives a competing identity from its own resource id (2b soak).
+    static PROJECTION_TURN_ATTEMPT: std::cell::Cell<Option<Uuid>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+pub(crate) struct ProjectionTurnAttemptScope {
+    previous: Option<Uuid>,
+}
+
+impl Drop for ProjectionTurnAttemptScope {
+    fn drop(&mut self) {
+        PROJECTION_TURN_ATTEMPT.set(self.previous);
+    }
+}
+
 const PENDING_CLEANUP_ROUND_DIRS: [&str; 2] = [
     PROJECTION_CLEANUP_ROUND_0_DIR,
     PROJECTION_CLEANUP_ROUND_1_DIR,
@@ -89,7 +107,6 @@ const PENDING_CLEANUP_ROUND_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_CLEANUP_ROUND_STATE_BYTES: u64 = 4 * 1024;
 const PENDING_CLEANUP_MARKER_SCHEMA_VERSION: u32 = 1;
 const PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION: u32 = 1;
-pub(crate) const PROJECTION_RECOVERY_GRACE_SECONDS: u64 = 24 * 60 * 60;
 pub(crate) const MAX_PENDING_PROJECTION_CLEANUP_PER_PASS: usize = 64;
 const PENDING_CLEANUP_NAMESPACE_SCHEMA_VERSION: u32 = 1;
 const MUTATION_AUTHORITY_SCHEMA_VERSION: u32 = 1;
@@ -475,8 +492,6 @@ thread_local! {
         std::cell::RefCell::new(None);
     static RECEIPT_SCAN_COUNTERS: std::cell::Cell<ProjectionStoreTestCounters> =
         std::cell::Cell::new(ProjectionStoreTestCounters::ZERO);
-    static PROJECTION_CLEANUP_TIME: std::cell::Cell<Option<u64>> =
-        const { std::cell::Cell::new(None) };
     static FAIL_BEFORE_PROJECTION_CLEANUP_MARKER_SWAP: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static FAIL_AFTER_PROJECTION_CLEANUP_MARKER_SWAP: std::cell::Cell<bool> =
@@ -636,14 +651,8 @@ pub(crate) fn reset_projection_store_test_hooks() {
     COMPLETION_PUBLICATION_HOOK.with(|hook| drop(hook.borrow_mut().take()));
     COMPLETION_PUBLICATION_ACT_HOOK.with(|hook| drop(hook.borrow_mut().take()));
     COMPLETION_RETAINED_SLOT_HOOK.with(|hook| drop(hook.borrow_mut().take()));
-    PROJECTION_CLEANUP_TIME.with(|time| time.set(None));
     FAIL_BEFORE_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| fail.set(false));
     FAIL_AFTER_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| fail.set(false));
-}
-
-#[cfg(test)]
-pub(crate) fn set_projection_cleanup_time_for_test(unix_seconds: Option<u64>) {
-    PROJECTION_CLEANUP_TIME.with(|time| time.set(unix_seconds));
 }
 
 #[cfg(test)]
@@ -918,26 +927,6 @@ impl PendingProjectionCleanupMarker {
     }
 }
 
-pub(crate) struct ProjectionCleanupRetirementAuthority {
-    evidence_digest: [u8; 32],
-}
-
-impl ProjectionCleanupRetirementAuthority {
-    pub(crate) fn permits(
-        &self,
-        record: &LocalProjectionEvidenceRecord,
-    ) -> Result<bool, ProjectionStoreError> {
-        Ok(self.evidence_digest == local_forensic_record_digest(record)?)
-    }
-
-    #[cfg(test)]
-    fn for_test(record: &LocalProjectionEvidenceRecord) -> Self {
-        Self {
-            evidence_digest: local_forensic_record_digest(record).unwrap(),
-        }
-    }
-}
-
 /// Disconnected immutable storage for projection bases, intents, and completions.
 ///
 /// Opening this store is never performed by graph startup. Every path operation
@@ -948,7 +937,6 @@ pub struct ProjectionReceiptStore {
     store_id: ProjectionReceiptStoreId,
     workspace_id: WorkspaceId,
     endpoint: Option<ProjectionEndpointBinding>,
-    cleanup_session_id: Uuid,
     capability: Dir,
     namespaces: ReceiptNamespaces,
 }
@@ -1058,6 +1046,11 @@ pub(crate) struct ProjectionCatalogEntry {
 }
 
 impl ProjectionReceiptStore {
+    pub(crate) fn enter_turn_attempt(&self, attempt_id: Uuid) -> ProjectionTurnAttemptScope {
+        let previous = PROJECTION_TURN_ATTEMPT.replace(Some(attempt_id));
+        ProjectionTurnAttemptScope { previous }
+    }
+
     pub fn open(root: &Path, workspace_id: WorkspaceId) -> Result<Self, ProjectionStoreError> {
         Self::open_with_binding(root, workspace_id, None)
     }
@@ -1214,7 +1207,6 @@ impl ProjectionReceiptStore {
             store_id,
             workspace_id,
             endpoint: Some(endpoint),
-            cleanup_session_id: Uuid::new_v4(),
             capability,
             namespaces,
         })
@@ -1266,7 +1258,6 @@ impl ProjectionReceiptStore {
             store_id,
             workspace_id,
             endpoint,
-            cleanup_session_id: Uuid::new_v4(),
             capability,
             namespaces,
         })
@@ -1478,12 +1469,8 @@ impl ProjectionReceiptStore {
         intent: &ProjectionIntent,
         intent_id: ProjectionIntentId,
     ) -> Result<ProjectionAttemptReservation, ProjectionStoreError> {
-        self.reserve_deterministic_attempt_under_lease(
-            intent,
-            intent_id,
-            deterministic_mutation_uuid(b"tine/projection-attempt/v1\0", self.store_id, intent_id),
-            true,
-        )
+        let attempt_id = self.turn_attempt_id(intent_id)?;
+        self.reserve_deterministic_attempt_under_lease(intent, intent_id, attempt_id, true)
     }
 
     pub(crate) fn reserve_fallback_attempt(
@@ -1493,16 +1480,29 @@ impl ProjectionReceiptStore {
         let intent_id = self.require_published_intent(intent)?;
         let _lease = self.acquire_mutation_lease(intent_id)?;
         mutation_authority_leased_hook();
-        self.reserve_deterministic_attempt_under_lease(
-            intent,
-            intent_id,
-            deterministic_mutation_uuid(
-                b"tine/projection-fallback-attempt/v1\0",
+        let attempt_id = self.turn_attempt_id(intent_id)?;
+        self.reserve_deterministic_attempt_under_lease(intent, intent_id, attempt_id, true)
+    }
+
+    fn turn_attempt_id(&self, intent_id: ProjectionIntentId) -> Result<Uuid, ProjectionStoreError> {
+        if let Some(attempt_id) = PROJECTION_TURN_ATTEMPT.get() {
+            return Ok(attempt_id);
+        }
+        #[cfg(test)]
+        {
+            // Unit tests that exercise the receipt store below the turn
+            // executor retain their historical deterministic fixture seed.
+            return Ok(deterministic_mutation_uuid(
+                b"tine/projection-attempt/v1\0",
                 self.store_id,
                 intent_id,
-            ),
-            false,
-        )
+            ));
+        }
+        #[cfg(not(test))]
+        {
+            let _ = intent_id;
+            Err(ProjectionStoreError::MissingTurnAttemptContext)
+        }
     }
 
     fn reserve_deterministic_attempt_under_lease(
@@ -2143,87 +2143,6 @@ impl ProjectionReceiptStore {
         }
         pending.sort_unstable_by_key(|(_, record)| (record.intent_id(), record.attempt_id()));
         Ok(pending)
-    }
-
-    /// Persist one exact unchanged-quarantine observation. Retirement is
-    /// authorized only after a different store-open session observes the same
-    /// marker at least one grace interval later. A backward wall-clock step
-    /// starts settlement over from the current session and time.
-    pub(crate) fn projection_cleanup_grace_elapsed(
-        &self,
-        record: &LocalProjectionEvidenceRecord,
-    ) -> Result<Option<ProjectionCleanupRetirementAuthority>, ProjectionStoreError> {
-        if !record.is_cleanup_bound() {
-            return Err(ProjectionStoreError::ForensicBindingMismatch);
-        }
-        let name = pending_cleanup_filename(record);
-        let (round, current_bytes) = read_pending_cleanup_marker(
-            &self.namespaces.pending_cleanup.capability,
-            self.store_id,
-            self.namespaces.pending_cleanup.identity,
-            &name,
-        )?;
-        let mut marker = decode_pending_cleanup_marker(&current_bytes)?;
-        if marker.evidence != *record {
-            return Err(ProjectionStoreError::ForensicBindingMismatch);
-        }
-        let now = projection_cleanup_unix_seconds()?;
-        let evidence_digest = local_forensic_record_digest(record)?;
-        let restart_and_grace = marker.observation.as_ref().is_some_and(|observation| {
-            observation.evidence_digest == evidence_digest
-                && observation.session_id != self.cleanup_session_id
-                && now >= observation.observed_unix_seconds
-                && now - observation.observed_unix_seconds >= PROJECTION_RECOVERY_GRACE_SECONDS
-        });
-        if restart_and_grace {
-            return Ok(Some(ProjectionCleanupRetirementAuthority {
-                evidence_digest,
-            }));
-        }
-
-        let must_reset = marker.observation.as_ref().is_none_or(|observation| {
-            observation.evidence_digest != evidence_digest
-                || now < observation.observed_unix_seconds
-        });
-        if must_reset {
-            marker.observation = Some(PendingProjectionCleanupObservation {
-                schema_version: PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION,
-                evidence_digest,
-                session_id: self.cleanup_session_id,
-                observed_unix_seconds: now,
-            });
-            let replacement = encode_pending_cleanup_marker(&marker)?;
-            replace_mutation_authority_if_exact(&round, &name, &current_bytes, &replacement)?;
-        }
-        Ok(None)
-    }
-
-    pub(crate) fn reset_projection_cleanup_grace(
-        &self,
-        record: &LocalProjectionEvidenceRecord,
-    ) -> Result<(), ProjectionStoreError> {
-        if !record.is_cleanup_bound() {
-            return Err(ProjectionStoreError::ForensicBindingMismatch);
-        }
-        let name = pending_cleanup_filename(record);
-        let (round, current_bytes) = read_pending_cleanup_marker(
-            &self.namespaces.pending_cleanup.capability,
-            self.store_id,
-            self.namespaces.pending_cleanup.identity,
-            &name,
-        )?;
-        let mut marker = decode_pending_cleanup_marker(&current_bytes)?;
-        if marker.evidence != *record {
-            return Err(ProjectionStoreError::ForensicBindingMismatch);
-        }
-        marker.observation = Some(PendingProjectionCleanupObservation {
-            schema_version: PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION,
-            evidence_digest: local_forensic_record_digest(record)?,
-            session_id: self.cleanup_session_id,
-            observed_unix_seconds: projection_cleanup_unix_seconds()?,
-        });
-        let replacement = encode_pending_cleanup_marker(&marker)?;
-        replace_mutation_authority_if_exact(&round, &name, &current_bytes, &replacement)
     }
 
     pub(crate) fn retire_pending_projection_cleanup(
@@ -3223,6 +3142,7 @@ pub enum ProjectionStoreError {
     WriteProofMismatch,
     RecoveryTargetMismatch,
     AttemptBindingMismatch,
+    MissingTurnAttemptContext,
     MutationAuthorityMismatch,
     MutationAuthorityPending,
     MutationAuthorityTooLarge {
@@ -3325,6 +3245,9 @@ impl fmt::Display for ProjectionStoreError {
             }
             Self::AttemptBindingMismatch => {
                 f.write_str("local projection attempt is not canonically bound to its intent")
+            }
+            Self::MissingTurnAttemptContext => {
+                f.write_str("managed projection mutation has no turn-derived attempt identity")
             }
             Self::MutationAuthorityMismatch => {
                 f.write_str("projection mutation authority does not match the durable operation")
@@ -4513,22 +4436,6 @@ fn decode_pending_cleanup_marker(
     Ok(marker)
 }
 
-fn projection_cleanup_unix_seconds() -> Result<u64, ProjectionStoreError> {
-    #[cfg(test)]
-    if let Some(seconds) = PROJECTION_CLEANUP_TIME.with(std::cell::Cell::get) {
-        return Ok(seconds);
-    }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|_| {
-            ProjectionStoreError::Io(io::Error::new(
-                ErrorKind::InvalidData,
-                "system clock is before the Unix epoch",
-            ))
-        })
-}
-
 fn valid_local_forensic_version(record: &LocalProjectionEvidenceRecord) -> bool {
     match record.schema_version {
         PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION => record.recovery_resource_id.is_none(),
@@ -4618,13 +4525,8 @@ fn endpoint_binding_bytes(binding: ProjectionEndpointBinding) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::io::{Read as _, Seek as _, Write as _};
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt as _;
-    use std::rc::Rc;
 
     use crate::oplog::{FrontierV2, PageId};
 
@@ -4838,18 +4740,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
-    }
-
-    fn retirement_quarantine_path(
-        recovery_path: &Path,
-        record: &LocalProjectionEvidenceRecord,
-    ) -> PathBuf {
-        let resource_id = record.recovery_resource_id().unwrap();
-        recovery_path.parent().unwrap().join(format!(
-            "Tine-recovery-{}-{}.projection-quarantine",
-            record.attempt_id().simple(),
-            hex(resource_id.as_bytes())
-        ))
     }
 
     #[test]
@@ -5325,7 +5215,13 @@ mod tests {
     }
 
     #[test]
-    fn fallback_publication_crashes_reuse_one_second_exact_attempt() {
+    fn fallback_reuses_the_turn_derived_attempt_instead_of_inventing_a_second_name() {
+        let fresh = Fixture::new("fresh-turn-derived-fallback");
+        let derived = Uuid::from_u128(0xf2f2_f2f2_f2f2_f2f2_f2f2_f2f2_f2f2_f2f2);
+        let _turn = fresh.store.enter_turn_attempt(derived);
+        let fresh_fallback = fresh.store.reserve_fallback_attempt(&fresh.intent).unwrap();
+        assert_eq!(fresh_fallback.attempt_id(), derived);
+
         let fixture = Fixture::new("fallback-attempt-publication-crash");
         let primary = fixture.store.reserve_attempt(&fixture.intent).unwrap();
         let mut recovery = fixture
@@ -5342,24 +5238,14 @@ mod tests {
             )
             .is_err());
         recovery.release_failed_recovery().unwrap();
-        let mut stable = None;
-
         for _ in 0..8 {
-            ATTEMPT_PUBLICATION_HOOK.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(|| panic!("simulated process crash")));
-            });
-            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = fixture.store.reserve_fallback_attempt(&fixture.intent);
-            }));
-            assert!(crashed.is_err());
+            let fallback = fixture
+                .store
+                .reserve_fallback_attempt(&fixture.intent)
+                .unwrap();
+            assert_eq!(fallback, primary);
             assert_eq!(fixture.authority_stats(), (0, 0));
-            assert_eq!(fixture.attempt_stats(&fixture.intent).0, 2);
-            let snapshot = fixture.attempt_snapshot(&fixture.intent);
-            if let Some(expected) = &stable {
-                assert_eq!(&snapshot, expected);
-            } else {
-                stable = Some(snapshot);
-            }
+            assert_eq!(fixture.attempt_stats(&fixture.intent).0, 1);
         }
     }
 
@@ -5844,6 +5730,46 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_crashed_under_2a_replays_under_2b_without_refusal() {
+        let fixture = Fixture::new_replacement("legacy-attempt-turn-continuation");
+
+        // Packet 2a reserved from receipt-store identity. There is deliberately
+        // no turn scope around this call, which preserves that old producer in
+        // test builds for compatibility fixtures.
+        let legacy = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let mut interrupted = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&legacy))
+            .unwrap();
+        fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut interrupted,
+            )
+            .unwrap();
+        drop(interrupted);
+        assert!(fixture.authority_path(&fixture.intent).exists());
+
+        // Packet 2b derives a different fresh id from the replay turn. Durable
+        // residue is stronger evidence: it resumes the recorded attempt rather
+        // than refusing or manufacturing a parallel attempt.
+        let derived = Uuid::from_u128(0x2b2b_2b2b_2b2b_2b2b_2b2b_2b2b_2b2b_2b2b);
+        assert_ne!(legacy.attempt_id(), derived);
+        let reopened = fixture.reopen_store();
+        let _turn = reopened.enter_turn_attempt(derived);
+        let resumed = reopened.begin_mutation(&fixture.intent, None).unwrap();
+        assert_eq!(
+            resumed.active.as_ref().map(|attempt| attempt.attempt_id()),
+            Some(legacy.attempt_id())
+        );
+        assert_eq!(resumed.reservations.len(), 1);
+        assert_eq!(fixture.attempt_stats(&fixture.intent).0, 1);
+    }
+
+    #[test]
     fn completed_mutation_authorities_do_not_accumulate_at_store_root() {
         let fixture = Fixture::new("completed-authority-lifecycle");
         let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
@@ -5932,7 +5858,7 @@ mod tests {
         let records = reopened.local_forensic_evidence(&fixture.intent).unwrap();
         let conflict = fixture
             .graph
-            .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records, None)
+            .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records)
             .unwrap();
         let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
             panic!("same-byte replacement did not become a recoverable conflict: {conflict:?}");
@@ -5945,6 +5871,161 @@ mod tests {
         assert_eq!(fs::read(&displaced).unwrap(), base);
     }
 
+    /// §4 row C3: a pre-existing derived staged name is data, not scratch.
+    /// The writer moves it intact to strict conflict trash before recreating
+    /// the exact turn-derived name for its own bytes.
+    #[test]
+    fn a_staged_name_occupied_after_crash_is_quarantined_not_deleted() {
+        let fixture = Fixture::new_replacement("occupied-derived-staged-name");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let staged_name = format!(
+            ".{}.{}.projection.staged",
+            fixture.intent.path().file_name(),
+            reservation.attempt_id().simple()
+        );
+        let staged_path = fixture
+            .graph_root
+            .join(fixture.intent.path().as_str())
+            .parent()
+            .unwrap()
+            .join(&staged_name);
+        let unknown = b"- pre-existing staged-name bytes\n";
+        fs::write(&staged_path, unknown).unwrap();
+
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        let proof = fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            )
+            .unwrap();
+        fixture
+            .store
+            .publish_completion(authority, &fixture.intent, &proof)
+            .unwrap();
+
+        assert!(!staged_path.exists());
+        assert_eq!(
+            fs::read(fixture.graph_root.join(fixture.intent.path().as_str())).unwrap(),
+            fixture.target
+        );
+        let quarantined = fixture
+            .snapshot_graph()
+            .into_iter()
+            .filter_map(|(path, bytes)| bytes.map(|bytes| (path, bytes)))
+            .find(|(path, bytes)| {
+                path.to_string_lossy().contains("projection-residue") && bytes == unknown
+            });
+        assert!(
+            quarantined.is_some(),
+            "the occupied derived name must survive byte-identically in conflict trash"
+        );
+    }
+
+    #[test]
+    fn turn_replay_after_publication_retires_the_displaced_pre_image() {
+        let fixture = Fixture::new_replacement("in-turn-exact-recovery-retirement");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records,)
+                .unwrap(),
+            ProjectionRecoveryCleanup::Retired
+        );
+        assert!(!recovery_path.exists());
+    }
+
+    #[test]
+    fn a_post_crash_recovery_file_is_trashed_not_unlinked() {
+        let fixture = Fixture::new_replacement("post-crash-recovery-retention");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let graph_root = fixture.graph_root.clone();
+        let target_path = fixture.intent.path().to_owned();
+        let records_for_restart = records.clone();
+
+        // A new thread has no process-local in-turn unlink authority, which is
+        // the exact capability loss a process crash creates.
+        let cleanup = std::thread::spawn(move || {
+            Graph::open(&graph_root)
+                .retire_completed_projection_recovery(target_path.as_str(), &records_for_restart)
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = cleanup else {
+            panic!("post-crash cleanup discarded retained bytes: {cleanup:?}");
+        };
+        assert!(!recovery_path.exists());
+        assert_eq!(
+            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
+            b"- base\n"
+        );
+    }
+
+    #[test]
+    fn an_externally_substituted_recovery_inode_is_retained() {
+        let fixture = Fixture::new_replacement("externally-substituted-recovery");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let original = recovery_path.with_extension("original-provider-inode");
+        fs::rename(&recovery_path, &original).unwrap();
+        let substituted = b"- external substitute\n";
+        fs::write(&recovery_path, substituted).unwrap();
+        let graph_root = fixture.graph_root.clone();
+        let target_path = fixture.intent.path().to_owned();
+
+        let cleanup = std::thread::spawn(move || {
+            Graph::open(&graph_root)
+                .retire_completed_projection_recovery(target_path.as_str(), &records)
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = cleanup else {
+            panic!("substituted recovery was not retained: {cleanup:?}");
+        };
+        assert_eq!(fs::read(original).unwrap(), b"- base\n");
+        assert_eq!(
+            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
+            substituted
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_crash_hardlinked_recovery_refuses_and_keeps_durable_residue() {
+        let fixture = Fixture::new_replacement("post-crash-hardlinked-recovery");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let extra_link = recovery_path.with_extension("linked-recovery-copy");
+        fs::hard_link(&recovery_path, &extra_link).unwrap();
+        let graph_root = fixture.graph_root.clone();
+        let target_path = fixture.intent.path().to_owned();
+        let records_for_restart = records.clone();
+
+        let refusal = std::thread::spawn(move || {
+            Graph::open(&graph_root)
+                .retire_completed_projection_recovery(target_path.as_str(), &records_for_restart)
+                .unwrap_err()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(refusal.kind(), io::ErrorKind::AlreadyExists, "{refusal}");
+        assert_eq!(fs::read(&recovery_path).unwrap(), b"- base\n");
+        assert_eq!(fs::read(&extra_link).unwrap(), b"- base\n");
+        assert_eq!(
+            fixture.store.pending_projection_cleanup().unwrap().len(),
+            1,
+            "the durable receipt remains the residue record for a refused quarantine"
+        );
+    }
+
     /// §4.6 / §4.2 row C4: the W2 displacement fault point produces
     /// "displaced, not yet published" — the live name gone, the derived
     /// recovery name holding the exact precondition, and nothing staged.
@@ -5953,43 +6034,36 @@ mod tests {
     /// `projection_recovery_after_bound_capture_hook` fires BEFORE the
     /// displacement rename, so it cannot reach this state at all.
     #[test]
-    fn the_projection_displacement_hook_observes_the_unpublished_displaced_state() {
+    fn turn_replay_after_displacement_republishes_and_retires() {
         let fixture = Fixture::new_replacement("projection-after-displacement-hook");
         let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
         let target_path = fixture.graph_root.join(fixture.intent.path().as_str());
         let parent = target_path.parent().unwrap().to_path_buf();
         let recovery_path = parent.join(reservation.recovery_filename());
+        let staged_path = parent.join(format!(
+            ".{}.{}.projection.staged",
+            fixture.intent.path().file_name(),
+            reservation.attempt_id().simple()
+        ));
 
-        type Observation = (bool, bool, Vec<u8>, usize);
+        type Observation = (bool, bool, Vec<u8>, bool, Vec<u8>);
         let observed: std::sync::Arc<std::sync::Mutex<Option<Observation>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let recorder = std::sync::Arc::clone(&observed);
         let observed_target = target_path.clone();
         let observed_recovery = recovery_path.clone();
-        let observed_parent = parent.clone();
+        let observed_staged = staged_path.clone();
         crate::model::set_projection_after_displacement_hook_for_test(
             target_path.clone(),
             move || {
-                let staged = fs::read_dir(&observed_parent)
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .filter(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .ends_with(".projection.tmp")
-                    })
-                    .count();
                 *recorder.lock().unwrap() = Some((
                     observed_target.exists(),
                     observed_recovery.exists(),
                     fs::read(&observed_recovery).unwrap_or_default(),
-                    staged,
+                    observed_staged.exists(),
+                    fs::read(&observed_staged).unwrap_or_default(),
                 ));
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "injected displacement cut",
-                ))
+                panic!("simulated process crash after displacement")
             },
         );
 
@@ -5997,7 +6071,103 @@ mod tests {
             .store
             .begin_mutation(&fixture.intent, Some(&reservation))
             .unwrap();
-        let error = fixture
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = fixture.graph.write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            );
+        }));
+        assert!(crashed.is_err());
+        drop(authority);
+
+        let (target_present, recovery_present, recovery_bytes, staged_present, staged_bytes) =
+            observed
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the projection displacement hook must fire");
+        assert!(
+            !target_present,
+            "the live name must already be gone at the displacement cut"
+        );
+        assert!(recovery_present, "the displaced pre-image must be retained");
+        assert_eq!(recovery_bytes, b"- base\n".to_vec());
+        assert!(
+            staged_present,
+            "the turn-derived staged name must survive the cut"
+        );
+        assert_eq!(staged_bytes, fixture.target);
+
+        let graph_root = fixture.graph_root.clone();
+        let receipt_root = fixture.store.root_path().to_path_buf();
+        let workspace_id = fixture.store.workspace_id();
+        let intent = fixture.intent.clone();
+        let target = fixture.target.clone();
+        std::thread::spawn(move || {
+            let graph = Graph::open(&graph_root);
+            let store = ProjectionReceiptStore::open(&receipt_root, workspace_id).unwrap();
+            let mut resumed = store.begin_mutation(&intent, None).unwrap();
+            let proof = graph
+                .write_page_projection(
+                    intent.path().as_str(),
+                    Some(b"- base\n"),
+                    &target,
+                    &mut resumed,
+                )
+                .unwrap();
+            store.publish_completion(resumed, &intent, &proof).unwrap();
+            let records = store.local_forensic_evidence(&intent).unwrap();
+            assert_eq!(
+                records.len(),
+                1,
+                "resumed retirement must publish bound evidence"
+            );
+            assert!(matches!(
+                graph
+                    .retire_completed_projection_recovery(intent.path().as_str(), &records)
+                    .unwrap(),
+                ProjectionRecoveryCleanup::ConflictRetained { .. }
+            ));
+            store
+                .retire_pending_projection_cleanup(&records[0])
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(fs::read(&target_path).unwrap(), fixture.target);
+        assert!(!recovery_path.exists());
+        assert!(!staged_path.exists());
+        assert!(fixture
+            .reopen_store()
+            .pending_projection_cleanup()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_resumed_retirement_still_retires_its_recovery_file() {
+        turn_replay_after_displacement_republishes_and_retires();
+    }
+
+    #[test]
+    fn a_lost_directory_entry_after_the_single_barrier_converges() {
+        let fixture = Fixture::new_replacement("lost-single-turn-barrier");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let recovery_path = fixture
+            .graph_root
+            .join(fixture.intent.path().as_str())
+            .parent()
+            .unwrap()
+            .join(reservation.recovery_filename());
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        let turn = crate::model::ProjectionTurnBarrierScope::begin().unwrap();
+        let proof = fixture
             .graph
             .write_page_projection(
                 fixture.intent.path().as_str(),
@@ -6005,25 +6175,39 @@ mod tests {
                 &fixture.target,
                 &mut authority,
             )
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
-        drop(authority);
-
-        let (target_present, recovery_present, recovery_bytes, staged) = observed
-            .lock()
-            .unwrap()
-            .take()
-            .expect("the projection displacement hook must fire");
+            .unwrap();
+        fixture
+            .store
+            .publish_completion(authority, &fixture.intent, &proof)
+            .unwrap();
+        super::super::projection::retire_pending_projection_recovery(
+            &fixture.graph,
+            &fixture.store,
+            None,
+        )
+        .unwrap();
+        crate::model::fail_next_projection_directory_sync_for_test();
         assert!(
-            !target_present,
-            "the live name must already be gone at the displacement cut"
+            turn.finish().is_err(),
+            "the simulated final barrier must fail"
         );
-        assert!(recovery_present, "the displaced pre-image must be retained");
-        assert_eq!(recovery_bytes, b"- base\n".to_vec());
-        assert_eq!(staged, 0, "nothing is staged yet at this cut");
-        // In-process the writer still restores. The crash disposition belongs to
-        // the recovery walk and lands with the producer conversion.
-        assert_eq!(fs::read(&target_path).unwrap(), b"- base\n".to_vec());
+
+        let replay = crate::model::ProjectionTurnBarrierScope::begin().unwrap();
+        fixture
+            .graph
+            .rebarrier_page_projection(fixture.intent.path(), Some(fixture.target.as_slice()))
+            .unwrap();
+        replay.finish().unwrap();
+
+        assert_eq!(
+            fs::read(fixture.graph_root.join(fixture.intent.path().as_str())).unwrap(),
+            fixture.target
+        );
+        assert!(!recovery_path.exists());
+        assert!(fixture
+            .snapshot_graph()
+            .keys()
+            .all(|path| !path.to_string_lossy().ends_with(".projection.staged")));
     }
 
     #[test]
@@ -6069,7 +6253,6 @@ mod tests {
             fixture.graph.retire_completed_projection_recovery(
                 fixture.intent.path().as_str(),
                 std::slice::from_ref(&marker),
-                None,
             ),
             Ok(ProjectionRecoveryCleanup::ConflictRetained { .. })
         ));
@@ -6411,1067 +6594,6 @@ mod tests {
             read_state(&fixture.store).0,
             before.0,
             "the durable flip was elided while the inactive round held a marker"
-        );
-    }
-
-    #[test]
-    fn pending_cleanup_index_visits_only_live_attempts_after_historical_completions() {
-        let fixture = Fixture::new("bounded-pending-cleanup-index");
-        for index in 0_u128..33 {
-            let path = ManagedPath::parse(format!("pages/history-{index}.md")).unwrap();
-            let absolute = fixture.graph_root.join(path.as_str());
-            fs::write(&absolute, b"- base\n").unwrap();
-            let target = format!("- target {index}\n").into_bytes();
-            let intent = ProjectionIntent::new(
-                fixture.store.workspace_id(),
-                PageId::from_uuid(Uuid::from_u128(10_000 + index)),
-                path,
-                FrontierV2::default(),
-                Vec::new(),
-                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
-                crate::oplog::ProjectionTargetKind::Present,
-                BlobDescription::of(&target),
-                Vec::new(),
-            )
-            .unwrap();
-            fixture
-                .store
-                .publish_intent(&intent, Some(b"- base\n"))
-                .unwrap();
-            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
-            let mut authority = fixture
-                .store
-                .begin_mutation(&intent, Some(&reservation))
-                .unwrap();
-            let proof = fixture
-                .graph
-                .write_page_projection(
-                    intent.path().as_str(),
-                    Some(b"- base\n"),
-                    &target,
-                    &mut authority,
-                )
-                .unwrap();
-            fixture
-                .store
-                .publish_completion(authority, &intent, &proof)
-                .unwrap();
-            if index != 32 {
-                let (_, record) = fixture
-                    .store
-                    .pending_projection_cleanup()
-                    .unwrap()
-                    .into_iter()
-                    .find(|(candidate, _)| candidate == &intent)
-                    .unwrap();
-                assert_eq!(
-                    fixture
-                        .graph
-                        .retire_completed_projection_recovery(
-                            intent.path().as_str(),
-                            std::slice::from_ref(&record),
-                            None,
-                        )
-                        .unwrap(),
-                    ProjectionRecoveryCleanup::Quarantined
-                );
-                assert_eq!(
-                    fixture
-                        .graph
-                        .retire_completed_projection_recovery(
-                            intent.path().as_str(),
-                            std::slice::from_ref(&record),
-                            Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
-                        )
-                        .unwrap(),
-                    ProjectionRecoveryCleanup::Retired
-                );
-                fixture
-                    .store
-                    .retire_pending_projection_cleanup(&record)
-                    .unwrap();
-            }
-        }
-
-        reset_projection_store_test_counters();
-        let pending = fixture.store.pending_projection_cleanup().unwrap();
-        let counters = projection_store_test_counters();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(counters.pending_cleanup_entries, 1);
-        assert_eq!(counters.catalog_directory_entries, 0);
-        assert_eq!(counters.completion_lookups, 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn graph_local_retirement_succeeds_when_receipts_are_on_another_filesystem() {
-        let shared_memory = Path::new("/dev/shm");
-        if !shared_memory.is_dir() {
-            return;
-        }
-        let graph_parent =
-            std::env::temp_dir().join(format!("tine-exdev-graph-{}", Uuid::new_v4()));
-        let receipt_parent = shared_memory.join(format!("tine-exdev-receipts-{}", Uuid::new_v4()));
-        fs::create_dir(&graph_parent).unwrap();
-        if fs::create_dir(&receipt_parent).is_err() {
-            let _ = fs::remove_dir(&graph_parent);
-            return;
-        }
-        if fs::metadata(&graph_parent).unwrap().dev()
-            == fs::metadata(&receipt_parent).unwrap().dev()
-        {
-            let _ = fs::remove_dir(&graph_parent);
-            let _ = fs::remove_dir(&receipt_parent);
-            return;
-        }
-        set_projection_cleanup_time_for_test(Some(50_000));
-        let graph_root = graph_parent.join("graph");
-        fs::create_dir(&graph_root).unwrap();
-        fs::create_dir(graph_root.join("pages")).unwrap();
-        let path = ManagedPath::parse("pages/external-volume.md").unwrap();
-        fs::write(graph_root.join(path.as_str()), b"- base\n").unwrap();
-        let graph = Graph::open(&graph_root);
-        let store = ProjectionReceiptStore::open(
-            &receipt_parent.join("receipts"),
-            WorkspaceId::from_uuid(Uuid::from_u128(1)),
-        )
-        .unwrap();
-        let target = b"- target\n";
-        let intent = ProjectionIntent::new(
-            store.workspace_id(),
-            PageId::from_uuid(Uuid::from_u128(2)),
-            path,
-            FrontierV2::default(),
-            Vec::new(),
-            ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
-            crate::oplog::ProjectionTargetKind::Present,
-            BlobDescription::of(target),
-            Vec::new(),
-        )
-        .unwrap();
-        store.publish_intent(&intent, Some(b"- base\n")).unwrap();
-        let reservation = store.reserve_attempt(&intent).unwrap();
-        let recovery_path = graph_root
-            .join("pages")
-            .join(reservation.recovery_filename());
-        let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
-        let proof = graph
-            .write_page_projection(
-                intent.path().as_str(),
-                Some(b"- base\n"),
-                target,
-                &mut authority,
-            )
-            .unwrap();
-        store
-            .publish_completion(authority, &intent, &proof)
-            .unwrap();
-        let (_, record) = store
-            .pending_projection_cleanup()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(
-            graph
-                .retire_completed_projection_recovery(
-                    intent.path().as_str(),
-                    std::slice::from_ref(&record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        assert!(store
-            .projection_cleanup_grace_elapsed(&record)
-            .unwrap()
-            .is_none());
-        set_projection_cleanup_time_for_test(Some(50_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        let reopened =
-            ProjectionReceiptStore::open(store.root_path(), store.workspace_id()).unwrap();
-        let retirement = reopened
-            .projection_cleanup_grace_elapsed(&record)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            graph
-                .retire_completed_projection_recovery(
-                    intent.path().as_str(),
-                    std::slice::from_ref(&record),
-                    Some(&retirement),
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Retired
-        );
-        reopened.retire_pending_projection_cleanup(&record).unwrap();
-        assert!(!recovery_path.exists());
-        assert!(store.pending_projection_cleanup().unwrap().is_empty());
-        drop(store);
-        drop(reopened);
-        drop(graph);
-        crate::test_support::remove_dir_all(&graph_parent);
-        crate::test_support::remove_dir_all(&receipt_parent);
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn completed_recovery_retirement_quarantines_final_race_winner() {
-        let fixture = Fixture::new_replacement("completed-recovery-retirement-final-race");
-        let base = b"- base\n";
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let displaced = recovery_path.with_extension("provider-retained");
-        let raced_recovery = recovery_path.clone();
-        let raced_displaced = displaced.clone();
-        crate::model::set_projection_recovery_retirement_hook_for_test(move || {
-            fs::rename(&raced_recovery, &raced_displaced)?;
-            fs::write(&raced_recovery, base)
-        });
-
-        let conflict = fixture
-            .graph
-            .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records, None)
-            .unwrap();
-        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
-            panic!("final race did not become a recoverable conflict: {conflict:?}");
-        };
-        assert!(!recovery_path.exists());
-        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
-        assert!(!quarantine.exists());
-        assert_eq!(
-            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
-            base
-        );
-        assert_eq!(fs::read(&displaced).unwrap(), base);
-    }
-
-    #[test]
-    fn completed_recovery_retirement_retains_stale_handle_write_at_final_boundary() {
-        let fixture = Fixture::new_replacement("completed-recovery-stale-handle");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let mut stale = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&recovery_path)
-            .unwrap();
-        super::super::projection::retire_one_projection_recovery(
-            &fixture.graph,
-            &fixture.store,
-            &fixture.intent,
-            &records[0],
-        )
-        .unwrap();
-        crate::model::set_projection_recovery_final_retirement_hook_for_test(move || {
-            stale.seek(io::SeekFrom::Start(0))?;
-            stale.write_all(b"- stale writer changed this inode\n")?;
-            stale.set_len(b"- stale writer changed this inode\n".len() as u64)?;
-            stale.sync_all()
-        });
-
-        let conflict = fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                &records,
-                Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
-            )
-            .unwrap();
-        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
-            panic!("stale handle change did not become a recoverable conflict: {conflict:?}");
-        };
-        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
-        assert!(!quarantine.exists());
-        assert_eq!(
-            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
-            b"- stale writer changed this inode\n"
-        );
-        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn settled_stale_descriptor_write_after_final_reread_documents_handoff_residual() {
-        set_projection_cleanup_time_for_test(Some(10_000));
-        let fixture = Fixture::new_replacement("settled-stale-descriptor-after-final-reread");
-        let target_path = fixture.graph_root.join(fixture.intent.path().as_str());
-        let stale = Rc::new(RefCell::new(
-            fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&target_path)
-                .unwrap(),
-        ));
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        super::super::projection::retire_one_projection_recovery(
-            &fixture.graph,
-            &fixture.store,
-            &fixture.intent,
-            record,
-        )
-        .unwrap();
-        let quarantine = retirement_quarantine_path(&recovery_path, record);
-        // Necessity gate: the prior immediate-delete construction fails here
-        // because it removed the recovery name before any durable observation.
-        assert_eq!(fs::read(&quarantine).unwrap(), b"- base\n");
-
-        let name = pending_cleanup_filename(record);
-        let (_, marker_bytes) = read_pending_cleanup_marker(
-            &fixture.store.namespaces.pending_cleanup.capability,
-            fixture.store.store_id,
-            fixture.store.namespaces.pending_cleanup.identity,
-            &name,
-        )
-        .unwrap();
-        let marker = decode_pending_cleanup_marker(&marker_bytes).unwrap();
-        let observation = marker
-            .observation
-            .expect("first pass must durably observe the quarantine");
-        assert_eq!(observation.session_id, fixture.store.cleanup_session_id);
-        assert_eq!(observation.observed_unix_seconds, 10_000);
-
-        set_projection_cleanup_time_for_test(Some(10_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        let reopened = fixture.reopen_store();
-        assert_ne!(
-            reopened.cleanup_session_id,
-            fixture.store.cleanup_session_id
-        );
-        assert!(
-            reopened
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_some(),
-            "settled retirement requires a different session and elapsed grace"
-        );
-
-        let changed = b"- autosaved after Tine's final settled reread\n";
-        let hook_stale = Rc::clone(&stale);
-        crate::model::set_projection_recovery_after_final_reread_hook_for_test(move || {
-            let mut stale = hook_stale.borrow_mut();
-            stale.seek(io::SeekFrom::Start(0))?;
-            stale.write_all(changed)?;
-            stale.set_len(changed.len() as u64)?;
-            stale.sync_all()
-        });
-
-        super::super::projection::retire_one_projection_recovery(
-            &fixture.graph,
-            &reopened,
-            &fixture.intent,
-            record,
-        )
-        .unwrap();
-        assert!(!quarantine.exists());
-        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
-
-        // Portable filesystems cannot revoke a writable descriptor held across
-        // restart plus the full grace interval. At the exact post-reread cut,
-        // cleanup therefore accepts the clean-handoff contract and unlinks the
-        // name. The retained descriptor proves the finite-grace residual rather
-        // than claiming that these out-of-contract bytes remain recoverable.
-        let mut anonymous = stale.borrow_mut();
-        anonymous.seek(io::SeekFrom::Start(0)).unwrap();
-        let mut observed = Vec::new();
-        anonymous.read_to_end(&mut observed).unwrap();
-        assert_eq!(
-            observed, changed,
-            "the exact accepted residual must remain observable through the held descriptor"
-        );
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn unchanged_quarantine_requires_restart_and_meaningful_grace() {
-        set_projection_cleanup_time_for_test(Some(10_000));
-        let fixture = Fixture::new_replacement("cleanup-restart-and-grace");
-        let (_, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        assert!(fixture
-            .store
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-
-        set_projection_cleanup_time_for_test(Some(10_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        assert!(
-            fixture
-                .store
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_none(),
-            "elapsed wall time in the creating session authorized retirement"
-        );
-        let reopened = fixture.reopen_store();
-        let retirement = reopened
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    Some(&retirement),
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Retired
-        );
-        reopened.retire_pending_projection_cleanup(record).unwrap();
-        assert!(!recovery_path.exists());
-        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn restart_before_grace_retains_quarantine_and_clock_rollback_restarts_settlement() {
-        set_projection_cleanup_time_for_test(Some(20_000));
-        let fixture = Fixture::new_replacement("cleanup-clock-rollback");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        assert!(fixture
-            .store
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-
-        set_projection_cleanup_time_for_test(Some(20_000 + PROJECTION_RECOVERY_GRACE_SECONDS - 1));
-        let pre_grace = fixture.reopen_store();
-        assert!(pre_grace
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-
-        set_projection_cleanup_time_for_test(Some(19_000));
-        let rollback = fixture.reopen_store();
-        assert!(rollback
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-        set_projection_cleanup_time_for_test(Some(19_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        assert!(
-            rollback
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_none(),
-            "rollback-reset observation retired in the same session"
-        );
-        let settled = fixture.reopen_store();
-        assert!(settled
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_some());
-
-        let quarantine = retirement_quarantine_path(&recovery_path, record);
-        assert_eq!(fs::read(quarantine).unwrap(), b"- base\n");
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn cleanup_observation_crash_cuts_retain_or_publish_conservative_state() {
-        set_projection_cleanup_time_for_test(Some(25_000));
-        let fixture = Fixture::new_replacement("cleanup-observation-crash-cuts");
-        let (_, _, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-
-        fail_before_projection_cleanup_marker_swap_for_test();
-        assert!(fixture
-            .store
-            .projection_cleanup_grace_elapsed(record)
-            .is_err());
-        let reopened = fixture.reopen_store();
-        assert!(
-            reopened
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_none(),
-            "pre-swap crash lost the pending marker or invented settlement"
-        );
-
-        set_projection_cleanup_time_for_test(Some(24_000));
-        fail_after_projection_cleanup_marker_swap_for_test();
-        assert!(reopened.projection_cleanup_grace_elapsed(record).is_err());
-        set_projection_cleanup_time_for_test(Some(24_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        let after_crash = fixture.reopen_store();
-        assert!(
-            after_crash
-                .projection_cleanup_grace_elapsed(record)
-                .unwrap()
-                .is_some(),
-            "post-swap crash did not preserve the conservative rollback-reset observation"
-        );
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn changed_quarantine_becomes_visible_conflict_without_blocking_cleanup_queue() {
-        set_projection_cleanup_time_for_test(Some(30_000));
-        let fixture = Fixture::new_replacement("changed-quarantine-conflict");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        assert!(fixture
-            .store
-            .projection_cleanup_grace_elapsed(record)
-            .unwrap()
-            .is_none());
-        let quarantine = retirement_quarantine_path(&recovery_path, record);
-        let changed = b"- external editor's newer recoverable bytes\n";
-        fs::write(&quarantine, changed).unwrap();
-
-        let outcome = fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                std::slice::from_ref(record),
-                None,
-            )
-            .unwrap();
-        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = outcome else {
-            panic!("changed quarantine was not surfaced as a conflict: {outcome:?}");
-        };
-        assert!(!quarantine.exists());
-        let conflict = fixture.graph_root.join(relative_path);
-        assert!(
-            !conflict
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with('.'),
-            "recoverable conflict remained hidden"
-        );
-        assert_eq!(fs::read(conflict).unwrap(), changed);
-        fixture
-            .store
-            .retire_pending_projection_cleanup(record)
-            .unwrap();
-        assert!(fixture
-            .store
-            .pending_projection_cleanup()
-            .unwrap()
-            .is_empty());
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn oversized_changed_quarantine_is_renamed_visible_without_loading_it() {
-        let fixture = Fixture::new_replacement("oversized-changed-quarantine");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let record = &records[0];
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    std::slice::from_ref(record),
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        let quarantine = retirement_quarantine_path(&recovery_path, record);
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&quarantine)
-            .unwrap()
-            .set_len(MAX_PROJECTION_EVIDENCE_BYTES + 1)
-            .unwrap();
-        let outcome = fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                std::slice::from_ref(record),
-                None,
-            )
-            .unwrap();
-        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = outcome else {
-            panic!("oversized changed quarantine was not retained visibly: {outcome:?}");
-        };
-        assert!(!quarantine.exists());
-        assert_eq!(
-            fs::metadata(fixture.graph_root.join(relative_path))
-                .unwrap()
-                .len(),
-            MAX_PROJECTION_EVIDENCE_BYTES + 1
-        );
-    }
-
-    #[test]
-    fn settled_cleanup_queue_drains_in_bounded_passes_without_history_growth() {
-        set_projection_cleanup_time_for_test(Some(40_000));
-        let fixture = Fixture::new("bounded-settled-cleanup");
-        for index in 0_u128..70 {
-            let path = ManagedPath::parse(format!("pages/settled-{index}.md")).unwrap();
-            fs::write(fixture.graph_root.join(path.as_str()), b"- base\n").unwrap();
-            let target = format!("- target {index}\n").into_bytes();
-            let intent = ProjectionIntent::new(
-                fixture.store.workspace_id(),
-                PageId::from_uuid(Uuid::from_u128(50_000 + index)),
-                path,
-                FrontierV2::default(),
-                Vec::new(),
-                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
-                crate::oplog::ProjectionTargetKind::Present,
-                BlobDescription::of(&target),
-                Vec::new(),
-            )
-            .unwrap();
-            fixture
-                .store
-                .publish_intent(&intent, Some(b"- base\n"))
-                .unwrap();
-            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
-            let mut authority = fixture
-                .store
-                .begin_mutation(&intent, Some(&reservation))
-                .unwrap();
-            let proof = fixture
-                .graph
-                .write_page_projection(
-                    intent.path().as_str(),
-                    Some(b"- base\n"),
-                    &target,
-                    &mut authority,
-                )
-                .unwrap();
-            fixture
-                .store
-                .publish_completion(authority, &intent, &proof)
-                .unwrap();
-        }
-
-        reset_projection_store_test_counters();
-        let first_pass = fixture
-            .store
-            .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
-            .unwrap();
-        assert_eq!(first_pass.len(), MAX_PENDING_PROJECTION_CLEANUP_PER_PASS);
-        assert_eq!(
-            projection_store_test_counters().pending_cleanup_entries,
-            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
-        );
-
-        for (intent, record) in fixture.store.pending_projection_cleanup().unwrap() {
-            assert_eq!(
-                fixture
-                    .graph
-                    .retire_completed_projection_recovery(
-                        intent.path().as_str(),
-                        std::slice::from_ref(&record),
-                        None,
-                    )
-                    .unwrap(),
-                ProjectionRecoveryCleanup::Quarantined
-            );
-            assert!(fixture
-                .store
-                .projection_cleanup_grace_elapsed(&record)
-                .unwrap()
-                .is_none());
-        }
-
-        set_projection_cleanup_time_for_test(Some(40_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
-        let reopened = fixture.reopen_store();
-        let mut pass_sizes = Vec::new();
-        loop {
-            let pass = reopened
-                .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
-                .unwrap();
-            if pass.is_empty() {
-                break;
-            }
-            pass_sizes.push(pass.len());
-            for (intent, record) in pass {
-                let retirement = reopened
-                    .projection_cleanup_grace_elapsed(&record)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    fixture
-                        .graph
-                        .retire_completed_projection_recovery(
-                            intent.path().as_str(),
-                            std::slice::from_ref(&record),
-                            Some(&retirement),
-                        )
-                        .unwrap(),
-                    ProjectionRecoveryCleanup::Retired
-                );
-                reopened.retire_pending_projection_cleanup(&record).unwrap();
-            }
-        }
-        assert_eq!(pass_sizes.iter().sum::<usize>(), 70);
-        assert_eq!(pass_sizes.len(), 2);
-        assert!(pass_sizes
-            .iter()
-            .all(|size| *size <= MAX_PENDING_PROJECTION_CLEANUP_PER_PASS));
-        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
-        assert!(fs::read_dir(fixture.graph_root.join("pages"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .all(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                !name.ends_with(".projection.recovery") && !name.ends_with(".projection-quarantine")
-            }));
-        set_projection_cleanup_time_for_test(None);
-    }
-
-    #[test]
-    fn blocked_cleanup_round_cannot_starve_later_changed_sidecar() {
-        let fixture = Fixture::new("fair-cleanup-blocked-prefix");
-        for index in 0_u128..MAX_PENDING_PROJECTION_CLEANUP_PER_PASS as u128 {
-            let path = ManagedPath::parse(format!("pages/incomplete-{index}.md")).unwrap();
-            fs::write(fixture.graph_root.join(path.as_str()), b"- base\n").unwrap();
-            let target = format!("- incomplete target {index}\n").into_bytes();
-            let intent = ProjectionIntent::new(
-                fixture.store.workspace_id(),
-                PageId::from_uuid(Uuid::from_u128(80_000 + index)),
-                path,
-                FrontierV2::default(),
-                Vec::new(),
-                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
-                crate::oplog::ProjectionTargetKind::Present,
-                BlobDescription::of(&target),
-                Vec::new(),
-            )
-            .unwrap();
-            fixture
-                .store
-                .publish_intent(&intent, Some(b"- base\n"))
-                .unwrap();
-            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
-            let mut authority = fixture
-                .store
-                .begin_mutation(&intent, Some(&reservation))
-                .unwrap();
-            fixture
-                .graph
-                .write_page_projection(
-                    intent.path().as_str(),
-                    Some(b"- base\n"),
-                    &target,
-                    &mut authority,
-                )
-                .unwrap();
-            drop(authority);
-        }
-
-        // Rotate the 64 incomplete markers into round 0, then durably finish
-        // the empty-round transition without visiting round 0. This is the
-        // exact crash/restart state in which a later insertion belongs to the
-        // inactive round behind a full retained prefix.
-        assert_eq!(
-            fixture
-                .store
-                .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
-                .unwrap()
-                .len(),
-            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
-        );
-        let namespace = &fixture.store.namespaces.pending_cleanup;
-        let queue = open_pending_cleanup_rounds(
-            &namespace.capability,
-            fixture.store.store_id,
-            namespace.identity,
-        )
-        .unwrap();
-        assert_eq!(queue.state.active_round, 1);
-        assert!(queue.rounds[1].entries().unwrap().next().is_none());
-        flip_pending_cleanup_round(&namespace.capability, &queue).unwrap();
-        let restarted = fixture.reopen_store();
-
-        let later_path = ManagedPath::parse("pages/later-changed.md").unwrap();
-        fs::write(
-            fixture.graph_root.join(later_path.as_str()),
-            b"- later base\n",
-        )
-        .unwrap();
-        let later_target = b"- later target\n";
-        let later_intent = ProjectionIntent::new(
-            restarted.workspace_id(),
-            PageId::from_uuid(Uuid::from_u128(90_000)),
-            later_path,
-            FrontierV2::default(),
-            Vec::new(),
-            ProjectionPrecondition::Base(BlobDescription::of(b"- later base\n")),
-            crate::oplog::ProjectionTargetKind::Present,
-            BlobDescription::of(later_target),
-            Vec::new(),
-        )
-        .unwrap();
-        restarted
-            .publish_intent(&later_intent, Some(b"- later base\n"))
-            .unwrap();
-        let reservation = restarted.reserve_attempt(&later_intent).unwrap();
-        let recovery_path = fixture
-            .graph_root
-            .join(later_intent.path().as_str())
-            .parent()
-            .unwrap()
-            .join(reservation.recovery_filename());
-        let mut authority = restarted
-            .begin_mutation(&later_intent, Some(&reservation))
-            .unwrap();
-        let proof = fixture
-            .graph
-            .write_page_projection(
-                later_intent.path().as_str(),
-                Some(b"- later base\n"),
-                later_target,
-                &mut authority,
-            )
-            .unwrap();
-        restarted
-            .publish_completion(authority, &later_intent, &proof)
-            .unwrap();
-        let changed = b"- provider changed the later retained sidecar\n";
-        fs::write(&recovery_path, changed).unwrap();
-
-        reset_projection_store_test_counters();
-        super::super::projection::retire_pending_projection_recovery(&fixture.graph, &restarted)
-            .unwrap();
-        assert_eq!(
-            projection_store_test_counters().pending_cleanup_entries,
-            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
-        );
-        assert_eq!(fs::read(&recovery_path).unwrap(), changed);
-
-        // The next active round contains the same 64 retained markers plus the
-        // later insertion. Since every visit rotates a marker away, two more
-        // capped passes are a hard upper bound independent of directory order.
-        let mut later_pass_visits = Vec::new();
-        for _ in 0..2 {
-            reset_projection_store_test_counters();
-            super::super::projection::retire_pending_projection_recovery(
-                &fixture.graph,
-                &restarted,
-            )
-            .unwrap();
-            let visits = projection_store_test_counters().pending_cleanup_entries;
-            assert!(visits <= MAX_PENDING_PROJECTION_CLEANUP_PER_PASS);
-            later_pass_visits.push(visits);
-            if !recovery_path.exists() {
-                break;
-            }
-        }
-        assert!(
-            !recovery_path.exists(),
-            "a full retained prefix starved the later changed sidecar"
-        );
-        assert!(later_pass_visits.len() <= 2);
-        let conflicts = fs::read_dir(fixture.graph_root.join("pages"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with("Tine-recovered-") && name.ends_with(".projection-conflict")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(fs::read(conflicts[0].path()).unwrap(), changed);
-    }
-
-    #[test]
-    fn final_quarantine_same_byte_rebind_preserves_both_resources() {
-        let fixture = Fixture::new_replacement("final-quarantine-same-byte-rebind");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
-        let retained = quarantine.with_extension("retained-provider-inode");
-        let raced_quarantine = quarantine.clone();
-        let raced_retained = retained.clone();
-        crate::model::set_projection_recovery_final_retirement_hook_for_test(move || {
-            fs::rename(&raced_quarantine, &raced_retained)?;
-            fs::write(&raced_quarantine, b"- base\n")
-        });
-
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(fs::read(quarantine).unwrap(), b"- base\n");
-        assert_eq!(fs::read(retained).unwrap(), b"- base\n");
-        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn cleanup_crash_cuts_resume_quarantine_and_marker_retirement_idempotently() {
-        let fixture = Fixture::new_replacement("cleanup-crash-cuts");
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    None,
-                )
-                .unwrap(),
-            ProjectionRecoveryCleanup::Quarantined
-        );
-        crate::model::set_projection_recovery_final_retirement_hook_for_test(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "crash after graph-local quarantine",
-            ))
-        });
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Interrupted
-        );
-        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
-        assert!(!recovery_path.exists());
-        assert_eq!(fs::read(&quarantine).unwrap(), b"- base\n");
-        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
-
-        let reopened = fixture.reopen_store();
-        let (_, record) = reopened
-            .pending_projection_cleanup()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                std::slice::from_ref(&record),
-                Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
-            )
-            .unwrap();
-        assert!(!quarantine.exists());
-        // Crash before retiring the durable marker. The next reopen observes
-        // exact absence and retires only that one still-pending attempt.
-        let reopened = fixture.reopen_store();
-        let (_, record) = reopened
-            .pending_projection_cleanup()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        fixture
-            .graph
-            .retire_completed_projection_recovery(
-                fixture.intent.path().as_str(),
-                std::slice::from_ref(&record),
-                Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
-            )
-            .unwrap();
-        reopened.retire_pending_projection_cleanup(&record).unwrap();
-        assert!(fixture
-            .reopen_store()
-            .pending_projection_cleanup()
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn completed_recovery_retirement_preserves_parent_rebind_and_original_quarantine() {
-        let fixture = Fixture::new_at_with_base(
-            "completed-recovery-retirement-parent-rebind",
-            "pages/深い/authority ☕.md",
-            Some(b"- base\n"),
-        );
-        let (_reservation, recovery_path, records) = fixture.complete_replacement();
-        let parent = recovery_path.parent().unwrap().to_path_buf();
-        let moved_parent = parent.with_file_name("深い-retained");
-        let retained_parent = moved_parent.clone();
-        let replacement_path = recovery_path.clone();
-        crate::model::set_projection_recovery_retirement_hook_for_test(move || {
-            fs::rename(&parent, &moved_parent)?;
-            fs::create_dir(&parent)?;
-            fs::write(&replacement_path, b"- base\n")
-        });
-
-        assert_eq!(
-            fixture
-                .graph
-                .retire_completed_projection_recovery(
-                    fixture.intent.path().as_str(),
-                    &records,
-                    None,
-                )
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(fs::read(&recovery_path).unwrap(), b"- base\n");
-        let quarantine_name = retirement_quarantine_path(&recovery_path, &records[0])
-            .file_name()
-            .unwrap()
-            .to_owned();
-        assert_eq!(
-            fs::read(retained_parent.join(quarantine_name)).unwrap(),
-            b"- base\n"
         );
     }
 

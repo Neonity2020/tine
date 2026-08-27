@@ -1410,11 +1410,18 @@ detect corruption either. Three such helpers existed on the managed projection
 paths and fired three times per save and eight times per cross-page move; they
 are deleted, and no read path may reintroduce one. See the `MS-REF-` note below.
 
-**Invariant — a projection operation flushes one directory, the one whose
-entries it changed.** `model::sync_projection_chain_with_class` — the single
-place every projection directory barrier passes through, for Direct Files and
-managed storage alike — flushes `chain.last()` and nothing above it. The
-argument has two halves and they are exhaustive:
+**Invariant — managed projection takes one directory barrier per turn per leaf
+directory.** A projection turn defers reconstructible graph-directory barriers
+until its final name change, deduplicates them by opened leaf-directory
+identity, and flushes each distinct leaf exactly once before checkpoint. File
+barriers remain one per distinct staged inode. Strict private-authority and
+conflict-trash barriers are not coalesced into this reconstructible point.
+
+This collapse is managed-class-conditional. Direct Files does not execute a
+projection turn and its publication barriers are unchanged; the same
+`sync_projection_chain_with_class` primitive still flushes `chain.last()` and
+nothing above it immediately. The leaf-only argument has two halves and they
+are exhaustive:
 
 * An ancestor **Tine created during this operation** is made durable when it is
   created, not afterwards: `model::create_projection_chain_component` is the
@@ -1448,16 +1455,29 @@ Enforced by
 `model::tests::a_projection_operation_flushes_one_directory_whatever_its_depth`
 (chain depth must not change the barrier count) and
 `model::tests::a_created_projection_ancestor_costs_exactly_one_extra_barrier`
-(each created ancestor still costs its own barrier, exactly once).
+(each created ancestor still costs its own barrier, exactly once), plus
+`model::tests::a_same_directory_move_takes_one_directory_barrier` and
+`model::tests::managed_barrier_collapse_does_not_change_direct_files_retire_publish_barriers` for the
+turn boundary and the class guard.
 
 **The budget, and where it stands.** `crate::durability_counters` counts every
 barrier `tine-core` initiates and
 `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 asserts the per-operation totals against
-`MANAGED_SAVE_BARRIER_BUDGET` = **35** and `MANAGED_MOVE_BARRIER_BUDGET` =
-**112**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+`MANAGED_SAVE_BARRIER_BUDGET` = **29** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**87**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
 appends and SQLite file-set publication are not reachable from this crate and
 are excluded (measured at three more per save, four per move).
+
+The packet-2b collapse reduced the complete packet-2b-pre ledgers from 35 to 29
+for a save and from 112 to 87 for a cross-page move. The exact intermediate
+attribution while receipt publications still exist is: save foreground
+`file_fsync=1 dir_fsync=2 syncfs=0 total=3`, save total
+`file_fsync=12 dir_fsync=16 syncfs=1 total=29`; move foreground is zero and move
+total is `file_fsync=40 dir_fsync=46 syncfs=1 total=87`. These are pinned with
+no headroom. The removed 6/25 directory barriers were repeated
+`SharedReconstructibleProjection` barriers within turns; no strict authority or
+quarantine barrier was removed.
 
 The 2026-08-27 counter-completeness sweep raised those enforced numbers from
 25/74 without adding or moving a single durability syscall. This is measurement
@@ -1495,8 +1515,8 @@ because no in-scope failure needed it, not because it was expensive:
 Enforced by `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 and `oplog::projection_store::tests::an_empty_pending_cleanup_queue_elides_the_durable_round_flip`.
 
-The cost-model audit's target is 3 and 5. The gap is stated here rather than
-hidden, and it is in two places that this contract does not yet cover:
+The cost-model audit's target is 3 and 5. The remaining gap is stated here
+rather than hidden:
 
 * The **projection receipt store** publishes five artifacts per intent (base,
   intent, attempt reservation, mutation authority, completion) = 10 barriers per
@@ -1509,15 +1529,11 @@ hidden, and it is in two places that this contract does not yet cover:
   at a time: each is separated from the next by a read-back of the artifact just
   published, so staging them behind one barrier would have to carry the staged
   bytes in memory as well. Collapsing that is the next step, not this one.
-* The **projection directory chain** is still entered about six times per
-  foreground save. Each entry now costs exactly one barrier instead of one per
-  chain level — the 2026-08-26 chain-flush cut, measured on the fixture as
-  foreground 14 → 8 and per-save total 37 → 28, cross-page move 93 → 77, before
-  the 2026-08-27 removals above took those totals to 25 and 74 — but six entries
-  is still six barriers, and collapsing *those* means changing the
-  publication protocol rather than the barrier rule. That is the user-visible
-  Markdown write path, whose temp + fsync + rename + base-revision guard + lock
-  semantics are deliberately untouched.
+
+The remaining gap is therefore receipt publication, not repeated managed graph
+directory barriers. Direct Files' user-visible Markdown publication keeps its
+temp + fsync + rename + base-revision guard + lock and immediate directory
+barriers unchanged.
 
 ### 2.10b No-clobber publication when the filesystem has no rename flags
 
@@ -1929,6 +1945,83 @@ journey boundary by
 `sync_runtime::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem`
 and
 `…::android_managed_storage_journey_holds_one_page_on_a_normalizing_graph_filesystem`.
+
+### 2.10e Projection-turn identities and graph names
+
+Every managed projection name is derived from its durable turn record, not from
+receipt-store or process identity. Derivation scheme 1 hashes the domain tag
+`tine/projection-turn/v1\0`, the big-endian scheme number, workspace, lineage,
+device, endpoint, one-byte sequence domain and big-endian sequence into the
+32-byte `turn_id`. For page index `i`, it hashes
+`tine/projection-attempt/v2\0 || turn_id || u32_be(i) || page_id`, takes the
+first 16 bytes, and applies the RFC 9562 UUID version-8 and variant masks. The
+three graph names are then:
+
+```
+.{target}.{attempt_id.simple()}.projection.recovery
+.{target}.{attempt_id.simple()}.projection.staged
+.{target}.{attempt_id.simple()}.projection.withdrawn
+```
+
+Integers are big-endian and `simple()` is lowercase hexadecimal without
+hyphens. A receipt reservation records this supplied attempt id; it does not
+derive another one. Replay has one compatibility rule: an existing durable
+reservation or mutation authority is resumed under the attempt id it recorded,
+including packet-2a residue. Only a page without such residue starts under the
+turn-derived id. This is I2a: an undrained turn can enumerate every name its
+managed executor may have left behind.
+
+The live scheme list is `LIVE_PROJECTION_TURN_DERIVATION_SCHEMES`; an unknown
+scheme is a protocol refusal, never guessed. The byte-level derivation and the
+legacy-residue rule are enforced by `oplog::projection_turn_journal::tests`,
+`oplog::projection_store::tests::a_turn_crashed_under_2a_replays_under_2b_without_refusal`,
+and the real-store recovery-equivalence oracle.
+
+### 2.10f The interrupted-publication recovery walk
+
+Editor publication is the deliberate exception to derivable graph names (I2b).
+It is shared with Direct Files and uses process-scoped recovery names. New
+managed names carry four fields,
+`.{target}.{pid}.{seq}.{turn8}.editor-recovery`; the parser accepts that exact
+shape and the three-field legacy shape. It is a parser, not a suffix glob: the
+leading dot, numeric process fields, hexadecimal turn field when present,
+known suffix, and text-extension target must all validate.
+
+Every checked graph open performs one bounded, no-follow
+interrupted-publication walk before either journal is opened or replayed. The
+walk uses the retained managed-text inventory limits, reads no document
+contents, restores a sole claimant over a missing live name with no-replace,
+and moves every competing claimant to conflict trash. Traversal, bounds,
+permission, and unsafe-entry errors propagate through `open_checked`; they may
+not be converted into an empty result. This is I2c: a failed walk refuses
+activation before replay can publish onto an incompletely recovered tree.
+
+`model::tests::checked_open_fails_closed_when_the_recovery_name_walk_exceeds_its_bound`,
+`model::tests::editor_recovery_names_accept_legacy_and_turn_derived_shapes`, and
+`sync_runtime::tests::the_open_time_recovery_walk_precedes_every_journal_replay`
+enforce the bounds, grammar, API propagation, and source ordering.
+
+### 2.10g Retain-never-delete recovery
+
+Recovery may unlink a graph-tree object only inside the live turn that captured
+both its bytes and its exact open-file identity, and only while both still
+match. A reopened process has no such capability. Anything unbound, changed,
+occupied, or merely byte-identical under another identity is moved intact to
+`.trash/conflicts/`; it is never treated as scratch and unlinked.
+
+Quarantine is itself a durability protocol. It validates a no-follow,
+single-link source, renames no-replace into strict `PrivateDurableAuthority`
+conflict trash, flushes the destination chain first and the source chain second,
+then reopens and verifies identity. Created ancestors are flushed eagerly. A
+hard-link, folded-name, or other refusal leaves the source in place and its
+durable pending-cleanup receipt records the residue; the owning turn cannot
+discard that debt as successful cleanup. Thus every derived or discovered
+leftover is restored, quarantined, or durably reported in place before its turn
+checkpoints.
+
+The crash and external-race coverage lives in the packet-2b C3-C6, R2-R5 and
+X5-X6 tests, including occupied staged-name quarantine, in-turn exact-identity
+retirement, post-crash retention, and hard-link refusal.
 
 ## 4. Concord base ledger (Direct Files)
 

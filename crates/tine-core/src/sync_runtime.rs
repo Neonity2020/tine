@@ -19240,6 +19240,22 @@ impl RuntimeActor {
         };
         let outcome = match pending {
             PendingManagedLocalCommit::Projection(pending) => {
+                let path = ManagedPath::parse(pending.relative_path().to_owned())
+                    .map_err(|error| format!("pending foreground path is invalid: {error}"))?;
+                if matches!(self.graph.read_projection_input(&path), Ok(None))
+                    && !self.graph.has_interrupted_publication_claimant(&path)
+                {
+                    // The durable foreground frame remains queued. W4 ran
+                    // before this runtime was opened, so claimant-free absence
+                    // is an external deletion: stop trying to resurrect the W1
+                    // target and let journal drain accept the original batch
+                    // before the normal external-import lane authors absence.
+                    self.managed_local
+                        .as_mut()
+                        .expect("clean foreground journal remains installed")
+                        .last_failure = None;
+                    return Ok(true);
+                }
                 TrustedLocalCommitCoordinator::retry_pending_projection(&self.graph, pending)
             }
             PendingManagedLocalCommit::Overlay(recovery) => {
@@ -29311,6 +29327,183 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_foreground_no_claimant_crash_lands_in_the_conflict_dock_not_a_refusal() {
+        let fixture = ActivationFixture::nested_unicode("foreground-external-delete", 0xa1783);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        )
+        .unwrap();
+        let (mut page, revision) = match actor
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "Root.md".into(),
+                },
+            })
+            .unwrap()
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("foreground target did not load: {other:?}"),
+        };
+        page.blocks[0].raw = "journal committed before an external deletion".into();
+
+        crate::model::inject_journal_projection_before_publish_failure(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "injected append-before-W1 cut",
+        ));
+        let saved = actor
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                &saved,
+                SyncApplicationPageSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::BlockedRecovery { .. }
+                }
+            ),
+            "unexpected post-append outcome: {saved:?}"
+        );
+        assert_eq!(actor.managed_local.as_ref().unwrap().pending_count(), 1);
+
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        actor
+            .observe(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+
+        let mut ticks = Vec::new();
+        for _ in 0..128 {
+            ticks.push(actor.tick());
+            let missing = matches!(
+                actor
+                    .load_application_page(SyncApplicationPageLoadRequest {
+                        page: SyncApplicationPageSelector::ExactPath {
+                            path: "Root.md".into(),
+                        },
+                    })
+                    .unwrap(),
+                SyncApplicationPageLoadOutcome::Missing { .. }
+            );
+            if actor.managed_local.as_ref().unwrap().pending_count() == 0
+                && !actor.clean.as_ref().unwrap().watcher_status().pending
+                && missing
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            actor.managed_local.as_ref().unwrap().pending_count(),
+            0,
+            "ticks: {ticks:?}"
+        );
+        assert!(
+            !actor.clean.as_ref().unwrap().watcher_status().pending,
+            "ticks: {ticks:?}"
+        );
+        assert!(matches!(
+            actor
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::ExactPath {
+                        path: "Root.md".into(),
+                    },
+                })
+                .unwrap(),
+            SyncApplicationPageLoadOutcome::Missing { .. }
+        ));
+        assert!(
+            !fixture.graph_root.join("Root.md").exists(),
+            "the accepted foreground target must not be resurrected over the external deletion"
+        );
+        drop(actor);
+
+        let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .expect("claimant-free deletion must cold-reopen");
+        assert!(
+            reopened
+                .graph
+                .read_projection_input(&ManagedPath::parse("Root.md").unwrap())
+                .unwrap()
+                .is_none(),
+            "a later open resurrected the accepted foreground bytes"
+        );
+        assert!(!fixture.graph_root.join("Root.md").exists());
+    }
+
+    #[test]
+    fn the_open_time_recovery_walk_precedes_every_journal_replay() {
+        let runtime_source = include_str!("sync_runtime.rs");
+        let open = runtime_source
+            .split_once("fn open_clean_runtime_resources_with_progress(")
+            .unwrap()
+            .1
+            .split_once("fn open_reconstructible_activation_receipts(")
+            .unwrap()
+            .0;
+        let graph_open = open.find("Graph::open_checked").unwrap();
+        let semantic_replay = open.find("drain_open_managed_local_journal").unwrap();
+        let projection_replay = open.find("drain_open_projection_turn_journal").unwrap();
+        assert!(graph_open < semantic_replay);
+        assert!(graph_open < projection_replay);
+
+        let model_source = include_str!("model.rs");
+        let checked_open = model_source
+            .split_once("pub fn open_checked_with_assets(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn has_interrupted_publication_claimant")
+            .unwrap()
+            .0;
+        assert!(
+            checked_open
+                .find("recover_interrupted_publishes()?")
+                .unwrap()
+                < checked_open.rfind("Ok(graph)").unwrap(),
+            "W4 must complete or fail before checked open can expose a graph"
+        );
+        let quarantine = model_source
+            .split_once("fn quarantine_projection_artifact(")
+            .unwrap()
+            .1
+            .split_once("fn create_editor_staged_recovery(")
+            .unwrap()
+            .0;
+        assert!(
+            quarantine
+                .find("sync_projection_chain_required(&destination.chain)")
+                .unwrap()
+                < quarantine
+                    .find("sync_projection_chain_required(&parent.chain)")
+                    .unwrap(),
+            "quarantine must make its destination name durable before its source removal"
+        );
+
+        let drain_source = include_str!("oplog/local_journal_drain.rs");
+        let absence = drain_source
+            .find("has_interrupted_publication_claimant(intent.path())")
+            .unwrap();
+        let accept_absence = drain_source[absence..].find("Ok(None) => true").unwrap();
+        assert!(
+            accept_absence > 0,
+            "claimant refusal must precede C-absent acceptance"
+        );
+    }
+
     /// A foreground page save must not depend on the frontend repeatedly
     /// resubmitting it to advance an earlier, finite retained continuation.
     /// The managed actor owns that continuation and can settle it before
@@ -29453,8 +29646,11 @@ mod tests {
 
     /// The same errno off Android remains a real projection failure. The
     /// journaled edit is already durable, but the application response defers
-    /// while the disposable Markdown projection stays pending and names the
-    /// failed barrier rather than pretending it reached disk.
+    /// while the visible Markdown projection stays pending and names the
+    /// failed end-of-turn barrier rather than pretending it reached disk. The
+    /// collapsed-barrier protocol permits the publication rename to be visible
+    /// before that one barrier refuses; replay still owns it until the barrier
+    /// succeeds.
     #[test]
     fn a_projection_directory_barrier_refusal_stays_pending_off_android() {
         let fixture = ActivationFixture::nested_unicode("clean-desktop-einval", 0xa1784);
@@ -29500,7 +29696,7 @@ mod tests {
             ),
             "the accepted journal edit must defer while projection is pending: {outcome:?}"
         );
-        assert!(!fs::read_to_string(fixture.graph_root.join("Root.md"))
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
             .unwrap()
             .contains("desktop barrier refusal is fatal"));
 

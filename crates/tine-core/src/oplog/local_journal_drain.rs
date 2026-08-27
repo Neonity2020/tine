@@ -732,12 +732,18 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                 }
             }
             Ok(None) if exact_target.is_none() || projection.precondition_base().is_none() => false,
-            Ok(None) => {
+            Ok(None) if graph.has_interrupted_publication_claimant(intent.path()) => {
                 return conflict(
                     ManagedLocalDrainStage::Authenticate,
-                    "graph target is not the exact journal-authorized bytes",
+                    "an unresolved publication artifact still claims the absent journal target",
                 )
             }
+            // W4 has already reconciled publication artifacts before any
+            // journal replay. A claimant-free absence is therefore a real
+            // external deletion, not a torn W1 window. Accept this older batch
+            // first, suppress its obsolete projection, and let the ordinary
+            // clean watcher/full-scan import the deletion as the next batch.
+            Ok(None) => true,
             Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
         };
         if superseded {
