@@ -501,6 +501,16 @@ assert.match(
   /pull_request:[\s\S]*?paths-ignore:[\s\S]*?"\*\*\/\*\.md"/,
   "docs-only pull requests still start app validation"
 );
+assert.match(
+  ciWorkflow,
+  /pr-validation:[\s\S]*?tool: wasm-pack@0\.15\.0[\s\S]*?name: F-Droid clean-source WASM rebuild is current[\s\S]*?npm run build:wasm[\s\S]*?git diff --exit-code -- src\/render\/wasm/,
+  "pull requests do not rebuild the same WASM source boundary F-Droid consumes"
+);
+assert.match(
+  ciWorkflow,
+  /test:[\s\S]*?name: Full CI \/ Linux tests and release contracts[\s\S]*?tool: wasm-pack@0\.15\.0[\s\S]*?name: F-Droid clean-source WASM rebuild is current[\s\S]*?npm run build:wasm[\s\S]*?git diff --exit-code -- src\/render\/wasm/,
+  "full release CI does not prove the F-Droid WASM source rebuild"
+);
 for (const name of REQUIRED_FULL_CI_JOBS) {
   if (/Full CI \/ Linux tine-core nextest shard [1-4]\/4/.test(name)) continue;
   assert.ok(ciWorkflow.includes(`name: ${name}`), `CI workflow is missing stable evidence job ${name}`);
