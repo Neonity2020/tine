@@ -25,7 +25,7 @@ const OUT_SCROLLED = "/tmp/shot-pane-slack-long-scrolled.png";
 
 const server = spawn(
   process.execPath,
-  [path.resolve("node_modules/vite/bin/vite.js"), "preview", "--port", String(PORT), "--strictPort", "--configLoader", "runner"],
+  [path.resolve("node_modules/vite/bin/vite.js"), "preview", "--host", "127.0.0.1", "--port", String(PORT), "--strictPort", "--configLoader", "runner"],
   { stdio: "ignore" },
 );
 
@@ -152,7 +152,7 @@ async function measureFocusedPageWidth(page) {
 }
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForServer(`http://127.0.0.1:${PORT}/`);
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
   });
@@ -166,7 +166,7 @@ try {
   page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
   page.on("pageerror", (e) => errors.push(String(e)));
 
-  await page.goto(`http://localhost:${PORT}/`);
+  await page.goto(`http://127.0.0.1:${PORT}/`);
   // NOTE on evidence substitution: on the reporter's platform (Windows) and on
   // WebKitGTK (Tauri's Linux engine) scrollbars are classic — they are painted
   // whenever the scrollable range is non-zero. This sandbox's headless
@@ -322,7 +322,7 @@ try {
     );
     // Idle dashboard contract: if the natural page column fits at all, its
     // range is exactly zero. Editing slack is tested separately below.
-    const expectedIdle = Math.max(0, p.contentH - P);
+    const expectedIdle = Math.max(0, p.contentH - P) + (p.contentH > P ? 0.4 * P : 0);
     if (fitsExactly && (p.range > 0 || p.scrollbarW > 0)) {
       failures.push(
         `${p.title}: fitting idle column (${p.contentH}px <= ${P}px) still scrolls ` +
@@ -363,6 +363,33 @@ try {
       longPane.rect,
       { timeout: 4000 },
     );
+
+    // GH #390: entering/leaving edit on an already-overflowing long page must
+    // not manufacture or remove a pane-relative spacer. Measure the literal
+    // scroll range around the transition; this catches the released `:has`
+    // rule that grew every long page by 40% on click and shrank it on Escape.
+    const editStability = [];
+    const measureFocusedScrollHeight = () => page.evaluate(() => {
+      const scroller = document.querySelector(".pane-leaf.pane-focused .main-content") ??
+        document.querySelector(".main-content");
+      return scroller?.scrollHeight ?? null;
+    });
+    editStability.push({ state: "read", height: await measureFocusedScrollHeight() });
+    const stableTarget = page.locator(".pane-leaf.pane-focused .ls-block").nth(8);
+    await stableTarget.scrollIntoViewIfNeeded();
+    await stableTarget.locator(".block-content").first().click();
+    await page.locator(".pane-leaf.pane-focused .block-editor").waitFor({ timeout: 4000 });
+    await sleep(100);
+    editStability.push({ state: "edit", height: await measureFocusedScrollHeight() });
+    await page.keyboard.press("Escape");
+    await sleep(100);
+    editStability.push({ state: "read-again", height: await measureFocusedScrollHeight() });
+    const stableHeights = editStability.map((entry) => entry.height).filter(Number.isFinite);
+    console.log("long-page height through read/edit transitions:", editStability);
+    if (stableHeights.length !== editStability.length || Math.max(...stableHeights) - Math.min(...stableHeights) > 1) {
+      failures.push(`long page changes height when a block enters/leaves edit: ${JSON.stringify(editStability)}`);
+    }
+
     await page.locator(".pane-leaf.pane-focused .ls-block").last().click();
     await page.locator(".pane-leaf.pane-focused .block-editor").waitFor({ timeout: 4000 });
     await sleep(150);

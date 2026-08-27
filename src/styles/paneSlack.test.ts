@@ -55,8 +55,10 @@ describe("pane end-of-page slack is pane-relative (GH #369)", () => {
     expect(spacer).toMatch(/flex:\s*1\s+1\s+0/);
   });
 
-  it("restores 40%-of-pane tail room only while a page editor is active", () => {
-    const active = ruleBody(/^\.main-content:has\(\.block-editor\)::after\s*\{([^}]*)\}/m);
-    expect(active).toMatch(/flex:\s*1\s+0\s+40%/);
+  it("keeps 40%-of-pane tail room stable for naturally overflowing pages (GH #390)", () => {
+    const overflowing = ruleBody(/^\.main-content\.natural-content-overflow::after\s*\{([^}]*)\}/m);
+    expect(overflowing).toMatch(/flex:\s*1\s+0\s+40%/);
+    // Mounting a textarea is transient and must not change pane geometry.
+    expect(app).not.toMatch(/\.main-content:has\(\.block-editor\)::after/);
   });
 });

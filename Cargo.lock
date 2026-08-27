@@ -2931,8 +2931,8 @@ dependencies = [
 
 [[package]]
 name = "lsdoc"
-version = "0.5.5"
-source = "git+https://github.com/martinkoutecky/lsdoc?tag=v0.5.5#c79cb059da5b4360ebde2e5fd953fa1f43ddabc3"
+version = "0.5.6"
+source = "git+https://github.com/martinkoutecky/lsdoc?tag=v0.5.6#74b9e62e04d6c4645bed1d68d97be1464ef101b7"
 dependencies = [
  "memchr",
  "phf 0.11.3",
@@ -5623,7 +5623,7 @@ dependencies = [
 
 [[package]]
 name = "tine"
-version = "0.6.97"
+version = "0.6.98"
 dependencies = [
  "base64 0.22.1",
  "cap-std",
@@ -5660,7 +5660,7 @@ dependencies = [
 
 [[package]]
 name = "tine-core"
-version = "0.6.97"
+version = "0.6.98"
 dependencies = [
  "ahash",
  "ammonia",
@@ -5694,7 +5694,7 @@ dependencies = [
 
 [[package]]
 name = "tine-ios-folder-picker-native"
-version = "0.6.97"
+version = "0.6.98"
 dependencies = [
  "tauri",
  "tauri-plugin",

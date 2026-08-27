@@ -522,12 +522,36 @@ textarea {
   background: var(--border-color);
 }
 
+/* A frameless desktop window carries three native-replacement window buttons in
+   this same row, so it reaches its real fit boundary earlier than Android/iOS
+   (or a system-decorated desktop window).  Treat that extra cluster as actual
+   occupied space instead of penalizing every phone with the desktop cutoff. */
 @container topbar (max-width: 460px) {
+  .topbar:has(.win-controls) .topbar-optional-action {
+    display: none;
+  }
+  .topbar:has(.win-controls) .topbar-right {
+    margin-left: auto;
+  }
+  .topbar:has(.win-controls) .topbar-overflow {
+    display: block;
+  }
+  .topbar:has(.win-controls) .topbar-overflow [data-topbar-overflow-action="back"],
+  .topbar:has(.win-controls) .topbar-overflow [data-topbar-overflow-action="forward"],
+  .topbar:has(.win-controls) .topbar-overflow .topbar-overflow-sep {
+    display: none;
+  }
+}
+
+@container topbar (max-width: 345px) {
   /* The tab strip is the flexible middle (.tab-bar flex:1 1 auto, min-width:0;
      .tab-strip-scroll overflow-x:auto) — it shrinks and scrolls, so it never
      clips the fixed clusters and must stay reachable on a narrow desktop window.
      Only the fixed-width low-priority action buttons overflow into the "…" menu.
-     (Real mobile already hides tabs via the isMobilePlatform Show + spacer.) */
+     (Real mobile already hides tabs via the isMobilePlatform Show + spacer.)
+     345px is the measured CONTENT-BOX fit boundary (the toolbar has 28px of
+     inline padding): at a 390px phone viewport every frequent action fits
+     directly, including the compact workspace switcher. */
   .topbar .topbar-optional-action {
     display: none;
   }
@@ -877,11 +901,11 @@ textarea {
   flex: 1 1 0;
 }
 
-/* The breathing room is an editing affordance. Restore its non-shrinking 40%
-   pane-relative basis only while this pane owns a mounted editor: long-page
-   tails can still move comfortably above the bottom edge, while read-only
-   dashboards never scroll through blank space. */
-.main-content:has(.block-editor)::after {
+/* The breathing room belongs to pages whose NATURAL content already overflows,
+   not to the transient presence of an editor. PaneScroller measures only the
+   real inner column, so long-page tails keep a stable 40% affordance through
+   read/edit transitions while fitting dashboards never gain a scroll range. */
+.main-content.natural-content-overflow::after {
   flex: 1 0 40%;
 }
 

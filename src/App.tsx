@@ -1,4 +1,4 @@
-import { Show, Suspense, createEffect, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
+import { Show, Suspense, createEffect, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
 import { Sidebar } from "./components/Sidebar";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
 import { QueryWorkspace } from "./components/QueryWorkspace";
@@ -617,6 +617,59 @@ function PaneContent(props: { router: PaneRouter }): JSX.Element {
   );
 }
 
+/** A page pane's end slack is a property of its natural content geometry, not
+ *  of whether a textarea happens to be mounted.  Long pages keep the same
+ *  breathing room in read and edit mode; fitting dashboard panes keep none.
+ *  This makes click/edit transitions height-stable (GH #390) while retaining
+ *  the pane-relative tail affordance from GH #369. */
+function PaneScroller(props: {
+  paneId: string;
+  router: PaneRouter;
+  class?: string;
+  identifyPane?: boolean;
+  children: JSX.Element;
+}): JSX.Element {
+  let scroller!: HTMLElement;
+  let inner!: HTMLDivElement;
+  const [naturalOverflow, setNaturalOverflow] = createSignal(false);
+
+  const measure = () => {
+    if (!scroller?.isConnected || !inner?.isConnected) return;
+    setNaturalOverflow(inner.scrollHeight > scroller.clientHeight + 1);
+  };
+
+  onMount(() => {
+    measure();
+    const frame = requestAnimationFrame(measure);
+    if (typeof ResizeObserver === "undefined") {
+      onCleanup(() => cancelAnimationFrame(frame));
+      return;
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(scroller);
+    observer.observe(inner);
+    onCleanup(() => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    });
+  });
+
+  return (
+    <main
+      class={`main-content${props.class ? ` ${props.class}` : ""}`}
+      classList={{ "natural-content-overflow": naturalOverflow() }}
+      tabindex="-1"
+      data-pane-id={props.identifyPane === false ? undefined : props.paneId}
+      ref={(el) => {
+        scroller = el;
+        props.router.setScrollerElement(el);
+      }}
+    >
+      <div class="main-content-inner" ref={inner}>{props.children}</div>
+    </main>
+  );
+}
+
 function PaneLeaf(props: { paneId: string }): JSX.Element {
   const router = paneRouter(props.paneId);
   const multi = () => layoutHasMultiplePanes();
@@ -645,16 +698,9 @@ function PaneLeaf(props: { paneId: string }): JSX.Element {
             >
               <PaneTabSplitPreview paneId={props.paneId} />
               <PaneEdgeSegHighlight paneId={props.paneId} />
-              <main
-                class="main-content"
-                tabindex="-1"
-                data-pane-id={props.paneId}
-                ref={(el) => router.setScrollerElement(el)}
-              >
-                <div class="main-content-inner">
-                  <PaneContent router={router} />
-                </div>
-              </main>
+              <PaneScroller paneId={props.paneId} router={router}>
+                <PaneContent router={router} />
+              </PaneScroller>
             </div>
           }
         >
@@ -676,11 +722,9 @@ function PaneLeaf(props: { paneId: string }): JSX.Element {
               paneStrip
               focused={focusedPaneId() === props.paneId}
             />
-            <main class="main-content pane-main-content" tabindex="-1" ref={(el) => router.setScrollerElement(el)}>
-              <div class="main-content-inner">
-                <PaneContent router={router} />
-              </div>
-            </main>
+            <PaneScroller paneId={props.paneId} router={router} class="pane-main-content" identifyPane={false}>
+              <PaneContent router={router} />
+            </PaneScroller>
           </div>
         </Show>
       </SurfaceContext.Provider>

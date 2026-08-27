@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.98] - 2026-08-27
+
 ### Changed
 
 - **Managed-storage projection recovery is prepared for cheaper durable
@@ -18,6 +20,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   turns, and a disposable per-page SQLite digest avoids rendering an unchanged
   page merely to prove it needs no terminal repair. Durability-barrier budgets
   remain 25 for a save and 74 for a cross-page move.
+
+- **The shared parser is updated to lsdoc v0.5.6.** Raw HTML recognition now
+  indexes every supported tag in one source pass, static HTML export renders
+  safe Hiccup vectors as markup, and deeply nested projections serialize
+  iteratively instead of consuming the native stack. Native and browser-WASM
+  consumers use the same released parser and serialization contract.
 
 - **Managed storage's private receipt-store format has been bumped**
   (development only). Projection records now carry an explicit target-kind
@@ -42,6 +50,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   section is open, including built-in shortcuts and a clear no-results state.
 
 ### Fixed
+
+- **Long pages no longer grow and shrink when a block enters or leaves edit
+  mode** (GH #390). Pane-relative end-of-page breathing room is now derived
+  from whether the page content naturally overflows, rather than from the
+  transient presence of a textarea, so its scroll geometry stays stable.
+
+- **A held mouse click now shows the block caret on mouse-down, matching
+  Logseq** (GH #368). Exact rendered-text caret placement still applies, and a
+  drag can still select text in the editor or escalate across blocks.
+
+- **Android and system-decorated windows keep frequent top-bar actions directly
+  visible whenever they fit** (GH #205). The overflow threshold now accounts
+  for whether Tine's three custom window controls actually occupy the row, so a
+  390px phone no longer hides calendar, journals, theme, and right sidebar in
+  the `...` menu while leaving usable space.
 
 - **Copying the in-app Guide no longer stops after its first page** (GH #391).
   Guide pages now carry the same completed-write receipt as ordinary Direct
@@ -3915,7 +3938,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.90...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.98...HEAD
+[0.6.98]: https://github.com/martinkoutecky/tine/compare/v0.6.97...v0.6.98
 [0.6.90]: https://github.com/martinkoutecky/tine/compare/v0.6.5...v0.6.90
 [0.6.0]: https://github.com/martinkoutecky/tine/compare/v0.5.10...v0.6.0
 [0.5.10]: https://github.com/martinkoutecky/tine/compare/v0.5.9...v0.5.10
