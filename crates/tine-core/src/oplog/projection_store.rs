@@ -348,7 +348,10 @@ fn publish_immutable_exact(
     }
 
     #[cfg(not(target_os = "android"))]
-    publish_immutable_exact_strict(dir, filename, bytes, kind)
+    {
+        crate::durability_counters::note_immutable_publication();
+        publish_immutable_exact_strict(dir, filename, bytes, kind)
+    }
 }
 
 /// Android's app-private filesystem is single-writer from Tine's point of
@@ -381,7 +384,6 @@ fn publish_android_private_immutable(
         return Ok(());
     }
 
-    crate::durability_counters::note_immutable_publication();
     let temp_name = format!(".tmp-{}", Uuid::new_v4());
     let temp_name_c = CString::new(temp_name.as_str())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt temp filename"))?;
@@ -406,7 +408,7 @@ fn publish_android_private_immutable(
     let mut temp = unsafe { File::from_raw_fd(temp_fd) };
     let result = (|| {
         temp.write_all(bytes)?;
-        temp.sync_all()?;
+        crate::durability_counters::sync_file(&temp)?;
         drop(temp);
 
         if verify_existing()? {
@@ -4190,7 +4192,7 @@ fn replace_mutation_authority_if_exact_inner(
     let mut temp = directory.open_with(&temp_name, &options)?;
     let result = (|| {
         temp.write_all(replacement)?;
-        temp.sync_all()?;
+        crate::durability_counters::sync_file(&temp)?;
         drop(temp);
         #[cfg(test)]
         if inject_cleanup_marker_failures {

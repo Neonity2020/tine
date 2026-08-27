@@ -46,6 +46,7 @@
 //! runtime sees that runtime's barriers and no other test's.
 
 use std::cell::RefCell;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -61,11 +62,11 @@ use std::sync::Arc;
 /// The value is asserted against the contract document by
 /// `durability_counters::tests::the_contract_states_the_barrier_budget`, so
 /// the two cannot drift apart.
-pub const MANAGED_SAVE_BARRIER_BUDGET: u64 = 25;
+pub const MANAGED_SAVE_BARRIER_BUDGET: u64 = 35;
 
 /// The same ceiling for one accepted cross-page (for example cross-day) move,
 /// which projects two pages and therefore pays the receipt-store cost twice.
-pub const MANAGED_MOVE_BARRIER_BUDGET: u64 = 74;
+pub const MANAGED_MOVE_BARRIER_BUDGET: u64 = 112;
 
 /// The primitive kinds counted here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +123,41 @@ fn attribute(kind: Barrier, count: u64) {
 pub(crate) fn note_immutable_publication() {
     note(Barrier::File);
     note(Barrier::Directory);
+}
+
+/// A regular file or directory handle that can be forced to stable storage.
+///
+/// Both standard and capability-scoped handles occur throughout `tine-core`.
+/// Keeping their raw primitive calls here gives the source guard one complete,
+/// reviewable boundary for file and directory barriers.
+pub(crate) trait DurableHandle {
+    fn sync_to_stable_storage(&self) -> io::Result<()>;
+}
+
+impl DurableHandle for std::fs::File {
+    fn sync_to_stable_storage(&self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+impl DurableHandle for cap_std::fs::File {
+    fn sync_to_stable_storage(&self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+/// Force one regular file to stable storage and record its barrier.
+#[inline]
+pub(crate) fn sync_file(file: &impl DurableHandle) -> io::Result<()> {
+    note(Barrier::File);
+    file.sync_to_stable_storage()
+}
+
+/// Force one directory handle to stable storage and record its barrier.
+#[inline]
+pub(crate) fn sync_directory(directory: &impl DurableHandle) -> io::Result<()> {
+    note(Barrier::Directory);
+    directory.sync_to_stable_storage()
 }
 
 /// A point-in-time reading of every counter.
@@ -275,6 +311,293 @@ mod tests {
                  See the removed-checks table in docs/storage-sync-contract.md."
             );
         }
+    }
+
+    #[test]
+    fn production_barrier_primitives_stay_inside_counted_wrappers() {
+        use std::collections::HashSet;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        fn visit(directory: &Path, files: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, files);
+                } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+
+        fn module_directory(source_path: &Path) -> PathBuf {
+            match source_path.file_name().and_then(|name| name.to_str()) {
+                Some("lib.rs" | "mod.rs") => source_path.parent().unwrap().to_path_buf(),
+                _ => source_path
+                    .parent()
+                    .unwrap()
+                    .join(source_path.file_stem().unwrap()),
+            }
+        }
+
+        fn test_only_external_modules(source_path: &Path, source: &str) -> Vec<PathBuf> {
+            let module_directory = module_directory(source_path);
+            let mut modules = Vec::new();
+            for suffix in source.split("#[cfg(test)]").skip(1) {
+                let declaration = suffix
+                    .trim_start()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
+                let declaration = declaration
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| declaration.strip_prefix("pub "))
+                    .unwrap_or(declaration);
+                let Some(name) = declaration
+                    .strip_prefix("mod ")
+                    .and_then(|name| name.strip_suffix(';'))
+                else {
+                    continue;
+                };
+                for candidate in [
+                    module_directory.join(format!("{name}.rs")),
+                    module_directory.join(name).join("mod.rs"),
+                ] {
+                    if candidate.exists() {
+                        modules.push(candidate);
+                    }
+                }
+            }
+            modules
+        }
+
+        fn without_inline_test_modules(source: &str) -> String {
+            fn matching_brace(source: &str, open: usize) -> Option<usize> {
+                let bytes = source.as_bytes();
+                let mut index = open;
+                let mut depth = 0_usize;
+                while index < bytes.len() {
+                    if bytes[index..].starts_with(b"//") {
+                        index += 2;
+                        while index < bytes.len() && bytes[index] != b'\n' {
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    if bytes[index..].starts_with(b"/*") {
+                        index += 2;
+                        let mut comment_depth = 1_usize;
+                        while index < bytes.len() && comment_depth > 0 {
+                            if bytes[index..].starts_with(b"/*") {
+                                comment_depth += 1;
+                                index += 2;
+                            } else if bytes[index..].starts_with(b"*/") {
+                                comment_depth -= 1;
+                                index += 2;
+                            } else {
+                                index += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    let raw_prefix = match bytes[index] {
+                        b'r' => Some(index + 1),
+                        b'b' if bytes.get(index + 1) == Some(&b'r') => Some(index + 2),
+                        _ => None,
+                    };
+                    if let Some(mut delimiter) = raw_prefix {
+                        let mut hashes = 0_usize;
+                        while bytes.get(delimiter) == Some(&b'#') {
+                            hashes += 1;
+                            delimiter += 1;
+                        }
+                        if bytes.get(delimiter) == Some(&b'"') {
+                            index = delimiter + 1;
+                            while index < bytes.len() {
+                                if bytes[index] == b'"'
+                                    && bytes.get(index + 1..index + 1 + hashes).is_some_and(
+                                        |suffix| suffix.iter().all(|byte| *byte == b'#'),
+                                    )
+                                {
+                                    index += 1 + hashes;
+                                    break;
+                                }
+                                index += 1;
+                            }
+                            continue;
+                        }
+                    }
+                    let string_quote = bytes[index] == b'"'
+                        || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"'));
+                    if string_quote {
+                        if bytes[index] == b'b' {
+                            index += 1;
+                        }
+                        index += 1;
+                        while index < bytes.len() {
+                            match bytes[index] {
+                                b'\\' => index += 2,
+                                b'"' => {
+                                    index += 1;
+                                    break;
+                                }
+                                _ => index += 1,
+                            }
+                        }
+                        continue;
+                    }
+                    if bytes[index] == b'\'' {
+                        let line_end = bytes[index + 1..]
+                            .iter()
+                            .position(|byte| *byte == b'\n')
+                            .map_or(bytes.len(), |relative| index + 1 + relative);
+                        if let Some(relative_close) = bytes[index + 1..line_end]
+                            .iter()
+                            .position(|byte| *byte == b'\'')
+                        {
+                            let close = index + 1 + relative_close;
+                            if close.saturating_sub(index) <= 8 {
+                                index = close + 1;
+                                continue;
+                            }
+                        }
+                    }
+                    match bytes[index] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(index + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                    index += 1;
+                }
+                None
+            }
+
+            let mut production = source.to_owned();
+            let mut search_from = 0;
+            while let Some(relative_attribute) = production[search_from..].find("#[cfg(test)]") {
+                let attribute = search_from + relative_attribute;
+                let mut item = attribute + "#[cfg(test)]".len();
+                loop {
+                    item += production[item..]
+                        .find(|character: char| !character.is_whitespace())
+                        .unwrap_or(production.len() - item);
+                    if !production[item..].starts_with("#[") {
+                        break;
+                    }
+                    let Some(attribute_end) = production[item..].find(']') else {
+                        break;
+                    };
+                    item += attribute_end + 1;
+                }
+                if !production[item..].starts_with("mod ") {
+                    search_from = item;
+                    continue;
+                }
+                let Some(relative_open) = production[item..].find('{') else {
+                    search_from = item;
+                    continue;
+                };
+                if production[item..]
+                    .find(';')
+                    .is_some_and(|semicolon| semicolon < relative_open)
+                {
+                    search_from = item;
+                    continue;
+                }
+                let open = item + relative_open;
+                let close = matching_brace(&production, open)
+                    .expect("a cfg(test) module must have balanced braces");
+                production.replace_range(attribute..close, "");
+                search_from = attribute;
+            }
+            production
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        visit(&root, &mut files);
+        files.sort();
+
+        // External modules declared directly behind `#[cfg(test)]` are not
+        // production source. Discover them from their parent declarations
+        // instead of maintaining a filename convention or an exclusion list.
+        let test_only_files = files
+            .iter()
+            .flat_map(|path| {
+                let source = fs::read_to_string(path).unwrap();
+                test_only_external_modules(path, &source)
+            })
+            .collect::<HashSet<_>>();
+
+        let primitive_patterns = [
+            ".sync_all(",
+            ".sync_data(",
+            "libc::fsync(",
+            "libc::fdatasync(",
+            "libc::syncfs(",
+            "rustix::fs::fsync(",
+            "rustix::fs::fdatasync(",
+            "rustix::fs::syncfs(",
+            "nix::unistd::fsync(",
+            "nix::unistd::fdatasync(",
+            "FlushFileBuffers(",
+            "NtFlushBuffersFile(",
+            "F_FULLFSYNC",
+            "F_BARRIERFSYNC",
+        ];
+        let mut raw_primitives = Vec::new();
+        for path in files {
+            if test_only_files.contains(&path) {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap();
+            // Inline modules declared directly behind `#[cfg(test)]` are also
+            // test-only. Remove their complete brace-balanced bodies while
+            // retaining production items that follow them in the same file.
+            let production = without_inline_test_modules(&source);
+            let compact = production
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            let relative = path.strip_prefix(&root).unwrap().to_string_lossy();
+            for pattern in primitive_patterns {
+                for _ in 0..compact.matches(pattern).count() {
+                    raw_primitives.push((relative.to_string(), pattern));
+                }
+            }
+        }
+        raw_primitives.sort();
+
+        assert_eq!(
+            raw_primitives,
+            vec![
+                ("durability_counters.rs".into(), ".sync_all("),
+                ("durability_counters.rs".into(), ".sync_all("),
+                ("filesystem_durability.rs".into(), "libc::syncfs("),
+                ("filesystem_durability.rs".into(), "libc::syncfs("),
+            ],
+            "a production durability primitive exists outside the counted \
+             file/directory wrappers in durability_counters.rs or the counted \
+             filesystem wrappers in filesystem_durability.rs"
+        );
+
+        let wrappers = without_inline_test_modules(include_str!("durability_counters.rs"));
+        assert_eq!(wrappers.matches("note(Barrier::File);").count(), 2);
+        assert_eq!(wrappers.matches("note(Barrier::Directory);").count(), 2);
+        let filesystem_wrappers = include_str!("filesystem_durability.rs");
+        assert_eq!(
+            filesystem_wrappers
+                .matches("note(crate::durability_counters::Barrier::Filesystem);")
+                .count(),
+            2
+        );
     }
 
     #[test]

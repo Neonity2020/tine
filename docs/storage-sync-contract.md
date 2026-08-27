@@ -1454,10 +1454,20 @@ Enforced by
 barrier `tine-core` initiates and
 `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 asserts the per-operation totals against
-`MANAGED_SAVE_BARRIER_BUDGET` = **25** and `MANAGED_MOVE_BARRIER_BUDGET` =
-**74**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+`MANAGED_SAVE_BARRIER_BUDGET` = **35** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**112**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
 appends and SQLite file-set publication are not reachable from this crate and
 are excluded (measured at three more per save, four per move).
+
+The 2026-08-27 counter-completeness sweep raised those enforced numbers from
+25/74 without adding or moving a single durability syscall. This is measurement
+visibility, not a latency regression: the save fixture made five previously
+unattributed projection-receipt publications visible (five file + five
+directory barriers); the move fixture made sixteen such publication pairs,
+five mutation-authority replacement file barriers, and one clean-foreground
+retirement directory barrier visible. The budgets are pinned to those complete
+measured totals with no headroom, and the source guard rejects any future raw
+barrier outside the counted wrappers.
 
 **Barriers with no in-scope scenario are deleted, not budgeted.** Three
 mechanisms left the count on 2026-08-27 (save 28 → 25, move 77 → 74), each

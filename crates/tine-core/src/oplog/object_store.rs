@@ -2623,7 +2623,7 @@ impl ObjectStore {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         let file = run.open_with(BLOCK_CLAIM_INDEX_FILE, &options)?.into_std();
-        file.sync_all()?;
+        crate::durability_counters::sync_file(&file)?;
         sync_dir_required(&run)?;
         Ok(BlockClaimIndexStore {
             backing: BlockClaimIndexBacking::Standalone(Mutex::new(file)),
@@ -5472,7 +5472,7 @@ impl DurableEngineHistoryStore {
         let mut temp = self.control.open_with(&temp_name, &options)?;
         let result = (|| {
             temp.write_all(replacement.to_string().as_bytes())?;
-            temp.sync_all()?;
+            crate::durability_counters::sync_file(&temp)?;
             drop(temp);
             #[cfg(test)]
             ENGINE_HISTORY_FAIL_BEFORE_HEAD_SWAP.with(|fail| {
@@ -7067,8 +7067,7 @@ impl ArchiveBatchPublication {
                         &self.namespaces[artifact.namespace],
                         &artifact.temp_name,
                     )?;
-                    crate::durability_counters::note(crate::durability_counters::Barrier::File);
-                    file.sync_all()?;
+                    crate::durability_counters::sync_file(&file)?;
                 }
                 Ok(())
             }
@@ -7318,7 +7317,7 @@ fn open_engine_history_transition_lock(root: &Dir) -> Result<fs::File, StoreErro
             "engine history transition lock is not a regular no-follow file".into(),
         ));
     }
-    file.sync_all()?;
+    crate::durability_counters::sync_file(&file)?;
     sync_dir_required(root)?;
     Ok(file)
 }
@@ -7344,7 +7343,7 @@ fn open_engine_history_transition_lock(root: &Dir) -> Result<fs::File, StoreErro
             "engine history transition lock is not a regular no-follow file".into(),
         ));
     }
-    file.sync_all()?;
+    crate::durability_counters::sync_file(&file)?;
     sync_dir_required(root)?;
     Ok(file)
 }

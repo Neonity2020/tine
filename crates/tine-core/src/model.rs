@@ -23971,42 +23971,20 @@ pub fn dir_fsync_error_is_unsupported(error: &io::Error) -> bool {
     dir_fsync_is_unsupported(error)
 }
 
-/// A file handle that can be forced to stable storage.
-///
-/// Both `std::fs::File` and the capability-scoped `cap_std::fs::File` appear on
-/// managed write paths; this lets one counted barrier helper serve both.
-pub(crate) trait DurableFileHandle {
-    fn sync_to_stable_storage(&self) -> io::Result<()>;
-}
-
-impl DurableFileHandle for fs::File {
-    fn sync_to_stable_storage(&self) -> io::Result<()> {
-        self.sync_all()
-    }
-}
-
-impl DurableFileHandle for cap_std::fs::File {
-    fn sync_to_stable_storage(&self) -> io::Result<()> {
-        self.sync_all()
-    }
-}
-
 /// `fsync` one regular file and record the durability barrier.
 ///
 /// Every production file barrier in this module goes through here so the
 /// per-operation barrier count is a measurable, testable number rather than an
 /// invisible sum spread across modules (2026-08-26 cost-model audit, D1).
 #[inline]
-fn barrier_sync_all(file: &impl DurableFileHandle) -> io::Result<()> {
-    crate::durability_counters::note(crate::durability_counters::Barrier::File);
-    file.sync_to_stable_storage()
+fn barrier_sync_all(file: &impl crate::durability_counters::DurableHandle) -> io::Result<()> {
+    crate::durability_counters::sync_file(file)
 }
 
 /// `fsync` one already-opened directory handle and record the barrier.
 #[inline]
 fn barrier_sync_dir_handle(handle: &fs::File) -> io::Result<()> {
-    crate::durability_counters::note(crate::durability_counters::Barrier::Directory);
-    handle.sync_all()
+    crate::durability_counters::sync_directory(handle)
 }
 
 /// fsync a directory so a rename into it survives a crash.
@@ -26613,7 +26591,7 @@ impl BootstrapSourcePassWriters {
         })
     }
 
-    fn sync_all(&mut self) -> io::Result<()> {
+    fn sync_to_stable_storage(&mut self) -> io::Result<()> {
         barrier_sync_all(&self.inventory)?;
         barrier_sync_all(&self.entries)?;
         barrier_sync_all(&self.chunks)?;
@@ -26894,7 +26872,7 @@ fn collect_bootstrap_source_pass(
         seal_chunks,
     )?;
     note_bootstrap_source_io_stage("sync bootstrap source raw spool writers");
-    writers.sync_all()?;
+    writers.sync_to_stable_storage()?;
     // Sorting no longer needs the raw spool writers, so release them at the
     // durable handoff before reopening and removing those files.
     drop(writers);
@@ -51322,7 +51300,7 @@ mod tests {
             )
             .unwrap();
         }
-        writers.sync_all().unwrap();
+        writers.sync_to_stable_storage().unwrap();
         sort_bootstrap_source_spool(
             &paths,
             BootstrapSourceSpoolKind::Entries,

@@ -8316,7 +8316,7 @@ fn prepare_clean_join_candidate(
                 hasher.update(&bytes);
                 written = written.saturating_add(bytes.len());
             }
-            file.sync_all()
+            crate::durability_counters::sync_file(&file)
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
             let mut digest = [0_u8; 32];
             digest.copy_from_slice(&hasher.finalize());
@@ -9842,12 +9842,8 @@ impl ManagedLocalRuntimeState {
                 }
             }
         }
-        self.directory
-            .try_clone()
-            .map_err(display)?
-            .into_std_file()
-            .sync_all()
-            .map_err(display)
+        let directory = self.directory.try_clone().map_err(display)?.into_std_file();
+        crate::durability_counters::sync_directory(&directory).map_err(display)
     }
 }
 

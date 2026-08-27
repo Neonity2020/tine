@@ -5699,7 +5699,7 @@ fn copy_bootstrap_file_exact(
             io::copy(&mut input, &mut output)?;
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             {
-                output.sync_all()?;
+                crate::durability_counters::sync_file(&output)?;
                 sync_parent(destination)?;
             }
             Ok(())

@@ -1436,7 +1436,7 @@ pub(crate) fn publish_activation_marker(
             .create_new(true)
             .open(&temporary)?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
+        crate::durability_counters::sync_file(&file)?;
         drop(file);
         fs::rename(&temporary, &destination)?;
         crate::filesystem_durability::sync_reconstructible_directory_path(enrollment_root)
@@ -1474,7 +1474,7 @@ pub(crate) fn replace_activation_marker_for_join(
         .create_new(true)
         .open(&temporary)?;
     file.write_all(&replacement.encode()?)?;
-    file.sync_all()?;
+    crate::durability_counters::sync_file(&file)?;
     drop(file);
     fs::rename(&destination, &backup)?;
     if let Err(error) = fs::rename(&temporary, &destination) {
@@ -1538,7 +1538,7 @@ pub(crate) fn publish_clean_shared_state(
             .create_new(true)
             .open(&temporary)?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
+        crate::durability_counters::sync_file(&file)?;
         drop(file);
         fs::rename(&temporary, &destination)?;
         crate::filesystem_durability::sync_reconstructible_directory_path(enrollment_root)
