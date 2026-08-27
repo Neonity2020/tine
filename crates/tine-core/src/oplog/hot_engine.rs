@@ -9888,10 +9888,14 @@ impl ShardedHotEngine {
         &self,
         intent_id: ProjectionIntentId,
     ) -> Result<bool, EngineError> {
-        self.local_completion_index
+        // Generic/offline engine users do not own the managed-runtime lease
+        // and therefore do not attach this device-local cache. Absence there
+        // means no local evidence; every production managed open attaches it
+        // after lease acquisition and before any repair or actor work.
+        Ok(self
+            .local_completion_index
             .as_ref()
-            .map(|index| index.contains_completed(intent_id))
-            .ok_or_else(|| EngineError::ProjectionWork("local completion index is not open".into()))
+            .is_some_and(|index| index.contains_completed(intent_id)))
     }
 
     pub(crate) fn stage_local_projection_completion(
@@ -9900,11 +9904,11 @@ impl ShardedHotEngine {
     ) -> Result<bool, EngineError> {
         self.local_completion_index
             .as_mut()
-            .ok_or_else(|| {
-                EngineError::ProjectionWork("local completion index is not open".into())
-            })?
-            .stage_completed(intent)
-            .map_err(|error| EngineError::Archive(error.to_string()))
+            .map_or(Ok(false), |index| {
+                index
+                    .stage_completed(intent)
+                    .map_err(|error| EngineError::Archive(error.to_string()))
+            })
     }
 
     pub(crate) fn local_completion_flush_due(&self, now: Instant) -> bool {
