@@ -43,6 +43,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Rapid scrolling and zooming no longer make PDF pages compete for the UI
+  thread or flash blank while sharpening.** The reader now has one
+  viewport-prioritized full-page render scheduler, drops obsolete prefetch work,
+  pauses speculative rendering during fast wheel bursts, and defers selectable
+  text-layer construction until scrolling settles. A page's previous bitmap
+  remains visible until its sharper zoom replacement is complete. The longer-term
+  tile-aware viewer architecture is tracked in GH #393.
+
 - **Long PDFs no longer skip pages or overload the viewer during ordinary
   scrolling.** Evicting an offscreen page's canvas could collapse its flex
   wrapper, shrinking the document while it was being scrolled and making many

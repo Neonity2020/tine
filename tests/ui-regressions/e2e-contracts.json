@@ -499,12 +499,12 @@
    "contracts": [
     {
      "class": "stateful-ux",
-     "userOutcome": "A long PDF keeps stable page geometry as offscreen canvases are evicted, gentle scrolling visits consecutive pages, and opening it renders only a bounded neighborhood instead of the whole document.",
+     "userOutcome": "A long PDF keeps stable page geometry as offscreen canvases are evicted, gentle scrolling visits consecutive pages, and rapid zoom/scroll settles on a rendered destination without concurrent full-page raster work or an unbounded canvas neighborhood.",
      "blocking": true
     }
    ],
    "acceptableVariations": [
-    "Page dimensions, cache policy, prefetch distance, and the number of simultaneously visible pages may evolve while scroll order and bounded rendering remain intact."
+    "Page dimensions, cache policy, scheduler implementation, prefetch distance, and the number of simultaneously visible pages may evolve while scroll order, readable zoom transitions, and bounded rendering remain intact."
    ],
    "nonRequirements": [
     "Exact pixels, canvas count, process memory, frame duration, PDF contents, DOM nesting, or scrollbar styling."

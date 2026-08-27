@@ -103,6 +103,33 @@ function page(width: number, height: number) {
   };
 }
 
+function controlledPage(width: number, height: number) {
+  const jobs: Array<{
+    resolve: () => void;
+    reject: (error: unknown) => void;
+    cancel: ReturnType<typeof vi.fn>;
+  }> = [];
+  const result = {
+    getViewport: vi.fn(({ scale }: { scale: number }) => ({ width: width * scale, height: height * scale })),
+    getTextContent: vi.fn().mockResolvedValue({ items: [] }),
+    render: vi.fn(() => {
+      let resolve = () => {};
+      let reject = (_error: unknown) => {};
+      const promise = new Promise<void>((done, fail) => {
+        resolve = done;
+        reject = fail;
+      });
+      const cancel = vi.fn(() => reject(Object.assign(new Error("cancelled"), {
+        name: "RenderingCancelledException",
+      })));
+      jobs.push({ resolve, reject, cancel });
+      return { promise, cancel };
+    }),
+    jobs,
+  };
+  return result;
+}
+
 function documentWithPages(pages: ReturnType<typeof page>[]) {
   return {
     numPages: pages.length,
@@ -286,6 +313,85 @@ describe("PdfViewer resource safety", () => {
 
       expect(visiblePage.render).toHaveBeenCalledOnce();
       expect(host.querySelector(".pdf-load-error")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
+  it("runs one viewport raster at a time and drops queued pages that leave the prefetch region", async () => {
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const pages = [controlledPage(612, 792), controlledPage(612, 792), controlledPage(612, 792)];
+    const pdf = documentWithPages(pages as ReturnType<typeof page>[]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="queue.pdf" label="Queue PDF" />, host);
+    try {
+      await flush();
+      const pageElements = [...host.querySelectorAll<HTMLElement>(".pdf-page")];
+      const observer = TestIntersectionObserver.instances[0];
+      observer.show(pageElements[0]);
+      observer.show(pageElements[1]);
+      observer.show(pageElements[2]);
+      await flush();
+
+      expect(pages[0].render).toHaveBeenCalledOnce();
+      expect(pages[1].render).not.toHaveBeenCalled();
+      expect(pages[2].render).not.toHaveBeenCalled();
+      expect(host.querySelector(".pdf-scroll")?.getAttribute("data-active-renders")).toBe("1");
+
+      observer.hide(pageElements[1]);
+      pages[0].jobs[0].resolve();
+      await flush();
+
+      expect(pages[1].render).not.toHaveBeenCalled();
+      expect(pages[2].render).toHaveBeenCalledOnce();
+      pages[2].jobs[0].resolve();
+      await flush();
+      expect(host.querySelector(".pdf-scroll")?.getAttribute("data-active-renders")).toBe("0");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps the previous page bitmap visible until a zoom replacement finishes", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 1, scale: 1 });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const visiblePage = controlledPage(612, 792);
+    const pdf = documentWithPages([visiblePage as ReturnType<typeof page>]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="zoom.pdf" label="Zoom PDF" />, host);
+    try {
+      await flush();
+      const pageElement = host.querySelector<HTMLElement>(".pdf-page")!;
+      TestIntersectionObserver.instances[0].show(pageElement);
+      await flush();
+      visiblePage.jobs[0].resolve();
+      await flush();
+      const original = pageElement.querySelector("canvas")!;
+      expect(original.isConnected).toBe(true);
+
+      (host.querySelector('button[title="Zoom in"]') as HTMLButtonElement).click();
+      await vi.advanceTimersByTimeAsync(120);
+      await flush();
+      expect(visiblePage.render).toHaveBeenCalledTimes(2);
+      expect(pageElement.querySelector("canvas")).toBe(original);
+      expect(original.isConnected).toBe(true);
+      expect(original.width).toBeGreaterThan(0);
+
+      visiblePage.jobs[1].resolve();
+      await flush();
+      expect(pageElement.querySelector("canvas")).not.toBe(original);
+      expect(original.isConnected).toBe(false);
+      expect(original.width).toBe(0);
+      expect(original.height).toBe(0);
     } finally {
       dispose();
     }

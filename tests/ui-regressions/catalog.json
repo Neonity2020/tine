@@ -8490,6 +8490,30 @@
     "failBefore": "proven"
    },
    "notes": "Martin's 2026-08-27 report reproduced in the real Tauri/WebKit app with a 34-page document. .pdf-scroll is a flex column, but .pdf-page retained the default flex-shrink value. Once the LRU removed an offscreen canvas, empty wrappers collapsed, scrollHeight fell from roughly 25,900 to 9,500 px, all 34 pages appeared intersecting, and gentle wheel steps jumped by about ten pages while every canvas rendered. Giving each wrapper a non-shrinking flex basis preserves the cheap placeholder geometry: the generated fail-before journey now opens with 2 canvases, keeps all page wrappers at least 682 px high and a 23,748 px scroll range, and advances sequentially. The supplied user PDF remains an external diagnostic fixture and is not committed."
+  },
+  {
+   "id": "UI-PDF-BOUNDED-RENDER-SCHEDULER-20260827",
+   "title": "Rapid PDF scrolling and zooming prioritize the viewport without piling up full-page rendering or blanking the current page",
+   "family": "pdf-render-lifecycle",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/PdfViewer.test.tsx::runs one viewport raster at a time and drops queued pages that leave the prefetch region",
+     "src/components/PdfViewer.test.tsx::keeps the previous page bitmap visible until a zoom replacement finishes",
+     "scripts/e2e-pdf-scroll-resources.mjs"
+    ],
+    "scenario": "pdf.long-document-scroll-resources",
+    "failBefore": "proven"
+   },
+   "notes": "Martin's 2026-08-27 report and controlled real-app run used a public 45-page mathematical thesis supplied outside the repository; the file was never committed. The previous full-page viewer let every observer callback start its own raster task, retained no global priority or concurrency boundary, and resized the displayed canvas before a sharper zoom render completed. Rapid zoom/scroll reached about 771 MiB proportional memory and caused visible stalls. The bounded first stage adds one viewport-prioritized render scheduler, cancels irrelevant work, suppresses speculative work during fast scrolling, retains the prior bitmap until its replacement is complete, and defers text-layer work until scrolling settles. Exact-head real-app evidence observed one active raster at most, queue depth one, one obsolete render cancelled, and a 24 ms worst frame gap in the synthetic rapid-scroll journey. The supplied thesis still reached about 1.07 GiB RSS at high zoom, so bitmap-memory reduction is explicitly not claimed here. Exact memory, frame timing, prefetch distance, and DOM shape are diagnostic rather than user contracts. The longer-term tiled/PDF.js-viewer architecture is tracked separately in GH #393."
   }
  ]
 }
