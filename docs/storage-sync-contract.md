@@ -1522,18 +1522,21 @@ turn boundary and the class guard.
 barrier `tine-core` initiates and
 `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 asserts the per-operation totals against
-`MANAGED_SAVE_BARRIER_BUDGET` = **29** and `MANAGED_MOVE_BARRIER_BUDGET` =
-**87**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+`MANAGED_SAVE_BARRIER_BUDGET` = **31** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**89**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
 appends and SQLite file-set publication are not reachable from this crate and
 are excluded (measured at three more per save, four per move).
 
 The packet-2b collapse reduced the complete packet-2b-pre ledgers from 35 to 29
-for a save and from 112 to 87 for a cross-page move. The exact intermediate
-attribution while receipt publications still exist is: save foreground
+for a save and from 112 to 87 for a cross-page move. Packet C-2 adds exactly
+one coalesced local-completion chain install when this fixture reaches idle:
+one directory barrier plus one staged-publication filesystem barrier for the
+whole operation, never per page. The exact attribution while receipt
+publications still exist is: save foreground
 `file_fsync=1 dir_fsync=2 syncfs=0 total=3`, save total
-`file_fsync=12 dir_fsync=16 syncfs=1 total=29`; move foreground is zero and move
-total is `file_fsync=40 dir_fsync=46 syncfs=1 total=87`. These are pinned with
-no headroom. The removed 6/25 directory barriers were repeated
+`file_fsync=12 dir_fsync=17 syncfs=2 total=31`; move foreground is zero and move
+total is `file_fsync=40 dir_fsync=47 syncfs=2 total=89`. These are pinned with
+no headroom. The packet-2b removed 6/25 directory barriers were repeated
 `SharedReconstructibleProjection` barriers within turns; no strict authority or
 quarantine barrier was removed.
 
