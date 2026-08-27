@@ -265,8 +265,8 @@ and manifest tail.
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and clean open | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
-| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v6 and versioned rows | derived receipts and diagnostics |
-| `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | receipt cleanup | receipt cleanup | bounded cleanup queue | disposable maintenance state |
+| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
+| `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests; losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
@@ -998,6 +998,19 @@ the only stores carrying a pre-(c) claim are development stores, and the 0.7
 blank-slate policy applies: refuse with a named remedy rather than build
 migration machinery for records that exist on no user's disk.
 
+**Why packet 2c does not move it again.** Packet 2c retires only the
+own-endpoint facet of the receipt protocol. The foreign receiver namespaces,
+record formats, and recovery protocol remain live and unchanged, so the
+wholesale-retirement premise for a `TINEPR7` claim is false. A store written by
+a pre-2c `(c)` build differs only by possibly retaining own-endpoint receipt
+artifacts. Current code neither authors nor consults those artifacts as
+authority: it reports their validated names, leaves their bytes untouched, and
+recovers own work exclusively from the durable turn/journal plus the local
+completion index. Refusing `TINEPR6` would reactivate an intermediate
+development store and could lose undrained frames without adding safety. The
+real-store recovery-equivalence oracle covers every specified crash cut for
+exactly this transition.
+
 | Claim observed | Response |
 | --- | --- |
 | current magic, current version, exactly `STORE_CLAIM_LEN` bytes, regular file | proceed to the full in-place validation |
@@ -1273,9 +1286,12 @@ reports states whose in-scope scenario is not disk corruption
 local authoring still appends its semantic managed-local frame and the drain
 views that frame as a turn; ingress-local, ingress-foreign, terminal-local,
 terminal-foreign and superseded-repair producers append description-only
-records to the projection-turn journal. The turn-level executor still publishes
-and recovers projection receipts as redundant evidence. No replay decision
-branches on whether a receipt-backed operation came from either turn domain.
+records to the projection-turn journal. The common own-endpoint executor does
+not publish or recover projection receipts: its only recovery authority is the
+turn/journal and its only durable completion suppression is the local completion
+index. The foreign receiver executor continues to publish and recover the full
+receipt protocol, including base bytes and records, attempts, mutation
+authority, completion, pending cleanup, and forensic evidence.
 
 **Cold-open order is part of the write-safety contract.** After retained
 authority and archive/SQLite reconstruction, startup opens both local journals
@@ -1288,8 +1304,9 @@ a completed-and-reclaimed terminal turn is not recreated on the next open.
 ### 3.2b Own-endpoint completion index and `DeferredAbsence`
 
 Every successful own-endpoint manifested projection passes through the common
-executor. Immediately after its receipt completion is published, that seam
-stages one local-completion value in the engine: exact `ProjectionIntentId`,
+executor. Immediately after the graph mutation and exact-identity in-turn
+cleanup have completed, that seam stages one local-completion value in the
+engine: exact `ProjectionIntentId`,
 page id, path, `attempted | completed` state, `Present | Absent` target kind,
 and post-frontier. The intent id binds page, path, frontier, precondition and
 target; lookup is never by bare path. A completion by page P at X therefore
@@ -1522,8 +1539,8 @@ turn boundary and the class guard.
 barrier `tine-core` initiates and
 `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`
 asserts the per-operation totals against
-`MANAGED_SAVE_BARRIER_BUDGET` = **31** and `MANAGED_MOVE_BARRIER_BUDGET` =
-**89**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
+`MANAGED_SAVE_BARRIER_BUDGET` = **10** and `MANAGED_MOVE_BARRIER_BUDGET` =
+**13**. Those are *core-initiated* barriers: `tine-storage`'s own local-journal
 appends and SQLite file-set publication are not reachable from this crate and
 are excluded (measured at three more per save, four per move).
 
@@ -1531,24 +1548,26 @@ The packet-2b collapse reduced the complete packet-2b-pre ledgers from 35 to 29
 for a save and from 112 to 87 for a cross-page move. Packet C-2 adds exactly
 one coalesced local-completion chain install when this fixture reaches idle:
 one directory barrier plus one staged-publication filesystem barrier for the
-whole operation, never per page. The exact attribution while receipt
-publications still exist is: save foreground
+whole operation, never per page. Packet 2c removes own-endpoint receipt
+publication from that executor. The final exact attribution is: save foreground
 `file_fsync=1 dir_fsync=2 syncfs=0 total=3`, save total
-`file_fsync=12 dir_fsync=17 syncfs=2 total=31`; move foreground is zero and move
-total is `file_fsync=40 dir_fsync=47 syncfs=2 total=89`. These are pinned with
-no headroom. The packet-2b removed 6/25 directory barriers were repeated
+`file_fsync=2 dir_fsync=6 syncfs=2 total=10`; move foreground is zero and move
+total is `file_fsync=6 dir_fsync=5 syncfs=2 total=13`. These are exact-equality
+assertions, not ceilings: either upward or downward drift requires a new
+attribution before the pin moves. The packet-2b removed 6/25 directory barriers were repeated
 `SharedReconstructibleProjection` barriers within turns; no strict authority or
 quarantine barrier was removed.
 
 The 2026-08-27 counter-completeness sweep raised those enforced numbers from
 25/74 without adding or moving a single durability syscall. This is measurement
 visibility, not a latency regression: the save fixture made five previously
-unattributed projection-receipt publications visible (five file + five
-directory barriers); the move fixture made sixteen such publication pairs,
-five mutation-authority replacement file barriers, and one clean-foreground
-retirement directory barrier visible. The budgets are pinned to those complete
-measured totals with no headroom, and the source guard rejects any future raw
-barrier outside the counted wrappers.
+unattributed own-endpoint projection-receipt publications visible (five file +
+five directory barriers); the move fixture made sixteen such publication
+pairs, five mutation-authority replacement file barriers, and one clean-
+foreground retirement directory barrier visible. Packet 2c removes those own-
+endpoint barriers; the retained foreign receiver protocol remains outside the
+save/move fixtures. The exact ledgers and the source guard reject unreviewed
+barrier drift or any future raw barrier outside the counted wrappers.
 
 **Barriers with no in-scope scenario are deleted, not budgeted.** Three
 mechanisms left the count on 2026-08-27 (save 28 → 25, move 77 → 74), each
@@ -1579,20 +1598,25 @@ and `oplog::projection_store::tests::an_empty_pending_cleanup_queue_elides_the_d
 The cost-model audit's target is 3 and 5. The remaining gap is stated here
 rather than hidden:
 
-* The **projection receipt store** publishes five artifacts per intent (base,
-  intent, attempt reservation, mutation authority, completion) = 10 barriers per
-  projected page, plus one forensic-evidence record and one pending-cleanup
-  marker for each recovery file a projection displaces. It published *nine*
+* The **foreign receiver projection receipt store** publishes five artifacts
+  per intent (base, intent, attempt reservation, mutation authority, completion)
+  = 10 barriers per received page, plus one forensic-evidence record and one
+  pending-cleanup marker for each recovery file a projection displaces. It
+  published *nine*
   before the 2026-08-26 refusal census cut the four per-intent namespace
   bindings; the survivors each name an in-scope crash/torn-write scenario and
   are recorded in the census
   (`specs/notes/2026-08-26-p-census-receipt.md`). They are still published one
   at a time: each is separated from the next by a read-back of the artifact just
   published, so staging them behind one barrier would have to carry the staged
-  bytes in memory as well. Collapsing that is the next step, not this one.
+  bytes in memory as well. This cost belongs to foreign ingress, not the local
+  save/move ledgers; packet C-3 consumes the receiver history without weakening
+  this protocol.
 
-The remaining gap is therefore receipt publication, not repeated managed graph
-directory barriers. Direct Files' user-visible Markdown publication keeps its
+The remaining save/move gap is no longer receipt publication or repeated
+managed graph directory barriers; it is the turn/journal, graph publication,
+archive, and coalesced completion-index work shown by the exact 10/13 ledgers.
+Direct Files' user-visible Markdown publication keeps its
 temp + fsync + rename + base-revision guard + lock and immediate directory
 barriers unchanged.
 
@@ -2025,18 +2049,19 @@ three graph names are then:
 ```
 
 Integers are big-endian and `simple()` is lowercase hexadecimal without
-hyphens. A receipt reservation records this supplied attempt id; it does not
-derive another one. Replay has one compatibility rule: an existing durable
-reservation or mutation authority is resumed under the attempt id it recorded,
-including packet-2a residue. Only a page without such residue starts under the
-turn-derived id. This is I2a: an undrained turn can enumerate every name its
-managed executor may have left behind.
+hyphens. A foreign receiver receipt reservation records this supplied attempt
+id; it does not derive another one, and receiver recovery resumes its retained
+durable reservation or mutation authority. Own-endpoint replay never reads that
+namespace: every attempt id comes directly from the turn. Packet-2a/2b own-
+endpoint residue is inert, is reported by validated names only, and is neither
+resumed nor deleted. This is I2a: an undrained own turn can enumerate every
+graph name its executor may have left behind without receipt evidence.
 
 The live scheme list is `LIVE_PROJECTION_TURN_DERIVATION_SCHEMES`; an unknown
-scheme is a protocol refusal, never guessed. The byte-level derivation and the
-legacy-residue rule are enforced by `oplog::projection_turn_journal::tests`,
-`oplog::projection_store::tests::a_turn_crashed_under_2a_replays_under_2b_without_refusal`,
-and the real-store recovery-equivalence oracle.
+scheme is a protocol refusal, never guessed. The byte-level derivation is
+enforced by `oplog::projection_turn_journal::tests`; the real-store recovery-
+equivalence oracle proves turn-only own recovery over every specified crash cut
+while the foreign receiver protocol remains unchanged.
 
 ### 2.10f The interrupted-publication recovery walk
 
@@ -2074,11 +2099,12 @@ Quarantine is itself a durability protocol. It validates a no-follow,
 single-link source, renames no-replace into strict `PrivateDurableAuthority`
 conflict trash, flushes the destination chain first and the source chain second,
 then reopens and verifies identity. Created ancestors are flushed eagerly. A
-hard-link, folded-name, or other refusal leaves the source in place and its
-durable pending-cleanup receipt records the residue; the owning turn cannot
-discard that debt as successful cleanup. Thus every derived or discovered
-leftover is restored, quarantined, or durably reported in place before its turn
-checkpoints.
+hard-link, folded-name, or other refusal leaves the source in place. On the
+foreign receiver path, its durable pending-cleanup receipt records the residue.
+On the own-endpoint path, the in-turn exact-identity capability refuses before
+the local completion is staged, so the owning journal turn cannot checkpoint
+and discard the debt. Thus every derived or discovered leftover is restored,
+quarantined, or reported in place before its turn checkpoints.
 
 The crash and external-race coverage lives in the packet-2b C3-C6, R2-R5 and
 X5-X6 tests, including occupied staged-name quarantine, in-turn exact-identity

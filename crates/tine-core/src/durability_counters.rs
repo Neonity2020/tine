@@ -50,23 +50,23 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The maximum number of core-initiated durability barriers one accepted
-/// single-block managed save may perform.
+/// The exact number of core-initiated durability barriers one accepted
+/// single-block managed save performs in the pinned fixture.
 ///
-/// This is a *ceiling on current behaviour*, not the destination: the
+/// This is the current measured behaviour, not the destination: the
 /// cost-model audit's target is 3, and `docs/storage-sync-contract.md`
-/// §2.10a-i names exactly which two remaining mechanisms hold the number
-/// here. Its job is to make any further growth fail a test instead of
+/// §2.10a-i attributes the remaining work. Its job is to make any drift fail a
+/// test instead of
 /// disappearing into a phase timer.
 ///
 /// The value is asserted against the contract document by
 /// `durability_counters::tests::the_contract_states_the_barrier_budget`, so
 /// the two cannot drift apart.
-pub const MANAGED_SAVE_BARRIER_BUDGET: u64 = 31;
+pub const MANAGED_SAVE_BARRIER_BUDGET: u64 = 10;
 
-/// The same ceiling for one accepted cross-page (for example cross-day) move,
-/// which projects two pages and therefore pays the receipt-store cost twice.
-pub const MANAGED_MOVE_BARRIER_BUDGET: u64 = 89;
+/// The same exact fixture total for one accepted cross-page (for example
+/// cross-day) move, which projects two pages.
+pub const MANAGED_MOVE_BARRIER_BUDGET: u64 = 13;
 
 /// The primitive kinds counted here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

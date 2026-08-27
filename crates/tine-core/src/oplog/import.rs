@@ -13537,7 +13537,6 @@ mod tests {
         );
         crate::oplog::projection::execute_clean_manifested_projection_work(
             &graph,
-            &receipts,
             rebuilt_projection.database(),
             &mut rebuilt_engine,
             &terminal_work[0],
@@ -13550,7 +13549,6 @@ mod tests {
         );
         crate::oplog::projection::execute_clean_manifested_projection_work(
             &graph,
-            &receipts,
             rebuilt_projection.database(),
             &mut rebuilt_engine,
             &terminal_work[0],
@@ -13605,7 +13603,6 @@ mod tests {
         ));
         crate::oplog::projection::execute_clean_manifested_projection_work(
             &graph,
-            &receipts,
             rebuilt_projection.database(),
             &mut rebuilt_engine,
             &delete_work[0],
@@ -13623,7 +13620,6 @@ mod tests {
         assert!(
             crate::oplog::projection::execute_clean_manifested_projection_work(
                 &graph,
-                &receipts,
                 rebuilt_projection.database(),
                 &mut rebuilt_engine,
                 &terminal_work[0],

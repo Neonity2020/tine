@@ -243,6 +243,20 @@ impl LocalCompletionIndex {
                 .is_some_and(|entry| entry.entry.state == LocalCompletionState::Completed)
     }
 
+    pub(crate) fn completed_intent_ids(&self) -> BTreeSet<ProjectionIntentId> {
+        self.entries
+            .iter()
+            .filter(|(_, stored)| stored.entry.state == LocalCompletionState::Completed)
+            .map(|(intent_id, _)| *intent_id)
+            .chain(
+                self.buffered
+                    .iter()
+                    .filter(|(_, entry)| entry.state == LocalCompletionState::Completed)
+                    .map(|(intent_id, _)| *intent_id),
+            )
+            .collect()
+    }
+
     pub(crate) fn stage_completed(
         &mut self,
         intent: &ProjectionIntent,

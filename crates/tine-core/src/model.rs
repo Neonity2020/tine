@@ -12,7 +12,7 @@ use crate::doc::{self, DocBlock, Document, StructuralLayoutIdentity};
 use crate::graph_text_scope::{GraphTextScope, GraphTextScopeBinding};
 use crate::oplog::projection::GuardedProjectionLayout;
 use crate::oplog::projection_store::{
-    ProjectionMutationAuthority, ProjectionRecoveryEvidencePublisher, MAX_PROJECTION_EVIDENCE_BYTES,
+    ProjectionMutationEvidence, ProjectionRecoveryEvidencePublisher, MAX_PROJECTION_EVIDENCE_BYTES,
 };
 use crate::oplog::sync_layout::{
     BOOTSTRAP_SOURCE_CAPTURE_CHUNKS_DIR as BOOTSTRAP_SOURCE_CHUNK_DIRECTORY,
@@ -1918,7 +1918,7 @@ impl HandoffSafeGuard {
         relative_path: &str,
         expected_base: Option<&[u8]>,
         target: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         let guarded_layout =
             canonical_guarded_projection_layout_for_test(graph, relative_path, target)?;
@@ -1939,7 +1939,7 @@ impl HandoffSafeGuard {
         expected_base: Option<&[u8]>,
         target: &[u8],
         guarded_layout: &GuardedProjectionLayout,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_write_call();
@@ -1953,7 +1953,7 @@ impl HandoffSafeGuard {
                 guarded_layout,
                 reservation,
                 known_attempts,
-                Some(publisher),
+                publisher,
             )
         })
     }
@@ -1963,7 +1963,7 @@ impl HandoffSafeGuard {
         graph: &Graph,
         relative_path: &str,
         expected_base: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_remove_call();
@@ -1975,7 +1975,7 @@ impl HandoffSafeGuard {
                 expected_base,
                 reservation,
                 known_attempts,
-                Some(publisher),
+                publisher,
             )
         })
     }
@@ -1987,7 +1987,7 @@ impl HandoffSafeGuard {
         relative_path: &str,
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         let guarded_layout =
             canonical_guarded_projection_layout_for_test(graph, relative_path, expected_target)?;
@@ -2008,7 +2008,7 @@ impl HandoffSafeGuard {
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
         guarded_layout: &GuardedProjectionLayout,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();
@@ -2030,7 +2030,7 @@ impl HandoffSafeGuard {
         graph: &Graph,
         relative_path: &str,
         expected_base: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();
@@ -2049,7 +2049,7 @@ impl HandoffSafeGuard {
         &self,
         graph: &Graph,
         relative_path: &str,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();
@@ -2069,7 +2069,7 @@ impl HandoffSafeGuard {
         graph: &Graph,
         relative_path: &str,
         expected_target: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         let write = self.admit_projection_writer(graph)?;
         authority.consume_write_evidence(relative_path, |reservation, _, _| {
@@ -2189,7 +2189,7 @@ impl PublishedHandoffLatch {
         relative_path: &str,
         expected_base: Option<&[u8]>,
         target: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         let guarded_layout =
             canonical_guarded_projection_layout_for_test(graph, relative_path, target)?;
@@ -2210,7 +2210,7 @@ impl PublishedHandoffLatch {
         expected_base: Option<&[u8]>,
         target: &[u8],
         guarded_layout: &GuardedProjectionLayout,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_write_call();
@@ -2224,7 +2224,7 @@ impl PublishedHandoffLatch {
                 guarded_layout,
                 reservation,
                 known_attempts,
-                Some(publisher),
+                publisher,
             )
         })
     }
@@ -2234,7 +2234,7 @@ impl PublishedHandoffLatch {
         graph: &Graph,
         relative_path: &str,
         expected_base: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_remove_call();
@@ -2246,7 +2246,7 @@ impl PublishedHandoffLatch {
                 expected_base,
                 reservation,
                 known_attempts,
-                Some(publisher),
+                publisher,
             )
         })
     }
@@ -2258,7 +2258,7 @@ impl PublishedHandoffLatch {
         relative_path: &str,
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         let guarded_layout =
             canonical_guarded_projection_layout_for_test(graph, relative_path, expected_target)?;
@@ -2279,7 +2279,7 @@ impl PublishedHandoffLatch {
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
         guarded_layout: &GuardedProjectionLayout,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();
@@ -2301,7 +2301,7 @@ impl PublishedHandoffLatch {
         graph: &Graph,
         relative_path: &str,
         expected_base: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();
@@ -2320,7 +2320,7 @@ impl PublishedHandoffLatch {
         &self,
         graph: &Graph,
         relative_path: &str,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();
@@ -17852,7 +17852,7 @@ impl Graph {
         relative_path: &str,
         expected_base: Option<&[u8]>,
         target: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         let guarded_layout =
             canonical_guarded_projection_layout_for_test(self, relative_path, target)?;
@@ -17871,7 +17871,7 @@ impl Graph {
         expected_base: Option<&[u8]>,
         target: &[u8],
         guarded_layout: &GuardedProjectionLayout,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_write_call();
@@ -17885,7 +17885,7 @@ impl Graph {
                 guarded_layout,
                 reservation,
                 known_attempts,
-                Some(publisher),
+                publisher,
             )
         })
     }
@@ -18442,7 +18442,7 @@ impl Graph {
     pub(crate) fn confirm_removed_page_projection(
         &self,
         relative_path: &str,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();
@@ -18464,7 +18464,7 @@ impl Graph {
         &self,
         relative_path: &str,
         expected_base: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_remove_call();
@@ -18476,7 +18476,7 @@ impl Graph {
                 expected_base,
                 reservation,
                 known_attempts,
-                Some(publisher),
+                publisher,
             )
         })
     }
@@ -19265,7 +19265,7 @@ impl Graph {
         &self,
         relative_path: &str,
         expected_base: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();
@@ -19359,7 +19359,7 @@ impl Graph {
         relative_path: &str,
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         let guarded_layout =
             canonical_guarded_projection_layout_for_test(self, relative_path, expected_target)?;
@@ -19378,7 +19378,7 @@ impl Graph {
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
         guarded_layout: &GuardedProjectionLayout,
-        authority: &mut ProjectionMutationAuthority,
+        authority: &mut impl ProjectionMutationEvidence,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
         count_projection_recovery_call();

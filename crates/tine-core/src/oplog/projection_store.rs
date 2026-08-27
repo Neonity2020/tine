@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
@@ -13,6 +13,7 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::RwLock;
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
@@ -64,6 +65,11 @@ thread_local! {
 
 pub(crate) struct ProjectionTurnAttemptScope {
     previous: Option<Uuid>,
+}
+
+pub(crate) fn enter_projection_turn_attempt(attempt_id: Uuid) -> ProjectionTurnAttemptScope {
+    let previous = PROJECTION_TURN_ATTEMPT.replace(Some(attempt_id));
+    ProjectionTurnAttemptScope { previous }
 }
 
 impl Drop for ProjectionTurnAttemptScope {
@@ -939,6 +945,7 @@ pub struct ProjectionReceiptStore {
     endpoint: Option<ProjectionEndpointBinding>,
     capability: Dir,
     namespaces: ReceiptNamespaces,
+    retired_own_endpoint_intents: RwLock<BTreeSet<ProjectionIntentId>>,
 }
 
 /// Private one-shot authority spanning one exact graph operation and its
@@ -964,6 +971,34 @@ pub(crate) struct ProjectionMutationAuthority {
     created_durable_record: bool,
     graph_operation_consumed: bool,
     completion_published: bool,
+}
+
+/// One-shot graph mutation evidence derived exclusively from the durable
+/// projection turn currently being replayed. Unlike
+/// [`ProjectionMutationAuthority`], this authors and consults no receipt-store
+/// artifact: the turn supplies the stable attempt id and the local completion
+/// index supplies own-endpoint execution evidence.
+pub(crate) struct ProjectionTurnMutationAuthority {
+    reservation: ProjectionAttemptReservation,
+    graph_operation_consumed: bool,
+}
+
+pub(crate) trait ProjectionMutationEvidence {
+    fn consume_write_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(
+            &ProjectionAttemptReservation,
+            &[ProjectionAttemptReservation],
+            Option<&ProjectionRecoveryEvidencePublisher<'_>>,
+        ) -> io::Result<T>,
+    ) -> io::Result<T>;
+
+    fn consume_recovery_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(&[ProjectionAttemptReservation]) -> io::Result<T>,
+    ) -> io::Result<T>;
 }
 
 pub(crate) struct ProjectionRecoveryEvidencePublisher<'a> {
@@ -1034,6 +1069,83 @@ impl fmt::Debug for ProjectionMutationAuthority {
     }
 }
 
+impl ProjectionTurnMutationAuthority {
+    pub(crate) fn for_current_turn(
+        intent: &ProjectionIntent,
+    ) -> Result<Self, ProjectionStoreError> {
+        let attempt_id = if let Some(attempt_id) = PROJECTION_TURN_ATTEMPT.get() {
+            attempt_id
+        } else {
+            #[cfg(test)]
+            {
+                let mut bytes = [0_u8; 16];
+                bytes.copy_from_slice(&intent.id()?.as_bytes()[..16]);
+                bytes[6] = (bytes[6] & 0x0f) | 0x80;
+                bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                Uuid::from_bytes(bytes)
+            }
+            #[cfg(not(test))]
+            {
+                return Err(ProjectionStoreError::MissingTurnAttemptContext);
+            }
+        };
+        Ok(Self {
+            reservation: ProjectionAttemptReservation::new(intent, attempt_id)?,
+            graph_operation_consumed: false,
+        })
+    }
+
+    pub(crate) fn cleanup_records(
+        &self,
+        intent: &ProjectionIntent,
+        proof: &ProjectionWriteProof,
+    ) -> Result<Vec<LocalProjectionEvidenceRecord>, ProjectionStoreError> {
+        if !self.graph_operation_consumed
+            || proof.path() != intent.path().as_str()
+            || proof.digest() != intent.target().sha256()
+            || BlobDescription::of(proof.bytes()) != intent.target()
+        {
+            return Err(ProjectionStoreError::WriteProofMismatch);
+        }
+        proof
+            .recovery_evidence()
+            .iter()
+            .map(|evidence| {
+                if self.reservation.recovery_filename() != evidence.filename() {
+                    return Err(ProjectionStoreError::UnreservedRecoveryEvidence);
+                }
+                Ok(LocalProjectionEvidenceRecord {
+                    schema_version: LOCAL_FORENSIC_SCHEMA_VERSION,
+                    intent_id: intent.id()?,
+                    attempt_id: self.reservation.attempt_id(),
+                    target_path: intent.path().clone(),
+                    recovery_relative_path: evidence.path().to_owned(),
+                    recovery_filename: evidence.filename().to_owned(),
+                    recovery_resource_id: evidence.resource_id(),
+                    observed: BlobDescription::from_parts(*evidence.digest(), evidence.len()),
+                })
+            })
+            .collect()
+    }
+
+    fn consume_graph_operation(&mut self, relative_path: &str) -> io::Result<()> {
+        if self.graph_operation_consumed {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "projection turn mutation authority was already consumed",
+            ));
+        }
+        if self.reservation.target_path().as_str() != relative_path {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "projection turn mutation authority target path mismatch",
+            ));
+        }
+        self.graph_operation_consumed = true;
+        Ok(())
+    }
+}
+
 /// Canonical read-only catalog row used only by the combined import authority.
 ///
 /// Fields stay crate-private so a downstream caller cannot manufacture a
@@ -1046,11 +1158,6 @@ pub(crate) struct ProjectionCatalogEntry {
 }
 
 impl ProjectionReceiptStore {
-    pub(crate) fn enter_turn_attempt(&self, attempt_id: Uuid) -> ProjectionTurnAttemptScope {
-        let previous = PROJECTION_TURN_ATTEMPT.replace(Some(attempt_id));
-        ProjectionTurnAttemptScope { previous }
-    }
-
     pub fn open(root: &Path, workspace_id: WorkspaceId) -> Result<Self, ProjectionStoreError> {
         Self::open_with_binding(root, workspace_id, None)
     }
@@ -1209,6 +1316,7 @@ impl ProjectionReceiptStore {
             endpoint: Some(endpoint),
             capability,
             namespaces,
+            retired_own_endpoint_intents: RwLock::new(BTreeSet::new()),
         })
     }
 
@@ -1260,6 +1368,7 @@ impl ProjectionReceiptStore {
             endpoint,
             capability,
             namespaces,
+            retired_own_endpoint_intents: RwLock::new(BTreeSet::new()),
         })
     }
 
@@ -1859,6 +1968,15 @@ impl ProjectionReceiptStore {
     ) -> Result<Option<ProjectionCompletion>, ProjectionStoreError> {
         #[cfg(test)]
         count_completion_lookup();
+        let candidate_id = intent.id()?;
+        if self
+            .retired_own_endpoint_intents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&candidate_id)
+        {
+            return Ok(None);
+        }
         let intent_id = self.require_published_intent(intent)?;
         let completions = self.namespace(COMPLETIONS_DIR)?;
         let Some(bytes) = read_optional_regular(
@@ -1981,6 +2099,7 @@ impl ProjectionReceiptStore {
     pub(crate) fn pending_projection_cleanup(
         &self,
     ) -> Result<Vec<(ProjectionIntent, LocalProjectionEvidenceRecord)>, ProjectionStoreError> {
+        let (_, _, retired_pending_prefixes) = self.retired_own_endpoint_names();
         let queue = open_pending_cleanup_rounds(
             &self.namespaces.pending_cleanup.capability,
             self.store_id,
@@ -1997,6 +2116,12 @@ impl ProjectionReceiptStore {
                         "non-UTF-8 pending projection cleanup entry".into(),
                     )
                 })?;
+                if retired_pending_prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                {
+                    continue;
+                }
                 if is_temp_name(name) {
                     continue;
                 }
@@ -2041,6 +2166,12 @@ impl ProjectionReceiptStore {
         if max_entries == 0 {
             return Ok(Vec::new());
         }
+        let (_, _, retired_pending_prefixes) = self.retired_own_endpoint_names();
+        let is_retired_own_name = |name: &str| {
+            retired_pending_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        };
         let namespace = &self.namespaces.pending_cleanup.capability;
         let mut queue = open_pending_cleanup_rounds(
             namespace,
@@ -2049,7 +2180,7 @@ impl ProjectionReceiptStore {
         )?;
         let mut active = usize::from(queue.state.active_round);
         let mut entries = queue.rounds[active].entries()?;
-        let mut first = entries.next().transpose()?;
+        let mut first = next_non_retired_pending_entry(&mut entries, &retired_pending_prefixes)?;
         if first.is_none() {
             drop(entries);
             // An empty active round normally means "flip, then drain whatever
@@ -2064,14 +2195,13 @@ impl ProjectionReceiptStore {
             // removable temporary entries is NOT empty here, so it falls
             // through to the flip and the existing temp-removal path rather
             // than inventing a second cleanup route.
-            if queue.rounds[1 - active]
-                .entries()?
-                .next()
-                .transpose()?
+            let mut inactive_entries = queue.rounds[1 - active].entries()?;
+            if next_non_retired_pending_entry(&mut inactive_entries, &retired_pending_prefixes)?
                 .is_none()
             {
                 return Ok(Vec::new());
             }
+            drop(inactive_entries);
             flip_pending_cleanup_round(namespace, &queue)?;
             queue = open_pending_cleanup_rounds(
                 namespace,
@@ -2080,7 +2210,7 @@ impl ProjectionReceiptStore {
             )?;
             active = usize::from(queue.state.active_round);
             entries = queue.rounds[active].entries()?;
-            first = entries.next().transpose()?;
+            first = next_non_retired_pending_entry(&mut entries, &retired_pending_prefixes)?;
         }
         let Some(first) = first else {
             return Ok(Vec::new());
@@ -2089,7 +2219,8 @@ impl ProjectionReceiptStore {
         let mut pending = Vec::new();
         let mut removed_temporary = false;
         let mut rotated = false;
-        for entry in std::iter::once(Ok(first)).chain(entries).take(max_entries) {
+        let mut visited_live_entries = 0;
+        for entry in std::iter::once(Ok(first)).chain(entries) {
             let entry = entry?;
             #[cfg(test)]
             count_pending_cleanup_entry();
@@ -2099,6 +2230,13 @@ impl ProjectionReceiptStore {
                     "non-UTF-8 pending projection cleanup entry".into(),
                 )
             })?;
+            if is_retired_own_name(name) {
+                continue;
+            }
+            if visited_live_entries == max_entries {
+                break;
+            }
+            visited_live_entries += 1;
             if is_temp_name(name) {
                 require_regular_entry(&entry.file_type()?, name)?;
                 queue.rounds[active].remove_file(name)?;
@@ -2187,6 +2325,7 @@ impl ProjectionReceiptStore {
     pub(crate) fn validated_catalog(
         &self,
     ) -> Result<Vec<ProjectionCatalogEntry>, ProjectionStoreError> {
+        let (retired_intent_names, retired_completion_names, _) = self.retired_own_endpoint_names();
         let intents_dir = self.namespace(INTENTS_DIR)?;
         let mut intents = BTreeMap::new();
         let mut validated_bases = std::collections::BTreeSet::new();
@@ -2204,6 +2343,9 @@ impl ProjectionReceiptStore {
             let name = name.to_str().ok_or_else(|| {
                 ProjectionStoreError::UnsafeEntry("non-UTF-8 projection intent entry".into())
             })?;
+            if retired_intent_names.contains(name) {
+                continue;
+            }
             require_regular_entry(&entry.file_type()?, name)?;
             if is_temp_name(name) {
                 continue;
@@ -2273,6 +2415,9 @@ impl ProjectionReceiptStore {
             let name = name.to_str().ok_or_else(|| {
                 ProjectionStoreError::UnsafeEntry("non-UTF-8 projection completion entry".into())
             })?;
+            if retired_completion_names.contains(name) {
+                continue;
+            }
             require_regular_entry(&entry.file_type()?, name)?;
             if is_temp_name(name) {
                 continue;
@@ -2589,6 +2734,110 @@ impl ProjectionReceiptStore {
             return Err(ProjectionStoreError::EndpointBindingMismatch);
         }
         Ok(())
+    }
+
+    /// Best-effort names-only reporting for pre-2c own-endpoint receipt
+    /// residue. The supplied ids come exclusively from the own turn/journal
+    /// and local-completion authorities. This method never decodes a receipt,
+    /// never treats one as recovery evidence, and never deletes or rewrites an
+    /// artifact; receiver rows outside the supplied set remain untouched.
+    pub(crate) fn retired_own_endpoint_artifacts(
+        &self,
+        own_intent_ids: &BTreeSet<ProjectionIntentId>,
+    ) -> Vec<String> {
+        self.retired_own_endpoint_intents
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(own_intent_ids.iter().copied());
+        let mut reported = BTreeSet::new();
+        let own_prefixes = own_intent_ids
+            .iter()
+            .map(|intent_id| format!("{}.", hex(intent_id.as_bytes())))
+            .collect::<Vec<_>>();
+        for intent_id in own_intent_ids {
+            let intent_name = intent_filename(*intent_id);
+            if self
+                .namespaces
+                .intents
+                .capability
+                .symlink_metadata(&intent_name)
+                .is_ok()
+            {
+                reported.insert(format!("{INTENTS_DIR}/{intent_name}"));
+            }
+            let completion_name = completion_filename(*intent_id);
+            if self
+                .namespaces
+                .completions
+                .capability
+                .symlink_metadata(&completion_name)
+                .is_ok()
+            {
+                reported.insert(format!("{COMPLETIONS_DIR}/{completion_name}"));
+            }
+            let intent_directory = hex(intent_id.as_bytes());
+            for (namespace, directory) in [
+                (ATTEMPTS_DIR, &self.namespaces.attempts.capability),
+                (FORENSICS_DIR, &self.namespaces.forensics.capability),
+            ] {
+                if directory.symlink_metadata(&intent_directory).is_ok() {
+                    reported.insert(format!("{namespace}/{intent_directory}/"));
+                }
+            }
+            for name in [
+                mutation_authority_filename(*intent_id),
+                mutation_authority_lease_filename(*intent_id),
+            ] {
+                if self.capability.symlink_metadata(&name).is_ok() {
+                    reported.insert(name);
+                }
+            }
+        }
+        // Pending-cleanup marker names begin with the exact intent id. Report
+        // matching names without decoding the marker or opening any evidence
+        // path: residue is diagnostic, never own-endpoint recovery authority.
+        for round_name in PENDING_CLEANUP_ROUND_DIRS {
+            let Ok(round) =
+                open_dir_nofollow(&self.namespaces.pending_cleanup.capability, round_name)
+            else {
+                continue;
+            };
+            let Ok(entries) = round.entries() else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if own_prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                    reported.insert(format!(
+                        "{FORENSICS_DIR}/{PENDING_CLEANUP_DIR}/{round_name}/{name}"
+                    ));
+                }
+            }
+        }
+        reported.into_iter().collect()
+    }
+
+    fn retired_own_endpoint_names(&self) -> (BTreeSet<String>, BTreeSet<String>, Vec<String>) {
+        let intent_ids = self
+            .retired_own_endpoint_intents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let intents = intent_ids
+            .iter()
+            .map(|intent_id| intent_filename(*intent_id))
+            .collect();
+        let completions = intent_ids
+            .iter()
+            .map(|intent_id| completion_filename(*intent_id))
+            .collect();
+        let pending_prefixes = intent_ids
+            .iter()
+            .map(|intent_id| format!("{}.", hex(intent_id.as_bytes())))
+            .collect();
+        (intents, completions, pending_prefixes)
     }
 
     fn require_write_proof(
@@ -3055,6 +3304,60 @@ impl ProjectionMutationAuthority {
             self.durable.intent_id,
             self.durable.forensics_identity,
         )
+    }
+}
+
+impl ProjectionMutationEvidence for ProjectionMutationAuthority {
+    fn consume_write_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(
+            &ProjectionAttemptReservation,
+            &[ProjectionAttemptReservation],
+            Option<&ProjectionRecoveryEvidencePublisher<'_>>,
+        ) -> io::Result<T>,
+    ) -> io::Result<T> {
+        ProjectionMutationAuthority::consume_write_evidence(
+            self,
+            relative_path,
+            |reservation, attempts, publisher| operation(reservation, attempts, Some(publisher)),
+        )
+    }
+
+    fn consume_recovery_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(&[ProjectionAttemptReservation]) -> io::Result<T>,
+    ) -> io::Result<T> {
+        ProjectionMutationAuthority::consume_recovery_evidence(self, relative_path, operation)
+    }
+}
+
+impl ProjectionMutationEvidence for ProjectionTurnMutationAuthority {
+    fn consume_write_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(
+            &ProjectionAttemptReservation,
+            &[ProjectionAttemptReservation],
+            Option<&ProjectionRecoveryEvidencePublisher<'_>>,
+        ) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.consume_graph_operation(relative_path)?;
+        operation(
+            &self.reservation,
+            std::slice::from_ref(&self.reservation),
+            None,
+        )
+    }
+
+    fn consume_recovery_evidence<T>(
+        &mut self,
+        relative_path: &str,
+        operation: impl FnOnce(&[ProjectionAttemptReservation]) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.consume_graph_operation(relative_path)?;
+        operation(std::slice::from_ref(&self.reservation))
     }
 }
 
@@ -4244,6 +4547,26 @@ fn pending_cleanup_filename(record: &LocalProjectionEvidenceRecord) -> String {
     )
 }
 
+fn next_non_retired_pending_entry(
+    entries: &mut cap_std::fs::ReadDir,
+    retired_prefixes: &[String],
+) -> Result<Option<cap_std::fs::DirEntry>, ProjectionStoreError> {
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            ProjectionStoreError::UnsafeEntry("non-UTF-8 pending projection cleanup entry".into())
+        })?;
+        if !retired_prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
 fn encode_pending_cleanup_round_state(
     state: &PendingCleanupRoundState,
 ) -> Result<Vec<u8>, ProjectionStoreError> {
@@ -4637,6 +4960,26 @@ mod tests {
             let mut pending = vec![self.graph_root.clone()];
             while let Some(path) = pending.pop() {
                 let relative = path.strip_prefix(&self.graph_root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    snapshot.insert(relative, None);
+                    for entry in fs::read_dir(path).unwrap() {
+                        pending.push(entry.unwrap().path());
+                    }
+                } else {
+                    snapshot.insert(relative, Some(fs::read(path).unwrap()));
+                }
+            }
+            snapshot
+        }
+
+        fn snapshot_store(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut snapshot = BTreeMap::new();
+            let mut pending = vec![self.store.root_path().to_path_buf()];
+            while let Some(path) = pending.pop() {
+                let relative = path
+                    .strip_prefix(self.store.root_path())
+                    .unwrap()
+                    .to_path_buf();
                 if path.is_dir() {
                     snapshot.insert(relative, None);
                     for entry in fs::read_dir(path).unwrap() {
@@ -5218,7 +5561,7 @@ mod tests {
     fn fallback_reuses_the_turn_derived_attempt_instead_of_inventing_a_second_name() {
         let fresh = Fixture::new("fresh-turn-derived-fallback");
         let derived = Uuid::from_u128(0xf2f2_f2f2_f2f2_f2f2_f2f2_f2f2_f2f2_f2f2);
-        let _turn = fresh.store.enter_turn_attempt(derived);
+        let _turn = enter_projection_turn_attempt(derived);
         let fresh_fallback = fresh.store.reserve_fallback_attempt(&fresh.intent).unwrap();
         assert_eq!(fresh_fallback.attempt_id(), derived);
 
@@ -5759,7 +6102,7 @@ mod tests {
         let derived = Uuid::from_u128(0x2b2b_2b2b_2b2b_2b2b_2b2b_2b2b_2b2b_2b2b);
         assert_ne!(legacy.attempt_id(), derived);
         let reopened = fixture.reopen_store();
-        let _turn = reopened.enter_turn_attempt(derived);
+        let _turn = enter_projection_turn_attempt(derived);
         let resumed = reopened.begin_mutation(&fixture.intent, None).unwrap();
         assert_eq!(
             resumed.active.as_ref().map(|attempt| attempt.attempt_id()),
@@ -5842,6 +6185,37 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn registered_own_endpoint_residue_is_inert_and_remains_byte_identical() {
+        let fixture = Fixture::new_replacement("registered-own-residue");
+        let (_, _, records) = fixture.complete_replacement();
+        assert_eq!(records.len(), 1);
+        assert_eq!(fixture.store.validated_catalog().unwrap().len(), 1);
+        let before_store = fixture.snapshot_store();
+        let before_graph = fixture.snapshot_graph();
+
+        let own = [fixture.intent.id().unwrap()].into_iter().collect();
+        let reported = fixture.store.retired_own_endpoint_artifacts(&own);
+        assert!(reported.iter().any(|path| path.ends_with(".intent")));
+        assert!(reported.iter().any(|path| path.ends_with(".completion")));
+        assert!(reported
+            .iter()
+            .any(|path| path.ends_with(PENDING_CLEANUP_SUFFIX)));
+        assert!(fixture
+            .store
+            .load_completion(&fixture.intent)
+            .unwrap()
+            .is_none());
+        assert!(fixture.store.validated_catalog().unwrap().is_empty());
+        assert!(fixture
+            .store
+            .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+            .unwrap()
+            .is_empty());
+        assert_eq!(fixture.snapshot_store(), before_store);
+        assert_eq!(fixture.snapshot_graph(), before_graph);
     }
 
     #[test]

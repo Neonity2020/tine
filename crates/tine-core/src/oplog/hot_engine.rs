@@ -9898,6 +9898,12 @@ impl ShardedHotEngine {
             .is_some_and(|index| index.contains_completed(intent_id)))
     }
 
+    pub(crate) fn local_completed_projection_intent_ids(&self) -> BTreeSet<ProjectionIntentId> {
+        self.local_completion_index
+            .as_ref()
+            .map_or_else(BTreeSet::new, LocalCompletionIndex::completed_intent_ids)
+    }
+
     pub(crate) fn stage_local_projection_completion(
         &mut self,
         intent: &ProjectionIntent,

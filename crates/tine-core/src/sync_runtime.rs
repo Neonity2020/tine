@@ -6391,6 +6391,7 @@ fn open_clean_runtime_resources_with_progress(
     engine
         .open_local_completion_index(&store)
         .map_err(display)?;
+    let mut retired_own_intent_ids = engine.local_completed_projection_intent_ids();
     let endpoint = engine
         .projection_endpoint_binding()
         .ok_or_else(|| "clean runtime has no projection endpoint".to_owned())?;
@@ -6415,10 +6416,18 @@ fn open_clean_runtime_resources_with_progress(
         binding.device_id().as_uuid(),
     )
     .map_err(display)?;
-    completion_guard.retain(retained_local_completion_intents(
-        &managed_local,
-        &projection_turns,
-    )?);
+    let retained_own_intents =
+        retained_local_completion_intents(&managed_local, &projection_turns)?;
+    retired_own_intent_ids.extend(retained_own_intents.iter().copied());
+    let retired_receipt_artifacts =
+        receipts.retired_own_endpoint_artifacts(&retired_own_intent_ids);
+    if !retired_receipt_artifacts.is_empty() {
+        eprintln!(
+            "retired own-endpoint receipt artifacts remain inert: {}",
+            retired_receipt_artifacts.join(", ")
+        );
+    }
+    completion_guard.retain(retained_own_intents);
     let recovered_provider_batches = drain_open_managed_local_journal(
         &graph,
         &receipts,
@@ -28661,81 +28670,95 @@ mod tests {
                 }
                 let cut_snapshot = snapshot_real_store_tree(&fixture.root);
                 let completions_at_cut = receipt_completion_count(&fixture.request.receipt_root);
-                if feature.produces_turn() {
-                    assert_eq!(
-                        completions_at_cut,
-                        schedule.completed_pages,
-                        "{} schedule {ordinal} is not the requested real receipt prefix",
-                        feature.label()
-                    );
-                }
+                assert_eq!(
+                    completions_at_cut,
+                    0,
+                    "{} schedule {ordinal} authored an own-endpoint completion receipt",
+                    feature.label()
+                );
 
                 crate::oplog::projection_store::reset_projection_store_test_counters();
-                let receipt_resources =
+                crate::oplog::projection::reset_turn_replay_page_completions_for_test();
+                let first_turn_resources =
                     open_clean_runtime_resources(&reopen_request(&fixture.request))
                         .unwrap()
                         .unwrap();
-                let receipt_outcome = real_store_oracle_outcome(&receipt_resources);
-                assert_eq!(receipt_resources.managed_local.pending_count(), 0);
-                assert_eq!(receipt_resources.projection_turns.pending_count(), 0);
-                let receipt_lookups =
+                let first_turn_outcome = real_store_oracle_outcome(&first_turn_resources);
+                assert_eq!(first_turn_resources.managed_local.pending_count(), 0);
+                assert_eq!(first_turn_resources.projection_turns.pending_count(), 0);
+                let first_turn_replayed_pages =
+                    crate::oplog::projection::turn_replay_page_completions_for_test();
+                let first_turn_lookups =
                     crate::oplog::projection_store::projection_store_test_counters()
                         .completion_lookups;
-                drop(receipt_resources);
+                drop(first_turn_resources);
 
                 restore_real_store_tree(&fixture.root, &cut_snapshot);
                 let withheld = withhold_receipt_completions(&fixture.request.receipt_root);
-                assert_eq!(withheld, completions_at_cut);
+                assert_eq!(
+                    withheld, 0,
+                    "own-endpoint cut unexpectedly produced completion artifacts"
+                );
                 crate::oplog::projection_store::reset_projection_store_test_counters();
                 crate::oplog::projection::reset_turn_replay_page_completions_for_test();
-                let turn_resources =
+                let second_turn_resources =
                     open_clean_runtime_resources(&reopen_request(&fixture.request))
                         .unwrap()
                         .unwrap();
-                let turn_outcome = real_store_oracle_outcome(&turn_resources);
-                assert_eq!(turn_resources.managed_local.pending_count(), 0);
-                assert_eq!(turn_resources.projection_turns.pending_count(), 0);
-                let turn_replayed_pages =
+                let second_turn_outcome = real_store_oracle_outcome(&second_turn_resources);
+                assert_eq!(second_turn_resources.managed_local.pending_count(), 0);
+                assert_eq!(second_turn_resources.projection_turns.pending_count(), 0);
+                let second_turn_replayed_pages =
                     crate::oplog::projection::turn_replay_page_completions_for_test();
-                let turn_lookups = crate::oplog::projection_store::projection_store_test_counters()
-                    .completion_lookups;
-                drop(turn_resources);
+                let second_turn_lookups =
+                    crate::oplog::projection_store::projection_store_test_counters()
+                        .completion_lookups;
+                drop(second_turn_resources);
 
-                assert_real_store_projection_heads_are_exact(&receipt_outcome, feature, ordinal);
-                assert_real_store_projection_heads_are_exact(&turn_outcome, feature, ordinal);
+                assert_real_store_projection_heads_are_exact(&first_turn_outcome, feature, ordinal);
+                assert_real_store_projection_heads_are_exact(
+                    &second_turn_outcome,
+                    feature,
+                    ordinal,
+                );
 
                 if feature.produces_turn() && !schedule.checkpointed {
                     assert!(
-                        receipt_lookups >= page_count,
-                        "receipt side did not consult completions"
+                        first_turn_replayed_pages >= page_count,
+                        "first turn-only recovery skipped production replay for {} schedule {ordinal}",
+                        feature.label()
                     );
                     assert!(
-                        turn_lookups >= page_count,
-                        "turn side did not prove completions absent"
-                    );
-                    assert!(
-                        turn_replayed_pages >= page_count,
-                        "turn-only recovery skipped production replay for {} schedule {ordinal}",
+                        second_turn_replayed_pages >= page_count,
+                        "second turn-only recovery skipped production replay for {} schedule {ordinal}",
                         feature.label()
                     );
                 }
-                let expected = expected.get_or_insert_with(|| receipt_outcome.clone());
                 assert_eq!(
-                    &receipt_outcome,
+                    first_turn_lookups, 0,
+                    "own-endpoint recovery consulted receipt completions"
+                );
+                assert_eq!(
+                    second_turn_lookups, 0,
+                    "own-endpoint recovery consulted receipt completions"
+                );
+                let expected = expected.get_or_insert_with(|| first_turn_outcome.clone());
+                assert_eq!(
+                    &first_turn_outcome,
                     expected,
-                    "receipt recovery differed for {} schedule {ordinal}: {schedule:?}",
+                    "first turn-only recovery differed for {} schedule {ordinal}: {schedule:?}",
                     feature.label()
                 );
                 assert_eq!(
-                    &turn_outcome,
+                    &second_turn_outcome,
                     expected,
-                    "turn-only recovery differed for {} schedule {ordinal}: {schedule:?}",
+                    "second turn-only recovery differed for {} schedule {ordinal}: {schedule:?}",
                     feature.label()
                 );
                 assert_eq!(
-                    turn_outcome,
-                    receipt_outcome,
-                    "protocols differed for {} schedule {ordinal}: {schedule:?}",
+                    second_turn_outcome,
+                    first_turn_outcome,
+                    "turn-only repetitions differed for {} schedule {ordinal}: {schedule:?}",
                     feature.label()
                 );
             }
@@ -29650,7 +29673,11 @@ mod tests {
             SyncShutdownOutcome::Safe(_)
         ));
 
-        assert!(withhold_receipt_completions(&fixture.request.receipt_root) > 0);
+        assert_eq!(
+            withhold_receipt_completions(&fixture.request.receipt_root),
+            0,
+            "the own-endpoint fixture must author no receipt completion"
+        );
         fs::remove_file(fixture.graph_root.join(path.as_str())).unwrap();
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
         let ticks = drain_until_settled(&reopened);
@@ -29747,7 +29774,11 @@ mod tests {
         assert!(error.contains("deterministic cut during production turn replay"));
         assert!(fixture.graph_root.join(path.as_str()).is_file());
 
-        assert!(withhold_receipt_completions(&fixture.request.receipt_root) > 0);
+        assert_eq!(
+            withhold_receipt_completions(&fixture.request.receipt_root),
+            0,
+            "the cold own-endpoint replay must author no receipt completion"
+        );
         fs::remove_file(fixture.graph_root.join(path.as_str())).unwrap();
         let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
             .unwrap()
@@ -35639,6 +35670,27 @@ mod tests {
         assert!(
             !receiver_handle.status().unwrap().has_runnable_work(),
             "a drained running receiver must return the scheduler to sleep",
+        );
+        let graph = Graph::open_checked(&receiver.graph_root).unwrap();
+        let endpoint = ProjectionEndpointBinding {
+            endpoint_id: receiver.request.identities.endpoint_id,
+            device_id: receiver.request.identities.device_id,
+            graph_resource_id: graph.canonical_resource_id().unwrap(),
+        };
+        drop(graph);
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &receiver.request.receipt_root,
+            receiver.request.identities.workspace_id,
+            endpoint,
+        )
+        .unwrap();
+        assert!(
+            receipts
+                .validated_catalog()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.completion.is_some()),
+            "the foreign receiver path must retain its durable completion protocol"
         );
     }
 
@@ -42643,22 +42695,166 @@ mod tests {
         ));
         crate::durability_counters::BarrierSession::detach_current_thread();
 
-        assert!(
-            save_total.total() <= crate::durability_counters::MANAGED_SAVE_BARRIER_BUDGET,
+        assert_eq!(
+            save_total.total(),
+            crate::durability_counters::MANAGED_SAVE_BARRIER_BUDGET,
             "one accepted single-block managed save performed {} core-initiated durability \
-             barriers, budget {} ({}). Each barrier is a device round trip; a regression \
-             here is a latency regression on every edit.",
+             barriers, pinned total {} ({}). Each barrier is a device round trip; any drift \
+             must be attributed before this exact ledger changes.",
             save_total.total(),
             crate::durability_counters::MANAGED_SAVE_BARRIER_BUDGET,
             save_total.report()
         );
-        assert!(
-            move_total.total() <= crate::durability_counters::MANAGED_MOVE_BARRIER_BUDGET,
+        assert_eq!(
+            move_total.total(),
+            crate::durability_counters::MANAGED_MOVE_BARRIER_BUDGET,
             "one accepted cross-page move performed {} core-initiated durability barriers, \
-             budget {} ({}).",
+             pinned total {} ({}).",
             move_total.total(),
             crate::durability_counters::MANAGED_MOVE_BARRIER_BUDGET,
             move_total.report()
+        );
+    }
+
+    #[test]
+    fn own_endpoint_save_and_move_author_no_receipt_artifacts() {
+        let fixture = ActivationFixture::nested_unicode("own-receipt-retirement", 0xa1c3);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("own receipt retirement fixture activates");
+        drive_initial_feed(&handle);
+
+        let mut request = simple_application_move_request(&handle, "Own Receipt Retirement");
+        drain_managed_local(&handle);
+        let before_save = recursive_file_bytes(&fixture.request.receipt_root);
+
+        let (page, revision) = load_application_exact(&handle, &request.source_path);
+        let (page, revision) =
+            save_application_block_text(&handle, page, revision, "own receipt retirement save");
+        drain_managed_local(&handle);
+        assert_eq!(
+            recursive_file_bytes(&fixture.request.receipt_root),
+            before_save,
+            "an own-endpoint save must not author or rewrite receipt artifacts"
+        );
+
+        request.source_revision = revision;
+        request.roots[0].identity = page.blocks[0].id.clone();
+        let (_destination, destination_revision) =
+            load_application_exact(&handle, &request.destination_path);
+        request.destination_revision = destination_revision;
+        let moved = accepted_application_move(&handle, &request);
+        assert!(matches!(
+            moved,
+            SyncApplicationMoveSubtreesOutcome::Committed { .. }
+        ));
+        drain_managed_local(&handle);
+        assert_eq!(
+            recursive_file_bytes(&fixture.request.receipt_root),
+            before_save,
+            "an own-endpoint move must not author or rewrite receipt artifacts"
+        );
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn residual_own_endpoint_receipts_are_reported_but_remain_inert_on_open() {
+        let fixture = ActivationFixture::nested_unicode("own-receipt-residue", 0xa1c4);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("own receipt residue fixture activates");
+        drive_initial_feed(&handle);
+        drain_managed_local(&handle);
+
+        let request = simple_application_move_request(&handle, "Own Receipt Residue");
+        let base = fs::read(fixture.graph_root.join(&request.source_path)).unwrap();
+        let (page, revision) = load_application_exact(&handle, &request.source_path);
+        let _ = save_application_block_text(&handle, page, revision, "residual receipt save");
+        let frames = managed_local_journal_frames(&reopen_request(&fixture.request));
+        let record = crate::oplog::decode_managed_local_record(
+            frames
+                .last()
+                .expect("the save retains its authoritative frame"),
+        )
+        .unwrap();
+        let intent = record
+            .projections()
+            .iter()
+            .find(|projection| projection.intent().path().as_str() == request.source_path.as_str())
+            .expect("the save frame carries its own projection")
+            .completion_intent()
+            .unwrap()
+            .clone();
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let graph = Graph::open(&fixture.graph_root);
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            fixture.request.identities.endpoint_id,
+            fixture.request.identities.device_id,
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &fixture.request.receipt_root,
+            fixture.request.identities.workspace_id,
+            endpoint,
+        )
+        .unwrap();
+        let published_base = match intent.precondition() {
+            crate::oplog::ProjectionPrecondition::Absent => None,
+            crate::oplog::ProjectionPrecondition::Base(description) => {
+                assert_eq!(*description, BlobDescription::of(&base));
+                Some(base.as_slice())
+            }
+        };
+        receipts.publish_intent(&intent, published_base).unwrap();
+        assert_eq!(
+            receipts.validated_catalog().unwrap().len(),
+            1,
+            "the fixture must carry one pre-2c own receipt before retirement registration"
+        );
+        let before_report = recursive_file_bytes(&fixture.request.receipt_root);
+        let own = [intent.id().unwrap()].into_iter().collect();
+        let reported = receipts.retired_own_endpoint_artifacts(&own);
+        assert!(
+            reported.iter().any(|path| path.ends_with(".intent")),
+            "the residual own intent suffix was not reported: {reported:?}"
+        );
+        assert!(
+            receipts.validated_catalog().unwrap().is_empty(),
+            "registered own residue must be excluded from the live receiver catalog"
+        );
+        assert_eq!(
+            recursive_file_bytes(&fixture.request.receipt_root),
+            before_report,
+            "reporting and registering own residue must be names-only"
+        );
+        drop(receipts);
+        drop(graph);
+        let before_open = recursive_file_bytes(&fixture.request.receipt_root);
+
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert_eq!(
+            recursive_file_bytes(&fixture.request.receipt_root),
+            before_open,
+            "reporting residual own receipt suffixes must not delete or rewrite them"
         );
     }
 
@@ -42668,9 +42864,10 @@ mod tests {
     /// The fast budget test runs on a five-file fixture because barrier count
     /// is a property of the *shape* of an accepted batch, not of graph size.
     /// This probe is what proves that claim on a real corpus, and it is what
-    /// the 2026-08-26 cost-model audit measured (66 barriers per save, 151 per
-    /// cross-day move, on the anonymized 1,045-file graph). Run it after any
-    /// change to the publication protocol and compare against the fixture.
+    /// packet 2c measured on the anonymized real-graph copy. Exact base
+    /// `72150fb1` produced a warm-up save at 33, stable saves at 31, and a move
+    /// at 89; packet 2c produces 12, then stable 10s, and a move at 13. Run it
+    /// after any publication-protocol change and compare against the fixture.
     ///
     /// ```text
     /// TINE_MS_AUDIT_GRAPH_COPY=/path/to/graph \
@@ -48514,7 +48711,7 @@ mod tests {
     }
 
     #[test]
-    fn first_external_change_publishes_an_ordinary_receipt_that_supersedes_after_restart() {
+    fn first_own_endpoint_external_change_leaves_receipts_empty_after_restart() {
         const PATH: &str = "Root.md";
         let fixture = ActivationFixture::nested_unicode("bootstrap-supersession", 0xa1d0);
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
@@ -48558,7 +48755,10 @@ mod tests {
         );
         assert_eq!(fs::read(fixture.graph_root.join(PATH)).unwrap(), edited);
         let after_import = completion_count();
-        assert_eq!(after_import, 1);
+        assert_eq!(
+            after_import, 0,
+            "an own-endpoint external admission uses turn/local-completion authority, not receipts"
+        );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

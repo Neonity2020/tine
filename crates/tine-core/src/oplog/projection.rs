@@ -35,7 +35,10 @@ use super::{
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
-use crate::oplog::projection_store::MAX_PENDING_PROJECTION_CLEANUP_PER_PASS;
+use crate::oplog::projection_store::{
+    enter_projection_turn_attempt, ProjectionTurnMutationAuthority,
+    MAX_PENDING_PROJECTION_CLEANUP_PER_PASS,
+};
 use crate::Graph;
 
 thread_local! {
@@ -43,8 +46,6 @@ thread_local! {
     // projection boundary: intent and attempt authority are durable, but the
     // graph mutation has not started.
     static HARNESS_FAIL_DURING_MANIFESTED_PROJECTION: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-    static HARNESS_FAIL_AFTER_FORMATTING_INTENT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     // Repeats of the same manifested-projection fault. A one-shot fault always
     // converges on the first retry, which cannot exercise a retained
@@ -275,10 +276,6 @@ pub(crate) fn fail_next_manifested_projection_during_write_for_harness(
     ManifestedProjectionFaultScope { previously_armed }
 }
 
-pub(crate) fn fail_next_formatting_adoption_after_intent_for_harness() {
-    HARNESS_FAIL_AFTER_FORMATTING_INTENT.with(|fail| fail.set(true));
-}
-
 pub(crate) fn fail_manifested_projection_repeatedly_for_harness(times: u32) {
     HARNESS_FAIL_MANIFESTED_PROJECTION_REPEATS.with(|fail| fail.set(times));
 }
@@ -298,18 +295,6 @@ fn fail_during_manifested_projection_for_harness() -> Result<(), ProjectionError
         if fail.replace(false) {
             Err(ProjectionError::Work(
                 "deterministic failure during manifested projection".into(),
-            ))
-        } else {
-            Ok(())
-        }
-    })
-}
-
-fn fail_after_formatting_intent_for_harness() -> Result<(), ProjectionError> {
-    HARNESS_FAIL_AFTER_FORMATTING_INTENT.with(|fail| {
-        if fail.replace(false) {
-            Err(ProjectionError::Work(
-                "deterministic failure after formatting-only intent".into(),
             ))
         } else {
             Ok(())
@@ -1869,32 +1854,23 @@ fn receiver_clean_tombstone_plan(
 /// evidence; it is disposable and never becomes a second work-status store.
 pub(crate) fn execute_clean_manifested_projection_work(
     graph: &Graph,
-    receipts: &ProjectionReceiptStore,
     projection: &SqliteFrontier,
     engine: &mut ShardedHotEngine,
     work: &ProjectionWork,
 ) -> Result<(), ProjectionError> {
-    execute_manifested_projection_work_with_runtime(graph, receipts, engine, projection, work, None)
+    execute_manifested_projection_work_with_runtime(graph, engine, projection, work, None)
         .map(|_| ())
 }
 
 pub(crate) fn execute_clean_manifested_projection_work_under_handoff(
     graph: &Graph,
-    receipts: &ProjectionReceiptStore,
     projection: &SqliteFrontier,
     engine: &mut ShardedHotEngine,
     work: &ProjectionWork,
     handoff: &crate::model::PublishedHandoffLatch,
 ) -> Result<(), ProjectionError> {
-    execute_manifested_projection_work_with_runtime(
-        graph,
-        receipts,
-        engine,
-        projection,
-        work,
-        Some(handoff),
-    )
-    .map(|_| ())
+    execute_manifested_projection_work_with_runtime(graph, engine, projection, work, Some(handoff))
+        .map(|_| ())
 }
 
 /// Lower accepted manifest locators into the description-only page list stored
@@ -2167,7 +2143,7 @@ pub(crate) fn replay_projection_turn(
             let attempt_id = turn
                 .attempt_id(page_index)
                 .ok_or(ProjectionError::WorkIntentMismatch)?;
-            let _attempt_scope = receipts.enter_turn_attempt(attempt_id);
+            let _attempt_scope = enter_projection_turn_attempt(attempt_id);
             turn_replay_page_start_for_test()?;
             if matches!(
                 turn.origin,
@@ -2300,7 +2276,7 @@ pub(crate) fn replay_projection_turn(
             }
             if work.endpoint_id() == endpoint.endpoint_id() {
                 let result = execute_manifested_projection_work_with_runtime(
-                    graph, receipts, engine, projection, work, handoff,
+                    graph, engine, projection, work, handoff,
                 );
                 if let Err(ProjectionError::WorkNotReady) = result {
                     if projection_work_is_already_exact(graph, engine, projection, work)? {
@@ -2336,7 +2312,6 @@ pub(crate) fn replay_projection_turn(
                     }
                     write_projection_exact_with_handoff(
                         graph,
-                        receipts,
                         engine,
                         work.page_id(),
                         observed.as_deref(),
@@ -2569,20 +2544,18 @@ fn locate_projection_failure(path: &str, error: ProjectionError) -> ProjectionEr
 
 fn execute_manifested_projection_work_with_runtime(
     graph: &Graph,
-    receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
     projection: &SqliteFrontier,
     work: &ProjectionWork,
     handoff: Option<&crate::model::PublishedHandoffLatch>,
 ) -> Result<ProjectionExecution, ProjectionError> {
     let path = work.path().as_str().to_owned();
-    execute_manifested_projection_work_located(graph, receipts, engine, projection, work, handoff)
+    execute_manifested_projection_work_located(graph, engine, projection, work, handoff)
         .map_err(|error| locate_projection_failure(&path, error))
 }
 
 fn execute_manifested_projection_work_located(
     graph: &Graph,
-    receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
     projection: &SqliteFrontier,
     work: &ProjectionWork,
@@ -2611,22 +2584,11 @@ fn execute_manifested_projection_work_located(
             .projection_endpoint_binding()
             .ok_or(ProjectionError::EndpointBindingMismatch)
     )?;
-    let receipt_store_id = engine
-        .projection_receipt_store_id()
-        .ok_or(ProjectionError::EndpointBindingMismatch)?;
-    if receipts.store_id() != receipt_store_id {
-        return Err(ProjectionError::EndpointBindingMismatch);
-    }
-    projection_phase!("require_endpoint", receipts.require_endpoint(endpoint))?;
     if projection_phase!("canonical_resource", graph.canonical_resource_id())?
         != endpoint.graph_resource_id
     {
         return Err(ProjectionError::EndpointBindingMismatch);
     }
-    projection_phase!(
-        "retire_pending_recovery",
-        retire_pending_projection_recovery(graph, receipts, handoff)
-    )?;
     let archive = projection_phase!(
         "authorize_work",
         engine
@@ -2705,46 +2667,17 @@ fn execute_manifested_projection_work_located(
             return Err(ProjectionError::WorkNotReady);
         }
     }
-    // Projecting one document costs ~95ms uniformly (F46), which is far too slow
-    // for ~1.2KB of bytes and points at durable-write barriers rather than work.
-    // This is the first of several durable receipt steps per document; time it to
-    // test that hypothesis instead of assuming it.
-    let intent_started = super::phase_trace_enabled().then(std::time::Instant::now);
-    projection_phase!(
-        "publish_intent_total",
-        receipts.publish_intent(
-            &local_attempt_intent,
-            expected_base.map(AnnotatedProjectionBase::bytes),
-        )
-    )?;
-    if let Some(started) = intent_started {
-        eprintln!(
-            "PHASE TIME Projection.publish_intent {:.1}ms",
-            started.elapsed().as_secs_f64() * 1000.0,
-        );
-    }
-    if projection_phase!(
-        "load_completion",
-        receipts.load_completion(&local_attempt_intent)
-    )?
-    .is_some()
+    if engine
+        .local_projection_completed(local_attempt_intent.id()?)
+        .map_err(ProjectionError::Engine)?
     {
-        engine
-            .stage_local_projection_completion(&local_attempt_intent)
-            .map_err(ProjectionError::Engine)?;
-        retire_completed_projection_recovery(graph, receipts, &local_attempt_intent, handoff)?;
         return Ok(ProjectionExecution::NeedsTurnRebarrier);
     }
-    let attempts = projection_phase!(
-        "load_attempts",
-        receipts.load_attempt_reservations(&local_attempt_intent)
-    )?;
-    let has_attempts = !attempts.is_empty();
+
     // A deletion can crash after the target's absence is durable and before
-    // either its receipt completion or owning turn checkpoint is durable. The
-    // accepted turn is sufficient authority to confirm that already-exact
-    // absence; asking `recover_removed_page_projection` for the displaced base
-    // inode would make completion evidence a prerequisite for turn replay.
+    // either its local completion or owning turn checkpoint is durable. The
+    // accepted turn is sufficient authority to confirm already-exact absence;
+    // receipt residue is neither read nor resumed.
     let deletion_is_already_exact = if target.is_none() {
         projection_phase!(
             "read_deleted_projection_input",
@@ -2756,94 +2689,74 @@ fn execute_manifested_projection_work_located(
     } else {
         false
     };
-    let recovery_result = if !has_attempts {
-        None
-    } else {
-        let mut authority = receipts.begin_mutation(&local_attempt_intent, None)?;
-        let result = match (handoff, target) {
-            (Some(handoff), Some(target)) => handoff.recover_page_projection_with_layout(
+    let mut recovery_authority =
+        ProjectionTurnMutationAuthority::for_current_turn(&local_attempt_intent)?;
+    let recovery_result = match (handoff, target) {
+        (Some(handoff), Some(target)) => handoff.recover_page_projection_with_layout(
+            graph,
+            manifested.path().as_str(),
+            expected_base.map(AnnotatedProjectionBase::bytes),
+            target,
+            &guarded_layout,
+            &mut recovery_authority,
+        ),
+        (None, Some(target)) => graph.recover_page_projection_with_layout(
+            manifested.path().as_str(),
+            expected_base.map(AnnotatedProjectionBase::bytes),
+            target,
+            &guarded_layout,
+            &mut recovery_authority,
+        ),
+        (Some(handoff), None) if deletion_is_already_exact => handoff
+            .confirm_removed_page_projection(
                 graph,
                 manifested.path().as_str(),
-                expected_base.map(AnnotatedProjectionBase::bytes),
-                target,
-                &guarded_layout,
-                &mut authority,
+                &mut recovery_authority,
             ),
-            (None, Some(target)) => graph.recover_page_projection_with_layout(
+        (None, None) if deletion_is_already_exact => graph
+            .confirm_removed_page_projection(manifested.path().as_str(), &mut recovery_authority),
+        (Some(handoff), None) => {
+            let base = expected_base
+                .as_ref()
+                .ok_or(ProjectionError::WorkIntentMismatch)?;
+            handoff.recover_removed_page_projection(
+                graph,
                 manifested.path().as_str(),
-                expected_base.map(AnnotatedProjectionBase::bytes),
-                target,
-                &guarded_layout,
-                &mut authority,
-            ),
-            (Some(handoff), None) if deletion_is_already_exact => handoff
-                .confirm_removed_page_projection(graph, manifested.path().as_str(), &mut authority),
-            (None, None) if deletion_is_already_exact => {
-                graph.confirm_removed_page_projection(manifested.path().as_str(), &mut authority)
-            }
-            (Some(handoff), None) => {
-                let base = expected_base
-                    .as_ref()
-                    .ok_or(ProjectionError::WorkIntentMismatch)?;
-                handoff.recover_removed_page_projection(
-                    graph,
-                    manifested.path().as_str(),
-                    base.bytes(),
-                    &mut authority,
-                )
-            }
-            (None, None) => {
-                let base = expected_base
-                    .as_ref()
-                    .ok_or(ProjectionError::WorkIntentMismatch)?;
-                graph.recover_removed_page_projection(
-                    manifested.path().as_str(),
-                    base.bytes(),
-                    &mut authority,
-                )
-            }
-        };
-        Some((result, authority))
+                base.bytes(),
+                &mut recovery_authority,
+            )
+        }
+        (None, None) => {
+            let base = expected_base
+                .as_ref()
+                .ok_or(ProjectionError::WorkIntentMismatch)?;
+            graph.recover_removed_page_projection(
+                manifested.path().as_str(),
+                base.bytes(),
+                &mut recovery_authority,
+            )
+        }
     };
     let recovered = match recovery_result {
-        Some((Ok(proof), authority)) => Some((proof, authority)),
-        Some((Err(error), authority))
+        Ok(proof) => Some((proof, recovery_authority)),
+        Err(error)
             if matches!(
                 error.kind(),
                 io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
             ) =>
         {
-            authority.release_failed_recovery()?;
             None
         }
-        Some((Err(error), _)) if crate::model::is_projection_semantic_refusal(&error) => {
+        Err(error) if crate::model::is_projection_semantic_refusal(&error) => {
             return Err(ProjectionError::GuardedConflict(error));
         }
-        Some((Err(error), _)) => return Err(error.into()),
-        None => None,
+        Err(error) => return Err(error.into()),
     };
     let (proof, authority) = match recovered {
         Some(recovered) => recovered,
         None => {
-            // publish_intent was 0.6ms of the 95ms (F47), so the cost is further
-            // down. Split reservation+begin_mutation from the write that follows:
-            // if one carries ~90ms and the other is sub-millisecond, the lever is
-            // a single barrier; if the cost is spread, per-document work is
-            // inherently multi-step and decision item 13 needs reframing.
-            let mutation_started = super::phase_trace_enabled().then(std::time::Instant::now);
-            let mut authority = if has_attempts {
-                let reservation = receipts.reserve_fallback_attempt(&local_attempt_intent)?;
-                receipts.begin_mutation(&local_attempt_intent, Some(&reservation))?
-            } else {
-                let reservation = receipts.reserve_attempt(&local_attempt_intent)?;
-                receipts.begin_mutation(&local_attempt_intent, Some(&reservation))?
-            };
-            if let Some(started) = mutation_started {
-                eprintln!(
-                    "PHASE TIME Projection.begin_mutation {:.1}ms",
-                    started.elapsed().as_secs_f64() * 1000.0,
-                );
-            }
+            let mut authority =
+                ProjectionTurnMutationAuthority::for_current_turn(&local_attempt_intent)?;
             fail_during_manifested_projection_for_harness()?;
             let current = projection_phase!(
                 "read_projection_input",
@@ -2948,17 +2861,29 @@ fn execute_manifested_projection_work_located(
             }
         }
     };
-    projection_phase!(
-        "publish_completion",
-        receipts.publish_completion(authority, &local_attempt_intent, &proof)
-    )?;
+    let cleanup_records = authority.cleanup_records(&local_attempt_intent, &proof)?;
+    for record in &cleanup_records {
+        let cleanup = match handoff {
+            Some(handoff) => handoff.retire_completed_projection_recovery(
+                graph,
+                local_attempt_intent.path().as_str(),
+                std::slice::from_ref(record),
+            ),
+            None => graph.retire_completed_projection_recovery(
+                local_attempt_intent.path().as_str(),
+                std::slice::from_ref(record),
+            ),
+        }?;
+        debug_assert!(matches!(
+            cleanup,
+            ProjectionRecoveryCleanup::Missing
+                | ProjectionRecoveryCleanup::Retired
+                | ProjectionRecoveryCleanup::ConflictRetained { .. }
+        ));
+    }
     engine
         .stage_local_projection_completion(&local_attempt_intent)
         .map_err(ProjectionError::Engine)?;
-    projection_phase!(
-        "retire_completed_recovery",
-        retire_completed_projection_recovery(graph, receipts, &local_attempt_intent, handoff)
-    )?;
     if let Some(started) = total_started {
         eprintln!(
             "PHASE TIME Projection.total path={} {:.3}ms",
@@ -2979,36 +2904,24 @@ enum ProjectionExecution {
     DeferredAbsence,
 }
 
-/// Publish intent/base evidence, invoke the singular guarded graph writer, and
-/// publish completion only after the writer returns the exact reread target.
-pub fn write_projection_exact(
-    graph: &Graph,
-    store: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    page_id: PageId,
-    expected_base: Option<&[u8]>,
-) -> Result<ProjectionWrite, ProjectionError> {
-    write_projection_exact_with_handoff(graph, store, engine, page_id, expected_base, None)
-}
-
 /// Re-render a superseded accepted page without abandoning the projection
-/// turn's already-published graph-text reservation. The ordinary public entry
-/// point passes no handoff; turn replay must pass the latch that owns the turn.
+/// turn's already-published graph-text reservation.
 fn write_projection_exact_with_handoff(
     graph: &Graph,
-    store: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
+    engine: &mut ShardedHotEngine,
     page_id: PageId,
     expected_base: Option<&[u8]>,
     handoff: Option<&crate::model::PublishedHandoffLatch>,
-) -> Result<ProjectionWrite, ProjectionError> {
-    require_endpoint_authority(graph, store, engine)?;
-    retire_pending_projection_recovery(graph, store, handoff)?;
+) -> Result<(), ProjectionError> {
+    let endpoint = engine
+        .projection_endpoint_binding()
+        .ok_or(ProjectionError::EndpointBindingMismatch)?;
+    if graph.canonical_resource_id()? != endpoint.graph_resource_id() {
+        return Err(ProjectionError::EndpointBindingMismatch);
+    }
     let authorization = engine.authorize_projection_write(page_id)?;
     let plan = plan_projection(engine.workspace_id(), authorization.state(), expected_base)?;
-    store.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
-    let reservation = store.reserve_attempt(plan.intent())?;
-    let mut authority = store.begin_mutation(plan.intent(), Some(&reservation))?;
+    let mut authority = ProjectionTurnMutationAuthority::for_current_turn(plan.intent())?;
     let proof = match handoff {
         Some(handoff) => handoff.write_page_projection_with_layout(
             graph,
@@ -3026,66 +2939,25 @@ fn write_projection_exact_with_handoff(
             &mut authority,
         ),
     }?;
-    let completion = store.publish_completion(authority, plan.intent(), &proof)?;
-    retire_completed_projection_recovery(graph, store, plan.intent(), handoff)?;
-    record_completed_path(store, engine, page_id, plan.intent())?;
+    let cleanup_records = authority.cleanup_records(plan.intent(), &proof)?;
+    for record in &cleanup_records {
+        match handoff {
+            Some(handoff) => handoff.retire_completed_projection_recovery(
+                graph,
+                plan.intent().path().as_str(),
+                std::slice::from_ref(record),
+            ),
+            None => graph.retire_completed_projection_recovery(
+                plan.intent().path().as_str(),
+                std::slice::from_ref(record),
+            ),
+        }?;
+    }
+    engine
+        .stage_local_projection_completion(plan.intent())
+        .map_err(ProjectionError::Engine)?;
     debug_assert_eq!(authorization.state().page.page_id, page_id);
-    Ok(ProjectionWrite { plan, completion })
-}
-
-/// Adopt an exact, semantically unchanged external representation as this
-/// endpoint's next projection/import baseline. This publishes only a
-/// device-local intent/base/completion and completed-path point; it does not
-/// author an operation or an operation batch.
-pub(crate) fn adopt_existing_projection_formatting(
-    graph: &Graph,
-    store: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    handoff: &crate::model::HandoffSafeGuard,
-    page_id: PageId,
-    observed_bytes: &[u8],
-    observed_annotations: &[AnnotatedIdentity],
-) -> Result<(), ProjectionError> {
-    require_endpoint_authority(graph, store, engine)?;
-    let authorization = engine.authorize_projection_write(page_id)?;
-    let current = graph
-        .read_projection_input(&authorization.state().page.path)?
-        .ok_or_else(|| ProjectionError::Work("formatting-only source disappeared".into()))?;
-    if current != observed_bytes {
-        return Err(ProjectionError::Work(
-            "formatting-only source changed after import observation".into(),
-        ));
-    }
-    let plan = plan_projection_with_layout_annotations(
-        engine.workspace_id(),
-        authorization.state(),
-        Some(observed_bytes),
-        Some(observed_annotations),
-    )?;
-    if plan.target() != observed_bytes {
-        return Err(ProjectionError::Work(
-            "formatting-only source is not the exact accepted semantic state".into(),
-        ));
-    }
-    store.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
-    fail_after_formatting_intent_for_harness()?;
-    if store.load_completion(plan.intent())?.is_none() {
-        let attempts = store.load_attempt_reservations(plan.intent())?;
-        let mut authority = if attempts.is_empty() {
-            let reservation = store.reserve_attempt(plan.intent())?;
-            store.begin_mutation(plan.intent(), Some(&reservation))?
-        } else {
-            store.begin_mutation(plan.intent(), None)?
-        };
-        let proof = handoff.confirm_existing_page_projection(
-            graph,
-            plan.intent().path().as_str(),
-            plan.target(),
-            &mut authority,
-        )?;
-        store.publish_completion(authority, plan.intent(), &proof)?;
-    }
-    record_adopted_formatting_path(store, engine, page_id, plan.intent())
+    Ok(())
 }
 
 /// Recover every incomplete intent only when current accepted engine state
