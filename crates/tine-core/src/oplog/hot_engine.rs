@@ -54,6 +54,9 @@ use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathIndexStore, PortablePathOccupied, PortablePathRecord,
     PortablePathReleased,
 };
+use super::receiver_absence_summary::ReceiverAbsenceSummary;
+#[cfg(test)]
+use super::receiver_absence_summary::ReceiverAbsenceSummaryOpenStats;
 use super::reference_catalog::ReferenceCatalogPolicyV1;
 #[cfg(test)]
 use super::reference_catalog::{
@@ -8526,6 +8529,11 @@ pub struct ShardedHotEngine {
     /// chain is durable; this engine-owned value also owns the coalescing
     /// buffer from cold repair through actor shutdown.
     local_completion_index: Option<LocalCompletionIndex>,
+    /// Derived receiver half, retained only so post-open completions can append
+    /// an install-after-receipt summary generation.
+    receiver_absence_summary: RefCell<Option<ReceiverAbsenceSummary>>,
+    #[cfg(test)]
+    receiver_absence_summary_open_stats: RefCell<Option<ReceiverAbsenceSummaryOpenStats>>,
     /// Disposable per-open merge of receiver receipt history with the local
     /// completion half. Durable truth remains in those two stores.
     absence_decision_map: RefCell<Option<AbsenceDecisionMap>>,
@@ -8790,6 +8798,9 @@ impl ShardedHotEngine {
             transient_effective_view_order: VecDeque::new(),
             archive_store: None,
             local_completion_index: None,
+            receiver_absence_summary: RefCell::new(None),
+            #[cfg(test)]
+            receiver_absence_summary_open_stats: RefCell::new(None),
             absence_decision_map: RefCell::new(None),
             deferred_absence_observations: RefCell::new(BTreeSet::new()),
             projection_endpoint: None,
@@ -9951,8 +9962,9 @@ impl ShardedHotEngine {
     }
 
     /// Materialize the receiver/own absence-decision map after old own receipt
-    /// ids have been registered as inert. The validated receiver catalog is
-    /// read exactly once per managed open.
+    /// ids have been registered as inert. Managed opens use the disposable
+    /// receiver summary plus its completion-filename horizon; generic engines
+    /// without an archive capability retain the full-catalog fallback.
     pub(crate) fn open_absence_decision_map(
         &self,
         receipts: &ProjectionReceiptStore,
@@ -9960,19 +9972,31 @@ impl ShardedHotEngine {
         if self.absence_decision_map.borrow().is_some() {
             return Ok(());
         }
-        let catalog = receipts
-            .validated_catalog()
-            .map_err(|error| EngineError::Receipt(error.to_string()))?;
-        let mut map = AbsenceDecisionMap::default();
-        for entry in catalog {
-            if entry.completion.is_some() {
-                map.record_receiver_completion(&entry.intent)
-                    .map_err(|error| EngineError::Receipt(error.to_string()))?;
-            } else {
-                map.record_receiver_intent(&entry.intent)
-                    .map_err(|error| EngineError::Receipt(error.to_string()))?;
+        let mut map = if let Some(store) = self.archive_store.as_deref() {
+            let opened = ReceiverAbsenceSummary::open(store, receipts)
+                .map_err(|error| EngineError::Receipt(error.to_string()))?;
+            #[cfg(test)]
+            {
+                *self.receiver_absence_summary_open_stats.borrow_mut() = Some(opened.stats.clone());
             }
-        }
+            *self.receiver_absence_summary.borrow_mut() = opened.cache;
+            opened.map
+        } else {
+            let catalog = receipts
+                .validated_catalog()
+                .map_err(|error| EngineError::Receipt(error.to_string()))?;
+            let mut map = AbsenceDecisionMap::default();
+            for entry in catalog {
+                if entry.completion.is_some() {
+                    map.record_receiver_completion(&entry.intent)
+                        .map_err(|error| EngineError::Receipt(error.to_string()))?;
+                } else {
+                    map.record_receiver_intent(&entry.intent)
+                        .map_err(|error| EngineError::Receipt(error.to_string()))?;
+                }
+            }
+            map
+        };
         for entry in self
             .local_completion_index
             .as_ref()
@@ -10059,6 +10083,14 @@ impl ShardedHotEngine {
             map.record_receiver_intent(intent)
                 .map_err(|error| EngineError::Receipt(error.to_string()))?;
         }
+        let summary_failed = self
+            .receiver_absence_summary
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|summary| summary.record_intent(intent).is_err());
+        if summary_failed {
+            self.receiver_absence_summary.borrow_mut().take();
+        }
         Ok(())
     }
 
@@ -10070,7 +10102,24 @@ impl ShardedHotEngine {
             map.record_receiver_completion(intent)
                 .map_err(|error| EngineError::Receipt(error.to_string()))?;
         }
+        let summary_failed = self
+            .receiver_absence_summary
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|summary| summary.record_completion(intent).is_err());
+        if summary_failed {
+            // The receiver completion is already durable truth. Cache failure
+            // is crash-equivalent and heals from the filename horizon.
+            self.receiver_absence_summary.borrow_mut().take();
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receiver_absence_summary_open_stats_for_test(
+        &self,
+    ) -> Option<ReceiverAbsenceSummaryOpenStats> {
+        self.receiver_absence_summary_open_stats.borrow().clone()
     }
 
     pub(crate) fn local_completed_projection_intent_ids(&self) -> BTreeSet<ProjectionIntentId> {
