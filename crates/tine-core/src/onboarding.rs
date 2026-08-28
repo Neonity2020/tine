@@ -1218,6 +1218,8 @@ mod tests {
         assert!(page.markdown.contains("graph.write.block"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page.markdown.contains("Tine-owned presentation styles"));
+        assert!(page.markdown.contains("Style and colors are independent"));
+        assert!(page.markdown.contains("notnote's editorial style"));
         assert!(page
             .markdown
             .contains("The theme receives neither those tasks"));

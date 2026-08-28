@@ -578,7 +578,9 @@ within a column; merged cells are still v2+.
   removes behavior/packages without making graph files unreadable.
 - **Declarative theme API 0.2** — executable code is not involved: packages contain
   strictly validated literal colors and may select host-owned editorial typography,
-  journal-header, and Today task-summary presets. Themes install from the signed
+  journal-header, and Today task-summary presets. Presentation style and color scheme
+  are selected independently, so an installed editorial style can use a built-in
+  palette. Themes install from the signed
   catalogue or local files under Settings → Appearance, remain device-local, and sit
   below graph `logseq/custom.css` in the cascade. Existing color-only API 0.1 themes
   remain compatible.
@@ -637,10 +639,11 @@ within a column; merged cells are still v2+.
   replaced; markup structure kept) and **re-verified to still reproduce the
   divergence** before it's shown. Copied reports include the Tine version used.
   mldoc is loaded only on demand; nothing is uploaded.
-- Light/dark themes, a built-in theme gallery (Default, Nord, Solarized, Gruvbox),
-  accent color, custom CSS, wide mode (`t w`), document mode (`t d`). Gallery
-  themes are app-level and device-local: Tine stores only the selected theme id in
-  its backend settings, applies the theme as a managed `#tine-theme` CSS layer, and
+- Light/dark themes, independently selectable presentation styles and color schemes,
+  a built-in color gallery (Default, Nord, Solarized, Gruvbox), accent color, custom
+  CSS, wide mode (`t w`), document mode (`t d`). Theme choices are app-level and
+  device-local: Tine stores the selected style and color ids in its backend settings,
+  applies colors as a managed `#tine-theme` CSS layer, and
   never writes to your graph. Tine also aliases common Logseq `--ls-*` theme
   variables, so both gallery themes and file-based themes in `logseq/custom.css`
   can recolor backgrounds, text, links, borders, and inline code. The cascade is

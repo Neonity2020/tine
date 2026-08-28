@@ -57,8 +57,10 @@ try {
   await page.locator('input[type="file"][accept="application/json,.json"]').setInputFiles(manifestFile);
   await page.locator(".toast-msg", { hasText: "Presentation E2E 1.0.0 installed" }).waitFor();
   const installed = page.locator(".installed-theme-row", { hasText: "Presentation E2E" });
-  await installed.getByRole("button", { name: "Use theme", exact: true }).click();
-  await installed.getByRole("button", { name: "Selected", exact: true }).waitFor();
+  await installed.getByRole("button", { name: "Use colors", exact: true }).click();
+  await installed.getByRole("button", { name: "Use style", exact: true }).click();
+  await installed.getByRole("button", { name: "Colors selected", exact: true }).waitFor();
+  await installed.getByRole("button", { name: "Style selected", exact: true }).waitFor();
   await page.locator(".settings-pane-head .icon-btn:not(.settings-maximize)").click();
 
   const today = page.locator(".page-section.journal-today");

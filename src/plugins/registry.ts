@@ -11,7 +11,7 @@ import {
 import { pluginManager } from "./manager";
 import { SUPPORTED_THEME_API_VERSIONS, parseThemeManifest, type ThemeApiVersion } from "../themes/manifest";
 import { applyThemeRevocations, installThemePackage, themeVersionIsRevoked } from "../themes/manager";
-import { applyTheme, selectedGalleryTheme } from "../themeGallery";
+import { reapplyThemeSelection } from "../themeGallery";
 
 export const COMMUNITY_REGISTRY_URL =
   "https://raw.githubusercontent.com/martinkoutecky/tine-plugin-registry/main/index.json";
@@ -501,7 +501,7 @@ async function applyLiveSnapshot(
     setCommunityPlugins(current.index.plugins);
     setCommunityThemes(current.index.themes);
     applyThemeRevocations(current.revoked);
-    applyTheme(selectedGalleryTheme());
+    reapplyThemeSelection();
     hasVerifiedRegistry = true;
     unsafeCacheHeld = false;
     setRegistryState("ready");

@@ -4,7 +4,9 @@ Tine community themes are inert JSON packages. They do not contain WebAssembly,
 JavaScript, CSS selectors, imports, font files, images, or network resources. A
 package sets a bounded allowlist of Logseq-compatible semantic color variables for
 light, dark, or both modes. API 0.2 may also select a few host-owned presentation
-presets. Tine generates the selector-bounded CSS and inserts it before the graph
+presets. Users select package presentation and colors independently, so a package's
+style can be combined with a built-in palette. Tine generates the selector-bounded
+CSS and inserts it before the graph
 owner's `logseq/custom.css`, which remains the final override.
 
 ## Package shape
@@ -63,7 +65,8 @@ query or scan the graph. Tine may later offer a separate indexed graph-wide coun
 
 Installed versions are addressed immutably by `id@version`. A version revoked by the
 signed community registry cannot be installed or selected; if it was active, Tine
-immediately clears its generated style and returns to Default. Uninstall remains
+immediately clears the style and/or colors selected from that package while preserving
+an independent safe selection. Uninstall remains
 available so revocation never traps a package on the device.
 
 ## Ports

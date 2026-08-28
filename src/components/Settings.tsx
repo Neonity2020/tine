@@ -99,7 +99,14 @@ import {
 import { MEDIA_EDITORS } from "../mediaEditors";
 import { mediaEditorCommand, setMediaEditorCommand } from "../mediaEditorSettings";
 import { formatAssetName } from "../media";
-import { galleryThemes, selectedGalleryTheme, applyTheme as applyGalleryTheme } from "../themeGallery";
+import {
+  applyThemeColors,
+  applyThemeStyle,
+  clearThemeSelection,
+  galleryThemes,
+  selectedThemeColors,
+  selectedThemeStyle,
+} from "../themeGallery";
 import type { GalleryTheme } from "../styles/themes";
 import { platformKind } from "../platform";
 import {
@@ -214,7 +221,9 @@ type SettingSearchEntry = {
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "diagnostics", label: "Diagnostic report", description: "bug report flight recorder timings previous run privacy" },
-  { tab: "appearance", label: "Theme", description: "light dark system gallery colors" },
+  { tab: "appearance", label: "Theme mode", description: "light dark system" },
+  { tab: "appearance", label: "Style", description: "typography journal headings presentation notnote" },
+  { tab: "appearance", label: "Color scheme", description: "default nord solarized gruvbox theme package colors" },
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
   { tab: "appearance", label: "Interface size", description: "zoom scale Ctrl scroll" },
   { tab: "appearance", label: "Wide mode", description: "reading width" },
@@ -1200,7 +1209,7 @@ function ThemeGalleryCard(props: {
       class="theme-gallery-card"
       classList={{ selected: props.selected }}
       aria-pressed={props.selected}
-      onClick={() => applyGalleryTheme(props.id)}
+      onClick={() => applyThemeColors(props.id)}
     >
       <span class="theme-gallery-thumb">
         <img src={props.thumbnail} alt="" loading="lazy" />
@@ -1245,7 +1254,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
     if (!confirmed) return;
     setThemePackageBusy(key);
     try {
-      if (selectedGalleryTheme() === key) applyGalleryTheme("");
+      clearThemeSelection(key);
       await uninstallThemePackage(key);
       pushToast(`${name} was uninstalled.`, "info");
     } catch (error) {
@@ -1284,7 +1293,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
   return (
     <>
       <div class="settings-row">
-        <span class="settings-label">Theme</span>
+        <span class="settings-label">Mode</span>
         <div
           class="theme-switch theme-switch3"
           classList={{ "is-light": appearancePreference() === "light", "is-system": appearancePreference() === "system", "is-dark": appearancePreference() === "dark" }}
@@ -1326,6 +1335,28 @@ function AppearanceTab(props: { search: string }): JSX.Element {
       </div>
 
       <div class="settings-section">Themes</div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-label">Style</div>
+          <div class="settings-hint">Typography, journal headings, and other presentation choices.</div>
+        </div>
+        <select
+          class="settings-select"
+          aria-label="Theme style"
+          value={selectedThemeStyle()}
+          onChange={(event) => applyThemeStyle(event.currentTarget.value)}
+        >
+          <option value="">Default</option>
+          <For each={installedThemes().filter((installed) =>
+            !themeVersionIsRevoked(installed.key)
+            && Object.keys(installed.manifest.presentation ?? {}).length > 0
+          )}>
+            {(installed) => <option value={installed.key}>{installed.manifest.name}</option>}
+          </For>
+        </select>
+      </div>
+
+      <div class="settings-section">Color scheme</div>
       <div class="theme-gallery-grid">
         <ThemeGalleryCard
           id=""
@@ -1333,7 +1364,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
           author="Tine"
           badge="Stock"
           thumbnail="/theme-thumbnails/default.png"
-          selected={selectedGalleryTheme() === ""}
+          selected={selectedThemeColors() === ""}
         />
         <For each={galleryThemes}>
           {(theme) => (
@@ -1343,13 +1374,13 @@ function AppearanceTab(props: { search: string }): JSX.Element {
               author={theme.author}
               badge={galleryBadge(theme)}
               thumbnail={theme.thumbnail}
-              selected={selectedGalleryTheme() === theme.id}
+              selected={selectedThemeColors() === theme.id}
             />
           )}
         </For>
       </div>
       <div class="settings-hint theme-gallery-hint">
-        Themes use validated colors and Tine-owned presentation styles. If you keep your own <code>logseq/custom.css</code>, it still takes priority.
+        Style and colors are independent. Theme packages use validated colors and Tine-owned presentation styles; your <code>logseq/custom.css</code> still takes priority.
       </div>
 
       <Show when={COMMUNITY_REGISTRY_ENABLED}>
@@ -1432,11 +1463,20 @@ function AppearanceTab(props: { search: string }): JSX.Element {
                     <div class="settings-field-control">
                       <button
                         class="settings-btn"
-                        disabled={revoked() || selectedGalleryTheme() === installed.key}
-                        onClick={() => applyGalleryTheme(installed.key)}
+                        disabled={revoked() || selectedThemeColors() === installed.key}
+                        onClick={() => applyThemeColors(installed.key)}
                       >
-                        {revoked() ? "Revoked" : selectedGalleryTheme() === installed.key ? "Selected" : "Use theme"}
+                        {revoked() ? "Revoked" : selectedThemeColors() === installed.key ? "Colors selected" : "Use colors"}
                       </button>
+                      <Show when={Object.keys(installed.manifest.presentation ?? {}).length > 0}>
+                        <button
+                          class="settings-btn"
+                          disabled={revoked() || selectedThemeStyle() === installed.key}
+                          onClick={() => applyThemeStyle(installed.key)}
+                        >
+                          {revoked() ? "Revoked" : selectedThemeStyle() === installed.key ? "Style selected" : "Use style"}
+                        </button>
+                      </Show>
                       <button class="settings-link" onClick={() => void backend().openExternal(installed.manifest.source)}>Details</button>
                       <button
                         class="settings-btn settings-btn-danger"
