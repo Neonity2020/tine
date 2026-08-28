@@ -57,6 +57,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A journal-feed read failure is no longer misreported as an empty graph**
+  (GH #385). The initial Journals view now shows the actual bounded backend
+  error, while a transient refresh failure still keeps an already visible feed
+  intact and retries later. This makes cloud-filesystem and access failures
+  diagnosable without mistaking present journal files for no journals.
+
 - **Unlinked References no longer falls back to a whole-graph scan while an
   ordinary edit's one-page SQLite update is already in flight** (GH #400).
   Reference reads wait for that bounded background delta, then use the exact
