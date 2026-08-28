@@ -21,7 +21,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Same-structure external Markdown content edits no longer leave a managed
   page stale or raise `hot_source_join` merely because Tine reached it through
-  a page-name or internal page-ID route** (GH #397). Application-page routes now
+  a page-name route** (GH #397). Application-page routes now
   agree on current source content while managed reconciliation is still in
   progress. Structural edits such as adding, deleting, or moving bullets still
   wait for the managed watcher to reconcile them safely.

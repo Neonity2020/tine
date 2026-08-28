@@ -12294,12 +12294,12 @@ impl RuntimeActor {
         page_id: PageId,
     ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
         // Exact-path reads already hydrate from the current source bytes while
-        // a bounded watcher reconciliation is still pending. Logical and
-        // internal page-id application routes must have the same freshness
-        // contract: selector choice cannot turn an ordinary external-editor
-        // race into a hot-source join refusal. This is a disposable read view
-        // only; the watcher still authors the external change into accepted
-        // history.
+        // a bounded watcher reconciliation is still pending. The logical
+        // application read route resolves a page id and must have the same
+        // freshness contract: selector choice cannot turn an ordinary
+        // external-editor race into a hot-source join refusal. This helper is
+        // only for read hydration; mutation baselines keep using accepted
+        // authority below.
         if self.exact_projection_read_available() {
             if let Ok(Some(current)) = load_projected_source_rebased_application_page_from_parts(
                 self.active_engine()
@@ -15685,7 +15685,8 @@ impl RuntimeActor {
                         Ok(SyncApplicationPageLoadOutcome::Ambiguous)
                     }
                     EditorNameState::Exact(page_id) => {
-                        let current = self.load_application_page_id_ready(page_id)?;
+                        let current =
+                            self.load_application_current_source_page_id_ready(page_id)?;
                         Ok(SyncApplicationPageLoadOutcome::Loaded {
                             page: current.page,
                             revision: current.revision,
@@ -16058,6 +16059,19 @@ impl RuntimeActor {
             .map(|current| self.finish_managed_application_query_result_page_hydration(current))
     }
 
+    fn load_application_current_source_page_id_ready(
+        &self,
+        page_id: PageId,
+    ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
+        let current = self
+            .load_active_current_source_application_page(page_id)
+            .map_err(map_editor_application_error)?
+            .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_load_current_source_page_id_missing",
+            ))?;
+        Ok(self.finish_managed_application_query_result_page_hydration(current))
+    }
+
     fn load_application_reference_page_id_ready(
         &self,
         page_id: PageId,
@@ -16085,7 +16099,7 @@ impl RuntimeActor {
         page_id: PageId,
     ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
         let current = self
-            .load_active_current_source_application_page(page_id)
+            .load_active_preferred_application_page(page_id, self.exact_projection_read_available())
             .map_err(map_editor_application_error)?
             .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
                 "application_load_page_id_untracked_missing",
@@ -34054,6 +34068,21 @@ mod tests {
             SyncApplicationPageLoadOutcome::Loaded { page, .. }
                 if page.blocks[0].raw == EXTERNAL
         ));
+
+        let delete =
+            handle.mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Root logical".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: Some("Root.md".into()),
+            });
+        assert!(
+            matches!(
+                delete,
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(_))
+            ),
+            "a mutation baseline must refuse the unadmitted external edit: {delete:?}"
+        );
+        assert!(fixture.graph_root.join("Root.md").is_file());
 
         drain_until_settled(&handle);
         assert!(matches!(

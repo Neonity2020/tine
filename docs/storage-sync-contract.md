@@ -811,12 +811,12 @@ observations queued behind it are reconciled, and clean shutdown drains this
 work before reporting `StoppedSafe`.
 
 Application-page hydration has selector parity while bounded external
-reconciliation is pending. Exact-path, logical-name, and internal page-id reads
-may combine
-the exact current Markdown/Org source with the projected page only when path,
-outline topology, and block identities still match. This source-rebased value
-is a disposable read view, never accepted history; the watcher remains the sole
-author of the external operation. A structural or identity-changing outside
+reconciliation is pending. Exact-path and logical-name application reads may
+combine the exact current Markdown/Org source with the projected page only when
+path, outline topology, and block identities still match. This source-rebased value
+is a disposable read view, never accepted history, and is not used as a
+mutation baseline; the watcher remains the sole author of the external
+operation. A structural or identity-changing outside
 edit therefore waits for ordinary reconciliation rather than being guessed,
 while a same-topology content edit cannot make one selector fresh and another
 refuse at `hot_source_join`.
