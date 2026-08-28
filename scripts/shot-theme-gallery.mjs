@@ -3,6 +3,8 @@
 // crops used by Settings card thumbnails.
 // Usage (after `source scripts/env.sh && npm run build`):
 //   node scripts/shot-theme-gallery.mjs
+// Set TINE_UPDATE_THEME_THUMBNAILS=1 only when intentionally refreshing the
+// checked-in Settings thumbnails; ordinary verification leaves them untouched.
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
@@ -13,6 +15,7 @@ const OUT = "subagent-tasks/notes";
 const THUMBS = "public/theme-thumbnails";
 const THEMES = ["nord", "solarized", "gruvbox"];
 const MODES = ["light", "dark"];
+const UPDATE_THUMBNAILS = process.env.TINE_UPDATE_THEME_THUMBNAILS === "1";
 
 mkdirSync(OUT, { recursive: true });
 mkdirSync(THUMBS, { recursive: true });
@@ -78,15 +81,20 @@ async function metrics(page) {
     const code = document.querySelector(".inline-code, .code-block, code");
     const sidebar = document.querySelector(".left-sidebar");
     const theme = document.getElementById("tine-theme");
+    const custom = document.getElementById("tine-custom-css");
     const ids = Array.from(document.head.children).map((el) => el.id).filter(Boolean);
     return {
       bg: style(body, "background-color"),
+      primaryToken: style(document.documentElement, "--bg-primary").trim(),
+      primaryLsToken: style(document.documentElement, "--ls-primary-background-color").trim(),
+      bodyPrimaryToken: style(body, "--bg-primary").trim(),
       text: style(body, "color"),
       link: link ? style(link, "color") : "",
       tag: tag ? style(tag, "color") : "",
       border: sidebar ? style(sidebar, "border-right-color") : "",
       codeBg: code ? style(code, "background-color") : "",
       themeBytes: theme?.textContent?.length ?? 0,
+      customBytes: custom?.textContent?.length ?? 0,
       order: ids.filter((id) => id === "tine-ls-shim" || id === "tine-theme" || id === "tine-custom-css"),
     };
   });
@@ -127,7 +135,7 @@ try {
     assertManagedOrder(`Default/${mode}`, got.order);
     defaultMetrics[mode] = got;
     await page.screenshot({ path: `${OUT}/theme-gallery-default-${mode}.png` });
-    if (mode === "light") {
+    if (mode === "light" && UPDATE_THUMBNAILS) {
       await page.screenshot({
         path: `${THUMBS}/default.png`,
         clip: { x: 246, y: 58, width: 640, height: 360 },
@@ -145,7 +153,7 @@ try {
       assertManagedOrder(`${theme}/${mode}`, got.order);
       assertRecolored(theme, mode, got, defaultMetrics[mode]);
       await page.screenshot({ path: `${OUT}/theme-gallery-${theme}-${mode}.png` });
-      if (mode === "light") {
+      if (mode === "light" && UPDATE_THUMBNAILS) {
         await page.screenshot({
           path: `${THUMBS}/${theme}.png`,
           clip: { x: 246, y: 58, width: 640, height: 360 },

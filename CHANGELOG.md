@@ -57,6 +57,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Built-in themes now recolor the main page in dark mode** (GH #401). The
+  no-flash startup frame now yields its high-specificity viewport colors to the
+  active theme tokens after startup, so Nord, Solarized, and Gruvbox apply
+  consistently to the page and sidebar while `custom.css` remains the final
+  user override.
+
 - **An exact `#` or `[[` page match no longer hides other matching pages**
   (GH #186). The exact page remains the first/default result and suppresses the
   redundant Create row, while prefix, substring, and fuzzy matches remain

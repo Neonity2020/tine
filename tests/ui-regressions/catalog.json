@@ -6404,6 +6404,31 @@
    "notes": "GH #245 and #269. homePage.ts now uses graph metadata backed by Logseq's :default-home {:page ...} entry in logseq/config.edn, with a guarded one-time migration from the former per-device app-settings string. graph.ts's loadGraphPath opens it via openPage(name, page, {inPlace:true}) only on first-bind / graph-switch loads \u2014 never on same-graph force refresh; a missing page falls back silently. Settings Graph tab rows expose pick-from-existing-pages (quickSwitch, pages only), a stale-value hint, and Clear. Fail-before for the navigation behavior was proven by manager mutation probe at integration (2026-08-06); fail-before for graph ownership was proven by src/homePage.test.ts returning the stale device-local value instead of graph metadata on the pre-fix source."
   },
   {
+   "id": "UI-THEME-BUILTIN-VIEWPORT-401",
+   "title": "Built-in themes recolor the dark-mode viewport and page as well as secondary sidebar surfaces, while custom.css remains the final override",
+   "family": "theme",
+   "sources": {
+    "issues": [
+     401
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "browser",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/startupReveal.test.ts",
+     "scripts/shot-theme-gallery.mjs"
+    ],
+    "scenario": "theme.builtin-dark-viewport",
+    "failBefore": "proven"
+   },
+   "notes": "GH #401. The dependency-free startup frame used a high-specificity html[data-theme=dark] body rule with fixed default colors. Theme variables changed correctly, but the body retained Tine's default dark background and text while secondary surfaces recolored. The startup rule now uses --bg-primary and --text-primary with the same fixed colors only as pre-CSS fallbacks. The browser gate measures every built-in theme in light and dark modes and proves custom.css still wins after the managed theme layer."
+  },
+  {
    "id": "UI-THEME-SYSTEM-MODE-193",
    "title": "A System appearance choice follows the OS/WebView prefers-color-scheme signal immediately and live, while manual Light/Dark ignore it",
    "family": "theme",
