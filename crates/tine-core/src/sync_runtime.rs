@@ -44001,6 +44001,85 @@ mod tests {
         crate::durability_counters::BarrierSession::detach_current_thread();
     }
 
+    /// Packet C-4's real-corpus absence gate. The supplied source is copied by
+    /// `ActivationFixture::copied_graph`; all managed writes and external
+    /// deletions therefore land only in the disposable fixture.
+    #[test]
+    #[ignore = "manual gate: absence sweep on an anonymized corpus copy"]
+    fn managed_absence_sweep_probe() {
+        let source = real_graph_copy_source_from_env("TINE_MS_AUDIT_GRAPH_COPY");
+        let fixture = ActivationFixture::copied_graph("c4-sweep-probe", 0xc4c0, &source);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("the sweep corpus copy activates");
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("sweep corpus inventory did not load: {other:?}"),
+        };
+        assert!(pages.len() >= 4);
+        let deleted = pages
+            .iter()
+            .take(4)
+            .map(|page| page.rel_path.clone())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        for path in &deleted {
+            fs::remove_file(fixture.graph_root.join(path)).unwrap();
+        }
+
+        let open_request = reopen_request(&fixture.request);
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("the sweep corpus copy reopens");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        for _ in 0..4096 {
+            let tick = actor.tick();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "corpus sweep did not converge: {tick:?}"
+            );
+            if !actor.clean.as_ref().unwrap().watcher_status().pending {
+                break;
+            }
+        }
+        let records = actor.clean.as_ref().unwrap().sweeps.records_for_test();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].members.len(), 4);
+        assert_eq!(records[0].tier, SweepTier::Tier2);
+        assert_eq!(records[0].pages_at_open as usize, pages.len());
+        assert!(actor.publication_barrier_active());
+        eprintln!(
+            "corpus_sweep tier=tier2 k={} pages_at_open={} barrier_held_before_close=true",
+            records[0].members.len(),
+            records[0].pages_at_open
+        );
+        actor
+            .clean
+            .as_mut()
+            .unwrap()
+            .sweeps
+            .force_open_window_close_for_test()
+            .unwrap();
+        assert!(!actor.publication_barrier_active());
+        eprintln!("corpus_sweep barrier_released_at_close=true");
+    }
+
     /// Measured C-2 freshness gate. The fixture copies the supplied corpus
     /// before activation; the local completion objects are written only below
     /// that disposable fixture.
