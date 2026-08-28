@@ -8637,6 +8637,29 @@
         "failBefore": "proven"
       },
       "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey. mark_clean_shutdown() was placed after tauri's App::run(), which never returns (the event loop exits the process via std::process::exit), so the flight recorder's session-active marker survived every quit and every subsequent launch showed the sticky 'Tine did not close cleanly last time' warning. Present since the flight recorder shipped (GH #343, 271885b2). Fix hooks RunEvent::Exit, the callback tauri delivers before exiting. Wiring is untestable at unit layer (needs the real event loop); the E2E journey's clean-close-honored phase is the observation-boundary proof: unclean toast present on reopen before the fix (diag-1 artifacts), absent after."
+    },
+    {
+      "id": "UI-ABSENCE-RESTORE-PANEL-AUTOCLOSE-INTERNAL",
+      "title": "Completing a sweep Restore does not close the recovery panel or drop the sweep surface",
+      "family": "managed-storage-recovery",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/absenceSweeps.test.ts::rebindAbsenceSweepScope::keeps the sweep list and an open panel across a same-generation rebind",
+          "scripts/e2e-absence-sweeps.mjs::restore-action"
+        ],
+        "scenario": "absence-sweeps.restore-keeps-panel",
+        "failBefore": "proven"
+      },
+      "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey (5/5 runs failed on it). The App.tsx sweep-listener effect used bare `() => snapshot().field` accessors inside on(), which re-run on every snapshot replacement even with unchanged values; the effect unconditionally called clearAbsenceSweeps(). Restore's completion emits runtime status events, so finishing a Restore refired the effect and closed the panel the user was looking at while transiently wiping the sweep list (instrumented capture: diag-3 store log, four identical-input refires 150ms after disposition). Fix: memoized effect inputs + rebindAbsenceSweepScope clears only on real generation changes. Fail-before is the instrumented E2E evidence; the helper unit test plus the journey's restore-action/restored-history assertions are the regression coverage."
     }
   ]
 }
