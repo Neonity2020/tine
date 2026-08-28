@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const TOKENS = new Set([
   "--ls-active-primary-color", "--ls-primary-background-color", "--ls-secondary-background-color",
@@ -28,7 +29,7 @@ const PRESENTATION = {
 function fail(errors, code, message) { errors.push({ code, message }); }
 function checkUrl(value) { try { return typeof value === "string" && new URL(value).protocol === "https:"; } catch { return false; } }
 
-function checkTheme(file) {
+export function checkTheme(file) {
   const report = { format: "tine-theme-check/v1", checkedAt: new Date().toISOString(), status: "failed", theme: null, sha256: null, errors: [], warnings: [] };
   let bytes;
   try { bytes = fs.readFileSync(file); } catch { fail(report.errors, "theme.missing", "theme.json is missing"); return report; }
@@ -86,18 +87,20 @@ function checkTheme(file) {
   return report;
 }
 
-const [, , command, target, ...flags] = process.argv;
-if (command !== "check" || !target) {
-  console.error("Usage: node scripts/tine-theme.mjs check <theme-dir-or-json> [--json]");
-  process.exit(2);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const [, , command, target, ...flags] = process.argv;
+  if (command !== "check" || !target) {
+    console.error("Usage: node scripts/tine-theme.mjs check <theme-dir-or-json> [--json]");
+    process.exit(2);
+  }
+  const input = fs.realpathSync(target);
+  const file = fs.statSync(input).isDirectory() ? path.join(input, "theme.json") : input;
+  const report = checkTheme(file);
+  if (flags.includes("--json")) console.log(JSON.stringify(report, null, 2));
+  else {
+    console.log(`${report.status.toUpperCase()}: ${report.theme?.id ?? "unknown"}@${report.theme?.version ?? "unknown"}`);
+    for (const error of report.errors) console.error(`error ${error.code}: ${error.message}`);
+    if (report.sha256) console.log(`sha256 ${report.sha256}`);
+  }
+  process.exitCode = report.status === "passed" ? 0 : 1;
 }
-const input = fs.realpathSync(target);
-const file = fs.statSync(input).isDirectory() ? path.join(input, "theme.json") : input;
-const report = checkTheme(file);
-if (flags.includes("--json")) console.log(JSON.stringify(report, null, 2));
-else {
-  console.log(`${report.status.toUpperCase()}: ${report.theme?.id ?? "unknown"}@${report.theme?.version ?? "unknown"}`);
-  for (const error of report.errors) console.error(`error ${error.code}: ${error.message}`);
-  if (report.sha256) console.log(`sha256 ${report.sha256}`);
-}
-process.exitCode = report.status === "passed" ? 0 : 1;

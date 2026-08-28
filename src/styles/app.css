@@ -1712,9 +1712,7 @@ html[data-theme-journal-header="editorial"] .journal-title .title-cal {
 }
 
 html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-row {
-  position: relative;
   display: block;
-  min-height: 96px;
 }
 
 html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-main {
@@ -1722,7 +1720,7 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   flex-direction: column;
   align-items: center;
   text-align: center;
-  padding: 0 156px;
+  padding: 0;
 }
 
 html[data-theme-journal-header="editorial"] .page-section.journal-today .journal-title {
@@ -1734,9 +1732,8 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .journal
 }
 
 html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-actions {
-  position: absolute;
-  top: 8px;
-  right: 0;
+  justify-content: center;
+  margin-top: 9px;
 }
 
 .today-task-summary {
@@ -2619,6 +2616,12 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   .plugin-setting-control {
     min-width: 0;
     justify-content: flex-start;
+  }
+}
+
+@media (hover: none) {
+  html[data-theme-journal-header="editorial"] .journal-title:hover {
+    color: var(--text-title);
   }
 }
 .settings-advanced { margin-top: 10px; }
@@ -3625,19 +3628,11 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
     font-size: 28px;
     line-height: 1.18;
   }
-  html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-row {
-    min-height: 0;
-  }
-  html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-main {
-    padding: 0;
-  }
   html[data-theme-journal-header="editorial"] .page-section.journal-today .journal-title {
     font-size: 38px;
     white-space: normal;
   }
   html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-actions {
-    position: static;
-    justify-content: center;
     margin-top: 7px;
   }
   .today-task-summary {

@@ -19,8 +19,9 @@ icon:: 🔌
   - Flip the same toggle to disable: the behavior stops, the package stays installed, and your pages remain exactly as readable as before — a plugin may not invent a format your graph would depend on.
   - **Uninstall…** removes only that package version from this device. Tine asks first and states the boundary: it does not change your graph or notes.
   - Behind the scenes, cached signed revocations are checked before a saved plugin starts, so a version revoked as unsafe stays disabled even while you are offline.
-- ## Themes recolor; they never run
-  - Themes live separately under Settings → **Appearance**: pick a built-in gallery theme (Default, Nord, Solarized, Gruvbox), or install a **token theme** from the Theme packages list or a local `.json` file — packages of validated color values with no scripts, selectors, imports, or remote assets. One theme is selected at a time, the choice stays on this device, and no theme ever writes to your graph.
+- ## Themes change presentation; they never run
+  - Themes live separately under Settings → **Appearance**: pick a built-in gallery theme (Default, Nord, Solarized, Gruvbox), or install a declarative theme from the Theme packages list or a local `.json` file. Packages contain validated colors and may select a few Tine-owned presentation styles, such as editorial reading type, a larger journal header, or a compact Today task count. They contain no scripts, selectors, imports, downloaded fonts, or remote assets. One theme is selected at a time, the choice stays on this device, and no theme ever reads or writes your graph.
+  - A Today summary, when selected, is rendered by Tine from the journal page already on screen: it counts open task markers there and calls the `DOING`, `NOW`, `STARTED`, and `IN-PROGRESS` subset “in progress.” The theme receives neither those tasks nor a query interface.
   - Your own `logseq/custom.css` outranks every theme: themes recolor Tine through Logseq's `--ls-*` variables, and your CSS loads last. Uninstalling a theme package leaves it untouched, too.
 - ## Platform and distribution lines
   - Desktop and Android share the same plugin and theme lifecycle; a package that did not declare your platform shows as unavailable rather than failing later.
