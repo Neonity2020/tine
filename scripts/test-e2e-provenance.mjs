@@ -8,6 +8,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildInputState, deriveTauriManifest, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
+import {
+  classifyProofOnlyDelta,
+  createCandidateReceipt,
+  createPromotionPlan,
+  loadProofOnlyRegistry,
+} from "./release-proof-reuse-lib.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const helper = path.join(root, "scripts/build-e2e-receipt.mjs");
@@ -203,8 +209,102 @@ try {
   assert.match(unreceipted.stderr, /build receipt is required at/);
   assert.equal(fs.existsSync(launchProbe), false, "run-e2e launched an app before rejecting its missing receipt");
   assert.equal(fs.existsSync(unreceiptedArtifacts), false, "run-e2e started E2E artifact work before provenance validation");
+
+  const promotionFixture = path.join(temporary, "promotion-fixture");
+  for (const directory of ["dist", "scripts", "src-tauri/gen/schemas", "tests/ui-regressions"]) {
+    fs.mkdirSync(path.join(promotionFixture, directory), { recursive: true });
+  }
+  for (const [source, destination] of [
+    [helper, "scripts/build-e2e-receipt.mjs"],
+    [inputHelper, "scripts/build-e2e-inputs.mjs"],
+    [proofReuseHelper, "scripts/release-proof-reuse-lib.mjs"],
+    [proofOnlyRegistry, "scripts/release-proof-only.json"],
+    [runner, "scripts/run-e2e.mjs"],
+    [capabilities, "scripts/e2e-capabilities.mjs"],
+    [contracts, "tests/ui-regressions/e2e-contracts.json"],
+  ]) fs.copyFileSync(source, path.join(promotionFixture, destination));
+  fs.writeFileSync(path.join(promotionFixture, "scripts/e2e-page-properties.mjs"), "// source proof\n");
+  fs.writeFileSync(path.join(promotionFixture, "source.txt"), "unchanged product\n");
+  fs.writeFileSync(path.join(promotionFixture, "dist/index.html"), `<script src="${asset}"></script>\n`);
+  const promotedApp = path.join(promotionFixture, process.platform === "win32" ? "tine.exe" : "tine");
+  fs.writeFileSync(promotedApp, process.platform === "win32"
+    ? `@echo off\r\nrem ${asset}\r\n`
+    : `#!/bin/sh\n# ${asset}\nexit 0\n`);
+  if (process.platform !== "win32") fs.chmodSync(promotedApp, 0o755);
+  git(promotionFixture, ["init"]);
+  git(promotionFixture, ["add", "."]);
+  git(promotionFixture, ["-c", "user.email=tine-test@example.invalid", "-c", "user.name=Tine test", "commit", "-m", "source"]);
+  const source = git(promotionFixture, ["rev-parse", "HEAD"]);
+  const promotedSnapshot = path.join(temporary, "promoted-before.json");
+  const promotedReceipt = path.join(temporary, "promoted-receipt.json");
+  runChecked(process.execPath, [path.join(promotionFixture, "scripts/build-e2e-receipt.mjs"), "before", "--snapshot", promotedSnapshot], { cwd: promotionFixture });
+  runChecked(process.execPath, [path.join(promotionFixture, "scripts/build-e2e-receipt.mjs"), "after", "--snapshot", promotedSnapshot, "--app", promotedApp, "--receipt", promotedReceipt], { cwd: promotionFixture });
+  fs.writeFileSync(path.join(promotionFixture, "scripts/e2e-page-properties.mjs"), "// corrected proof\n");
+  git(promotionFixture, ["add", "scripts/e2e-page-properties.mjs"]);
+  git(promotionFixture, ["-c", "user.email=tine-test@example.invalid", "-c", "user.name=Tine test", "commit", "-m", "proof only"]);
+  const target = git(promotionFixture, ["rev-parse", "HEAD"]);
+  const registry = loadProofOnlyRegistry(path.join(promotionFixture, "scripts/release-proof-only.json"));
+  const delta = classifyProofOnlyDelta(promotionFixture, source, target, registry);
+  const buildReceipt = JSON.parse(fs.readFileSync(promotedReceipt, "utf8"));
+  const candidateReceipt = createCandidateReceipt({
+    version: "1.2.3",
+    sourceCommit: source,
+    productInputDigest: delta.productInputDigest,
+    assets: [{ name: "candidate.bin", size: 1, sha256: "a".repeat(64) }],
+  });
+  const sourceEvidence = {
+    schemaVersion: 1,
+    kind: "tine-release-promotion-source",
+    runId: 456,
+    sourceCommit: source,
+    artifacts: ["release-candidate", "release-candidate-receipt", "release-proof-linux-x64", "release-proof-windows-x64"]
+      .map((name, artifactIndex) => ({ id: artifactIndex + 1, name, size: 1, digest: null })),
+  };
+  const promotionPlan = createPromotionPlan({
+    delta,
+    sourceRunId: 456,
+    candidateReceipt,
+    sourceEvidence,
+    authorizer: "tine-test",
+  });
+  const promotionPlanFile = path.join(temporary, "promotion-plan.json");
+  fs.writeFileSync(promotionPlanFile, `${JSON.stringify(promotionPlan, null, 2)}\n`);
+  const promotedValidation = runNode([
+    path.join(promotionFixture, "scripts/run-e2e.mjs"),
+    "linux-release",
+    "--scenario=page-properties",
+    "--validate-build-receipt-only",
+  ], {
+    cwd: promotionFixture,
+    env: {
+      ...process.env,
+      TINE_APP: promotedApp,
+      TINE_E2E_BUILD_RECEIPT: promotedReceipt,
+      TINE_E2E_PROMOTION_PLAN: promotionPlanFile,
+    },
+  });
+  assert.equal(promotedValidation.status, 0, promotedValidation.stderr || promotedValidation.stdout);
+  assert.equal(buildReceipt.sourceRevision, source);
+  const wrongPromotionPlanFile = path.join(temporary, "wrong-promotion-plan.json");
+  fs.writeFileSync(wrongPromotionPlanFile, `${JSON.stringify({ ...promotionPlan, productInputDigest: "f".repeat(64) }, null, 2)}\n`);
+  const wrongPromotedValidation = runNode([
+    path.join(promotionFixture, "scripts/run-e2e.mjs"),
+    "linux-release",
+    "--scenario=page-properties",
+    "--validate-build-receipt-only",
+  ], {
+    cwd: promotionFixture,
+    env: {
+      ...process.env,
+      TINE_APP: promotedApp,
+      TINE_E2E_BUILD_RECEIPT: promotedReceipt,
+      TINE_E2E_PROMOTION_PLAN: wrongPromotionPlanFile,
+    },
+  });
+  assert.notEqual(wrongPromotedValidation.status, 0);
+  assert.match(wrongPromotedValidation.stderr, /does not authorize this binary\/proof checkout/);
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true });
 }
 
-console.log("E2E provenance tests passed (receipt input digest + no-launch receipt rejection).");
+console.log("E2E provenance tests passed (exact and promoted receipt validation + no-launch rejection).");
