@@ -10403,6 +10403,10 @@ mod tests {
         }
 
         fn apply_external_paths(&mut self, paths: &[&str]) -> BatchId {
+            let mut projection_turns =
+                crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                    self.runtime.engine(),
+                );
             let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
             match OperationalCoordinator::execute_clean_external(
                 &mut session,
@@ -10410,6 +10414,7 @@ mod tests {
                 &self.receipts,
                 paths,
                 &mut crate::oplog::absence_sweep::NoopSweepRecorder,
+                &mut projection_turns,
             )
             .unwrap()
             {
@@ -11090,6 +11095,10 @@ mod tests {
         )
         .unwrap();
         let error = {
+            let mut projection_turns =
+                crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                    fixture.runtime.engine(),
+                );
             let mut session = fixture
                 .runtime
                 .admit_clean_mutation(&fixture.graph)
@@ -11100,6 +11109,7 @@ mod tests {
                 &fixture.receipts,
                 &["pages/copy.md"],
                 &mut crate::oplog::absence_sweep::NoopSweepRecorder,
+                &mut projection_turns,
             ) {
                 Err(error) => error,
                 Ok(_) => panic!("duplicate UUID copy unexpectedly entered durable history"),
@@ -11143,6 +11153,10 @@ mod tests {
         .unwrap();
         fail_next_clean_after_manifest_for_harness();
         let pending = {
+            let mut projection_turns =
+                crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                    fixture.runtime.engine(),
+                );
             let mut session = fixture
                 .runtime
                 .admit_clean_mutation(&fixture.graph)
@@ -11153,6 +11167,7 @@ mod tests {
                 &fixture.receipts,
                 &["pages/a.md"],
                 &mut crate::oplog::absence_sweep::NoopSweepRecorder,
+                &mut projection_turns,
             )
             .unwrap()
             {
@@ -13329,6 +13344,10 @@ mod tests {
         .unwrap();
         let projection_fault =
             crate::oplog::projection::fail_next_manifested_projection_during_write_for_harness();
+        let mut projection_turns =
+            crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                clean_runtime.engine(),
+            );
         let state = {
             let mut session = clean_runtime.admit_clean_mutation(&graph).unwrap();
             OperationalCoordinator::execute_clean_local(
@@ -13336,6 +13355,7 @@ mod tests {
                 &graph,
                 &receipts,
                 &transaction,
+                &mut projection_turns,
             )
             .unwrap()
         };
@@ -13359,7 +13379,13 @@ mod tests {
         );
         let retry = {
             let mut session = clean_runtime.admit_clean_mutation(&graph).unwrap();
-            OperationalCoordinator::retry_clean_local(&mut session, &graph, &receipts, pending)
+            OperationalCoordinator::retry_clean_local_with_turns(
+                &mut session,
+                &graph,
+                &receipts,
+                pending,
+                &mut projection_turns,
+            )
         };
         match retry {
             CleanLocalMutationState::Complete(batch_id) => assert_eq!(batch_id, first_batch),
@@ -13389,6 +13415,7 @@ mod tests {
                 &graph,
                 &receipts,
                 &interrupted,
+                &mut projection_turns,
             )
             .unwrap()
         };

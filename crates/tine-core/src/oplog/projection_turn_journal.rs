@@ -900,6 +900,48 @@ fn read_lineage_digest(bytes: &[u8], offset: usize) -> Result<LineageDigest, Str
     Ok(LineageDigest::from_bytes(slice))
 }
 
+/// Deterministic-identity journal for unit tests that drive the clean
+/// coordinator/actor below the sync runtime. Production opens the journal
+/// with the activation binding identities; these tests only need a working
+/// journal instance in an isolated root.
+#[cfg(test)]
+pub(crate) fn open_test_projection_turn_journal(
+    application_runtime_root: &std::path::Path,
+) -> ProjectionTurnJournalState {
+    open_projection_turn_journal(
+        application_runtime_root,
+        WorkspaceId::from_uuid(Uuid::from_u128(0x7e57_0000_0001)),
+        crate::oplog::LineageDigest::of(b"test projection turn journal"),
+        ProjectionEndpointId::from_uuid(Uuid::from_u128(0x7e57_0000_0002)),
+        Uuid::from_u128(0x7e57_0000_0003),
+    )
+    .expect("test projection turn journal opens")
+}
+
+/// One-shot scratch journal in a fresh isolated root, stamped with the
+/// engine's real workspace/endpoint/device identity so replay's endpoint
+/// binding check accepts its turns. Resume self-heals by appending any
+/// un-retained batch turn, so unit tests below the runtime may use a fresh
+/// journal per coordinator call.
+#[cfg(test)]
+pub(crate) fn open_scratch_projection_turn_journal_for(
+    engine: &super::hot_engine::ShardedHotEngine,
+) -> ProjectionTurnJournalState {
+    let binding = engine
+        .projection_endpoint_binding()
+        .expect("test engine has a projection endpoint binding");
+    let root = std::env::temp_dir().join(format!("tine-scratch-turns-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("scratch projection turn root");
+    open_projection_turn_journal(
+        &root,
+        engine.workspace_id(),
+        crate::oplog::LineageDigest::of(b"test projection turn journal"),
+        binding.endpoint_id(),
+        binding.device_id().as_uuid(),
+    )
+    .expect("scratch projection turn journal opens")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

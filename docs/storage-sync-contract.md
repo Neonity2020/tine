@@ -1164,8 +1164,22 @@ A clean local mutation that reaches its manifest commit and then fails to apply
 disposable derived state (SQLite and/or exact Markdown projection) returns
 `CleanActorMutationOutcome::DurablePending` and retains an affine continuation
 in `CleanRuntimeActorCore::pending`. That continuation is advanced only by
-`retry_pending`. The legacy coordinator's `PendingLocalMutation::Published`
+`retry_pending_with_turns`. The legacy coordinator's `PendingLocalMutation::Published`
 continuation is a different object that the clean actor never writes.
+
+Every clean continuation resume — inline after the manifest commit, and on
+every retry — drains Markdown projection through the projection-turn journal:
+the resume appends the batch's `IngressLocal`/`IngressForeign` turn when the
+journal does not already retain it, and replays turns in order. There is no
+turnless projection arm: a managed projection mutation without a turn-derived
+attempt identity is refused in production
+(`ProjectionStoreError::MissingTurnAttemptContext`), and the 2026-08-28
+regression fix deleted the pre-turn resume executor that violated this. The
+refusal's in-scope scenario is not an external adversary but the codebase
+itself: it turns a silently identity-less projection write into a loud,
+recoverable failure, and the `clean_recovery_turns` integration test holds the
+drain green at the non-`cfg(test)` boundary where the unit suite's
+deterministic attempt-identity fallback cannot mask it.
 
 Therefore, when the clean runtime is installed, an application save that lands in
 `DurablePending` settles through the clean actor, bounded by

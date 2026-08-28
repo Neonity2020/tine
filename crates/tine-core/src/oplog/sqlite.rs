@@ -10696,12 +10696,17 @@ mod tests {
             transaction: &OperationTransaction,
         ) -> AcceptedBatchEvent {
             let batch_id = {
+                let mut projection_turns =
+                    crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                        self.runtime.engine(),
+                    );
                 let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
                 match OperationalCoordinator::execute_clean_local(
                     &mut session,
                     &self.graph,
                     &self.receipts,
                     transaction,
+                    &mut projection_turns,
                 )
                 .unwrap()
                 {
@@ -10749,6 +10754,10 @@ mod tests {
 
         fn reconcile_and_assert_identity_shadow(&mut self, path: &str) -> AcceptedBatchEvent {
             let batch_id = {
+                let mut projection_turns =
+                    crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                        self.runtime.engine(),
+                    );
                 let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
                 match OperationalCoordinator::execute_clean_external(
                     &mut session,
@@ -10756,6 +10765,7 @@ mod tests {
                     &self.receipts,
                     &[path],
                     &mut crate::oplog::absence_sweep::NoopSweepRecorder,
+                    &mut projection_turns,
                 )
                 .unwrap()
                 {
