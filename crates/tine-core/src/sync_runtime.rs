@@ -29800,7 +29800,7 @@ mod tests {
     /// schedules.
     fn run_receiver_absence_decision_oracle() {
         receiver_without_completion_creates_first_projection_case();
-        receiver_completion_defers_closed_window_external_deletion_case();
+        receiver_completion_defers_closed_window_external_deletion_case(false);
         receiver_incomplete_update_maps_absent_terminal_to_deferral_case();
     }
 
@@ -37646,7 +37646,9 @@ mod tests {
     /// Packet C-3's mandatory receiver schedule. A receiver completion is
     /// device-local evidence that Tine wrote this path; a later closed-window
     /// absence belongs to external observation, not replay authorization.
-    fn receiver_completion_defers_closed_window_external_deletion_case() {
+    fn receiver_completion_defers_closed_window_external_deletion_case(
+        crash_before_summary_update: bool,
+    ) {
         let (initiator, receiver, initiator_handle, receiver_handle) =
             joined_shared_pair("receiver-completion-absence-map", 0xc3_2000);
         let path = "notes/receiver-completion-absence-map.md";
@@ -37670,6 +37672,11 @@ mod tests {
                 content: "receiver updated bytes must not resurrect".into(),
             }],
         );
+        if crash_before_summary_update {
+            crate::oplog::receiver_absence_summary::skip_next_receiver_absence_summary_update_for_test(
+                receiver.request.identities.workspace_id,
+            );
+        }
         publish_shared_batch(&initiator_handle, &initiator, batch_id);
         settle_shared_provider(&initiator_handle);
         deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
@@ -37677,10 +37684,14 @@ mod tests {
             fs::read(receiver.graph_root.join(path)).unwrap(),
             b"- receiver updated bytes must not resurrect\n"
         );
-        assert!(matches!(
-            receiver_handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
+        if crash_before_summary_update {
+            receiver_handle.stop_without_clean_drain().unwrap();
+        } else {
+            assert!(matches!(
+                receiver_handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+        }
 
         fs::remove_file(receiver.graph_root.join(path)).unwrap();
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
@@ -37724,7 +37735,12 @@ mod tests {
 
     #[test]
     fn receiver_completion_defers_closed_window_external_deletion_and_stays_archive_durable() {
-        receiver_completion_defers_closed_window_external_deletion_case();
+        receiver_completion_defers_closed_window_external_deletion_case(false);
+    }
+
+    #[test]
+    fn stale_receiver_summary_horizon_defers_after_completion_then_crash() {
+        receiver_completion_defers_closed_window_external_deletion_case(true);
     }
 
     fn receiver_incomplete_update_maps_absent_terminal_to_deferral_case() {

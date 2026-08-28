@@ -54,6 +54,7 @@ pub mod projection_store;
 pub(crate) mod projection_turn_journal;
 pub mod projection_work;
 pub mod receipt;
+pub(crate) mod receiver_absence_summary;
 pub mod reference_catalog;
 pub mod refusal;
 #[allow(dead_code)] // retained recovery format plus test construction surface

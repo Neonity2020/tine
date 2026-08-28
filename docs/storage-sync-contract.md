@@ -265,6 +265,7 @@ and manifest tail.
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
+| `archive/operations/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
 | `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
@@ -1359,10 +1360,25 @@ crash backstop. Absent-precondition work with no exact matching entry creates
 as before.
 
 Foreign replay builds a disposable absence-decision map once per managed open
-from one validated receiver-catalog pass plus the local completion index. The
-map is keyed by `(page, path)`. Its answer is the frontier-maximal completion
-across both halves; a defensive incomparable maximal set with mixed target
-kinds chooses the reversible Present/defer direction.
+from the receiver summary plus the local completion index. The receiver summary
+is a chain-versioned, disposable object at
+`archive/operations/sweeps/receiver-absence-summary-v1/`; retained receipt
+records remain the truth. Its horizon is the count and set digest of the exact
+receiver evidence filenames it covers - completion AND intent names, because a
+durable intent without a completion is itself map evidence (incomplete-intent
+recovery and the local-index pruning guard consume it), so behind-truth must be
+detectable for both namespaces. Every summary install strictly follows the
+durable evidence it names. Open performs one names-only readdir of each of the
+two evidence namespaces. An equal horizon reads no receipt content; extra
+names are behind truth and delta-read exactly those completion/intent records;
+a summary naming evidence the directories lack, or any missing/torn/invalid
+chain, triggers exactly one full validated-catalog rebuild. Receiver evidence
+is immutable, add-only, and never production-deleted, so a valid summary can
+only be behind truth. Losing or corrupting it therefore
+changes cost only, never an absence decision or refusal outcome. The map is
+keyed by `(page, path)`. Its answer is the frontier-maximal completion across
+both halves; a defensive incomparable maximal set with mixed target kinds
+chooses the reversible Present/defer direction.
 
 The receiver executor consults that answer only after a fresh,
 capability-bound reread of the target path and before publishing a new intent:
