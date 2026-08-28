@@ -1,4 +1,4 @@
-import { Show, Suspense, createEffect, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
+import { Show, Suspense, createEffect, createMemo, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
 import { Sidebar } from "./components/Sidebar";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
 import { QueryWorkspace } from "./components/QueryWorkspace";
@@ -171,7 +171,7 @@ import { storageTransitionRuntime } from "./storageTransitionRuntime";
 import { writeClipboardTextResilient } from "./clipboard";
 import type { SparseV2CancelResult } from "./types";
 import {
-  clearAbsenceSweeps,
+  rebindAbsenceSweepScope,
   ingestAbsenceSweepEvent,
 } from "./absenceSweeps";
 
@@ -693,14 +693,26 @@ function PaneScroller(props: {
   // One generation-scoped listener carries durable absence-sweep snapshots to
   // the global recovery surface. Rebinding clears the old graph's list; panel
   // dismissal is intentionally unrelated to this lifecycle.
+  //
+  // Both inputs MUST be memos: a bare `() => snapshot().field` accessor inside
+  // `on(...)` retriggers on every snapshot replacement even when the field
+  // value is unchanged (Solid dedupes per signal, and the snapshot signal
+  // holds a fresh object each status event). Restore's own completion emits
+  // such events, so the unmemoized form re-fired here and — via the
+  // unconditional clear it used to call — closed the recovery panel at the
+  // exact moment a Restore finished. The clear itself is additionally scoped
+  // to real generation changes inside rebindAbsenceSweepScope.
+  const sweepScopeGeneration = createMemo(
+    () => managedStorageRuntime.snapshot().bindingGeneration,
+  );
+  const sweepScopeAuthority = createMemo(
+    () => managedStorageRuntime.snapshot().applicationPageAdmission?.authority,
+  );
   createEffect(on(
-    [
-      () => managedStorageRuntime.snapshot().bindingGeneration,
-      () => managedStorageRuntime.snapshot().applicationPageAdmission?.authority,
-    ],
+    [sweepScopeGeneration, sweepScopeAuthority],
     ([bindingGeneration, authority]) => {
       if (!isTauri() && ABSENCE_SWEEP_DEMO) return;
-      clearAbsenceSweeps();
+      rebindAbsenceSweepScope(bindingGeneration);
       if (bindingGeneration === null || authority !== "managed_writable") return;
       let disposed = false;
       let unlisten = () => {};

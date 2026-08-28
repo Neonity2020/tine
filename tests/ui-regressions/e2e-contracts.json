@@ -762,6 +762,34 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-absence-sweeps.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Reopening a managed graph after a large external group deletion surfaces the affected pages and lets the user Restore their exact Markdown content through the real application.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Closing the group-deletion warning or recovery panel records no decision; the sweep remains waiting, and an explicit Restore remains visible afterward as disposed history without live action controls.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A quit through the app's own close path with all managed slots verified stopped is not reported as an unclean close on the next launch.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Warning and dock wording, control placement, and panel presentation may evolve while the deletion group remains reviewable and its durable state is visible.",
+    "Managed activation, reopen, and Restore durations may vary while the journey reaches each semantic state within its polling bounds."
+   ],
+   "nonRequirements": [
+    "Pixels, geometry, palette, animation timing, DOM nesting, exact toast wording beyond the group-deletion label family, or generated sweep and page identifiers."
+   ],
+   "stability": "quarantined",
+   "quarantineReason": "2026-08-28 (updated after fixes and burn-in): the journey's product assertions are sound \u2014 it found and now guards two real defects (restore closing the recovery panel via unmemoized listener-effect inputs; clean quits falsely reported unclean because mark_clean_shutdown was unreachable after tauri's never-returning run()), and on the fixed binary every run that escaped driver trouble was product-correct (pass-2 plus burn-in runs 2-8; run 1 failed only on a WebKitWebDriver screenshot stall with the correct product state captured in the failure body). Quarantine remains solely for WebKitWebDriver session stalls on the local runner: intermittent UND_ERR_HEADERS_TIMEOUT / indefinite hangs on session-level calls (burn-in runs 1 and 9, plus one 15-minute pre-fix hang) and an orphaned-session cascade ('Maximum number of active sessions', run 10). Harness debt: harden the driver lifecycle (per-call timeouts, session reaping) before this journey becomes a blocking release gate; artifact screenshots are already best-effort."
+  },
   "scripts/e2e-search-parity.mjs": {
    "contracts": [
     {
@@ -982,20 +1010,20 @@
    "stability": "burn-in"
   },
   "scripts/e2e-windows-page-reference-latency.mjs": {
-    "contracts": [
-      {
-        "class": "core-operation",
-        "userOutcome": "On the reporter-scale Windows fixture, literal page-reference typing reaches the editor and paints autocomplete candidates while collecting per-key and backend timing evidence.",
-        "blocking": true
-      }
-    ],
-    "acceptableVariations": [
-      "Hosted Windows scheduling, WebView2 startup, disk throughput, and individual timing samples may vary."
-    ],
-    "nonRequirements": [
-      "Exact popup geometry, candidate styling, or equality to one machine's millisecond timings."
-    ],
-    "stability": "burn-in"
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "On the reporter-scale Windows fixture, literal page-reference typing reaches the editor and paints autocomplete candidates while collecting per-key and backend timing evidence.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Hosted Windows scheduling, WebView2 startup, disk throughput, and individual timing samples may vary."
+   ],
+   "nonRequirements": [
+    "Exact popup geometry, candidate styling, or equality to one machine's millisecond timings."
+   ],
+   "stability": "burn-in"
   },
   "scripts/e2e-windows-smoke.mjs": {
    "contracts": [
@@ -1096,7 +1124,7 @@
     "Exact watcher event count, delivery latency within the generous wait, toast geometry, colors, or DOM nesting.",
     "Generated block identities and conflict-trash filename."
    ],
-      "stability": "burn-in",
+   "stability": "burn-in",
    "notes": "Added after field sequences where Apply wrote the merge but the pre-merge editor remained installed, then expanded when a current-journal resolution disappeared from the live feed and its sticky notice survived. The journey asserts the file, visible current journal, notice retirement, save-debounce settlement, copy retirement, and process restart in both watcher modes; TINE_E2E_CONCORD_DECISION=mine additionally proves that same-content handoff adopts the returned revision before ordinary editing resumes."
   },
   "scripts/e2e-concord-focus-freshness.mjs": {
@@ -1164,7 +1192,7 @@
     },
     {
      "class": "core-operation",
-     "userOutcome": "After resolving the incumbent, the originally requested file actually arrives — refusal is never a dead end.",
+     "userOutcome": "After resolving the incumbent, the originally requested file actually arrives \u2014 refusal is never a dead end.",
      "blocking": true
     },
     {
@@ -1176,7 +1204,7 @@
    ],
    "acceptableVariations": [
     "How the message is presented (toast, inline banner, empty-state text) and its exact wording, as long as it names the page holding the unsaved changes.",
-    "Whether the incumbent is resolved by saving, discarding, or answering a conflict banner — any of them must release the requested file.",
+    "Whether the incumbent is resolved by saving, discarding, or answering a conflict banner \u2014 any of them must release the requested file.",
     "Whether the requested file arrives on re-navigation or automatically once the incumbent is clean."
    ],
    "nonRequirements": [
@@ -1186,14 +1214,14 @@
    ],
    "stability": "quarantined",
    "quarantineReason": "2026-08-10 (464a8ed4): Harness debt, not a product defect. No user gesture opens a chosen file by path: the Quick Switcher row renders kind and name only, so two files sharing a page name are indistinguishable, and positional selection would be the brittle oracle the semantic-E2E contract forbids. See notes for the source-level confirmation.",
-   "notes": "GH #304, fixed in GH #254 increment 3. Two files legitimately share one page name (the duplicate-day stray of #21, or same-titled pages in different folders). Replacing the loaded instance destroyed the unsaved edit, and the dirty mark SURVIVED to describe the replacement's content, so the next save wrote the wrong file's bytes under the user's intent. The journey deliberately continues past 'the edit survived' to prove the refusal is not a trap: a survival-only assertion would pass on an implementation that never shows the requested file at all, which is why the non-wedging half is blocking rather than advisory. QUARANTINED 2026-08-10, harness debt. The first two assertions run green against the branch binary — the unsaved edit survives — but the journey drives the second file through an invented `#/page-path/...` hash route that the router does not implement, so the navigation never happens and the survival assertion passes VACUOUSLY. It is quarantined rather than deleted because the journey shape is right; what is missing is a real UI affordance for opening a same-named file by path (the duplicate-day journal conflicts list is the honest candidate). ROOT CAUSE CONFIRMED AT SOURCE 2026-08-10: no user gesture opens a chosen file by path. The router does support a path-pinned route (Page.tsx uses r.path -> getPageByPath), and the Quick Switcher is the only UI carrying a per-file path into openFile, but its row renders kind and name ONLY (QuickSwitcher.tsx Row), so two files sharing a page name are visually identical and a user cannot choose between them; selecting positionally would be exactly the brittle oracle the semantic-E2E contract forbids. No duplicates/conflicts list exists, and the router is not exposed on window, so browser.execute cannot reach openFile without adding a production test hook. The journey stays quarantined until such an affordance exists - which is itself the product gap GH #304's scenario implies. Until then the composition-level regressions in src/instanceReplacement.test.ts carry this contract; they drive the real store and both fail against the pre-fix code."
+   "notes": "GH #304, fixed in GH #254 increment 3. Two files legitimately share one page name (the duplicate-day stray of #21, or same-titled pages in different folders). Replacing the loaded instance destroyed the unsaved edit, and the dirty mark SURVIVED to describe the replacement's content, so the next save wrote the wrong file's bytes under the user's intent. The journey deliberately continues past 'the edit survived' to prove the refusal is not a trap: a survival-only assertion would pass on an implementation that never shows the requested file at all, which is why the non-wedging half is blocking rather than advisory. QUARANTINED 2026-08-10, harness debt. The first two assertions run green against the branch binary \u2014 the unsaved edit survives \u2014 but the journey drives the second file through an invented `#/page-path/...` hash route that the router does not implement, so the navigation never happens and the survival assertion passes VACUOUSLY. It is quarantined rather than deleted because the journey shape is right; what is missing is a real UI affordance for opening a same-named file by path (the duplicate-day journal conflicts list is the honest candidate). ROOT CAUSE CONFIRMED AT SOURCE 2026-08-10: no user gesture opens a chosen file by path. The router does support a path-pinned route (Page.tsx uses r.path -> getPageByPath), and the Quick Switcher is the only UI carrying a per-file path into openFile, but its row renders kind and name ONLY (QuickSwitcher.tsx Row), so two files sharing a page name are visually identical and a user cannot choose between them; selecting positionally would be exactly the brittle oracle the semantic-E2E contract forbids. No duplicates/conflicts list exists, and the router is not exposed on window, so browser.execute cannot reach openFile without adding a production test hook. The journey stays quarantined until such an affordance exists - which is itself the product gap GH #304's scenario implies. Until then the composition-level regressions in src/instanceReplacement.test.ts carry this contract; they drive the real store and both fail against the pre-fix code."
   },
   "scripts/e2e-conflict-keep-mine.mjs": {
    "contracts": [
     {
      "class": "exact-safety-interoperability",
      "authority": "GH #254 increment 2, conflict-override authority: an override is bound to the exact bytes the user was shown. Discarding an unseen external write is irrecoverable loss of another writer's work.",
-     "userOutcome": "Clicking \"Keep mine\" cannot overwrite an external write that landed after the banner appeared — bytes the user was never shown are never discarded by a click answering an older conflict.",
+     "userOutcome": "Clicking \"Keep mine\" cannot overwrite an external write that landed after the banner appeared \u2014 bytes the user was never shown are never discarded by a click answering an older conflict.",
      "blocking": true
     },
     {
@@ -1213,7 +1241,7 @@
    ],
    "stability": "quarantined",
    "quarantineReason": "2026-08-10 (464a8ed4): Harness debt, not a product defect. The forbidden shape is a force that RACES the watcher re-observation; this journey waits 8s first, so it observes increment 2's designed outcome instead. Constructing the race needs a deterministic hook the harness lacks; gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers it at the core boundary.",
-   "notes": "GH #254. This is the sequence increment 2's adversarial rounds 3 and 4 each found broken in different places, and which nothing outside a mocked backend has ever driven. The failure is silent: \"Keep mine\" appears to work, and what is lost is someone else's write that the user cannot see was ever there. The non-wedging half is blocking because a refusal that leaves no live banner strands the edit — a conflicted page is skipped by the ordinary save path, so the user has no route back. QUARANTINED 2026-08-10, harness debt, NOT a product defect. Run against the branch binary it reproducibly showed \"Keep mine\" overwriting the second external winner. That is increment 2's DESIGNED outcome for this timing: a conflicted page is skipped by the ordinary save path, so the only thing that mints authority for a newer winner is the watcher's re-observation — and once that runs, the banner is re-armed and the click legitimately answers the CURRENT conflict. The harm the contract actually forbids is answering with authority minted for a DIFFERENT winner, i.e. a click that RACES the re-observation, which this journey does not construct: it waits 8s first. Fixing it means driving the stale-click shape (issue the force while a re-observation is in flight), which needs a deterministic hook the harness does not have. gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers that shape at the core boundary meanwhile."
+   "notes": "GH #254. This is the sequence increment 2's adversarial rounds 3 and 4 each found broken in different places, and which nothing outside a mocked backend has ever driven. The failure is silent: \"Keep mine\" appears to work, and what is lost is someone else's write that the user cannot see was ever there. The non-wedging half is blocking because a refusal that leaves no live banner strands the edit \u2014 a conflicted page is skipped by the ordinary save path, so the user has no route back. QUARANTINED 2026-08-10, harness debt, NOT a product defect. Run against the branch binary it reproducibly showed \"Keep mine\" overwriting the second external winner. That is increment 2's DESIGNED outcome for this timing: a conflicted page is skipped by the ordinary save path, so the only thing that mints authority for a newer winner is the watcher's re-observation \u2014 and once that runs, the banner is re-armed and the click legitimately answers the CURRENT conflict. The harm the contract actually forbids is answering with authority minted for a DIFFERENT winner, i.e. a click that RACES the re-observation, which this journey does not construct: it waits 8s first. Fixing it means driving the stale-click shape (issue the force while a re-observation is in flight), which needs a deterministic hook the harness does not have. gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers that shape at the core boundary meanwhile."
   }
  }
 }
