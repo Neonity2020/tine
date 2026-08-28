@@ -783,7 +783,7 @@
     "Pixels, geometry, palette, animation timing, DOM nesting, exact toast wording beyond the group-deletion label family, or generated sweep and page identifiers."
    ],
    "stability": "quarantined",
-   "quarantineReason": "2026-08-28: the new native journey is intentionally not runner-selected until its required unchanged-binary 10-run burn-in is complete; the packet write set does not authorize editing scripts/run-e2e.mjs."
+   "quarantineReason": "2026-08-28: two-run E2E stop-loss exhausted before Restore, so burn-in is 0/10 and this journey remains advisory. Attempt 1 reached the surfaced Tier-3 panel with all eight members and actions, then hit a harness race between an indexed Dismiss lookup and toast removal. After replacing that lookup atomically, attempt 2 again reached the complete panel, but the panel disappeared before the semantic close lookup while repeated RecoveryBlocked ProjectionDrain error toasts were visible. Classification is ambiguous product/harness debt; determine whether managed recovery churn is resetting presentation, then rerun the unchanged-binary burn-in. The packet write set also does not authorize runner registration."
   },
   "scripts/e2e-search-parity.mjs": {
    "contracts": [
