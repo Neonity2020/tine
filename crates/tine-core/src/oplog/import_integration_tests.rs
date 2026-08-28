@@ -357,12 +357,17 @@ impl AuthorityFixture {
             content: content.into(),
         }])
         .unwrap();
+        let mut projection_turns =
+            crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                self.engine.0.engine(),
+            );
         let mut session = self.engine.0.admit_clean_mutation(&self.graph).unwrap();
         match OperationalCoordinator::execute_clean_local(
             &mut session,
             &self.graph,
             &self.receipts,
             &transaction,
+            &mut projection_turns,
         )
         .unwrap()
         {
@@ -379,12 +384,17 @@ impl AuthorityFixture {
             page_id: authority.page_id,
         }])
         .unwrap();
+        let mut projection_turns =
+            crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                self.engine.0.engine(),
+            );
         let mut session = self.engine.0.admit_clean_mutation(&self.graph).unwrap();
         match OperationalCoordinator::execute_clean_local(
             &mut session,
             &self.graph,
             &self.receipts,
             &transaction,
+            &mut projection_turns,
         )
         .unwrap()
         {

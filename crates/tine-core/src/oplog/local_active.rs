@@ -1488,12 +1488,17 @@ mod bounded_admission {
                     content: content.into(),
                 }])
                 .unwrap();
+            let mut projection_turns =
+                crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                    self.runtime.engine(),
+                );
             let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
             let state = OperationalCoordinator::execute_clean_local(
                 &mut session,
                 &self.graph,
                 &self.receipts,
                 &transaction,
+                &mut projection_turns,
             )
             .unwrap();
             match state {

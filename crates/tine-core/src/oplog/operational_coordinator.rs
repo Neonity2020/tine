@@ -21,7 +21,6 @@ use super::local_active::{
     CleanRuntimeSession, LocalRuntimeAdmission, RuntimePromotionError, RuntimeRevocation,
     WorkspaceAuthorityBoundary, WorkspaceAuthorityRefusal,
 };
-use super::projection_turn_journal::ProjectionTurnJournalState;
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
     ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, LineageDigest, ObjectStore,
@@ -29,6 +28,7 @@ use super::{
     ProjectionReceiptStore, ProjectionWork, RebuildSource, SessionId, ShardedHotEngine,
     SqliteFrontier, TailOverlay, TailReservation,
 };
+use crate::oplog::projection_turn_journal::ProjectionTurnJournalState;
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
 const RESUME_OPERATION_BUDGET: usize = 256;
@@ -466,7 +466,6 @@ pub(crate) struct CleanPublishedContinuation {
     batch_id: BatchId,
     identity: super::sqlite::PreparedSqliteIdentityTransition,
     failure: OperationalCoordinatorError,
-    projection_turn_ingress: bool,
 }
 
 impl CleanPublishedContinuation {
@@ -477,10 +476,6 @@ impl CleanPublishedContinuation {
     pub(crate) fn failure(&self) -> &OperationalCoordinatorError {
         &self.failure
     }
-
-    pub(crate) const fn projection_turn_ingress(&self) -> bool {
-        self.projection_turn_ingress
-    }
 }
 
 fn execute_clean_local_inner(
@@ -490,6 +485,7 @@ fn execute_clean_local_inner(
     transaction: &OperationTransaction,
     batch_id: Option<BatchId>,
     persist_fingerprint: Option<&mut dyn FnMut(ContentDigest) -> Result<(), String>>,
+    projection_turns: &mut ProjectionTurnJournalState,
 ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
     let (admission, engine, database) = session.parts().map_err(|refusal| {
         OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
@@ -570,7 +566,6 @@ fn execute_clean_local_inner(
                     batch_id,
                     identity,
                     failure,
-                    projection_turn_ingress: false,
                 },
             ));
         }
@@ -586,7 +581,6 @@ fn execute_clean_local_inner(
         guard: published,
         batch_id,
         identity,
-        projection_turn_ingress: false,
         failure: OperationalCoordinatorError::new(
             OperationalPhase::SqliteDrain,
             "durable clean operation is awaiting derived-state application",
@@ -603,7 +597,7 @@ fn execute_clean_local_inner(
         engine,
         database,
         &continuation,
-        None,
+        projection_turns,
     ) {
         Ok(()) => {
             continuation.guard.complete();
@@ -628,8 +622,17 @@ impl OperationalCoordinator {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
-        execute_clean_local_inner(session, graph, receipts, transaction, None, None)
+        execute_clean_local_inner(
+            session,
+            graph,
+            receipts,
+            transaction,
+            None,
+            None,
+            projection_turns,
+        )
     }
 
     /// Execute one clean local mutation with a stable application-owned batch
@@ -643,6 +646,7 @@ impl OperationalCoordinator {
         batch_id: BatchId,
         transaction: &OperationTransaction,
         mut persist_fingerprint: impl FnMut(ContentDigest) -> Result<(), String>,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
         execute_clean_local_inner(
             session,
@@ -651,40 +655,16 @@ impl OperationalCoordinator {
             transaction,
             Some(batch_id),
             Some(&mut persist_fingerprint),
+            projection_turns,
         )
-    }
-
-    pub(crate) fn retry_clean_local(
-        session: &mut CleanRuntimeSession<'_>,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        continuation: CleanPublishedContinuation,
-    ) -> CleanLocalMutationState {
-        Self::retry_clean_local_inner(session, graph, receipts, continuation, None)
     }
 
     pub(crate) fn retry_clean_local_with_turns(
         session: &mut CleanRuntimeSession<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
-        continuation: CleanPublishedContinuation,
-        projection_turns: &mut ProjectionTurnJournalState,
-    ) -> CleanLocalMutationState {
-        Self::retry_clean_local_inner(
-            session,
-            graph,
-            receipts,
-            continuation,
-            Some(projection_turns),
-        )
-    }
-
-    fn retry_clean_local_inner(
-        session: &mut CleanRuntimeSession<'_>,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
         mut continuation: CleanPublishedContinuation,
-        projection_turns: Option<&mut ProjectionTurnJournalState>,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> CleanLocalMutationState {
         let (admission, engine, database) = match session.parts() {
             Ok(parts) => parts,
@@ -788,7 +768,6 @@ impl OperationalCoordinator {
                         batch_id,
                         identity,
                         failure,
-                        projection_turn_ingress: true,
                     },
                 ));
             }
@@ -804,7 +783,6 @@ impl OperationalCoordinator {
             guard: published,
             batch_id,
             identity,
-            projection_turn_ingress: true,
             failure: OperationalCoordinatorError::new(
                 OperationalPhase::SqliteDrain,
                 "durable clean provider operation is awaiting derived-state application",
@@ -822,7 +800,7 @@ impl OperationalCoordinator {
             engine,
             database,
             &continuation,
-            Some(projection_turns),
+            projection_turns,
         ) {
             Ok(()) => {
                 continuation.guard.complete();
@@ -846,6 +824,7 @@ impl OperationalCoordinator {
         receipts: &ProjectionReceiptStore,
         requested_paths: &[&str],
         sweep_recorder: &mut dyn SweepRecorder,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanExternalMutationState, OperationalCoordinatorError> {
         let (admission, engine, database) = session.parts().map_err(|refusal| {
             OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
@@ -1017,7 +996,6 @@ impl OperationalCoordinator {
                         batch_id,
                         identity,
                         failure,
-                        projection_turn_ingress: false,
                     },
                 ));
             }
@@ -1033,7 +1011,6 @@ impl OperationalCoordinator {
             guard: published,
             batch_id,
             identity,
-            projection_turn_ingress: false,
             failure: OperationalCoordinatorError::new(
                 OperationalPhase::SqliteDrain,
                 "durable clean external operation is awaiting derived-state application",
@@ -1050,7 +1027,7 @@ impl OperationalCoordinator {
             engine,
             database,
             &continuation,
-            None,
+            projection_turns,
         ) {
             Ok(()) => {
                 continuation.guard.complete();
@@ -1316,7 +1293,7 @@ fn resume_clean_published(
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
     continuation: &CleanPublishedContinuation,
-    projection_turns: Option<&mut ProjectionTurnJournalState>,
+    projection_turns: &mut ProjectionTurnJournalState,
 ) -> Result<(), OperationalCoordinatorError> {
     authorize_coordinator(admission, graph, engine)?;
     let event = AcceptedBatchEvent::from_accepted(
@@ -1367,13 +1344,8 @@ fn resume_clean_published(
         ));
     }
 
-    if continuation.projection_turn_ingress {
-        let turns = projection_turns.ok_or_else(|| {
-            OperationalCoordinatorError::new(
-                OperationalPhase::ProjectionDrain,
-                "clean provider continuation has no projection-turn journal",
-            )
-        })?;
+    {
+        let turns = projection_turns;
         let work = engine
             .clean_projection_work_for_batch(continuation.batch_id)
             .map_err(|error| {
@@ -1497,131 +1469,6 @@ fn resume_clean_published(
         }
         return Ok(());
     }
-
-    for work in engine
-        .clean_projection_work_for_batch(continuation.batch_id)
-        .map_err(|error| {
-            OperationalCoordinatorError::retained_block(
-                OperationalPhase::ProjectionDrain,
-                error.to_string(),
-                RetainedBlockReason::PublishedAuthentication,
-            )
-        })?
-    {
-        reprove_workspace_authority(
-            admission,
-            WorkspaceAuthorityBoundary::ProjectionDrain,
-            OperationalPhase::ProjectionDrain,
-        )?;
-        fault(OperationalFaultPoint::BeforeProjection)?;
-        super::projection::execute_clean_manifested_projection_work_under_handoff(
-            graph,
-            database,
-            engine,
-            &work,
-            &continuation.guard,
-        )
-        .map_err(|error| {
-            OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
-        })?;
-        fault(OperationalFaultPoint::AfterProjection)?;
-    }
-
-    // Projection intents authored by another endpoint describe accepted
-    // semantic state, not bytes that this receiver may copy verbatim.  Once
-    // SQLite has advanced to the accepted frontier, render each foreign
-    // intent again against this endpoint's exact local base and record the
-    // result in its private receipt store.  Keeping this in the resumable
-    // published continuation makes provider ingress crash-safe: a retry may
-    // observe the manifest and SQLite transition already complete, but it
-    // must still finish the receiver-local Markdown projection.
-    let receiver_endpoint = engine
-        .projection_endpoint_binding()
-        .ok_or_else(|| {
-            OperationalCoordinatorError::new(
-                OperationalPhase::ProjectionDrain,
-                "clean provider receiver has no enrolled projection endpoint",
-            )
-        })?
-        .endpoint_id();
-    let batch = match engine
-        .archive_store()
-        .ok_or_else(|| {
-            OperationalCoordinatorError::retained_block(
-                OperationalPhase::ArchiveStage,
-                "clean committed operation has no retained archive",
-                RetainedBlockReason::PublishedAuthentication,
-            )
-        })?
-        .inspect_batch(continuation.batch_id)
-        .map_err(|error| {
-            OperationalCoordinatorError::retained_block(
-                OperationalPhase::ProjectionDrain,
-                error.to_string(),
-                RetainedBlockReason::PublishedAuthentication,
-            )
-        })? {
-        BatchInspection::Ready(batch) => batch,
-        BatchInspection::Absent | BatchInspection::Staged { .. } => {
-            return Err(OperationalCoordinatorError::retained_block(
-                OperationalPhase::ProjectionDrain,
-                "clean accepted batch became partial before receiver-local projection",
-                RetainedBlockReason::PublishedAuthentication,
-            ));
-        }
-    };
-    let projection = super::projection_manifest::validate_projection_object_set(
-        batch.manifest(),
-        batch.objects(),
-    )
-    .map_err(|error| {
-        OperationalCoordinatorError::retained_block(
-            OperationalPhase::ProjectionDrain,
-            error.to_string(),
-            RetainedBlockReason::PublishedAuthentication,
-        )
-    })?;
-    for source in projection
-        .intents()
-        .iter()
-        .filter(|source| source.source_endpoint_id() != receiver_endpoint)
-    {
-        reprove_workspace_authority(
-            admission,
-            WorkspaceAuthorityBoundary::ProjectionDrain,
-            OperationalPhase::ProjectionDrain,
-        )?;
-        let completed = super::projection::execute_receiver_local_projection_under_handoff(
-            graph,
-            receipts,
-            engine,
-            Some(database),
-            source,
-            &continuation.guard,
-            true,
-        )
-        .map_err(|error| {
-            OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
-        })?;
-        if completed.is_none() {
-            // Name the artifact and the operation. This detail is what
-            // `clean_shutdown` reports when it refuses `Safe`, so an
-            // unapplied delivered deletion is never silent.
-            let operation = if matches!(source.target(), super::ManifestProjectionTarget::Absent) {
-                "deletion"
-            } else {
-                "projection"
-            };
-            return Err(OperationalCoordinatorError::continuation_required(
-                OperationalPhase::ProjectionDrain,
-                format!(
-                    "clean receiver-local {operation} of {:?} requires a continuation",
-                    source.path().as_str()
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn draft_with_bounded_peer_candidates(
@@ -1872,6 +1719,7 @@ mod tests {
         receipts: ProjectionReceiptStore,
         archive: ObjectStore,
         runtime: CleanLocalRuntime,
+        projection_turns: crate::oplog::projection_turn_journal::ProjectionTurnJournalState,
         lineage: LineageDigest,
         catalog: DocumentId,
         page_id: PageId,
@@ -2023,6 +1871,10 @@ mod tests {
             let home_document_id = page.home_document_id;
             let block_id = page.blocks[0].block_id;
             Self {
+                projection_turns:
+                    crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
+                        runtime.engine(),
+                    ),
                 _root: root,
                 graph_root,
                 archive_root,
@@ -2083,6 +1935,7 @@ mod tests {
                 &self.graph,
                 &self.receipts,
                 transaction,
+                &mut self.projection_turns,
             )
         }
 
@@ -2099,6 +1952,7 @@ mod tests {
                 batch_id,
                 transaction,
                 |_| Ok(()),
+                &mut self.projection_turns,
             )
         }
 
@@ -2121,6 +1975,7 @@ mod tests {
                 &self.receipts,
                 paths,
                 &mut crate::oplog::absence_sweep::NoopSweepRecorder,
+                &mut self.projection_turns,
             )
         }
 
@@ -2132,11 +1987,12 @@ mod tests {
                 .runtime
                 .admit_clean_derived_recovery(&self.graph)
                 .unwrap();
-            OperationalCoordinator::retry_clean_local(
+            OperationalCoordinator::retry_clean_local_with_turns(
                 &mut session,
                 &self.graph,
                 &self.receipts,
                 continuation,
+                &mut self.projection_turns,
             )
         }
 
@@ -2159,6 +2015,7 @@ mod tests {
                 enrollment_root,
                 database_path,
                 graph,
+                projection_turns,
                 receipts,
                 archive,
                 runtime,
@@ -2253,6 +2110,7 @@ mod tests {
                 enrollment_root,
                 database_path,
                 graph,
+                projection_turns,
                 receipts,
                 archive,
                 runtime,
@@ -2460,6 +2318,7 @@ mod tests {
             &fixture.graph,
             &foreign_receipts,
             &transaction,
+            &mut fixture.projection_turns,
         ) {
             Err(error) => error,
             Ok(_) => panic!("a stale clean local binding must be typed before publication"),
@@ -2802,12 +2661,14 @@ mod tests {
             .admit_clean_derived_recovery(&fixture.graph)
             .unwrap();
 
-        let pending = expect_clean_local_pending(OperationalCoordinator::retry_clean_local(
-            &mut session,
-            &foreign_graph,
-            &fixture.receipts,
-            pending,
-        ));
+        let pending =
+            expect_clean_local_pending(OperationalCoordinator::retry_clean_local_with_turns(
+                &mut session,
+                &foreign_graph,
+                &fixture.receipts,
+                pending,
+                &mut fixture.projection_turns,
+            ));
         assert_eq!(pending.batch_id(), batch_id);
         assert_eq!(pending.failure().phase(), OperationalPhase::Bindings);
         assert!(fixture.graph.probe_managed_text_writer().is_err());
@@ -3261,6 +3122,7 @@ mod tests {
                 &fixture.graph,
                 &foreign,
                 &transaction,
+                &mut fixture.projection_turns,
             ),
             Err(OperationalCoordinatorError {
                 phase: OperationalPhase::Bindings,
@@ -3288,12 +3150,14 @@ mod tests {
             .runtime
             .admit_clean_derived_recovery(&fixture.graph)
             .unwrap();
-        let pending = expect_clean_local_pending(OperationalCoordinator::retry_clean_local(
-            &mut session,
-            &foreign_graph,
-            &fixture.receipts,
-            pending,
-        ));
+        let pending =
+            expect_clean_local_pending(OperationalCoordinator::retry_clean_local_with_turns(
+                &mut session,
+                &foreign_graph,
+                &fixture.receipts,
+                pending,
+                &mut fixture.projection_turns,
+            ));
         assert_eq!(pending.batch_id(), batch_id);
         assert_eq!(pending.failure().phase(), OperationalPhase::Bindings);
         assert!(fixture.graph.probe_managed_text_writer().is_err());
