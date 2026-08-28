@@ -18,6 +18,9 @@ describe("stable desktop startup reveal (GH #132)", () => {
     expect(index).toContain('id="tine-startup-style"');
     expect(index).toContain('localStorage.getItem("logseq-claude.theme")');
     expect(index).toContain('matchMedia("(prefers-color-scheme: dark)")');
+    expect(index).toContain("background: var(--bg-primary, #ffffff);");
+    expect(index).toContain("background: var(--bg-primary, #1a1b1e);");
+    expect(index).toContain("color: var(--text-primary, #d1d5db);");
     expect(shell).toBeGreaterThanOrEqual(0);
     expect(module).toBeGreaterThan(shell);
     expect(main).toContain("root.replaceChildren();");

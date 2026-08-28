@@ -78,15 +78,20 @@ async function metrics(page) {
     const code = document.querySelector(".inline-code, .code-block, code");
     const sidebar = document.querySelector(".left-sidebar");
     const theme = document.getElementById("tine-theme");
+    const custom = document.getElementById("tine-custom-css");
     const ids = Array.from(document.head.children).map((el) => el.id).filter(Boolean);
     return {
       bg: style(body, "background-color"),
+      primaryToken: style(document.documentElement, "--bg-primary").trim(),
+      primaryLsToken: style(document.documentElement, "--ls-primary-background-color").trim(),
+      bodyPrimaryToken: style(body, "--bg-primary").trim(),
       text: style(body, "color"),
       link: link ? style(link, "color") : "",
       tag: tag ? style(tag, "color") : "",
       border: sidebar ? style(sidebar, "border-right-color") : "",
       codeBg: code ? style(code, "background-color") : "",
       themeBytes: theme?.textContent?.length ?? 0,
+      customBytes: custom?.textContent?.length ?? 0,
       order: ids.filter((id) => id === "tine-ls-shim" || id === "tine-theme" || id === "tine-custom-css"),
     };
   });
