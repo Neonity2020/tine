@@ -5,6 +5,7 @@ import {
   applyTheme,
   ensureThemeStyle,
   selectedGalleryTheme,
+  selectedThemePresentation,
   initThemeGallery,
 } from "./themeGallery";
 import {
@@ -83,6 +84,41 @@ describe("theme gallery style layer", () => {
     expect(managedStyleIds()).toEqual([LS_SHIM_STYLE_ID, THEME_GALLERY_STYLE_ID, CUSTOM_CSS_STYLE_ID]);
     await uninstallThemePackage(installed.key);
     applyTheme("");
+  });
+
+  it("applies and clears API 0.2 host-owned presentation attributes", async () => {
+    const installed = await installThemePackage({
+      schemaVersion: 1,
+      id: "page.tine.theme.editorial",
+      name: "Editorial",
+      version: "1.0.0",
+      apiVersion: "0.2",
+      description: "A bounded presentation test.",
+      author: "Tine",
+      license: "MIT",
+      source: "https://example.invalid/theme",
+      modes: { light: { "--ls-primary-background-color": "#fefefe" } },
+      presentation: {
+        contentTypography: "editorial-serif",
+        journalHeader: "editorial",
+        todayTaskSummary: "compact",
+      },
+      screenshots: [],
+    });
+
+    applyTheme(installed.key);
+
+    expect(selectedThemePresentation()).toEqual(installed.manifest.presentation);
+    expect(document.documentElement.getAttribute("data-theme-content-typography")).toBe("editorial-serif");
+    expect(document.documentElement.getAttribute("data-theme-journal-header")).toBe("editorial");
+    expect(document.documentElement.getAttribute("data-theme-today-task-summary")).toBe("compact");
+
+    applyTheme("");
+    expect(selectedThemePresentation()).toEqual({});
+    expect(document.documentElement.hasAttribute("data-theme-content-typography")).toBe(false);
+    expect(document.documentElement.hasAttribute("data-theme-journal-header")).toBe(false);
+    expect(document.documentElement.hasAttribute("data-theme-today-task-summary")).toBe(false);
+    await uninstallThemePackage(installed.key);
   });
 
   it("refuses to apply or reinstall a theme version revoked by the signed registry", async () => {

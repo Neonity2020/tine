@@ -9,7 +9,7 @@ import {
   type PluginPlatform,
 } from "./manifest";
 import { pluginManager } from "./manager";
-import { THEME_API_VERSION, parseThemeManifest } from "../themes/manifest";
+import { SUPPORTED_THEME_API_VERSIONS, parseThemeManifest, type ThemeApiVersion } from "../themes/manifest";
 import { applyThemeRevocations, installThemePackage, themeVersionIsRevoked } from "../themes/manager";
 import { applyTheme, selectedGalleryTheme } from "../themeGallery";
 
@@ -314,7 +314,7 @@ export function parseRegistryIndex(value: unknown): RegistryIndex {
         },
         publishedAt: text(version.publishedAt, `${id}.publishedAt`, 80),
       };
-    }).filter((version) => version.apiVersion === THEME_API_VERSION);
+    }).filter((version) => SUPPORTED_THEME_API_VERSIONS.includes(version.apiVersion as ThemeApiVersion));
     const ai = item.aiDevelopment;
     if (ai !== "none" && ai !== "assisted" && ai !== "primary") throw new Error(`${id} has invalid AI provenance`);
     return {

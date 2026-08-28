@@ -14,6 +14,16 @@ const TOKENS = new Set([
 ]);
 const COLOR = /^(?:#[0-9A-Fa-f]{3,8}|transparent|(?:rgb|rgba|hsl|hsla)\([0-9.,%+\- /]+\))$/;
 const LICENSES = new Set(["0BSD", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "MPL-2.0", "GPL-2.0-only", "GPL-3.0-only", "AGPL-3.0-only", "Unlicense"]);
+const API_VERSIONS = new Set(["0.1", "0.2"]);
+const ROOT_FIELDS = new Set([
+  "schemaVersion", "id", "name", "version", "apiVersion", "description", "author", "license",
+  "source", "modes", "presentation", "screenshots", "portedFrom", "aiDevelopment",
+]);
+const PRESENTATION = {
+  contentTypography: new Set(["default", "editorial-serif"]),
+  journalHeader: new Set(["default", "editorial"]),
+  todayTaskSummary: new Set(["hidden", "compact"]),
+};
 
 function fail(errors, code, message) { errors.push({ code, message }); }
 function checkUrl(value) { try { return typeof value === "string" && new URL(value).protocol === "https:"; } catch { return false; } }
@@ -27,7 +37,14 @@ function checkTheme(file) {
   let value;
   try { value = JSON.parse(bytes.toString("utf8")); } catch { fail(report.errors, "theme.json", "theme.json is invalid JSON"); return report; }
   report.theme = { id: value?.id ?? null, version: value?.version ?? null, name: value?.name ?? null };
-  if (value?.schemaVersion !== 1 || value?.apiVersion !== "0.1") fail(report.errors, "theme.api", "theme schemaVersion/apiVersion must be 1/0.1");
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    fail(report.errors, "theme.shape", "theme manifest must be an object");
+    return report;
+  }
+  for (const key of Object.keys(value)) {
+    if (!ROOT_FIELDS.has(key)) fail(report.errors, "theme.field", `${key} is not a recognized theme field`);
+  }
+  if (value.schemaVersion !== 1 || !API_VERSIONS.has(value.apiVersion)) fail(report.errors, "theme.api", "theme schemaVersion/apiVersion must be 1 and one of 0.1, 0.2");
   if (typeof value?.id !== "string" || !/^[a-z0-9](?:[a-z0-9.-]{1,62}[a-z0-9])$/.test(value.id) || !value.id.includes(".")) fail(report.errors, "theme.id", "id must be a lowercase dotted identifier");
   if (!LICENSES.has(value?.license)) fail(report.errors, "theme.license", "license must be a recognized registry SPDX identifier");
   if (!checkUrl(value?.source)) fail(report.errors, "theme.source", "source must be a public https URL");
@@ -49,6 +66,21 @@ function checkTheme(file) {
   }
   if (value?.portedFrom && (!checkUrl(value.portedFrom.source) || !value.portedFrom.revision || !Array.isArray(value.portedFrom.authors) || value.portedFrom.authors.length === 0)) {
     fail(report.errors, "theme.provenance", "portedFrom must include source, revision, and original authors");
+  }
+  if (value.presentation !== undefined) {
+    if (value.apiVersion !== "0.2") {
+      fail(report.errors, "theme.presentation-api", "presentation requires theme API 0.2");
+    } else if (!value.presentation || typeof value.presentation !== "object" || Array.isArray(value.presentation)) {
+      fail(report.errors, "theme.presentation", "presentation must be an object");
+    } else {
+      for (const [key, setting] of Object.entries(value.presentation)) {
+        if (!Object.hasOwn(PRESENTATION, key)) {
+          fail(report.errors, "theme.presentation-field", `${key} is not a host-owned presentation setting`);
+        } else if (!PRESENTATION[key].has(setting)) {
+          fail(report.errors, "theme.presentation-value", `${key} has an unsupported presentation value`);
+        }
+      }
+    }
   }
   report.status = report.errors.length === 0 ? "passed" : "failed";
   return report;
