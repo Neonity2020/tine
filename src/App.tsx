@@ -173,7 +173,6 @@ import type { SparseV2CancelResult } from "./types";
 import {
   clearAbsenceSweeps,
   ingestAbsenceSweepEvent,
-  refreshAbsenceSweeps,
 } from "./absenceSweeps";
 
 /** The single persistence transaction used by both desktop close and Android
@@ -705,13 +704,25 @@ function PaneScroller(props: {
       if (bindingGeneration === null || authority !== "managed_writable") return;
       let disposed = false;
       let unlisten = () => {};
-      void backend()
-        .onAbsenceSweepChanged(bindingGeneration, (sweep) => ingestAbsenceSweepEvent(sweep, { announce: true }))
-        .then((stop) => {
-          if (disposed) stop();
-          else unlisten = stop;
-        });
-      void refreshAbsenceSweeps({ announce: true }).catch(() => {});
+      void (async () => {
+        try {
+          const stop = await backend().onAbsenceSweepChanged(
+            bindingGeneration,
+            (sweep) => ingestAbsenceSweepEvent(sweep, { announce: true }),
+          );
+          if (disposed) {
+            stop();
+            return;
+          }
+          unlisten = stop;
+        } catch {
+          // The current snapshot remains useful if native event registration
+          // is temporarily unavailable.
+        }
+        const sweeps = await backend().listAbsenceSweeps();
+        if (disposed) return;
+        for (const sweep of sweeps) ingestAbsenceSweepEvent(sweep, { announce: true });
+      })().catch(() => {});
       onCleanup(() => {
         disposed = true;
         unlisten();
