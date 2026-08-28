@@ -121,6 +121,23 @@ impl AbsenceDecisionMap {
         }
     }
 
+    pub(crate) fn restored_generation_requires_deferral(
+        &self,
+        page_id: PageId,
+        path: &ManagedPath,
+    ) -> bool {
+        let Some(entries) = self.completions.get(&(page_id, path.clone())) else {
+            return false;
+        };
+        entries.iter().any(|present| {
+            present.target_kind == ProjectionTargetKind::Present
+                && entries.iter().any(|absent| {
+                    absent.target_kind == ProjectionTargetKind::Absent
+                        && frontier_strictly_dominates(&present.frontier, &absent.frontier)
+                })
+        })
+    }
+
     pub(crate) fn incomplete_receiver_intents(
         &self,
         page_id: PageId,

@@ -1050,6 +1050,7 @@ mod tests {
             page_id,
             before: Some(before.clone()),
             after: Some(after.clone()),
+            lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
         };
         let name_key = before.name().key_digest();
         let path_key = before.path().unwrap().portable_key().digest();
@@ -1138,6 +1139,7 @@ mod tests {
                     page_id,
                     before: Some(base.clone()),
                     after: Some(proposed_state.clone()),
+                    lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
                 }],
                 &BTreeMap::from([(page_id, Some(current_state.clone()))]),
                 &BTreeMap::from([(page_id, Some(proposed_state))]),
@@ -1216,6 +1218,7 @@ mod tests {
             page_id: next_page,
             before: None,
             after: Some(after.clone()),
+            lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
         };
         let maps = (
             BTreeMap::from([(next_page, None)]),
@@ -1266,6 +1269,7 @@ mod tests {
             page_id: edited,
             before: Some(edited_state.clone()),
             after: Some(edited_state.clone()),
+            lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
         };
         let transition = prepare_page_name_identity_transition(
             batch(63),

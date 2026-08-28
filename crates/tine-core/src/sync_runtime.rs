@@ -47,7 +47,9 @@ use crate::model::{
     BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
     RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
-use crate::oplog::absence_sweep::{SweepError, SweepManager, SweepNotification, SweepTier};
+use crate::oplog::absence_sweep::{
+    SweepError, SweepManager, SweepMember, SweepNotification, SweepRestoreCursor, SweepTier,
+};
 use crate::oplog::discovery::{
     classify_enrollment_error, discover_startup, AmbiguousEvidence, DiscoveryClassification,
     DiscoveryComponent, DiscoveryRequest, NonActiveStage, StartupStorageProfile,
@@ -223,6 +225,68 @@ pub const MAX_LOCAL_MUTATION_REFERENCED_PATHS: usize = 512;
 pub const MAX_LOCAL_MUTATION_PATH_BYTES: usize = 256 * 1024;
 /// Maximum aggregate UTF-8 bytes in names, content, preambles, and order keys.
 pub const MAX_LOCAL_MUTATION_TEXT_BYTES: usize = 1024 * 1024;
+const RESTORE_CHUNK_OPERATION_LIMIT: usize = MAX_LOCAL_MUTATION_ROWS;
+const RESTORE_CHUNK_ENCODED_OPERATION_BYTES: usize = 16 * 1024 * 1024;
+const RESTORE_MAX_NONDECREASING_RETRIES: u8 = 3;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RestoreAfterChunkAdmission {
+    transaction: OperationTransaction,
+    remaining: Option<usize>,
+}
+
+#[cfg(test)]
+static RESTORE_TEST_CUT_AFTER_PROGRESS: Mutex<BTreeSet<WorkspaceId>> = Mutex::new(BTreeSet::new());
+#[cfg(test)]
+static RESTORE_TEST_AFTER_CHUNK_ADMISSION: Mutex<
+    BTreeMap<WorkspaceId, RestoreAfterChunkAdmission>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn fail_once_after_restore_progress(workspace_id: WorkspaceId) {
+    RESTORE_TEST_CUT_AFTER_PROGRESS
+        .lock()
+        .unwrap()
+        .insert(workspace_id);
+}
+
+#[cfg(test)]
+fn admit_after_restore_chunks_for_test(
+    workspace_id: WorkspaceId,
+    transaction: OperationTransaction,
+    remaining: Option<usize>,
+) {
+    RESTORE_TEST_AFTER_CHUNK_ADMISSION.lock().unwrap().insert(
+        workspace_id,
+        RestoreAfterChunkAdmission {
+            transaction,
+            remaining,
+        },
+    );
+}
+
+#[cfg(test)]
+fn take_restore_after_chunk_admission(workspace_id: WorkspaceId) -> Option<OperationTransaction> {
+    let mut admissions = RESTORE_TEST_AFTER_CHUNK_ADMISSION.lock().unwrap();
+    let admission = admissions.get_mut(&workspace_id)?;
+    let transaction = admission.transaction.clone();
+    if let Some(remaining) = admission.remaining.as_mut() {
+        *remaining = remaining.saturating_sub(1);
+        if *remaining == 0 {
+            admissions.remove(&workspace_id);
+        }
+    }
+    Some(transaction)
+}
+
+#[cfg(test)]
+fn clear_restore_after_chunk_admission(workspace_id: WorkspaceId) {
+    RESTORE_TEST_AFTER_CHUNK_ADMISSION
+        .lock()
+        .unwrap()
+        .remove(&workspace_id);
+}
 /// The public boundary uses the materialization's proven row cap. Every query
 /// validates this before it is placed on the actor queue.
 pub const MAX_SYNC_RUNTIME_QUERY_ROWS: usize = MAX_MATERIALIZATION_QUERY_ROWS;
@@ -1899,6 +1963,30 @@ pub struct SyncAbsenceSweepActionOutcome {
     pub sweep_id: String,
     pub action_id: String,
     pub authored_batch_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncAbsenceSweepRestoreFidelityGrade {
+    ByteIdentical,
+    SemanticallyIdentical,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncAbsenceSweepRestoreFidelity {
+    pub page_id: String,
+    pub path: String,
+    pub grade: SyncAbsenceSweepRestoreFidelityGrade,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncAbsenceSweepRestoreOutcome {
+    pub sweep_id: String,
+    pub action_id: String,
+    pub authored_batch_ids: Vec<String>,
+    pub fidelity: Vec<SyncAbsenceSweepRestoreFidelity>,
 }
 
 impl From<&SweepNotification> for SyncAbsenceSweepEvent {
@@ -4340,6 +4428,25 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
     }
 
+    /// Begin or resume a durable whole-sweep Restore. Every committed chunk
+    /// advances the sweep action cursor before the next chunk is attempted.
+    pub fn restore_absence_sweep(
+        &self,
+        sweep_id: &str,
+    ) -> Result<SyncAbsenceSweepRestoreOutcome, SyncRuntimeRequestError> {
+        let sweep_id = uuid::Uuid::parse_str(sweep_id)
+            .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::RestoreAbsenceSweep {
+            sweep_id,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+    }
+
     /// Explicitly keep the accepted deletions and release any tier-3 grace
     /// hold. This records the disposition before publication becomes runnable.
     pub fn dispose_absence_sweep_keep_deletion(
@@ -4794,6 +4901,7 @@ fn bounded_local_mutation_size(transaction: &OperationTransaction) -> SyncLocalM
         charge_local_row(&mut size);
         match operation {
             SemanticOperation::CreatePage { name, path, .. }
+            | SemanticOperation::RevivePage { name, path, .. }
             | SemanticOperation::ReconcileExternalPageState { name, path, .. } => {
                 charge_local_text(&mut size, name.as_str().len());
                 charge_local_path(&mut size, path);
@@ -4904,6 +5012,70 @@ fn local_size_exceeded(size: SyncLocalMutationRequestSize) -> bool {
         || size.referenced_paths > MAX_LOCAL_MUTATION_REFERENCED_PATHS
         || size.path_bytes > MAX_LOCAL_MUTATION_PATH_BYTES
         || size.text_bytes > MAX_LOCAL_MUTATION_TEXT_BYTES
+}
+
+fn restore_chunk(operations: &[SemanticOperation]) -> Result<Vec<SemanticOperation>, String> {
+    let mut chunk = Vec::new();
+    let mut encoded_bytes = 0_usize;
+    for operation in operations.iter().take(RESTORE_CHUNK_OPERATION_LIMIT) {
+        let operation_bytes = postcard::to_allocvec(operation)
+            .map_err(|error| format!("cannot size restore operation: {error}"))?
+            .len();
+        if !chunk.is_empty()
+            && encoded_bytes.saturating_add(operation_bytes) > RESTORE_CHUNK_ENCODED_OPERATION_BYTES
+        {
+            break;
+        }
+        encoded_bytes = encoded_bytes.saturating_add(operation_bytes);
+        chunk.push(operation.clone());
+    }
+    if chunk.is_empty() && !operations.is_empty() {
+        chunk.push(operations[0].clone());
+    }
+    Ok(chunk)
+}
+
+fn restore_fidelity(
+    engine: &ShardedHotEngine,
+    receipts: &ProjectionReceiptStore,
+    members: &[SweepMember],
+) -> Vec<SyncAbsenceSweepRestoreFidelity> {
+    members
+        .iter()
+        .map(|member| SyncAbsenceSweepRestoreFidelity {
+            page_id: member.page_id.to_string(),
+            path: member.path.as_str().to_owned(),
+            grade: if member.prior_present_intent_id.is_some_and(|intent_id| {
+                engine
+                    .has_revival_render_evidence(
+                        intent_id,
+                        member.page_id,
+                        &member.path,
+                        &member.predecessor_accepted_state.frontier,
+                    )
+                    .unwrap_or(false)
+                    || receipts
+                        .load_intent(intent_id)
+                        .ok()
+                        .flatten()
+                        .filter(|intent| {
+                            intent.page_id() == member.page_id
+                                && intent.path() == &member.path
+                                && intent.frontier() == &member.predecessor_accepted_state.frontier
+                                && intent.target_kind()
+                                    == crate::oplog::ProjectionTargetKind::Present
+                        })
+                        .and_then(|intent| {
+                            receipts.load_retained_base(intent.target()).ok().flatten()
+                        })
+                        .is_some()
+            }) {
+                SyncAbsenceSweepRestoreFidelityGrade::ByteIdentical
+            } else {
+                SyncAbsenceSweepRestoreFidelityGrade::SemanticallyIdentical
+            },
+        })
+        .collect()
 }
 
 fn map_local_actor_error(_: SyncRuntimeRequestError) -> SyncLocalMutationRequestError {
@@ -8949,6 +9121,10 @@ enum ActorRequest {
         sweep_id: uuid::Uuid,
         reply: mpsc::Sender<Result<SyncAbsenceSweepActionOutcome, SyncRuntimeRequestError>>,
     },
+    RestoreAbsenceSweep {
+        sweep_id: uuid::Uuid,
+        reply: mpsc::Sender<Result<SyncAbsenceSweepRestoreOutcome, SyncRuntimeRequestError>>,
+    },
     DisposeAbsenceSweep {
         sweep_id: uuid::Uuid,
         reply: mpsc::Sender<Result<(), SyncRuntimeRequestError>>,
@@ -9393,6 +9569,11 @@ fn run_actor_loop(
             }
             ActorRequest::ReapplyAbsenceSweep { sweep_id, reply } => {
                 let result = actor.reapply_absence_sweep(sweep_id);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::RestoreAbsenceSweep { sweep_id, reply } => {
+                let result = actor.restore_absence_sweep(sweep_id);
                 let _ = reply.send(result);
                 false
             }
@@ -12200,6 +12381,17 @@ impl RuntimeActor {
         for (sweep_id, _) in pending_reapply {
             actor.reapply_absence_sweep(sweep_id).map_err(|error| {
                 format!("cannot resume durable absence sweep re-apply {sweep_id}: {error}")
+            })?;
+        }
+        let pending_restore = actor
+            .clean
+            .as_ref()
+            .expect("clean actor was just assembled")
+            .sweeps
+            .pending_restore_actions();
+        for (sweep_id, _) in pending_restore {
+            actor.restore_absence_sweep(sweep_id).map_err(|error| {
+                format!("cannot resume durable absence sweep restore {sweep_id}: {error}")
             })?;
         }
         for batch_id in recovered_provider_batches {
@@ -21451,6 +21643,254 @@ impl RuntimeActor {
         })
     }
 
+    fn restore_absence_sweep(
+        &mut self,
+        sweep_id: uuid::Uuid,
+    ) -> Result<SyncAbsenceSweepRestoreOutcome, SyncRuntimeRequestError> {
+        let action = self
+            .clean
+            .as_mut()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .sweeps
+            .begin_restore(sweep_id)
+            .map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(format!(
+                    "cannot durably begin absence sweep restore: {error}"
+                ))
+            })?;
+        let action_id = action.action_id;
+        let members = action.members;
+        let mut authored_batch_ids = action.authored_batch_ids;
+        let mut cursor = action.cursor;
+        if action.completed {
+            return Ok(SyncAbsenceSweepRestoreOutcome {
+                sweep_id: sweep_id.to_string(),
+                action_id: action_id.to_string(),
+                authored_batch_ids: authored_batch_ids.iter().map(ToString::to_string).collect(),
+                fidelity: restore_fidelity(
+                    self.clean
+                        .as_ref()
+                        .expect("completed restore retains its clean runtime")
+                        .runtime
+                        .engine(),
+                    &self.receipts,
+                    &members,
+                ),
+            });
+        }
+
+        loop {
+            let plans = {
+                let clean = self
+                    .clean
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+                members
+                    .iter()
+                    .map(|member| {
+                        clean.runtime.engine().plan_revive_page_operations(
+                            member.page_id,
+                            &member.predecessor_accepted_state.frontier,
+                            member.prior_present_intent_id,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            let plans = match plans {
+                Ok(plans) => plans,
+                Err(error) => {
+                    let reason =
+                        format!("cannot recompute current-to-predecessor restore diff: {error}");
+                    let _ = self
+                        .clean
+                        .as_mut()
+                        .expect("restore action retains its clean runtime")
+                        .sweeps
+                        .fail_restore(sweep_id, action_id, reason.clone());
+                    return Err(SyncRuntimeRequestError::ActorRefused(reason));
+                }
+            };
+            let watermark = plans.iter().try_fold(0_u64, |total, operations| {
+                total
+                    .checked_add(u64::try_from(operations.len()).map_err(|_| ())?)
+                    .ok_or(())
+            });
+            let watermark = match watermark {
+                Ok(watermark) => watermark,
+                Err(()) => {
+                    let reason = "restore operation watermark overflowed".to_owned();
+                    let _ = self
+                        .clean
+                        .as_mut()
+                        .expect("restore action retains its clean runtime")
+                        .sweeps
+                        .fail_restore(sweep_id, action_id, reason.clone());
+                    return Err(SyncRuntimeRequestError::ActorRefused(reason));
+                }
+            };
+            let nondecreasing_retries = match &cursor {
+                Some(previous) if watermark >= previous.remaining_operation_watermark => {
+                    previous.nondecreasing_retries.saturating_add(1)
+                }
+                Some(_) | None => 0,
+            };
+            if nondecreasing_retries > RESTORE_MAX_NONDECREASING_RETRIES {
+                let previous = cursor
+                    .as_ref()
+                    .map_or(watermark, |cursor| cursor.remaining_operation_watermark);
+                let reason = format!(
+                    "restore aborted after {RESTORE_MAX_NONDECREASING_RETRIES} retries because concurrent admission kept the operation watermark non-decreasing ({previous} -> {watermark})"
+                );
+                self.clean
+                    .as_mut()
+                    .expect("restore action retains its clean runtime")
+                    .sweeps
+                    .fail_restore(sweep_id, action_id, reason.clone())
+                    .map_err(|error| {
+                        SyncRuntimeRequestError::ActorRefused(format!(
+                            "{reason}; additionally could not append failed restore action: {error}"
+                        ))
+                    })?;
+                return Err(SyncRuntimeRequestError::ActorRefused(reason));
+            }
+            if watermark == 0 {
+                self.clean
+                    .as_mut()
+                    .expect("restore action retains its clean runtime")
+                    .sweeps
+                    .finish_restore(sweep_id, action_id)
+                    .map_err(|error| {
+                        SyncRuntimeRequestError::ActorRefused(format!(
+                            "restore reached whole-page equality but its completion record could not be appended: {error}"
+                        ))
+                    })?;
+                return Ok(SyncAbsenceSweepRestoreOutcome {
+                    sweep_id: sweep_id.to_string(),
+                    action_id: action_id.to_string(),
+                    authored_batch_ids: authored_batch_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    fidelity: restore_fidelity(
+                        self.clean
+                            .as_ref()
+                            .expect("restore action retains its clean runtime")
+                            .runtime
+                            .engine(),
+                        &self.receipts,
+                        &members,
+                    ),
+                });
+            }
+
+            let operations = plans
+                .iter()
+                .find(|operations| !operations.is_empty())
+                .expect("positive watermark has one nonempty page diff");
+            let chunk = restore_chunk(operations)
+                .map_err(|reason| SyncRuntimeRequestError::ActorRefused(reason))?;
+            let transaction = OperationTransaction::new(chunk).map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(format!(
+                    "cannot construct bounded restore chunk: {error}"
+                ))
+            })?;
+            let (batch_id, retained_phase) = match self.submit_local_mutation(transaction) {
+                SyncLocalMutationOutcome::Durable { batch_id } => (batch_id, None),
+                SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                    batch_id: Some(batch_id),
+                    phase,
+                } => (batch_id, Some(phase)),
+                outcome => {
+                    let reason =
+                        format!("restore chunk did not author an accepted batch: {outcome:?}");
+                    let _ = self
+                        .clean
+                        .as_mut()
+                        .expect("restore action retains its clean runtime")
+                        .sweeps
+                        .fail_restore(sweep_id, action_id, reason.clone());
+                    return Err(SyncRuntimeRequestError::ActorRefused(reason));
+                }
+            };
+            authored_batch_ids.push(batch_id);
+            let next_cursor = SweepRestoreCursor {
+                chunk_ordinal: cursor
+                    .as_ref()
+                    .map_or(1, |cursor| cursor.chunk_ordinal.saturating_add(1)),
+                remaining_operation_watermark: watermark,
+                nondecreasing_retries,
+            };
+            self.clean
+                .as_mut()
+                .expect("restore action retains its clean runtime")
+                .sweeps
+                .record_restore_progress(
+                    sweep_id,
+                    action_id,
+                    authored_batch_ids.clone(),
+                    next_cursor.clone(),
+                )
+                .map_err(|error| {
+                    SyncRuntimeRequestError::ActorRefused(format!(
+                        "restore chunk {batch_id} is accepted but its durable cursor could not be appended: {error}"
+                    ))
+                })?;
+            cursor = Some(next_cursor);
+            #[cfg(test)]
+            {
+                let workspace_id = self.binding.workspace_id();
+                if RESTORE_TEST_CUT_AFTER_PROGRESS
+                    .lock()
+                    .unwrap()
+                    .remove(&workspace_id)
+                {
+                    return Err(SyncRuntimeRequestError::ActorUnavailable);
+                }
+            }
+            if let Some(phase) = retained_phase {
+                let settlement = self
+                    .settle_clean_retained_publication(&batch_id.to_string(), phase)
+                    .map_err(|error| {
+                        SyncRuntimeRequestError::ActorRefused(format!(
+                            "restore chunk {batch_id} authored but its derived projection could not settle: {error}"
+                        ))
+                    })?;
+                if matches!(settlement, ApplicationPublicationSettlement::Deferred(_)) {
+                    let reason = format!(
+                        "restore chunk {batch_id} authored but its derived projection did not settle before the next chunk"
+                    );
+                    self.clean
+                        .as_mut()
+                        .expect("restore action retains its clean runtime")
+                        .sweeps
+                        .fail_restore(sweep_id, action_id, reason.clone())
+                        .map_err(|error| {
+                            SyncRuntimeRequestError::ActorRefused(format!(
+                                "{reason}; additionally could not append failed restore action: {error}"
+                            ))
+                        })?;
+                    return Err(SyncRuntimeRequestError::ActorRefused(reason));
+                }
+            }
+            #[cfg(test)]
+            {
+                let workspace_id = self.binding.workspace_id();
+                if let Some(interference) = take_restore_after_chunk_admission(workspace_id) {
+                    match self.submit_local_mutation(interference) {
+                        SyncLocalMutationOutcome::Durable { .. }
+                        | SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                            batch_id: Some(_),
+                            ..
+                        } => {}
+                        outcome => {
+                            panic!("armed restore interference was not admitted: {outcome:?}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn execute_local_transaction_with_batch_id(
         &mut self,
         transaction: OperationTransaction,
@@ -24085,6 +24525,7 @@ fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {
 mod tests {
     use super::*;
     use crate::model::Format;
+    use crate::oplog::absence_sweep::SweepActionState;
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
     use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
     use std::collections::BTreeMap;
@@ -29186,6 +29627,7 @@ mod tests {
         }
         run_receiver_absence_decision_oracle();
         run_absence_sweep_recovery_oracle();
+        run_restore_recovery_oracle();
     }
 
     /// The permanent real-store oracle owns the three receiver decisions as
@@ -29210,6 +29652,12 @@ mod tests {
         tier3_grace_holds_forced_publication_and_is_rederived_before_reopen_repair();
         startup_scan_absences_coalesce_into_one_sweep_across_a_mid_scan_crash();
         crate::oplog::absence_sweep::assert_torn_sweep_tail_recovers_for_oracle();
+    }
+
+    fn run_restore_recovery_oracle() {
+        restore_revives_the_same_page_projects_it_and_survives_a_second_reopen();
+        over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor();
+        post_restore_external_deletion_defers_through_frontier_maximal_present_evidence();
     }
 
     #[test]
@@ -30233,6 +30681,475 @@ mod tests {
         assert!(handle
             .dispose_absence_sweep_keep_deletion(&event.sweep_id)
             .is_ok());
+    }
+
+    #[test]
+    fn restore_revives_the_same_page_projects_it_and_survives_a_second_reopen() {
+        let fixture = ActivationFixture::nested_unicode("sweep-restore-reopen", 0xc5101);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("restore fixture activates");
+        drive_initial_feed(&handle);
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        let deletion_ticks = drain_until_settled(&handle);
+        assert!(admitted_an_epoch(&deletion_ticks), "{deletion_ticks:?}");
+        let event = handle
+            .absence_sweep_events()
+            .unwrap()
+            .into_iter()
+            .last()
+            .expect("the deletion forms a surfaced sweep");
+
+        let restored = handle.restore_absence_sweep(&event.sweep_id).unwrap();
+        assert!(!restored.authored_batch_ids.is_empty());
+        assert_eq!(
+            restored.fidelity[0].grade,
+            SyncAbsenceSweepRestoreFidelityGrade::SemanticallyIdentical,
+            "activation-imported content has no retained archive rendering"
+        );
+        let _restore_ticks = drain_until_settled(&handle);
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Root.md")).unwrap(),
+            b"title:: Root logical\n\n- exact CRLF bytes\n"
+        );
+        assert!(matches!(
+            handle
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::ExactPath {
+                        path: "Root.md".into(),
+                    },
+                })
+                .unwrap(),
+            SyncApplicationPageLoadOutcome::Loaded { .. }
+        ));
+        assert_eq!(
+            handle.restore_absence_sweep(&event.sweep_id).unwrap(),
+            restored,
+            "a completed whole-sweep Restore is idempotent"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        assert!(matches!(
+            reopened
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::ExactPath {
+                        path: "Root.md".into(),
+                    },
+                })
+                .unwrap(),
+            SyncApplicationPageLoadOutcome::Loaded { .. }
+        ));
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Root.md")).unwrap(),
+            b"title:: Root logical\n\n- exact CRLF bytes\n"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor() {
+        let fixture = ActivationFixture::nested_unicode("sweep-restore-chunks", 0xc5102);
+        let mut source = String::new();
+        for index in 0..1_100 {
+            source.push_str(&format!("- original block {index:04}\n"));
+        }
+        fs::write(fixture.graph_root.join("Root.md"), source.as_bytes()).unwrap();
+        let expected = source.into_bytes();
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("chunk fixture activates");
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let open_request = reopen_request(&fixture.request);
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("chunk fixture reopens");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        let root = ManagedPath::parse("Root.md".to_owned()).unwrap();
+        let page_id = actor
+            .clean
+            .as_ref()
+            .unwrap()
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&root, 2)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .page_id;
+        let page = actor
+            .clean
+            .as_ref()
+            .unwrap()
+            .runtime
+            .engine()
+            .materialize_page(page_id)
+            .unwrap();
+        assert_eq!(page.blocks.len(), 1_100);
+
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        actor
+            .observe(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        for _ in 0..64 {
+            let tick = actor.tick();
+            assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+            if !actor.clean.as_ref().unwrap().watcher_status().pending {
+                break;
+            }
+        }
+        let sweep_id = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].sweep_id;
+        assert!(
+            actor.publication_barrier_active(),
+            "the sweep hold must remain active while Restore authors chunks"
+        );
+
+        for (chunk_ordinal, blocks) in page.blocks.chunks(400).enumerate() {
+            let operations = blocks
+                .iter()
+                .map(|block| SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: block.block_id,
+                        home_document_id: block.home_document_id,
+                    },
+                    content: format!("changed before restore {chunk_ordinal}"),
+                })
+                .collect();
+            assert!(matches!(
+                actor.submit_local_mutation(OperationTransaction::new(operations).unwrap()),
+                SyncLocalMutationOutcome::Durable { .. }
+                    | SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: Some(_),
+                        ..
+                    }
+            ));
+        }
+
+        admit_after_restore_chunks_for_test(
+            fixture.request.identities.workspace_id,
+            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: page.blocks[0].block_id,
+                    home_document_id: page.blocks[0].home_document_id,
+                },
+                content: "concurrent admission after the first restore chunk".into(),
+            }])
+            .unwrap(),
+            Some(1),
+        );
+        fail_once_after_restore_progress(fixture.request.identities.workspace_id);
+        assert_eq!(
+            actor.restore_absence_sweep(sweep_id),
+            Err(SyncRuntimeRequestError::ActorUnavailable)
+        );
+        assert!(
+            actor.publication_barrier_active(),
+            "a crash cut between chunks must not release the sweep hold"
+        );
+        let interrupted = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].clone();
+        assert!(interrupted.actions.iter().any(|action| matches!(
+            action.state,
+            SweepActionState::Progress {
+                restore_cursor: Some(SweepRestoreCursor {
+                    chunk_ordinal: 1,
+                    remaining_operation_watermark,
+                    ..
+                }),
+                ..
+            } if remaining_operation_watermark > RESTORE_CHUNK_OPERATION_LIMIT as u64
+        )));
+        drop(actor);
+
+        let open_request = reopen_request(&fixture.request);
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("interrupted restore reopens");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let resumed = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .expect("startup resumes the durable restore cursor");
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Root.md")).unwrap(),
+            expected
+        );
+        let completed = resumed.clean.as_ref().unwrap().sweeps.records_for_test()[0].clone();
+        assert!(completed.disposed_at_unix_ms.is_some());
+        assert!(
+            !resumed.publication_barrier_active(),
+            "Restore completion must dispose the sweep and release its hold"
+        );
+        assert!(completed
+            .actions
+            .iter()
+            .any(|action| matches!(action.state, SweepActionState::Completed)));
+        assert!(completed.actions.iter().any(|action| matches!(
+            action.state,
+            SweepActionState::Progress {
+                restore_cursor: Some(SweepRestoreCursor {
+                    chunk_ordinal,
+                    ..
+                }),
+                ..
+            } if chunk_ordinal >= 2
+        )));
+    }
+
+    #[test]
+    fn restore_surfaces_failed_action_after_three_nondecreasing_interference_retries() {
+        let fixture = ActivationFixture::nested_unicode("sweep-restore-abort", 0xc5103);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("abort fixture activates");
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let open_request = reopen_request(&fixture.request);
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("abort fixture reopens");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        let root = ManagedPath::parse("Root.md".to_owned()).unwrap();
+        let page_id = actor
+            .clean
+            .as_ref()
+            .unwrap()
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&root, 2)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .page_id;
+        let block = actor
+            .clean
+            .as_ref()
+            .unwrap()
+            .runtime
+            .engine()
+            .materialize_page(page_id)
+            .unwrap()
+            .blocks[0]
+            .clone();
+
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        actor
+            .observe(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        for _ in 0..64 {
+            let tick = actor.tick();
+            assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+            if !actor.clean.as_ref().unwrap().watcher_status().pending {
+                break;
+            }
+        }
+        let sweep_id = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].sweep_id;
+        admit_after_restore_chunks_for_test(
+            fixture.request.identities.workspace_id,
+            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: block.block_id,
+                    home_document_id: block.home_document_id,
+                },
+                content: "interference keeps regrowing the restore diff".into(),
+            }])
+            .unwrap(),
+            None,
+        );
+        let failure = actor.restore_absence_sweep(sweep_id).unwrap_err();
+        clear_restore_after_chunk_admission(fixture.request.identities.workspace_id);
+        assert!(
+            failure
+                .to_string()
+                .contains("aborted after 3 retries because concurrent admission kept the operation watermark non-decreasing"),
+            "{failure}"
+        );
+        let record = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].clone();
+        assert!(record.disposed_at_unix_ms.is_none());
+        assert!(record.actions.iter().any(|action| matches!(
+            &action.state,
+            SweepActionState::Failed { reason }
+                if reason.contains("aborted after 3 retries")
+        )));
+        assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+            .unwrap()
+            .contains("interference keeps regrowing"));
+    }
+
+    #[test]
+    fn restore_kitchen_sink_corpus_preserves_every_construct_byte_for_byte() {
+        let fixture = ActivationFixture::nested_unicode("sweep-restore-kitchen-sink", 0xc5104);
+        let relative = "notes/Kitchen Sink.md";
+        let source = include_bytes!("../../../src/fixtures/kitchen-sink.md");
+        fs::write(fixture.graph_root.join(relative), source).unwrap();
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("construct corpus activates");
+        drive_initial_feed(&handle);
+
+        fs::remove_file(fixture.graph_root.join(relative)).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(relative).unwrap()])
+            .unwrap();
+        let deletion_ticks = drain_until_settled(&handle);
+        assert!(admitted_an_epoch(&deletion_ticks), "{deletion_ticks:?}");
+        let event = handle
+            .absence_sweep_events()
+            .unwrap()
+            .into_iter()
+            .last()
+            .expect("construct corpus deletion forms a sweep");
+        let outcome = handle.restore_absence_sweep(&event.sweep_id).unwrap();
+        assert_eq!(outcome.fidelity.len(), 1);
+        assert_eq!(
+            fs::read(fixture.graph_root.join(relative)).unwrap(),
+            source,
+            "the labeled all-construct corpus must survive revival byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn restore_uses_retained_projection_rendering_and_reports_byte_identical_fidelity() {
+        let fixture = ActivationFixture::nested_unicode("sweep-restore-exact", 0xc5106);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("exact fidelity fixture activates");
+        drive_initial_feed(&handle);
+        let (mut page, revision) =
+            load_application_logical(&handle, "Root logical", SyncPageKind::Page);
+        page.blocks[0].raw = "saved CRLF layout evidence before restore".into();
+        let path = page.path.clone();
+        accepted_application_save(
+            &handle,
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing { path, revision },
+                    page,
+                })
+                .unwrap(),
+            "Root logical",
+            SyncPageKind::Page,
+        );
+        drain_managed_local(&handle);
+        let expected = fs::read(fixture.graph_root.join("Root.md")).unwrap();
+
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(admitted_an_epoch(&ticks), "{ticks:?}");
+        let event = handle
+            .absence_sweep_events()
+            .unwrap()
+            .into_iter()
+            .last()
+            .unwrap();
+        let outcome = handle.restore_absence_sweep(&event.sweep_id).unwrap();
+        assert_eq!(
+            outcome.fidelity[0].grade,
+            SyncAbsenceSweepRestoreFidelityGrade::ByteIdentical
+        );
+        let _restore_ticks = drain_until_settled(&handle);
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Root.md")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn post_restore_external_deletion_defers_through_frontier_maximal_present_evidence() {
+        let fixture = ActivationFixture::nested_unicode("sweep-post-restore-defer", 0xc5105);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("post-restore fixture activates");
+        drive_initial_feed(&handle);
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        let first_delete = drain_until_settled(&handle);
+        assert!(admitted_an_epoch(&first_delete), "{first_delete:?}");
+        let first_event = handle
+            .absence_sweep_events()
+            .unwrap()
+            .into_iter()
+            .last()
+            .unwrap();
+        handle.restore_absence_sweep(&first_event.sweep_id).unwrap();
+        assert!(fixture.graph_root.join("Root.md").exists());
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        let second_delete = drain_until_settled(&reopened);
+        assert!(
+            !second_delete
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::AdmittedComplete { .. })),
+            "frontier-maximal restored Present evidence must defer the closed-window external absence: {second_delete:?}"
+        );
+        assert!(!fixture.graph_root.join("Root.md").exists());
+        let coalescer_ticks = drain_until_settled(&reopened);
+        assert!(
+            coalescer_ticks
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::Recovering)),
+            "the deferred absence must reach the sweep coalescer on the following actor turn: {coalescer_ticks:?}"
+        );
+        let events = reopened.absence_sweep_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.sweep_id != first_event.sweep_id));
     }
 
     #[test]
@@ -44078,6 +44995,132 @@ mod tests {
             .unwrap();
         assert!(!actor.publication_barrier_active());
         eprintln!("corpus_sweep barrier_released_at_close=true");
+    }
+
+    /// Packet C-5a's real-corpus Restore scale gate. The supplied graph is
+    /// copied before activation; deletion, revival batches, projections, and
+    /// sweep records are confined to the disposable fixture. Assertions use
+    /// semantic digests so private corpus text is never emitted by the gate.
+    #[test]
+    #[ignore = "manual gate: whole-sweep Restore on an anonymized corpus copy"]
+    fn managed_absence_restore_probe() {
+        let source = real_graph_copy_source_from_env("TINE_MS_AUDIT_GRAPH_COPY");
+        let fixture = ActivationFixture::copied_graph("c5a-restore-probe", 0xc5a0, &source);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("the restore corpus copy activates");
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("restore corpus inventory did not load: {other:?}"),
+        };
+        let page_count = pages.len();
+        let removal_count = page_count
+            .saturating_mul(3)
+            .saturating_add(9)
+            .checked_div(10)
+            .expect("the fixed percentage divisor is nonzero");
+        let mut candidates = pages
+            .iter()
+            .filter(|page| page.rel_path.ends_with(".md") || page.rel_path.ends_with(".org"))
+            .filter_map(|page| {
+                fs::metadata(fixture.graph_root.join(&page.rel_path))
+                    .ok()
+                    .is_some_and(|metadata| metadata.is_file())
+                    .then_some(page.rel_path.clone())
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        assert!(
+            candidates.len() >= removal_count,
+            "the corpus copy has fewer writable text files than its 30% restore sample requires"
+        );
+
+        let mut selected = Vec::new();
+        for path in candidates {
+            let (mut page, _) = load_application_exact(&handle, &path);
+            if page.read_only {
+                continue;
+            }
+            let bytes = fs::read(fixture.graph_root.join(&path)).unwrap();
+            page.rev = None;
+            page.activation = None;
+            let semantic_digest = ContentDigest::of(&serde_json::to_vec(&page).unwrap());
+            selected.push((path, bytes, semantic_digest));
+            if selected.len() == removal_count {
+                break;
+            }
+        }
+        assert_eq!(
+            selected.len(),
+            removal_count,
+            "the corpus copy must supply the full 30% writable-page sample"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        for (path, _, _) in &selected {
+            fs::remove_file(fixture.graph_root.join(path)).unwrap();
+        }
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+        let event = handle
+            .absence_sweep_events()
+            .unwrap()
+            .into_iter()
+            .last()
+            .expect("the closed-window corpus deletions surface one sweep");
+        assert_eq!(event.tier, SyncAbsenceSweepTier::Tier3);
+        assert_eq!(event.absence_count, selected.len());
+        assert_eq!(event.pages_at_open, page_count);
+        assert!(
+            handle
+                .prepare_shared()
+                .unwrap_err()
+                .to_string()
+                .contains("external deletions awaiting disposition"),
+            "the tier-3 restore window must retain the publication barrier"
+        );
+        let restored = handle.restore_absence_sweep(&event.sweep_id).unwrap();
+        assert_eq!(restored.fidelity.len(), selected.len());
+        drain_managed_local(&handle);
+
+        let byte_identical = restored
+            .fidelity
+            .iter()
+            .filter(|entry| entry.grade == SyncAbsenceSweepRestoreFidelityGrade::ByteIdentical)
+            .count();
+        let semantically_identical = restored.fidelity.len() - byte_identical;
+        for (path, expected_bytes, expected_digest) in &selected {
+            let (mut page, _) = load_application_exact(&handle, path);
+            page.rev = None;
+            page.activation = None;
+            let actual_digest = ContentDigest::of(&serde_json::to_vec(&page).unwrap());
+            assert_eq!(
+                actual_digest, *expected_digest,
+                "a restored corpus page differs semantically"
+            );
+            if restored.fidelity.iter().any(|entry| {
+                entry.path == *path
+                    && entry.grade == SyncAbsenceSweepRestoreFidelityGrade::ByteIdentical
+            }) {
+                assert_eq!(
+                    fs::read(fixture.graph_root.join(path)).unwrap(),
+                    *expected_bytes,
+                    "a byte-identical corpus restore changed accepted layout"
+                );
+            }
+        }
+        eprintln!(
+            "corpus_restore pages_at_open={} removed={} authored_batches={} byte_identical={} semantically_identical={} semantic_digest_match=true",
+            page_count,
+            selected.len(),
+            restored.authored_batch_ids.len(),
+            byte_identical,
+            semantically_identical
+        );
     }
 
     /// Measured C-2 freshness gate. The fixture copies the supplied corpus

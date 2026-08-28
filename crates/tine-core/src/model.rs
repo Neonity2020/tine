@@ -18071,7 +18071,11 @@ impl Graph {
         let mut target_doc = parse_doc(&target_path.absolute_path, target_text);
         bind_guarded_projection_identities(&mut target_doc, guarded_layout.target())
             .map_err(|error| projection_semantic_refusal(error.kind(), error.to_string()))?;
-        let serialization_base = current_text.or(expected_base_text);
+        let serialization_base = current_text.or(expected_base_text).or_else(|| {
+            guarded_layout
+                .uses_revive_page_self_base()
+                .then_some(target_text)
+        });
         let (_, guarded_target) = self.serialize_page_document(
             target_doc,
             &target_path.absolute_path,
@@ -19460,10 +19464,15 @@ impl Graph {
         let mut target_doc = parse_doc(&target_path.absolute_path, expected_target_text);
         bind_guarded_projection_identities(&mut target_doc, guarded_layout.target())
             .map_err(|error| projection_semantic_refusal(error.kind(), error.to_string()))?;
+        let serialization_base = expected_base_text.or_else(|| {
+            guarded_layout
+                .uses_revive_page_self_base()
+                .then_some(expected_target_text)
+        });
         let (_, guarded_target) = self.serialize_page_document(
             target_doc,
             &target_path.absolute_path,
-            expected_base_text,
+            serialization_base,
             guarded_layout.base(),
         )?;
         if guarded_target.as_bytes() != expected_target {

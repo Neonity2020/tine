@@ -1848,6 +1848,17 @@ pub enum SemanticOperation {
     DeletePage {
         page_id: PageId,
     },
+    /// Restore one tombstoned catalog identity in place. The predecessor
+    /// frontier is authenticated archive authority for the target snapshot;
+    /// the intent id is best-effort layout provenance only.
+    RevivePage {
+        page_id: PageId,
+        name: LogicalPageName,
+        path: ManagedPath,
+        kind: ManagedTextKind,
+        predecessor_frontier: FrontierV2,
+        prior_present_intent_id: Option<ProjectionIntentId>,
+    },
     RenamePagesAndRewriteReferrers {
         page_changes: Vec<PageRename>,
         block_rewrites: Vec<BlockContentRewrite>,
@@ -3782,6 +3793,28 @@ struct DraftProjectionPage {
     post_frontier: FrontierV2,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DraftRevivalRenderEvidence {
+    bytes: Vec<u8>,
+    annotations: Vec<AnnotatedIdentity>,
+    frontier: FrontierV2,
+    claim_evidence: Vec<ProjectionClaimEvidence>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ResolvedRevivalRenderEvidence {
+    page_id: PageId,
+    path: ManagedPath,
+    render: DraftRevivalRenderEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DraftRevivalIntentReference {
+    intent_id: ProjectionIntentId,
+    path: ManagedPath,
+    frontier: FrontierV2,
+}
+
 /// What one differential draft proof observed, so a caller can also pin which
 /// derivation copied the whole-graph catalog and which refused.
 #[cfg(test)]
@@ -3808,6 +3841,8 @@ pub struct AuthorTransactionDraft {
     prospective_documents: BTreeMap<DocumentId, LoroDoc>,
     requirements: Vec<ProjectionRequirement>,
     pages: BTreeMap<PageId, DraftProjectionPage>,
+    revival_intent_references: BTreeMap<PageId, DraftRevivalIntentReference>,
+    revival_render_evidence: BTreeMap<PageId, DraftRevivalRenderEvidence>,
     external_observation: Option<ExternalImportObservationMaterial>,
     /// Process-local editor work.  This remains affine and never crosses a
     /// draft/capture/finalize failure, journal, overlay, or recovery boundary.
@@ -9960,10 +9995,23 @@ impl ShardedHotEngine {
         page_id: PageId,
         path: &ManagedPath,
     ) -> AbsenceDecision {
+        let decision = self
+            .absence_decision_map
+            .borrow()
+            .as_ref()
+            .map_or(AbsenceDecision::Create, |map| map.decision(page_id, path));
+        decision
+    }
+
+    pub(crate) fn restored_generation_requires_absence_deferral(
+        &self,
+        page_id: PageId,
+        path: &ManagedPath,
+    ) -> bool {
         self.absence_decision_map
             .borrow()
             .as_ref()
-            .map_or(AbsenceDecision::Create, |map| map.decision(page_id, path))
+            .is_some_and(|map| map.restored_generation_requires_deferral(page_id, path))
     }
 
     pub(crate) fn note_deferred_absence_observation(&self, page_id: PageId, path: &ManagedPath) {
@@ -15617,19 +15665,29 @@ impl ShardedHotEngine {
                 frontier: projection.intent.post_frontier().clone(),
                 claim_evidence: projection.intent.claim_evidence().to_vec(),
             };
+            let revival_target_layout = record.semantic_effect.pages().iter().any(|delta| {
+                delta.page_id == projection.intent.page_id()
+                    && delta.lifecycle == super::PageDeltaLifecycle::RevivePage
+            });
+            let target_layout = match projection.intent.target() {
+                ManifestProjectionTarget::Present {
+                    bytes, annotations, ..
+                } if revival_target_layout => Some((bytes.as_slice(), annotations.as_slice())),
+                ManifestProjectionTarget::Absent | ManifestProjectionTarget::Present { .. } => None,
+            };
+            let retained_layout = projection
+                .render_base
+                .as_ref()
+                .or(projection.precondition_base.as_ref());
             let planned = super::projection::plan_projection_with_layout_annotations(
                 self.workspace_id,
                 &state,
-                projection
-                    .render_base
-                    .as_ref()
-                    .or(projection.precondition_base.as_ref())
-                    .map(AnnotatedProjectionBase::bytes),
-                projection
-                    .render_base
-                    .as_ref()
-                    .or(projection.precondition_base.as_ref())
-                    .map(AnnotatedProjectionBase::annotations),
+                retained_layout
+                    .map(AnnotatedProjectionBase::bytes)
+                    .or_else(|| target_layout.map(|(bytes, _)| bytes)),
+                retained_layout
+                    .map(AnnotatedProjectionBase::annotations)
+                    .or_else(|| target_layout.map(|(_, annotations)| annotations)),
             )
             .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
             let (target_bytes, target_annotations) = match projection.intent.target() {
@@ -16245,8 +16303,16 @@ impl ShardedHotEngine {
     }
 
     fn current_hot_page_state(&self, page_id: PageId) -> Result<PageState, EngineError> {
+        let state = self.current_hot_catalog_page_state(page_id)?;
+        match state {
+            PageState::Live { .. } => Ok(state),
+            PageState::Tombstone { .. } => Err(EngineError::PageDeleted(page_id)),
+        }
+    }
+
+    fn current_hot_catalog_page_state(&self, page_id: PageId) -> Result<PageState, EngineError> {
         if let Some(catalog) = self.local_overlay.documents.get(&self.catalog_document_id) {
-            return require_live_page(catalog, page_id);
+            return read_page_state(catalog, page_id)?.ok_or(EngineError::PageNotFound(page_id));
         }
         if self.scratch.is_some() {
             if let Some(row) = self.authenticated_current_page_catalog_row(page_id)? {
@@ -16264,7 +16330,7 @@ impl ShardedHotEngine {
         let catalog = self
             .current_catalog_document()?
             .ok_or(EngineError::PageNotFound(page_id))?;
-        require_live_page(catalog, page_id)
+        read_page_state(&catalog, page_id)?.ok_or(EngineError::PageNotFound(page_id))
     }
 
     /// Draft one transaction twice — once with the in-place prospective
@@ -16334,6 +16400,14 @@ impl ShardedHotEngine {
                 assert_eq!(oracle.semantic_effect, optimized.semantic_effect);
                 assert_eq!(oracle.portable_path_root, optimized.portable_path_root);
                 assert_eq!(oracle.requirements, optimized.requirements);
+                assert_eq!(
+                    oracle.revival_intent_references,
+                    optimized.revival_intent_references
+                );
+                assert_eq!(
+                    oracle.revival_render_evidence,
+                    optimized.revival_render_evidence
+                );
                 assert_eq!(
                     oracle.prospective_documents.keys().collect::<Vec<_>>(),
                     optimized.prospective_documents.keys().collect::<Vec<_>>()
@@ -16461,6 +16535,43 @@ impl ShardedHotEngine {
         }
         let generation = self.history_generation;
         let mutation_token = self.author_mutation_generation();
+        let mut revival_intent_references = BTreeMap::new();
+        let mut revival_render_evidence = BTreeMap::new();
+        for operation in &transaction.operations {
+            let SemanticOperation::RevivePage {
+                page_id,
+                path,
+                predecessor_frontier,
+                prior_present_intent_id: Some(intent_id),
+                ..
+            } = operation
+            else {
+                continue;
+            };
+            revival_intent_references.insert(
+                *page_id,
+                DraftRevivalIntentReference {
+                    intent_id: *intent_id,
+                    path: path.clone(),
+                    frontier: predecessor_frontier.clone(),
+                },
+            );
+            let Some(evidence) =
+                self.revival_render_evidence(*intent_id, *page_id, path, predecessor_frontier)?
+            else {
+                continue;
+            };
+            if evidence.page_id != *page_id
+                || evidence.path != *path
+                || evidence.render.frontier != *predecessor_frontier
+            {
+                return Err(EngineError::ProjectionManifest(
+                    "RevivePage prior-Present intent does not bind its predecessor page, path, and frontier"
+                        .into(),
+                ));
+            }
+            revival_render_evidence.insert(*page_id, evidence.render);
+        }
         let parts = self.prepare_transaction_core(
             author,
             origin,
@@ -16599,6 +16710,8 @@ impl ShardedHotEngine {
             prospective_documents: parts.prospective_documents,
             requirements,
             pages,
+            revival_intent_references,
+            revival_render_evidence,
             external_observation: parts.external_observation,
             prepared_editor_projection,
         })
@@ -17481,6 +17594,42 @@ impl ShardedHotEngine {
                 "draft capture is not bound to the enrolled projection runtime".into(),
             ));
         }
+        for (page_id, reference) in &draft.revival_intent_references {
+            if draft.revival_render_evidence.contains_key(page_id) {
+                continue;
+            }
+            let Some(intent) = receipts
+                .load_intent(reference.intent_id)
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+            else {
+                continue;
+            };
+            if intent.page_id() != *page_id
+                || intent.path() != &reference.path
+                || intent.frontier() != &reference.frontier
+                || intent.target_kind() != ProjectionTargetKind::Present
+            {
+                return Err(EngineError::ProjectionManifest(
+                    "RevivePage prior-Present receipt does not bind its predecessor page, path, frontier, and target kind"
+                        .into(),
+                ));
+            }
+            let Some(base) = receipts
+                .load_retained_base(intent.target())
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+            else {
+                continue;
+            };
+            draft.revival_render_evidence.insert(
+                *page_id,
+                DraftRevivalRenderEvidence {
+                    bytes: base.bytes().to_vec(),
+                    annotations: intent.annotations().to_vec(),
+                    frontier: reference.frontier.clone(),
+                    claim_evidence: intent.claim_evidence().to_vec(),
+                },
+            );
+        }
         let graph_resource_id = graph
             .canonical_resource_id()
             .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -18124,6 +18273,7 @@ impl ShardedHotEngine {
                     }
                 })
                 .transpose()?;
+            let revival_render_layout = draft.revival_render_evidence.get(&requirement.page_id);
             let render_base =
                 move_render_layout.and_then(MoveProjectionRenderLayout::manifest_render_base);
             let target = match requirement.target {
@@ -18137,6 +18287,14 @@ impl ShardedHotEngine {
                     let (render_bytes, render_annotations) = move_render_layout
                         .map(MoveProjectionRenderLayout::base)
                         .map(|base| (Some(base.bytes()), Some(base.annotations())))
+                        .or_else(|| {
+                            revival_render_layout.map(|evidence| {
+                                (
+                                    Some(evidence.bytes.as_slice()),
+                                    Some(evidence.annotations.as_slice()),
+                                )
+                            })
+                        })
                         .unwrap_or_else(|| match &inputs[&requirement.path] {
                             CapabilityCapturedProjectionMaterial::Present {
                                 bytes,
@@ -18484,7 +18642,22 @@ impl ShardedHotEngine {
         });
         #[cfg(test)]
         let effect_derive_started = Instant::now();
-        let effect = derive_effect_from_snapshots(&before_snapshots, &after_snapshots)?;
+        let revival_pages: BTreeSet<PageId> = transaction
+            .operations
+            .iter()
+            .filter_map(|operation| {
+                if let SemanticOperation::RevivePage { page_id, .. } = operation {
+                    Some(*page_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let effect = derive_effect_from_snapshots_for_revivals(
+            &before_snapshots,
+            &after_snapshots,
+            &revival_pages,
+        )?;
         let effect_bytes = effect.encode()?;
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
@@ -19799,11 +19972,19 @@ impl ShardedHotEngine {
                         frontier: intent.post_frontier().clone(),
                         claim_evidence: expected_evidence,
                     };
+                    let revival_target_layout = effect.pages().iter().any(|delta| {
+                        delta.page_id == intent.page_id()
+                            && delta.lifecycle == super::PageDeltaLifecycle::RevivePage
+                    });
                     let plan = super::projection::plan_projection_with_layout_annotations(
                         self.workspace_id,
                         &state,
-                        render_base.map(AnnotatedProjectionBase::bytes),
-                        render_base.map(AnnotatedProjectionBase::annotations),
+                        render_base
+                            .map(AnnotatedProjectionBase::bytes)
+                            .or_else(|| revival_target_layout.then_some(bytes.as_slice())),
+                        render_base
+                            .map(AnnotatedProjectionBase::annotations)
+                            .or_else(|| revival_target_layout.then_some(annotations.as_slice())),
                     )
                     .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
                     if plan.target() != bytes || plan.intent().annotations() != annotations {
@@ -20604,6 +20785,347 @@ impl ShardedHotEngine {
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {
         self.materialize_page_inner(page_id, false, None)
             .map(|(page, _, _)| page)
+    }
+
+    fn revival_render_evidence(
+        &self,
+        sought_intent_id: ProjectionIntentId,
+        sought_page_id: PageId,
+        sought_path: &ManagedPath,
+        sought_frontier: &FrontierV2,
+    ) -> Result<Option<ResolvedRevivalRenderEvidence>, EngineError> {
+        let mut found = None;
+        let mut frontier_match = None;
+        let mut frontier_match_ambiguous = false;
+        for batch in self.archive.values() {
+            let projection = super::projection_manifest::validate_projection_object_set(
+                batch.manifest(),
+                batch.objects(),
+            )
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+            for intent in projection.intents() {
+                let ManifestProjectionTarget::Present {
+                    description,
+                    bytes,
+                    annotations,
+                } = intent.target()
+                else {
+                    continue;
+                };
+                let precondition = match intent.precondition() {
+                    ManifestProjectionPrecondition::Absent => ProjectionPrecondition::Absent,
+                    ManifestProjectionPrecondition::Present { base } => {
+                        let base =
+                            projection.bases().get(&base.document_id()).ok_or_else(|| {
+                                EngineError::ProjectionManifest(
+                                    "manifested projection precondition base is absent".into(),
+                                )
+                            })?;
+                        ProjectionPrecondition::Base(base.description())
+                    }
+                };
+                let receipt_intent = ProjectionIntent::new(
+                    intent.workspace_id(),
+                    intent.page_id(),
+                    intent.path().clone(),
+                    intent.post_frontier().clone(),
+                    intent.claim_evidence().to_vec(),
+                    precondition,
+                    ProjectionTargetKind::Present,
+                    *description,
+                    annotations.clone(),
+                )
+                .map_err(EngineError::from)?;
+                let candidate = ResolvedRevivalRenderEvidence {
+                    page_id: intent.page_id(),
+                    path: intent.path().clone(),
+                    render: DraftRevivalRenderEvidence {
+                        bytes: bytes.clone(),
+                        annotations: annotations.clone(),
+                        frontier: intent.post_frontier().clone(),
+                        claim_evidence: intent.claim_evidence().to_vec(),
+                    },
+                };
+                if candidate.page_id == sought_page_id
+                    && candidate.path == *sought_path
+                    && candidate.render.frontier == *sought_frontier
+                {
+                    if frontier_match
+                        .as_ref()
+                        .is_some_and(|prior| prior != &candidate)
+                    {
+                        frontier_match_ambiguous = true;
+                    } else {
+                        frontier_match = Some(candidate.clone());
+                    }
+                }
+                if receipt_intent.id().map_err(EngineError::from)? != sought_intent_id {
+                    continue;
+                }
+                if found.as_ref().is_some_and(|prior| prior != &candidate) {
+                    return Err(EngineError::ProjectionManifest(
+                        "prior-Present projection intent id resolves to conflicting archive evidence"
+                            .into(),
+                    ));
+                }
+                found = Some(candidate);
+            }
+        }
+        Ok(found.or_else(|| {
+            (!frontier_match_ambiguous)
+                .then_some(frontier_match)
+                .flatten()
+        }))
+    }
+
+    pub(crate) fn has_revival_render_evidence(
+        &self,
+        intent_id: ProjectionIntentId,
+        page_id: PageId,
+        path: &ManagedPath,
+        frontier: &FrontierV2,
+    ) -> Result<bool, EngineError> {
+        self.revival_render_evidence(intent_id, page_id, path, frontier)
+            .map(|evidence| evidence.is_some())
+    }
+
+    /// Reconstruct one page from an authenticated projection frontier. Sweep
+    /// Restore uses this as its payload source; an intent reference may supply
+    /// layout evidence, but never substitutes for these accepted semantic
+    /// documents.
+    pub(crate) fn materialize_page_at_projection_frontier(
+        &self,
+        page_id: PageId,
+        frontier: &FrontierV2,
+    ) -> Result<MaterializedPage, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        let documents = self.reconstruct_projection_frontier(frontier)?;
+        self.materialize_page_from_documents(page_id, &documents)
+    }
+
+    /// Recompute the complete semantic operation diff from the current shard
+    /// state to one immutable accepted predecessor snapshot. The caller may
+    /// take a bounded prefix, commit it, and call again; no returned operation
+    /// is plan authority across a batch boundary.
+    pub(crate) fn plan_revive_page_operations(
+        &self,
+        page_id: PageId,
+        predecessor_frontier: &FrontierV2,
+        prior_present_intent_id: Option<ProjectionIntentId>,
+    ) -> Result<Vec<SemanticOperation>, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        let target = self.materialize_page_at_projection_frontier(page_id, predecessor_frontier)?;
+        let current_state = self.current_hot_catalog_page_state(page_id)?;
+        if current_state.home_document_id() != target.home_document_id {
+            return Err(EngineError::InvalidTransaction(format!(
+                "RevivePage cannot change immutable home shard for {page_id}"
+            )));
+        }
+
+        let page_document = self.clone_current_hot_document(target.home_document_id, 1)?;
+        validate_shard(
+            self.catalog_document_id,
+            target.home_document_id,
+            &page_document,
+        )?;
+        if shard_page_id(&page_document)? != Some(page_id) {
+            return Err(EngineError::MalformedDocument {
+                document_id: target.home_document_id,
+                reason: "revival membership shard page identity mismatch".into(),
+            });
+        }
+        let current_memberships = read_memberships(target.home_document_id, &page_document)?;
+        let mut documents = BTreeMap::from([(target.home_document_id, page_document)]);
+        let mut home_ids = current_memberships
+            .values()
+            .map(|claim| claim.home_document_id)
+            .collect::<BTreeSet<_>>();
+        home_ids.extend(target.blocks.iter().map(|block| block.home_document_id));
+        for home_document_id in home_ids {
+            if documents.contains_key(&home_document_id) {
+                continue;
+            }
+            documents.insert(
+                home_document_id,
+                self.clone_current_hot_document(home_document_id, 1)?,
+            );
+        }
+
+        let current_live_state = match &current_state {
+            PageState::Live { .. } => current_state.clone(),
+            PageState::Tombstone {
+                name,
+                home_document_id,
+                kind,
+            } => PageState::Live {
+                name: name.clone(),
+                path: target.path.clone(),
+                home_document_id: *home_document_id,
+                kind: *kind,
+            },
+        };
+        let current = self.materialize_page_from_state(
+            page_id,
+            current_live_state,
+            |document_id| documents.get(&document_id),
+            0,
+        )?;
+
+        let mut operations = Vec::new();
+        match &current_state {
+            PageState::Tombstone { .. } => operations.push(SemanticOperation::RevivePage {
+                page_id,
+                name: target.name.clone(),
+                path: target.path.clone(),
+                kind: target.kind,
+                predecessor_frontier: predecessor_frontier.clone(),
+                prior_present_intent_id,
+            }),
+            PageState::Live {
+                name,
+                path,
+                kind,
+                home_document_id: _,
+            } => {
+                if name != &target.name || path != &target.path {
+                    operations.push(SemanticOperation::RenamePagesAndRewriteReferrers {
+                        page_changes: vec![PageRename {
+                            page_id,
+                            new_name: target.name.clone(),
+                            new_path: target.path.clone(),
+                        }],
+                        block_rewrites: Vec::new(),
+                        page_preamble_rewrites: Vec::new(),
+                    });
+                }
+                if *kind != target.kind {
+                    operations.push(SemanticOperation::SetPageKind {
+                        page_id,
+                        kind: target.kind,
+                    });
+                }
+            }
+        }
+
+        let target_by_id = target
+            .blocks
+            .iter()
+            .map(|block| (block.block_id, block))
+            .collect::<BTreeMap<_, _>>();
+        let current_by_id = current
+            .blocks
+            .iter()
+            .map(|block| (block.block_id, block))
+            .collect::<BTreeMap<_, _>>();
+        let extra = current_by_id
+            .keys()
+            .filter(|block_id| !target_by_id.contains_key(block_id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for block_id in &extra {
+            let parent = current_by_id[block_id].parent;
+            if parent.is_none_or(|parent| !extra.contains(&parent)) {
+                operations.push(SemanticOperation::DeleteSubtree {
+                    root_block_id: *block_id,
+                    page_id,
+                });
+            }
+        }
+
+        let target_depth = |block_id: BlockId| {
+            let mut depth = 0_usize;
+            let mut cursor = Some(block_id);
+            let mut visited = BTreeSet::new();
+            while let Some(id) = cursor {
+                if !visited.insert(id) {
+                    return usize::MAX;
+                }
+                let Some(block) = target_by_id.get(&id) else {
+                    return depth;
+                };
+                depth = depth.saturating_add(1);
+                cursor = block.parent;
+            }
+            depth
+        };
+        let mut target_blocks = target.blocks.iter().collect::<Vec<_>>();
+        target_blocks.sort_unstable_by_key(|block| (target_depth(block.block_id), block.block_id));
+        for block in &target_blocks {
+            let home = documents
+                .get(&block.home_document_id)
+                .ok_or(EngineError::MissingDocument(block.home_document_id))?;
+            let raw = read_block_state(block.home_document_id, home, block.block_id)?
+                .ok_or(EngineError::BlockNotFound(block.block_id))?;
+            let desired_claim =
+                MembershipClaim::new(block.home_document_id, block.parent, block.order.clone())?;
+            if raw.owner != BlockOwner::Page(page_id)
+                || current_memberships.get(&block.block_id) != Some(&desired_claim)
+            {
+                operations.push(SemanticOperation::RestoreSubtree {
+                    page_id,
+                    blocks: vec![BlockRestore {
+                        block: BlockLocation {
+                            block_id: block.block_id,
+                            home_document_id: block.home_document_id,
+                        },
+                        claim: desired_claim,
+                    }],
+                });
+            }
+        }
+        for block in &target_blocks {
+            let home = documents
+                .get(&block.home_document_id)
+                .ok_or(EngineError::MissingDocument(block.home_document_id))?;
+            let raw = read_block_state(block.home_document_id, home, block.block_id)?
+                .ok_or(EngineError::BlockNotFound(block.block_id))?;
+            let location = BlockLocation {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+            };
+            if raw.content != block.content {
+                operations.push(SemanticOperation::EditBlockContent {
+                    block: location,
+                    content: block.content.clone(),
+                });
+            }
+            if (raw.logseq_uuid, raw.logseq_identity_origin)
+                != (block.logseq_uuid, block.logseq_identity_origin)
+            {
+                let mutation = match (
+                    raw.logseq_uuid,
+                    block.logseq_uuid,
+                    block.logseq_identity_origin,
+                ) {
+                    (None, Some(logseq_uuid), Some(LogseqIdentityOrigin::ExternalImported)) => {
+                        LogseqIdentityMutation::AssignExternal { logseq_uuid }
+                    }
+                    (Some(_), Some(logseq_uuid), Some(LogseqIdentityOrigin::ExternalImported)) => {
+                        LogseqIdentityMutation::ReplaceExternal { logseq_uuid }
+                    }
+                    (Some(_), None, None) => LogseqIdentityMutation::RemoveExternal,
+                    _ => {
+                        return Err(EngineError::InvalidTransaction(format!(
+                            "RevivePage cannot state-target policy-generated identity for block {}",
+                            block.block_id
+                        )));
+                    }
+                };
+                operations.push(SemanticOperation::MutateBlockLogseqIdentity {
+                    block: location,
+                    mutation,
+                });
+            }
+        }
+        if current.preamble != target.preamble {
+            operations.push(SemanticOperation::SetPagePreamble {
+                page_id,
+                preamble: target.preamble,
+            });
+        }
+        Ok(operations)
     }
 
     /// Materialize one page from the accepted clean suffix while consulting
@@ -25253,6 +25775,22 @@ impl ShardedHotEngine {
         Ok(SemanticEffect::decode(semantic_objects[0].payload())?)
     }
 
+    pub(crate) fn accepted_batch_revives_page(
+        &self,
+        batch_id: BatchId,
+        page_id: PageId,
+    ) -> Result<bool, EngineError> {
+        let batch = self.load_accepted_validated_batch(batch_id)?;
+        let revives = self
+            .accepted_semantic_effect(&batch)?
+            .pages()
+            .iter()
+            .any(|delta| {
+                delta.page_id == page_id && delta.lifecycle == super::PageDeltaLifecycle::RevivePage
+            });
+        Ok(revives)
+    }
+
     fn accepted_batch_causal_containment(
         &self,
         batch: &ValidatedBatch,
@@ -28731,6 +29269,59 @@ impl ShardedHotEngine {
                     },
                 )?;
             }
+            SemanticOperation::RevivePage {
+                page_id,
+                name,
+                path,
+                kind,
+                predecessor_frontier,
+                prior_present_intent_id: _,
+            } => {
+                let target =
+                    self.materialize_page_at_projection_frontier(*page_id, predecessor_frontier)?;
+                if target.name != *name || target.path != *path || target.kind != *kind {
+                    return Err(EngineError::InvalidTransaction(format!(
+                        "RevivePage target for {page_id} differs from its authenticated predecessor frontier"
+                    )));
+                }
+                let catalog = self.ensure_working_document(
+                    working,
+                    before_vectors,
+                    before_snapshots,
+                    self.catalog_document_id,
+                    peer_id,
+                )?;
+                let state = read_page_state(catalog, *page_id)?
+                    .ok_or(EngineError::PageNotFound(*page_id))?;
+                let PageState::Tombstone {
+                    name: tombstone_name,
+                    home_document_id,
+                    kind: tombstone_kind,
+                } = state
+                else {
+                    return Err(EngineError::InvalidTransaction(format!(
+                        "RevivePage requires tombstoned page {page_id}"
+                    )));
+                };
+                if tombstone_name != *name
+                    || tombstone_kind != *kind
+                    || home_document_id != target.home_document_id
+                {
+                    return Err(EngineError::InvalidTransaction(format!(
+                        "RevivePage requires the recorded predecessor identity for {page_id}"
+                    )));
+                }
+                insert_page_state(
+                    catalog,
+                    *page_id,
+                    &PageState::Live {
+                        name: name.clone(),
+                        path: path.clone(),
+                        home_document_id,
+                        kind: *kind,
+                    },
+                )?;
+            }
             SemanticOperation::RestoreSubtree { page_id, blocks } => {
                 let page_home = self.page_home_from_working(
                     working,
@@ -29582,6 +30173,7 @@ fn explicit_bootstrap_author_documents(
             SemanticOperation::EditPagePath { .. }
             | SemanticOperation::SetPageKind { .. }
             | SemanticOperation::DeletePage { .. }
+            | SemanticOperation::RevivePage { .. }
             | SemanticOperation::ReconcileExternalPageState { .. } => {
                 documents.insert(catalog_document_id);
             }
@@ -31727,7 +32319,7 @@ fn derive_effect_with_catalog(
 ) -> Result<(SemanticEffect, Option<BTreeMap<PageId, PageState>>), EngineError> {
     let before = snapshot_documents_with_validation(catalog_document_id, before, false)?;
     let after = snapshot_documents_with_validation(catalog_document_id, after, true)?;
-    derive_effect_from_snapshots_with_catalog(&before, &after)
+    derive_effect_from_snapshots_with_catalog(&before, &after, &BTreeSet::new())
 }
 
 #[derive(Clone, Debug)]
@@ -32163,12 +32755,22 @@ fn derive_effect_from_snapshots(
     before: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
     after: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
 ) -> Result<SemanticEffect, EngineError> {
-    derive_effect_from_snapshots_with_catalog(before, after).map(|(effect, _)| effect)
+    derive_effect_from_snapshots_for_revivals(before, after, &BTreeSet::new())
+}
+
+fn derive_effect_from_snapshots_for_revivals(
+    before: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    after: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    revival_pages: &BTreeSet<PageId>,
+) -> Result<SemanticEffect, EngineError> {
+    derive_effect_from_snapshots_with_catalog(before, after, revival_pages)
+        .map(|(effect, _)| effect)
 }
 
 fn derive_effect_from_snapshots_with_catalog(
     before: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
     after: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    revival_pages: &BTreeSet<PageId>,
 ) -> Result<(SemanticEffect, Option<BTreeMap<PageId, PageState>>), EngineError> {
     let mut pages = Vec::new();
     let mut page_preambles = Vec::new();
@@ -32193,16 +32795,12 @@ fn derive_effect_from_snapshots_with_catalog(
                     _ => &BTreeMap::new(),
                 };
                 if before_pages.is_empty() {
-                    pages.extend(after_pages.iter().map(|(page_id, state)| PageDelta {
-                        page_id: *page_id,
-                        before: None,
-                        after: Some(state.clone()),
+                    pages.extend(after_pages.iter().map(|(page_id, state)| {
+                        PageDelta::ordinary(*page_id, None, Some(state.clone()))
                     }));
                 } else if after_pages.is_empty() {
-                    pages.extend(before_pages.iter().map(|(page_id, state)| PageDelta {
-                        page_id: *page_id,
-                        before: Some(state.clone()),
-                        after: None,
+                    pages.extend(before_pages.iter().map(|(page_id, state)| {
+                        PageDelta::ordinary(*page_id, Some(state.clone()), None)
                     }));
                 } else {
                     let keys: BTreeSet<PageId> = before_pages
@@ -32214,11 +32812,7 @@ fn derive_effect_from_snapshots_with_catalog(
                         let before_state = before_pages.get(&page_id).cloned();
                         let after_state = after_pages.get(&page_id).cloned();
                         if before_state != after_state {
-                            pages.push(PageDelta {
-                                page_id,
-                                before: before_state,
-                                after: after_state,
-                            });
+                            pages.push(PageDelta::ordinary(page_id, before_state, after_state));
                         }
                     }
                 }
@@ -32358,6 +32952,11 @@ fn derive_effect_from_snapshots_with_catalog(
                     reason: "document changed between catalog and shard roles".into(),
                 });
             }
+        }
+    }
+    for page in &mut pages {
+        if revival_pages.contains(&page.page_id) {
+            page.mark_revive_page()?;
         }
     }
     let effect =
@@ -36844,6 +37443,7 @@ mod validation_tests {
             page_id: extra_page_id,
             before: None,
             after: Some(live_page(extra_home_id, "pages/Extra.md")),
+            lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
         });
         let mut extra_blocks = expected.blocks().to_vec();
         extra_blocks.push(BlockDelta {
@@ -38245,6 +38845,7 @@ mod validation_tests {
                     home_document_id: catalog_id,
                     kind: ManagedTextKind::Page,
                 }),
+                lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
             }],
             Vec::new(),
             Vec::new(),

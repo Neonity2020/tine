@@ -265,7 +265,7 @@ and manifest tail.
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
-| `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, and C-5 Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
+| `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests; losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
@@ -1421,21 +1421,24 @@ All tiers author ordinary accepted deletion batches immediately; local
 acceptance and inbound provider admission never wait for classification. Tier 1
 is quiet. Tier 2 and tier 3 append structured `SyncAbsenceSweepEvent` values to
 the runtime notification surface. An open sweep escalates in place as `k`
-crosses a boundary, appending its new tier and members. Packet C-4 deliberately
-adds no frontend toast, dock, or list: user-visible surfacing lands with C-5,
-together with a working Restore action.
+crosses a boundary, appending its new tier and members. The backend Restore,
+Re-apply, and Keep-deletion actions are available through `SyncRuntimeHandle`;
+frontend toast, dock, list, and action wiring belong to packet C-5b.
 
 Each logical record is the append-only immutable chain in the layout table.
 The current state is its highest valid linked version and records: sweep id;
 open, last-observation, and close timestamps; pages-at-open; tier; tier-3 grace
 deadline; ordered `(path, page_id)` members; each member's deletion batch id,
 predecessor accepted-state frontier, and best-effort prior-Present intent id;
-explicit disposal; and versioned action history. The action schema already
-admits Restore progress (authored batches, chunk/watermark cursor, monotonic
-retry count), although RevivePage and Restore execution are C-5. O-C3 remains
-binding on C-5/re-baselining: predecessor payloads needed for Restore must stay
-pinned before any future re-baseline can retire them. Records are retain-all;
-there is no packet C-4 GC knob.
+explicit disposal; and versioned action history. Restore progress uses the
+already-defined authored-batch list and cursor containing chunk ordinal,
+remaining-operation watermark, and monotonic retry count; packet C-5a does not
+change this record format. O-C3 remains binding on future re-baselining:
+before it retires any batch, predecessor state, intent, or annotation object,
+it must pin or copy forward everything required to render every retained
+Restore record at its existing fidelity grade. The best-effort intent reference
+is provenance and layout evidence, never the restore payload source. Records
+are retain-all; there is no record-GC knob.
 
 The `sweeps/` directory is created idempotently only after the workspace lease
 is acquired and archive repair has completed. Open enumerates only the positive
@@ -1479,8 +1482,55 @@ current accepted state and re-authors only still-live pages as ordinary
 direct user-file operation. The ordinary guarded Absent projection removes the
 files, so watcher observations cannot fight the action. Started/progress/
 completion records make it restart-resumable and idempotent. Keep-deletion is
-also recorded before it releases grace. Restore/RevivePage and its UI remain
-C-5 work.
+also recorded before it releases grace.
+
+Restore is a whole-sweep actor action. It renders each member from the accepted
+predecessor state immediately before that member's deletion batch. A retained
+Present intent can contribute exact layout and annotation evidence, yielding a
+`byte_identical` fidelity grade. Without that evidence the ordinary canonical
+renderer yields `semantically_identical`: the accepted semantic state is exact,
+but layout may be regenerated. Activation-imported pages with no prior intent
+remain restorable. Completion disposes the sweep exactly like Re-apply and
+Keep-deletion, releasing any tier-3 grace hold immediately after all restore
+batches have authored. Projection remains ordinary manifested publication; a
+restored page therefore reappears through the common executor and its completed
+Present entry becomes frontier-maximal `(page, path)` evidence for later
+absence decisions.
+
+Restore uses `RevivePage`, a semantic operation that changes a catalog entry
+from Tombstone to Live at the recorded predecessor name, path, kind, home
+shard, and **same page id**. The semantic-effect schema carries a required,
+authenticated `revive_page` lifecycle discriminant on that `PageDelta`.
+Authoring validation and receiver decoding refuse Tombstone-to-Live without
+it. This protects malformed/imported content and honest peer divergence from
+silently resurrecting a tombstoned page. `CreatePage` continues to refuse a
+tombstoned id. This is one exact 0.7 decoder/schema version—there is no dual
+decoder or wire-version peek—and the enrollment graph-schema floor is
+unchanged. Already-shipped pre-0.7 builds treat the unsupported clean
+descriptor as benign non-join.
+
+The first operation in every revival batch is the catalog flip, making the
+following content operations legal in vector order. The remaining operations
+are a state-targeted semantic-tree diff from the **current** shard to the
+immutable predecessor snapshot: block insert/remove/move/edit, membership,
+preamble, and metadata changes. An already-equal page emits no content work.
+Peers admit and replay these as ordinary CRDT operations, so concurrent remote
+edits resolve through the normal merge rather than a special restore channel.
+
+An over-limit restore takes a bounded prefix and commits it as an ordinary
+batch, then appends a durable action cursor before planning the next chunk.
+If that accepted chunk retains derived projection work, Restore settles that
+local continuation before authoring another chunk; the absence publication
+barrier remains active throughout and still gates only the history-bearing
+outbound families. Every chunk re-diffs current state. Its cursor records `{chunk ordinal,
+remaining-operation watermark}`, where the watermark is the size of the full
+fresh diff before that chunk. The next recomputed watermark must be strictly
+smaller. A non-decreasing value means concurrent admission re-grew the diff;
+Restore retries at most three times, then appends a Failed action with the cause
+and returns a failed backend action for an explicit re-run. It never records a
+partial restore as successful. The final step recomputes and asserts an empty
+whole-page diff before appending Completed. Startup automatically resumes
+Started or Progress actions from their durable cursor.
 
 ### 2.10a Durability barriers by artifact class
 

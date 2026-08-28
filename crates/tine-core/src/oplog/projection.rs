@@ -847,6 +847,7 @@ fn materialized_page_projection_identity_equal(
 pub(crate) struct GuardedProjectionLayout {
     base: Vec<StructuralLayoutIdentity>,
     target: Vec<StructuralLayoutIdentity>,
+    revive_page_self_base: bool,
 }
 
 impl GuardedProjectionLayout {
@@ -854,6 +855,16 @@ impl GuardedProjectionLayout {
         Self {
             base,
             target: structural_layout_identities(target_annotations),
+            revive_page_self_base: false,
+        }
+    }
+
+    fn for_revive_page(target_annotations: &[AnnotatedIdentity]) -> Self {
+        let target = structural_layout_identities(target_annotations);
+        Self {
+            base: target.clone(),
+            target,
+            revive_page_self_base: true,
         }
     }
 
@@ -871,7 +882,12 @@ impl GuardedProjectionLayout {
         Self {
             base: Vec::new(),
             target: Vec::new(),
+            revive_page_self_base: false,
         }
+    }
+
+    pub(crate) fn uses_revive_page_self_base(&self) -> bool {
+        self.revive_page_self_base
     }
 
     #[cfg(test)]
@@ -897,6 +913,7 @@ impl GuardedProjectionLayout {
         Self {
             base: Vec::new(),
             target,
+            revive_page_self_base: false,
         }
     }
 
@@ -1731,6 +1748,9 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
     // would hit (creation-shaped replay) or miss (the precondition key switch).
     if !source_absent
         && local_base.is_none()
+        && !engine
+            .accepted_batch_revives_page(source.source_batch_id(), source.page_id())
+            .map_err(ProjectionError::Engine)?
         && engine.receiver_absence_decision(plan.intent().page_id(), plan.intent().path())
             == super::absence_decision::AbsenceDecision::DeferredAbsence
     {
@@ -2825,6 +2845,12 @@ fn execute_manifested_projection_work_located(
     let expected_base = decoded.annotated_base();
     let guarded_layout = decoded.guarded_layout();
     let local_attempt_intent = decoded.receiver_local_intent().clone();
+    let revival_work = engine
+        .accepted_batch_revives_page(work.batch_id(), work.page_id())
+        .map_err(ProjectionError::Engine)?;
+    let revival_guarded_layout = revival_work
+        .then(|| GuardedProjectionLayout::for_revive_page(manifested.target().annotations()));
+    let effective_guarded_layout = revival_guarded_layout.as_ref().unwrap_or(guarded_layout);
     // Own-endpoint replay-absence decision. A captured Present precondition is
     // direct shape evidence that the file existed when this work was authored.
     // An Absent precondition is creation-shaped and defers only when the exact
@@ -2838,6 +2864,7 @@ fn execute_manifested_projection_work_located(
     )?;
     if target.is_some()
         && observed_before_intent.is_none()
+        && !revival_work
         && (expected_base.is_some()
             || engine
                 .local_projection_completed(local_attempt_intent.id()?)
@@ -2864,13 +2891,27 @@ fn execute_manifested_projection_work_located(
             plan_projection_with_layout_annotations(
                 engine.workspace_id(),
                 current.state(),
-                expected_base.map(AnnotatedProjectionBase::bytes),
-                expected_base.map(AnnotatedProjectionBase::annotations),
+                expected_base
+                    .map(AnnotatedProjectionBase::bytes)
+                    .or_else(|| revival_work.then_some(target)),
+                expected_base
+                    .map(AnnotatedProjectionBase::annotations)
+                    .or_else(|| revival_work.then_some(manifested.target().annotations())),
             )
         )?;
         let target_matches = replay.target() == target;
-        let layout_matches = replay.guarded_layout() == guarded_layout;
-        let intent_matches = local_attempt_intent.matches_replay_except_frontier(replay.intent());
+        let layout_matches = revival_work || replay.guarded_layout() == guarded_layout;
+        let intent_matches = if revival_work {
+            replay.intent().workspace_id() == local_attempt_intent.workspace_id()
+                && replay.intent().page_id() == local_attempt_intent.page_id()
+                && replay.intent().path() == local_attempt_intent.path()
+                && replay.intent().claim_evidence() == local_attempt_intent.claim_evidence()
+                && replay.intent().target_kind() == local_attempt_intent.target_kind()
+                && replay.intent().target() == local_attempt_intent.target()
+                && replay.intent().annotations() == local_attempt_intent.annotations()
+        } else {
+            local_attempt_intent.matches_replay_except_frontier(replay.intent())
+        };
         if !target_matches || !layout_matches || !intent_matches {
             if super::phase_trace_enabled() {
                 eprintln!(
@@ -2919,14 +2960,14 @@ fn execute_manifested_projection_work_located(
             manifested.path().as_str(),
             expected_base.map(AnnotatedProjectionBase::bytes),
             target,
-            &guarded_layout,
+            effective_guarded_layout,
             &mut recovery_authority,
         ),
         (None, Some(target)) => graph.recover_page_projection_with_layout(
             manifested.path().as_str(),
             expected_base.map(AnnotatedProjectionBase::bytes),
             target,
-            &guarded_layout,
+            effective_guarded_layout,
             &mut recovery_authority,
         ),
         (Some(handoff), None) if deletion_is_already_exact => handoff
@@ -2997,14 +3038,14 @@ fn execute_manifested_projection_work_located(
                             manifested.path().as_str(),
                             expected_base.map(AnnotatedProjectionBase::bytes),
                             target,
-                            &guarded_layout,
+                            effective_guarded_layout,
                             &mut authority,
                         ),
                         (None, target) => graph.recover_page_projection_with_layout(
                             manifested.path().as_str(),
                             expected_base.map(AnnotatedProjectionBase::bytes),
                             target,
-                            &guarded_layout,
+                            effective_guarded_layout,
                             &mut authority,
                         ),
                     }
@@ -3027,14 +3068,14 @@ fn execute_manifested_projection_work_located(
                             manifested.path().as_str(),
                             expected_base.map(AnnotatedProjectionBase::bytes),
                             target,
-                            &guarded_layout,
+                            effective_guarded_layout,
                             &mut authority,
                         ),
                         (None, Some(target)) => graph.write_page_projection_with_layout(
                             manifested.path().as_str(),
                             expected_base.map(AnnotatedProjectionBase::bytes),
                             target,
-                            &guarded_layout,
+                            effective_guarded_layout,
                             &mut authority,
                         ),
                         (Some(handoff), None) => {

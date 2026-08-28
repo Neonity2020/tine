@@ -201,10 +201,11 @@ pub use refusal::ManagedStorageRefusalScenario;
 pub(crate) use refusal::BLOCKED_REASON_SCENARIOS;
 pub use semantic::{
     BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName, LogicalPageNameError,
-    LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta, PageNameKeyDigest,
-    PagePreambleDelta, PagePreambleState, PageState, PolicyGeneratedAnchorReason, SemanticEffect,
-    SemanticError, VisibleMembership, CATALOG_PAGE_STATE_SCHEMA_VERSION,
-    MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
+    LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta, PageDeltaLifecycle,
+    PageNameKeyDigest, PagePreambleDelta, PagePreambleState, PageState,
+    PolicyGeneratedAnchorReason, SemanticEffect, SemanticError, VisibleMembership,
+    CATALOG_PAGE_STATE_SCHEMA_VERSION, MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION,
+    SEMANTIC_EFFECT_SCHEMA_VERSION,
 };
 pub use sqlite::{
     AcceptedBatchEvent, ApplicationRuntimeRoot, ApplyDisposition, ForensicEvidence,

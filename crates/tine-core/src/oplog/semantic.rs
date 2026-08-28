@@ -6,7 +6,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::{BlockId, DocumentId, LogseqUuid, ManagedPath, ManagedTextKind, PageId};
 
-pub const SEMANTIC_EFFECT_SCHEMA_VERSION: u32 = 5;
+pub const SEMANTIC_EFFECT_SCHEMA_VERSION: u32 = 6;
 pub const CATALOG_PAGE_STATE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SEMANTIC_EFFECT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SEMANTIC_DELTA_ENTRIES: usize = 100_000;
@@ -443,9 +443,56 @@ pub struct PageDelta {
     pub page_id: PageId,
     pub before: Option<PageState>,
     pub after: Option<PageState>,
+    /// Authenticated semantic-operation provenance for lifecycle transitions.
+    ///
+    /// This field is deliberately required on the wire. In particular, a
+    /// Tombstone -> Live transition is never inferred from its states: only a
+    /// delta explicitly marked `RevivePage` may perform that transition.
+    pub lifecycle: PageDeltaLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PageDeltaLifecycle {
+    Ordinary,
+    RevivePage,
 }
 
 impl PageDelta {
+    pub fn ordinary(page_id: PageId, before: Option<PageState>, after: Option<PageState>) -> Self {
+        Self {
+            page_id,
+            before,
+            after,
+            lifecycle: PageDeltaLifecycle::Ordinary,
+        }
+    }
+
+    pub(crate) fn mark_revive_page(&mut self) -> Result<(), SemanticError> {
+        if !matches!(
+            (&self.before, &self.after),
+            (
+                Some(PageState::Tombstone {
+                    name: before_name,
+                    home_document_id: before_home,
+                    kind: before_kind,
+                }),
+                Some(PageState::Live {
+                    name: after_name,
+                    home_document_id: after_home,
+                    kind: after_kind,
+                    ..
+                }),
+            ) if before_name == after_name
+                && before_home == after_home
+                && before_kind == after_kind
+        ) {
+            return Err(SemanticError::InvalidPageLifecycle);
+        }
+        self.lifecycle = PageDeltaLifecycle::RevivePage;
+        Ok(())
+    }
+
     fn validate_lifecycle(&self) -> Result<(), SemanticError> {
         if self.before == self.after {
             return Err(SemanticError::UnchangedDelta);
@@ -456,10 +503,15 @@ impl PageDelta {
             }
         }
 
-        match (&self.before, &self.after) {
-            (None, Some(PageState::Live { .. }))
-            | (Some(PageState::Live { .. }), Some(PageState::Live { .. })) => Ok(()),
+        match (&self.lifecycle, &self.before, &self.after) {
+            (PageDeltaLifecycle::Ordinary, None, Some(PageState::Live { .. }))
+            | (
+                PageDeltaLifecycle::Ordinary,
+                Some(PageState::Live { .. }),
+                Some(PageState::Live { .. }),
+            ) => Ok(()),
             (
+                PageDeltaLifecycle::Ordinary,
                 Some(PageState::Live {
                     name: before_name,
                     kind: before_kind,
@@ -471,6 +523,25 @@ impl PageDelta {
                     ..
                 }),
             ) if before_name == after_name && before_kind == after_kind => Ok(()),
+            (
+                PageDeltaLifecycle::RevivePage,
+                Some(PageState::Tombstone {
+                    name: before_name,
+                    home_document_id: before_home,
+                    kind: before_kind,
+                }),
+                Some(PageState::Live {
+                    name: after_name,
+                    home_document_id: after_home,
+                    kind: after_kind,
+                    ..
+                }),
+            ) if before_name == after_name
+                && before_home == after_home
+                && before_kind == after_kind =>
+            {
+                Ok(())
+            }
             _ => Err(SemanticError::InvalidPageLifecycle),
         }
     }
@@ -728,6 +799,15 @@ impl SemanticEffect {
 
     pub fn pages(&self) -> &[PageDelta] {
         &self.pages
+    }
+
+    pub(crate) fn mark_revive_page(&mut self, page_id: PageId) -> Result<(), SemanticError> {
+        let index = self
+            .pages
+            .binary_search_by_key(&page_id, |delta| delta.page_id)
+            .map_err(|_| SemanticError::InvalidPageLifecycle)?;
+        self.pages[index].mark_revive_page()?;
+        self.validate()
     }
 
     pub fn page_preambles(&self) -> &[PagePreambleDelta] {
@@ -1058,7 +1138,7 @@ impl fmt::Display for SemanticError {
             Self::NonCanonical => f.write_str("semantic effect is not canonically ordered/encoded"),
             Self::UnchangedDelta => f.write_str("semantic effect contains an unchanged delta"),
             Self::InvalidPageLifecycle => f.write_str(
-                "invalid page lifecycle transition: creation must be None -> Live; edits must be Live -> Live; deletion must be Live -> same-kind Tombstone",
+                "invalid page lifecycle transition: creation must be None -> Live; edits must be Live -> Live; deletion must be Live -> same-kind Tombstone; revival must be explicitly discriminated RevivePage Tombstone -> same-identity Live",
             ),
             Self::BlockStateRemoved => {
                 f.write_str("authoritative block state cannot be physically removed")
@@ -1121,6 +1201,7 @@ mod tests {
                 page_id: page_id(1),
                 before,
                 after,
+                lifecycle: PageDeltaLifecycle::Ordinary,
             }],
             Vec::new(),
             Vec::new(),
@@ -1187,16 +1268,19 @@ mod tests {
                     page_id: target,
                     before: Some(before_target),
                     after: Some(authored_target),
+                    lifecycle: PageDeltaLifecycle::Ordinary,
                 },
                 PageDelta {
                     page_id: unrelated,
                     before: None,
                     after: Some(unrelated_after),
+                    lifecycle: PageDeltaLifecycle::Ordinary,
                 },
                 PageDelta {
                     page_id: deleted,
                     before: Some(deleted_before),
                     after: Some(deleted_after),
+                    lifecycle: PageDeltaLifecycle::Ordinary,
                 },
             ],
             vec![PagePreambleDelta {
@@ -1297,6 +1381,7 @@ mod tests {
                 home_document_id: home,
                 kind: ManagedTextKind::Page,
             }),
+            lifecycle: PageDeltaLifecycle::Ordinary,
         };
         let preamble_state = |preamble: Option<&str>| PagePreambleState {
             page_id,
@@ -1684,6 +1769,76 @@ mod tests {
     }
 
     #[test]
+    fn revive_page_discriminant_alone_legalizes_same_identity_tombstone_to_live() {
+        let home = document_id(2);
+        let mut delta = PageDelta::ordinary(
+            page_id(1),
+            Some(tombstone(home, ManagedTextKind::Page)),
+            Some(live_at("shared/name.md", home, ManagedTextKind::Page)),
+        );
+        assert_eq!(delta.mark_revive_page(), Ok(()));
+        let effect = SemanticEffect::new(vec![delta], Vec::new(), Vec::new()).unwrap();
+        let encoded = effect.encode().unwrap();
+        let decoded = SemanticEffect::decode(&encoded).unwrap();
+        assert_eq!(decoded.pages()[0].lifecycle, PageDeltaLifecycle::RevivePage);
+    }
+
+    #[test]
+    fn receiver_refuses_tombstone_to_live_without_authenticated_revive_discriminant() {
+        let home = document_id(2);
+        let ordinary = PageDelta::ordinary(
+            page_id(1),
+            Some(tombstone(home, ManagedTextKind::Page)),
+            Some(live_at("shared/name.md", home, ManagedTextKind::Page)),
+        );
+        let wire = SemanticEffectWire {
+            semantic_effect_schema_version: SEMANTIC_EFFECT_SCHEMA_VERSION,
+            pages: vec![ordinary.clone()],
+            page_preambles: Vec::new(),
+            blocks: Vec::new(),
+            memberships: Vec::new(),
+        };
+        let mut tampered = SEMANTIC_MAGIC.to_vec();
+        tampered.extend(postcard::to_allocvec(&wire).unwrap());
+        assert_eq!(
+            SemanticEffect::decode(&tampered).unwrap_err(),
+            SemanticError::InvalidPageLifecycle
+        );
+
+        #[derive(Serialize)]
+        struct LegacyPageDelta {
+            page_id: PageId,
+            before: Option<PageState>,
+            after: Option<PageState>,
+        }
+        #[derive(Serialize)]
+        struct LegacyWire {
+            semantic_effect_schema_version: u32,
+            pages: Vec<LegacyPageDelta>,
+            page_preambles: Vec<PagePreambleDelta>,
+            blocks: Vec<BlockDelta>,
+            memberships: Vec<MembershipDelta>,
+        }
+        let legacy = LegacyWire {
+            semantic_effect_schema_version: SEMANTIC_EFFECT_SCHEMA_VERSION,
+            pages: vec![LegacyPageDelta {
+                page_id: ordinary.page_id,
+                before: ordinary.before,
+                after: ordinary.after,
+            }],
+            page_preambles: Vec::new(),
+            blocks: Vec::new(),
+            memberships: Vec::new(),
+        };
+        let mut legacy_bytes = SEMANTIC_MAGIC.to_vec();
+        legacy_bytes.extend(postcard::to_allocvec(&legacy).unwrap());
+        assert!(matches!(
+            SemanticEffect::decode(&legacy_bytes),
+            Err(SemanticError::Decode(_))
+        ));
+    }
+
+    #[test]
     fn page_kind_is_canonical_semantic_state_and_effect_identity() {
         let page = effect(ManagedTextKind::Page);
         let journal = effect(ManagedTextKind::Journal);
@@ -1746,6 +1901,7 @@ mod tests {
                     home_document_id: document_id(2),
                     kind: ManagedTextKind::Journal,
                 }),
+                lifecycle: PageDeltaLifecycle::Ordinary,
             }],
             Vec::new(),
             Vec::new(),

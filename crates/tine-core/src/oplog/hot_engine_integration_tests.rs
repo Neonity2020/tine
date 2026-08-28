@@ -557,6 +557,19 @@ fn page_kind_is_durable_across_create_rename_mutation_delete_and_replay() {
     ));
     assert!(matches!(
         engine.prepare_bootstrap_transaction(
+            author(40_008, 40_008),
+            &tx(vec![SemanticOperation::CreatePage {
+                page_id: ids.page_a,
+                home_document_id: ids.home_a,
+                name: crate::oplog::LogicalPageName::parse("A").unwrap(),
+                path: path("pages/A.md"),
+                kind: ManagedTextKind::Page,
+            }]),
+        ),
+        Err(EngineError::PageAlreadyExists(page_id)) if page_id == ids.page_a
+    ));
+    assert!(matches!(
+        engine.prepare_bootstrap_transaction(
             author(40_006, 40_006),
             &tx(vec![SemanticOperation::SetPageKind {
                 page_id: ids.page_b,
@@ -586,6 +599,161 @@ fn page_kind_is_durable_across_create_rename_mutation_delete_and_replay() {
         ),
         Err(EngineError::PageDeleted(page_id)) if page_id == ids.page_a
     ));
+}
+
+#[test]
+fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
+    let ids = Ids::new();
+    let dir = TestDir::new("revive-page-replay");
+    let archive = store(&dir, ids);
+    let (mut engine, baseline) = seed_engine(ids, &archive);
+    let predecessor = engine.materialize_page_for_projection(ids.page_a).unwrap();
+    let expected = predecessor.page.clone();
+    let deletion = engine
+        .prepare_bootstrap_transaction(
+            author(40_100, 40_100),
+            &tx(vec![SemanticOperation::DeletePage {
+                page_id: ids.page_a,
+            }]),
+        )
+        .unwrap();
+    let deletion = ready(&archive, &deletion);
+    assert!(matches!(
+        engine.stage_ready(deletion.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let drift = engine
+        .prepare_bootstrap_transaction(
+            author(40_102, 40_102),
+            &tx(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: ids.block_a,
+                    home_document_id: ids.home_a,
+                },
+                content: "tombstoned shard drift before revival".into(),
+            }]),
+        )
+        .unwrap();
+    let drift = ready(&archive, &drift);
+    assert!(matches!(
+        engine.stage_ready(drift.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    let operations = engine
+        .plan_revive_page_operations(ids.page_a, &predecessor.frontier, None)
+        .unwrap();
+    assert!(
+        operations.len() > 1,
+        "the flip-first gate needs content work after the catalog operation"
+    );
+    assert!(matches!(
+        operations.first(),
+        Some(SemanticOperation::RevivePage { page_id, .. }) if *page_id == ids.page_a
+    ));
+    let revived = engine
+        .prepare_bootstrap_transaction(author(40_101, 40_101), &tx(operations))
+        .unwrap();
+    assert_eq!(
+        semantic_effect(&revived).pages()[0].lifecycle,
+        crate::oplog::PageDeltaLifecycle::RevivePage
+    );
+    let revived = ready(&archive, &revived);
+    assert!(matches!(
+        engine.stage_ready(revived.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert_eq!(engine.materialize_page(ids.page_a).unwrap(), expected);
+
+    let mut peer = ids.engine();
+    for batch in [baseline, deletion, drift, revived] {
+        assert!(matches!(
+            peer.stage_ready(batch).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+    }
+    assert_eq!(peer.materialize_page(ids.page_a).unwrap(), expected);
+}
+
+#[test]
+fn revive_page_concurrent_remote_edit_uses_ordinary_crdt_merge() {
+    let ids = Ids::new();
+    let dir = TestDir::new("revive-page-concurrent-edit");
+    let archive = store(&dir, ids);
+    let (mut prefix, baseline) = seed_engine(ids, &archive);
+    let predecessor = prefix
+        .materialize_page_for_projection(ids.page_a)
+        .unwrap()
+        .frontier;
+    let deletion = prefix
+        .prepare_bootstrap_transaction(
+            author(40_200, 40_200),
+            &tx(vec![SemanticOperation::DeletePage {
+                page_id: ids.page_a,
+            }]),
+        )
+        .unwrap();
+    let deletion = ready(&archive, &deletion);
+    assert!(matches!(
+        prefix.stage_ready(deletion.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    let revival_ops = prefix
+        .plan_revive_page_operations(ids.page_a, &predecessor, None)
+        .unwrap();
+    let revival = prefix
+        .prepare_bootstrap_transaction(author(40_201, 40_201), &tx(revival_ops))
+        .unwrap();
+    let revival = ready(&archive, &revival);
+
+    let mut remote_author = ids.engine();
+    for batch in [baseline.clone(), deletion.clone()] {
+        assert!(matches!(
+            remote_author.stage_ready(batch).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+    }
+    let remote_edit = remote_author
+        .prepare_bootstrap_transaction(
+            author(40_202, 40_202),
+            &tx(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: ids.block_a,
+                    home_document_id: ids.home_a,
+                },
+                content: "concurrent remote edit during revival".into(),
+            }]),
+        )
+        .unwrap();
+    let remote_edit = ready(&archive, &remote_edit);
+
+    let converge = |first: ValidatedBatch, second: ValidatedBatch| {
+        let mut peer = ids.engine();
+        for batch in [baseline.clone(), deletion.clone(), first, second] {
+            assert!(matches!(
+                peer.stage_ready(batch).disposition,
+                BatchDisposition::Accepted { .. }
+            ));
+        }
+        peer.canonical_snapshot().unwrap()
+    };
+    let revival_then_edit = converge(revival.clone(), remote_edit.clone());
+    let edit_then_revival = converge(remote_edit, revival);
+    assert_eq!(revival_then_edit, edit_then_revival);
+    assert!(matches!(
+        revival_then_edit
+            .pages
+            .iter()
+            .find(|(page_id, _)| *page_id == ids.page_a)
+            .map(|(_, state)| state),
+        Some(PageState::Live { .. })
+    ));
+    assert!(revival_then_edit
+        .blocks
+        .iter()
+        .any(|block| block.block_id == ids.block_a
+            && block.content == "concurrent remote edit during revival"));
 }
 
 #[test]
@@ -633,6 +801,7 @@ fn page_kind_mismatch_between_effect_and_catalog_object_is_rejected() {
                         kind: ManagedTextKind::Journal,
                     },
                 }),
+                lifecycle: delta.lifecycle,
             })
             .collect(),
         declared.page_preambles().to_vec(),
@@ -795,7 +964,7 @@ fn page_kind_changing_deletion_matching_catalog_and_effect_is_rejected() {
         receiver.stage_ready(ready(&archive, &tampered)).disposition,
         BatchDisposition::Rejected {
             error: EngineError::Semantic(error),
-        } if error == "invalid page lifecycle transition: creation must be None -> Live; edits must be Live -> Live; deletion must be Live -> same-kind Tombstone"
+        } if error == "invalid page lifecycle transition: creation must be None -> Live; edits must be Live -> Live; deletion must be Live -> same-kind Tombstone; revival must be explicitly discriminated RevivePage Tombstone -> same-identity Live"
     ));
 }
 

@@ -3512,6 +3512,7 @@ mod tests {
                         home_document_id: page.home_document_id,
                         kind: page.kind,
                     }),
+                    lifecycle: super::super::PageDeltaLifecycle::Ordinary,
                 })
                 .collect(),
             Vec::new(),
