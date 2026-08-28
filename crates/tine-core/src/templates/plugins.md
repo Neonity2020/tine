@@ -13,7 +13,7 @@ icon:: 🧩
 	- Disable a plugin at any time without removing it. **Uninstall** removes only that app-local package version and never changes your graph or notes.
 	- Signed revocations are checked before saved plugins start. A revoked version stays disabled even when the live catalogue is temporarily unavailable.
 - ## Themes
-	- Token themes live under **Settings → Appearance → Themes**, separately from executable plugins. They contain validated color tokens rather than code.
+	- Declarative themes live under **Settings → Appearance → Themes**, separately from executable plugins. They contain validated colors and may select bounded Tine-owned presentation styles rather than running code.
 	- A selected token theme remains subordinate to your graph's `logseq/custom.css`, so your own CSS still wins.
 - ## Create one yourself
 	- 1. Open **Settings → Plugins → Browse**.

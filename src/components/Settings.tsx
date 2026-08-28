@@ -1349,7 +1349,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
         </For>
       </div>
       <div class="settings-hint theme-gallery-hint">
-        Themes recolor Tine using Logseq's <code>--ls-*</code> variables. If you keep your own <code>logseq/custom.css</code>, it still takes priority.
+        Themes use validated colors and Tine-owned presentation styles. If you keep your own <code>logseq/custom.css</code>, it still takes priority.
       </div>
 
       <Show when={COMMUNITY_REGISTRY_ENABLED}>
@@ -1391,7 +1391,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
       <div class="settings-row">
         <div>
           <div class="settings-label">Install a token theme</div>
-          <div class="settings-hint">Theme packages contain only whitelisted color tokens and metadata—no scripts, selectors, imports, or remote assets.</div>
+          <div class="settings-hint">Theme packages contain whitelisted colors, metadata, and optional Tine-owned presentation presets—no scripts, selectors, imports, or remote assets.</div>
         </div>
         <div>
           <input

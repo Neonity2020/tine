@@ -1217,6 +1217,10 @@ mod tests {
         assert!(page.markdown.contains("Unavailable on"));
         assert!(page.markdown.contains("graph.write.block"));
         assert!(page.markdown.contains("What you should see"));
+        assert!(page.markdown.contains("Tine-owned presentation styles"));
+        assert!(page
+            .markdown
+            .contains("The theme receives neither those tasks"));
         assert!(page.markdown.contains("[[Features/Plugins]]"));
 
         let index = GUIDE_TEMPLATES

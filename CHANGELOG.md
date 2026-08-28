@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Declarative themes can now shape reading presentation without running code.**
+  Theme API 0.2 adds bounded Tine-owned presets for editorial serif typography,
+  journal headers, and a Today task summary, while existing color-only 0.1
+  themes remain compatible and `logseq/custom.css` still wins the cascade.
+
 - **Managed-storage group deletions now have an explicit recovery surface.**
   Tier 2 and Tier 3 absence sweeps raise a warning and remain available in a
   Deleted pages dock with their member pages and durable action status. Restore,

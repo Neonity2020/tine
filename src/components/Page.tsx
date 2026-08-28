@@ -33,6 +33,8 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { PagePropertyValue } from "./PagePropertyValue";
 import { graphBinding } from "../persistence";
 import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from "../pageDeleteTrace";
+import { selectedThemePresentation } from "../themeGallery";
+import { TodayTaskSummary } from "./TodayTaskSummary";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -685,6 +687,10 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   let renameCancelled = false;
   let pageActionsTrigger: HTMLButtonElement | undefined;
   const pageTarget = () => pageTargetFromFeedPage(props.page);
+  const isTodayJournal = () => props.page.kind === "journal"
+    && props.page.name === journalTitle(localDateFromDayKey(currentDayKey()));
+  const showTodayTaskSummary = () => isTodayJournal()
+    && selectedThemePresentation().todayTaskSummary === "compact";
   const pageActionsOpen = () => {
     const menu = contextMenu();
     return menu?.kind === "page"
@@ -804,7 +810,10 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   return (
     <div
       class="page-section"
-      classList={{ "page-mutation-busy": pageMutationVisiblyBusy(props.page.name) }}
+      classList={{
+        "page-mutation-busy": pageMutationVisiblyBusy(props.page.name),
+        "journal-today": isTodayJournal(),
+      }}
       inert={pageMutationBusy(props.page.name) ? true : undefined}
       aria-busy={pageMutationBusy(props.page.name) ? "true" : undefined}
     >
@@ -827,86 +836,92 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         <NamespaceCrumb name={props.page.name} />
       </Show>
       <div class="page-title-row">
-        <Show
-          when={!renaming()}
-          fallback={
-            <input
-              class="page-title-input"
-              value={newName()}
-              disabled={pageMutationBusy(props.page.name)}
-              ref={(el) => queueMicrotask(() => (el.focus(), el.select()))}
-              onInput={(e) => setNewName(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void commitRename();
-                else if (e.key === "Escape") {
-                  renameCancelled = true;
-                  setRenaming(false);
-                  dropTitleLease();
-                }
-              }}
-              onBlur={() => void commitRename()}
-            />
-          }
-        >
-          <h1
-            class="page-title"
-            classList={{ "journal-title": props.page.kind === "journal" }}
-            title={props.page.guide ? "Bundled Guide page" : props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar, middle-click → new tab)" : "Shift-click to open in sidebar, middle-click → new tab"}
-            onClick={(e) => {
-              const dest = internalLinkDest(e);
-              if (dest === "sidebar" && !props.page.guide) openPageInSidebar(pageTarget());
-              else if (dest === "background" && !props.page.guide) openPageTargetInNewTab(pageTarget());
-              else router.openPageTarget(pageTarget());
-            }}
-            onMouseDown={internalLinkMouseDown}
-            onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
-            onDblClick={startRename}
-            onContextMenu={(e) => {
-              if (props.page.guide) return;
-              if (!shouldOpenTextContextMenu(e.target)) return;
-              e.preventDefault();
-              openPageContextMenu(e.clientX, e.clientY, pageTarget(), true);
-            }}
+        <div class="page-title-main">
+          <Show
+            when={!renaming()}
+            fallback={
+              <input
+                class="page-title-input"
+                value={newName()}
+                disabled={pageMutationBusy(props.page.name)}
+                ref={(el) => queueMicrotask(() => (el.focus(), el.select()))}
+                onInput={(e) => setNewName(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void commitRename();
+                  else if (e.key === "Escape") {
+                    renameCancelled = true;
+                    setRenaming(false);
+                    dropTitleLease();
+                  }
+                }}
+                onBlur={() => void commitRename()}
+              />
+            }
           >
-            <Show when={props.page.kind === "journal"}>
-              <svg class="title-cal" viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="4" y="5" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
-                <line x1="4" y1="9.5" x2="20" y2="9.5" stroke="currentColor" stroke-width="1.7" />
-                <line x1="8.5" y1="3" x2="8.5" y2="7" stroke="currentColor" stroke-width="1.7" />
-                <line x1="15.5" y1="3" x2="15.5" y2="7" stroke="currentColor" stroke-width="1.7" />
-              </svg>
-            </Show>
-            <Show
-              when={pageProperties(propertySource(), props.page.format)
-                .find(([k]) => k.toLowerCase() === "icon")?.[1]
-                ?.trim()}
+            <h1
+              class="page-title"
+              classList={{ "journal-title": props.page.kind === "journal" }}
+              title={props.page.guide ? "Bundled Guide page" : props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar, middle-click → new tab)" : "Shift-click to open in sidebar, middle-click → new tab"}
+              onClick={(e) => {
+                const dest = internalLinkDest(e);
+                if (dest === "sidebar" && !props.page.guide) openPageInSidebar(pageTarget());
+                else if (dest === "background" && !props.page.guide) openPageTargetInNewTab(pageTarget());
+                else router.openPageTarget(pageTarget());
+              }}
+              onMouseDown={internalLinkMouseDown}
+              onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
+              onDblClick={startRename}
+              onContextMenu={(e) => {
+                if (props.page.guide) return;
+                if (!shouldOpenTextContextMenu(e.target)) return;
+                e.preventDefault();
+                openPageContextMenu(e.clientX, e.clientY, pageTarget(), true);
+              }}
             >
-              {(icon) => (
-                <span
-                  class="page-icon page-title-icon"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    editPageHeader();
-                  }}
-                >
-                  <EmojiText text={icon()} />
-                </span>
-              )}
-            </Show>
-            <EmojiText text={props.page.title} />
-          </h1>
-        </Show>
-        <Show when={!props.page.guide}>
-          <CarryActions page={props.page} />
-          <TagTableToggle page={props.page} />
-        </Show>
-        <Show when={props.page.guide}>
-          <button class="guide-copy-btn" onClick={() => void copyGuideIntoGraph(props.page.name)}>
-            Copy the guide into your graph
-          </button>
-        </Show>
-        <Show when={!props.page.guide}>
+              <Show when={props.page.kind === "journal"}>
+                <svg class="title-cal" viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="4" y="5" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
+                  <line x1="4" y1="9.5" x2="20" y2="9.5" stroke="currentColor" stroke-width="1.7" />
+                  <line x1="8.5" y1="3" x2="8.5" y2="7" stroke="currentColor" stroke-width="1.7" />
+                  <line x1="15.5" y1="3" x2="15.5" y2="7" stroke="currentColor" stroke-width="1.7" />
+                </svg>
+              </Show>
+              <Show
+                when={pageProperties(propertySource(), props.page.format)
+                  .find(([k]) => k.toLowerCase() === "icon")?.[1]
+                  ?.trim()}
+              >
+                {(icon) => (
+                  <span
+                    class="page-icon page-title-icon"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      editPageHeader();
+                    }}
+                  >
+                    <EmojiText text={icon()} />
+                  </span>
+                )}
+              </Show>
+              <EmojiText text={props.page.title} />
+            </h1>
+          </Show>
+          <Show when={showTodayTaskSummary()}>
+            <TodayTaskSummary page={props.page} />
+          </Show>
+        </div>
+        <div class="page-title-actions">
+          <Show when={!props.page.guide}>
+            <CarryActions page={props.page} />
+            <TagTableToggle page={props.page} />
+          </Show>
+          <Show when={props.page.guide}>
+            <button class="guide-copy-btn" onClick={() => void copyGuideIntoGraph(props.page.name)}>
+              Copy the guide into your graph
+            </button>
+          </Show>
+          <Show when={!props.page.guide}>
           <button
             ref={pageActionsTrigger}
             type="button"
@@ -945,7 +960,8 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
               />
             </svg>
           </button>
-        </Show>
+          </Show>
+        </div>
       </div>
       <Show when={aliasNames(propertySource(), props.page.format).length}>
         <div class="page-aliases" title="Also known as — other names that link here" onClick={editPageHeader}>

@@ -1636,6 +1636,20 @@ textarea {
   gap: 8px;
 }
 
+.page-title-main {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.page-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
 .page-title {
   font-size: var(--ls-page-title-size);
   font-weight: 600;
@@ -1664,6 +1678,65 @@ textarea {
   opacity: 0.6;
   color: var(--text-muted);
   vertical-align: -0.04em;
+}
+
+/* Theme API 0.2 presentation presets. Packages select these bounded host-owned
+   treatments; selectors, measurements, responsive behavior, and content stay
+   under Tine's control. */
+html[data-theme-content-typography="editorial-serif"] .page-section {
+  --tine-editable-font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua",
+    Palatino, Georgia, var(--tine-editable-emoji-font), serif;
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+    Georgia, serif;
+  font-size: 19px;
+}
+
+html[data-theme-content-typography="editorial-serif"] .page-section :is(.block-content, .block-editor) {
+  line-height: 30px;
+  min-height: 34px;
+}
+
+html[data-theme-journal-header="editorial"] .journal-title {
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+    Georgia, serif;
+  font-size: 34px;
+  font-weight: 700;
+}
+
+html[data-theme-journal-header="editorial"] .journal-title .title-cal {
+  display: none;
+}
+
+html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-row {
+  display: block;
+}
+
+html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 0;
+}
+
+html[data-theme-journal-header="editorial"] .page-section.journal-today .journal-title {
+  max-width: 100%;
+  margin: 4px 0 8px;
+  font-size: 46px;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-actions {
+  justify-content: center;
+  margin-top: 9px;
+}
+
+.today-task-summary {
+  color: var(--text-secondary);
+  font-family: var(--ls-font-family);
+  font-size: 16px;
+  line-height: 1.35;
 }
 
 .fav-star {
@@ -2539,6 +2612,12 @@ textarea {
   .plugin-setting-control {
     min-width: 0;
     justify-content: flex-start;
+  }
+}
+
+@media (hover: none) {
+  html[data-theme-journal-header="editorial"] .journal-title:hover {
+    color: var(--text-title);
   }
 }
 .settings-advanced { margin-top: 10px; }
@@ -3529,6 +3608,9 @@ textarea {
     gap: 6px;
     min-width: 0;
   }
+  .page-title-actions {
+    gap: 4px;
+  }
   .page-title.journal-title {
     flex: 1 1 auto;
     min-width: 0;
@@ -3537,6 +3619,20 @@ textarea {
     white-space: nowrap;
     font-size: 16px;
     line-height: 1.15;
+  }
+  html[data-theme-journal-header="editorial"] .page-title.journal-title {
+    font-size: 28px;
+    line-height: 1.18;
+  }
+  html[data-theme-journal-header="editorial"] .page-section.journal-today .journal-title {
+    font-size: 38px;
+    white-space: normal;
+  }
+  html[data-theme-journal-header="editorial"] .page-section.journal-today .page-title-actions {
+    margin-top: 7px;
+  }
+  .today-task-summary {
+    font-size: 15px;
   }
   .page-title.journal-title .title-cal {
     margin-right: 0.25em;

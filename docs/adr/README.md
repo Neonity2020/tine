@@ -85,3 +85,4 @@ see the project `CLAUDE.md`.
 | [0056](0056-concord-base-ledger-and-three-way.md) | Concord base ledger enables block-level 3-way conflict suggestions | Accepted |
 | [0057](0057-concord-conflict-objects-and-in-page-resolution.md) | A conflict is a derived, multi-sided object resolved in the page; markers are parsed, never invented | Accepted |
 | [0058](0058-privacy-safe-diagnostic-flight-recorder.md) | Production diagnostics use a bounded privacy-safe flight recorder, separate from detailed debug logs | Accepted |
+| [0059](0059-bounded-theme-presentation-presets.md) | Theme API 0.2 adds bounded host-owned typography, journal-header, and Today-summary presets | Accepted |

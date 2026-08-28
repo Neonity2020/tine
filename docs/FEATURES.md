@@ -554,7 +554,7 @@ within a column; merged cells are still v2+.
   switching. Also openable from the command line: `tine /path/to/graph` or the
   `TINE_GRAPH` env var.
 
-## Plugins & token themes
+## Plugins & declarative themes
 
 - **Experimental Tine-native plugin API 0.2** — small WebAssembly guests receive
   versioned, bounded events and return inert effects that Tine validates. They do not
@@ -576,10 +576,12 @@ within a column; merged cells are still v2+.
   preconditioned focused-block edits only through declared capabilities. Plugin
   settings are device-local scalar values in Tine's own controls. Disable or uninstall
   removes behavior/packages without making graph files unreadable.
-- **Token theme API 0.1** — executable code is not involved: packages contain a
-  strictly validated literal-color vocabulary. Themes install from the signed
+- **Declarative theme API 0.2** — executable code is not involved: packages contain
+  strictly validated literal colors and may select host-owned editorial typography,
+  journal-header, and Today task-summary presets. Themes install from the signed
   catalogue or local files under Settings → Appearance, remain device-local, and sit
-  below graph `logseq/custom.css` in the cascade.
+  below graph `logseq/custom.css` in the cascade. Existing color-only API 0.1 themes
+  remain compatible.
 - **Starter ecosystem and authoring tools** — the first examples cover bullet
   threading, query-filter shortcuts, and a behavioral port of heading shortcuts. A
   Rust SDK/template, deterministic checker, port-gap format, threat model, registry
