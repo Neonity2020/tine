@@ -120,6 +120,20 @@ function graphMetaWithTemplate(template: string | null): GraphMeta {
 }
 
 describe("Journals feed generation lifecycle", () => {
+  it("surfaces an initial feed read failure instead of claiming the graph has no journals", async () => {
+    vi.spyOn(backend(), "journalFeedPage").mockRejectedValue(
+      new Error("iCloud journal read failed"),
+    );
+    const mounted = mount(() => <PageView />);
+    try {
+      await vi.waitFor(() => expect(mounted.root.textContent).toContain("iCloud journal read failed"));
+      expect(mounted.root.textContent).toContain("Couldn't open this page");
+      expect(mounted.root.textContent).not.toContain("No journal entries found");
+    } finally {
+      mounted.dispose();
+    }
+  });
+
   it("saves an edited page route when activation reset abandons the Journals reload", async () => {
     vi.useFakeTimers();
     const existing: PageDto = {

@@ -85,14 +85,14 @@ function ownerIsLive(owner: JournalsFeedOwner): boolean {
 /** The single start-over owner for route loads, watcher changes and calendar
  * rollover.  It intentionally keeps the old feed/cursor until a response has
  * passed all ownership checks. */
-async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Promise<void> {
+async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Promise<unknown | null> {
   // An already-dead watcher/surface must be entirely inert.  In particular it
   // must not steal the generation from a live request that is about to land.
-  if (!ownerIsLive(owner)) return;
+  if (!ownerIsLive(owner)) return null;
   const generation = ++feedGeneration; // invalidate starts/appends before checking edit safety
   if (feedHasActiveEdit()) {
     pendingFeedRestart = true;
-    return;
+    return null;
   }
   const browserDay = localDayKey();
   loadingGeneration = generation;
@@ -104,13 +104,13 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
       }
       // A stale/disposed owner cannot create deferred work for a later surface.
       if (generation === feedGeneration && ownerIsLive(owner)) pendingFeedRestart = true;
-      return;
+      return null;
     }
     // The page can become owned while the backend request is in flight. Never
     // begin installing a feed response that is already known to be unsafe.
     if (feedHasActiveEdit()) {
       pendingFeedRestart = true;
-      return;
+      return null;
     }
     // Clear the deferred flag before loadFeed synchronously updates doc.feed;
     // otherwise the intentionally reactive pending-retry effect observes the
@@ -125,15 +125,17 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
     // the old feed atomically and replay after ownership releases.
     if (!installed) {
       pendingFeedRestart = true;
-      return;
+      return null;
     }
     journalAsOfDay = response.as_of_day;
     nextBeforeDay = response.next_before_day;
     feedDone = response.done;
-  } catch {
+    return null;
+  } catch (error) {
     // A failed refresh must leave the displayed feed and its cursor usable.
     // Focus, visibility, load-more, or the next calendar check will retry.
     if (generation === feedGeneration && ownerIsLive(owner)) pendingFeedRestart = true;
+    return error;
   } finally {
     if (loadingGeneration === generation) loadingGeneration = null;
   }
@@ -144,14 +146,14 @@ let journalRefreshFlight: {
   graphBinding: number;
   day: number;
   owner: JournalsFeedOwner;
-  promise: Promise<void>;
+  promise: Promise<unknown | null>;
 } | null = null;
 
 /** One lifecycle boundary for initial load, graph rebind, timer, focus,
  * visibility/resume, watcher refresh and deferred-edit retry. A configured
  * template is durably ensured before the feed is allowed to observe that day. */
-async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promise<void> {
-  if (!ownerIsLive(owner)) return;
+async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promise<unknown | null> {
+  if (!ownerIsLive(owner)) return null;
   const date = new Date();
   const day = localDayKey(date);
   const current = journalRefreshFlight;
@@ -171,7 +173,7 @@ async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promis
   ++feedGeneration;
   if (feedHasActiveEdit()) {
     pendingFeedRestart = true;
-    return;
+    return null;
   }
 
   const flight = {
@@ -179,24 +181,24 @@ async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promis
     graphBinding: owner.graphBinding,
     day,
     owner,
-    promise: Promise.resolve(),
+    promise: Promise.resolve<unknown | null>(null),
   };
   flight.promise = (async () => {
     const ensured = await ensureJournalTemplateForDay(date, () => !feedHasActiveEdit());
     const liveOwner = flight.owner;
     if (ensured !== "ready") {
       if (ownerIsLive(liveOwner)) pendingFeedRestart = true;
-      return;
+      return null;
     }
     if (!ownerIsLive(liveOwner) || localDayKey() !== day) {
       if (ownerIsLive(liveOwner)) pendingFeedRestart = true;
-      return;
+      return null;
     }
-    await restartJournalFeed(liveOwner);
+    return restartJournalFeed(liveOwner);
   })();
   journalRefreshFlight = flight;
   try {
-    await flight.promise;
+    return await flight.promise;
   } finally {
     if (journalRefreshFlight === flight) journalRefreshFlight = null;
   }
@@ -299,8 +301,12 @@ export function PageView(): JSX.Element {
           // restartJournalFeed synchronously reads the working set safety gate.
           // Keep those reads out of this route/epoch loader's dependency set:
           // loadFeed replaces doc.feed, and subscribing here would self-reload.
-          await untrack(() => refreshJournalFeedForCurrentDay(journalOwner(r, epoch)));
+          const feedError = await untrack(() => refreshJournalFeedForCurrentDay(journalOwner(r, epoch)));
           if (epoch !== graphEpoch()) return; // graph switched mid-load — drop it
+          // A background refresh failure keeps an already rendered feed usable.
+          // On the first load there is no old feed to preserve: report the real
+          // backend error instead of turning it into "No journal entries".
+          if (feedError !== null && doc.feed.length === 0) throw feedError;
         } else {
           if (isGuidePageName(r.name)) {
             await ensureGuidePagesLoaded(true);

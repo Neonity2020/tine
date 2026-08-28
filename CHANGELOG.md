@@ -57,6 +57,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **An exact `#` or `[[` page match no longer hides other matching pages**
+  (GH #186). The exact page remains the first/default result and suppresses the
+  redundant Create row, while prefix, substring, and fuzzy matches remain
+  available in the existing bounded literal autocomplete pool.
+
+- **A journal-feed read failure is no longer misreported as an empty graph**
+  (GH #385). The initial Journals view now shows the actual bounded backend
+  error, while a transient refresh failure still keeps an already visible feed
+  intact and retries later. This makes cloud-filesystem and access failures
+  diagnosable without mistaking present journal files for no journals.
+
+- **Unlinked References no longer falls back to a whole-graph scan while an
+  ordinary edit's one-page SQLite update is already in flight** (GH #400).
+  Reference reads wait for that bounded background delta, then use the exact
+  current candidate set; an unavailable or failed disposable projection still
+  falls back to the parser. Exact Direct Files byte conflicts remain unchanged
+  and continue to preserve both the disk version and the unsaved draft.
+
 - **Long pages no longer grow and shrink when a block enters or leaves edit
   mode** (GH #390). Pane-relative end-of-page breathing room is now derived
   from whether the page content naturally overflows, rather than from the

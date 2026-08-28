@@ -8563,6 +8563,31 @@
     "failBefore": "proven"
    },
    "notes": "Martin's 2026-08-27 report and controlled real-app run used a public 45-page mathematical thesis supplied outside the repository; the file was never committed. The previous full-page viewer let every observer callback start its own raster task, retained no global priority or concurrency boundary, and resized the displayed canvas before a sharper zoom render completed. Rapid zoom/scroll reached about 771 MiB proportional memory and caused visible stalls. The bounded first stage adds one viewport-prioritized render scheduler, cancels irrelevant work, suppresses speculative work during fast scrolling, retains the prior bitmap until its replacement is complete, and defers text-layer work until scrolling settles. Exact-head real-app evidence observed one active raster at most, queue depth one, one obsolete render cancelled, and a 24 ms worst frame gap in the synthetic rapid-scroll journey. The supplied thesis still reached about 1.07 GiB RSS at high zoom, so bitmap-memory reduction is explicitly not claimed here. Exact memory, frame timing, prefetch distance, and DOM shape are diagnostic rather than user contracts. The longer-term tiled/PDF.js-viewer architecture is tracked separately in GH #393."
+  },
+  {
+   "id": "UI-AUTOCOMPLETE-EXACT-RETAINS-MATCHES-186",
+   "title": "An exact page autocomplete result stays first without suppressing other matching pages",
+   "family": "search",
+   "sources": {
+    "issues": [
+     186
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/editor/autocomplete.test.ts::orderAcItems (autocomplete default action)::keeps prefix and substring pages after an exact CJK match without offering Create",
+     "src/components/Block.referenceAuthoring.test.tsx::keeps other CJK page matches visible after the exact page without a Create row"
+    ],
+    "scenario": "autocomplete.exact-page-retains-other-matches",
+    "failBefore": "proven"
+   },
+   "notes": "GH #186 follow-up decision, 2026-08-28. Querying 小明 against 我是小明, 小明, and 小明的家 now keeps the exact page first, omits only the redundant Create row, and retains the prefix and substring rows. Inline completion remains literal and page/tag-scoped, uses the existing 100-candidate backend pool, and does not import Ctrl+K DSL or content-search scope."
   }
  ]
 }
