@@ -1650,10 +1650,6 @@ textarea {
   flex: 0 0 auto;
 }
 
-.page-title-actions .page-carry-actions {
-  margin-left: 0;
-}
-
 .page-title {
   font-size: var(--ls-page-title-size);
   font-weight: 600;
