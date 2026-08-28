@@ -919,6 +919,23 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-theme-presentation.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "An installed Theme API 0.2 preset can apply host-owned content typography, journal-header presentation, and a compact Today task summary on desktop and mobile without horizontal overflow.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Exact preset metrics and summary wording may evolve together with the documented bounded Theme API while the selected presentation remains distinct, legible, and responsive."
+   ],
+   "nonRequirements": [
+    "Theme-authored arbitrary markup, scripts, layout ownership, or unbounded CSS behavior."
+   ],
+   "stability": "stable",
+   "notes": "Catalog neighbor for the Theme API 0.2 real-app journey introduced on master in 74b4c41e."
+  },
   "scripts/e2e-wayland-app-id.mjs": {
    "contracts": [
     {
