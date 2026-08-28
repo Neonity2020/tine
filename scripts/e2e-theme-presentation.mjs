@@ -61,6 +61,23 @@ try {
   await installed.getByRole("button", { name: "Use style", exact: true }).click();
   await installed.getByRole("button", { name: "Colors selected", exact: true }).waitFor();
   await installed.getByRole("button", { name: "Style selected", exact: true }).waitFor();
+  await page.getByTitle("Light theme").click();
+  const packageBackground = await page.evaluate(() =>
+    getComputedStyle(document.documentElement).getPropertyValue("--ls-primary-background-color").trim());
+  const gruvbox = page.locator(".theme-gallery-card", { hasText: "Gruvbox" });
+  await gruvbox.click();
+  await gruvbox.evaluate((card) => {
+    if (card.getAttribute("aria-pressed") !== "true") throw new Error("Gruvbox colors were not selected");
+  });
+  const composition = await page.evaluate(() => ({
+    typography: document.documentElement.getAttribute("data-theme-content-typography"),
+    journalHeader: document.documentElement.getAttribute("data-theme-journal-header"),
+    background: getComputedStyle(document.documentElement).getPropertyValue("--ls-primary-background-color").trim(),
+  }));
+  if (composition.typography !== "editorial-serif" || composition.journalHeader !== "editorial"
+      || !composition.background || composition.background === packageBackground) {
+    throw new Error(`theme composition failed: ${JSON.stringify({ packageBackground, composition })}`);
+  }
   await page.locator(".settings-pane-head .icon-btn:not(.settings-maximize)").click();
 
   const today = page.locator(".page-section.journal-today");
@@ -108,7 +125,7 @@ try {
     throw new Error(`mobile presentation failed: ${JSON.stringify(mobile)}`);
   }
 
-  console.log(`theme presentation E2E passed: ${JSON.stringify({ desktop, mobile })}`);
+  console.log(`theme presentation E2E passed: ${JSON.stringify({ composition, desktop, mobile })}`);
   await browser.close();
 } finally {
   server.kill("SIGTERM");
