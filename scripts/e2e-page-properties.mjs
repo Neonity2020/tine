@@ -301,9 +301,12 @@ async function drivePageHeaderArrowDown(expectedValue) {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // JS focus alone can produce an activeElement inside a background WebView.
     // A real WebDriver pointer click first transfers native focus to the app;
-    // preparePageHeaderArrowDown then restores the semantic end-of-header caret.
+    // let the freshly materialized editor finish its reactive ownership turn
+    // before preparePageHeaderArrowDown restores the semantic end-of-header
+    // caret. A human click-to-key gesture naturally includes this interval.
     const header = await browser.$(".page-blocks textarea.block-editor");
     await header.click();
+    await sleep(100);
     const preKey = await preparePageHeaderArrowDown(expectedValue);
     if (
       !preKey.documentHasFocus
