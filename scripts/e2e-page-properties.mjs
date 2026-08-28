@@ -333,14 +333,22 @@ async function drivePageHeaderArrowDown(expectedValue) {
         if (await pageHeaderArrowDownReachedBody()) return;
         await sleep(25);
       }
-      throw new Error(`PAGE_HEADER_ARROWDOWN_DELIVERED_BUT_IGNORED ${JSON.stringify(await pageArrowDownCapsule(`delivered-${attempt}`))}`);
+      attempts.push(await pageArrowDownCapsule(`delivered-${attempt}`));
+      await sleep(75);
+      continue;
     }
     attempts.push(capsule ?? await pageArrowDownCapsule(`undelivered-${attempt}`));
     await sleep(75);
   }
-  // The release runner may retry this isolated scenario once. Do not retry a
-  // delivered semantic failure: only this explicit no-delivery/readiness token
-  // is classified as hosted native-input infrastructure.
+  // A single delivered event can still race WebKitGTK's editor ownership turn;
+  // require the semantic handoff on either of two independently prepared native
+  // actions. If either action was delivered but both attempts failed, preserve
+  // the semantic failure instead of laundering it into infrastructure noise.
+  if (attempts.some((capsule) => deliveredExpectedArrowDown(capsule, expectedValue))) {
+    throw new Error(`PAGE_HEADER_ARROWDOWN_DELIVERED_BUT_IGNORED ${JSON.stringify(attempts)}`);
+  }
+  // The release runner may retry this isolated scenario once, but only when
+  // neither independently prepared native action reached the expected editor.
   throw new Error(`E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown ${JSON.stringify(attempts)}`);
 }
 
