@@ -1519,7 +1519,10 @@ edits resolve through the normal merge rather than a special restore channel.
 
 An over-limit restore takes a bounded prefix and commits it as an ordinary
 batch, then appends a durable action cursor before planning the next chunk.
-Every chunk re-diffs current state. Its cursor records `{chunk ordinal,
+If that accepted chunk retains derived projection work, Restore settles that
+local continuation before authoring another chunk; the absence publication
+barrier remains active throughout and still gates only the history-bearing
+outbound families. Every chunk re-diffs current state. Its cursor records `{chunk ordinal,
 remaining-operation watermark}`, where the watermark is the size of the full
 fresh diff before that chunk. The next recomputed watermark must be strictly
 smaller. A non-decreasing value means concurrent admission re-grew the diff;

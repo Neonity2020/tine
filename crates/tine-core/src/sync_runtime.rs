@@ -21794,12 +21794,12 @@ impl RuntimeActor {
                     "cannot construct bounded restore chunk: {error}"
                 ))
             })?;
-            let batch_id = match self.submit_local_mutation(transaction) {
-                SyncLocalMutationOutcome::Durable { batch_id }
-                | SyncLocalMutationOutcome::RetryableRetainedRecovery {
+            let (batch_id, retained_phase) = match self.submit_local_mutation(transaction) {
+                SyncLocalMutationOutcome::Durable { batch_id } => (batch_id, None),
+                SyncLocalMutationOutcome::RetryableRetainedRecovery {
                     batch_id: Some(batch_id),
-                    ..
-                } => batch_id,
+                    phase,
+                } => (batch_id, Some(phase)),
                 outcome => {
                     let reason =
                         format!("restore chunk did not author an accepted batch: {outcome:?}");
@@ -21839,6 +21839,42 @@ impl RuntimeActor {
             #[cfg(test)]
             {
                 let workspace_id = self.binding.workspace_id();
+                if RESTORE_TEST_CUT_AFTER_PROGRESS
+                    .lock()
+                    .unwrap()
+                    .remove(&workspace_id)
+                {
+                    return Err(SyncRuntimeRequestError::ActorUnavailable);
+                }
+            }
+            if let Some(phase) = retained_phase {
+                let settlement = self
+                    .settle_clean_retained_publication(&batch_id.to_string(), phase)
+                    .map_err(|error| {
+                        SyncRuntimeRequestError::ActorRefused(format!(
+                            "restore chunk {batch_id} authored but its derived projection could not settle: {error}"
+                        ))
+                    })?;
+                if matches!(settlement, ApplicationPublicationSettlement::Deferred(_)) {
+                    let reason = format!(
+                        "restore chunk {batch_id} authored but its derived projection did not settle before the next chunk"
+                    );
+                    self.clean
+                        .as_mut()
+                        .expect("restore action retains its clean runtime")
+                        .sweeps
+                        .fail_restore(sweep_id, action_id, reason.clone())
+                        .map_err(|error| {
+                            SyncRuntimeRequestError::ActorRefused(format!(
+                                "{reason}; additionally could not append failed restore action: {error}"
+                            ))
+                        })?;
+                    return Err(SyncRuntimeRequestError::ActorRefused(reason));
+                }
+            }
+            #[cfg(test)]
+            {
+                let workspace_id = self.binding.workspace_id();
                 if let Some(interference) = take_restore_after_chunk_admission(workspace_id) {
                     match self.submit_local_mutation(interference) {
                         SyncLocalMutationOutcome::Durable { .. }
@@ -21850,13 +21886,6 @@ impl RuntimeActor {
                             panic!("armed restore interference was not admitted: {outcome:?}")
                         }
                     }
-                }
-                if RESTORE_TEST_CUT_AFTER_PROGRESS
-                    .lock()
-                    .unwrap()
-                    .remove(&workspace_id)
-                {
-                    return Err(SyncRuntimeRequestError::ActorUnavailable);
                 }
             }
         }
@@ -30798,6 +30827,10 @@ mod tests {
             }
         }
         let sweep_id = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].sweep_id;
+        assert!(
+            actor.publication_barrier_active(),
+            "the sweep hold must remain active while Restore authors chunks"
+        );
 
         for (chunk_ordinal, blocks) in page.blocks.chunks(400).enumerate() {
             let operations = blocks
@@ -30837,6 +30870,10 @@ mod tests {
             actor.restore_absence_sweep(sweep_id),
             Err(SyncRuntimeRequestError::ActorUnavailable)
         );
+        assert!(
+            actor.publication_barrier_active(),
+            "a crash cut between chunks must not release the sweep hold"
+        );
         let interrupted = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].clone();
         assert!(interrupted.actions.iter().any(|action| matches!(
             action.state,
@@ -30869,6 +30906,10 @@ mod tests {
         );
         let completed = resumed.clean.as_ref().unwrap().sweeps.records_for_test()[0].clone();
         assert!(completed.disposed_at_unix_ms.is_some());
+        assert!(
+            !resumed.publication_barrier_active(),
+            "Restore completion must dispose the sweep and release its hold"
+        );
         assert!(completed
             .actions
             .iter()
@@ -44972,64 +45013,87 @@ mod tests {
             SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
             other => panic!("restore corpus inventory did not load: {other:?}"),
         };
+        let page_count = pages.len();
+        let removal_count = page_count
+            .saturating_mul(3)
+            .saturating_add(9)
+            .checked_div(10)
+            .expect("the fixed percentage divisor is nonzero");
         let mut candidates = pages
-            .into_iter()
-            .filter(|page| page.rel_path.ends_with(".md"))
+            .iter()
+            .filter(|page| page.rel_path.ends_with(".md") || page.rel_path.ends_with(".org"))
             .filter_map(|page| {
                 fs::metadata(fixture.graph_root.join(&page.rel_path))
                     .ok()
-                    .map(|metadata| (metadata.len(), page.rel_path))
+                    .is_some_and(|metadata| metadata.is_file())
+                    .then_some(page.rel_path.clone())
             })
             .collect::<Vec<_>>();
-        candidates.sort_unstable_by(|left, right| right.cmp(left));
+        candidates.sort_unstable();
+        assert!(
+            candidates.len() >= removal_count,
+            "the corpus copy has fewer writable text files than its 30% restore sample requires"
+        );
 
         let mut selected = Vec::new();
-        for (_, path) in candidates.into_iter().take(32) {
+        for path in candidates {
             let (mut page, _) = load_application_exact(&handle, &path);
             if page.read_only {
                 continue;
             }
+            let bytes = fs::read(fixture.graph_root.join(&path)).unwrap();
             page.rev = None;
             page.activation = None;
             let semantic_digest = ContentDigest::of(&serde_json::to_vec(&page).unwrap());
-            selected.push((path, semantic_digest));
-            if selected.len() == 4 {
+            selected.push((path, bytes, semantic_digest));
+            if selected.len() == removal_count {
                 break;
             }
         }
         assert_eq!(
             selected.len(),
-            4,
-            "the corpus copy must contain four writable Markdown pages"
+            removal_count,
+            "the corpus copy must supply the full 30% writable-page sample"
         );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
 
-        for (path, _) in &selected {
+        for (path, _, _) in &selected {
             fs::remove_file(fixture.graph_root.join(path)).unwrap();
         }
-        handle
-            .observe_watcher(
-                selected
-                    .iter()
-                    .map(|(path, _)| SyncWatcherObservation::managed_path(path).unwrap())
-                    .collect(),
-            )
-            .unwrap();
-        let deletion_ticks = drain_until_settled(&handle);
-        assert!(admitted_an_epoch(&deletion_ticks));
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        drive_initial_feed_with_turn_budget(&handle, 4096);
         let event = handle
             .absence_sweep_events()
             .unwrap()
             .into_iter()
             .last()
-            .expect("four corpus deletions surface one sweep");
+            .expect("the closed-window corpus deletions surface one sweep");
+        assert_eq!(event.tier, SyncAbsenceSweepTier::Tier3);
+        assert_eq!(event.absence_count, selected.len());
+        assert_eq!(event.pages_at_open, page_count);
+        assert!(
+            handle
+                .prepare_shared()
+                .unwrap_err()
+                .to_string()
+                .contains("external deletions awaiting disposition"),
+            "the tier-3 restore window must retain the publication barrier"
+        );
         let restored = handle.restore_absence_sweep(&event.sweep_id).unwrap();
         assert_eq!(restored.fidelity.len(), selected.len());
-        assert!(restored.fidelity.iter().all(|entry| {
-            entry.grade == SyncAbsenceSweepRestoreFidelityGrade::SemanticallyIdentical
-        }));
         drain_managed_local(&handle);
 
-        for (path, expected_digest) in &selected {
+        let byte_identical = restored
+            .fidelity
+            .iter()
+            .filter(|entry| entry.grade == SyncAbsenceSweepRestoreFidelityGrade::ByteIdentical)
+            .count();
+        let semantically_identical = restored.fidelity.len() - byte_identical;
+        for (path, expected_bytes, expected_digest) in &selected {
             let (mut page, _) = load_application_exact(&handle, path);
             page.rev = None;
             page.activation = None;
@@ -45038,11 +45102,24 @@ mod tests {
                 actual_digest, *expected_digest,
                 "a restored corpus page differs semantically"
             );
+            if restored.fidelity.iter().any(|entry| {
+                entry.path == *path
+                    && entry.grade == SyncAbsenceSweepRestoreFidelityGrade::ByteIdentical
+            }) {
+                assert_eq!(
+                    fs::read(fixture.graph_root.join(path)).unwrap(),
+                    *expected_bytes,
+                    "a byte-identical corpus restore changed accepted layout"
+                );
+            }
         }
         eprintln!(
-            "corpus_restore pages={} authored_batches={} semantic_digest_match=true",
+            "corpus_restore pages_at_open={} removed={} authored_batches={} byte_identical={} semantically_identical={} semantic_digest_match=true",
+            page_count,
             selected.len(),
-            restored.authored_batch_ids.len()
+            restored.authored_batch_ids.len(),
+            byte_identical,
+            semantically_identical
         );
     }
 
