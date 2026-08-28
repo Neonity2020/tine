@@ -57,6 +57,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **An exact `#` or `[[` page match no longer hides other matching pages**
+  (GH #186). The exact page remains the first/default result and suppresses the
+  redundant Create row, while prefix, substring, and fuzzy matches remain
+  available in the existing bounded literal autocomplete pool.
+
 - **A journal-feed read failure is no longer misreported as an empty graph**
   (GH #385). The initial Journals view now shows the actual bounded backend
   error, while a transient refresh failure still keeps an already visible feed
