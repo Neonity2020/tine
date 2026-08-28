@@ -293,16 +293,18 @@ async function closeRecoveryPanel() {
 }
 
 async function dismissSweepToast() {
-  const dismissButtons = await browser.$$('button[aria-label="Dismiss"]');
-  const index = await browser.execute((family) => {
+  const outcome = await browser.execute((family) => {
     const buttons = [...document.querySelectorAll('button[aria-label="Dismiss"]')];
-    return buttons.findIndex((button) => (button.parentElement?.textContent ?? "").includes(family));
+    const button = buttons.find((candidate) =>
+      (candidate.parentElement?.textContent ?? "").includes(family)
+    );
+    if (!button) return { clicked: false, alreadyAbsent: true };
+    button.click();
+    return { clicked: true, alreadyAbsent: false };
   }, `${DELETED_COUNT} pages were deleted together`);
-  if (index < 0) return false;
-  await dismissButtons[index].click();
   await waitFor(async () => !(await surfaceSnapshot()).toastFamily, 15_000,
     "group-deletion toast did not dismiss");
-  return true;
+  return outcome;
 }
 
 async function clickPanelAction(text) {
@@ -543,12 +545,12 @@ try {
 
   phase = "dismiss-without-disposition";
   await closeRecoveryPanel();
-  const toastDismissed = await dismissSweepToast();
+  const toastDismissal = await dismissSweepToast();
   const reopenedPanel = await openRecoveryPanel("post-dismiss reopen");
   assertLivePanel(reopenedPanel, "post-dismiss reopen");
   receipt.milestones.noDispositionOnDismiss = {
     panelClosed: true,
-    toastDismissed,
+    toastDismissal,
     reopened: true,
     status: "waiting for your decision",
   };
@@ -627,9 +629,11 @@ try {
     expected: expectedOutcomeForPhase(),
     observed: receipt.error,
     evidence,
-    classification: ["window-manager", "initial-launch", "managed-reopen"].includes(phase)
-      ? "infrastructure"
-      : "ambiguous",
+    classification: /Index out of bounds|element not interactable|WebDriverError/.test(receipt.error)
+      ? "harness"
+      : ["window-manager", "initial-launch", "managed-reopen"].includes(phase)
+        ? "infrastructure"
+        : "ambiguous",
   };
   writeReceipt();
   console.error(`FAIL: native absence-sweep journey: ${JSON.stringify(receipt.failureCapsule)}`);
