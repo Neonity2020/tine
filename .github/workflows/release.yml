@@ -69,7 +69,6 @@ jobs:
         with:
           workspaces: ". -> target"
       - run: npm ci
-        if: inputs.mode == 'build'
       - name: Require updater signing key
         if: inputs.mode == 'build'
         env:

@@ -109,6 +109,11 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
+  /- run: npm ci\n\s+- name: Require updater signing key/,
+  "promotion preflight must install the dependencies used by shared release contracts"
+);
+assert.match(
+  releaseWorkflow,
   /name: Upload reusable Linux x64 proof input[\s\S]*?release-proof-linux-x64[\s\S]*?name: Upload reusable Windows x64 proof input[\s\S]*?release-proof-windows-x64/,
   "no-publication candidates do not retain the exact binaries/frontends needed by promotion proofs"
 );

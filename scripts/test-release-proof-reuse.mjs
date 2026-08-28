@@ -40,10 +40,14 @@ try {
   fs.mkdirSync(path.join(root, "scripts"), { recursive: true });
   fs.mkdirSync(path.join(root, ".github/workflows"), { recursive: true });
   fs.mkdirSync(path.join(root, "src/generated"), { recursive: true });
+  fs.mkdirSync(path.join(root, "src-tauri"), { recursive: true });
   fs.writeFileSync(path.join(root, "src/product.ts"), "export const product = 1;\n");
   fs.writeFileSync(path.join(root, "src/generated/runtime.js"), "runtime-v1\n");
   fs.writeFileSync(path.join(root, "package.json"), "{\"version\":\"1.2.3\"}\n");
+  fs.writeFileSync(path.join(root, "package-lock.json"), "{\"lockfileVersion\":3}\n");
+  fs.writeFileSync(path.join(root, "src-tauri/tauri.conf.json"), "{\"productName\":\"Tine\"}\n");
   fs.writeFileSync(path.join(root, ".github/workflows/release.yml"), "name: release\n");
+  fs.writeFileSync(path.join(root, "scripts/build-product.mjs"), "// packaging input v1\n");
   fs.writeFileSync(path.join(root, "scripts/e2e-page-properties.mjs"), "// proof v1\n");
   git(root, "init");
   const sourceCommit = commit(root, "source candidate");
@@ -135,7 +139,10 @@ try {
   for (const [file, content, pattern] of [
     ["src/product.ts", "export const product = 2;\n", /product or unclassified proof input changed/],
     ["package.json", "{\"version\":\"1.2.4\"}\n", /product or unclassified proof input changed/],
+    ["package-lock.json", "{\"lockfileVersion\":2}\n", /product or unclassified proof input changed/],
     [".github/workflows/release.yml", "name: changed-release\n", /product or unclassified proof input changed/],
+    ["src-tauri/tauri.conf.json", "{\"productName\":\"Changed Tine\"}\n", /product or unclassified proof input changed/],
+    ["scripts/build-product.mjs", "// packaging input v2\n", /product or unclassified proof input changed/],
     ["src/generated/runtime.js", "runtime-v2\n", /product or unclassified proof input changed/],
   ]) {
     git(root, "checkout", "-B", `negative-${path.basename(file).replaceAll(".", "-")}`, proofBranch);
