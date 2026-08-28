@@ -13,6 +13,7 @@ import { WorkspaceSwitcher } from "./components/WorkspaceSwitcher";
 import { TopbarOverflowMenu } from "./components/TopbarOverflowMenu";
 import { ContextMenu } from "./components/ContextMenu";
 import { Toasts, Lightbox } from "./components/Toasts";
+import { AbsenceSweepCenter } from "./components/AbsenceSweepCenter";
 import { AudioOverlay } from "./components/AudioOverlay";
 import { CalendarJump } from "./components/CalendarJump";
 import { ConflictBar } from "./components/ConflictBar";
@@ -169,6 +170,11 @@ import { createStartupRecoveryController } from "./startupRecovery";
 import { storageTransitionRuntime } from "./storageTransitionRuntime";
 import { writeClipboardTextResilient } from "./clipboard";
 import type { SparseV2CancelResult } from "./types";
+import {
+  clearAbsenceSweeps,
+  ingestAbsenceSweepEvent,
+  refreshAbsenceSweeps,
+} from "./absenceSweeps";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -299,6 +305,8 @@ installReloadOnFocus();
 // at call time instead, which is why that gate needs no snapshot).
 const ALWAYS_ASK_DEMO =
   typeof location !== "undefined" && /[?&]alwaysask\b/.test(location.search);
+const ABSENCE_SWEEP_DEMO =
+  typeof location !== "undefined" && /[?&]absence-sweeps\b/.test(location.search);
 
 // Concord P5 policy toggle: "Reload from disk" on a held change re-enters the
 // ordinary external-change path with the policy bypassed for that one change, so
@@ -659,6 +667,57 @@ function PaneScroller(props: {
       observer.disconnect();
     });
   });
+  onMount(() => {
+    if (isTauri() || !ABSENCE_SWEEP_DEMO) return;
+    ingestAbsenceSweepEvent({
+      sweep_id: "11111111-1111-4111-8111-111111111111",
+      tier: "tier3",
+      absence_count: 8,
+      pages_at_open: 64,
+      opened_at_unix_ms: 1_777_000_000_000,
+      closed_at_unix_ms: 1_777_000_060_000,
+      grace_deadline_unix_ms: 1_777_000_360_000,
+      disposed_at_unix_ms: null,
+      members: [
+        { page_id: "1", path: "pages/Project roadmap.md" },
+        { page_id: "2", path: "journals/2026_08_28.md" },
+        { page_id: "3", path: "pages/Meeting notes.md" },
+        { page_id: "4", path: "research/Reading queue.org" },
+        { page_id: "5", path: "pages/Release checklist.md" },
+        { page_id: "6", path: "journals/2026_08_27.md" },
+        { page_id: "7", path: "pages/Ideas.md" },
+        { page_id: "8", path: "pages/Archive index.md" },
+      ],
+      latest_action: null,
+    }, { announce: true });
+  });
+  // One generation-scoped listener carries durable absence-sweep snapshots to
+  // the global recovery surface. Rebinding clears the old graph's list; panel
+  // dismissal is intentionally unrelated to this lifecycle.
+  createEffect(on(
+    [
+      () => managedStorageRuntime.snapshot().bindingGeneration,
+      () => managedStorageRuntime.snapshot().applicationPageAdmission?.authority,
+    ],
+    ([bindingGeneration, authority]) => {
+      if (!isTauri() && ABSENCE_SWEEP_DEMO) return;
+      clearAbsenceSweeps();
+      if (bindingGeneration === null || authority !== "managed_writable") return;
+      let disposed = false;
+      let unlisten = () => {};
+      void backend()
+        .onAbsenceSweepChanged(bindingGeneration, (sweep) => ingestAbsenceSweepEvent(sweep, { announce: true }))
+        .then((stop) => {
+          if (disposed) stop();
+          else unlisten = stop;
+        });
+      void refreshAbsenceSweeps({ announce: true }).catch(() => {});
+      onCleanup(() => {
+        disposed = true;
+        unlisten();
+      });
+    },
+  ));
 
   return (
     <main
@@ -1697,6 +1756,7 @@ export function App(): JSX.Element {
         </div>
       </Show>
       <DrawerBackground class="drawer-floating-background" blockedBy="any">
+        <AbsenceSweepCenter />
         <Toasts />
       </DrawerBackground>
       <Lightbox />

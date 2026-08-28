@@ -270,6 +270,61 @@ export interface SparseV2ErrorEvent {
   message: string;
 }
 
+export type SyncAbsenceSweepTier = "tier2" | "tier3";
+export type SyncAbsenceSweepActionKind = "restore" | "reapply" | "keep_deletion";
+export type SyncAbsenceSweepActionState = "started" | "progress" | "completed" | "failed";
+
+export interface SyncAbsenceSweepMember {
+  page_id: string;
+  path: string;
+}
+
+export interface SyncAbsenceSweepAction {
+  action_id: string;
+  action: SyncAbsenceSweepActionKind;
+  state: SyncAbsenceSweepActionState;
+  recorded_at_unix_ms: number;
+  authored_batch_ids: string[];
+  chunk_ordinal: number | null;
+  remaining_operation_watermark: number | null;
+  nondecreasing_retries: number | null;
+  failure_reason: string | null;
+}
+
+export interface SyncAbsenceSweepEvent {
+  sweep_id: string;
+  tier: SyncAbsenceSweepTier;
+  absence_count: number;
+  pages_at_open: number;
+  opened_at_unix_ms: number;
+  closed_at_unix_ms: number | null;
+  grace_deadline_unix_ms: number | null;
+  disposed_at_unix_ms: number | null;
+  members: SyncAbsenceSweepMember[];
+  latest_action: SyncAbsenceSweepAction | null;
+}
+
+export interface SyncAbsenceSweepChangedEvent {
+  binding_generation: number;
+  sweep: SyncAbsenceSweepEvent;
+}
+
+export interface SyncAbsenceSweepActionOutcome {
+  sweep_id: string;
+  action_id: string;
+  authored_batch_ids: string[];
+}
+
+export interface SyncAbsenceSweepRestoreFidelity {
+  page_id: string;
+  path: string;
+  grade: "byte_identical" | "semantically_identical";
+}
+
+export interface SyncAbsenceSweepRestoreOutcome extends SyncAbsenceSweepActionOutcome {
+  fidelity: SyncAbsenceSweepRestoreFidelity[];
+}
+
 export interface SparseV2RuntimeStatus {
   lifecycle: "active" | "terminal" | "stopped_safe" | "stopped_crashed";
   recovery: "first_promotion" | "resumed_own_unsafe" | "adopted_safe_handoff" | "took_over_crashed_unsafe" | null;

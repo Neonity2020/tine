@@ -1123,6 +1123,19 @@ export function mockBackend(): Backend {
     async sparseV2Tick() {
       return { state: "idle", detail: null, epoch: null };
     },
+    async listAbsenceSweeps() {
+      return [];
+    },
+    async onAbsenceSweepChanged() {
+      return () => {};
+    },
+    async reapplyAbsenceSweep(sweepId) {
+      return { sweep_id: sweepId, action_id: "mock-reapply", authored_batch_ids: [] };
+    },
+    async restoreAbsenceSweep(sweepId) {
+      return { sweep_id: sweepId, action_id: "mock-restore", authored_batch_ids: [], fidelity: [] };
+    },
+    async keepAbsenceSweepDeletion() {},
     async sparseV2CleanShutdown() {
       if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
       const runtime = { ...sparseV2.runtime, lifecycle: "stopped_safe" as const };
