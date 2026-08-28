@@ -566,7 +566,7 @@ fn page_kind_is_durable_across_create_rename_mutation_delete_and_replay() {
                 kind: ManagedTextKind::Page,
             }]),
         ),
-        Err(EngineError::PageDeleted(page_id)) if page_id == ids.page_a
+        Err(EngineError::PageAlreadyExists(page_id)) if page_id == ids.page_a
     ));
     assert!(matches!(
         engine.prepare_bootstrap_transaction(
