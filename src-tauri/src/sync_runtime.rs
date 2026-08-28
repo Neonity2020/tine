@@ -3889,6 +3889,8 @@ mod clean_shutdown_slot_tests {
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
             managed_local_stage: None,
+            sweep_deadline_remaining: None,
+            sweep_deadline_due: false,
         }
     }
 

@@ -10755,6 +10755,7 @@ mod tests {
                     &self.graph,
                     &self.receipts,
                     &[path],
+                    &mut crate::oplog::absence_sweep::NoopSweepRecorder,
                 )
                 .unwrap()
                 {

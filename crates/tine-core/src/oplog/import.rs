@@ -10377,6 +10377,7 @@ mod tests {
                 &self.graph,
                 &self.receipts,
                 paths,
+                &mut crate::oplog::absence_sweep::NoopSweepRecorder,
             )
             .unwrap()
             {
@@ -11066,6 +11067,7 @@ mod tests {
                 &fixture.graph,
                 &fixture.receipts,
                 &["pages/copy.md"],
+                &mut crate::oplog::absence_sweep::NoopSweepRecorder,
             ) {
                 Err(error) => error,
                 Ok(_) => panic!("duplicate UUID copy unexpectedly entered durable history"),
@@ -11118,6 +11120,7 @@ mod tests {
                 &fixture.graph,
                 &fixture.receipts,
                 &["pages/a.md"],
+                &mut crate::oplog::absence_sweep::NoopSweepRecorder,
             )
             .unwrap()
             {

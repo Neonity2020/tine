@@ -265,6 +265,7 @@ and manifest tail.
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
+| `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, and C-5 Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; missing/stale/corrupt state rebuilds from baseline plus manifests; losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
@@ -917,6 +918,12 @@ in this table.
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
 | `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
 
+One retryable setup refusal is intentionally outside the durable-scenario table:
+
+| Operation | In-scope scenario | Required response |
+| --- | --- | --- |
+| prepare-share while an absence publication barrier is active | A half-synced folder or dying mount delivers mass absence; publishing the first shared baseline would propagate history-bearing deletions before disposition | Refuse with `external deletions awaiting disposition`; retain all local durability and retry after sweep close/grace expiry or explicit disposition |
+
 #### Checks with no in-scope scenario, and what happened to them
 
 The rule that every refusal, fail-closed path, or re-verification of already
@@ -1346,8 +1353,10 @@ previously executed creation. Either case returns `DeferredAbsence`: finished
 without mutation, continuation retired, no completion/index entry written, and
 the Present terminal head left untouched. Foreground archive publication,
 engine admission, SQLite projection, checkpointing, and ordinary startup or
-differs-scan reconciliation continue; C-2 deliberately authors no sweep record.
-Absent-precondition work with no exact matching entry creates as before.
+differs-scan reconciliation continue. The current C-4 runtime immediately hands
+the deferral to §3.2c's sweep coalescer; the startup/differs scan remains its
+crash backstop. Absent-precondition work with no exact matching entry creates
+as before.
 
 Foreign replay builds a disposable absence-decision map once per managed open
 from one validated receiver-catalog pass plus the local completion index. The
@@ -1375,10 +1384,10 @@ shortcut, decide recovery.
 
 A receiver `DeferredAbsence` is finished without mutation: its continuation
 retires, no completion or local-index entry is written, and its Present
-terminal head stays untouched. Its provenance is `replay-deferred`. Packet C-3
-authors no sweep record; the ordinary startup/differs scan is the durable
-observation backstop. Packet C-4 consumes these observations in its
-coalescer/tiers.
+terminal head stays untouched. Its provenance is `replay-deferred`. The engine
+hands that observation to the packet C-4 coalescer before another outbound
+actor turn; a crash before handoff remains covered by the ordinary mandatory
+startup/differs scan.
 
 O-C5 accepts two bounded residuals. A crash after own-endpoint execution but
 before its coalesced flush can lose at most the 60-second/64-turn suffix, so a
@@ -1389,6 +1398,89 @@ entry and expose an older retained receiver Present completion. A later foreign
 recreation then mis-defers conservatively instead of projecting. The O-C5 cap
 bounds this second residual too; it never resurrects content and never silently
 loses it, because the downstream sweep retains the recoverable disposition.
+
+### 3.2c Absence sweeps, tiers, and publication hold
+
+An **absence observation** is a startup full-scan difference, a live watcher
+difference where accepted state is Present and disk is absent, or a
+`replay-deferred` disposition from §3.2b. The first observation durably opens a
+sweep. A sweep absorbs another observation only while it arrives less than
+`W = 60 seconds` after the previous observation, and closes after 60 seconds
+of quiet. All absences discovered by one startup scan form one sweep regardless
+of how many bounded scan turns it needs. Membership is the set union by
+deletion batch id; `k` is its count at evaluation and the percentage denominator
+is the accepted page count captured when the sweep opened.
+
+Tier precedence is exact and accept-by-default:
+
+1. tier 3 when `k >= min(50, ceil(0.10 × pages-at-open))`;
+2. otherwise tier 2 when `k >= 4`;
+3. otherwise tier 1.
+
+All tiers author ordinary accepted deletion batches immediately; local
+acceptance and inbound provider admission never wait for classification. Tier 1
+is quiet. Tier 2 and tier 3 append structured `SyncAbsenceSweepEvent` values to
+the runtime notification surface. An open sweep escalates in place as `k`
+crosses a boundary, appending its new tier and members. Packet C-4 deliberately
+adds no frontend toast, dock, or list: user-visible surfacing lands with C-5,
+together with a working Restore action.
+
+Each logical record is the append-only immutable chain in the layout table.
+The current state is its highest valid linked version and records: sweep id;
+open, last-observation, and close timestamps; pages-at-open; tier; tier-3 grace
+deadline; ordered `(path, page_id)` members; each member's deletion batch id,
+predecessor accepted-state frontier, and best-effort prior-Present intent id;
+explicit disposal; and versioned action history. The action schema already
+admits Restore progress (authored batches, chunk/watermark cursor, monotonic
+retry count), although RevivePage and Restore execution are C-5. O-C3 remains
+binding on C-5/re-baselining: predecessor payloads needed for Restore must stay
+pinned before any future re-baseline can retire them. Records are retain-all;
+there is no packet C-4 GC knob.
+
+The `sweeps/` directory is created idempotently only after the workspace lease
+is acquired and archive repair has completed. Open enumerates only the positive
+`<uuid>.<20 decimal digits>` grammar. It reconstructs records before drain
+resumption and before every publication-capable step, ignores unrelated residue,
+and falls back from a torn highest object to the preceding valid chain object.
+Terminal records are inert. Open or in-grace records resume under their
+recorded id, re-establish the barrier, repeat their structured notification,
+and re-arm the earliest deadline wake.
+
+The ordering invariant is tier-independent: the record is durable at sweep
+open before any member deletion batch commits. `execute_clean_external`
+finalizes the batch and absence set, then calls the `SweepRecorder` seam to
+append `{batch id, members}`, and only then crosses `commit_clean_prepared`.
+A crash between those steps leaves a recorded but uncommitted member. Reopen
+reconciles member batch ids against the accepted-batch set, drops that member,
+and lets the startup scan re-observe the still-absent file. No accepted deletion
+can therefore predate its sweep record.
+
+One named `publication_barrier_active()` predicate is true from sweep open. For
+tier 1/2 it ends at close. For tier 3 it extends until exactly five minutes
+after close or explicit disposal. It retains but excludes from runnable work
+all three history-bearing outbound families: forced batch plus frontier-head
+publication; full archive/descriptor/head repair; and prepare-share/baseline
+publication (which refuses as named in §3.1). Descriptor-only republication is
+the named exemption because it contains no batch, head, or frontier data.
+Inbound admission, conflict resolution, local durability, and local acceptance
+remain runnable. Both the actor receive timeout and the native watcher sleep
+are capped by the earliest close/grace deadline, and both timeout ends force a
+deadline turn on an otherwise quiet graph.
+
+This is the approved O-C4 propagation-timing delta: accepted external
+deletions are locally durable immediately, but their history-bearing outbound
+publication is delayed through the coalescence window and, at tier 3, through
+the five-minute grace. Dependency order is unchanged when the retained queue
+is released.
+
+Re-apply is an actor-owned disposition action. It compares every member with
+current accepted state and re-authors only still-live pages as ordinary
+`DeletePage` batches; already tombstoned members are no-ops. It performs no
+direct user-file operation. The ordinary guarded Absent projection removes the
+files, so watcher observations cannot fight the action. Started/progress/
+completion records make it restart-resumable and idempotent. Keep-deletion is
+also recorded before it releases grace. Restore/RevivePage and its UI remain
+C-5 work.
 
 ### 2.10a Durability barriers by artifact class
 
@@ -1600,6 +1692,15 @@ foreground retirement directory barrier visible. Packet 2c removes those own-
 endpoint barriers; the retained foreign receiver protocol remains outside the
 save/move fixtures. The exact ledgers and the source guard reject unreviewed
 barrier drift or any future raw barrier outside the counted wrappers.
+
+Packet C-4 adds no save- or move-path barrier. Sweep-chain installs occur only
+on the absence/observation path and use the ordinary staged/no-replace archive
+publication discipline. Each appended sweep version pays one staged-object
+file flush, its staged-publication filesystem barrier, and one coalesced
+`sweeps/` directory barrier. A sweep normally appends at open/membership,
+escalation or additional membership, close, and action progress; the cost is
+per sweep transition, never per ordinary save. The exact save/move pins above
+therefore remain 10/13 with foreground 3/0.
 
 **Barriers with no in-scope scenario are deleted, not budgeted.** Three
 mechanisms left the count on 2026-08-27 (save 28 → 25, move 77 → 74), each

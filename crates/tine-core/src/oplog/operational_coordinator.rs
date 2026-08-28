@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crate::model::{HandoffSafeGuard, PublishedHandoffLatch};
 use crate::Graph;
 
+use super::absence_sweep::{SweepError, SweepRecorder};
 use super::enrollment::{EnrollmentError, VerifiedLocalCompositionError};
 use super::hot_engine::{EngineError, LocalAuthorCapture, ReconciliationNeeded};
 use super::import::plan_clean_affected_import;
@@ -844,6 +845,7 @@ impl OperationalCoordinator {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         requested_paths: &[&str],
+        sweep_recorder: &mut dyn SweepRecorder,
     ) -> Result<CleanExternalMutationState, OperationalCoordinatorError> {
         let (admission, engine, database) = session.parts().map_err(|refusal| {
             OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
@@ -959,6 +961,45 @@ impl OperationalCoordinator {
                 format!("clean SQLite identity candidates are unavailable: {error}"),
             )
         })?;
+        let mut page_count_at_open = || {
+            let mut count = 0_usize;
+            let mut cursor = None;
+            loop {
+                let pages = commit_claim_source
+                    .page_inventory_after(
+                        cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
+                        None,
+                        512,
+                    )
+                    .map_err(|error| SweepError::Invalid(error.to_string()))?;
+                if pages.is_empty() {
+                    break;
+                }
+                count = count.saturating_add(pages.len());
+                let last = pages.last().expect("nonempty page inventory batch");
+                cursor = Some((last.path.clone(), last.page_id));
+                if pages.len() < 512 {
+                    break;
+                }
+            }
+            Ok(count)
+        };
+        if let Err(error) = sweep_recorder.record_prepared_absence_batch(
+            engine,
+            &prepared,
+            &commit_claim_source,
+            &mut page_count_at_open,
+        ) {
+            published.cancel_prepublication();
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::Publication,
+                format!("durable sweep membership append failed before deletion commit: {error}"),
+            ));
+        }
+        if let Err(error) = fault(OperationalFaultPoint::AfterSweepRecord) {
+            published.cancel_prepublication();
+            return Err(error);
+        }
         let outcome = match engine.commit_clean_prepared(&prepared, &commit_claim_source) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1659,6 +1700,7 @@ pub(crate) enum OperationalFaultPoint {
     AfterDraft,
     AfterCapture,
     AfterFinalize,
+    AfterSweepRecord,
     AfterReservation,
     AfterManifest,
     AfterStage,
@@ -1753,6 +1795,7 @@ fn operational_fault_error(point: OperationalFaultPoint) -> OperationalCoordinat
             OperationalFaultPoint::AfterDraft => OperationalPhase::Draft,
             OperationalFaultPoint::AfterCapture => OperationalPhase::Capture,
             OperationalFaultPoint::AfterFinalize => OperationalPhase::Finalize,
+            OperationalFaultPoint::AfterSweepRecord => OperationalPhase::Publication,
             OperationalFaultPoint::AfterReservation => OperationalPhase::TailReservation,
             OperationalFaultPoint::AfterManifest => OperationalPhase::Publication,
             OperationalFaultPoint::AfterStage => OperationalPhase::ArchiveStage,
@@ -2077,6 +2120,7 @@ mod tests {
                 &self.graph,
                 &self.receipts,
                 paths,
+                &mut crate::oplog::absence_sweep::NoopSweepRecorder,
             )
         }
 

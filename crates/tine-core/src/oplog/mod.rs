@@ -8,6 +8,7 @@
 //! projection-work state are disposable derived data.
 
 pub(crate) mod absence_decision;
+pub(crate) mod absence_sweep;
 pub mod batch;
 #[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod bootstrap_import;

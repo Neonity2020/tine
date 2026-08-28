@@ -8446,6 +8446,12 @@ fn verify_lazy_genesis_page_checkpoint(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DeferredAbsenceObservation {
+    pub(crate) page_id: PageId,
+    pub(crate) path: ManagedPath,
+}
+
 pub struct ShardedHotEngine {
     /// Lazy cache for `nonlinear_accepted_since` (audit 4, P2). `nonlinear_watermark`
     /// holds the highest acceptance sequence whose batch is known causally
@@ -8488,6 +8494,11 @@ pub struct ShardedHotEngine {
     /// Disposable per-open merge of receiver receipt history with the local
     /// completion half. Durable truth remains in those two stores.
     absence_decision_map: RefCell<Option<AbsenceDecisionMap>>,
+    /// In-process handoff from every replay family to the sweep coalescer.
+    /// Crash before admission is covered by the mandatory startup differs
+    /// scan; while alive, this buffer ensures the publication barrier begins
+    /// before another outbound actor turn can run.
+    deferred_absence_observations: RefCell<BTreeSet<DeferredAbsenceObservation>>,
     projection_endpoint: Option<ProjectionEndpointBinding>,
     projection_receipt_store_id: Option<super::ProjectionReceiptStoreId>,
     /// Latest source-endpoint projection row per exact path for the clean
@@ -8745,6 +8756,7 @@ impl ShardedHotEngine {
             archive_store: None,
             local_completion_index: None,
             absence_decision_map: RefCell::new(None),
+            deferred_absence_observations: RefCell::new(BTreeSet::new()),
             projection_endpoint: None,
             projection_receipt_store_id: None,
             clean_projection_heads: BTreeMap::new(),
@@ -9952,6 +9964,30 @@ impl ShardedHotEngine {
             .borrow()
             .as_ref()
             .map_or(AbsenceDecision::Create, |map| map.decision(page_id, path))
+    }
+
+    pub(crate) fn note_deferred_absence_observation(&self, page_id: PageId, path: &ManagedPath) {
+        self.deferred_absence_observations
+            .borrow_mut()
+            .insert(DeferredAbsenceObservation {
+                page_id,
+                path: path.clone(),
+            });
+    }
+
+    pub(crate) fn take_deferred_absence_observations(&self) -> Vec<DeferredAbsenceObservation> {
+        std::mem::take(&mut *self.deferred_absence_observations.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn restore_deferred_absence_observations(
+        &self,
+        observations: impl IntoIterator<Item = DeferredAbsenceObservation>,
+    ) {
+        self.deferred_absence_observations
+            .borrow_mut()
+            .extend(observations);
     }
 
     pub(crate) fn incomplete_receiver_projection_intents(

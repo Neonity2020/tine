@@ -1738,6 +1738,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             last_error: Option<String>,
             retry: RetrySchedule,
             initial_tick_pending: bool,
+            sweep_deadline_remaining: Option<Duration>,
             // The managed twin of `WatchedGraph::snap`/`baseline`. Poll mode
             // used to push `RescanRequired` every cycle unconditionally; it now
             // arms on the same (mtime, len) stat diff the Direct lane has always
@@ -1795,6 +1796,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                     // so application and enrollment work can
                                     // run between those turns.
                                     initial_tick_pending: true,
+                                    sweep_deadline_remaining: None,
                                     snap: HashMap::new(),
                                     baseline: false,
                                 },
@@ -2132,11 +2134,16 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 // joined or initiated sharing. The SharedActive transition
                 // schedules its own initial provider scan, and later poll or
                 // exact events continue through this lane.
-                let provider_lane_active = graph
-                    .handle
-                    .status()
-                    .map(|status| sparse_provider_lane_is_active(status.shared_phase))
-                    .unwrap_or(false);
+                let actor_status = graph.handle.status().ok();
+                graph.sweep_deadline_remaining = actor_status
+                    .as_ref()
+                    .and_then(|status| status.sweep_deadline_remaining);
+                let sweep_deadline_due = actor_status
+                    .as_ref()
+                    .is_some_and(|status| status.sweep_deadline_due);
+                let provider_lane_active = actor_status
+                    .as_ref()
+                    .is_some_and(|status| sparse_provider_lane_is_active(status.shared_phase));
                 // The actor's startup scan can finish before this thread has
                 // replaced the legacy directory watches with the recursive
                 // graph-root watch. One scan after watch installation closes
@@ -2164,6 +2171,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     && !retry_due
                     && !initial_tick
                     && !force_sparse_tick
+                    && !sweep_deadline_due
                 {
                     continue;
                 }
@@ -2335,6 +2343,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             .values()
                             .filter_map(|graph| graph.retry.remaining(now)),
                     )
+                    .chain(
+                        sparse_graphs
+                            .values()
+                            .filter_map(|graph| graph.sweep_deadline_remaining),
+                    )
                     .min();
                 let wait_for =
                     inotify_cycle_wait(retry_wait, desired.difference(&watched).next().is_some());
@@ -2356,7 +2369,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let now = Instant::now();
                 let retry_wait = sparse_graphs
                     .values()
-                    .filter_map(|graph| graph.retry.remaining(now))
+                    .filter_map(|graph| {
+                        match (graph.retry.remaining(now), graph.sweep_deadline_remaining) {
+                            (Some(retry), Some(sweep)) => Some(retry.min(sweep)),
+                            (Some(retry), None) => Some(retry),
+                            (None, Some(sweep)) => Some(sweep),
+                            (None, None) => None,
+                        }
+                    })
                     .min()
                     .unwrap_or(Duration::from_secs(3))
                     .min(Duration::from_secs(3));
@@ -2436,6 +2456,8 @@ mod tests {
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
             managed_local_stage: None,
+            sweep_deadline_remaining: None,
+            sweep_deadline_due: false,
         }
     }
 
@@ -3327,6 +3349,22 @@ mod tests {
             ),
             "an admitted local change must not consume the provider obligation",
         );
+    }
+
+    #[test]
+    fn a_due_sweep_deadline_forces_the_quiet_watcher_turn() {
+        let mut due = runtime_snapshot(SyncRuntimeLifecycle::Active);
+        due.sweep_deadline_due = true;
+        assert!(due.has_runnable_work());
+        assert!(sparse_tick_needs_continuation(
+            &SyncRuntimeTick::Idle,
+            false,
+            due.has_runnable_work(),
+        ));
+
+        let source = include_str!("watcher.rs");
+        assert!(source.contains("&& !sweep_deadline_due"));
+        assert!(source.contains("graph.sweep_deadline_remaining"));
     }
 
     /// Provider arrival while the receiving actor is already busy with its own

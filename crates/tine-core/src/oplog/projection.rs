@@ -1734,6 +1734,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         && engine.receiver_absence_decision(plan.intent().page_id(), plan.intent().path())
             == super::absence_decision::AbsenceDecision::DeferredAbsence
     {
+        engine.note_deferred_absence_observation(plan.intent().page_id(), plan.intent().path());
         return Ok(Some(ProjectionExecution::DeferredAbsence));
     }
     receipts.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
@@ -1926,7 +1927,12 @@ fn recover_receiver_incomplete_projection_under_handoff(
             ) {
                 Ok(proof) => (proof, fallback),
                 Err(error) => {
-                    return receiver_recovery_terminal_disposition(graph, intent.path(), error);
+                    let disposition =
+                        receiver_recovery_terminal_disposition(graph, intent.path(), error)?;
+                    if disposition == ProjectionExecution::DeferredAbsence {
+                        engine.note_deferred_absence_observation(intent.page_id(), intent.path());
+                    }
+                    return Ok(disposition);
                 }
             }
         }
@@ -1965,11 +1971,18 @@ fn recover_receiver_incomplete_projection_under_handoff(
                     ) {
                         Ok(proof) => (proof, fallback),
                         Err(error) => {
-                            return receiver_recovery_terminal_disposition(
+                            let disposition = receiver_recovery_terminal_disposition(
                                 graph,
                                 intent.path(),
                                 error,
-                            );
+                            )?;
+                            if disposition == ProjectionExecution::DeferredAbsence {
+                                engine.note_deferred_absence_observation(
+                                    intent.page_id(),
+                                    intent.path(),
+                                );
+                            }
+                            return Ok(disposition);
                         }
                     }
                 }
@@ -2830,6 +2843,7 @@ fn execute_manifested_projection_work_located(
                 .local_projection_completed(local_attempt_intent.id()?)
                 .map_err(ProjectionError::Engine)?)
     {
+        engine.note_deferred_absence_observation(work.page_id(), work.path());
         return Ok(ProjectionExecution::DeferredAbsence);
     }
     if let Some(target) = target {

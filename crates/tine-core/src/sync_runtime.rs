@@ -47,6 +47,7 @@ use crate::model::{
     BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
     RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
+use crate::oplog::absence_sweep::{SweepError, SweepManager, SweepNotification, SweepTier};
 use crate::oplog::discovery::{
     classify_enrollment_error, discover_startup, AmbiguousEvidence, DiscoveryClassification,
     DiscoveryComponent, DiscoveryRequest, NonActiveStage, StartupStorageProfile,
@@ -1844,6 +1845,12 @@ pub struct SyncRuntimeStatusSnapshot {
     pub managed_local_checkpointed_sequence: u64,
     pub managed_local_next_sequence: u64,
     pub managed_local_stage: Option<String>,
+    /// Earliest durable absence-sweep transition (quiet-window close or
+    /// tier-3 grace expiry), measured when this snapshot was produced.
+    pub sweep_deadline_remaining: Option<Duration>,
+    /// True once the earliest durable sweep transition is due. This is
+    /// runnable work even on a filesystem-quiet graph.
+    pub sweep_deadline_due: bool,
 }
 
 impl SyncRuntimeStatusSnapshot {
@@ -1860,7 +1867,55 @@ impl SyncRuntimeStatusSnapshot {
     /// sleep.
     #[must_use]
     pub const fn has_runnable_work(&self) -> bool {
-        self.watcher.pending || self.provider_runnable
+        self.watcher.pending || self.provider_runnable || self.sweep_deadline_due
+    }
+}
+
+/// Backend notification emitted when an absence sweep reaches a surfaced
+/// tier. Packet C-4 deliberately exposes this structured event without adding
+/// frontend presentation; C-5 consumes it alongside working Restore support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncAbsenceSweepTier {
+    Tier2,
+    Tier3,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncAbsenceSweepEvent {
+    pub sweep_id: String,
+    pub tier: SyncAbsenceSweepTier,
+    pub absence_count: usize,
+    pub pages_at_open: usize,
+    pub opened_at_unix_ms: u64,
+    pub closed_at_unix_ms: Option<u64>,
+    pub grace_deadline_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncAbsenceSweepActionOutcome {
+    pub sweep_id: String,
+    pub action_id: String,
+    pub authored_batch_ids: Vec<String>,
+}
+
+impl From<&SweepNotification> for SyncAbsenceSweepEvent {
+    fn from(notification: &SweepNotification) -> Self {
+        Self {
+            sweep_id: notification.sweep_id.to_string(),
+            tier: match notification.tier {
+                SweepTier::Tier1 => unreachable!("tier-1 sweeps are quiet"),
+                SweepTier::Tier2 => SyncAbsenceSweepTier::Tier2,
+                SweepTier::Tier3 => SyncAbsenceSweepTier::Tier3,
+            },
+            absence_count: notification.absence_count,
+            pages_at_open: notification.pages_at_open,
+            opened_at_unix_ms: notification.opened_at_unix_ms,
+            closed_at_unix_ms: notification.closed_at_unix_ms,
+            grace_deadline_unix_ms: notification.grace_deadline_unix_ms,
+        }
     }
 }
 
@@ -3394,6 +3449,8 @@ impl SyncRuntimeHandle {
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
             managed_local_stage: None,
+            sweep_deadline_remaining: None,
+            sweep_deadline_due: false,
         };
         let status = Arc::new(RwLock::new(initial));
         let (sender, receiver) = mpsc::sync_channel(ACTOR_CHANNEL_CAPACITY);
@@ -3441,6 +3498,8 @@ impl SyncRuntimeHandle {
                         managed_local_checkpointed_sequence: 0,
                         managed_local_next_sequence: 0,
                         managed_local_stage: None,
+                        sweep_deadline_remaining: None,
+                        sweep_deadline_due: false,
                     };
                 }
                 #[cfg(test)]
@@ -4248,6 +4307,58 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    /// Structured tier-2/tier-3 absence-sweep notifications retained by the
+    /// actor. This is the packet C-4 backend surface; user-visible presentation
+    /// intentionally lands with C-5 once Restore is executable.
+    pub fn absence_sweep_events(
+        &self,
+    ) -> Result<Vec<SyncAbsenceSweepEvent>, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::AbsenceSweepEvents {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    pub fn reapply_absence_sweep(
+        &self,
+        sweep_id: &str,
+    ) -> Result<SyncAbsenceSweepActionOutcome, SyncRuntimeRequestError> {
+        let sweep_id = uuid::Uuid::parse_str(sweep_id)
+            .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ReapplyAbsenceSweep {
+            sweep_id,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+    }
+
+    /// Explicitly keep the accepted deletions and release any tier-3 grace
+    /// hold. This records the disposition before publication becomes runnable.
+    pub fn dispose_absence_sweep_keep_deletion(
+        &self,
+        sweep_id: &str,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let sweep_id = uuid::Uuid::parse_str(sweep_id)
+            .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::DisposeAbsenceSweep {
+            sweep_id,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+    }
+
     /// Why the clean runtime most recently had to retain a publication.
     ///
     /// Observational: it never advances retained work. A save can succeed
@@ -4895,6 +5006,7 @@ struct CleanRuntimeResources {
     runtime: CleanLocalRuntime,
     managed_local: ManagedLocalRuntimeState,
     projection_turns: ProjectionTurnJournalState,
+    sweeps: SweepManager,
     recovered_provider_batches: Vec<BatchId>,
 }
 
@@ -4907,6 +5019,7 @@ struct CleanRuntimeResources {
 /// Patricia-backed promotion state merely to fit the old actor shape.
 struct CleanRuntimeActorCore {
     runtime: CleanLocalRuntime,
+    sweeps: SweepManager,
     pending: Option<CleanPublishedContinuation>,
     /// Tracks consecutive identical failures of the retained continuation so a
     /// deterministic failure escalates to a named block instead of an
@@ -5138,13 +5251,14 @@ impl From<OperationalCoordinatorError> for CleanActorMutationFailure {
 }
 
 impl CleanRuntimeActorCore {
-    fn new(runtime: CleanLocalRuntime, seed_full_scan: bool) -> Self {
+    fn new(runtime: CleanLocalRuntime, sweeps: SweepManager, seed_full_scan: bool) -> Self {
         let mut watcher = CleanWatcherState::default();
         if seed_full_scan {
             watcher.seed_full_scan();
         }
         Self {
             runtime,
+            sweeps,
             pending: None,
             retry_fingerprint: None,
             watcher,
@@ -5750,6 +5864,7 @@ impl CleanRuntimeActorCore {
                 graph,
                 receipts,
                 &requested,
+                &mut self.sweeps,
             )
             .map_err(CleanActorMutationFailure::from)?
         };
@@ -6182,6 +6297,13 @@ fn activate_clean_runtime_resources_retaining_archive(
     engine
         .open_local_completion_index(&store)
         .map_err(display)?;
+    let accepted_batch_ids = engine
+        .status()
+        .accepted_batch_ids()
+        .map_err(display)?
+        .into_iter()
+        .collect();
+    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
     let mut runtime = CleanLocalRuntime::from_open_parts(
         request.identities.session_id,
         endpoint,
@@ -6216,6 +6338,7 @@ fn activate_clean_runtime_resources_retaining_archive(
         runtime,
         managed_local,
         projection_turns,
+        sweeps,
         recovered_provider_batches: Vec::new(),
     })
 }
@@ -6395,6 +6518,17 @@ fn open_clean_runtime_resources_with_progress(
     engine
         .open_local_completion_index(&store)
         .map_err(display)?;
+    // Packet C-4 open order: enumerate and reconcile sweep chains under the
+    // workspace lease before either journal drain or any actor publication
+    // path can run. Open/in-grace records therefore re-establish the barrier
+    // before retained outbound work becomes runnable.
+    let accepted_batch_ids = engine
+        .status()
+        .accepted_batch_ids()
+        .map_err(display)?
+        .into_iter()
+        .collect();
+    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
     let mut retired_own_intent_ids = engine.local_completed_projection_intent_ids();
     let endpoint = engine
         .projection_endpoint_binding()
@@ -6467,6 +6601,7 @@ fn open_clean_runtime_resources_with_progress(
         runtime,
         managed_local,
         projection_turns,
+        sweeps,
         recovered_provider_batches,
     }))
 }
@@ -8807,6 +8942,17 @@ enum ActorRequest {
     LastRetainedPublication {
         reply: mpsc::Sender<Option<SyncRetainedPublicationReport>>,
     },
+    AbsenceSweepEvents {
+        reply: mpsc::Sender<Vec<SyncAbsenceSweepEvent>>,
+    },
+    ReapplyAbsenceSweep {
+        sweep_id: uuid::Uuid,
+        reply: mpsc::Sender<Result<SyncAbsenceSweepActionOutcome, SyncRuntimeRequestError>>,
+    },
+    DisposeAbsenceSweep {
+        sweep_id: uuid::Uuid,
+        reply: mpsc::Sender<Result<(), SyncRuntimeRequestError>>,
+    },
     #[cfg(test)]
     LegacyPublicationSettlements { reply: mpsc::Sender<usize> },
     #[cfg(test)]
@@ -9022,9 +9168,9 @@ fn run_actor_loop(
     loop {
         let timeout = actor
             .local_completion_deadline_remaining(Instant::now())
-            .map_or(MANAGED_LOCAL_IDLE_TICK, |remaining| {
-                MANAGED_LOCAL_IDLE_TICK.min(remaining)
-            });
+            .into_iter()
+            .chain(actor.sweep_deadline_remaining())
+            .fold(MANAGED_LOCAL_IDLE_TICK, Duration::min);
         let request = match receiver.recv_timeout(timeout) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -9033,6 +9179,7 @@ fn run_actor_loop(
                     .as_ref()
                     .is_some_and(|managed| managed.pending_count() != 0)
                     || actor.local_completion_flush_due(Instant::now())
+                    || actor.sweep_deadline_due()
                 {
                     let tick = actor.tick();
                     actor.last_tick = Some(tick);
@@ -9230,6 +9377,41 @@ fn run_actor_loop(
             }
             ActorRequest::LastRetainedPublication { reply } => {
                 let _ = reply.send(actor.last_retained_publication.clone());
+                false
+            }
+            ActorRequest::AbsenceSweepEvents { reply } => {
+                let events = actor.clean.as_ref().map_or_else(Vec::new, |clean| {
+                    clean
+                        .sweeps
+                        .notifications()
+                        .iter()
+                        .map(SyncAbsenceSweepEvent::from)
+                        .collect()
+                });
+                let _ = reply.send(events);
+                false
+            }
+            ActorRequest::ReapplyAbsenceSweep { sweep_id, reply } => {
+                let result = actor.reapply_absence_sweep(sweep_id);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::DisposeAbsenceSweep { sweep_id, reply } => {
+                let result = actor
+                    .clean
+                    .as_mut()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)
+                    .and_then(|clean| {
+                        clean
+                            .sweeps
+                            .dispose_keep_deletion(sweep_id)
+                            .map_err(|error| {
+                                SyncRuntimeRequestError::ActorRefused(format!(
+                                    "cannot durably dispose absence sweep: {error}"
+                                ))
+                            })
+                    });
+                let _ = reply.send(result);
                 false
             }
             #[cfg(test)]
@@ -11615,6 +11797,80 @@ impl RuntimeActor {
             .is_some_and(|clean| clean.runtime.engine().local_completion_flush_due(now))
     }
 
+    fn sweep_deadline_remaining(&self) -> Option<Duration> {
+        self.clean
+            .as_ref()
+            .and_then(|clean| clean.sweeps.deadline_remaining())
+    }
+
+    fn sweep_deadline_due(&self) -> bool {
+        self.clean
+            .as_ref()
+            .is_some_and(|clean| clean.sweeps.deadline_due())
+    }
+
+    fn publication_barrier_active(&self) -> bool {
+        self.clean
+            .as_ref()
+            .is_some_and(|clean| clean.sweeps.publication_barrier_active())
+    }
+
+    fn admit_deferred_absence_observations(&mut self) -> Result<bool, String> {
+        let clean = self
+            .clean
+            .as_mut()
+            .ok_or_else(|| "clean actor has no sweep coalescer".to_owned())?;
+        let observations = clean.runtime.engine().take_deferred_absence_observations();
+        if observations.is_empty() {
+            return Ok(false);
+        }
+        let claim_source = clean
+            .runtime
+            .database()
+            .materialized_read()
+            .map_err(display)?;
+        let mut page_count_at_open = || {
+            let mut count = 0_usize;
+            let mut cursor = None;
+            loop {
+                let pages = claim_source
+                    .page_inventory_after(
+                        cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
+                        None,
+                        512,
+                    )
+                    .map_err(|error| SweepError::Invalid(error.to_string()))?;
+                if pages.is_empty() {
+                    break;
+                }
+                count = count.saturating_add(pages.len());
+                let last = pages.last().expect("nonempty page inventory batch");
+                cursor = Some((last.path.clone(), last.page_id));
+                if pages.len() < 512 {
+                    break;
+                }
+            }
+            Ok(count)
+        };
+        match clean.sweeps.record_deferred_absences(
+            clean.runtime.engine(),
+            &claim_source,
+            observations.clone(),
+            &mut page_count_at_open,
+        ) {
+            Ok(sweep_id) => Ok(sweep_id.is_some()),
+            Err(error) => {
+                clean
+                    .runtime
+                    .engine()
+                    .restore_deferred_absence_observations(observations);
+                Err(format!(
+                    "cannot durably admit replay-deferred absence observation: {error}"
+                ))
+            }
+        }
+    }
+
     fn local_completion_idle(&self) -> bool {
         self.clean.as_ref().is_some_and(|clean| {
             clean.pending.is_none()
@@ -11766,6 +12022,7 @@ impl RuntimeActor {
             runtime,
             managed_local,
             projection_turns,
+            sweeps,
             recovered_provider_batches,
         } = resources;
         if runtime.session_id() != identities.session_id
@@ -11828,6 +12085,7 @@ impl RuntimeActor {
         };
         let clean = CleanRuntimeActorCore::new(
             runtime,
+            sweeps,
             recovery == SyncRuntimeRecovery::CleanManifestReplay,
         );
         let last_watcher = clean.watcher_status();
@@ -11932,6 +12190,18 @@ impl RuntimeActor {
             pending_join: None,
             _not_send_or_sync: PhantomData,
         };
+        actor.admit_deferred_absence_observations()?;
+        let pending_reapply = actor
+            .clean
+            .as_ref()
+            .expect("clean actor was just assembled")
+            .sweeps
+            .pending_reapply_actions();
+        for (sweep_id, _) in pending_reapply {
+            actor.reapply_absence_sweep(sweep_id).map_err(|error| {
+                format!("cannot resume durable absence sweep re-apply {sweep_id}: {error}")
+            })?;
+        }
         for batch_id in recovered_provider_batches {
             actor.queue_clean_provider_publication(batch_id);
         }
@@ -19906,6 +20176,28 @@ impl RuntimeActor {
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
+        match self.admit_deferred_absence_observations() {
+            Ok(true) => return SyncRuntimeTick::Recovering,
+            Ok(false) => {}
+            Err(error) => return SyncRuntimeTick::RecoveryBlocked(error),
+        }
+        let deadline_changed = match self
+            .clean
+            .as_mut()
+            .expect("clean tick is routed only to a clean actor")
+            .sweeps
+            .process_deadlines()
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                return SyncRuntimeTick::RecoveryBlocked(format!(
+                    "cannot durably advance absence sweep deadline: {error}"
+                ));
+            }
+        };
+        if deadline_changed {
+            return SyncRuntimeTick::Recovering;
+        }
         if let Some(outcome) = self.tick_clean_foreground_derivative() {
             return outcome;
         }
@@ -20132,6 +20424,19 @@ impl RuntimeActor {
         SyncRuntimeTick::Terminal("pre-0.7 managed runtime is no longer supported".into())
     }
 
+    fn provider_history_publication_has_work(&self) -> bool {
+        self.provider_publication_probe
+            || self.provider_publication_cursor.is_some()
+            || !self.provider_publication_forced.is_empty()
+            || self.provider_publication_repair_requested
+            || self.provider_publication_repair_cursor.is_some()
+            || !self.provider_recovery_exact.is_empty()
+            || self.provider_recovery_backfill_requested
+            || self.provider_recovery_backfill_cursor.is_some()
+            || self.provider_head_dirty
+            || !self.provider_head_retirement.is_empty()
+    }
+
     fn provider_transport_has_work(&self) -> bool {
         !self.provider_exact.is_empty()
             || self.provider_rescan_requested
@@ -20143,17 +20448,8 @@ impl RuntimeActor {
             || !self.provider_accepted_archive_loss.is_empty()
             || self.provider_accepted_manifest_audit.is_some()
             || (self.provider_objects_changed && !self.provider_incomplete.is_empty())
-            || self.provider_publication_probe
-            || self.provider_publication_cursor.is_some()
-            || !self.provider_publication_forced.is_empty()
             || self.provider_descriptor_repair_requested
-            || self.provider_publication_repair_requested
-            || self.provider_publication_repair_cursor.is_some()
-            || !self.provider_recovery_exact.is_empty()
-            || self.provider_recovery_backfill_requested
-            || self.provider_recovery_backfill_cursor.is_some()
-            || self.provider_head_dirty
-            || !self.provider_head_retirement.is_empty()
+            || (!self.publication_barrier_active() && self.provider_history_publication_has_work())
     }
 
     fn provider_has_work(&self) -> bool {
@@ -20638,37 +20934,41 @@ impl RuntimeActor {
                 "clean SharedActive runtime has no provider transport".into(),
             );
         }
-        if let Some(batch_id) = self.provider_publication_forced.front().copied() {
-            let engine = match self.active_engine() {
-                Ok(engine) => engine,
-                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
-            };
-            let head = match clean_frontier_head(engine, &descriptor, self.binding.device_id()) {
-                Ok(head) => head,
-                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
-            };
-            let published = publish_clean_archive_batch(
-                &store,
-                self.provider.as_mut().expect("provider checked"),
-                descriptor.workspace_id(),
-                descriptor.lineage_digest(),
-                batch_id,
-            )
-            .and_then(|()| {
-                self.provider
-                    .as_mut()
-                    .expect("provider checked")
-                    .publish_frontier_head(&head)
-                    .map(|_| ())
-                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
-            });
-            return match published {
-                Ok(()) => {
-                    self.provider_publication_forced.pop_front();
-                    SyncRuntimeTick::Recovering
-                }
-                Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
-            };
+        let publication_held = self.publication_barrier_active();
+        if !publication_held {
+            if let Some(batch_id) = self.provider_publication_forced.front().copied() {
+                let engine = match self.active_engine() {
+                    Ok(engine) => engine,
+                    Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+                };
+                let head = match clean_frontier_head(engine, &descriptor, self.binding.device_id())
+                {
+                    Ok(head) => head,
+                    Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+                };
+                let published = publish_clean_archive_batch(
+                    &store,
+                    self.provider.as_mut().expect("provider checked"),
+                    descriptor.workspace_id(),
+                    descriptor.lineage_digest(),
+                    batch_id,
+                )
+                .and_then(|()| {
+                    self.provider
+                        .as_mut()
+                        .expect("provider checked")
+                        .publish_frontier_head(&head)
+                        .map(|_| ())
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+                });
+                return match published {
+                    Ok(()) => {
+                        self.provider_publication_forced.pop_front();
+                        SyncRuntimeTick::Recovering
+                    }
+                    Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+                };
+            }
         }
         if self.provider_descriptor_repair_requested {
             // Republish the one file another device joins by. A file-sync tool
@@ -20707,7 +21007,7 @@ impl RuntimeActor {
                 Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
             };
         }
-        if self.provider_publication_repair_requested {
+        if self.provider_publication_repair_requested && !publication_held {
             let engine = match self.active_engine() {
                 Ok(engine) => engine,
                 Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
@@ -21050,6 +21350,107 @@ impl RuntimeActor {
         }
     }
 
+    fn reapply_absence_sweep(
+        &mut self,
+        sweep_id: uuid::Uuid,
+    ) -> Result<SyncAbsenceSweepActionOutcome, SyncRuntimeRequestError> {
+        let (action_id, pages) = self
+            .clean
+            .as_mut()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .sweeps
+            .begin_reapply(sweep_id)
+            .map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(format!(
+                    "cannot durably begin absence sweep re-apply: {error}"
+                ))
+            })?;
+        let live_pages = {
+            let clean = self
+                .clean
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+            let claim_source = clean
+                .runtime
+                .database()
+                .materialized_read()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            let mut live = Vec::new();
+            for (page_id, path) in pages {
+                let predecessor = match clean.runtime.engine().clean_import_projection_predecessor(
+                    &path,
+                    Some(page_id),
+                    &claim_source,
+                ) {
+                    Ok(predecessor) => predecessor,
+                    Err(
+                        crate::oplog::EngineError::PageDeleted(_)
+                        | crate::oplog::EngineError::PageNotFound(_),
+                    ) => continue,
+                    Err(error) => {
+                        return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                            "cannot compare sweep member with accepted state: {error}"
+                        )));
+                    }
+                };
+                if matches!(
+                    predecessor,
+                    Some(
+                        crate::oplog::hot_engine::CleanImportProjectionPredecessor::Present { .. }
+                    )
+                ) {
+                    live.push(page_id);
+                }
+            }
+            live
+        };
+        let authored_batch_ids = if live_pages.is_empty() {
+            Vec::new()
+        } else {
+            let operations = live_pages
+                .into_iter()
+                .map(|page_id| SemanticOperation::DeletePage { page_id })
+                .collect();
+            let transaction = OperationTransaction::new(operations).map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(format!(
+                    "cannot plan idempotent absence sweep re-apply: {error}"
+                ))
+            })?;
+            match self.submit_local_mutation(transaction) {
+                SyncLocalMutationOutcome::Durable { batch_id }
+                | SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                    batch_id: Some(batch_id),
+                    ..
+                } => vec![batch_id],
+                outcome => {
+                    let reason = format!("re-apply did not author an accepted batch: {outcome:?}");
+                    let _ = self
+                        .clean
+                        .as_mut()
+                        .expect("clean sweep action retains its runtime")
+                        .sweeps
+                        .fail_reapply(sweep_id, action_id, reason.clone());
+                    return Err(SyncRuntimeRequestError::ActorRefused(reason));
+                }
+            }
+        };
+        self.clean
+            .as_mut()
+            .expect("clean sweep action retains its runtime")
+            .sweeps
+            .finish_reapply(sweep_id, action_id, authored_batch_ids.clone())
+            .map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(format!(
+                    "re-apply deletion is accepted but its sweep completion record could not be appended: {error}"
+                ))
+            })?;
+        Ok(SyncAbsenceSweepActionOutcome {
+            sweep_id: sweep_id.to_string(),
+            action_id: action_id.to_string(),
+            authored_batch_ids: authored_batch_ids.iter().map(ToString::to_string).collect(),
+        })
+    }
+
     fn execute_local_transaction_with_batch_id(
         &mut self,
         transaction: OperationTransaction,
@@ -21243,6 +21644,12 @@ impl RuntimeActor {
         if let Some(detail) = &self.terminal {
             return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
         }
+        if self.publication_barrier_active() {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "prepare-share refused: external deletions awaiting disposition; a half-synced folder or dying mount must not publish history-bearing deletions into the first shared baseline. Retry after the sweep closes or is explicitly disposed"
+                    .into(),
+            ));
+        }
         self.clean_shutdown()?;
         if let Some(descriptor) = self.clean_shared_descriptor.clone() {
             return SyncSharedEnrollmentDescriptor::from_clean(descriptor)
@@ -21414,6 +21821,7 @@ impl RuntimeActor {
             runtime,
             managed_local,
             projection_turns,
+            sweeps,
             recovered_provider_batches,
         } = resources;
         self.graph = graph;
@@ -21428,7 +21836,7 @@ impl RuntimeActor {
         // scan: a joiner's own pre-join batch can be superseded by the
         // reconstructed merged history, leaving its disk projection stale
         // until a scan reconciles it (GH #351 audit finding 1).
-        self.clean = Some(CleanRuntimeActorCore::new(runtime, true));
+        self.clean = Some(CleanRuntimeActorCore::new(runtime, sweeps, true));
         self.managed_local = Some(managed_local);
         self.projection_turns = Some(projection_turns);
         for batch_id in recovered_provider_batches {
@@ -21634,6 +22042,8 @@ impl RuntimeActor {
                 .managed_local
                 .as_ref()
                 .and_then(ManagedLocalRuntimeState::stage),
+            sweep_deadline_remaining: self.sweep_deadline_remaining(),
+            sweep_deadline_due: self.sweep_deadline_due(),
         }
     }
 }
@@ -28141,12 +28551,14 @@ mod tests {
             runtime,
             managed_local,
             projection_turns,
+            sweeps,
             recovered_provider_batches: _,
         } = resources;
         drop(managed_local);
         drop(runtime);
         drop(receipts);
         drop(graph);
+        drop(sweeps);
         let error = match open_clean_runtime_resources(&reopen_request(&fixture.request)) {
             Err(error) => error,
             Ok(_) => panic!("projection-turn journal unexpectedly opened twice"),
@@ -28773,6 +29185,7 @@ mod tests {
             }
         }
         run_receiver_absence_decision_oracle();
+        run_absence_sweep_recovery_oracle();
     }
 
     /// The permanent real-store oracle owns the three receiver decisions as
@@ -28783,6 +29196,20 @@ mod tests {
         receiver_without_completion_creates_first_projection_case();
         receiver_completion_defers_closed_window_external_deletion_case();
         receiver_incomplete_update_maps_absent_terminal_to_deferral_case();
+    }
+
+    /// Packet C-4 extends both the one-schedule and full real-store oracles
+    /// with the same durable sweep crash rows. In addition to the oracle's
+    /// existing graph bytes, accepted batch count/frontier and projection-head
+    /// comparison, these cases compare record membership against accepted
+    /// batch ids, startup re-observation, one-sweep scan coalescence, and the
+    /// provider manifest's absence/presence across reopen and grace release.
+    fn run_absence_sweep_recovery_oracle() {
+        sweep_membership_is_durable_before_deletion_commit_and_reopen_drops_the_uncommitted_member(
+        );
+        tier3_grace_holds_forced_publication_and_is_rederived_before_reopen_repair();
+        startup_scan_absences_coalesce_into_one_sweep_across_a_mid_scan_crash();
+        crate::oplog::absence_sweep::assert_torn_sweep_tail_recovers_for_oracle();
     }
 
     #[test]
@@ -28808,10 +29235,11 @@ mod tests {
             runtime,
             managed_local,
             projection_turns,
+            sweeps,
             recovered_provider_batches: _,
         } = resources;
         drop((managed_local, projection_turns));
-        let mut actor = CleanRuntimeActorCore::new(runtime, false);
+        let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
             .runtime
@@ -28916,11 +29344,12 @@ mod tests {
             runtime,
             managed_local,
             projection_turns,
+            sweeps,
             recovered_provider_batches: _,
         } = resources;
         drop((managed_local, projection_turns));
         let accepted_before = runtime.engine().accepted_batch_count().unwrap();
-        let mut actor = CleanRuntimeActorCore::new(runtime, false);
+        let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
             .runtime
@@ -28968,6 +29397,7 @@ mod tests {
             runtime,
             managed_local,
             projection_turns,
+            sweeps,
             recovered_provider_batches: _,
         } = reopened;
         drop((managed_local, projection_turns));
@@ -28982,7 +29412,7 @@ mod tests {
             "reopen must not project the cut batch"
         );
 
-        let mut actor = CleanRuntimeActorCore::new(runtime, false);
+        let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let current = actor
             .load_current_editor_page(owner.page_id)
             .unwrap()
@@ -29071,11 +29501,12 @@ mod tests {
                 runtime,
                 managed_local,
                 projection_turns,
+                sweeps,
                 recovered_provider_batches: _,
             } = resources;
             drop((managed_local, projection_turns));
             let accepted_before = runtime.engine().accepted_batch_count().unwrap();
-            let mut actor = CleanRuntimeActorCore::new(runtime, false);
+            let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
             let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
             let owner = actor
                 .runtime
@@ -29174,10 +29605,11 @@ mod tests {
                 runtime,
                 managed_local,
                 projection_turns,
+                sweeps,
                 recovered_provider_batches: _,
             } = reopened;
             drop((managed_local, projection_turns));
-            let mut actor = CleanRuntimeActorCore::new(runtime, false);
+            let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
             let retry = edit(&mut actor);
             let repaired = actor.execute_local(&graph, &receipts, &retry);
             assert!(
@@ -29357,10 +29789,11 @@ mod tests {
             runtime,
             managed_local,
             projection_turns,
+            sweeps,
             recovered_provider_batches: _,
         } = resources;
         drop((managed_local, projection_turns));
-        let mut actor = CleanRuntimeActorCore::new(runtime, false);
+        let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
             .runtime
@@ -29664,6 +30097,362 @@ mod tests {
             "a later open resurrected the accepted foreground bytes"
         );
         assert!(!fixture.graph_root.join("Root.md").exists());
+    }
+
+    #[test]
+    fn sweep_membership_is_durable_before_deletion_commit_and_reopen_drops_the_uncommitted_member()
+    {
+        let fixture = ActivationFixture::nested_unicode("sweep-before-delete-commit", 0xc4001);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        )
+        .unwrap();
+
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        actor
+            .observe(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        fail_once_at(OperationalFaultPoint::AfterSweepRecord);
+        let failed = actor.tick();
+        assert!(matches!(failed, SyncRuntimeTick::Failed(_)), "{failed:?}");
+        let records = actor.clean.as_ref().unwrap().sweeps.records_for_test();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].members.len(), 1);
+        let uncommitted_batch = records[0].members[0]
+            .deletion_batch_id
+            .expect("pre-commit record fixes the deletion batch id");
+        assert_eq!(
+            records[0].members[0].predecessor_accepted_state.page_id,
+            records[0].members[0].page_id
+        );
+        assert!(
+            records[0].members[0].prior_present_intent_id.is_some(),
+            "the C-4 format already carries C-5 Restore provenance"
+        );
+        assert!(
+            !actor
+                .active_engine()
+                .unwrap()
+                .status()
+                .accepted_batch_ids()
+                .unwrap()
+                .contains(&uncommitted_batch),
+            "the fault is between the durable sweep append and batch commit"
+        );
+        drop(actor);
+
+        let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .expect("recorded pre-commit crash reopens");
+        let records = reopened.sweeps.records_for_test();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].members.is_empty(),
+            "reopen reconciles membership against the committed-batch set"
+        );
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut resumed = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            reopened,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        for _ in 0..64 {
+            let tick = resumed.tick();
+            assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+            if !resumed.clean.as_ref().unwrap().watcher_status().pending {
+                break;
+            }
+        }
+        let records = resumed.clean.as_ref().unwrap().sweeps.records_for_test();
+        assert_eq!(records[0].members.len(), 1);
+        let resumed_batch = records[0].members[0].deletion_batch_id.unwrap();
+        assert!(
+            resumed
+                .active_engine()
+                .unwrap()
+                .status()
+                .accepted_batch_ids()
+                .unwrap()
+                .contains(&resumed_batch),
+            "the startup scan re-observes and commits the deterministic deletion batch"
+        );
+        assert!(matches!(
+            resumed
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::ExactPath {
+                        path: "Root.md".into(),
+                    },
+                })
+                .unwrap(),
+            SyncApplicationPageLoadOutcome::Missing { .. }
+        ));
+    }
+
+    #[test]
+    fn tier3_sweep_event_and_prepare_share_refusal_name_the_mass_absence_threat() {
+        let fixture = ActivationFixture::nested_unicode("sweep-prepare-share-refusal", 0xc4101);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("sweep fixture activates");
+        drive_initial_feed(&handle);
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(admitted_an_epoch(&ticks), "{ticks:?}");
+        let events = handle.absence_sweep_events().unwrap();
+        let event = events.last().expect("tier-3 sweep emits a backend event");
+        assert_eq!(event.tier, SyncAbsenceSweepTier::Tier3);
+        assert_eq!(event.absence_count, 1);
+        assert_eq!(event.pages_at_open, 3);
+
+        let refusal = handle.prepare_shared().unwrap_err().to_string();
+        assert!(refusal.contains("external deletions awaiting disposition"));
+        assert!(refusal.contains("half-synced folder or dying mount"));
+
+        let reapplied = handle.reapply_absence_sweep(&event.sweep_id).unwrap();
+        assert!(
+            reapplied.authored_batch_ids.is_empty(),
+            "an already-accepted deletion is an idempotent Re-apply noop"
+        );
+        assert!(handle
+            .dispose_absence_sweep_keep_deletion(&event.sweep_id)
+            .is_ok());
+    }
+
+    #[test]
+    fn tier3_grace_holds_forced_publication_and_is_rederived_before_reopen_repair() {
+        let fixture = ActivationFixture::nested_unicode("sweep-grace-reopen", 0xc4201);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let open_request = reopen_request(&fixture.request);
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("shared actor reopens");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        for _ in 0..128 {
+            let tick = actor.tick();
+            assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+            if !actor.provider_has_work() {
+                break;
+            }
+        }
+
+        fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+        actor
+            .observe(vec![
+                SyncWatcherObservation::managed_path("Root.md").unwrap()
+            ])
+            .unwrap();
+        for _ in 0..64 {
+            let tick = actor.tick();
+            assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+            if !actor.clean.as_ref().unwrap().watcher_status().pending {
+                break;
+            }
+        }
+        let record = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].clone();
+        assert_eq!(record.tier, SweepTier::Tier3);
+        let deletion_batch = record.members[0].deletion_batch_id.unwrap();
+        let provider_manifest = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{deletion_batch}.manifest"));
+        assert!(actor.publication_barrier_active());
+        assert!(!actor.provider_transport_has_work());
+        assert!(!provider_manifest.exists());
+
+        let descriptor_path = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH);
+        fs::remove_file(&descriptor_path).unwrap();
+        actor.provider_descriptor_repair_requested = true;
+        assert!(matches!(actor.tick(), SyncRuntimeTick::Recovering));
+        assert!(
+            descriptor_path.exists(),
+            "descriptor-only repair remains allowed during the hold"
+        );
+        assert!(
+            !provider_manifest.exists(),
+            "the descriptor-only exemption carries no batch/head history"
+        );
+
+        actor
+            .clean
+            .as_mut()
+            .unwrap()
+            .sweeps
+            .force_open_window_close_for_test()
+            .unwrap();
+        assert!(actor.publication_barrier_active());
+        assert!(!provider_manifest.exists());
+        drop(actor);
+
+        let open_request = reopen_request(&fixture.request);
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("in-grace sweep reopens");
+        assert!(resources.sweeps.publication_barrier_active());
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut reopened = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        assert!(reopened.publication_barrier_active());
+        assert!(
+            reopened.provider_history_publication_has_work(),
+            "reopen retained the held publication repair"
+        );
+        for _ in 0..16 {
+            let tick = reopened.tick();
+            assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+            assert!(
+                !provider_manifest.exists(),
+                "inbound/rescan work must not let held history escape"
+            );
+            if !reopened.provider_transport_has_work() {
+                break;
+            }
+        }
+        assert!(!reopened.provider_transport_has_work());
+
+        reopened
+            .clean
+            .as_mut()
+            .unwrap()
+            .sweeps
+            .force_grace_expiry_for_test()
+            .unwrap();
+        assert!(!reopened.publication_barrier_active());
+        for _ in 0..128 {
+            let tick = reopened.tick();
+            assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+            if provider_manifest.exists() {
+                break;
+            }
+        }
+        assert!(
+            provider_manifest.exists(),
+            "held deletion publishes only after the recorded grace expires"
+        );
+    }
+
+    #[test]
+    fn startup_scan_absences_coalesce_into_one_sweep_across_a_mid_scan_crash() {
+        let fixture = ActivationFixture::scaled("sweep-mid-scan", 0xc4301, 260);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("scaled sweep fixture activates");
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        for index in 0..4 {
+            fs::remove_file(fixture.graph_root.join(format!(
+                "notes/規模/{}/深い/Página-{index}-計画.md",
+                index % 8
+            )))
+            .unwrap();
+        }
+
+        let interrupted = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        assert!(matches!(
+            interrupted.tick().unwrap(),
+            SyncRuntimeTick::Recovering
+        ));
+        assert!(interrupted.absence_sweep_events().unwrap().is_empty());
+        drop(interrupted);
+
+        let resumed = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        let ticks = drain_until_settled(&resumed);
+        assert!(admitted_an_epoch(&ticks), "{ticks:?}");
+        let events = resumed.absence_sweep_events().unwrap();
+        let event = events.last().expect("the resumed scan evaluates one sweep");
+        assert_eq!(event.tier, SyncAbsenceSweepTier::Tier2);
+        assert_eq!(event.absence_count, 4);
+        assert_eq!(event.pages_at_open, 263);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sweep_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "startup scan timing must not split its absences"
+        );
+    }
+
+    #[test]
+    fn open_sweep_escalates_from_quiet_tier1_to_structured_tier2_in_place() {
+        let fixture = ActivationFixture::scaled("sweep-tier-escalation", 0xc4401, 100);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("tier escalation fixture activates");
+        drive_initial_feed(&handle);
+        let path = |index: usize| format!("notes/規模/{}/深い/Página-{index}-計画.md", index % 8);
+        let first = (0..3).map(path).collect::<Vec<_>>();
+        for path in &first {
+            fs::remove_file(fixture.graph_root.join(path)).unwrap();
+        }
+        handle
+            .observe_watcher(
+                first
+                    .iter()
+                    .map(|path| SyncWatcherObservation::managed_path(path).unwrap())
+                    .collect(),
+            )
+            .unwrap();
+        drain_until_settled(&handle);
+        assert!(
+            handle.absence_sweep_events().unwrap().is_empty(),
+            "tier 1 is quiet"
+        );
+
+        let fourth = path(3);
+        fs::remove_file(fixture.graph_root.join(&fourth)).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(fourth).unwrap()])
+            .unwrap();
+        drain_until_settled(&handle);
+        let events = handle.absence_sweep_events().unwrap();
+        let event = events.last().expect("crossing k=4 emits tier 2");
+        assert_eq!(event.tier, SyncAbsenceSweepTier::Tier2);
+        assert_eq!(event.absence_count, 4);
+        assert_eq!(event.pages_at_open, 103);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sweep_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "tier escalation updates the open logical sweep"
+        );
     }
 
     #[test]
@@ -42931,6 +43720,12 @@ mod tests {
         crate::durability_counters::BarrierSession::detach_current_thread();
 
         assert_eq!(
+            save_foreground.total(),
+            3,
+            "managed save foreground barrier pin moved: {}",
+            save_foreground.report()
+        );
+        assert_eq!(
             save_total.total(),
             crate::durability_counters::MANAGED_SAVE_BARRIER_BUDGET,
             "one accepted single-block managed save performed {} core-initiated durability \
@@ -42939,6 +43734,12 @@ mod tests {
             save_total.total(),
             crate::durability_counters::MANAGED_SAVE_BARRIER_BUDGET,
             save_total.report()
+        );
+        assert_eq!(
+            move_foreground.total(),
+            0,
+            "managed move foreground barrier pin moved: {}",
+            move_foreground.report()
         );
         assert_eq!(
             move_total.total(),
