@@ -2103,17 +2103,6 @@ pub(crate) fn execute_clean_manifested_projection_work(
         .map(|_| ())
 }
 
-pub(crate) fn execute_clean_manifested_projection_work_under_handoff(
-    graph: &Graph,
-    projection: &SqliteFrontier,
-    engine: &mut ShardedHotEngine,
-    work: &ProjectionWork,
-    handoff: &crate::model::PublishedHandoffLatch,
-) -> Result<(), ProjectionError> {
-    execute_manifested_projection_work_with_runtime(graph, engine, projection, work, Some(handoff))
-        .map(|_| ())
-}
-
 /// Lower accepted manifest locators into the description-only page list stored
 /// by a projection-domain turn. Archive objects are durable before every A3-A7
 /// append, so this reads authority; it does not capture graph bytes.

@@ -5564,6 +5564,7 @@ impl CleanRuntimeActorCore {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorMutationOutcome::RetainedPriorPending {
@@ -5578,8 +5579,14 @@ impl CleanRuntimeActorCore {
                     detail: error.to_string(),
                 }
             })?;
-            OperationalCoordinator::execute_clean_local(&mut session, graph, receipts, transaction)
-                .map_err(CleanActorMutationFailure::from)?
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                graph,
+                receipts,
+                transaction,
+                projection_turns,
+            )
+            .map_err(CleanActorMutationFailure::from)?
         };
         Ok(self.retain_outcome(state))
     }
@@ -5667,6 +5674,7 @@ impl CleanRuntimeActorCore {
         batch_id: BatchId,
         transaction: &OperationTransaction,
         persist_fingerprint: impl FnMut(ContentDigest) -> Result<(), String>,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorMutationOutcome::RetainedPriorPending {
@@ -5688,6 +5696,7 @@ impl CleanRuntimeActorCore {
                 batch_id,
                 transaction,
                 persist_fingerprint,
+                projection_turns,
             )
             .map_err(CleanActorMutationFailure::from)?
         };
@@ -5750,28 +5759,11 @@ impl CleanRuntimeActorCore {
         })
     }
 
-    fn retry_pending(
-        &mut self,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-    ) -> Option<CleanActorMutationOutcome> {
-        self.retry_pending_inner(graph, receipts, None)
-    }
-
     fn retry_pending_with_turns(
         &mut self,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         projection_turns: &mut ProjectionTurnJournalState,
-    ) -> Option<CleanActorMutationOutcome> {
-        self.retry_pending_inner(graph, receipts, Some(projection_turns))
-    }
-
-    fn retry_pending_inner(
-        &mut self,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        projection_turns: Option<&mut ProjectionTurnJournalState>,
     ) -> Option<CleanActorMutationOutcome> {
         // Escalation never stops the retries: an identical detail string three
         // times is not proof the failure is deterministic (a transient
@@ -5781,24 +5773,13 @@ impl CleanRuntimeActorCore {
         // pending retry.
         let pending = self.pending.take()?;
         let state = match self.runtime.admit_clean_derived_recovery(graph) {
-            Ok(mut session) if pending.projection_turn_ingress() => match projection_turns {
-                Some(turns) => OperationalCoordinator::retry_clean_local_with_turns(
-                    &mut session,
-                    graph,
-                    receipts,
-                    pending,
-                    turns,
-                ),
-                None => OperationalCoordinator::retry_clean_local(
-                    &mut session,
-                    graph,
-                    receipts,
-                    pending,
-                ),
-            },
-            Ok(mut session) => {
-                OperationalCoordinator::retry_clean_local(&mut session, graph, receipts, pending)
-            }
+            Ok(mut session) => OperationalCoordinator::retry_clean_local_with_turns(
+                &mut session,
+                graph,
+                receipts,
+                pending,
+                projection_turns,
+            ),
             Err(admission) => {
                 self.pending = Some(pending);
                 let pending = self.pending.as_ref().expect("pending was restored");
@@ -6131,6 +6112,7 @@ impl CleanRuntimeActorCore {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         paths: &BTreeSet<ManagedPath>,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanActorExternalOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorExternalOutcome::DurablePending {
@@ -6152,6 +6134,7 @@ impl CleanRuntimeActorCore {
                 receipts,
                 &requested,
                 &mut self.sweeps,
+                projection_turns,
             )
             .map_err(CleanActorMutationFailure::from)?
         };
@@ -20419,11 +20402,15 @@ impl RuntimeActor {
                 affected_page_ids,
             });
         }
+        let turns = self
+            .projection_turns
+            .as_mut()
+            .expect("clean transaction retains its projection-turn journal");
         let outcome = self
             .clean
             .as_mut()
             .expect("clean transaction is routed only to a clean actor")
-            .execute_local(&self.graph, &self.receipts, &transaction)
+            .execute_local(&self.graph, &self.receipts, &transaction, turns)
             .map_err(|failure| {
                 let code = trusted_local_preparation_refusal_code(failure.phase);
                 if runtime_debug_diagnostics_enabled() {
@@ -20701,11 +20688,15 @@ impl RuntimeActor {
                 (clean.watcher.exact.clone(), None)
             }
         };
+        let turns = self
+            .projection_turns
+            .as_mut()
+            .expect("clean actor retains its projection-turn journal");
         let outcome = self
             .clean
             .as_mut()
             .expect("clean actor remains installed")
-            .execute_external_paths(&self.graph, &self.receipts, &paths);
+            .execute_external_paths(&self.graph, &self.receipts, &paths, turns);
         match outcome {
             Ok(CleanActorExternalOutcome::Noop) => {
                 let clean = self.clean.as_mut().expect("clean actor remains installed");
@@ -21649,11 +21640,15 @@ impl RuntimeActor {
             return SyncLocalMutationOutcome::Revoked { batch_id, phase };
         }
         if self.clean.is_some() {
+            let turns = self
+                .projection_turns
+                .as_mut()
+                .expect("clean mutation retains its projection-turn journal");
             let outcome = self
                 .clean
                 .as_mut()
                 .expect("clean mutation is routed only to a clean actor")
-                .execute_local(&self.graph, &self.receipts, &transaction);
+                .execute_local(&self.graph, &self.receipts, &transaction, turns);
             return match outcome {
                 Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
                     self.queue_clean_provider_publication(batch_id);
@@ -22070,6 +22065,10 @@ impl RuntimeActor {
             let outcome = {
                 let episode_directory = &self.move_episode_directory;
                 let clean = self.clean.as_mut().expect("clean actor remains installed");
+                let turns = self
+                    .projection_turns
+                    .as_mut()
+                    .expect("clean mutation retains its projection-turn journal");
                 match correlated_batch_id {
                     Some(batch_id) => {
                         let Some(episode) = application_move_episode.as_ref() else {
@@ -22091,9 +22090,10 @@ impl RuntimeActor {
                                     fail_episode_publication,
                                 )
                             },
+                            turns,
                         )
                     }
-                    None => clean.execute_local(&self.graph, &self.receipts, &transaction),
+                    None => clean.execute_local(&self.graph, &self.receipts, &transaction, turns),
                 }
             };
             return match outcome {
@@ -29012,6 +29012,7 @@ mod tests {
                 &resources.graph,
                 &resources.receipts,
                 &transaction,
+                &mut resources.projection_turns,
             )
             .unwrap()
         };
@@ -29092,6 +29093,7 @@ mod tests {
                 &resources.graph,
                 &resources.receipts,
                 &transaction,
+                &mut resources.projection_turns,
             )
             .unwrap()
         };
@@ -29608,6 +29610,7 @@ mod tests {
                     &resources.graph,
                     &resources.receipts,
                     &transaction,
+                    &mut resources.projection_turns,
                 )
             } else {
                 let mut session = resources
@@ -29619,6 +29622,7 @@ mod tests {
                     &resources.graph,
                     &resources.receipts,
                     &transaction,
+                    &mut resources.projection_turns,
                 )
             };
             if feature.produces_turn() {
@@ -29850,7 +29854,8 @@ mod tests {
             sweeps,
             recovered_provider_batches: _,
         } = resources;
-        drop((managed_local, projection_turns));
+        drop(managed_local);
+        let mut projection_turns = projection_turns;
         let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
@@ -29881,7 +29886,7 @@ mod tests {
 
         fail_once_at(OperationalFaultPoint::AfterManifest);
         let pending = actor
-            .execute_local(&graph, &receipts, &transaction)
+            .execute_local(&graph, &receipts, &transaction, &mut projection_turns)
             .unwrap();
         let pending_batch = match pending {
             CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
@@ -29904,7 +29909,7 @@ mod tests {
         // outcome is what stops a caller settling the earlier batch and then
         // reporting the second request as saved.
         let same_pending = actor
-            .execute_local(&graph, &receipts, &transaction)
+            .execute_local(&graph, &receipts, &transaction, &mut projection_turns)
             .unwrap();
         assert!(matches!(
             same_pending,
@@ -29912,7 +29917,7 @@ mod tests {
                 if batch_id == pending_batch
         ));
         assert_eq!(
-            actor.retry_pending(&graph, &receipts),
+            actor.retry_pending_with_turns(&graph, &receipts, &mut projection_turns),
             Some(CleanActorMutationOutcome::Durable(pending_batch))
         );
         assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
@@ -29924,6 +29929,7 @@ mod tests {
             .expect("clean actor reloads the saved page");
         assert_eq!(saved.blocks[0].content, "clean actor exact save");
         drop(actor);
+        drop(projection_turns);
 
         let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
             .unwrap()
@@ -29959,7 +29965,8 @@ mod tests {
             sweeps,
             recovered_provider_batches: _,
         } = resources;
-        drop((managed_local, projection_turns));
+        drop(managed_local);
+        let mut projection_turns = projection_turns;
         let accepted_before = runtime.engine().accepted_batch_count().unwrap();
         let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -29988,7 +29995,7 @@ mod tests {
         let before_bytes = fs::read(fixture.graph_root.join("Root.md")).unwrap();
 
         crate::oplog::object_store::fail_next_publish_after_objects();
-        let cut = actor.execute_local(&graph, &receipts, &transaction);
+        let cut = actor.execute_local(&graph, &receipts, &transaction, &mut projection_turns);
         assert!(
             !matches!(cut, Ok(CleanActorMutationOutcome::Durable(_))),
             "the armed object-only cut must not report a durable save: {cut:?}"
@@ -29999,6 +30006,7 @@ mod tests {
             "an unpublished batch must not project Markdown"
         );
         drop(actor);
+        drop(projection_turns);
 
         let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
             .unwrap()
@@ -30012,7 +30020,8 @@ mod tests {
             sweeps,
             recovered_provider_batches: _,
         } = reopened;
-        drop((managed_local, projection_turns));
+        drop(managed_local);
+        let mut projection_turns = projection_turns;
         assert_eq!(
             runtime.engine().accepted_batch_count().unwrap(),
             accepted_before,
@@ -30040,7 +30049,7 @@ mod tests {
         .unwrap();
         assert!(
             matches!(
-                actor.execute_local(&graph, &receipts, &retry),
+                actor.execute_local(&graph, &receipts, &retry, &mut projection_turns),
                 Ok(CleanActorMutationOutcome::Durable(_))
             ),
             "a fresh session must complete the same edit after the cut"
@@ -30116,7 +30125,8 @@ mod tests {
                 sweeps,
                 recovered_provider_batches: _,
             } = resources;
-            drop((managed_local, projection_turns));
+            drop(managed_local);
+            let mut projection_turns = projection_turns;
             let accepted_before = runtime.engine().accepted_batch_count().unwrap();
             let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
             let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -30162,7 +30172,8 @@ mod tests {
                 }
             }
             let transaction = edit(&mut actor);
-            let cut_outcome = actor.execute_local(&graph, &receipts, &transaction);
+            let cut_outcome =
+                actor.execute_local(&graph, &receipts, &transaction, &mut projection_turns);
             assert!(
                 !matches!(cut_outcome, Ok(CleanActorMutationOutcome::Durable(_))),
                 "the armed {cut:?} cut must not report a durable save: {cut_outcome:?}"
@@ -30173,6 +30184,7 @@ mod tests {
                 "an unpublished batch must not project Markdown"
             );
             drop(actor);
+            drop(projection_turns);
 
             // The invariant: every installed final name still hashes to its
             // own content. Temporary names are not archive entries and are
@@ -30220,10 +30232,11 @@ mod tests {
                 sweeps,
                 recovered_provider_batches: _,
             } = reopened;
-            drop((managed_local, projection_turns));
+            drop(managed_local);
+            let mut projection_turns = projection_turns;
             let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
             let retry = edit(&mut actor);
-            let repaired = actor.execute_local(&graph, &receipts, &retry);
+            let repaired = actor.execute_local(&graph, &receipts, &retry, &mut projection_turns);
             assert!(
                 matches!(repaired, Ok(CleanActorMutationOutcome::Durable(_))),
                 "a fresh session must complete the same edit after a {cut:?} cut: {repaired:?}"
@@ -30232,6 +30245,7 @@ mod tests {
                 .unwrap()
                 .contains("batch cut edit"));
             drop(actor);
+            drop(projection_turns);
 
             let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
                 .unwrap()
@@ -30404,7 +30418,8 @@ mod tests {
             sweeps,
             recovered_provider_batches: _,
         } = resources;
-        drop((managed_local, projection_turns));
+        drop(managed_local);
+        let mut projection_turns = projection_turns;
         let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
@@ -30432,7 +30447,7 @@ mod tests {
 
         fail_once_at(OperationalFaultPoint::AfterManifest);
         let pending = actor
-            .execute_local(&graph, &receipts, &transaction)
+            .execute_local(&graph, &receipts, &transaction, &mut projection_turns)
             .unwrap();
         let CleanActorMutationOutcome::DurablePending { batch_id, .. } = pending else {
             panic!("fault must retain this submission's own durable work: {pending:?}");
@@ -30450,7 +30465,7 @@ mod tests {
         fs::remove_file(&manifest_path).unwrap();
 
         for attempt in 1..MAX_IDENTICAL_RETAINED_RETRY_ATTEMPTS {
-            let retried = actor.retry_pending(&graph, &receipts);
+            let retried = actor.retry_pending_with_turns(&graph, &receipts, &mut projection_turns);
             assert!(
                 matches!(
                     &retried,
@@ -30460,7 +30475,7 @@ mod tests {
                 "attempt {attempt} escalated or completed early: {retried:?}"
             );
         }
-        let stuck = actor.retry_pending(&graph, &receipts);
+        let stuck = actor.retry_pending_with_turns(&graph, &receipts, &mut projection_turns);
         let Some(CleanActorMutationOutcome::DurableStuck {
             batch_id: stuck_batch,
             phase,
@@ -30478,7 +30493,7 @@ mod tests {
         // cause is repaired the very next tick's retry must recover without a
         // restart.
         fs::write(&manifest_path, &manifest_bytes).unwrap();
-        let recovered = actor.retry_pending(&graph, &receipts);
+        let recovered = actor.retry_pending_with_turns(&graph, &receipts, &mut projection_turns);
         assert!(
             matches!(&recovered, Some(CleanActorMutationOutcome::Durable(retained)) if *retained == batch_id),
             "a repaired cause must recover on the next retry: {recovered:?}"
@@ -31668,6 +31683,7 @@ mod tests {
                 &resources.graph,
                 &resources.receipts,
                 &transaction,
+                &mut resources.projection_turns,
             )
         };
         assert!(matches!(
