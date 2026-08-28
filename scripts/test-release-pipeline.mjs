@@ -91,6 +91,58 @@ const windowsScenarios = [
   "e2e-tab-overflow.mjs",
 ];
 
+execFileSync(process.execPath, [path.join(process.cwd(), "scripts/test-release-proof-reuse.mjs")], {
+  cwd: process.cwd(),
+  stdio: "pipe",
+});
+
+assert.doesNotMatch(releaseWorkflow, /\n  push:/, "release publication must not be triggered implicitly by a tag push");
+assert.match(
+  releaseWorkflow,
+  /workflow_dispatch:[\s\S]*?mode:[\s\S]*?options: \[build, promote\][\s\S]*?source_run_id:[\s\S]*?publish:/,
+  "release workflow does not expose the explicit build/promote and publication controls"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Release and proof-reuse contract fixtures[\s\S]*?test-release-pipeline\.mjs/,
+  "release preflight does not exercise proof-reuse negative fixtures"
+);
+assert.match(
+  releaseWorkflow,
+  /- run: npm ci\n\s+- name: Require updater signing key/,
+  "promotion preflight must install the dependencies used by shared release contracts"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Upload reusable Linux x64 proof input[\s\S]*?release-proof-linux-x64[\s\S]*?name: Upload reusable Windows x64 proof input[\s\S]*?release-proof-windows-x64/,
+  "no-publication candidates do not retain the exact binaries/frontends needed by promotion proofs"
+);
+assert.match(
+  releaseWorkflow,
+  /assemble-release-candidate\.mjs release-input release-candidate-assembled --receipt release-candidate-receipt\.json[\s\S]*?name: release-candidate-receipt/,
+  "candidate assembly does not publish a content-addressed candidate receipt"
+);
+assert.match(
+  releaseWorkflow,
+  /promotion-plan:[\s\S]*?check-release-promotion-source\.mjs[\s\S]*?create-release-promotion-plan\.mjs[\s\S]*?promotion-linux-proof:[\s\S]*?run-release-promotion-proofs\.mjs[\s\S]*?promotion-windows-proof:[\s\S]*?run-release-promotion-proofs\.mjs[\s\S]*?promote-release:[\s\S]*?verify-release-promotion\.mjs/,
+  "manual promotion does not verify its source, rerun changed proofs, and verify final receipts"
+);
+assert.match(
+  releaseWorkflow,
+  /promotion-linux-proof:[\s\S]*?path: \$\{\{ runner\.temp \}\}\/release-promotion-plan[\s\S]*?promotion-windows-proof:[\s\S]*?path: \$\{\{ runner\.temp \}\}\/release-promotion-plan/,
+  "promotion proof inputs must not dirty the product checkout"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Rerun changed advisory proof against exact source binary\n\s+shell: pwsh\n\s+run: node scripts\/run-release-promotion-proofs\.mjs --plan [^\n]+ --platform windows --output promotion-windows-proofs\.json/,
+  "Windows promotion proof invocation must use PowerShell-safe syntax"
+);
+assert.match(
+  releaseWorkflow,
+  /Upload, verify, and publish promoted release[\s\S]*?if: inputs\.publish && startsWith\(github\.ref, 'refs\/tags\/'\)/,
+  "proof-only promotion can publish without an explicit tagged publication request"
+);
+
 const trackedPaths = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
   .split("\0")
   .filter(Boolean);
@@ -998,7 +1050,7 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
-  /windows-smoke:\n    needs: \[preflight, build\][\s\S]*?if: \$\{\{ always\(\) && needs\.preflight\.result == 'success' && needs\.build\.result != 'cancelled' \}\}[\s\S]*?continue-on-error: true[\s\S]*?name: release-windows-x64[\s\S]*?name: release-e2e-frontend-windows-x64[\s\S]*?npm run e2e:windows:smoke -- --scenario=\$\{\{ matrix\.scenario \}\}/,
+  /windows-smoke:\n    needs: \[preflight, build\][\s\S]*?inputs\.mode == 'build'[\s\S]*?needs\.preflight\.result == 'success'[\s\S]*?continue-on-error: true[\s\S]*?name: release-windows-x64[\s\S]*?name: release-e2e-frontend-windows-x64[\s\S]*?npm run e2e:windows:smoke -- --scenario=\$\{\{ matrix\.scenario \}\}/,
   "Windows advisory scenarios do not consume the staged app independently of assembly"
 );
 assert.match(
@@ -1223,7 +1275,7 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
-  /name: Release pipeline contract fixtures[\s\S]*?node scripts\/test-storage-pin\.mjs/,
+  /name: Release product and offline-source contract fixtures[\s\S]*?node scripts\/test-storage-pin\.mjs/,
   "release preflight does not exercise the storage-pin negative fixtures"
 );
 

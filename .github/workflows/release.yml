@@ -1,11 +1,8 @@
-# Build Tine installers for Linux, macOS (universal), and Windows and publish them
-# to a GitHub Release. Triggered by pushing a version tag:
-#
-#   git tag v0.1.0 && git push origin v0.1.0
-#
-# …or run it manually from the Actions tab (workflow_dispatch) to smoke-test the
-# build matrix WITHOUT cutting a release. Both paths fail before packaging unless
-# the exact candidate SHA already has a successful manually dispatched full CI.
+# Build Tine installers for Linux, macOS (universal), and Windows as an immutable
+# candidate, or promote an already-verified candidate across an explicitly
+# allowlisted proof-only delta. Releases are manual: use build mode for an exact
+# product candidate and promote mode only when the proof-reuse guard accepts the
+# source/target pair. Set publish only on a tag ref after the dry run is green.
 #
 # Publication is atomic at the workflow level: every expensive build writes only
 # an immutable workflow artifact; one assembler creates latest.json; and one
@@ -18,9 +15,23 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Build a new product candidate, or promote an earlier candidate across a proof-only delta
+        type: choice
+        options: [build, promote]
+        default: build
+        required: true
+      source_run_id:
+        description: Successful no-publication build run to reuse (promote mode only)
+        type: string
+        required: false
+      publish:
+        description: Publish after verification (requires a tag ref)
+        type: boolean
+        default: false
+        required: true
 
 permissions:
   contents: read
@@ -45,17 +56,21 @@ jobs:
           node-version: 20
           cache: npm
       - name: Require exact-SHA full CI evidence
+        if: inputs.mode == 'build'
         env:
           GH_TOKEN: ${{ github.token }}
           CI_EVIDENCE_SHA: ${{ github.sha }}
           CI_EVIDENCE_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-ci-evidence.mjs
       - uses: dtolnay/rust-toolchain@1.96.0
+        if: inputs.mode == 'build'
       - uses: swatinem/rust-cache@v2
+        if: inputs.mode == 'build'
         with:
           workspaces: ". -> target"
       - run: npm ci
       - name: Require updater signing key
+        if: inputs.mode == 'build'
         env:
           SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
@@ -64,35 +79,64 @@ jobs:
             exit 1
           fi
       - name: Version, Android code, tag, and changelog agree
+        if: inputs.mode == 'build'
         env:
           REQUIRE_RELEASE_READINESS: "1"
         run: node scripts/check-release-preflight.mjs
       - name: Flatpak offline npm sources are current
+        if: inputs.mode == 'build'
         run: node scripts/check-flatpak-node-sources.mjs
       - name: Flatpak offline Cargo sources are current
+        if: inputs.mode == 'build'
         run: node scripts/check-flatpak-cargo-sources.mjs
       - name: Certified tine-storage pin is current
+        if: inputs.mode == 'build'
         run: node scripts/check-storage-pin.mjs
       - name: lsdoc WASM pin is current
+        if: inputs.mode == 'build'
         run: node scripts/check-wasm-pin.mjs
       - name: lsdoc oracle bytes and cross-platform EOL policy are current
+        if: inputs.mode == 'build'
         run: node scripts/check-lsdoc-oracle-sync.mjs
-      - name: Release pipeline contract fixtures
+      - name: Release product and offline-source contract fixtures
+        if: inputs.mode == 'build'
         run: |
           node scripts/test-storage-pin.mjs
-          node scripts/test-release-pipeline.mjs
           node scripts/test-env-toolchain-fallback.mjs
+      - name: Release and proof-reuse contract fixtures
+        run: node scripts/test-release-pipeline.mjs
+      - name: Validate manual release mode
+        env:
+          MODE: ${{ inputs.mode }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          PUBLISH: ${{ inputs.publish }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$MODE" = promote ] && ! [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::promote mode requires a numeric source_run_id"
+            exit 1
+          fi
+          if [ "$MODE" = build ] && [ -n "$SOURCE_RUN_ID" ]; then
+            echo "::error::source_run_id is valid only in promote mode"
+            exit 1
+          fi
+          if [ "$PUBLISH" = true ] && [[ "$REF" != refs/tags/* ]]; then
+            echo "::error::publication requires dispatching the workflow on a tag ref"
+            exit 1
+          fi
 
   # Reuse the actual privileged, network-disabled Flatpak bundle build. It runs
   # in parallel with the platform packages but is a hard publication dependency.
   flatpak:
     needs: preflight
+    if: inputs.mode == 'build'
     uses: ./.github/workflows/flatpak.yml
 
   # Build each desktop platform concurrently. Jobs never mutate a GitHub Release;
   # they upload immutable workflow artifacts for the assembler/publisher below.
   build:
     needs: preflight
+    if: inputs.mode == 'build'
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -505,6 +549,35 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      # Promotion reruns only the proof that changed, but it must exercise the
+      # exact old product binary and frontend. Preserve those inputs beside the
+      # candidate for the same short three-day promotion window.
+      - name: Upload reusable Linux x64 proof input
+        if: matrix.lane == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-proof-linux-x64
+          path: |
+            target/release/tine
+            target/release/tine.build.json
+            dist
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload reusable Windows x64 proof input
+        if: matrix.lane == 'windows-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-proof-windows-x64
+          path: |
+            target/release/tine.exe
+            target/release/tine.exe.build.json
+            dist
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
       - name: Stage immutable release artifact
         run: node scripts/stage-release-lane.mjs "${{ matrix.lane }}" release-candidate "${{ github.sha }}"
 
@@ -538,7 +611,7 @@ jobs:
     # A failure in another build-matrix lane (for example the hard Linux E2E
     # gate) must not suppress evidence from an already-staged Windows x64 app.
     # If x64 itself failed, the artifact download below fails visibly instead.
-    if: ${{ always() && needs.preflight.result == 'success' && needs.build.result != 'cancelled' }}
+    if: ${{ inputs.mode == 'build' && always() && needs.preflight.result == 'success' && needs.build.result != 'cancelled' }}
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -619,6 +692,7 @@ jobs:
   #       ANDROID_KEY_PASSWORD       key password
   android:
     needs: preflight
+    if: inputs.mode == 'build'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -799,6 +873,7 @@ jobs:
   # GitHub Release.
   assemble:
     needs: [preflight, flatpak, build, android]
+    if: inputs.mode == 'build'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -809,7 +884,7 @@ jobs:
       - name: Assemble and verify complete candidate
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: node scripts/assemble-release-candidate.mjs release-input release-candidate-assembled
+        run: node scripts/assemble-release-candidate.mjs release-input release-candidate-assembled --receipt release-candidate-receipt.json
       - name: Upload verified release candidate
         uses: actions/upload-artifact@v4
         with:
@@ -818,13 +893,20 @@ jobs:
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
+      - name: Upload verified release candidate receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-receipt
+          path: release-candidate-receipt.json
+          if-no-files-found: error
+          retention-days: 3
 
   # The sole release writer. Expensive builds have already finished; this job
   # creates/reuses a draft, uploads distinct assets, uploads latest.json last,
   # re-downloads and verifies the draft, then publishes it.
   publish-release:
     needs: assemble
-    if: startsWith(github.ref, 'refs/tags/')
+    if: inputs.mode == 'build' && inputs.publish && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -835,6 +917,249 @@ jobs:
           name: release-candidate
           path: release-candidate
       - name: Upload, verify, and publish complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/publish-release-candidate.mjs "${{ github.ref_name }}" release-candidate
+
+  # Promotion is intentionally a second manual phase. It accepts only a
+  # successful no-publication build run, proves that the intervening Git delta
+  # is an explicitly registered real-app scenario edit, and reruns every proof
+  # named by that registry against the exact preserved product binary.
+  promotion-plan:
+    needs: preflight
+    if: inputs.mode == 'promote'
+    runs-on: ubuntu-22.04
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
+      linux_required: ${{ steps.plan-status.outputs.linux_required }}
+      windows_required: ${{ steps.plan-status.outputs.windows_required }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve source candidate commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          commit=$(gh api "repos/${{ github.repository }}/actions/runs/$SOURCE_RUN_ID" --jq .head_sha)
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source run did not identify a full Git commit"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-receipt
+          path: promotion-source
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Verify source run and retained artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/check-release-promotion-source.mjs \
+            --run-id "${{ inputs.source_run_id }}" \
+            --repo "${{ github.repository }}" \
+            --source "${{ steps.source.outputs.commit }}" \
+            --output promotion-source-evidence.json
+      - name: Create proof-only promotion plan
+        id: plan-status
+        run: |
+          node scripts/create-release-promotion-plan.mjs \
+            --source "${{ steps.source.outputs.commit }}" \
+            --target "${{ github.sha }}" \
+            --source-run-id "${{ inputs.source_run_id }}" \
+            --candidate-receipt promotion-source/release-candidate-receipt.json \
+            --source-evidence promotion-source-evidence.json \
+            --authorizer "${{ github.actor }}" \
+            --output release-promotion-plan.json
+          node -e 'const p=require("./release-promotion-plan.json"); const fs=require("fs"); const out=process.env.GITHUB_OUTPUT; fs.appendFileSync(out, `linux_required=${p.requiredProofs.some(x=>x.platform==="linux")}\nwindows_required=${p.requiredProofs.some(x=>x.platform==="windows")}\n`);'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-promotion-plan
+          path: release-promotion-plan.json
+          if-no-files-found: error
+          retention-days: 14
+
+  promotion-linux-proof:
+    needs: promotion-plan
+    if: inputs.mode == 'promote' && needs.promotion-plan.outputs.linux_required == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Linux real-app proof dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev webkit2gtk-driver xvfb xauth \
+            xdotool openbox x11-utils weston
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - run: npm ci
+      - run: cargo install tauri-driver --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-promotion-plan
+          path: ${{ runner.temp }}/release-promotion-plan
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-proof-linux-x64
+          path: source-proof
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Select exact source binary and frontend
+        run: |
+          app=$(find source-proof -type f -path '*/target/release/tine' -print -quit)
+          receipt=$(find source-proof -type f -name 'tine.build.json' -print -quit)
+          frontend=$(find source-proof -type f -path '*/dist/index.html' -print -quit)
+          if [ -z "$app" ] || [ -z "$receipt" ] || [ -z "$frontend" ]; then
+            echo "::error::preserved Linux proof input is incomplete"
+            exit 1
+          fi
+          chmod +x "$app"
+          rm -rf dist
+          cp -a "$(dirname "$frontend")" dist
+          echo "TINE_APP=$GITHUB_WORKSPACE/$app" >> "$GITHUB_ENV"
+          echo "TINE_E2E_BUILD_RECEIPT=$GITHUB_WORKSPACE/$receipt" >> "$GITHUB_ENV"
+      - name: Rerun changed blocking proof against exact source binary
+        run: |
+          node scripts/run-release-promotion-proofs.mjs \
+            --plan "${{ runner.temp }}/release-promotion-plan/release-promotion-plan.json" \
+            --platform linux \
+            --output promotion-linux-proofs.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-promotion-linux-proof
+          path: |
+            promotion-linux-proofs.json
+            test-results/release-promotion
+          if-no-files-found: error
+          retention-days: 14
+
+  promotion-windows-proof:
+    needs: promotion-plan
+    if: inputs.mode == 'promote' && needs.promotion-plan.outputs.windows_required == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-promotion-plan
+          path: ${{ runner.temp }}/release-promotion-plan
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-proof-windows-x64
+          path: source-proof
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Select exact source binary and frontend
+        shell: pwsh
+        run: |
+          $app = Get-ChildItem source-proof -Recurse -File -Filter tine.exe | Select-Object -First 1
+          $receipt = Get-ChildItem source-proof -Recurse -File -Filter tine.exe.build.json | Select-Object -First 1
+          $frontend = Get-ChildItem source-proof -Recurse -File -Filter index.html |
+            Where-Object { $_.Directory.Name -eq 'dist' } | Select-Object -First 1
+          if (-not $app -or -not $receipt -or -not $frontend) { throw 'preserved Windows proof input is incomplete' }
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+          Copy-Item $frontend.Directory.FullName dist -Recurse
+          "TINE_APP=$($app.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TINE_E2E_BUILD_RECEIPT=$($receipt.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install Edge WebDriver matching the WebView2 runtime
+        shell: pwsh
+        run: ./scripts/install-windows-webview2-driver.ps1
+      - name: Rerun changed advisory proof against exact source binary
+        shell: pwsh
+        run: node scripts/run-release-promotion-proofs.mjs --plan "${{ runner.temp }}/release-promotion-plan/release-promotion-plan.json" --platform windows --output promotion-windows-proofs.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-promotion-windows-proof
+          path: |
+            promotion-windows-proofs.json
+            test-results/release-promotion
+          if-no-files-found: error
+          retention-days: 14
+
+  promote-release:
+    needs: [promotion-plan, promotion-linux-proof, promotion-windows-proof]
+    if: ${{ always() && inputs.mode == 'promote' && needs.promotion-plan.result == 'success' && (needs.promotion-linux-proof.result == 'success' || needs.promotion-linux-proof.result == 'skipped') && (needs.promotion-windows-proof.result == 'success' || needs.promotion-windows-proof.result == 'skipped') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-promotion-plan
+          path: promotion
+      - uses: actions/download-artifact@v4
+        if: needs.promotion-plan.outputs.linux_required == 'true'
+        with:
+          name: release-promotion-linux-proof
+          path: promotion/linux
+      - uses: actions/download-artifact@v4
+        if: needs.promotion-plan.outputs.windows_required == 'true'
+        with:
+          name: release-promotion-windows-proof
+          path: promotion/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: release-candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-receipt
+          path: promotion/source
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+      - name: Finalize and verify promotion receipt
+        run: |
+          args=(--plan promotion/release-promotion-plan.json --output release-promotion-receipt.json)
+          if [ -f promotion/linux/promotion-linux-proofs.json ]; then
+            args+=(--proof promotion/linux/promotion-linux-proofs.json)
+          fi
+          if [ -f promotion/windows/promotion-windows-proofs.json ]; then
+            args+=(--proof promotion/windows/promotion-windows-proofs.json)
+          fi
+          node scripts/finalize-release-promotion.mjs "${args[@]}"
+          node scripts/verify-release-promotion.mjs \
+            --receipt release-promotion-receipt.json \
+            --candidate-receipt promotion/source/release-candidate-receipt.json \
+            --candidate release-candidate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-promotion-receipt
+          path: release-promotion-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload, verify, and publish promoted release
+        if: inputs.publish && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/publish-release-candidate.mjs "${{ github.ref_name }}" release-candidate
