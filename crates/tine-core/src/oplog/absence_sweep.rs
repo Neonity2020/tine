@@ -387,7 +387,7 @@ impl SweepManager {
 
     #[cfg(test)]
     fn open_empty_sweep_for_test(&mut self, pages_at_open: usize) -> Result<Uuid, SweepError> {
-        self.open_or_join_sweep(now_unix_ms()?, pages_at_open)
+        self.open_or_join_sweep(now_unix_ms()?, &mut || Ok(pages_at_open))
     }
 
     pub(crate) fn begin_reapply(
@@ -585,12 +585,7 @@ impl SweepManager {
                 .then(left.page_id.cmp(&right.page_id))
         });
         let now = now_unix_ms()?;
-        let pages_at_open = if self.chains.values().any(|chain| chain.record.is_open()) {
-            0
-        } else {
-            page_count_at_open()?
-        };
-        let sweep_id = self.open_or_join_sweep(now, pages_at_open)?;
+        let sweep_id = self.open_or_join_sweep(now, page_count_at_open)?;
         let mut record = self.chains[&sweep_id].record.clone();
         let prior_tier = record.tier;
         record.last_observation_at_unix_ms = now;
@@ -704,7 +699,11 @@ impl SweepManager {
         self.notifications.extend(resumed);
     }
 
-    fn open_or_join_sweep(&mut self, now: u64, pages_at_open: usize) -> Result<Uuid, SweepError> {
+    fn open_or_join_sweep(
+        &mut self,
+        now: u64,
+        page_count_at_open: &mut dyn FnMut() -> Result<usize, SweepError>,
+    ) -> Result<Uuid, SweepError> {
         self.process_deadlines_at(now)?;
         if let Some((id, _)) = self
             .chains
@@ -714,6 +713,12 @@ impl SweepManager {
         {
             return Ok(*id);
         }
+        // The denominator is read only when a sweep actually opens, and only
+        // AFTER elapsed windows have been processed: a stale open sweep closed
+        // in this same turn (suspend/resume outrunning the deadline wake) must
+        // not leave the successor with a zero page count, which would collapse
+        // the tier-3 threshold to one.
+        let pages_at_open = page_count_at_open()?;
         let sweep_id = Uuid::new_v4();
         let record = SweepRecord {
             sweep_id,
@@ -1038,5 +1043,53 @@ mod tests {
     #[test]
     fn record_chain_ignores_a_torn_highest_version_and_retains_the_last_valid_object() {
         assert_torn_sweep_tail_recovers_for_oracle();
+    }
+
+    /// Suspend/resume can deliver a fresh absence observation before the
+    /// deadline wake closes an elapsed open sweep. The successor sweep opened
+    /// in that same turn must carry the REAL page count: a zero denominator
+    /// collapses the tier-3 threshold to one and turns a single external
+    /// deletion into a spurious mass-deletion hold.
+    #[test]
+    fn a_fresh_observation_after_an_elapsed_window_opens_with_the_real_page_count() {
+        use crate::oplog::{CrdtPeerCounter, CrdtPeerId, DocumentDependencies, DocumentId};
+
+        let root = std::env::temp_dir().join(format!("tine-sweep-reopen-count-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xc4f002));
+        let store = ObjectStore::open(&root, workspace_id).unwrap();
+        let mut manager = SweepManager::open(&store, &BTreeSet::new()).unwrap();
+        let stale = manager.open_empty_sweep_for_test(1_000).unwrap();
+        let mut aged = manager.chains[&stale].record.clone();
+        aged.opened_at_unix_ms = aged.opened_at_unix_ms.saturating_sub(120_000);
+        aged.last_observation_at_unix_ms = aged.last_observation_at_unix_ms.saturating_sub(120_000);
+        manager.append_record(aged).unwrap();
+
+        let frontier = FrontierV2::new(vec![DocumentDependencies::new(
+            DocumentId::from_uuid(Uuid::from_u128(0xc4f003)),
+            vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(3), 1)],
+            Vec::new(),
+        )
+        .unwrap()])
+        .unwrap();
+        let page_id = PageId::from_uuid(Uuid::from_u128(0xc4f004));
+        let member = SweepMember {
+            path: ManagedPath::parse("reopen-count.md").unwrap(),
+            page_id,
+            deletion_batch_id: None,
+            predecessor_accepted_state: SweepAcceptedStateReference { page_id, frontier },
+            prior_present_intent_id: None,
+        };
+        let joined = manager
+            .record_members(vec![member], &mut || Ok(1_000))
+            .unwrap()
+            .expect("one member joins a sweep");
+        assert_ne!(joined, stale, "the elapsed window closes the stale sweep");
+        let record = manager.record(joined).unwrap();
+        assert_eq!(record.pages_at_open, 1_000);
+        assert_eq!(record.tier, SweepTier::Tier1);
+        drop(manager);
+        drop(store);
+        crate::test_support::remove_dir_all(&root);
     }
 }
