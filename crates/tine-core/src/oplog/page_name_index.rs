@@ -3324,6 +3324,7 @@ mod tests {
             page_id,
             before,
             after,
+            lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
         }
     }
 

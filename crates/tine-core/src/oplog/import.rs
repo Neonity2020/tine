@@ -7526,13 +7526,35 @@ fn plan_import(
         .iter()
         .map(|page| page.path().clone())
         .collect::<BTreeSet<_>>();
+    let deferred_absences = completed
+        .iter()
+        .filter(|page| {
+            matches!(
+                inventory.entries().get(page.path()),
+                Some(RawObservation::Absent)
+            ) && engine.restored_generation_requires_absence_deferral(page.page_id(), page.path())
+        })
+        .map(|page| (page.page_id(), page.path().clone()))
+        .collect::<BTreeSet<_>>();
+    for (page_id, path) in &deferred_absences {
+        engine.note_deferred_absence_observation(*page_id, path);
+    }
+    let deferred_page_ids = deferred_absences
+        .iter()
+        .map(|(page_id, _)| *page_id)
+        .collect::<BTreeSet<_>>();
+    let deferred_paths = deferred_absences
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<BTreeSet<_>>();
     let changed = completed.iter().any(|page| {
         instrumentation.inventory_path_lookups =
             instrumentation.inventory_path_lookups.saturating_add(1);
-        !matches!(
-            inventory.entries().get(page.path()),
-            Some(RawObservation::Present(bytes)) if bytes.description() == page.description()
-        )
+        !deferred_absences.contains(&(page.page_id(), page.path().clone()))
+            && !matches!(
+                inventory.entries().get(page.path()),
+                Some(RawObservation::Present(bytes)) if bytes.description() == page.description()
+            )
     }) || inventory.entries().iter().any(|(path, observation)| {
         matches!(observation, RawObservation::Present(_))
             && !completed_paths.contains(path)
@@ -7551,6 +7573,8 @@ fn plan_import(
             &scope,
             &page_transition,
             &parsed_documents,
+            &deferred_page_ids,
+            &deferred_paths,
             &mut instrumentation,
         ) {
             Ok(BuiltImportMaterial::Semantic(execution)) => (
@@ -8061,6 +8085,8 @@ fn build_execution_material(
     scope: &ImportScopeSnapshot,
     page_transition: &DesiredPageTransition,
     parsed_documents: &ParsedImportDocuments,
+    deferred_page_ids: &BTreeSet<PageId>,
+    deferred_paths: &BTreeSet<ManagedPath>,
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<BuiltImportMaterial, ImportExecutionError> {
     let mut current_pages = BTreeMap::<PageId, &ReceiptBackedPage>::new();
@@ -8132,6 +8158,9 @@ fn build_execution_material(
     let mut desired_node_ids = BTreeMap::<(ManagedPath, usize), BlockId>::new();
     let mut observation_entries = Vec::with_capacity(inventory.entries().len());
     for (path, observation) in inventory.entries() {
+        if deferred_paths.contains(path) {
+            continue;
+        }
         let kind = scope
             .path_identities
             .get(path)
@@ -8375,6 +8404,9 @@ fn build_execution_material(
     let mut deletions = current_blocks
         .iter()
         .filter_map(|(block_id, current)| {
+            if deferred_page_ids.contains(&current.page_id) {
+                return None;
+            }
             (!desired_blocks.contains_key(block_id)
                 && current
                     .block
@@ -8464,7 +8496,7 @@ fn build_execution_material(
         .map(|page| page.page_id)
         .collect::<BTreeSet<_>>();
     for page_id in current_pages.keys() {
-        if !desired_page_ids.contains(page_id) {
+        if !desired_page_ids.contains(page_id) && !deferred_page_ids.contains(page_id) {
             push_operation(
                 &mut operations,
                 SemanticOperation::DeletePage { page_id: *page_id },
@@ -15245,6 +15277,8 @@ mod tests {
             &scope,
             &transition,
             &parsed_documents,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &mut ImportInstrumentation::default(),
         )
         .unwrap();

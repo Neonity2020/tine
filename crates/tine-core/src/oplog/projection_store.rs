@@ -1561,6 +1561,35 @@ impl ProjectionReceiptStore {
         Ok(Some(BaseBlob::from_parts(*description, bytes)?))
     }
 
+    /// Retrieve an exact content-addressed projection base retained for any
+    /// intent. Sweep restoration uses this only after an authenticated prior
+    /// Present intent names the same description; the blob is layout evidence,
+    /// never the semantic restore payload.
+    pub(crate) fn load_retained_base(
+        &self,
+        description: BlobDescription,
+    ) -> Result<Option<BaseBlob>, ProjectionStoreError> {
+        require_evidence_length(
+            "projection base",
+            description.byte_length(),
+            MAX_PROJECTION_EVIDENCE_BYTES,
+        )?;
+        let bases = self.namespace(BASES_DIR)?;
+        let bytes = read_optional_regular(
+            &bases,
+            &base_filename(description),
+            MAX_PROJECTION_EVIDENCE_BYTES,
+            Some(description.byte_length()),
+        )?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        if BlobDescription::of(&bytes) != description {
+            return Err(ProjectionStoreError::BaseEvidenceMismatch(description));
+        }
+        Ok(Some(BaseBlob::from_parts(description, bytes)?))
+    }
+
     /// Durably reserve the exact recovery filename Graph must use before any
     /// live page name can be retired or published.
     pub fn reserve_attempt(

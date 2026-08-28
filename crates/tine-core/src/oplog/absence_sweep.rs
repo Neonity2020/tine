@@ -110,6 +110,15 @@ pub(crate) struct SweepActionRecord {
     pub(crate) state: SweepActionState,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SweepRestoreAction {
+    pub(crate) action_id: Uuid,
+    pub(crate) members: Vec<SweepMember>,
+    pub(crate) authored_batch_ids: Vec<BatchId>,
+    pub(crate) cursor: Option<SweepRestoreCursor>,
+    pub(crate) completed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SweepRecord {
@@ -424,6 +433,129 @@ impl SweepManager {
             .collect();
         self.append_record(record)?;
         Ok((action_id, pages))
+    }
+
+    pub(crate) fn begin_restore(
+        &mut self,
+        sweep_id: Uuid,
+    ) -> Result<SweepRestoreAction, SweepError> {
+        let record = self
+            .chains
+            .get(&sweep_id)
+            .ok_or_else(|| SweepError::Invalid(format!("unknown sweep {sweep_id}")))?
+            .record
+            .clone();
+        if let Some(latest) = record
+            .actions
+            .iter()
+            .rev()
+            .find(|action| action.action == SweepActionKind::Restore)
+        {
+            if !matches!(latest.state, SweepActionState::Failed { .. }) {
+                return Ok(restore_action_snapshot(&record, latest.action_id));
+            }
+        }
+        let action_id = Uuid::new_v4();
+        let now = now_unix_ms()?;
+        let mut record = record;
+        record.actions.push(SweepActionRecord {
+            action_id,
+            action: SweepActionKind::Restore,
+            recorded_at_unix_ms: now,
+            state: SweepActionState::Started,
+        });
+        self.append_record(record.clone())?;
+        Ok(restore_action_snapshot(&record, action_id))
+    }
+
+    pub(crate) fn pending_restore_actions(&self) -> Vec<(Uuid, Uuid)> {
+        self.chains
+            .iter()
+            .filter_map(|(sweep_id, chain)| {
+                let mut latest = BTreeMap::<Uuid, (&SweepActionKind, &SweepActionState)>::new();
+                for action in &chain.record.actions {
+                    latest.insert(action.action_id, (&action.action, &action.state));
+                }
+                latest.into_iter().find_map(|(action_id, (kind, state))| {
+                    (*kind == SweepActionKind::Restore
+                        && matches!(
+                            state,
+                            SweepActionState::Started | SweepActionState::Progress { .. }
+                        ))
+                    .then_some((*sweep_id, action_id))
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn record_restore_progress(
+        &mut self,
+        sweep_id: Uuid,
+        action_id: Uuid,
+        authored_batch_ids: Vec<BatchId>,
+        cursor: SweepRestoreCursor,
+    ) -> Result<(), SweepError> {
+        let now = now_unix_ms()?;
+        let mut record = self
+            .chains
+            .get(&sweep_id)
+            .ok_or_else(|| SweepError::Invalid(format!("unknown sweep {sweep_id}")))?
+            .record
+            .clone();
+        record.actions.push(SweepActionRecord {
+            action_id,
+            action: SweepActionKind::Restore,
+            recorded_at_unix_ms: now,
+            state: SweepActionState::Progress {
+                authored_batch_ids,
+                restore_cursor: Some(cursor),
+            },
+        });
+        self.append_record(record)
+    }
+
+    pub(crate) fn finish_restore(
+        &mut self,
+        sweep_id: Uuid,
+        action_id: Uuid,
+    ) -> Result<(), SweepError> {
+        let now = now_unix_ms()?;
+        let mut record = self
+            .chains
+            .get(&sweep_id)
+            .ok_or_else(|| SweepError::Invalid(format!("unknown sweep {sweep_id}")))?
+            .record
+            .clone();
+        record.actions.push(SweepActionRecord {
+            action_id,
+            action: SweepActionKind::Restore,
+            recorded_at_unix_ms: now,
+            state: SweepActionState::Completed,
+        });
+        record.disposed_at_unix_ms = Some(now);
+        self.append_record(record)
+    }
+
+    pub(crate) fn fail_restore(
+        &mut self,
+        sweep_id: Uuid,
+        action_id: Uuid,
+        reason: String,
+    ) -> Result<(), SweepError> {
+        let now = now_unix_ms()?;
+        let mut record = self
+            .chains
+            .get(&sweep_id)
+            .ok_or_else(|| SweepError::Invalid(format!("unknown sweep {sweep_id}")))?
+            .record
+            .clone();
+        record.actions.push(SweepActionRecord {
+            action_id,
+            action: SweepActionKind::Restore,
+            recorded_at_unix_ms: now,
+            state: SweepActionState::Failed { reason },
+        });
+        self.append_record(record)
     }
 
     pub(crate) fn pending_reapply_actions(&self) -> Vec<(Uuid, Uuid)> {
@@ -824,6 +956,37 @@ impl SweepRecorder for SweepManager {
             });
         }
         self.record_members(members, page_count_at_open)
+    }
+}
+
+fn restore_action_snapshot(record: &SweepRecord, action_id: Uuid) -> SweepRestoreAction {
+    let mut authored_batch_ids = Vec::new();
+    let mut cursor = None;
+    let mut completed = false;
+    for action in record
+        .actions
+        .iter()
+        .filter(|action| action.action_id == action_id)
+    {
+        match &action.state {
+            SweepActionState::Started => {}
+            SweepActionState::Progress {
+                authored_batch_ids: batches,
+                restore_cursor,
+            } => {
+                authored_batch_ids = batches.clone();
+                cursor = restore_cursor.clone();
+            }
+            SweepActionState::Completed => completed = true,
+            SweepActionState::Failed { .. } => {}
+        }
+    }
+    SweepRestoreAction {
+        action_id,
+        members: record.members.clone(),
+        authored_batch_ids,
+        cursor,
+        completed,
     }
 }
 
