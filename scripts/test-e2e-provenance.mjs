@@ -13,6 +13,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const helper = path.join(root, "scripts/build-e2e-receipt.mjs");
 const runner = path.join(root, "scripts/run-e2e.mjs");
 const inputHelper = path.join(root, "scripts/build-e2e-inputs.mjs");
+const proofReuseHelper = path.join(root, "scripts/release-proof-reuse-lib.mjs");
+const proofOnlyRegistry = path.join(root, "scripts/release-proof-only.json");
 const capabilities = path.join(root, "scripts/e2e-capabilities.mjs");
 const contracts = path.join(root, "tests/ui-regressions/e2e-contracts.json");
 const index = path.join(root, "dist/index.html");
@@ -43,6 +45,8 @@ try {
   fs.mkdirSync(path.join(fixture, "tests/ui-regressions"), { recursive: true });
   fs.copyFileSync(helper, path.join(fixture, "scripts/build-e2e-receipt.mjs"));
   fs.copyFileSync(inputHelper, path.join(fixture, "scripts/build-e2e-inputs.mjs"));
+  fs.copyFileSync(proofReuseHelper, path.join(fixture, "scripts/release-proof-reuse-lib.mjs"));
+  fs.copyFileSync(proofOnlyRegistry, path.join(fixture, "scripts/release-proof-only.json"));
   fs.copyFileSync(runner, path.join(fixture, "scripts/run-e2e.mjs"));
   fs.copyFileSync(capabilities, path.join(fixture, "scripts/e2e-capabilities.mjs"));
   fs.copyFileSync(contracts, path.join(fixture, "tests/ui-regressions/e2e-contracts.json"));

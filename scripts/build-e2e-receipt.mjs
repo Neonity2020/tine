@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
+import { productIdentityAtCommit } from "./release-proof-reuse-lib.mjs";
 
 // Keeps every native E2E candidate tied to the source state that built it.
 
@@ -74,10 +75,11 @@ function snapshot(root, tauriManifestNormalization) {
   const state = tauriManifestNormalization ? normalizedBuildInputState(root) : buildInputState(root);
   const normalization = tauriManifestNormalization ? normalizationDescriptor(state.tauriManifest) : undefined;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "tine-e2e-build-input-snapshot",
     repositoryRoot: root,
     sourceRevision: git(root, ["rev-parse", "HEAD"]).trim(),
+    productInputDigest: productIdentityAtCommit(root, "HEAD").digest,
     buildInputDigest: state.digest,
     buildInputsDirty: state.dirty,
     buildInputChanges: state.changes,
@@ -98,8 +100,9 @@ function readSnapshot(file) {
   } catch (error) {
     throw new Error(`could not read build-input snapshot ${file}: ${error.message}`);
   }
-  if (!value || Array.isArray(value) || value.schemaVersion !== 1 || value.kind !== "tine-e2e-build-input-snapshot"
+  if (!value || Array.isArray(value) || value.schemaVersion !== 2 || value.kind !== "tine-e2e-build-input-snapshot"
     || typeof value.repositoryRoot !== "string" || typeof value.sourceRevision !== "string"
+    || !/^[a-f0-9]{64}$/i.test(value.productInputDigest || "")
     || typeof value.buildInputDigest !== "string" || typeof value.buildInputsDirty !== "boolean"
     || !Array.isArray(value.buildInputChanges)) {
     throw new Error(`invalid build-input snapshot ${file}`);
@@ -184,8 +187,9 @@ function createReceipt(root, before, app, dist) {
   const afterStat = fs.statSync(app);
   if (!sameFileStat(beforeStat, afterStat)) throw new Error("refusing receipt: app binary changed while being verified");
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     sourceRevision: before.sourceRevision,
+    productInputDigest: before.productInputDigest,
     builtAt: new Date().toISOString(),
     frontendAsset: asset,
     appSha256: crypto.createHash("sha256").update(bytes).digest("hex"),

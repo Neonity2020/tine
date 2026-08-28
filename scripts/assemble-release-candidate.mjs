@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { candidateProblems, releaseLayout, releaseNotes, RELEASE_LANES } from "./release-layout.mjs";
+import { createCandidateReceipt, hashFile, productIdentityAtCommit } from "./release-proof-reuse-lib.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -17,7 +18,7 @@ function findFragments(directory, found = []) {
   return found;
 }
 
-export function assembleCandidate({ input, output, version, commit, repository, pubDate = new Date().toISOString() }) {
+export function assembleCandidate({ input, output, version, commit, repository, pubDate = new Date().toISOString(), receiptFile }) {
   const layout = releaseLayout(version);
   const fragments = findFragments(input).map((file) => ({ file, value: JSON.parse(fs.readFileSync(file, "utf8")) }));
   const byLane = new Map();
@@ -77,18 +78,41 @@ export function assembleCandidate({ input, output, version, commit, repository, 
   fs.writeFileSync(path.join(output, "latest.json"), `${JSON.stringify(updater, null, 2)}\n`);
   const problems = candidateProblems(output, version);
   if (problems.length) throw new Error(`candidate verification failed:\n  ${problems.join("\n  ")}`);
+  let receipt;
+  if (receiptFile) {
+    const product = productIdentityAtCommit(root, commit);
+    receipt = createCandidateReceipt({
+      version,
+      sourceCommit: commit,
+      productInputDigest: product.digest,
+      assets: layout.allAssets.map((name) => ({
+        name,
+        size: fs.statSync(path.join(output, name)).size,
+        sha256: hashFile(path.join(output, name)),
+      })),
+    });
+    fs.writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`);
+  }
   console.log(`Release candidate OK: v${version}, ${layout.allAssets.length} assets, ${Object.keys(platforms).length} updater platforms.`);
+  return receipt;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const [inputArg, outputArg = "release-candidate-assembled"] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const receiptIndex = args.indexOf("--receipt");
+  const receiptArg = receiptIndex >= 0 ? args[receiptIndex + 1] : undefined;
+  if (receiptIndex >= 0) args.splice(receiptIndex, 2);
+  const [inputArg, outputArg = "release-candidate-assembled"] = args;
   const version = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8")).version;
-  if (!inputArg) throw new Error("usage: assemble-release-candidate.mjs INPUT [OUTPUT]");
+  if (!inputArg || (receiptIndex >= 0 && !receiptArg)) {
+    throw new Error("usage: assemble-release-candidate.mjs INPUT [OUTPUT] [--receipt FILE]");
+  }
   assembleCandidate({
     input: path.resolve(inputArg),
     output: path.resolve(outputArg),
     version,
     commit: process.env.GITHUB_SHA,
     repository: process.env.GITHUB_REPOSITORY ?? "martinkoutecky/tine",
+    receiptFile: receiptArg ? path.resolve(receiptArg) : undefined,
   });
 }
