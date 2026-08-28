@@ -8628,7 +8628,7 @@
     "all"
    ],
    "layer": "native",
-   "status": "fixing",
+   "status": "covered",
    "coverage": {
     "tests": [
      "scripts/e2e-absence-sweeps.mjs::clean-close-honored"
@@ -8650,7 +8650,7 @@
     "all"
    ],
    "layer": "native",
-   "status": "fixing",
+   "status": "covered",
    "coverage": {
     "tests": [
      "src/absenceSweeps.test.ts::rebindAbsenceSweepScope::keeps the sweep list and an open panel across a same-generation rebind",

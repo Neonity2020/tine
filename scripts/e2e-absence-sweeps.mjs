@@ -93,6 +93,17 @@ let wm;
 let wmLog;
 let phase = "fixture-setup";
 
+// A killed or hung run must still name where it was: persist the phase (and
+// a heartbeat timestamp) into the receipt on every transition.
+function setPhase(next) {
+  phase = next;
+  try {
+    receipt.phase = next;
+    receipt.phaseEnteredAt = new Date().toISOString();
+    writeReceipt();
+  } catch { /* receipt not writable yet */ }
+}
+
 function gitRevision() {
   const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" });
   return result.status === 0 ? result.stdout.trim() : "unavailable";
@@ -194,6 +205,22 @@ async function bodyText() {
     return await browser.$("body").getText();
   } catch {
     return "";
+  }
+}
+
+
+// Artifact screenshots are evidence, not assertions. WebKitWebDriver
+// intermittently stalls a session-level call (screenshot GETs in particular;
+// UND_ERR_HEADERS_TIMEOUT after ~5 minutes) while the app and the journey's
+// semantic state are perfectly healthy — burn-in run 1 failed exactly there
+// with the product state verified correct in the failure body. Losing a
+// screenshot must not fail the journey.
+async function saveEvidenceScreenshot(name) {
+  try {
+    await browser.saveScreenshot(path.join(ARTIFACTS, name));
+  } catch (error) {
+    (receipt.screenshotFailures ??= []).push({ name, error: String(error).slice(0, 200) });
+    writeReceipt();
   }
 }
 
@@ -495,7 +522,7 @@ function expectedOutcomeForPhase() {
 }
 
 try {
-  phase = "window-manager";
+  setPhase("window-manager");
   wmLog = fs.openSync(path.join(ARTIFACTS, "openbox.log"), "w");
   wm = spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
     env,
@@ -505,33 +532,33 @@ try {
   await waitFor(() => wm.exitCode === null && windowManagerReady(), 15_000,
     "window manager did not become ready");
 
-  phase = "initial-launch";
+  setPhase("initial-launch");
   await connect("initial");
 
-  phase = "managed-activation";
+  setPhase("managed-activation");
   await enableManagedStorage();
 
-  phase = "clean-close-before-external-deletion";
+  setPhase("clean-close-before-external-deletion");
   await cleanQuit("pre-deletion-clean-close");
 
-  phase = "external-group-deletion";
+  setPhase("external-group-deletion");
   for (const page of deletedPages) fs.unlinkSync(page.file);
   if (deletedPages.some(({ file }) => fs.existsSync(file))) {
     throw new Error("synthetic external deletion left one or more target files present");
   }
   receipt.milestones.externalGroupDeletion = deletedPages.map(({ relativePath }) => relativePath);
 
-  phase = "managed-reopen";
+  setPhase("managed-reopen");
   await connect("managed-reopen");
 
-  phase = "surface-wait";
+  setPhase("surface-wait");
   const surfaced = await waitFor(async () => {
     const snapshot = await surfaceSnapshot();
     return (snapshot.toastFamily && snapshot.reviewAction) || snapshot.dock ? snapshot : false;
   }, 120_000, "Tier-3 group deletion exposed neither its warning+Review family nor its recovery dock", 200);
   receipt.milestones.surfaced = surfaced;
 
-  phase = "clean-close-honored";
+  setPhase("clean-close-honored");
   // The previous instance exited through the app's own quit path with every
   // managed slot verified stopped. That exit must not be reported as a crash:
   // a false "did not close cleanly" warning trains users to ignore the real
@@ -549,10 +576,10 @@ try {
   }
   receipt.milestones.cleanCloseHonored = true;
 
-  phase = "initial-panel";
+  setPhase("initial-panel");
   const initialPanel = await openRecoveryPanel("initial surfacing");
   assertLivePanel(initialPanel, "initial surfacing");
-  await browser.saveScreenshot(path.join(ARTIFACTS, "surfaced-panel.png"));
+  await saveEvidenceScreenshot("surfaced-panel.png");
   receipt.milestones.initialPanel = {
     tier: "tier3",
     count: DELETED_COUNT,
@@ -561,7 +588,7 @@ try {
     actions: ["Restore", "Re-apply", "Keep deletion"],
   };
 
-  phase = "dismiss-without-disposition";
+  setPhase("dismiss-without-disposition");
   await closeRecoveryPanel();
   const toastDismissal = await dismissSweepToast();
   const reopenedPanel = await openRecoveryPanel("post-dismiss reopen");
@@ -573,7 +600,7 @@ try {
     status: "waiting for your decision",
   };
 
-  phase = "restore-action";
+  setPhase("restore-action");
   await clickPanelAction("Restore");
   await waitFor(() => deletedPages.every(({ file, content }) =>
     fs.existsSync(file) && fs.readFileSync(file, "utf8") === content
@@ -589,7 +616,7 @@ try {
   if (historyMissing.length) {
     throw new Error(`disposed history lost member rows: ${historyMissing.map(({ name }) => name).join(", ")}`);
   }
-  await browser.saveScreenshot(path.join(ARTIFACTS, "restored-history.png"));
+  await saveEvidenceScreenshot("restored-history.png");
   receipt.milestones.restore = {
     exactFilesRecreated: true,
     status: "Restored",
@@ -597,7 +624,7 @@ try {
     historyMembers: DELETED_COUNT,
   };
 
-  phase = "restored-page-navigation";
+  setPhase("restored-page-navigation");
   await closeRecoveryPanel();
   await openPageThroughSwitcher(deletedPages[0].name);
   await browser.waitUntil(async () => (await bodyText()).includes(deletedPages[0].marker), {
@@ -611,7 +638,7 @@ try {
     visible: true,
   };
 
-  phase = "final-clean-close";
+  setPhase("final-clean-close");
   await cleanQuit("final-clean-close");
   receipt.result = "pass";
   receipt.completedAt = new Date().toISOString();
