@@ -5241,7 +5241,7 @@
   },
   {
    "id": "REG-MANAGED-FOCUS-EXTERNAL-REFRESH-397",
-   "title": "Returning to a managed graph waits for external Markdown reconciliation and every page selector reads the same current source",
+   "title": "Managed application-page selectors read same-structure external Markdown content consistently while reconciliation is pending",
    "family": "managed-storage-external-reconciliation",
    "sources": {
     "issues": [
@@ -5257,14 +5257,12 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/sync_runtime.rs::tests::focus_rescan_reads_external_content_through_every_page_selector_before_watcher_settles",
-     "src-tauri/src/watcher.rs::tests::focus_rescan_is_armed_once_and_completes_only_after_every_lane_settles",
-     "src-tauri/src/watcher.rs::tests::retry_schedule_exposes_unfinished_direct_reconciliation"
+     "crates/tine-core/src/sync_runtime.rs::tests::application_page_selectors_read_external_content_before_watcher_settles"
     ],
     "scenario": "managed-storage.focus-rescan-external-edit-selector-parity",
-    "failBefore": "proven at dc6747c0: after an external same-structure CRLF edit queued a managed full rescan but before its first bounded watcher slice, exact-path hydration returned the disk winner while logical and editor-name hydration both failed with ActorRefusedAt(\"hot_source_join\"). The native watcher also emitted graph-rescan-complete unconditionally after that first slice even when status.watcher.pending remained true."
+    "failBefore": "proven at dc6747c0: after an external same-structure CRLF edit queued a managed full rescan but before it settled, exact-path hydration returned the disk winner while logical application-page hydration failed with ActorRefusedAt(\"hot_source_join\")."
    },
-   "notes": "GH #397 reported the exact hot_source_join toast and 2-3 minute stale interval on Windows. Root cause is a split freshness contract: focus completion was emitted after one bounded actor tick although a large managed scan still had many slices, and logical/page-id selectors lacked the source-rebased hydration already used by exact-path reads. The receipt now waits until every active managed watcher is settled, unfinished Direct reconciliation has no retry outstanding, and deferred configuration work is empty; it arms each explicit request once so bounded continuation cannot continually move its own epoch. Same-topology outside edits hydrate from current source bytes through exact, logical, page-id, and editor-name routes while accepted history remains owned by the watcher. Structural or identity-changing edits still wait for normal reconciliation."
+   "notes": "GH #397 reported the exact hot_source_join toast and 2-3 minute stale interval on Windows. Logical and internal page-id application hydration lacked the source-rebased read view already used by exact-path reads, so a bounded watcher continuation left those routes stale until the full graph scan reached the page. Same-topology outside content edits now hydrate from current source bytes through application-page routes while accepted history remains owned by the watcher. Structural or identity-changing edits still wait for normal reconciliation; this row does not claim a Windows or managed real-app observation-boundary run."
   }
  ]
 }

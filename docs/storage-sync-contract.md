@@ -810,19 +810,9 @@ watcher epoch remains unacknowledged until that continuation and any
 observations queued behind it are reconciled, and clean shutdown drains this
 work before reporting `StoppedSafe`.
 
-A focus-driven freshness request is one such imprecise observation, but its
-frontend completion receipt is stronger than one bounded actor turn. The native
-watcher arms each request exactly once and emits `graph-rescan-complete` only
-after every active managed slot reports no pending watcher work, every Direct
-Files reconciliation has no retry or unacknowledged observation outstanding,
-and deferred configuration work is empty. A newer focus request that arrives
-while one scan is in flight starts a new scan after the older receipt; it does
-not continually move the current scan's epoch. This is the input-authority
-boundary: returning to the window cannot release the freshness gate after only
-the first slice of a graph-sized managed scan.
-
-Application hydration has selector parity while that bounded reconciliation is
-pending. Exact-path, logical-name, page-id, and editor-name reads may combine
+Application-page hydration has selector parity while bounded external
+reconciliation is pending. Exact-path, logical-name, and internal page-id reads
+may combine
 the exact current Markdown/Org source with the projected page only when path,
 outline topology, and block identities still match. This source-rebased value
 is a disposable read view, never accepted history; the watcher remains the sole

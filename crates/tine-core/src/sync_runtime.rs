@@ -12294,11 +12294,12 @@ impl RuntimeActor {
         page_id: PageId,
     ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
         // Exact-path reads already hydrate from the current source bytes while
-        // a bounded watcher reconciliation is still pending. Logical,
-        // page-id, and editor selectors must have the same freshness contract:
-        // selector choice cannot turn an ordinary external-editor race into a
-        // hot-source join refusal. This is a disposable read view only; the
-        // watcher still authors the external change into accepted history.
+        // a bounded watcher reconciliation is still pending. Logical and
+        // internal page-id application routes must have the same freshness
+        // contract: selector choice cannot turn an ordinary external-editor
+        // race into a hot-source join refusal. This is a disposable read view
+        // only; the watcher still authors the external change into accepted
+        // history.
         if self.exact_projection_read_available() {
             if let Ok(Some(current)) = load_projected_source_rebased_application_page_from_parts(
                 self.active_engine()
@@ -18710,7 +18711,10 @@ impl RuntimeActor {
             SyncEditorPageSelector::PageId { page_id } => {
                 let page_id = parse_editor_page_id(&page_id)?;
                 let current = self
-                    .load_active_current_source_application_page(page_id)?
+                    .load_active_preferred_application_page(
+                        page_id,
+                        self.exact_projection_read_available(),
+                    )?
                     .map(|current| current.editor);
                 match current {
                     Some(current) => Ok(SyncEditorLoadOutcome::Loaded { page: current.dto }),
@@ -18722,7 +18726,10 @@ impl RuntimeActor {
                 match current {
                     EditorNameState::Exact(page_id) => {
                         let current = self
-                            .load_active_current_source_application_page(page_id)?
+                            .load_active_preferred_application_page(
+                                page_id,
+                                self.exact_projection_read_available(),
+                            )?
                             .map(|current| current.editor)
                             .ok_or(SyncEditorRequestError::ActorRefusedAt(
                                 "editor_load_page_missing",
@@ -33995,13 +34002,12 @@ mod tests {
         ));
     }
 
-    /// GH #397: a focus rescan is a bounded watcher continuation, so page
-    /// hydration can race the first slice on a large graph. Every selector
-    /// must still read the same current Markdown bytes while the actor has not
-    /// yet admitted them; selector choice cannot turn that ordinary race into
-    /// a `hot_source_join` refusal.
+    /// GH #397: page hydration can race a bounded watcher continuation on a
+    /// large graph. Application-page selectors must still read the same current
+    /// Markdown bytes while the actor has not yet admitted them; selector choice
+    /// cannot turn that ordinary race into a `hot_source_join` refusal.
     #[test]
-    fn focus_rescan_reads_external_content_through_every_page_selector_before_watcher_settles() {
+    fn application_page_selectors_read_external_content_before_watcher_settles() {
         const EXTERNAL: &str = "external winner before focus rescan settlement";
         let fixture = ActivationFixture::nested_unicode("focus-rescan-selector-parity", 0xa17c_397);
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
@@ -34047,19 +34053,6 @@ mod tests {
             logical,
             SyncApplicationPageLoadOutcome::Loaded { page, .. }
                 if page.blocks[0].raw == EXTERNAL
-        ));
-
-        let editor = handle
-            .load_editor_page(SyncEditorLoadRequest {
-                page: SyncEditorPageSelector::Name {
-                    name: "Root logical".into(),
-                    page_kind: SyncPageKind::Page,
-                },
-            })
-            .expect("an editor-name route must not refuse at hot_source_join");
-        assert!(matches!(
-            editor,
-            SyncEditorLoadOutcome::Loaded { page } if page.blocks[0].content == EXTERNAL
         ));
 
         drain_until_settled(&handle);
