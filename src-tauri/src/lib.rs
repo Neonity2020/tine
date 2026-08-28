@@ -632,7 +632,7 @@ pub fn run() {
     #[cfg(any(mobile, target_os = "windows"))]
     let builder = builder.plugin(tauri_plugin_opener::init());
 
-    let result = builder
+    let app = builder
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
@@ -927,11 +927,22 @@ pub fn run() {
             close_graph_window,
             tine_open_devtools
         ])
-        .run(context);
-    if result.is_ok() {
-        mark_clean_shutdown();
-    }
-    result.expect("error while running tauri application");
+        .build(context)
+        .expect("error while running tauri application");
+    // `App::run` never returns: Tauri exits the process from inside the event
+    // loop (`std::process::exit`), so code placed after it is unreachable.
+    // The clean-shutdown marker must therefore be cleared from the loop's own
+    // `RunEvent::Exit`, which Tauri delivers to this callback before exiting;
+    // clearing it anywhere later never runs and every quit is falsely reported
+    // as unclean on the next launch (the flight recorder's `session-active`
+    // marker survives). Enforced at the real boundary by
+    // `scripts/e2e-absence-sweeps.mjs`, which reopens the app mid-journey and
+    // asserts the unclean-exit toast is absent.
+    app.run(|_app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            mark_clean_shutdown();
+        }
+    });
 }
 
 #[cfg(test)]
