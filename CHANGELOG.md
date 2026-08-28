@@ -17,6 +17,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   failed restores retain their cause and can be re-run, while dismissing the
   warning or closing the panel never records a deletion decision.
 
+### Fixed
+
+- Restoring deleted pages from the recovery panel no longer closes the panel
+  by itself the moment the restore completes: the disposed sweep stays visible
+  as actionless history until you close it.
+- Quitting Tine normally no longer shows a false "Tine did not close cleanly
+  last time" warning on the next launch. The clean-shutdown marker was cleared
+  in code placed after the app's event loop, which never runs, so every quit
+  since the flight recorder shipped was reported as a crash.
+
 ## [0.6.98] - 2026-08-27
 
 ### Changed

@@ -22,6 +22,22 @@ export function clearAbsenceSweeps(): void {
   setAbsenceSweepPanelOpen(false);
 }
 
+// `undefined` = never bound; distinct from `null` (bound with no generation).
+let boundGeneration: number | null | undefined;
+
+/**
+ * Reset the sweep surface only when the graph binding actually changed.
+ * Durable sweep records outlive runtime-status churn: a status event or an
+ * authority flap on the SAME binding must not wipe the list or close a panel
+ * the user is looking at (restoring a sweep emits exactly such events, and
+ * clearing here closed the recovery panel at the moment Restore completed).
+ */
+export function rebindAbsenceSweepScope(bindingGeneration: number | null): void {
+  if (boundGeneration === bindingGeneration) return;
+  boundGeneration = bindingGeneration;
+  clearAbsenceSweeps();
+}
+
 export function ingestAbsenceSweepEvent(
   sweep: SyncAbsenceSweepEvent,
   options: { announce?: boolean } = {},
@@ -85,4 +101,5 @@ export function resetAbsenceSweepStateForTest(): void {
   setAbsenceSweeps([]);
   setAbsenceSweepPanelOpen(false);
   announced.clear();
+  boundGeneration = undefined;
 }
