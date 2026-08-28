@@ -48,7 +48,8 @@ use crate::model::{
     RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
 use crate::oplog::absence_sweep::{
-    SweepError, SweepManager, SweepMember, SweepNotification, SweepRestoreCursor, SweepTier,
+    SweepActionKind, SweepActionState, SweepError, SweepManager, SweepMember, SweepRecord,
+    SweepRestoreCursor, SweepTier,
 };
 use crate::oplog::discovery::{
     classify_enrollment_error, discover_startup, AmbiguousEvidence, DiscoveryClassification,
@@ -1955,6 +1956,47 @@ pub struct SyncAbsenceSweepEvent {
     pub opened_at_unix_ms: u64,
     pub closed_at_unix_ms: Option<u64>,
     pub grace_deadline_unix_ms: Option<u64>,
+    pub disposed_at_unix_ms: Option<u64>,
+    pub members: Vec<SyncAbsenceSweepMember>,
+    pub latest_action: Option<SyncAbsenceSweepAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncAbsenceSweepMember {
+    pub page_id: String,
+    pub path: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncAbsenceSweepActionKind {
+    Restore,
+    Reapply,
+    KeepDeletion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncAbsenceSweepActionState {
+    Started,
+    Progress,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncAbsenceSweepAction {
+    pub action_id: String,
+    pub action: SyncAbsenceSweepActionKind,
+    pub state: SyncAbsenceSweepActionState,
+    pub recorded_at_unix_ms: u64,
+    pub authored_batch_ids: Vec<String>,
+    pub chunk_ordinal: Option<u64>,
+    pub remaining_operation_watermark: Option<u64>,
+    pub nondecreasing_retries: Option<u8>,
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1989,20 +2031,74 @@ pub struct SyncAbsenceSweepRestoreOutcome {
     pub fidelity: Vec<SyncAbsenceSweepRestoreFidelity>,
 }
 
-impl From<&SweepNotification> for SyncAbsenceSweepEvent {
-    fn from(notification: &SweepNotification) -> Self {
+impl From<&SweepRecord> for SyncAbsenceSweepEvent {
+    fn from(record: &SweepRecord) -> Self {
+        let latest_action = record.actions.last().map(|action| {
+            let (state, authored_batch_ids, cursor, failure_reason) = match &action.state {
+                SweepActionState::Started => {
+                    (SyncAbsenceSweepActionState::Started, Vec::new(), None, None)
+                }
+                SweepActionState::Progress {
+                    authored_batch_ids,
+                    restore_cursor,
+                } => (
+                    SyncAbsenceSweepActionState::Progress,
+                    authored_batch_ids.iter().map(ToString::to_string).collect(),
+                    restore_cursor.as_ref(),
+                    None,
+                ),
+                SweepActionState::Completed => (
+                    SyncAbsenceSweepActionState::Completed,
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                SweepActionState::Failed { reason } => (
+                    SyncAbsenceSweepActionState::Failed,
+                    Vec::new(),
+                    None,
+                    Some(reason.clone()),
+                ),
+            };
+            SyncAbsenceSweepAction {
+                action_id: action.action_id.to_string(),
+                action: match action.action {
+                    SweepActionKind::Restore => SyncAbsenceSweepActionKind::Restore,
+                    SweepActionKind::Reapply => SyncAbsenceSweepActionKind::Reapply,
+                    SweepActionKind::KeepDeletion => SyncAbsenceSweepActionKind::KeepDeletion,
+                },
+                state,
+                recorded_at_unix_ms: action.recorded_at_unix_ms,
+                authored_batch_ids,
+                chunk_ordinal: cursor.map(|cursor| cursor.chunk_ordinal),
+                remaining_operation_watermark: cursor
+                    .map(|cursor| cursor.remaining_operation_watermark),
+                nondecreasing_retries: cursor.map(|cursor| cursor.nondecreasing_retries),
+                failure_reason,
+            }
+        });
         Self {
-            sweep_id: notification.sweep_id.to_string(),
-            tier: match notification.tier {
+            sweep_id: record.sweep_id.to_string(),
+            tier: match record.tier {
                 SweepTier::Tier1 => unreachable!("tier-1 sweeps are quiet"),
                 SweepTier::Tier2 => SyncAbsenceSweepTier::Tier2,
                 SweepTier::Tier3 => SyncAbsenceSweepTier::Tier3,
             },
-            absence_count: notification.absence_count,
-            pages_at_open: notification.pages_at_open,
-            opened_at_unix_ms: notification.opened_at_unix_ms,
-            closed_at_unix_ms: notification.closed_at_unix_ms,
-            grace_deadline_unix_ms: notification.grace_deadline_unix_ms,
+            absence_count: record.members.len(),
+            pages_at_open: record.pages_at_open as usize,
+            opened_at_unix_ms: record.opened_at_unix_ms,
+            closed_at_unix_ms: record.closed_at_unix_ms,
+            grace_deadline_unix_ms: record.grace_deadline_unix_ms,
+            disposed_at_unix_ms: record.disposed_at_unix_ms,
+            members: record
+                .members
+                .iter()
+                .map(|member| SyncAbsenceSweepMember {
+                    page_id: member.page_id.to_string(),
+                    path: member.path.to_string(),
+                })
+                .collect(),
+            latest_action,
         }
     }
 }
@@ -4409,6 +4505,25 @@ impl SyncRuntimeHandle {
         reply_receiver
             .recv()
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    /// Subscribe to changed durable sweep snapshots. The receiver is
+    /// observational: dropping it changes no sweep state and the actor prunes
+    /// the disconnected subscriber on its next notification.
+    pub fn subscribe_absence_sweep_events(
+        &self,
+    ) -> Result<Receiver<SyncAbsenceSweepEvent>, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::SubscribeAbsenceSweepEvents {
+            events: event_sender,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
+        Ok(event_receiver)
     }
 
     pub fn reapply_absence_sweep(
@@ -9117,6 +9232,10 @@ enum ActorRequest {
     AbsenceSweepEvents {
         reply: mpsc::Sender<Vec<SyncAbsenceSweepEvent>>,
     },
+    SubscribeAbsenceSweepEvents {
+        events: mpsc::Sender<SyncAbsenceSweepEvent>,
+        reply: mpsc::Sender<()>,
+    },
     ReapplyAbsenceSweep {
         sweep_id: uuid::Uuid,
         reply: mpsc::Sender<Result<SyncAbsenceSweepActionOutcome, SyncRuntimeRequestError>>,
@@ -9363,6 +9482,7 @@ fn run_actor_loop(
                 if let Err(error) = actor.flush_local_completions_if_required() {
                     actor.terminal = Some(error);
                 }
+                actor.publish_absence_sweep_changes();
                 *shared_status.write().unwrap() = actor.snapshot();
                 continue;
             }
@@ -9556,15 +9676,13 @@ fn run_actor_loop(
                 false
             }
             ActorRequest::AbsenceSweepEvents { reply } => {
-                let events = actor.clean.as_ref().map_or_else(Vec::new, |clean| {
-                    clean
-                        .sweeps
-                        .notifications()
-                        .iter()
-                        .map(SyncAbsenceSweepEvent::from)
-                        .collect()
-                });
+                let events = actor.absence_sweep_events();
                 let _ = reply.send(events);
+                false
+            }
+            ActorRequest::SubscribeAbsenceSweepEvents { events, reply } => {
+                actor.absence_sweep_subscribers.push(events);
+                let _ = reply.send(());
                 false
             }
             ActorRequest::ReapplyAbsenceSweep { sweep_id, reply } => {
@@ -9755,6 +9873,7 @@ fn run_actor_loop(
         if let Err(error) = actor.flush_local_completions_if_required() {
             actor.terminal = Some(error);
         }
+        actor.publish_absence_sweep_changes();
         *shared_status.write().unwrap() = actor.snapshot();
         if should_stop {
             break;
@@ -11878,6 +11997,8 @@ struct RuntimeActor {
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
+    absence_sweep_subscribers: Vec<mpsc::Sender<SyncAbsenceSweepEvent>>,
+    last_absence_sweep_events: BTreeMap<String, SyncAbsenceSweepEvent>,
     terminal: Option<String>,
     stopped_safe: bool,
     enrollment_root: EnrollmentApplicationRoot,
@@ -11994,6 +12115,36 @@ impl RuntimeActor {
         self.clean
             .as_ref()
             .is_some_and(|clean| clean.sweeps.publication_barrier_active())
+    }
+
+    fn absence_sweep_events(&self) -> Vec<SyncAbsenceSweepEvent> {
+        self.clean.as_ref().map_or_else(Vec::new, |clean| {
+            clean
+                .sweeps
+                .surfaced_records()
+                .map(SyncAbsenceSweepEvent::from)
+                .collect()
+        })
+    }
+
+    fn publish_absence_sweep_changes(&mut self) {
+        let current = self
+            .absence_sweep_events()
+            .into_iter()
+            .map(|event| (event.sweep_id.clone(), event))
+            .collect::<BTreeMap<_, _>>();
+        let changed = current
+            .iter()
+            .filter(|(sweep_id, event)| {
+                self.last_absence_sweep_events.get(*sweep_id) != Some(event)
+            })
+            .map(|(_, event)| event.clone())
+            .collect::<Vec<_>>();
+        self.last_absence_sweep_events = current;
+        for event in changed {
+            self.absence_sweep_subscribers
+                .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        }
     }
 
     fn admit_deferred_absence_observations(&mut self) -> Result<bool, String> {
@@ -12311,6 +12462,8 @@ impl RuntimeActor {
             recovery,
             last_watcher,
             last_tick: None,
+            absence_sweep_subscribers: Vec::new(),
+            last_absence_sweep_events: BTreeMap::new(),
             terminal: None,
             stopped_safe: false,
             enrollment_root,
@@ -21557,6 +21710,7 @@ impl RuntimeActor {
                     "cannot durably begin absence sweep re-apply: {error}"
                 ))
             })?;
+        self.publish_absence_sweep_changes();
         let live_pages = {
             let clean = self
                 .clean
@@ -21622,6 +21776,7 @@ impl RuntimeActor {
                         .expect("clean sweep action retains its runtime")
                         .sweeps
                         .fail_reapply(sweep_id, action_id, reason.clone());
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             }
@@ -21636,6 +21791,7 @@ impl RuntimeActor {
                     "re-apply deletion is accepted but its sweep completion record could not be appended: {error}"
                 ))
             })?;
+        self.publish_absence_sweep_changes();
         Ok(SyncAbsenceSweepActionOutcome {
             sweep_id: sweep_id.to_string(),
             action_id: action_id.to_string(),
@@ -21658,6 +21814,7 @@ impl RuntimeActor {
                     "cannot durably begin absence sweep restore: {error}"
                 ))
             })?;
+        self.publish_absence_sweep_changes();
         let action_id = action.action_id;
         let members = action.members;
         let mut authored_batch_ids = action.authored_batch_ids;
@@ -21707,6 +21864,7 @@ impl RuntimeActor {
                         .expect("restore action retains its clean runtime")
                         .sweeps
                         .fail_restore(sweep_id, action_id, reason.clone());
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             };
@@ -21725,6 +21883,7 @@ impl RuntimeActor {
                         .expect("restore action retains its clean runtime")
                         .sweeps
                         .fail_restore(sweep_id, action_id, reason.clone());
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             };
@@ -21751,6 +21910,7 @@ impl RuntimeActor {
                             "{reason}; additionally could not append failed restore action: {error}"
                         ))
                     })?;
+                self.publish_absence_sweep_changes();
                 return Err(SyncRuntimeRequestError::ActorRefused(reason));
             }
             if watermark == 0 {
@@ -21764,6 +21924,7 @@ impl RuntimeActor {
                             "restore reached whole-page equality but its completion record could not be appended: {error}"
                         ))
                     })?;
+                self.publish_absence_sweep_changes();
                 return Ok(SyncAbsenceSweepRestoreOutcome {
                     sweep_id: sweep_id.to_string(),
                     action_id: action_id.to_string(),
@@ -21809,6 +21970,7 @@ impl RuntimeActor {
                         .expect("restore action retains its clean runtime")
                         .sweeps
                         .fail_restore(sweep_id, action_id, reason.clone());
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             };
@@ -21835,6 +21997,7 @@ impl RuntimeActor {
                         "restore chunk {batch_id} is accepted but its durable cursor could not be appended: {error}"
                     ))
                 })?;
+            self.publish_absence_sweep_changes();
             cursor = Some(next_cursor);
             #[cfg(test)]
             {
@@ -21869,6 +22032,7 @@ impl RuntimeActor {
                                 "{reason}; additionally could not append failed restore action: {error}"
                             ))
                         })?;
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             }
@@ -30668,16 +30832,39 @@ mod tests {
         assert_eq!(event.tier, SyncAbsenceSweepTier::Tier3);
         assert_eq!(event.absence_count, 1);
         assert_eq!(event.pages_at_open, 3);
+        assert_eq!(event.members.len(), 1);
+        assert_eq!(event.members[0].path, "Root.md");
+        assert!(event.latest_action.is_none());
 
         let refusal = handle.prepare_shared().unwrap_err().to_string();
         assert!(refusal.contains("external deletions awaiting disposition"));
         assert!(refusal.contains("half-synced folder or dying mount"));
 
+        let action_events = handle.subscribe_absence_sweep_events().unwrap();
         let reapplied = handle.reapply_absence_sweep(&event.sweep_id).unwrap();
         assert!(
             reapplied.authored_batch_ids.is_empty(),
             "an already-accepted deletion is an idempotent Re-apply noop"
         );
+        let started = action_events.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            started.latest_action,
+            Some(SyncAbsenceSweepAction {
+                action: SyncAbsenceSweepActionKind::Reapply,
+                state: SyncAbsenceSweepActionState::Started,
+                ..
+            })
+        ));
+        let completed = action_events.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            completed.latest_action,
+            Some(SyncAbsenceSweepAction {
+                action: SyncAbsenceSweepActionKind::Reapply,
+                state: SyncAbsenceSweepActionState::Completed,
+                ..
+            })
+        ));
+        assert!(completed.disposed_at_unix_ms.is_some());
         assert!(handle
             .dispose_absence_sweep_keep_deletion(&event.sweep_id)
             .is_ok());

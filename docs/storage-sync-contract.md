@@ -1419,11 +1419,23 @@ Tier precedence is exact and accept-by-default:
 
 All tiers author ordinary accepted deletion batches immediately; local
 acceptance and inbound provider admission never wait for classification. Tier 1
-is quiet. Tier 2 and tier 3 append structured `SyncAbsenceSweepEvent` values to
-the runtime notification surface. An open sweep escalates in place as `k`
-crosses a boundary, appending its new tier and members. The backend Restore,
-Re-apply, and Keep-deletion actions are available through `SyncRuntimeHandle`;
-frontend toast, dock, list, and action wiring belong to packet C-5b.
+is quiet. Tier 2 and tier 3 become current `SyncAbsenceSweepEvent` snapshots on
+the runtime's read-only list surface. Each snapshot carries the tier and timing
+summary, explicit disposal, ordered `(page id, path)` members, and the latest
+durable action state including Restore cursor or recorded failure cause. An open
+sweep escalates in place as `k` crosses a boundary, appending its new tier and
+members. A read-only runtime subscription publishes the same snapshot at first
+surfacing and whenever its durable action state changes; Tauri relays it to only
+the window and binding generation that own that runtime. Disposed surfaced
+records remain listable as disposition history.
+
+The frontend keeps tier 1 quiet, raises a tier-2/tier-3 warning, and retains a
+dock/list/details surface with the member pages and live action state. Its
+Restore, Re-apply, and Keep-deletion controls map one-to-one to the three backend
+actions on `SyncRuntimeHandle`; a failed Restore shows its recorded cause and
+the re-run control invokes whole-sweep Restore again. Dismissing the warning or
+closing the surface changes presentation only. It never invokes a disposition;
+Keep-deletion is an explicit deliberate action.
 
 Each logical record is the append-only immutable chain in the layout table.
 The current state is its highest valid linked version and records: sweep id;

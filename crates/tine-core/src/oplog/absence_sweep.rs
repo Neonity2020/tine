@@ -349,6 +349,16 @@ impl SweepManager {
         &self.notifications
     }
 
+    /// Current durable records that have crossed the user-surfacing boundary.
+    /// Tier-1 records remain intentionally quiet; disposed records remain
+    /// visible so the application can show the disposition the user chose.
+    pub(crate) fn surfaced_records(&self) -> impl Iterator<Item = &SweepRecord> {
+        self.chains
+            .values()
+            .map(|chain| &chain.record)
+            .filter(|record| record.tier.surfaced())
+    }
+
     pub(crate) fn record(&self, sweep_id: Uuid) -> Option<&SweepRecord> {
         self.chains.get(&sweep_id).map(|chain| &chain.record)
     }
