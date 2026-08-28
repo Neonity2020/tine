@@ -5260,7 +5260,7 @@
      "crates/tine-core/src/sync_runtime.rs::tests::application_page_selectors_read_external_content_before_watcher_settles"
     ],
     "scenario": "managed-storage.focus-rescan-external-edit-selector-parity",
-    "failBefore": "proven at dc6747c0: after an external same-structure CRLF edit queued a managed full rescan but before it settled, exact-path hydration returned the disk winner while logical application-page hydration failed with ActorRefusedAt(\"hot_source_join\")."
+    "failBefore": "proven at 6e7bdd42: after an external same-structure CRLF edit queued a managed full rescan but before it settled, exact-path hydration returned the disk winner while logical application-page hydration failed with ActorRefusedAt(\"hot_source_join\")."
    },
    "notes": "GH #397 reported the exact hot_source_join toast and 2-3 minute stale interval on Windows. Logical application hydration lacked the source-rebased read view already used by exact-path reads, so a bounded watcher continuation left that route stale until the full graph scan reached the page. Same-topology outside content edits now hydrate from current source bytes through read-only application-page routes while accepted history remains owned by the watcher. Mutation baselines keep the accepted-authority route, and structural or identity-changing edits still wait for normal reconciliation; this row does not claim a Windows or managed real-app observation-boundary run."
   }
