@@ -8,6 +8,13 @@ icon:: 🔄
 - ## Current scope
 	- Managed storage currently covers **page and journal text** only. Assets, PDF sidecars, and configuration remain ordinary provider-synchronized files.
 	- Setup first makes a safety backup and checks that Tine can reconstruct the same Markdown/Org tree. If that cannot be proven, it stops instead of changing graph authority.
+- ## Review a detected group deletion
+	- This safety surface belongs only to a graph using Tine-managed storage. Direct-files graphs keep their ordinary file and snapshot recovery paths.
+	- Four deleted pages together become a **Tier 2** sweep. A deletion reaching at least 10% of the graph's pages (rounded up), or 50 pages when that is lower, becomes **Tier 3**. Tier 1 stays quiet. A Tier 3 sweep also pauses propagation for about five minutes so another device is less likely to carry a mass deletion onward before you can review it.
+	- Tine shows a warning and keeps a **Deleted pages** dock with the sweep's member pages and live action status. Closing either the warning or the panel makes no decision and deletes no sweep record.
+	- Choose **Restore** to revive every member from its accepted predecessor state, **Re-apply** to accept and re-author the deletion against the current state, or **Keep deletion** to deliberately retain the accepted deletion. These are the only actions that dispose the sweep.
+	- Restore may run in several durable chunks. The panel shows its progress; if it fails, it keeps the recorded cause and offers **Run Restore again** to resume through the same backend recovery path.
+	- What you should see: the dock remains until you make an explicit choice, and then keeps the completed disposition visible as history. See [[Reference/Troubleshooting and recovery]] for the same steps in recovery form.
 - ## Try it on a test graph
 	- 1. Open Settings (**t s**) → **Backups & recovery** → **Storage & sync**.
 	- 2. Read the **Known to be buggy** warning, then choose **Enable Tine-managed storage...** for a graph you are comfortable testing.

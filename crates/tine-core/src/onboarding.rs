@@ -807,6 +807,49 @@ mod tests {
     }
 
     #[test]
+    fn absence_sweep_recovery_is_taught_in_both_guide_surfaces() {
+        let managed = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Features/Managed sync")
+            .expect("managed-sync page is registered");
+        assert!(managed
+            .markdown
+            .contains("Review a detected group deletion"));
+        assert!(managed.markdown.contains("Four deleted pages"));
+        assert!(managed.markdown.contains("**Restore**"));
+        assert!(managed.markdown.contains("**Re-apply**"));
+        assert!(managed.markdown.contains("**Keep deletion**"));
+        assert!(managed.markdown.contains("Run Restore again"));
+        assert!(managed
+            .markdown
+            .contains("Closing either the warning or the panel makes no decision"));
+        assert!(managed
+            .markdown
+            .contains("[[Reference/Troubleshooting and recovery]]"));
+
+        let recovery = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Reference/Troubleshooting and recovery")
+            .expect("recovery page is registered");
+        assert!(recovery
+            .markdown
+            .contains("Review several deletions in Tine-managed storage"));
+        assert!(recovery
+            .markdown
+            .contains("Closing the warning or panel records no choice"));
+        assert!(recovery.markdown.contains("finished sweep remains visible"));
+
+        let dir = scratch("tine-guide-absence-sweep-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, "Features/Managed sync").unwrap();
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("managed-sync page was copied");
+        assert!(copied_markdown.contains("Run Restore again"));
+        assert!(copied_markdown.contains("[[tine-guide/Reference/Troubleshooting and recovery]]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn capture_plan_day_workflow_is_registered_linked_and_copyable() {
         let title = "Workflows/Capture and plan your day";
         let page = GUIDE_TEMPLATES
