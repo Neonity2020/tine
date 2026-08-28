@@ -181,7 +181,7 @@ async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promis
     graphBinding: owner.graphBinding,
     day,
     owner,
-    promise: Promise.resolve(null),
+    promise: Promise.resolve<unknown | null>(null),
   };
   flight.promise = (async () => {
     const ensured = await ensureJournalTemplateForDay(date, () => !feedHasActiveEdit());
