@@ -1009,7 +1009,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-promotion-plan
-          path: promotion
+          path: ${{ runner.temp }}/release-promotion-plan
       - uses: actions/download-artifact@v4
         with:
           name: release-proof-linux-x64
@@ -1034,7 +1034,7 @@ jobs:
       - name: Rerun changed blocking proof against exact source binary
         run: |
           node scripts/run-release-promotion-proofs.mjs \
-            --plan promotion/release-promotion-plan.json \
+            --plan "${{ runner.temp }}/release-promotion-plan/release-promotion-plan.json" \
             --platform linux \
             --output promotion-linux-proofs.json
       - uses: actions/upload-artifact@v4
@@ -1063,7 +1063,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-promotion-plan
-          path: promotion
+          path: ${{ runner.temp }}/release-promotion-plan
       - uses: actions/download-artifact@v4
         with:
           name: release-proof-windows-x64
@@ -1087,11 +1087,8 @@ jobs:
         shell: pwsh
         run: ./scripts/install-windows-webview2-driver.ps1
       - name: Rerun changed advisory proof against exact source binary
-        run: |
-          node scripts/run-release-promotion-proofs.mjs \
-            --plan promotion/release-promotion-plan.json \
-            --platform windows \
-            --output promotion-windows-proofs.json
+        shell: pwsh
+        run: node scripts/run-release-promotion-proofs.mjs --plan "${{ runner.temp }}/release-promotion-plan/release-promotion-plan.json" --platform windows --output promotion-windows-proofs.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

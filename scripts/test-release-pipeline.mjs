@@ -129,6 +129,16 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
+  /promotion-linux-proof:[\s\S]*?path: \$\{\{ runner\.temp \}\}\/release-promotion-plan[\s\S]*?promotion-windows-proof:[\s\S]*?path: \$\{\{ runner\.temp \}\}\/release-promotion-plan/,
+  "promotion proof inputs must not dirty the product checkout"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Rerun changed advisory proof against exact source binary\n\s+shell: pwsh\n\s+run: node scripts\/run-release-promotion-proofs\.mjs --plan [^\n]+ --platform windows --output promotion-windows-proofs\.json/,
+  "Windows promotion proof invocation must use PowerShell-safe syntax"
+);
+assert.match(
+  releaseWorkflow,
   /Upload, verify, and publish promoted release[\s\S]*?if: inputs\.publish && startsWith\(github\.ref, 'refs\/tags\/'\)/,
   "proof-only promotion can publish without an explicit tagged publication request"
 );
