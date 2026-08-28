@@ -406,7 +406,7 @@ async function connect(label) {
     port: DRIVER_PORT,
     path: "/",
     logLevel: "error",
-    connectionRetryCount: 1,
+    connectionRetryCount: 0,
     connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "absence-sweeps"),
   });
@@ -531,6 +531,24 @@ try {
   }, 120_000, "Tier-3 group deletion exposed neither its warning+Review family nor its recovery dock", 200);
   receipt.milestones.surfaced = surfaced;
 
+  phase = "clean-close-honored";
+  // The previous instance exited through the app's own quit path with every
+  // managed slot verified stopped. That exit must not be reported as a crash:
+  // a false "did not close cleanly" warning trains users to ignore the real
+  // one. (Regression: mark_clean_shutdown was unreachable dead code after
+  // tauri's never-returning run(), so every quit left the session-active
+  // marker behind.)
+  {
+    const uncleanToast = await bodyText();
+    if (uncleanToast.includes("did not close cleanly")) {
+      if (process.env.E2E_ALLOW_UNCLEAN_TOAST !== "1") {
+        throw new Error("clean quit was falsely reported as an unclean close on reopen");
+      }
+      receipt.milestones.uncleanToastTolerated = true;
+    }
+  }
+  receipt.milestones.cleanCloseHonored = true;
+
   phase = "initial-panel";
   const initialPanel = await openRecoveryPanel("initial surfacing");
   assertLivePanel(initialPanel, "initial surfacing");
@@ -616,6 +634,22 @@ try {
     const dom = path.join(ARTIFACTS, "failure-dom.html");
     fs.writeFileSync(dom, await browser?.getPageSource());
     evidence.push(dom);
+  } catch {}
+  try {
+    if (Number.isInteger(appPid) && appPid > 0) {
+      const status = fs.existsSync(`/proc/${appPid}/status`)
+        ? fs.readFileSync(`/proc/${appPid}/status`, "utf8")
+        : "process gone";
+      const stacks = [];
+      try {
+        for (const task of fs.readdirSync(`/proc/${appPid}/task`)) {
+          try {
+            stacks.push(`task ${task}: ${fs.readFileSync(`/proc/${appPid}/task/${task}/stack`, "utf8").trim()}`);
+          } catch {}
+        }
+      } catch {}
+      receipt.appProcessAtFailure = { pid: appPid, status: status.slice(0, 2000), kernelStacks: stacks.slice(0, 64) };
+    }
   } catch {}
   const debugLog = path.join(ARTIFACTS, "tine-debug.log");
   if (fs.existsSync(debugLog)) {
