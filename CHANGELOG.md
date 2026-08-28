@@ -57,6 +57,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Unlinked References no longer falls back to a whole-graph scan while an
+  ordinary edit's one-page SQLite update is already in flight** (GH #400).
+  Reference reads wait for that bounded background delta, then use the exact
+  current candidate set; an unavailable or failed disposable projection still
+  falls back to the parser. Exact Direct Files byte conflicts remain unchanged
+  and continue to preserve both the disk version and the unsaved draft.
+
 - **Long pages no longer grow and shrink when a block enters or leaves edit
   mode** (GH #390). Pane-relative end-of-page breathing room is now derived
   from whether the page content naturally overflows, rather than from the

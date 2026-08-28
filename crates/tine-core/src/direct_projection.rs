@@ -26,9 +26,20 @@ type PageRevisions = Arc<HashMap<PathBuf, String>>;
 // physical facts. The source-revision delta then rebuilds each page once even
 // when tine-storage's disposable SQLite schema itself remains compatible.
 const DIRECT_PROJECTION_FACTS_VERSION: u32 = 2;
+const REFERENCE_DELTA_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(test)]
 static PHYSICAL_PAGE_LOWERINGS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static BEFORE_APPLY_PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn run_before_apply_pending_hook() {
+    if let Some(hook) = BEFORE_APPLY_PENDING.lock().unwrap().take() {
+        hook();
+    }
+}
 
 #[derive(Clone)]
 enum PageDelta {
@@ -51,6 +62,9 @@ struct ProjectionShared {
     ready: AtomicBool,
     ready_generation: AtomicU64,
     reader: Mutex<Option<PhysicalGraphProjectionDatabase>>,
+    worker_available: AtomicBool,
+    worker_failed: AtomicBool,
+    worker_busy: AtomicBool,
     #[cfg(test)]
     indexed_reads: AtomicU64,
     #[cfg(test)]
@@ -78,6 +92,9 @@ impl DirectProjection {
             ready: AtomicBool::new(false),
             ready_generation: AtomicU64::new(0),
             reader: Mutex::new(None),
+            worker_available: AtomicBool::new(true),
+            worker_failed: AtomicBool::new(false),
+            worker_busy: AtomicBool::new(false),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -99,6 +116,7 @@ impl DirectProjection {
         revisions: PageRevisions,
     ) {
         self.shared.ready.store(false, Ordering::Release);
+        self.shared.worker_failed.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
         pending.full = Some((generation, pages, revisions));
         pending.deltas.clear();
@@ -133,6 +151,50 @@ impl DirectProjection {
 
     pub(crate) fn mark_stale(&self) {
         self.shared.ready.store(false, Ordering::Release);
+    }
+
+    /// A reference read which races an already-queued one-page fact delta is
+    /// much cheaper if it waits for that bounded worker turn than if it scans
+    /// every parsed page. The timeout is a latency ceiling, not an authority:
+    /// failure, worker loss, a newer generation, or expiry all return `false`
+    /// and the caller uses the exact parser fallback.
+    pub(crate) fn wait_for_reference_generation(&self, generation: u64) -> bool {
+        if self.ready_at(generation) {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + REFERENCE_DELTA_WAIT;
+        let mut pending = self.shared.pending.lock().unwrap();
+        loop {
+            if self.ready_at(generation) {
+                return true;
+            }
+            if !self.shared.worker_available.load(Ordering::Acquire)
+                || self.shared.worker_failed.load(Ordering::Acquire)
+                || self.shared.ready_generation.load(Ordering::Acquire) > generation
+                || pending.latest_generation > generation
+            {
+                return false;
+            }
+            if pending.full.is_none()
+                && pending.deltas.is_empty()
+                && !self.shared.worker_busy.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = self
+                .shared
+                .changed
+                .wait_timeout(pending, deadline - now)
+                .unwrap();
+            pending = next;
+            if timeout.timed_out() && !self.ready_at(generation) {
+                return false;
+            }
+        }
     }
 
     pub(crate) fn sparse_task_query(
@@ -645,10 +707,14 @@ impl Drop for DirectProjection {
 
 fn projection_worker(shared: Arc<ProjectionShared>) {
     let Some(parent) = shared.path.parent() else {
+        shared.worker_available.store(false, Ordering::Release);
+        shared.changed.notify_all();
         return;
     };
     if let Err(error) = std::fs::create_dir_all(parent) {
         eprintln!("[tine] Direct Files SQLite projection disabled: create directory: {error}");
+        shared.worker_available.store(false, Ordering::Release);
+        shared.changed.notify_all();
         return;
     }
     let lease_path = shared.path.with_extension("sqlite.writer.lock");
@@ -667,6 +733,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             eprintln!(
                 "[tine] Direct Files SQLite projection unavailable; another graph instance owns it or its lease cannot be opened: {error}"
             );
+            shared.worker_available.store(false, Ordering::Release);
+            shared.changed.notify_all();
             return;
         }
     };
@@ -674,6 +742,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         Ok(database) => database,
         Err(error) => {
             eprintln!("[tine] Direct Files SQLite projection disabled: {error}");
+            shared.worker_available.store(false, Ordering::Release);
+            shared.changed.notify_all();
             return;
         }
     };
@@ -689,8 +759,11 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 pending = shared.changed.wait(pending).unwrap();
             }
             if pending.stop {
+                shared.worker_available.store(false, Ordering::Release);
+                shared.changed.notify_all();
                 return;
             }
+            shared.worker_busy.store(true, Ordering::Release);
             (
                 pending.full.take(),
                 std::mem::take(&mut pending.deltas),
@@ -698,6 +771,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             )
         };
         let had_full = full.is_some();
+        #[cfg(test)]
+        run_before_apply_pending_hook();
         let applied = if requires_full_rebuild && !had_full {
             Err("a prior projection failure requires a complete parser snapshot".into())
         } else {
@@ -706,6 +781,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         if let Err(error) = applied {
             requires_full_rebuild = true;
             shared.ready.store(false, Ordering::Release);
+            shared.worker_failed.store(true, Ordering::Release);
+            shared.worker_busy.store(false, Ordering::Release);
+            shared.changed.notify_all();
             eprintln!(
                 "[tine] Direct Files SQLite projection is stale; using parser fallback: {error}"
             );
@@ -714,7 +792,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         if had_full {
             requires_full_rebuild = false;
         }
+        shared.worker_failed.store(false, Ordering::Release);
         let pending = shared.pending.lock().unwrap();
+        shared.worker_busy.store(false, Ordering::Release);
         if pending.full.is_none()
             && pending.deltas.is_empty()
             && pending.latest_generation == latest_generation
@@ -723,6 +803,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 .ready_generation
                 .store(latest_generation, Ordering::Release);
             shared.ready.store(true, Ordering::Release);
+            shared.changed.notify_all();
         }
     }
 }
@@ -1128,7 +1209,7 @@ fn page_recency(
 mod tests {
     use super::*;
     use crate::model::Graph;
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
     static PROJECTION_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1480,6 +1561,90 @@ mod tests {
             .page_aliases_with_owners()
             .iter()
             .any(|(alias, _, _)| alias == "changed alias"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// GH #400. An ordinary edit has already published its parsed page and
+    /// queued the exact one-page SQLite delta. A reference read which overlaps
+    /// that short worker turn must not immediately turn into a whole-graph
+    /// parser scan. Waiting for this already-running bounded delta preserves the
+    /// same semantics and avoids the reported multi-second fallback.
+    #[test]
+    fn reference_lookup_waits_for_an_inflight_one_page_projection_delta() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("reference-delta-handoff");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
+        std::fs::write(root.join("pages/source.md"), "- unrelated\n").unwrap();
+
+        let graph = Arc::new(Graph::open(&root));
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let (worker_paused_tx, worker_paused_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
+            worker_paused_tx.send(()).unwrap();
+            release_worker_rx.recv().unwrap();
+        }));
+
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "source")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "plain target mention".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        worker_paused_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the one-page projection delta reached the worker");
+
+        let reader = Arc::clone(&graph);
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let candidates = reader.reference_candidate_pages(
+                &[crate::refs::page_key("target")],
+                ReferenceKind::Plain,
+            );
+            result_tx.send(candidates.indexed).unwrap();
+        });
+
+        match result_rx.recv_timeout(Duration::from_millis(100)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            result => {
+                let _ = release_worker_tx.send(());
+                panic!(
+                    "reference lookup escaped to parser fallback before its queued delta completed: {result:?}"
+                );
+            }
+        }
+        release_worker_tx.send(()).unwrap();
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            true,
+            "the converged lookup must use current indexed candidates"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reference_wait_is_zero_cost_when_no_projection_work_exists() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("reference-no-work-wait");
+        let projection = DirectProjection::start(root.join("projection.sqlite")).unwrap();
+        let started = Instant::now();
+        assert!(!projection.wait_for_reference_generation(1));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "an unavailable projection must fall back immediately"
+        );
+        drop(projection);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1922,9 +2087,11 @@ mod tests {
         let oracle_backlinks = alias_target
             .as_deref()
             .map(|target| crate::query::backlinks(&oracle, target));
+        let oracle_unlinked_started = Instant::now();
         let oracle_unlinked = alias_target
             .as_deref()
             .map(|target| crate::query::unlinked_refs(&oracle, target));
+        let oracle_unlinked_elapsed = oracle_unlinked_started.elapsed();
         let oracle_count_started = Instant::now();
         let oracle_counts = oracle.block_ref_counts().unwrap();
         let oracle_count_elapsed = oracle_count_started.elapsed();
@@ -1966,12 +2133,15 @@ mod tests {
             projected_count_elapsed.as_micros(),
         );
         if let Some(target) = alias_target.as_deref() {
+            let indexed_unlinked_started = Instant::now();
+            let indexed_unlinked = crate::query::unlinked_refs(&graph, target);
+            let indexed_unlinked_elapsed = indexed_unlinked_started.elapsed();
             assert_eq!(
                 signature(&crate::query::backlinks(&graph, target)),
                 signature(oracle_backlinks.as_deref().unwrap())
             );
             assert_eq!(
-                signature(&crate::query::unlinked_refs(&graph, target)),
+                signature(&indexed_unlinked),
                 signature(oracle_unlinked.as_deref().unwrap())
             );
             let candidates = graph.reference_candidate_pages(
@@ -1980,9 +2150,11 @@ mod tests {
             );
             assert!(candidates.indexed);
             eprintln!(
-                "real-corpus-reference explicit_candidates={} full_pages={}",
+                "real-corpus-reference explicit_candidates={} full_pages={} parser_unlinked_us={} indexed_unlinked_us={}",
                 candidates.pages.len(),
-                candidates.full_page_count
+                candidates.full_page_count,
+                oracle_unlinked_elapsed.as_micros(),
+                indexed_unlinked_elapsed.as_micros(),
             );
         }
         if let Some(claim) = block_claim.as_deref() {

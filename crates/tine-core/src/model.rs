@@ -6051,6 +6051,9 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
+        if !projection.wait_for_reference_generation(generation) {
+            return None;
+        }
         let paths = projection.reference_candidate_paths(generation, names_norm, kind)?;
         self.direct_projection_pages_for_paths(generation, paths)
     }

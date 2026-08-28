@@ -3393,6 +3393,30 @@
    "notes": "Direct Files perf audit 2026-08-09, F1, found independently by both the Opus and Codex lanes with agreeing numbers (243 ms vs 263-281 ms). list_pages is memoized on raw cache_gen and its only rebuild path walks the graph text scope, re-reads every file and re-parses each one: ~35 us/file, linear from 506 to 8,006 pages, and find_entry rebuilds straight from it. Every save bumped the generation, so the first navigation or [[ autocomplete after any typing pause stalled ~1/4 s on a real 5,225-file graph. page_list_cache is now re-tagged to the new generation under the same condition the effective-identity index already uses. DELIBERATELY NARROWER than the auditor's recommendation: list_pages parses every file so a title:: edit really does move an entry (hence the !identity_changed gate), and referenced_page_names is genuinely content-derived and is left to rebuild. The test asserts a ratio, not an absolute time, so it survives a loaded shared box."
   },
   {
+   "id": "REG-DIRECT-REFERENCE-DELTA-HANDOFF-400",
+   "title": "A reference lookup overlapping an ordinary edit waits for its queued one-page SQLite delta instead of scanning the whole graph",
+   "family": "direct-reference-performance",
+   "sources": {
+    "issues": [
+     400
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "tine-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/direct_projection.rs::tests::reference_lookup_waits_for_an_inflight_one_page_projection_delta",
+     "crates/tine-core/src/direct_projection.rs::tests::reference_wait_is_zero_cost_when_no_projection_work_exists"
+    ],
+    "failBefore": "proven"
+   },
+   "notes": "GH #400 reported Unlinked References taking one to ten seconds. Direct Files already had a disposable SQLite candidate projection, but every one-page cache publication advanced the parser generation and marked SQLite unavailable until its worker applied the queued delta. A reference request in that short interval immediately used the exact but graph-wide parser fallback. The regression pauses that worker boundary and requires the read to remain pending until the bounded delta converges, while unavailable or failed projections retain the parser fallback. The separate conflict.save_baseline_present event in the report remains an intentional no-write guard for bytes that differ from the editor's loaded revision."
+  },
+  {
    "id": "REG-BACKGROUND-FLUSH-255",
    "title": "Pending edits are written when the app is backgrounded or hidden, not only on a clean window close",
    "family": "durability",
