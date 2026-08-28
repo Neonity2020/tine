@@ -24,6 +24,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Block background colors no longer crowd their bullets. Regular dots and
+  numbered-list ordinals now occupy the same 22px control track, while the
+  rounded highlight keeps text aligned with an unhighlighted or edited block.
+
 - **Same-structure external Markdown content edits no longer leave a managed
   page stale or raise `hot_source_join` merely because Tine reached it through
   a page-name route** (GH #397). Application-page routes now
