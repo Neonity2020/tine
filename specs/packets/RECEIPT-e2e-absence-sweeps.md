@@ -1,9 +1,13 @@
 # Packet E2E-AS receipt — absence-sweep surfacing UX
 
-Date: 2026-08-28  
-Branch: `batch/e2e-absence-sweeps`  
-Base: `71cbdf153fbcc0e698e58391d05f1719e728c15d`  
-Candidate build commit: `d9113aa4dbdaedec7317b2b8dced31e5cddf69f5`  
+Date: 2026-08-28
+
+Branch: `batch/e2e-absence-sweeps`
+
+Base: `71cbdf153fbcc0e698e58391d05f1719e728c15d`
+
+Candidate build commit: `d9113aa4dbdaedec7317b2b8dced31e5cddf69f5`
+
 Harness correction commit: `c35f2fc4a18c6d1f8faf384e981a249c3671c6d2`
 
 Outcome: the native journey and contracts entry are implemented, but the
