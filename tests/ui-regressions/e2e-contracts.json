@@ -762,6 +762,29 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-absence-sweeps.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Reopening a managed graph after a large external group deletion surfaces the affected pages and lets the user Restore their exact Markdown content through the real application.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Closing the group-deletion warning or recovery panel records no decision; the sweep remains waiting, and an explicit Restore remains visible afterward as disposed history without live action controls.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Warning and dock wording, control placement, and panel presentation may evolve while the deletion group remains reviewable and its durable state is visible.",
+    "Managed activation, reopen, and Restore durations may vary while the journey reaches each semantic state within its polling bounds."
+   ],
+   "nonRequirements": [
+    "Pixels, geometry, palette, animation timing, DOM nesting, exact toast wording beyond the group-deletion label family, or generated sweep and page identifiers."
+   ],
+   "stability": "quarantined",
+   "quarantineReason": "2026-08-28: the new native journey is intentionally not runner-selected until its required unchanged-binary 10-run burn-in is complete; the packet write set does not authorize editing scripts/run-e2e.mjs."
+  },
   "scripts/e2e-search-parity.mjs": {
    "contracts": [
     {

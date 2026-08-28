@@ -1,0 +1,639 @@
+#!/usr/bin/env node
+
+// Linux real-app proof for managed-storage group-deletion surfacing, deliberate
+// disposition, and Restore. The fixture is synthetic; every action and visible
+// assertion crosses the production Tauri/WebKit boundary, while Restore is also
+// checked against the graph's Markdown projection on disk.
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { createConnection } from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import { remote } from "webdriverio";
+import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+
+await ensureDisplay();
+
+if (process.platform !== "linux") throw new Error("absence-sweep proof is Linux-only");
+if (!process.env.TINE_APP) throw new Error("HARNESS UNAVAILABLE: set TINE_APP to the exact candidate");
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const APP = path.resolve(process.env.TINE_APP);
+const TD = process.env.TAURI_DRIVER || "tauri-driver";
+const WD = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";
+const XDOTOOL = process.env.E2E_XDOTOOL || "xdotool";
+const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4724);
+const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4725);
+const PAGE_COUNT = 20;
+const DELETED_COUNT = 8;
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "tine-absence-sweeps-"));
+const GRAPH = path.join(TMP, "graph");
+const XDG = path.join(TMP, "xdg");
+const ARTIFACTS = path.resolve(
+  process.env.E2E_ARTIFACT_DIR || path.join(ROOT, "artifacts", "e2e-absence-sweeps"),
+);
+const RECEIPT_PATH = path.join(ARTIFACTS, "absence-sweeps-receipt.json");
+
+if (!fs.existsSync(APP)) throw new Error(`HARNESS UNAVAILABLE: candidate is missing at ${APP}`);
+if (!Number.isSafeInteger(DRIVER_PORT) || DRIVER_PORT < 1 || DRIVER_PORT > 65535) {
+  throw new Error("E2E_DRIVER_PORT must be a valid TCP port");
+}
+if (!Number.isSafeInteger(NATIVE_PORT) || NATIVE_PORT < 1 || NATIVE_PORT > 65535) {
+  throw new Error("E2E_NATIVE_PORT must be a valid TCP port");
+}
+
+for (const dir of [
+  path.join(GRAPH, "logseq"),
+  path.join(GRAPH, "pages"),
+  path.join(XDG, "data"),
+  path.join(XDG, "config"),
+  path.join(XDG, "cache"),
+  ARTIFACTS,
+]) fs.mkdirSync(dir, { recursive: true });
+fs.writeFileSync(path.join(GRAPH, "logseq", "config.edn"), "{}\n");
+
+const fixturePages = Array.from({ length: PAGE_COUNT }, (_, index) => {
+  const ordinal = String(index + 1).padStart(2, "0");
+  const name = index < DELETED_COUNT ? `Absence Restore ${ordinal}` : `Absence Control ${ordinal}`;
+  const relativePath = `pages/${name}.md`;
+  const marker = `synthetic absence-sweep body ${ordinal}`;
+  const content = `- ${marker}\n`;
+  fs.writeFileSync(path.join(GRAPH, relativePath), content);
+  return { name, relativePath, file: path.join(GRAPH, relativePath), marker, content };
+});
+const deletedPages = fixturePages.slice(0, DELETED_COUNT);
+
+const env = {
+  ...process.env,
+  TINE_GRAPH: GRAPH,
+  TINE_DEBUG: "1",
+  TINE_DEBUG_LOG: path.join(ARTIFACTS, "tine-debug.log"),
+  XDG_DATA_HOME: path.join(XDG, "data"),
+  XDG_CONFIG_HOME: path.join(XDG, "config"),
+  XDG_CACHE_HOME: path.join(XDG, "cache"),
+  XDG_CONFIG_DIRS: process.env.XDG_CONFIG_DIRS || "/etc/xdg",
+  XDG_DATA_DIRS: process.env.XDG_DATA_DIRS || "/usr/local/share:/usr/share",
+  WEBKIT_DISABLE_DMABUF_RENDERER: "1",
+  WEBKIT_DISABLE_COMPOSITING_MODE: "1",
+  LIBGL_ALWAYS_SOFTWARE: "1",
+  GDK_BACKEND: "x11",
+};
+const xdoEnv = process.env.E2E_XDOTOOL_LIB
+  ? { ...env, LD_LIBRARY_PATH: process.env.E2E_XDOTOOL_LIB }
+  : env;
+
+let browser;
+let driver;
+let driverLog;
+let appPid;
+let wm;
+let wmLog;
+let phase = "fixture-setup";
+
+function gitRevision() {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" });
+  return result.status === 0 ? result.stdout.trim() : "unavailable";
+}
+
+function candidateReceipt() {
+  const file = process.env.TINE_BUILD_RECEIPT || `${APP}.build.json`;
+  if (!fs.existsSync(file)) return { path: file, present: false };
+  try {
+    return { path: file, present: true, value: JSON.parse(fs.readFileSync(file, "utf8")) };
+  } catch (error) {
+    return { path: file, present: true, error: String(error) };
+  }
+}
+
+const receipt = {
+  schemaVersion: 1,
+  scenario: "absence-sweeps",
+  testedCommit: gitRevision(),
+  app: APP,
+  buildReceipt: candidateReceipt(),
+  graph: GRAPH,
+  xdg: XDG,
+  artifacts: ARTIFACTS,
+  fixturePageCount: PAGE_COUNT,
+  deletedPageCount: DELETED_COUNT,
+  deletedPages: deletedPages.map(({ name, relativePath, marker, content }) => ({
+    name,
+    path: relativePath,
+    marker,
+    content,
+  })),
+  milestones: {},
+};
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+async function waitFor(predicate, timeoutMs, message, interval = 100) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const value = await predicate();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(interval);
+  }
+  throw new Error(`${message}${lastError ? `; last observation: ${String(lastError)}` : ""}`);
+}
+
+function tcpListening(port) {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const finish = (ready) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(500, () => finish(false));
+  });
+}
+
+function xdo(...args) {
+  return execFileSync(XDOTOOL, args, { encoding: "utf8", env: xdoEnv }).trim();
+}
+
+function windowIds(pattern = "^Tine( — .*)?$") {
+  try {
+    return xdo("search", "--onlyvisible", "--name", pattern).split(/\s+/).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function windowManagerReady() {
+  try {
+    return /window id #/i.test(execFileSync("xprop", ["-root", "_NET_SUPPORTING_WM_CHECK"], {
+      encoding: "utf8",
+      env,
+    }));
+  } catch {
+    return false;
+  }
+}
+
+async function bodyText() {
+  try {
+    return await browser.$("body").getText();
+  } catch {
+    return "";
+  }
+}
+
+async function visibleButtons() {
+  const result = [];
+  for (const button of await browser.$$("button")) {
+    if (!await button.isDisplayed()) continue;
+    result.push({
+      element: button,
+      text: (await button.getText()).trim().replace(/\s+/g, " "),
+      label: (await button.getAttribute("aria-label") || "").trim(),
+    });
+  }
+  return result;
+}
+
+async function exactVisibleButton(text) {
+  return (await visibleButtons()).find((button) => button.text.normalize("NFC") === text.normalize("NFC"))?.element;
+}
+
+async function panelSnapshot() {
+  return browser.execute((names) => {
+    const normalized = (value) => (value ?? "").trim().replace(/\s+/g, " ").normalize("NFC");
+    const panel = [...document.querySelectorAll("[aria-label]")].find((element) =>
+      normalized(element.getAttribute("aria-label")) === "Deleted page recovery"
+    );
+    if (!panel) return null;
+    const text = normalized(panel.textContent);
+    const buttons = [...panel.querySelectorAll("button")]
+      .filter((button) => button.getClientRects().length > 0)
+      .map((button) => normalized(button.textContent));
+    const leafTexts = [...panel.querySelectorAll("*")]
+      .filter((element) => element.children.length === 0 && element.getClientRects().length > 0)
+      .map((element) => normalized(element.textContent));
+    return {
+      text,
+      buttons,
+      memberMatches: names.map((name) => leafTexts.filter((value) => value === name.normalize("NFC")).length),
+    };
+  }, deletedPages.map(({ name }) => name));
+}
+
+async function surfaceSnapshot() {
+  return browser.execute((count) => {
+    const normalized = (value) => (value ?? "").trim().replace(/\s+/g, " ");
+    const text = normalized(document.body.textContent);
+    const buttons = [...document.querySelectorAll("button")]
+      .filter((button) => button.getClientRects().length > 0)
+      .map((button) => normalized(button.textContent));
+    return {
+      toastFamily: text.includes(`${count} pages were deleted together`),
+      reviewAction: buttons.includes("Review"),
+      dock: buttons.some((label) => label.includes(`${count} deleted pages`) && label.includes("Review")),
+    };
+  }, DELETED_COUNT);
+}
+
+async function recoveryOpenButton() {
+  const buttons = await visibleButtons();
+  return buttons.find(({ text }) => text.includes(`${DELETED_COUNT} deleted pages`) && text.includes("Review"))?.element
+    || buttons.find(({ text }) => text === "Review")?.element;
+}
+
+async function openRecoveryPanel(label) {
+  const button = await waitFor(() => recoveryOpenButton(), 60_000, `${label}: no recovery Review control appeared`, 200);
+  await button.click();
+  return waitFor(() => panelSnapshot(), 30_000, `${label}: recovery panel did not open`, 100);
+}
+
+function assertLivePanel(snapshot, label) {
+  if (!snapshot.text.includes("Tier 3")) throw new Error(`${label}: panel did not identify Tier 3: ${snapshot.text}`);
+  if (!snapshot.text.includes(`${DELETED_COUNT} deleted pages`)) {
+    throw new Error(`${label}: panel did not show the exact deleted-page count: ${snapshot.text}`);
+  }
+  if (!/waiting for your decision/i.test(snapshot.text)) {
+    throw new Error(`${label}: sweep was not waiting for a decision: ${snapshot.text}`);
+  }
+  for (const action of ["Restore", "Re-apply", "Keep deletion"]) {
+    if (!snapshot.buttons.includes(action)) throw new Error(`${label}: missing ${action} action: ${snapshot.buttons.join(", ")}`);
+  }
+  const missing = deletedPages.filter((_, index) => snapshot.memberMatches[index] !== 1);
+  if (missing.length) {
+    throw new Error(`${label}: member rows did not contain each deleted page exactly once: ${JSON.stringify({
+      names: missing.map(({ name }) => name),
+      matches: snapshot.memberMatches,
+    })}`);
+  }
+}
+
+async function closeRecoveryPanel() {
+  const button = (await visibleButtons()).find(({ label }) =>
+    label.toLowerCase().includes("close") && label.toLowerCase().includes("deleted page")
+  )?.element;
+  if (!button) throw new Error("recovery panel exposed no semantic close control");
+  await button.click();
+  await waitFor(async () => (await panelSnapshot()) === null, 15_000, "recovery panel did not close");
+}
+
+async function dismissSweepToast() {
+  const dismissButtons = await browser.$$('button[aria-label="Dismiss"]');
+  const index = await browser.execute((family) => {
+    const buttons = [...document.querySelectorAll('button[aria-label="Dismiss"]')];
+    return buttons.findIndex((button) => (button.parentElement?.textContent ?? "").includes(family));
+  }, `${DELETED_COUNT} pages were deleted together`);
+  if (index < 0) return false;
+  await dismissButtons[index].click();
+  await waitFor(async () => !(await surfaceSnapshot()).toastFamily, 15_000,
+    "group-deletion toast did not dismiss");
+  return true;
+}
+
+async function clickPanelAction(text) {
+  const panel = await browser.$('[aria-label="Deleted page recovery"]');
+  await panel.waitForDisplayed({ timeout: 15_000 });
+  for (const button of await panel.$$("button")) {
+    if ((await button.getText()).trim().replace(/\s+/g, " ") === text) {
+      await button.click();
+      return;
+    }
+  }
+  throw new Error(`recovery panel exposed no exact ${JSON.stringify(text)} action`);
+}
+
+async function openPageThroughSwitcher(name) {
+  await browser.keys(["Control", "k"]);
+  const input = await browser.$('[role="combobox"]');
+  await input.waitForDisplayed({ timeout: 15_000 });
+  await input.setValue(name);
+  await browser.waitUntil(() => browser.execute((expected) => {
+    const selected = document.querySelector('[role="option"][aria-selected="true"]');
+    const text = (selected?.textContent ?? "").trim().replace(/\s+/g, " ").normalize("NFC");
+    return text.includes("page") && text.includes(expected.normalize("NFC"));
+  }, name), {
+    timeout: 60_000,
+    interval: 200,
+    timeoutMsg: `switcher did not select restored page ${JSON.stringify(name)}`,
+  });
+  await browser.keys("Enter");
+  await browser.waitUntil(() => browser.execute((expected) =>
+    [...document.querySelectorAll("h1")].some((heading) =>
+      (heading.textContent ?? "").trim().normalize("NFC") === expected.normalize("NFC")
+    ), name), {
+    timeout: 60_000,
+    interval: 200,
+    timeoutMsg: `visible UI did not navigate to restored page ${JSON.stringify(name)}`,
+  });
+}
+
+async function acceptNativeConfirmation(label, before) {
+  const dialog = await waitFor(() => windowIds("^Tine$").find((id) => !before.has(id)), 30_000,
+    `${label} did not show its native confirmation`);
+  xdo("windowactivate", "--sync", dialog);
+  xdo("key", "--clearmodifiers", "alt+y");
+  await waitFor(() => !windowIds("^Tine$").includes(dialog), 30_000, `${label} confirmation did not close`);
+}
+
+async function openStorageSettings() {
+  const trigger = await browser.$('button[title^="Settings"]');
+  await trigger.waitForDisplayed({ timeout: 30_000 });
+  await trigger.click();
+  await browser.$(".settings-modal").waitForDisplayed({ timeout: 30_000 });
+  const tab = await waitFor(async () => (await visibleButtons()).find(({ text }) => text === "Backups & recovery")?.element,
+    30_000, "Backups & recovery settings tab was absent");
+  await tab.click();
+  await browser.waitUntil(async () => (await bodyText()).includes("Storage & sync"), {
+    timeout: 30_000,
+    interval: 200,
+    timeoutMsg: "Storage & sync settings did not appear",
+  });
+  const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
+  await experimental.waitForDisplayed({ timeout: 30_000 });
+  if ((await experimental.getAttribute("aria-expanded")) !== "true") await experimental.click();
+}
+
+async function closeSettings() {
+  const close = await browser.$(".settings-pane-head .icon-btn:not(.settings-maximize)");
+  await close.waitForClickable({ timeout: 30_000 });
+  await close.click();
+  await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 30_000 });
+}
+
+async function enableManagedStorage() {
+  await openStorageSettings();
+  const button = await waitFor(async () => (await visibleButtons())
+    .find(({ text }) => text.includes("Enable Tine-managed storage..."))?.element,
+  30_000, "Enable Tine-managed storage action was absent");
+  const before = new Set(windowIds("^Tine$"));
+  await button.click();
+  await acceptNativeConfirmation("managed activation", before);
+  await browser.waitUntil(async () => (await bodyText()).includes("Tine-managed storage active"), {
+    timeout: 300_000,
+    interval: 250,
+    timeoutMsg: "managed activation did not become active",
+  });
+  await closeSettings();
+}
+
+async function connect(label) {
+  driverLog = fs.openSync(path.join(ARTIFACTS, `${label}-tauri-driver.log`), "w");
+  driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
+    env,
+    stdio: ["ignore", driverLog, driverLog],
+    detached: true,
+  });
+  await waitFor(() => tcpListening(DRIVER_PORT), 30_000, `${label}: tauri-driver did not listen`);
+  browser = await remote({
+    hostname: "127.0.0.1",
+    port: DRIVER_PORT,
+    path: "/",
+    logLevel: "error",
+    connectionRetryCount: 1,
+    connectionRetryTimeout: 60_000,
+    capabilities: tauriCapabilities(APP, "absence-sweeps"),
+  });
+  await browser.waitUntil(async () => {
+    const text = await bodyText();
+    const startupVisible = await browser.$(".startup-recovery-overlay").isExisting();
+    return !startupVisible && text.includes("Journals");
+  }, {
+    timeout: 300_000,
+    interval: 250,
+    timeoutMsg: `${label}: graph UI did not become usable`,
+  });
+  const window = await waitFor(() => windowIds()[0], 30_000, `${label}: native window was absent`);
+  appPid = Number(xdo("getwindowpid", window));
+  if (!Number.isInteger(appPid) || appPid <= 0) throw new Error(`${label}: invalid app pid ${appPid}`);
+  receipt.milestones[label] = { pid: appPid, graph: GRAPH, xdg: XDG };
+}
+
+async function stopDriver() {
+  try {
+    await browser?.deleteSession();
+  } catch {}
+  browser = undefined;
+  const pid = driver?.pid;
+  if (pid) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {}
+    await waitFor(() => driver.exitCode !== null || !processAlive(pid), 30_000, "tauri-driver did not stop");
+  }
+  driver = undefined;
+  try {
+    if (driverLog !== undefined) fs.closeSync(driverLog);
+  } catch {}
+  driverLog = undefined;
+}
+
+async function cleanQuit(label) {
+  const pid = appPid;
+  if (!pid) return;
+  try {
+    await browser.executeAsync((done) => {
+      globalThis.__TAURI_INTERNALS__.invoke("tine_quit").then(
+        () => done({ ok: true }),
+        (error) => done({ error: String(error) }),
+      );
+    });
+  } catch {
+    // A successful quit destroys the WebView before WebDriver returns.
+  }
+  await waitFor(() => !processAlive(pid), 60_000, `${label}: Tine did not exit cleanly`);
+  appPid = undefined;
+  await stopDriver();
+  receipt.milestones[label] = { clean: true };
+}
+
+async function cleanup() {
+  try {
+    if (appPid && processAlive(appPid)) process.kill(appPid, "SIGKILL");
+  } catch {}
+  appPid = undefined;
+  try {
+    await stopDriver();
+  } catch {}
+  try {
+    if (wm?.pid) process.kill(-wm.pid, "SIGKILL");
+  } catch {}
+  try {
+    if (wmLog !== undefined) fs.closeSync(wmLog);
+  } catch {}
+}
+
+function writeReceipt() {
+  fs.writeFileSync(RECEIPT_PATH, `${JSON.stringify(receipt, null, 2)}\n`);
+}
+
+function expectedOutcomeForPhase() {
+  if (phase.includes("dismiss")) return "Closing the panel and dismissing its toast leave the sweep waiting and reopenable.";
+  if (phase.includes("restore") || phase.includes("history") || phase.includes("navigation")) {
+    return "Restore recreates every deleted Markdown page, keeps the disposed sweep as actionless history, and makes a restored page navigable.";
+  }
+  if (phase.includes("surface") || phase.includes("panel") || phase.includes("reopen")) {
+    return "Reopening the managed graph surfaces one eight-page Tier-3 sweep with its members and three explicit actions.";
+  }
+  return "The synthetic graph activates managed storage, closes cleanly, and reopens through the native app harness.";
+}
+
+try {
+  phase = "window-manager";
+  wmLog = fs.openSync(path.join(ARTIFACTS, "openbox.log"), "w");
+  wm = spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
+    env,
+    stdio: ["ignore", wmLog, wmLog],
+    detached: true,
+  });
+  await waitFor(() => wm.exitCode === null && windowManagerReady(), 15_000,
+    "window manager did not become ready");
+
+  phase = "initial-launch";
+  await connect("initial");
+
+  phase = "managed-activation";
+  await enableManagedStorage();
+
+  phase = "clean-close-before-external-deletion";
+  await cleanQuit("pre-deletion-clean-close");
+
+  phase = "external-group-deletion";
+  for (const page of deletedPages) fs.unlinkSync(page.file);
+  if (deletedPages.some(({ file }) => fs.existsSync(file))) {
+    throw new Error("synthetic external deletion left one or more target files present");
+  }
+  receipt.milestones.externalGroupDeletion = deletedPages.map(({ relativePath }) => relativePath);
+
+  phase = "managed-reopen";
+  await connect("managed-reopen");
+
+  phase = "surface-wait";
+  const surfaced = await waitFor(async () => {
+    const snapshot = await surfaceSnapshot();
+    return (snapshot.toastFamily && snapshot.reviewAction) || snapshot.dock ? snapshot : false;
+  }, 120_000, "Tier-3 group deletion exposed neither its warning+Review family nor its recovery dock", 200);
+  receipt.milestones.surfaced = surfaced;
+
+  phase = "initial-panel";
+  const initialPanel = await openRecoveryPanel("initial surfacing");
+  assertLivePanel(initialPanel, "initial surfacing");
+  await browser.saveScreenshot(path.join(ARTIFACTS, "surfaced-panel.png"));
+  receipt.milestones.initialPanel = {
+    tier: "tier3",
+    count: DELETED_COUNT,
+    members: deletedPages.map(({ name }) => name),
+    status: "waiting for your decision",
+    actions: ["Restore", "Re-apply", "Keep deletion"],
+  };
+
+  phase = "dismiss-without-disposition";
+  await closeRecoveryPanel();
+  const toastDismissed = await dismissSweepToast();
+  const reopenedPanel = await openRecoveryPanel("post-dismiss reopen");
+  assertLivePanel(reopenedPanel, "post-dismiss reopen");
+  receipt.milestones.noDispositionOnDismiss = {
+    panelClosed: true,
+    toastDismissed,
+    reopened: true,
+    status: "waiting for your decision",
+  };
+
+  phase = "restore-action";
+  await clickPanelAction("Restore");
+  await waitFor(() => deletedPages.every(({ file, content }) =>
+    fs.existsSync(file) && fs.readFileSync(file, "utf8") === content
+  ), 180_000, "Restore did not recreate every deleted page with its exact content", 200);
+  const history = await waitFor(async () => {
+    const snapshot = await panelSnapshot();
+    if (!snapshot || !snapshot.text.includes("Restored")) return false;
+    const liveActions = ["Restore", "Re-apply", "Keep deletion"]
+      .filter((action) => snapshot.buttons.includes(action));
+    return liveActions.length === 0 ? snapshot : false;
+  }, 180_000, "Restore completed on disk but the panel did not retain actionless Restored history", 200);
+  const historyMissing = deletedPages.filter((_, index) => history.memberMatches[index] !== 1);
+  if (historyMissing.length) {
+    throw new Error(`disposed history lost member rows: ${historyMissing.map(({ name }) => name).join(", ")}`);
+  }
+  await browser.saveScreenshot(path.join(ARTIFACTS, "restored-history.png"));
+  receipt.milestones.restore = {
+    exactFilesRecreated: true,
+    status: "Restored",
+    liveActions: 0,
+    historyMembers: DELETED_COUNT,
+  };
+
+  phase = "restored-page-navigation";
+  await closeRecoveryPanel();
+  await openPageThroughSwitcher(deletedPages[0].name);
+  await browser.waitUntil(async () => (await bodyText()).includes(deletedPages[0].marker), {
+    timeout: 60_000,
+    interval: 200,
+    timeoutMsg: `restored page ${JSON.stringify(deletedPages[0].name)} opened without its exact content`,
+  });
+  receipt.milestones.restoredPageNavigation = {
+    name: deletedPages[0].name,
+    marker: deletedPages[0].marker,
+    visible: true,
+  };
+
+  phase = "final-clean-close";
+  await cleanQuit("final-clean-close");
+  receipt.result = "pass";
+  receipt.completedAt = new Date().toISOString();
+  writeReceipt();
+  console.log(`PASS: native absence-sweep surfacing and Restore held: ${RECEIPT_PATH}`);
+} catch (error) {
+  receipt.result = "fail";
+  receipt.phase = phase;
+  receipt.error = String(error?.stack || error);
+  const evidence = [RECEIPT_PATH];
+  try {
+    receipt.body = (await bodyText()).slice(-8000);
+  } catch {}
+  try {
+    const screenshot = path.join(ARTIFACTS, "failure.png");
+    await browser?.saveScreenshot(screenshot);
+    evidence.push(screenshot);
+  } catch {}
+  try {
+    const dom = path.join(ARTIFACTS, "failure-dom.html");
+    fs.writeFileSync(dom, await browser?.getPageSource());
+    evidence.push(dom);
+  } catch {}
+  const debugLog = path.join(ARTIFACTS, "tine-debug.log");
+  if (fs.existsSync(debugLog)) {
+    receipt.debugLogExcerpt = fs.readFileSync(debugLog, "utf8").slice(-4000);
+    evidence.push(debugLog);
+  }
+  receipt.failureCapsule = {
+    testedCommit: receipt.testedCommit,
+    journey: "managed absence-sweep surfacing, no-dispose dismissal, Restore, and disposed history",
+    phase,
+    expected: expectedOutcomeForPhase(),
+    observed: receipt.error,
+    evidence,
+    classification: ["window-manager", "initial-launch", "managed-reopen"].includes(phase)
+      ? "infrastructure"
+      : "ambiguous",
+  };
+  writeReceipt();
+  console.error(`FAIL: native absence-sweep journey: ${JSON.stringify(receipt.failureCapsule)}`);
+  process.exitCode = 1;
+} finally {
+  await cleanup();
+}
