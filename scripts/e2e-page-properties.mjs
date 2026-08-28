@@ -212,6 +212,8 @@ async function pageArrowDownCapsule(phase) {
       documentHasFocus: document.hasFocus(),
       preKey: window.__tinePageArrowDownPreKey ?? null,
       keyWitness: window.__tinePageArrowDownKeyWitness ?? null,
+      inputTrace: window.__tinePageHeaderInputTrace ?? null,
+      compositionTrace: window.__tinePageHeaderCompositionTrace ?? null,
       active: {
         tag: active?.tagName ?? null,
         editor: describeEditor(active),
@@ -234,6 +236,7 @@ async function preparePageHeaderArrowDown(expectedValue) {
       isPageHeader: active === header,
       value: active instanceof HTMLTextAreaElement ? active.value : null,
       selection: active instanceof HTMLTextAreaElement ? [active.selectionStart, active.selectionEnd] : null,
+      delegatedKeydown: header instanceof HTMLTextAreaElement ? typeof header.$$keydown : null,
       expectedValue: expected,
       expectedSelection: [expected.length, expected.length],
     };
@@ -246,6 +249,10 @@ async function preparePageHeaderArrowDown(expectedValue) {
       const surface = textarea?.closest("[data-pane-id], [data-sidebar-surface], [data-surface-id]");
       const witness = {
         key: event.key,
+        code: event.code,
+        keyCode: event.keyCode,
+        which: event.which,
+        isTrusted: event.isTrusted,
         flags: {
           shift: event.shiftKey,
           ctrl: event.ctrlKey,
@@ -269,6 +276,11 @@ async function preparePageHeaderArrowDown(expectedValue) {
         window.__tinePageArrowDownKeyWitness = { ...witness, defaultPrevented: event.defaultPrevented };
       });
     }, { capture: true, once: true });
+    window.addEventListener("keydown", () => {
+      queueMicrotask(() => {
+        if (window.__tinePageArrowDownKeyWitness) window.__tinePageArrowDownKeyWitness.reachedWindowBubble = true;
+      });
+    }, { once: true });
     return preKey;
   }, expectedValue);
 }
@@ -355,21 +367,6 @@ async function drivePageHeaderArrowDown(expectedValue) {
   throw new Error(`E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown ${JSON.stringify(attempts)}`);
 }
 
-async function dismissUnrelatedAutocomplete() {
-  // Replacing text inside [[Prompt-Test]] legitimately opens page-reference
-  // autocomplete (including the always-present "Create new page" row).  While
-  // that popup is open, ArrowDown belongs to the popup, not cross-block caret
-  // navigation.  The materialization timing varies with runner load, so close
-  // it explicitly before exercising the independent page-header seam contract.
-  const popup = await browser.$(".autocomplete");
-  if (!(await popup.isExisting())) return;
-  await browser.keys(["Escape"]);
-  await browser.waitUntil(async () => !(await browser.$(".autocomplete").isExisting()), {
-    timeout: 2_000,
-    timeoutMsg: "page-reference autocomplete did not close before page-header ArrowDown",
-  });
-}
-
 async function replaceHeaderLikeUser(editor, replacement, selection = null) {
   // WebdriverIO's setValue() first clears the textarea as a separate WebDriver
   // command. Clearing an existing header and blurring is a real delete action,
@@ -379,11 +376,18 @@ async function replaceHeaderLikeUser(editor, replacement, selection = null) {
   // artificial empty input between the two actions.
   await browser.execute(() => {
     window.__tinePageHeaderInputTrace = [];
+    window.__tinePageHeaderCompositionTrace = [];
     const textarea = document.querySelector(".page-blocks textarea.block-editor");
+    for (const type of ["compositionstart", "compositionupdate", "compositionend"]) {
+      textarea?.addEventListener(type, (event) => {
+        window.__tinePageHeaderCompositionTrace.push({ type, data: event.data });
+      }, { capture: true });
+    }
     textarea?.addEventListener("input", (event) => {
       window.__tinePageHeaderInputTrace.push({
         inputType: event.inputType,
         data: event.data,
+        isComposing: event.isComposing,
         value: event.currentTarget.value,
       });
     }, { capture: true });
@@ -505,16 +509,20 @@ try {
   if (!originalHeader.includes("ai-prompt:: [[Prompt-Test]]") || !originalHeader.includes("\n\npage-level::")) {
     throw new Error(`page-header ordinary editor lost raw properties/separators: ${JSON.stringify(originalHeader)}`);
   }
-  const editedHeader = originalHeader.replace("ai-prompt:: [[Prompt-Test]]", "ai-prompt:: [[Prompt-Edited]]");
-  const oldPromptStart = originalHeader.indexOf("Prompt-Test");
-  const replacementTrace = await replaceHeaderLikeUser(headerEditor, "Prompt-Edited", {
-    start: oldPromptStart,
-    end: oldPromptStart + "Prompt-Test".length,
+  // Keep this native replacement independent of autocomplete. Editing inside a
+  // page reference opens a second interaction lifecycle whose close timing can
+  // obscure the separate page-header ArrowDown contract.
+  const oldTimestamp = "20250707092601";
+  const newTimestamp = "20260707092601";
+  const editedHeader = originalHeader.replace(oldTimestamp, newTimestamp);
+  const oldTimestampStart = originalHeader.indexOf(oldTimestamp);
+  const replacementTrace = await replaceHeaderLikeUser(headerEditor, newTimestamp, {
+    start: oldTimestampStart,
+    end: oldTimestampStart + oldTimestamp.length,
   });
   if ((await headerEditor.getValue()) !== editedHeader) {
     throw new Error(`native page-header replacement did not preserve the intended value: ${JSON.stringify({ replacementTrace, actual: await headerEditor.getValue() })}`);
   }
-  await dismissUnrelatedAutocomplete();
   await drivePageHeaderArrowDown(editedHeader);
   await browser.execute(() => {
     const editor = document.querySelector(".page-blocks textarea.block-editor");
@@ -522,7 +530,7 @@ try {
     if (editor instanceof HTMLTextAreaElement) editor.setSelectionRange(2, 2);
   });
   await browser.keys(["ArrowUp"]);
-  await browser.waitUntil(async () => (await browser.$(".page-blocks textarea.block-editor").getValue()).includes("Prompt-Edited"), {
+  await browser.waitUntil(async () => (await browser.$(".page-blocks textarea.block-editor").getValue()).includes(newTimestamp), {
     timeout: 5_000,
     timeoutMsg: "Arrow Up did not cross from the first body block back into the page header",
   });
@@ -533,12 +541,12 @@ try {
   });
   const detailedAfter = await waitForFile(
     `${GRAPH}/pages/Property detailed.md`,
-    (text) => text.includes("alias:: Test Record, Alternate") && text.includes("ai-prompt:: [[Prompt-Edited]]"),
+    (text) => text.includes("alias:: Test Record, Alternate") && text.includes(`timestamp:: ${newTimestamp}`),
     "detailed page property edit",
   );
   const detailedExpected = detailed
     .replace("alias:: Test Record", "alias:: Test Record, Alternate")
-    .replace("ai-prompt:: [[Prompt-Test]]", "ai-prompt:: [[Prompt-Edited]]");
+    .replace(oldTimestamp, newTimestamp);
   if (detailedAfter !== detailedExpected) {
     throw new Error(`detailed page changed outside the edited line\nEXPECTED:\n${detailedExpected}\nACTUAL:\n${detailedAfter}`);
   }
@@ -565,7 +573,7 @@ try {
   const reopenedCustom = await browser.execute(() => [...document.querySelectorAll(".page-properties .prop-row")]
     .find((row) => row.querySelector(".prop-key")?.textContent?.trim() === "ai-prompt")
     ?.querySelector(".prop-value")?.textContent?.trim() ?? null);
-  if (!reopenedCustom?.includes("Prompt-Edited")) {
+  if (!reopenedCustom?.includes("Prompt-Test")) {
     throw new Error(`reopened page did not parse the edited custom header: ${JSON.stringify(reopenedCustom)}`);
   }
   await openPage("Property deletion");
