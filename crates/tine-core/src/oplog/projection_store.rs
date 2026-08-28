@@ -2500,6 +2500,149 @@ impl ProjectionReceiptStore {
             .collect())
     }
 
+    /// Names-only completion snapshot for the disposable absence summary.
+    /// Retired own-endpoint residue is excluded exactly as it is from the full
+    /// validated catalog. No receipt content is opened on this path.
+    pub(crate) fn absence_summary_evidence_names(
+        &self,
+    ) -> Result<BTreeSet<String>, ProjectionStoreError> {
+        let (retired_intent_names, retired_completion_names, _) = self.retired_own_endpoint_names();
+        let mut names = BTreeSet::new();
+        for (namespace, suffix, kind, retired) in [
+            (
+                COMPLETIONS_DIR,
+                ".completion",
+                "projection completion rows",
+                &retired_completion_names,
+            ),
+            (
+                INTENTS_DIR,
+                ".intent",
+                "projection intent rows",
+                &retired_intent_names,
+            ),
+        ] {
+            let directory = self.namespace(namespace)?;
+            let mut directory_entries = 0_usize;
+            let mut namespace_rows = 0_usize;
+            for entry in directory.entries()? {
+                charge_catalog_directory_entry(
+                    &mut directory_entries,
+                    MAX_PROJECTION_CATALOG_DIRECTORY_ENTRIES,
+                )?;
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    ProjectionStoreError::UnsafeEntry("non-UTF-8 projection evidence entry".into())
+                })?;
+                if retired.contains(name) {
+                    continue;
+                }
+                require_regular_entry(&entry.file_type()?, name)?;
+                if is_temp_name(name) {
+                    continue;
+                }
+                if namespace_rows == MAX_PROJECTION_CATALOG_ROWS {
+                    return Err(ProjectionStoreError::EvidenceTooLarge {
+                        kind,
+                        declared: namespace_rows.saturating_add(1) as u64,
+                        limit: MAX_PROJECTION_CATALOG_ROWS as u64,
+                    });
+                }
+                require_canonical_evidence_name(name, suffix)?;
+                namespace_rows += 1;
+                if !names.insert(name.to_owned()) {
+                    return Err(ProjectionStoreError::MalformedEvidenceName(name.into()));
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// Read exactly the newly published receiver intents (no completion yet)
+    /// not represented by a current summary.
+    pub(crate) fn absence_summary_intent_delta(
+        &self,
+        newly_intended_names: &BTreeSet<String>,
+    ) -> Result<Vec<ProjectionIntent>, ProjectionStoreError> {
+        let intents_dir = self.namespace(INTENTS_DIR)?;
+        let mut intents = Vec::new();
+        for intent_name in newly_intended_names {
+            require_canonical_evidence_name(intent_name, ".intent")?;
+            let bytes = read_optional_regular(
+                &intents_dir,
+                intent_name,
+                MAX_PROJECTION_EVIDENCE_BYTES,
+                None,
+            )?
+            .ok_or_else(|| {
+                ProjectionStoreError::UnsafeEntry(format!(
+                    "projection intent disappeared after names snapshot: {intent_name}"
+                ))
+            })?;
+            let intent = ProjectionIntent::decode(&bytes)?;
+            self.require_workspace(&intent)?;
+            if intent.encode()? != bytes || intent_filename(intent.id()?) != *intent_name {
+                return Err(ProjectionStoreError::PathBindingMismatch(
+                    "projection intent",
+                ));
+            }
+            intents.push(intent);
+        }
+        Ok(intents)
+    }
+
+    /// Read exactly the newly completed receiver rows not represented by a
+    /// current summary. The matching intent filename is derived directly from
+    /// each completion name; no lifetime intent-directory walk occurs.
+    pub(crate) fn absence_summary_catalog_delta(
+        &self,
+        newly_completed_names: &BTreeSet<String>,
+    ) -> Result<Vec<ProjectionCatalogEntry>, ProjectionStoreError> {
+        let intents_dir = self.namespace(INTENTS_DIR)?;
+        let mut rows = Vec::new();
+        for completion_name in newly_completed_names {
+            require_canonical_evidence_name(completion_name, ".completion")?;
+            let intent_name = format!(
+                "{}.intent",
+                completion_name
+                    .strip_suffix(".completion")
+                    .expect("suffix was checked")
+            );
+            let bytes = read_optional_regular(
+                &intents_dir,
+                &intent_name,
+                MAX_PROJECTION_EVIDENCE_BYTES,
+                None,
+            )?
+            .ok_or_else(|| {
+                ProjectionStoreError::UnsafeEntry(format!(
+                    "projection completion has no matching intent: {completion_name}"
+                ))
+            })?;
+            let intent = ProjectionIntent::decode(&bytes)?;
+            self.require_workspace(&intent)?;
+            if intent.encode()? != bytes
+                || intent_filename(intent.id()?) != intent_name
+                || completion_filename(intent.id()?) != *completion_name
+            {
+                return Err(ProjectionStoreError::PathBindingMismatch(
+                    "projection intent",
+                ));
+            }
+            let completion = self.load_completion(&intent)?.ok_or_else(|| {
+                ProjectionStoreError::UnsafeEntry(format!(
+                    "projection completion disappeared after names snapshot: {completion_name}"
+                ))
+            })?;
+            rows.push(ProjectionCatalogEntry {
+                intent,
+                completion: Some(completion),
+            });
+        }
+        Ok(rows)
+    }
+
     /// Reconstruct completion only from an authorized replay and Graph's fresh
     /// capability-bound durable-target proof.
     pub(crate) fn reconstruct_completion(
@@ -4880,7 +5023,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
-    use crate::oplog::{FrontierV2, PageId};
+    use crate::oplog::{
+        DocumentId, FrontierV2, LineageDigest, ObjectStore, PageId, ShardedHotEngine,
+    };
 
     use super::*;
 
@@ -5112,6 +5257,49 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn absence_decision_map_steady_open_skips_the_full_receiver_catalog() {
+        let fixture = Fixture::new("absence-summary-map-cost-fail-before");
+        let archive_path = fixture.root.join("operations");
+        let mut rebuild_engine = ShardedHotEngine::new(
+            fixture.store.workspace_id(),
+            LineageDigest::of(b"absence-summary-map-cost"),
+            DocumentId::from_uuid(Uuid::from_u128(0xc6_0001)),
+        );
+        rebuild_engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&archive_path, fixture.store.workspace_id()).unwrap(),
+            )
+            .unwrap();
+        rebuild_engine
+            .open_absence_decision_map(&fixture.store)
+            .unwrap();
+
+        let mut engine = ShardedHotEngine::new(
+            fixture.store.workspace_id(),
+            LineageDigest::of(b"absence-summary-map-cost"),
+            DocumentId::from_uuid(Uuid::from_u128(0xc6_0001)),
+        );
+        engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&archive_path, fixture.store.workspace_id()).unwrap(),
+            )
+            .unwrap();
+
+        reset_projection_store_test_counters();
+        engine.open_absence_decision_map(&fixture.store).unwrap();
+        let measured = projection_store_test_counters();
+        assert_eq!(
+            measured.catalog_directory_entries, 0,
+            "a steady absence-map open must not enumerate the lifetime receiver catalog"
+        );
+        let summary = engine
+            .receiver_absence_summary_open_stats_for_test()
+            .expect("managed open records summary cost");
+        assert_eq!(summary.full_catalog_passes, 0);
+        assert_eq!(summary.receipt_content_reads, 0);
     }
 
     #[test]

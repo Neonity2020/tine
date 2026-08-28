@@ -101,9 +101,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
 use sync_runtime::{
     activate_sparse_v2, adopt_sparse_v2_shared, cancel_sparse_v2, cancel_sparse_v2_cold,
-    join_sparse_v2_shared, prepare_sparse_v2_share, sparse_v2_clean_shutdown,
-    sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query, sparse_v2_recovery_location,
-    sparse_v2_status, sparse_v2_tick,
+    join_sparse_v2_shared, keep_absence_sweep_deletion, list_absence_sweeps,
+    prepare_sparse_v2_share, reapply_absence_sweep, restore_absence_sweep,
+    sparse_v2_clean_shutdown, sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query,
+    sparse_v2_recovery_location, sparse_v2_status, sparse_v2_tick,
 };
 #[cfg(desktop)]
 use tauri::Emitter;
@@ -778,6 +779,10 @@ pub fn run() {
             sparse_v2_editor_load,
             sparse_v2_editor_save,
             sparse_v2_tick,
+            list_absence_sweeps,
+            reapply_absence_sweep,
+            restore_absence_sweep,
+            keep_absence_sweep_deletion,
             sparse_v2_clean_shutdown,
             guide_pages,
             copy_guide_into_graph,

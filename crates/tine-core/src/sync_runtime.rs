@@ -48,7 +48,8 @@ use crate::model::{
     RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
 use crate::oplog::absence_sweep::{
-    SweepError, SweepManager, SweepMember, SweepNotification, SweepRestoreCursor, SweepTier,
+    SweepActionKind, SweepActionState, SweepError, SweepManager, SweepMember, SweepRecord,
+    SweepRestoreCursor, SweepTier,
 };
 use crate::oplog::discovery::{
     classify_enrollment_error, discover_startup, AmbiguousEvidence, DiscoveryClassification,
@@ -1955,6 +1956,47 @@ pub struct SyncAbsenceSweepEvent {
     pub opened_at_unix_ms: u64,
     pub closed_at_unix_ms: Option<u64>,
     pub grace_deadline_unix_ms: Option<u64>,
+    pub disposed_at_unix_ms: Option<u64>,
+    pub members: Vec<SyncAbsenceSweepMember>,
+    pub latest_action: Option<SyncAbsenceSweepAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncAbsenceSweepMember {
+    pub page_id: String,
+    pub path: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncAbsenceSweepActionKind {
+    Restore,
+    Reapply,
+    KeepDeletion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncAbsenceSweepActionState {
+    Started,
+    Progress,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncAbsenceSweepAction {
+    pub action_id: String,
+    pub action: SyncAbsenceSweepActionKind,
+    pub state: SyncAbsenceSweepActionState,
+    pub recorded_at_unix_ms: u64,
+    pub authored_batch_ids: Vec<String>,
+    pub chunk_ordinal: Option<u64>,
+    pub remaining_operation_watermark: Option<u64>,
+    pub nondecreasing_retries: Option<u8>,
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1989,20 +2031,74 @@ pub struct SyncAbsenceSweepRestoreOutcome {
     pub fidelity: Vec<SyncAbsenceSweepRestoreFidelity>,
 }
 
-impl From<&SweepNotification> for SyncAbsenceSweepEvent {
-    fn from(notification: &SweepNotification) -> Self {
+impl From<&SweepRecord> for SyncAbsenceSweepEvent {
+    fn from(record: &SweepRecord) -> Self {
+        let latest_action = record.actions.last().map(|action| {
+            let (state, authored_batch_ids, cursor, failure_reason) = match &action.state {
+                SweepActionState::Started => {
+                    (SyncAbsenceSweepActionState::Started, Vec::new(), None, None)
+                }
+                SweepActionState::Progress {
+                    authored_batch_ids,
+                    restore_cursor,
+                } => (
+                    SyncAbsenceSweepActionState::Progress,
+                    authored_batch_ids.iter().map(ToString::to_string).collect(),
+                    restore_cursor.as_ref(),
+                    None,
+                ),
+                SweepActionState::Completed => (
+                    SyncAbsenceSweepActionState::Completed,
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                SweepActionState::Failed { reason } => (
+                    SyncAbsenceSweepActionState::Failed,
+                    Vec::new(),
+                    None,
+                    Some(reason.clone()),
+                ),
+            };
+            SyncAbsenceSweepAction {
+                action_id: action.action_id.to_string(),
+                action: match action.action {
+                    SweepActionKind::Restore => SyncAbsenceSweepActionKind::Restore,
+                    SweepActionKind::Reapply => SyncAbsenceSweepActionKind::Reapply,
+                    SweepActionKind::KeepDeletion => SyncAbsenceSweepActionKind::KeepDeletion,
+                },
+                state,
+                recorded_at_unix_ms: action.recorded_at_unix_ms,
+                authored_batch_ids,
+                chunk_ordinal: cursor.map(|cursor| cursor.chunk_ordinal),
+                remaining_operation_watermark: cursor
+                    .map(|cursor| cursor.remaining_operation_watermark),
+                nondecreasing_retries: cursor.map(|cursor| cursor.nondecreasing_retries),
+                failure_reason,
+            }
+        });
         Self {
-            sweep_id: notification.sweep_id.to_string(),
-            tier: match notification.tier {
+            sweep_id: record.sweep_id.to_string(),
+            tier: match record.tier {
                 SweepTier::Tier1 => unreachable!("tier-1 sweeps are quiet"),
                 SweepTier::Tier2 => SyncAbsenceSweepTier::Tier2,
                 SweepTier::Tier3 => SyncAbsenceSweepTier::Tier3,
             },
-            absence_count: notification.absence_count,
-            pages_at_open: notification.pages_at_open,
-            opened_at_unix_ms: notification.opened_at_unix_ms,
-            closed_at_unix_ms: notification.closed_at_unix_ms,
-            grace_deadline_unix_ms: notification.grace_deadline_unix_ms,
+            absence_count: record.members.len(),
+            pages_at_open: record.pages_at_open as usize,
+            opened_at_unix_ms: record.opened_at_unix_ms,
+            closed_at_unix_ms: record.closed_at_unix_ms,
+            grace_deadline_unix_ms: record.grace_deadline_unix_ms,
+            disposed_at_unix_ms: record.disposed_at_unix_ms,
+            members: record
+                .members
+                .iter()
+                .map(|member| SyncAbsenceSweepMember {
+                    page_id: member.page_id.to_string(),
+                    path: member.path.to_string(),
+                })
+                .collect(),
+            latest_action,
         }
     }
 }
@@ -4411,6 +4507,25 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    /// Subscribe to changed durable sweep snapshots. The receiver is
+    /// observational: dropping it changes no sweep state and the actor prunes
+    /// the disconnected subscriber on its next notification.
+    pub fn subscribe_absence_sweep_events(
+        &self,
+    ) -> Result<Receiver<SyncAbsenceSweepEvent>, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::SubscribeAbsenceSweepEvents {
+            events: event_sender,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
+        Ok(event_receiver)
+    }
+
     pub fn reapply_absence_sweep(
         &self,
         sweep_id: &str,
@@ -5449,6 +5564,7 @@ impl CleanRuntimeActorCore {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorMutationOutcome::RetainedPriorPending {
@@ -5463,8 +5579,14 @@ impl CleanRuntimeActorCore {
                     detail: error.to_string(),
                 }
             })?;
-            OperationalCoordinator::execute_clean_local(&mut session, graph, receipts, transaction)
-                .map_err(CleanActorMutationFailure::from)?
+            OperationalCoordinator::execute_clean_local(
+                &mut session,
+                graph,
+                receipts,
+                transaction,
+                projection_turns,
+            )
+            .map_err(CleanActorMutationFailure::from)?
         };
         Ok(self.retain_outcome(state))
     }
@@ -5552,6 +5674,7 @@ impl CleanRuntimeActorCore {
         batch_id: BatchId,
         transaction: &OperationTransaction,
         persist_fingerprint: impl FnMut(ContentDigest) -> Result<(), String>,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorMutationOutcome::RetainedPriorPending {
@@ -5573,6 +5696,7 @@ impl CleanRuntimeActorCore {
                 batch_id,
                 transaction,
                 persist_fingerprint,
+                projection_turns,
             )
             .map_err(CleanActorMutationFailure::from)?
         };
@@ -5635,28 +5759,11 @@ impl CleanRuntimeActorCore {
         })
     }
 
-    fn retry_pending(
-        &mut self,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-    ) -> Option<CleanActorMutationOutcome> {
-        self.retry_pending_inner(graph, receipts, None)
-    }
-
     fn retry_pending_with_turns(
         &mut self,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         projection_turns: &mut ProjectionTurnJournalState,
-    ) -> Option<CleanActorMutationOutcome> {
-        self.retry_pending_inner(graph, receipts, Some(projection_turns))
-    }
-
-    fn retry_pending_inner(
-        &mut self,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        projection_turns: Option<&mut ProjectionTurnJournalState>,
     ) -> Option<CleanActorMutationOutcome> {
         // Escalation never stops the retries: an identical detail string three
         // times is not proof the failure is deterministic (a transient
@@ -5666,24 +5773,13 @@ impl CleanRuntimeActorCore {
         // pending retry.
         let pending = self.pending.take()?;
         let state = match self.runtime.admit_clean_derived_recovery(graph) {
-            Ok(mut session) if pending.projection_turn_ingress() => match projection_turns {
-                Some(turns) => OperationalCoordinator::retry_clean_local_with_turns(
-                    &mut session,
-                    graph,
-                    receipts,
-                    pending,
-                    turns,
-                ),
-                None => OperationalCoordinator::retry_clean_local(
-                    &mut session,
-                    graph,
-                    receipts,
-                    pending,
-                ),
-            },
-            Ok(mut session) => {
-                OperationalCoordinator::retry_clean_local(&mut session, graph, receipts, pending)
-            }
+            Ok(mut session) => OperationalCoordinator::retry_clean_local_with_turns(
+                &mut session,
+                graph,
+                receipts,
+                pending,
+                projection_turns,
+            ),
             Err(admission) => {
                 self.pending = Some(pending);
                 let pending = self.pending.as_ref().expect("pending was restored");
@@ -6016,6 +6112,7 @@ impl CleanRuntimeActorCore {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         paths: &BTreeSet<ManagedPath>,
+        projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanActorExternalOutcome, CleanActorMutationFailure> {
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorExternalOutcome::DurablePending {
@@ -6037,6 +6134,7 @@ impl CleanRuntimeActorCore {
                 receipts,
                 &requested,
                 &mut self.sweeps,
+                projection_turns,
             )
             .map_err(CleanActorMutationFailure::from)?
         };
@@ -9117,6 +9215,10 @@ enum ActorRequest {
     AbsenceSweepEvents {
         reply: mpsc::Sender<Vec<SyncAbsenceSweepEvent>>,
     },
+    SubscribeAbsenceSweepEvents {
+        events: mpsc::Sender<SyncAbsenceSweepEvent>,
+        reply: mpsc::Sender<()>,
+    },
     ReapplyAbsenceSweep {
         sweep_id: uuid::Uuid,
         reply: mpsc::Sender<Result<SyncAbsenceSweepActionOutcome, SyncRuntimeRequestError>>,
@@ -9363,6 +9465,7 @@ fn run_actor_loop(
                 if let Err(error) = actor.flush_local_completions_if_required() {
                     actor.terminal = Some(error);
                 }
+                actor.publish_absence_sweep_changes();
                 *shared_status.write().unwrap() = actor.snapshot();
                 continue;
             }
@@ -9556,15 +9659,13 @@ fn run_actor_loop(
                 false
             }
             ActorRequest::AbsenceSweepEvents { reply } => {
-                let events = actor.clean.as_ref().map_or_else(Vec::new, |clean| {
-                    clean
-                        .sweeps
-                        .notifications()
-                        .iter()
-                        .map(SyncAbsenceSweepEvent::from)
-                        .collect()
-                });
+                let events = actor.absence_sweep_events();
                 let _ = reply.send(events);
+                false
+            }
+            ActorRequest::SubscribeAbsenceSweepEvents { events, reply } => {
+                actor.absence_sweep_subscribers.push(events);
+                let _ = reply.send(());
                 false
             }
             ActorRequest::ReapplyAbsenceSweep { sweep_id, reply } => {
@@ -9755,6 +9856,7 @@ fn run_actor_loop(
         if let Err(error) = actor.flush_local_completions_if_required() {
             actor.terminal = Some(error);
         }
+        actor.publish_absence_sweep_changes();
         *shared_status.write().unwrap() = actor.snapshot();
         if should_stop {
             break;
@@ -11878,6 +11980,8 @@ struct RuntimeActor {
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
+    absence_sweep_subscribers: Vec<mpsc::Sender<SyncAbsenceSweepEvent>>,
+    last_absence_sweep_events: BTreeMap<String, SyncAbsenceSweepEvent>,
     terminal: Option<String>,
     stopped_safe: bool,
     enrollment_root: EnrollmentApplicationRoot,
@@ -11994,6 +12098,36 @@ impl RuntimeActor {
         self.clean
             .as_ref()
             .is_some_and(|clean| clean.sweeps.publication_barrier_active())
+    }
+
+    fn absence_sweep_events(&self) -> Vec<SyncAbsenceSweepEvent> {
+        self.clean.as_ref().map_or_else(Vec::new, |clean| {
+            clean
+                .sweeps
+                .surfaced_records()
+                .map(SyncAbsenceSweepEvent::from)
+                .collect()
+        })
+    }
+
+    fn publish_absence_sweep_changes(&mut self) {
+        let current = self
+            .absence_sweep_events()
+            .into_iter()
+            .map(|event| (event.sweep_id.clone(), event))
+            .collect::<BTreeMap<_, _>>();
+        let changed = current
+            .iter()
+            .filter(|(sweep_id, event)| {
+                self.last_absence_sweep_events.get(*sweep_id) != Some(event)
+            })
+            .map(|(_, event)| event.clone())
+            .collect::<Vec<_>>();
+        self.last_absence_sweep_events = current;
+        for event in changed {
+            self.absence_sweep_subscribers
+                .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        }
     }
 
     fn admit_deferred_absence_observations(&mut self) -> Result<bool, String> {
@@ -12311,6 +12445,8 @@ impl RuntimeActor {
             recovery,
             last_watcher,
             last_tick: None,
+            absence_sweep_subscribers: Vec::new(),
+            last_absence_sweep_events: BTreeMap::new(),
             terminal: None,
             stopped_safe: false,
             enrollment_root,
@@ -20266,11 +20402,15 @@ impl RuntimeActor {
                 affected_page_ids,
             });
         }
+        let turns = self
+            .projection_turns
+            .as_mut()
+            .expect("clean transaction retains its projection-turn journal");
         let outcome = self
             .clean
             .as_mut()
             .expect("clean transaction is routed only to a clean actor")
-            .execute_local(&self.graph, &self.receipts, &transaction)
+            .execute_local(&self.graph, &self.receipts, &transaction, turns)
             .map_err(|failure| {
                 let code = trusted_local_preparation_refusal_code(failure.phase);
                 if runtime_debug_diagnostics_enabled() {
@@ -20548,11 +20688,15 @@ impl RuntimeActor {
                 (clean.watcher.exact.clone(), None)
             }
         };
+        let turns = self
+            .projection_turns
+            .as_mut()
+            .expect("clean actor retains its projection-turn journal");
         let outcome = self
             .clean
             .as_mut()
             .expect("clean actor remains installed")
-            .execute_external_paths(&self.graph, &self.receipts, &paths);
+            .execute_external_paths(&self.graph, &self.receipts, &paths, turns);
         match outcome {
             Ok(CleanActorExternalOutcome::Noop) => {
                 let clean = self.clean.as_mut().expect("clean actor remains installed");
@@ -21496,11 +21640,15 @@ impl RuntimeActor {
             return SyncLocalMutationOutcome::Revoked { batch_id, phase };
         }
         if self.clean.is_some() {
+            let turns = self
+                .projection_turns
+                .as_mut()
+                .expect("clean mutation retains its projection-turn journal");
             let outcome = self
                 .clean
                 .as_mut()
                 .expect("clean mutation is routed only to a clean actor")
-                .execute_local(&self.graph, &self.receipts, &transaction);
+                .execute_local(&self.graph, &self.receipts, &transaction, turns);
             return match outcome {
                 Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
                     self.queue_clean_provider_publication(batch_id);
@@ -21557,6 +21705,7 @@ impl RuntimeActor {
                     "cannot durably begin absence sweep re-apply: {error}"
                 ))
             })?;
+        self.publish_absence_sweep_changes();
         let live_pages = {
             let clean = self
                 .clean
@@ -21622,6 +21771,7 @@ impl RuntimeActor {
                         .expect("clean sweep action retains its runtime")
                         .sweeps
                         .fail_reapply(sweep_id, action_id, reason.clone());
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             }
@@ -21636,6 +21786,7 @@ impl RuntimeActor {
                     "re-apply deletion is accepted but its sweep completion record could not be appended: {error}"
                 ))
             })?;
+        self.publish_absence_sweep_changes();
         Ok(SyncAbsenceSweepActionOutcome {
             sweep_id: sweep_id.to_string(),
             action_id: action_id.to_string(),
@@ -21658,6 +21809,7 @@ impl RuntimeActor {
                     "cannot durably begin absence sweep restore: {error}"
                 ))
             })?;
+        self.publish_absence_sweep_changes();
         let action_id = action.action_id;
         let members = action.members;
         let mut authored_batch_ids = action.authored_batch_ids;
@@ -21707,6 +21859,7 @@ impl RuntimeActor {
                         .expect("restore action retains its clean runtime")
                         .sweeps
                         .fail_restore(sweep_id, action_id, reason.clone());
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             };
@@ -21725,6 +21878,7 @@ impl RuntimeActor {
                         .expect("restore action retains its clean runtime")
                         .sweeps
                         .fail_restore(sweep_id, action_id, reason.clone());
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             };
@@ -21751,6 +21905,7 @@ impl RuntimeActor {
                             "{reason}; additionally could not append failed restore action: {error}"
                         ))
                     })?;
+                self.publish_absence_sweep_changes();
                 return Err(SyncRuntimeRequestError::ActorRefused(reason));
             }
             if watermark == 0 {
@@ -21764,6 +21919,7 @@ impl RuntimeActor {
                             "restore reached whole-page equality but its completion record could not be appended: {error}"
                         ))
                     })?;
+                self.publish_absence_sweep_changes();
                 return Ok(SyncAbsenceSweepRestoreOutcome {
                     sweep_id: sweep_id.to_string(),
                     action_id: action_id.to_string(),
@@ -21809,6 +21965,7 @@ impl RuntimeActor {
                         .expect("restore action retains its clean runtime")
                         .sweeps
                         .fail_restore(sweep_id, action_id, reason.clone());
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             };
@@ -21835,6 +21992,7 @@ impl RuntimeActor {
                         "restore chunk {batch_id} is accepted but its durable cursor could not be appended: {error}"
                     ))
                 })?;
+            self.publish_absence_sweep_changes();
             cursor = Some(next_cursor);
             #[cfg(test)]
             {
@@ -21869,6 +22027,7 @@ impl RuntimeActor {
                                 "{reason}; additionally could not append failed restore action: {error}"
                             ))
                         })?;
+                    self.publish_absence_sweep_changes();
                     return Err(SyncRuntimeRequestError::ActorRefused(reason));
                 }
             }
@@ -21906,6 +22065,10 @@ impl RuntimeActor {
             let outcome = {
                 let episode_directory = &self.move_episode_directory;
                 let clean = self.clean.as_mut().expect("clean actor remains installed");
+                let turns = self
+                    .projection_turns
+                    .as_mut()
+                    .expect("clean mutation retains its projection-turn journal");
                 match correlated_batch_id {
                     Some(batch_id) => {
                         let Some(episode) = application_move_episode.as_ref() else {
@@ -21927,9 +22090,10 @@ impl RuntimeActor {
                                     fail_episode_publication,
                                 )
                             },
+                            turns,
                         )
                     }
-                    None => clean.execute_local(&self.graph, &self.receipts, &transaction),
+                    None => clean.execute_local(&self.graph, &self.receipts, &transaction, turns),
                 }
             };
             return match outcome {
@@ -28848,6 +29012,7 @@ mod tests {
                 &resources.graph,
                 &resources.receipts,
                 &transaction,
+                &mut resources.projection_turns,
             )
             .unwrap()
         };
@@ -28928,6 +29093,7 @@ mod tests {
                 &resources.graph,
                 &resources.receipts,
                 &transaction,
+                &mut resources.projection_turns,
             )
             .unwrap()
         };
@@ -29444,6 +29610,7 @@ mod tests {
                     &resources.graph,
                     &resources.receipts,
                     &transaction,
+                    &mut resources.projection_turns,
                 )
             } else {
                 let mut session = resources
@@ -29455,6 +29622,7 @@ mod tests {
                     &resources.graph,
                     &resources.receipts,
                     &transaction,
+                    &mut resources.projection_turns,
                 )
             };
             if feature.produces_turn() {
@@ -29636,7 +29804,7 @@ mod tests {
     /// schedules.
     fn run_receiver_absence_decision_oracle() {
         receiver_without_completion_creates_first_projection_case();
-        receiver_completion_defers_closed_window_external_deletion_case();
+        receiver_completion_defers_closed_window_external_deletion_case(false);
         receiver_incomplete_update_maps_absent_terminal_to_deferral_case();
     }
 
@@ -29686,7 +29854,8 @@ mod tests {
             sweeps,
             recovered_provider_batches: _,
         } = resources;
-        drop((managed_local, projection_turns));
+        drop(managed_local);
+        let mut projection_turns = projection_turns;
         let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
@@ -29717,7 +29886,7 @@ mod tests {
 
         fail_once_at(OperationalFaultPoint::AfterManifest);
         let pending = actor
-            .execute_local(&graph, &receipts, &transaction)
+            .execute_local(&graph, &receipts, &transaction, &mut projection_turns)
             .unwrap();
         let pending_batch = match pending {
             CleanActorMutationOutcome::DurablePending { batch_id, phase } => {
@@ -29740,7 +29909,7 @@ mod tests {
         // outcome is what stops a caller settling the earlier batch and then
         // reporting the second request as saved.
         let same_pending = actor
-            .execute_local(&graph, &receipts, &transaction)
+            .execute_local(&graph, &receipts, &transaction, &mut projection_turns)
             .unwrap();
         assert!(matches!(
             same_pending,
@@ -29748,7 +29917,7 @@ mod tests {
                 if batch_id == pending_batch
         ));
         assert_eq!(
-            actor.retry_pending(&graph, &receipts),
+            actor.retry_pending_with_turns(&graph, &receipts, &mut projection_turns),
             Some(CleanActorMutationOutcome::Durable(pending_batch))
         );
         assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
@@ -29760,6 +29929,7 @@ mod tests {
             .expect("clean actor reloads the saved page");
         assert_eq!(saved.blocks[0].content, "clean actor exact save");
         drop(actor);
+        drop(projection_turns);
 
         let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
             .unwrap()
@@ -29795,7 +29965,8 @@ mod tests {
             sweeps,
             recovered_provider_batches: _,
         } = resources;
-        drop((managed_local, projection_turns));
+        drop(managed_local);
+        let mut projection_turns = projection_turns;
         let accepted_before = runtime.engine().accepted_batch_count().unwrap();
         let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -29824,7 +29995,7 @@ mod tests {
         let before_bytes = fs::read(fixture.graph_root.join("Root.md")).unwrap();
 
         crate::oplog::object_store::fail_next_publish_after_objects();
-        let cut = actor.execute_local(&graph, &receipts, &transaction);
+        let cut = actor.execute_local(&graph, &receipts, &transaction, &mut projection_turns);
         assert!(
             !matches!(cut, Ok(CleanActorMutationOutcome::Durable(_))),
             "the armed object-only cut must not report a durable save: {cut:?}"
@@ -29835,6 +30006,7 @@ mod tests {
             "an unpublished batch must not project Markdown"
         );
         drop(actor);
+        drop(projection_turns);
 
         let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
             .unwrap()
@@ -29848,7 +30020,8 @@ mod tests {
             sweeps,
             recovered_provider_batches: _,
         } = reopened;
-        drop((managed_local, projection_turns));
+        drop(managed_local);
+        let mut projection_turns = projection_turns;
         assert_eq!(
             runtime.engine().accepted_batch_count().unwrap(),
             accepted_before,
@@ -29876,7 +30049,7 @@ mod tests {
         .unwrap();
         assert!(
             matches!(
-                actor.execute_local(&graph, &receipts, &retry),
+                actor.execute_local(&graph, &receipts, &retry, &mut projection_turns),
                 Ok(CleanActorMutationOutcome::Durable(_))
             ),
             "a fresh session must complete the same edit after the cut"
@@ -29952,7 +30125,8 @@ mod tests {
                 sweeps,
                 recovered_provider_batches: _,
             } = resources;
-            drop((managed_local, projection_turns));
+            drop(managed_local);
+            let mut projection_turns = projection_turns;
             let accepted_before = runtime.engine().accepted_batch_count().unwrap();
             let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
             let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -29998,7 +30172,8 @@ mod tests {
                 }
             }
             let transaction = edit(&mut actor);
-            let cut_outcome = actor.execute_local(&graph, &receipts, &transaction);
+            let cut_outcome =
+                actor.execute_local(&graph, &receipts, &transaction, &mut projection_turns);
             assert!(
                 !matches!(cut_outcome, Ok(CleanActorMutationOutcome::Durable(_))),
                 "the armed {cut:?} cut must not report a durable save: {cut_outcome:?}"
@@ -30009,6 +30184,7 @@ mod tests {
                 "an unpublished batch must not project Markdown"
             );
             drop(actor);
+            drop(projection_turns);
 
             // The invariant: every installed final name still hashes to its
             // own content. Temporary names are not archive entries and are
@@ -30056,10 +30232,11 @@ mod tests {
                 sweeps,
                 recovered_provider_batches: _,
             } = reopened;
-            drop((managed_local, projection_turns));
+            drop(managed_local);
+            let mut projection_turns = projection_turns;
             let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
             let retry = edit(&mut actor);
-            let repaired = actor.execute_local(&graph, &receipts, &retry);
+            let repaired = actor.execute_local(&graph, &receipts, &retry, &mut projection_turns);
             assert!(
                 matches!(repaired, Ok(CleanActorMutationOutcome::Durable(_))),
                 "a fresh session must complete the same edit after a {cut:?} cut: {repaired:?}"
@@ -30068,6 +30245,7 @@ mod tests {
                 .unwrap()
                 .contains("batch cut edit"));
             drop(actor);
+            drop(projection_turns);
 
             let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
                 .unwrap()
@@ -30240,7 +30418,8 @@ mod tests {
             sweeps,
             recovered_provider_batches: _,
         } = resources;
-        drop((managed_local, projection_turns));
+        drop(managed_local);
+        let mut projection_turns = projection_turns;
         let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
         let owner = actor
@@ -30268,7 +30447,7 @@ mod tests {
 
         fail_once_at(OperationalFaultPoint::AfterManifest);
         let pending = actor
-            .execute_local(&graph, &receipts, &transaction)
+            .execute_local(&graph, &receipts, &transaction, &mut projection_turns)
             .unwrap();
         let CleanActorMutationOutcome::DurablePending { batch_id, .. } = pending else {
             panic!("fault must retain this submission's own durable work: {pending:?}");
@@ -30286,7 +30465,7 @@ mod tests {
         fs::remove_file(&manifest_path).unwrap();
 
         for attempt in 1..MAX_IDENTICAL_RETAINED_RETRY_ATTEMPTS {
-            let retried = actor.retry_pending(&graph, &receipts);
+            let retried = actor.retry_pending_with_turns(&graph, &receipts, &mut projection_turns);
             assert!(
                 matches!(
                     &retried,
@@ -30296,7 +30475,7 @@ mod tests {
                 "attempt {attempt} escalated or completed early: {retried:?}"
             );
         }
-        let stuck = actor.retry_pending(&graph, &receipts);
+        let stuck = actor.retry_pending_with_turns(&graph, &receipts, &mut projection_turns);
         let Some(CleanActorMutationOutcome::DurableStuck {
             batch_id: stuck_batch,
             phase,
@@ -30314,7 +30493,7 @@ mod tests {
         // cause is repaired the very next tick's retry must recover without a
         // restart.
         fs::write(&manifest_path, &manifest_bytes).unwrap();
-        let recovered = actor.retry_pending(&graph, &receipts);
+        let recovered = actor.retry_pending_with_turns(&graph, &receipts, &mut projection_turns);
         assert!(
             matches!(&recovered, Some(CleanActorMutationOutcome::Durable(retained)) if *retained == batch_id),
             "a repaired cause must recover on the next retry: {recovered:?}"
@@ -30668,16 +30847,39 @@ mod tests {
         assert_eq!(event.tier, SyncAbsenceSweepTier::Tier3);
         assert_eq!(event.absence_count, 1);
         assert_eq!(event.pages_at_open, 3);
+        assert_eq!(event.members.len(), 1);
+        assert_eq!(event.members[0].path, "Root.md");
+        assert!(event.latest_action.is_none());
 
         let refusal = handle.prepare_shared().unwrap_err().to_string();
         assert!(refusal.contains("external deletions awaiting disposition"));
         assert!(refusal.contains("half-synced folder or dying mount"));
 
+        let action_events = handle.subscribe_absence_sweep_events().unwrap();
         let reapplied = handle.reapply_absence_sweep(&event.sweep_id).unwrap();
         assert!(
             reapplied.authored_batch_ids.is_empty(),
             "an already-accepted deletion is an idempotent Re-apply noop"
         );
+        let started = action_events.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            started.latest_action,
+            Some(SyncAbsenceSweepAction {
+                action: SyncAbsenceSweepActionKind::Reapply,
+                state: SyncAbsenceSweepActionState::Started,
+                ..
+            })
+        ));
+        let completed = action_events.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            completed.latest_action,
+            Some(SyncAbsenceSweepAction {
+                action: SyncAbsenceSweepActionKind::Reapply,
+                state: SyncAbsenceSweepActionState::Completed,
+                ..
+            })
+        ));
+        assert!(completed.disposed_at_unix_ms.is_some());
         assert!(handle
             .dispose_absence_sweep_keep_deletion(&event.sweep_id)
             .is_ok());
@@ -31481,6 +31683,7 @@ mod tests {
                 &resources.graph,
                 &resources.receipts,
                 &transaction,
+                &mut resources.projection_turns,
             )
         };
         assert!(matches!(
@@ -37459,7 +37662,9 @@ mod tests {
     /// Packet C-3's mandatory receiver schedule. A receiver completion is
     /// device-local evidence that Tine wrote this path; a later closed-window
     /// absence belongs to external observation, not replay authorization.
-    fn receiver_completion_defers_closed_window_external_deletion_case() {
+    fn receiver_completion_defers_closed_window_external_deletion_case(
+        crash_before_summary_update: bool,
+    ) {
         let (initiator, receiver, initiator_handle, receiver_handle) =
             joined_shared_pair("receiver-completion-absence-map", 0xc3_2000);
         let path = "notes/receiver-completion-absence-map.md";
@@ -37483,6 +37688,11 @@ mod tests {
                 content: "receiver updated bytes must not resurrect".into(),
             }],
         );
+        if crash_before_summary_update {
+            crate::oplog::receiver_absence_summary::skip_next_receiver_absence_summary_update_for_test(
+                receiver.request.identities.workspace_id,
+            );
+        }
         publish_shared_batch(&initiator_handle, &initiator, batch_id);
         settle_shared_provider(&initiator_handle);
         deliver_provider_to_receiver(&initiator, &receiver, &receiver_handle);
@@ -37490,10 +37700,14 @@ mod tests {
             fs::read(receiver.graph_root.join(path)).unwrap(),
             b"- receiver updated bytes must not resurrect\n"
         );
-        assert!(matches!(
-            receiver_handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
+        if crash_before_summary_update {
+            receiver_handle.stop_without_clean_drain().unwrap();
+        } else {
+            assert!(matches!(
+                receiver_handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+        }
 
         fs::remove_file(receiver.graph_root.join(path)).unwrap();
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
@@ -37537,7 +37751,12 @@ mod tests {
 
     #[test]
     fn receiver_completion_defers_closed_window_external_deletion_and_stays_archive_durable() {
-        receiver_completion_defers_closed_window_external_deletion_case();
+        receiver_completion_defers_closed_window_external_deletion_case(false);
+    }
+
+    #[test]
+    fn stale_receiver_summary_horizon_defers_after_completion_then_crash() {
+        receiver_completion_defers_closed_window_external_deletion_case(true);
     }
 
     fn receiver_incomplete_update_maps_absent_terminal_to_deferral_case() {

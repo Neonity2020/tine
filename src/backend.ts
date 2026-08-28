@@ -47,6 +47,10 @@ import type {
   SparseV2RuntimeStatusEvent,
   SparseV2TickEvent,
   SparseV2ErrorEvent,
+  SyncAbsenceSweepEvent,
+  SyncAbsenceSweepChangedEvent,
+  SyncAbsenceSweepActionOutcome,
+  SyncAbsenceSweepRestoreOutcome,
   SparseV2QueryRequest,
   SparseV2QueryReply,
   SparseV2EditorLoadRequest,
@@ -326,6 +330,14 @@ export interface Backend {
   sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
   sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
   sparseV2Tick(): Promise<SparseV2Tick>;
+  listAbsenceSweeps(): Promise<SyncAbsenceSweepEvent[]>;
+  onAbsenceSweepChanged(
+    bindingGeneration: number,
+    cb: (sweep: SyncAbsenceSweepEvent) => void,
+  ): Promise<() => void>;
+  reapplyAbsenceSweep(sweepId: string): Promise<SyncAbsenceSweepActionOutcome>;
+  restoreAbsenceSweep(sweepId: string): Promise<SyncAbsenceSweepRestoreOutcome>;
+  keepAbsenceSweepDeletion(sweepId: string): Promise<void>;
   sparseV2CleanShutdown(): Promise<import("./types").SparseV2RuntimeStatus>;
   /** Bundled read-only Guide pages, compiled from the same templates as the demo graph. */
   guidePages(): Promise<GuidePage[]>;
@@ -1133,6 +1145,27 @@ class TauriBackend implements Backend {
   }
   sparseV2Tick() {
     return this.call<SparseV2Tick>("sparse_v2_tick");
+  }
+  listAbsenceSweeps() {
+    return this.call<SyncAbsenceSweepEvent[]>("list_absence_sweeps");
+  }
+  async onAbsenceSweepChanged(
+    bindingGeneration: number,
+    cb: (sweep: SyncAbsenceSweepEvent) => void,
+  ): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<SyncAbsenceSweepChangedEvent>("absence-sweep-changed", (event) => {
+      if (event.payload.binding_generation === bindingGeneration) cb(event.payload.sweep);
+    });
+  }
+  reapplyAbsenceSweep(sweepId: string) {
+    return this.call<SyncAbsenceSweepActionOutcome>("reapply_absence_sweep", { sweepId });
+  }
+  restoreAbsenceSweep(sweepId: string) {
+    return this.call<SyncAbsenceSweepRestoreOutcome>("restore_absence_sweep", { sweepId });
+  }
+  keepAbsenceSweepDeletion(sweepId: string) {
+    return this.call<void>("keep_absence_sweep_deletion", { sweepId });
   }
   sparseV2CleanShutdown() {
     return this.call<import("./types").SparseV2RuntimeStatus>("sparse_v2_clean_shutdown");

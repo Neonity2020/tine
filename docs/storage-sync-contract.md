@@ -265,6 +265,7 @@ and manifest tail.
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
+| `archive/operations/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
 | `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
@@ -1163,8 +1164,22 @@ A clean local mutation that reaches its manifest commit and then fails to apply
 disposable derived state (SQLite and/or exact Markdown projection) returns
 `CleanActorMutationOutcome::DurablePending` and retains an affine continuation
 in `CleanRuntimeActorCore::pending`. That continuation is advanced only by
-`retry_pending`. The legacy coordinator's `PendingLocalMutation::Published`
+`retry_pending_with_turns`. The legacy coordinator's `PendingLocalMutation::Published`
 continuation is a different object that the clean actor never writes.
+
+Every clean continuation resume — inline after the manifest commit, and on
+every retry — drains Markdown projection through the projection-turn journal:
+the resume appends the batch's `IngressLocal`/`IngressForeign` turn when the
+journal does not already retain it, and replays turns in order. There is no
+turnless projection arm: a managed projection mutation without a turn-derived
+attempt identity is refused in production
+(`ProjectionStoreError::MissingTurnAttemptContext`), and the 2026-08-28
+regression fix deleted the pre-turn resume executor that violated this. The
+refusal's in-scope scenario is not an external adversary but the codebase
+itself: it turns a silently identity-less projection write into a loud,
+recoverable failure, and the `clean_recovery_turns` integration test holds the
+drain green at the non-`cfg(test)` boundary where the unit suite's
+deterministic attempt-identity fallback cannot mask it.
 
 Therefore, when the clean runtime is installed, an application save that lands in
 `DurablePending` settles through the clean actor, bounded by
@@ -1359,10 +1374,25 @@ crash backstop. Absent-precondition work with no exact matching entry creates
 as before.
 
 Foreign replay builds a disposable absence-decision map once per managed open
-from one validated receiver-catalog pass plus the local completion index. The
-map is keyed by `(page, path)`. Its answer is the frontier-maximal completion
-across both halves; a defensive incomparable maximal set with mixed target
-kinds chooses the reversible Present/defer direction.
+from the receiver summary plus the local completion index. The receiver summary
+is a chain-versioned, disposable object at
+`archive/operations/sweeps/receiver-absence-summary-v1/`; retained receipt
+records remain the truth. Its horizon is the count and set digest of the exact
+receiver evidence filenames it covers - completion AND intent names, because a
+durable intent without a completion is itself map evidence (incomplete-intent
+recovery and the local-index pruning guard consume it), so behind-truth must be
+detectable for both namespaces. Every summary install strictly follows the
+durable evidence it names. Open performs one names-only readdir of each of the
+two evidence namespaces. An equal horizon reads no receipt content; extra
+names are behind truth and delta-read exactly those completion/intent records;
+a summary naming evidence the directories lack, or any missing/torn/invalid
+chain, triggers exactly one full validated-catalog rebuild. Receiver evidence
+is immutable, add-only, and never production-deleted, so a valid summary can
+only be behind truth. Losing or corrupting it therefore
+changes cost only, never an absence decision or refusal outcome. The map is
+keyed by `(page, path)`. Its answer is the frontier-maximal completion across
+both halves; a defensive incomparable maximal set with mixed target kinds
+chooses the reversible Present/defer direction.
 
 The receiver executor consults that answer only after a fresh,
 capability-bound reread of the target path and before publishing a new intent:
@@ -1419,11 +1449,23 @@ Tier precedence is exact and accept-by-default:
 
 All tiers author ordinary accepted deletion batches immediately; local
 acceptance and inbound provider admission never wait for classification. Tier 1
-is quiet. Tier 2 and tier 3 append structured `SyncAbsenceSweepEvent` values to
-the runtime notification surface. An open sweep escalates in place as `k`
-crosses a boundary, appending its new tier and members. The backend Restore,
-Re-apply, and Keep-deletion actions are available through `SyncRuntimeHandle`;
-frontend toast, dock, list, and action wiring belong to packet C-5b.
+is quiet. Tier 2 and tier 3 become current `SyncAbsenceSweepEvent` snapshots on
+the runtime's read-only list surface. Each snapshot carries the tier and timing
+summary, explicit disposal, ordered `(page id, path)` members, and the latest
+durable action state including Restore cursor or recorded failure cause. An open
+sweep escalates in place as `k` crosses a boundary, appending its new tier and
+members. A read-only runtime subscription publishes the same snapshot at first
+surfacing and whenever its durable action state changes; Tauri relays it to only
+the window and binding generation that own that runtime. Disposed surfaced
+records remain listable as disposition history.
+
+The frontend keeps tier 1 quiet, raises a tier-2/tier-3 warning, and retains a
+dock/list/details surface with the member pages and live action state. Its
+Restore, Re-apply, and Keep-deletion controls map one-to-one to the three backend
+actions on `SyncRuntimeHandle`; a failed Restore shows its recorded cause and
+the re-run control invokes whole-sweep Restore again. Dismissing the warning or
+closing the surface changes presentation only. It never invokes a disposition;
+Keep-deletion is an explicit deliberate action.
 
 Each logical record is the append-only immutable chain in the layout table.
 The current state is its highest valid linked version and records: sweep id;

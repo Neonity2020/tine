@@ -3816,6 +3816,73 @@ pub(crate) async fn sparse_v2_tick(
 }
 
 #[tauri::command]
+pub(crate) async fn list_absence_sweeps(
+    state: crate::state::GraphContext<'_>,
+) -> Result<Vec<tine_core::sync_runtime::SyncAbsenceSweepEvent>, String> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::state::AppState>();
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        active_handle(&slot)?
+            .absence_sweep_events()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn reapply_absence_sweep(
+    sweep_id: String,
+    state: crate::state::GraphContext<'_>,
+) -> Result<tine_core::sync_runtime::SyncAbsenceSweepActionOutcome, String> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::state::AppState>();
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        active_handle(&slot)?
+            .reapply_absence_sweep(&sweep_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn restore_absence_sweep(
+    sweep_id: String,
+    state: crate::state::GraphContext<'_>,
+) -> Result<tine_core::sync_runtime::SyncAbsenceSweepRestoreOutcome, String> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::state::AppState>();
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        active_handle(&slot)?
+            .restore_absence_sweep(&sweep_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn keep_absence_sweep_deletion(
+    sweep_id: String,
+    state: crate::state::GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::state::AppState>();
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        active_handle(&slot)?
+            .dispose_absence_sweep_keep_deletion(&sweep_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub(crate) async fn sparse_v2_clean_shutdown(
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2RuntimeStatusDto, String> {

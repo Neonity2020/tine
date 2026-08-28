@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
 use tine_core::sync_runtime::{
-    SyncRuntimeHandle, SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncWatcherObservation,
+    SyncAbsenceSweepEvent, SyncRuntimeHandle, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
+    SyncWatcherObservation,
 };
 use tine_core::{
     model::GraphTextExactFeedPathClass, model::GraphTextExternalObservationTicket, model::PageKind,
@@ -80,6 +81,39 @@ struct SparseV2RuntimeStatusEvent {
     binding_generation: u64,
     runtime: crate::sync_runtime::SparseV2RuntimeStatusDto,
     application_page_admission: crate::state::ApplicationPageAdmission,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct AbsenceSweepChangedEvent {
+    binding_generation: u64,
+    sweep: SyncAbsenceSweepEvent,
+}
+
+fn relay_absence_sweep_events(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    handle: &SyncRuntimeHandle,
+) {
+    let Ok(events) = handle.subscribe_absence_sweep_events() else {
+        return;
+    };
+    let app = app.clone();
+    let label = label.to_owned();
+    let _ = std::thread::Builder::new()
+        .name(format!("tine-sweep-events-{label}"))
+        .spawn(move || {
+            while let Ok(sweep) = events.recv() {
+                let _ = app.emit_to(
+                    &label,
+                    "absence-sweep-changed",
+                    AbsenceSweepChangedEvent {
+                        binding_generation,
+                        sweep,
+                    },
+                );
+            }
+        });
 }
 
 /// Build the event from the one actor status observation that the watcher has
@@ -1781,6 +1815,12 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             current.handle = handle;
                         }
                         _ => {
+                            relay_absence_sweep_events(
+                                &app,
+                                &label,
+                                slot.binding_generation,
+                                &handle,
+                            );
                             sparse_graphs.insert(
                                 label,
                                 WatchedSparse {

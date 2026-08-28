@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Managed-storage group deletions now have an explicit recovery surface.**
+  Tier 2 and Tier 3 absence sweeps raise a warning and remain available in a
+  Deleted pages dock with their member pages and durable action status. Restore,
+  Re-apply, and Keep deletion map directly to the recorded backend actions;
+  failed restores retain their cause and can be re-run, while dismissing the
+  warning or closing the panel never records a deletion decision.
+
 ## [0.6.98] - 2026-08-27
 
 ### Changed
