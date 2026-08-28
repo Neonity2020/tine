@@ -19,6 +19,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **External Markdown edits no longer leave managed-storage pages stale or
+  raise a `hot_source_join` error when you return to Tine** (GH #397). A focus
+  refresh now stays behind the input gate until every bounded managed watcher
+  slice has finished, rather than declaring success after the first slice of a
+  large graph. Exact-path, page-name, page-ID, and editor loads also agree on a
+  same-structure external edit while reconciliation is still in progress.
+
 - Restoring deleted pages from the recovery panel no longer closes the panel
   by itself the moment the restore completes: the disposed sweep stays visible
   as actionless history until you close it.

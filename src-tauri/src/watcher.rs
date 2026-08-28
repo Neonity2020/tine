@@ -342,6 +342,35 @@ fn complete_full_rescan(app: &tauri::AppHandle, sequence: u64) {
     let _ = app.emit("graph-rescan-complete", GraphRescanComplete { sequence });
 }
 
+#[derive(Default)]
+struct FocusRescanInFlight {
+    sequence: Option<u64>,
+}
+
+impl FocusRescanInFlight {
+    /// Capture one explicit request exactly once. A managed full scan advances
+    /// in bounded actor turns; re-enqueuing RescanRequired on every one of
+    /// those turns would keep moving its epoch and prevent convergence.
+    fn arm_if_idle(&mut self, pending: Option<u64>) -> bool {
+        if self.sequence.is_some() {
+            return false;
+        }
+        self.sequence = pending;
+        self.sequence.is_some()
+    }
+
+    fn sequence(&self) -> Option<u64> {
+        self.sequence
+    }
+
+    /// Publish the receipt only after every lane covered by the request is
+    /// settled. A newer request remains in the global counter and is armed by
+    /// the next cycle after this sequence completes.
+    fn complete_if_settled(&mut self, settled: bool) -> Option<u64> {
+        settled.then(|| self.sequence.take()).flatten()
+    }
+}
+
 const LATENCY_RECEIPT_CAP: usize = 64;
 
 static LATENCY_RECEIPTS: OnceLock<Mutex<VecDeque<WatcherLatencyReceipt>>> = OnceLock::new();
@@ -531,6 +560,10 @@ impl RetrySchedule {
 
     fn remaining(&self, now: Instant) -> Option<Duration> {
         self.due.map(|due| due.saturating_duration_since(now))
+    }
+
+    fn pending(&self) -> bool {
+        self.due.is_some()
     }
 }
 
@@ -1779,6 +1812,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             // used.
             snap: HashMap<PathBuf, FileStamp>,
             baseline: bool,
+            /// The focus-rescan sequence this exact binding has accepted.
+            /// New/rebound graph slots must accept the in-flight sequence for
+            /// themselves before the global frontend receipt can complete.
+            focus_rescan_sequence: Option<u64>,
         }
 
         let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
@@ -1797,6 +1834,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         // failing reports once instead of every cycle.
         let mut watch_failures: HashMap<PathBuf, String> = HashMap::new();
         let mut forced_sparse_tick = false;
+        let mut focus_rescan = FocusRescanInFlight::default();
         loop {
             let force_sparse_tick = std::mem::take(&mut forced_sparse_tick);
             let inotify = watch_mode(&app) != "poll";
@@ -1839,6 +1877,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                     sweep_deadline_remaining: None,
                                     snap: HashMap::new(),
                                     baseline: false,
+                                    focus_rescan_sequence: None,
                                 },
                             );
                         }
@@ -2044,8 +2083,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             }
             // A focus-driven rescan demands the same full stat diff a kernel
             // rescan does, for the Direct lane and the managed lane alike.
-            let explicit_rescan = pending_full_rescan();
-            let event_need_full = event_need_full || explicit_rescan.is_some();
+            let explicit_rescan_armed = focus_rescan.arm_if_idle(pending_full_rescan());
+            let event_need_full = event_need_full || explicit_rescan_armed;
             for (label, graph) in graphs.iter_mut() {
                 if let Some(epoch) = drained_observation_epochs.get(&graph.root).copied() {
                     if graph
@@ -2188,11 +2227,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 // replaced the legacy directory watches with the recursive
                 // graph-root watch. One scan after watch installation closes
                 // that handoff interval; later steady-state events stay exact.
+                let focus_rescan_sequence = focus_rescan.sequence();
+                let focus_rescan_needed = focus_rescan_sequence
+                    .is_some_and(|sequence| graph.focus_rescan_sequence != Some(sequence));
                 let observations = sparse_observations(
                     &graph.root,
                     &paths,
                     &full_paths,
-                    event_need_full || initial_tick || poll_rescan,
+                    event_need_full || initial_tick || poll_rescan || focus_rescan_needed,
                     notify_error,
                 );
                 let (provider_paths, provider_imprecise) =
@@ -2224,6 +2266,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     }
                     if !observations.is_empty() {
                         graph.handle.observe_watcher(observations)?;
+                        if focus_rescan_needed {
+                            graph.focus_rescan_sequence = focus_rescan_sequence;
+                        }
                     }
                     graph.handle.tick()
                 })();
@@ -2366,8 +2411,30 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let _ = tx.send(());
             }
 
-            if let Some(sequence) = explicit_rescan {
+            let direct_rescan_settled = graphs.values().all(|graph| {
+                !graph.retry.pending()
+                    && graph.pending_observation_epoch.is_none()
+                    && graph.last_reconcile_error.is_none()
+            });
+            let managed_rescan_settled = sparse_graphs.values().all(|graph| {
+                graph.focus_rescan_sequence == focus_rescan.sequence()
+                    && graph
+                        .handle
+                        .status()
+                        .is_ok_and(|status| !status.watcher.pending)
+            });
+            if let Some(sequence) = focus_rescan.complete_if_settled(
+                direct_rescan_settled && managed_rescan_settled && config_recheck.is_empty(),
+            ) {
                 complete_full_rescan(&app, sequence);
+                // A second window may have requested a newer sequence while
+                // this bounded scan was in flight. Its control poke may have
+                // been coalesced already, so wake the loop from the durable
+                // request counter instead of waiting for another filesystem
+                // event.
+                if pending_full_rescan().is_some() {
+                    let _ = tx.send(());
+                }
             }
 
             // --- wait for the next cycle ---
@@ -2473,6 +2540,37 @@ pub(crate) fn set_watch_mode(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn focus_rescan_is_armed_once_and_completes_only_after_every_lane_settles() {
+        let mut rescan = FocusRescanInFlight::default();
+        assert!(rescan.arm_if_idle(Some(397)));
+        assert!(
+            !rescan.arm_if_idle(Some(398)),
+            "a bounded continuation must not enqueue another full scan each cycle"
+        );
+        assert_eq!(rescan.complete_if_settled(false), None);
+        assert!(
+            !rescan.arm_if_idle(Some(398)),
+            "an unsettled request retains its original sequence"
+        );
+        assert_eq!(rescan.complete_if_settled(true), Some(397));
+        assert!(
+            rescan.arm_if_idle(Some(398)),
+            "a newer request starts a fresh scan after the prior receipt"
+        );
+        assert_eq!(rescan.complete_if_settled(true), Some(398));
+    }
+
+    #[test]
+    fn retry_schedule_exposes_unfinished_direct_reconciliation() {
+        let mut retry = RetrySchedule::default();
+        assert!(!retry.pending());
+        retry.failed(Instant::now());
+        assert!(retry.pending());
+        retry.succeeded();
+        assert!(!retry.pending());
+    }
 
     #[test]
     fn unset_watch_mode_prefers_native_events_on_every_platform() {
