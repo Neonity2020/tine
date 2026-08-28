@@ -622,10 +622,31 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
         engine.stage_ready(deletion.clone()).disposition,
         BatchDisposition::Accepted { .. }
     ));
+    let drift = engine
+        .prepare_bootstrap_transaction(
+            author(40_102, 40_102),
+            &tx(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: ids.block_a,
+                    home_document_id: ids.home_a,
+                },
+                content: "tombstoned shard drift before revival".into(),
+            }]),
+        )
+        .unwrap();
+    let drift = ready(&archive, &drift);
+    assert!(matches!(
+        engine.stage_ready(drift.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
 
     let operations = engine
         .plan_revive_page_operations(ids.page_a, &predecessor.frontier, None)
         .unwrap();
+    assert!(
+        operations.len() > 1,
+        "the flip-first gate needs content work after the catalog operation"
+    );
     assert!(matches!(
         operations.first(),
         Some(SemanticOperation::RevivePage { page_id, .. }) if *page_id == ids.page_a
@@ -645,7 +666,7 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
     assert_eq!(engine.materialize_page(ids.page_a).unwrap(), expected);
 
     let mut peer = ids.engine();
-    for batch in [baseline, deletion, revived] {
+    for batch in [baseline, deletion, drift, revived] {
         assert!(matches!(
             peer.stage_ready(batch).disposition,
             BatchDisposition::Accepted { .. }
