@@ -262,7 +262,7 @@ and manifest tail.
 | private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1 | written last; sole local managed-authority selector |
 | private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
-| `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4 plus commit v1 | authoritative baseline; installed before the marker and never mutated |
+| `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4, page capsule v4/v5, plus commit v1 | authoritative baseline; new writes use capsule v5, readers retain receiptless-v4 recovery; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
 | `archive/operations/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
@@ -623,7 +623,18 @@ byte/inventory comparison under the watcher fence matches the sealed source.
 
 Each page capsule carries the exact original Markdown/Org bytes once, one
 deterministic CRDT checkpoint constructed directly from its terminal page
-state, plus its compact causal dependencies.
+state, plus its compact causal dependencies. New page-capsule v5 records may
+also carry a versioned, bounded SQLite semantic receipt binding the exact-source
+digest to a canonical materialized-page digest and payload. Receipt bytes are
+limited to 64 MiB and one million block rows; a larger page omits the receipt
+instead of refusing activation. Existing capsule-v4 records remain readable
+with no receipt. A missing, malformed, digest-mismatched, capsule-inconsistent,
+or parser-version-stale receipt is recovery evidence, not a refusal: disposable
+SQLite reconstruction reparses the exact source and performs the original
+capsule comparison. Only divergence established by that retained parse refuses
+reconstruction. A payload and digest consistently authored together are trusted
+at baseline construction under the crash/corruption threat model in §3; they
+are not a defense against a malicious byte-forging actor.
 One canonical activation-record pass fans each parsed page into both the
 baseline pack and bounded SQLite materialization chunks. Neither candidate is
 published by that construction pass, and SQLite does not re-read, re-parse, or

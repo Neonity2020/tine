@@ -3718,7 +3718,7 @@ fn spool_bootstrap_operations(
             )
         })?;
         let accepted = accepted_identities.assignments_for(&record.page.path)?;
-        let mut genesis_page = lazy_genesis_page_input(&record);
+        let mut genesis_page = lazy_genesis_page_input(&record)?;
         let (checkpoint, dependencies) = lazy_checkpoints.push_page(&genesis_page, &accepted)?;
         genesis_page.document_checkpoint = checkpoint;
         genesis_page.document_dependencies = Some(dependencies);
@@ -3739,7 +3739,9 @@ fn spool_bootstrap_operations(
     })
 }
 
-fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageInput {
+fn lazy_genesis_page_input(
+    record: &ActivationPageRecordV1,
+) -> Result<LazyGenesisPageInput, BootstrapStreamingImportError> {
     let blocks = record
         .page
         .blocks
@@ -3764,7 +3766,7 @@ fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageIn
             }
         })
         .collect();
-    LazyGenesisPageInput {
+    Ok(LazyGenesisPageInput {
         source_leaf: record.source_leaf,
         exact_source_bytes: record.exact_source_bytes.clone(),
         page_id: record.page.page_id,
@@ -3776,7 +3778,11 @@ fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageIn
         blocks,
         document_checkpoint: Vec::new(),
         document_dependencies: None,
-    }
+        sqlite_receipt: crate::oplog::lazy_genesis::LazyGenesisSqliteReceiptV1::new(
+            &record.exact_source_bytes,
+            record.sqlite_page(),
+        )?,
+    })
 }
 
 /// Resolve the only graph-wide decision needed while constructing baseline
@@ -3856,7 +3862,7 @@ fn build_lazy_genesis_from_activation_records(
                     .map(|logseq_uuid| (block.block_id, logseq_uuid))
             })
             .collect();
-        let mut page = lazy_genesis_page_input(&record);
+        let mut page = lazy_genesis_page_input(&record)?;
         let (checkpoint, dependencies) = checkpoints.push_page(&page, &page_assignments)?;
         page.document_checkpoint = checkpoint;
         page.document_dependencies = Some(dependencies);
@@ -4018,7 +4024,7 @@ fn build_clean_activation_candidates(
                     .map(|logseq_uuid| (block.block_id, logseq_uuid))
             })
             .collect();
-        let mut capsule = lazy_genesis_page_input(&record);
+        let mut capsule = lazy_genesis_page_input(&record)?;
         instrumentation.record_and_input_micros = instrumentation
             .record_and_input_micros
             .saturating_add(elapsed_micros(record_started));
@@ -4463,6 +4469,11 @@ pub(crate) fn open_or_rebuild_clean_genesis_projection(
 fn materialize_lazy_genesis_page(
     page: LazyGenesisPageInput,
 ) -> Result<super::MaterializedPageInput, BootstrapStreamingImportError> {
+    if let Some(receipt) = page.sqlite_receipt.as_ref() {
+        if let Some(payload) = receipt.verified_payload(&page)? {
+            return Ok(payload);
+        }
+    }
     let mut parser_instrumentation = ImportInstrumentation::default();
     let mut tree = parse_nodes(
         &page.path,
@@ -13694,6 +13705,126 @@ mod tests {
             )
             .is_err(),
             "an older accepted Present row must not regain write authority after a later deletion"
+        );
+    }
+
+    #[test]
+    fn clean_genesis_rebuild_reuses_receipted_semantics_without_parsing_source_pages() {
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "clean-rebuild-parse-budget",
+            &[
+                ("pages/alpha.md", "- alpha\n"),
+                ("pages/beta.md", "- beta\n  - child\n"),
+            ],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let scratch = root.path().join("clean-preparation");
+        let preparation_database = root.path().join("clean-preparation.sqlite");
+        let lineage = LineageDigest::of(b"clean-rebuild-parse-budget");
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            lineage,
+            DocumentId::from_uuid(Uuid::from_u128(0x5a82)),
+            &scratch,
+            &preparation_database,
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        assert_eq!(preparation.instrumentation().source_files, 2);
+
+        crate::outline::reset_parse_attempts();
+        let rebuilt = open_or_rebuild_clean_genesis_projection(
+            &root.path().join("clean-rebuilt.sqlite"),
+            ProjectionClaim::current(workspace, lineage),
+            preparation.candidates().baseline(),
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::outline::parse_attempts(),
+            0,
+            "a healthy rebuild must verify and reuse each baseline semantic receipt"
+        );
+        drop(rebuilt);
+    }
+
+    #[test]
+    fn invalid_or_stale_clean_genesis_receipts_reparse_and_verify_exact_source() {
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "clean-rebuild-receipt-fallback",
+            &[("pages/alpha.md", "- alpha\n")],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            LineageDigest::of(b"clean-rebuild-receipt-fallback"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a83)),
+            &root.path().join("clean-preparation"),
+            &root.path().join("clean-preparation.sqlite"),
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        let page_id = preparation
+            .candidates()
+            .baseline()
+            .page_ids()
+            .next()
+            .unwrap();
+        let source = preparation
+            .candidates()
+            .baseline()
+            .page(page_id)
+            .unwrap()
+            .unwrap();
+
+        crate::outline::reset_parse_attempts();
+        let receipted = materialize_lazy_genesis_page(source.clone()).unwrap();
+        assert_eq!(crate::outline::parse_attempts(), 0);
+        let mut receiptless = source.clone();
+        receiptless.sqlite_receipt = None;
+        crate::outline::reset_parse_attempts();
+        let reparsed = materialize_lazy_genesis_page(receiptless).unwrap();
+        assert_eq!(crate::outline::parse_attempts(), 1);
+        assert_eq!(
+            receipted, reparsed,
+            "the receipt fast path must equal the retained parser oracle"
+        );
+
+        let mut corrupt = source.clone();
+        corrupt
+            .sqlite_receipt
+            .as_mut()
+            .expect("new baseline carries a receipt")
+            .corrupt_semantic_digest_for_test();
+        crate::outline::reset_parse_attempts();
+        materialize_lazy_genesis_page(corrupt).unwrap();
+        assert_eq!(crate::outline::parse_attempts(), 1);
+
+        let mut stale = source.clone();
+        stale
+            .sqlite_receipt
+            .as_mut()
+            .expect("new baseline carries a receipt")
+            .mark_parser_stale_for_test();
+        crate::outline::reset_parse_attempts();
+        materialize_lazy_genesis_page(stale).unwrap();
+        assert_eq!(crate::outline::parse_attempts(), 1);
+
+        let mut receiptless_divergence = source;
+        receiptless_divergence.sqlite_receipt = None;
+        receiptless_divergence.exact_source_bytes = b"- changed behind the capsule\n".to_vec();
+        crate::outline::reset_parse_attempts();
+        let error = materialize_lazy_genesis_page(receiptless_divergence).unwrap_err();
+        assert_eq!(crate::outline::parse_attempts(), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("block identity differs from its exact source bytes"),
+            "receiptless fallback must retain exact-source divergence detection: {error}"
         );
     }
 

@@ -59,6 +59,13 @@ explicit integrity audit retain independent validators. Activation performs
 one final byte-exact live-tree scan without reparsing, accounts for watcher
 events crossing that scan, and publishes one small authority marker last.
 
+This process-only publication receipt is distinct from the optional bounded
+SQLite semantic verification receipt added to page-capsule v5. The latter is a
+durable cache of parser output, bound to the capsule's exact-source digest and
+checked before use solely to avoid reparsing during disposable SQLite rebuild.
+Receiptless v4 capsules and any absent, stale, or invalid v5 receipt retain the
+independent exact-source parser-and-compare validator.
+
 Fresh activation writes only the new format. Before 0.7, experimental older
 managed state may be rebuilt from a verified complete Markdown projection. If
 that cannot be proved, Tine preserves the old bytes for an explicit offline

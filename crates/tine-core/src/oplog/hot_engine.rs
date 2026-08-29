@@ -41646,6 +41646,7 @@ mod validation_tests {
                     .collect(),
                 document_checkpoint: Vec::new(),
                 document_dependencies: None,
+                sqlite_receipt: None,
             };
             let (checkpoint, _) = builder.push_page(&page, &BTreeMap::new()).unwrap();
             checkpoint_bytes = checkpoint_bytes.saturating_add(checkpoint.len() as u64);

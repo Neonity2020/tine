@@ -5376,6 +5376,32 @@
     "failBefore": "proven at 6e7bdd42: after an external same-structure CRLF edit queued a managed full rescan but before it settled, exact-path hydration returned the disk winner while logical application-page hydration failed with ActorRefusedAt(\"hot_source_join\")."
    },
    "notes": "GH #397 reported the exact hot_source_join toast and 2-3 minute stale interval on Windows. Logical application hydration lacked the source-rebased read view already used by exact-path reads, so a bounded watcher continuation left that route stale until the full graph scan reached the page. Same-topology outside content edits now hydrate from current source bytes through read-only application-page routes while accepted history remains owned by the watcher. Mutation baselines keep the accepted-authority route, and structural or identity-changing edits still wait for normal reconciliation; this row does not claim a Windows or managed real-app observation-boundary run."
+  },
+  {
+   "id": "REG-MANAGED-LAZY-GENESIS-PARSE-RECEIPT",
+   "title": "Disposable SQLite rebuilds reuse bounded baseline semantics without reparsing healthy pages",
+   "family": "managed-storage-performance-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/import.rs::tests::clean_genesis_rebuild_reuses_receipted_semantics_without_parsing_source_pages",
+     "crates/tine-core/src/oplog/import.rs::tests::invalid_or_stale_clean_genesis_receipts_reparse_and_verify_exact_source",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_v4_dual_decode_defaults_to_receiptless_fallback",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::sqlite_receipt_bounds_are_inclusive_and_omit_after_either_cap",
+     "crates/tine-core/src/oplog/import.rs::tests::import_admission_reuses_the_parser_owned_document",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_one_block_save_stays_within_two_parser_passes"
+    ],
+    "failBefore": "proven on the MS-08 packet base: rebuilding a missing disposable SQLite projection reparsed both pages in a two-page healthy baseline; the permanent budget requires zero source parses for already-receipted pages"
+   },
+   "notes": "Internal MS-08 cost-model correction. New page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Receiptless capsule v4 remains dual-decodable. Any absent, stale, invalid, or capsule-inconsistent receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save path was re-censused and already pins exactly one accepted-baseline parse plus one target parse, so this packet adds no speculative save rewrite."
   }
  ]
 }

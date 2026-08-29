@@ -46321,6 +46321,142 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "manual MS-08 gate: current parse census and real-corpus SQLite rebuild"]
+    fn managed_parse_receipt_real_graph_census() {
+        assert!(
+            !cfg!(debug_assertions),
+            "release-only; run with --release --ignored --test-threads=1"
+        );
+        let source = real_graph_copy_source_from_env("TINE_MANAGED_ACTIVATION_GRAPH_COPY");
+        let fixture = ActivationFixture::copied_graph("managed-parse-receipt", 0xa0d8, &source);
+
+        crate::model::start_managed_parse_census();
+        let activation = activate_with_scale_receipt(&fixture);
+        let activation_parses = crate::model::finish_managed_parse_census();
+        assert_eq!(
+            activation_parses, activation.source_files,
+            "activation must parse each source file exactly once"
+        );
+
+        crate::model::start_managed_parse_census();
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let cold_open_parses = crate::model::finish_managed_parse_census();
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        assert_eq!(
+            cold_open_parses, 0,
+            "a healthy cold open must not parse pages"
+        );
+        let handle = opened.handle.expect("the activated corpus reopens");
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("the parse census inventory did not load: {other:?}"),
+        };
+        let (page, revision) = pages
+            .iter()
+            .find_map(|entry| {
+                let (page, revision) = load_application_exact(&handle, &entry.rel_path);
+                (!page.blocks.is_empty()).then_some((page, revision))
+            })
+            .expect("the census corpus has a nonempty page");
+
+        crate::model::start_managed_parse_census();
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "managed parse receipt census edit",
+        );
+        let foreground_save_parses = crate::model::finish_managed_parse_census();
+        assert!(
+            foreground_save_parses <= 2,
+            "one-block foreground save exceeded its two-parse budget: {foreground_save_parses}"
+        );
+
+        crate::model::start_managed_parse_census();
+        drain_managed_local(&handle);
+        let drain_parses = crate::model::finish_managed_parse_census();
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        crate::oplog::sqlite::remove_disposable_projection(&fixture.request.database_path).unwrap();
+        crate::model::start_managed_parse_census();
+        let rebuild_started = Instant::now();
+        let rebuilt = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let rebuild_ms = rebuild_started.elapsed().as_millis();
+        let rebuild_parses = crate::model::finish_managed_parse_census();
+        assert_eq!(rebuilt.status, SyncRuntimeOpenStatus::Active);
+        assert_eq!(
+            rebuild_parses, 0,
+            "a healthy receipted SQLite rebuild must not parse source pages"
+        );
+        assert!(
+            rebuild_ms < 10_000,
+            "real-corpus SQLite rebuild exceeded 10 seconds: {rebuild_ms} ms"
+        );
+        let rebuilt = rebuilt.handle.expect("the rebuilt corpus reopens");
+        assert!(matches!(
+            rebuilt.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        eprintln!(
+            "managed_parse_receipt_census source_files={} activation_parses={} activation_ms={} cold_open_parses={} foreground_save_parses={} drain_parses={} rebuild_parses={} rebuild_ms={}",
+            activation.source_files,
+            activation_parses,
+            activation.total_ms,
+            cold_open_parses,
+            foreground_save_parses,
+            drain_parses,
+            rebuild_parses,
+            rebuild_ms,
+        );
+    }
+
+    #[test]
+    fn managed_one_block_save_stays_within_two_parser_passes() {
+        let fixture = ActivationFixture::nested_unicode("managed-save-parse-budget", 0xa0d9);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("the parse-budget fixture activates");
+        drive_initial_feed(&handle);
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "managed one-block two-parser-pass budget",
+        );
+        let stages = handle
+            .managed_application_save_instrumentation()
+            .expect("the actor reports foreground parse accounting")
+            .application_stages;
+        assert_eq!(stages.editor_accepted_parses, 1);
+        assert_eq!(stages.editor_target_parses, 1);
+        assert_eq!(
+            stages
+                .editor_accepted_parses
+                .saturating_add(stages.editor_target_parses),
+            2,
+            "one-block foreground save must not regain render/response reparses"
+        );
+        assert_eq!(stages.response_target_exact_dto_reparses, 0);
+
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
     fn assert_search_index_matches_materialized_sources(database_path: &Path) {
         let connection = rusqlite::Connection::open(database_path).unwrap();
         let phase: i64 = connection

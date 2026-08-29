@@ -22,6 +22,12 @@ use super::{
 };
 
 const LAZY_GENESIS_SCHEMA_VERSION: u32 = 4;
+const LEGACY_LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION: u32 = 4;
+const LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION: u32 = 5;
+const LAZY_GENESIS_SQLITE_RECEIPT_SCHEMA_VERSION: u32 = 1;
+/// Bump whenever the parser-to-materialized-page projection changes. A stale
+/// receipt remains readable but is ignored in favour of the retained parser.
+const LAZY_GENESIS_PARSER_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_COMMIT_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_PROVIDER_INDEX_SCHEMA_VERSION: u32 = 1;
 const LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION: u32 = 1;
@@ -34,6 +40,9 @@ pub(crate) const LAZY_GENESIS_ACTIVATION_MARKER_FILE: &str = "lazy-genesis.marke
 const MAX_LAZY_GENESIS_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
 const LAZY_GENESIS_SEGMENT_TARGET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_LAZY_GENESIS_CAPSULE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_LAZY_GENESIS_SQLITE_RECEIPT_BYTES: usize = 64 * 1024 * 1024;
+/// One page row plus the existing one-million-block parser ceiling.
+const MAX_LAZY_GENESIS_SQLITE_RECEIPT_ROWS: usize = 1_000_001;
 const MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
 pub(crate) const MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const LAZY_GENESIS_PROVIDER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -319,6 +328,137 @@ pub(crate) struct LazyGenesisPageInput {
     pub(crate) blocks: Vec<LazyGenesisBlockInput>,
     pub(crate) document_checkpoint: Vec<u8>,
     pub(crate) document_dependencies: Option<DocumentDependencies>,
+    pub(crate) sqlite_receipt: Option<LazyGenesisSqliteReceiptV1>,
+}
+
+/// Bounded, disposable-projection handoff carried by the authenticated
+/// baseline capsule. It is not independent authority: invalid, absent, or
+/// parser-stale receipts fall back to reparsing the capsule's exact bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LazyGenesisSqliteReceiptV1 {
+    schema_version: u32,
+    parser_schema_version: u32,
+    exact_source_digest: ContentDigest,
+    semantic_digest: ContentDigest,
+    row_count: u32,
+    /// Opaque until both receipt and parser schema versions match. Keeping the
+    /// parser-owned codec behind bytes lets a future binary ignore an old
+    /// receipt and reach the receiptless parser fallback.
+    payload: Vec<u8>,
+}
+
+impl LazyGenesisSqliteReceiptV1 {
+    pub(crate) fn new(
+        exact_source_bytes: &[u8],
+        payload: super::MaterializedPageInput,
+    ) -> io::Result<Option<Self>> {
+        let rows = payload.blocks.len().saturating_add(1);
+        if !sqlite_receipt_within_bounds(0, rows) {
+            return Ok(None);
+        }
+        let payload =
+            postcard::to_allocvec(&payload).map_err(|error| invalid(error.to_string()))?;
+        let semantic_digest = sqlite_receipt_semantic_digest(&payload);
+        let receipt = Self {
+            schema_version: LAZY_GENESIS_SQLITE_RECEIPT_SCHEMA_VERSION,
+            parser_schema_version: LAZY_GENESIS_PARSER_SCHEMA_VERSION,
+            exact_source_digest: ContentDigest::of(exact_source_bytes),
+            semantic_digest,
+            row_count: rows as u32,
+            payload,
+        };
+        if !sqlite_receipt_within_bounds(
+            postcard::to_allocvec(&receipt)
+                .map_err(|error| invalid(error.to_string()))?
+                .len(),
+            rows,
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(receipt))
+    }
+
+    pub(crate) fn verified_payload(
+        &self,
+        page: &LazyGenesisPageInput,
+    ) -> io::Result<Option<super::MaterializedPageInput>> {
+        if self.schema_version != LAZY_GENESIS_SQLITE_RECEIPT_SCHEMA_VERSION
+            || self.parser_schema_version != LAZY_GENESIS_PARSER_SCHEMA_VERSION
+            || !sqlite_receipt_within_bounds(
+                postcard::to_allocvec(self)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .len(),
+                self.row_count as usize,
+            )
+            || self.exact_source_digest != ContentDigest::of(&page.exact_source_bytes)
+            || self.semantic_digest != sqlite_receipt_semantic_digest(&self.payload)
+        {
+            return Ok(None);
+        }
+        let payload: super::MaterializedPageInput = match postcard::from_bytes(&self.payload) {
+            Ok(payload) => payload,
+            Err(_) => return Ok(None),
+        };
+        if payload.blocks.len().saturating_add(1) != self.row_count as usize
+            || !sqlite_receipt_matches_capsule(&payload, page)
+        {
+            return Ok(None);
+        }
+        Ok(Some(payload))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_semantic_digest_for_test(&mut self) {
+        self.semantic_digest = ContentDigest::of(b"corrupt lazy-genesis sqlite receipt");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_parser_stale_for_test(&mut self) {
+        self.parser_schema_version = self.parser_schema_version.saturating_add(1);
+    }
+}
+
+fn sqlite_receipt_semantic_digest(payload: &[u8]) -> ContentDigest {
+    let mut bytes = Vec::with_capacity(35 + payload.len());
+    bytes.extend_from_slice(b"tine/lazy-genesis/sqlite-receipt/v1\0");
+    bytes.extend_from_slice(payload);
+    ContentDigest::of(&bytes)
+}
+
+fn sqlite_receipt_matches_capsule(
+    payload: &super::MaterializedPageInput,
+    page: &LazyGenesisPageInput,
+) -> bool {
+    payload.page_id == page.page_id
+        && payload.home_document_id == page.home_document_id
+        && payload.name == page.name
+        && payload.path == page.path
+        && payload.kind == page.kind
+        && payload.preamble == page.preamble
+        && payload.blocks.len() == page.blocks.len()
+        && payload
+            .blocks
+            .iter()
+            .zip(&page.blocks)
+            .all(|(payload, stored)| {
+                let expected_uuid = if stored.external_uuid_claims.len() == 1 {
+                    Some(stored.external_uuid_claims[0])
+                } else {
+                    None
+                };
+                payload.block_id == stored.block_id
+                    && payload.home_document_id == stored.home_document_id
+                    && payload.parent == stored.parent
+                    && payload.order == stored.order
+                    && payload.content == stored.content
+                    && payload.logseq_uuid == expected_uuid
+            })
+}
+
+const fn sqlite_receipt_within_bounds(encoded_bytes: usize, rows: usize) -> bool {
+    encoded_bytes <= MAX_LAZY_GENESIS_SQLITE_RECEIPT_BYTES
+        && rows <= MAX_LAZY_GENESIS_SQLITE_RECEIPT_ROWS
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -335,12 +475,33 @@ struct LazyGenesisPageCapsuleV1 {
     preamble: Option<String>,
     blocks: Vec<LazyGenesisBlockInput>,
     document_checkpoint: Vec<u8>,
+    #[serde(default)]
+    sqlite_receipt: Option<LazyGenesisSqliteReceiptV1>,
+}
+
+/// Exact pre-receipt postcard shape. Postcard encodes structs as sequences, so
+/// serde defaults cannot recover a missing trailing field; dual decoding must
+/// retain the old shape explicitly.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyLazyGenesisPageCapsuleV4 {
+    schema_version: u32,
+    source_leaf: [u8; 32],
+    exact_source_bytes: Vec<u8>,
+    page_id: PageId,
+    home_document_id: DocumentId,
+    name: String,
+    path: ManagedPath,
+    kind: ManagedTextKind,
+    preamble: Option<String>,
+    blocks: Vec<LazyGenesisBlockInput>,
+    document_checkpoint: Vec<u8>,
 }
 
 impl LazyGenesisPageCapsuleV1 {
     fn from_input(input: LazyGenesisPageInput) -> io::Result<Self> {
         let capsule = Self {
-            schema_version: LAZY_GENESIS_SCHEMA_VERSION,
+            schema_version: LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION,
             source_leaf: input.source_leaf,
             exact_source_bytes: input.exact_source_bytes,
             page_id: input.page_id,
@@ -351,13 +512,28 @@ impl LazyGenesisPageCapsuleV1 {
             preamble: input.preamble,
             blocks: input.blocks,
             document_checkpoint: input.document_checkpoint,
+            sqlite_receipt: input.sqlite_receipt,
         };
+        let mut capsule = capsule;
+        if capsule.sqlite_receipt.is_some()
+            && postcard::to_allocvec(&capsule)
+                .map_err(|error| invalid(error.to_string()))?
+                .len()
+                > MAX_LAZY_GENESIS_CAPSULE_BYTES
+        {
+            capsule.sqlite_receipt = None;
+        }
         capsule.validate()?;
         Ok(capsule)
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.schema_version != LAZY_GENESIS_SCHEMA_VERSION
+        if !matches!(
+            self.schema_version,
+            LEGACY_LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION
+                | LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION
+        ) || (self.schema_version == LEGACY_LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION
+            && self.sqlite_receipt.is_some())
             || self.name.is_empty()
             || self.document_checkpoint.is_empty()
             || self.exact_source_bytes.len() > MAX_LAZY_GENESIS_CAPSULE_BYTES
@@ -408,8 +584,30 @@ impl LazyGenesisPageCapsuleV1 {
         if bytes.len() > MAX_LAZY_GENESIS_CAPSULE_BYTES {
             return Err(invalid("lazy genesis page capsule exceeds its fixed cap"));
         }
-        let capsule: Self =
-            postcard::from_bytes(bytes).map_err(|error| invalid(error.to_string()))?;
+        let capsule: Self = match postcard::from_bytes(bytes) {
+            Ok(capsule) => capsule,
+            Err(current_error) => {
+                let legacy: LegacyLazyGenesisPageCapsuleV4 =
+                    postcard::from_bytes(bytes).map_err(|_| invalid(current_error.to_string()))?;
+                if legacy.schema_version != LEGACY_LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION {
+                    return Err(invalid(current_error.to_string()));
+                }
+                Self {
+                    schema_version: legacy.schema_version,
+                    source_leaf: legacy.source_leaf,
+                    exact_source_bytes: legacy.exact_source_bytes,
+                    page_id: legacy.page_id,
+                    home_document_id: legacy.home_document_id,
+                    name: legacy.name,
+                    path: legacy.path,
+                    kind: legacy.kind,
+                    preamble: legacy.preamble,
+                    blocks: legacy.blocks,
+                    document_checkpoint: legacy.document_checkpoint,
+                    sqlite_receipt: None,
+                }
+            }
+        };
         capsule.validate()?;
         Ok(capsule)
     }
@@ -1128,6 +1326,7 @@ impl LazyGenesisCandidate {
             blocks: capsule.blocks,
             document_checkpoint: capsule.document_checkpoint,
             document_dependencies: Some(descriptor.document_dependencies.clone()),
+            sqlite_receipt: capsule.sqlite_receipt,
         }))
     }
 
@@ -1608,6 +1807,7 @@ mod tests {
                     external_uuid_claims: Vec::new(),
                 })
                 .collect(),
+            sqlite_receipt: None,
         }
     }
 
@@ -1663,6 +1863,47 @@ mod tests {
         assert_eq!(read.path.as_str(), "pages/b.org");
         assert_eq!(read.blocks.len(), 1);
         assert_eq!(read.exact_source_bytes, vec![b'x'; 8]);
+    }
+
+    #[test]
+    fn capsule_v4_dual_decode_defaults_to_receiptless_fallback() {
+        let current = LazyGenesisPageCapsuleV1::from_input(page(7, "pages/legacy.md", 2)).unwrap();
+        let legacy = LegacyLazyGenesisPageCapsuleV4 {
+            schema_version: LEGACY_LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION,
+            source_leaf: current.source_leaf,
+            exact_source_bytes: current.exact_source_bytes.clone(),
+            page_id: current.page_id,
+            home_document_id: current.home_document_id,
+            name: current.name.clone(),
+            path: current.path.clone(),
+            kind: current.kind,
+            preamble: current.preamble.clone(),
+            blocks: current.blocks.clone(),
+            document_checkpoint: current.document_checkpoint.clone(),
+        };
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded = LazyGenesisPageCapsuleV1::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.schema_version,
+            LEGACY_LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION
+        );
+        assert!(decoded.sqlite_receipt.is_none());
+    }
+
+    #[test]
+    fn sqlite_receipt_bounds_are_inclusive_and_omit_after_either_cap() {
+        assert!(sqlite_receipt_within_bounds(
+            MAX_LAZY_GENESIS_SQLITE_RECEIPT_BYTES,
+            MAX_LAZY_GENESIS_SQLITE_RECEIPT_ROWS
+        ));
+        assert!(!sqlite_receipt_within_bounds(
+            MAX_LAZY_GENESIS_SQLITE_RECEIPT_BYTES + 1,
+            MAX_LAZY_GENESIS_SQLITE_RECEIPT_ROWS
+        ));
+        assert!(!sqlite_receipt_within_bounds(
+            MAX_LAZY_GENESIS_SQLITE_RECEIPT_BYTES,
+            MAX_LAZY_GENESIS_SQLITE_RECEIPT_ROWS + 1
+        ));
     }
 
     /// Build a sealed single-segment pack of `pages` tiny pages.

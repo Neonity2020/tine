@@ -24,6 +24,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed storage no longer reparses every baseline page when rebuilding its
+  disposable SQLite projection.** New baseline capsules carry a bounded,
+  versioned semantic receipt that is verified and reused during a healthy
+  rebuild. Existing receiptless baselines, oversized pages, parser upgrades,
+  and invalid receipts retain the prior exact-source reparse-and-compare path.
+  Foreground one-block saves remain capped at their existing two parser passes.
+
 - **Managed storage now opens before its search indexes finish building.**
   Both Unicode and CJK substring indexes are built in bounded background turns;
   searches remain complete through an explicit slower fallback and show

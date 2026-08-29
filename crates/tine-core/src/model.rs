@@ -7681,6 +7681,10 @@ impl Graph {
         bytes: &[u8],
         require_round_trip: bool,
     ) -> io::Result<ParsedExternalDocument> {
+        #[cfg(test)]
+        if MANAGED_PARSE_CENSUS_ENABLED.load(Ordering::Relaxed) {
+            MANAGED_PARSE_CENSUS_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         let content = std::str::from_utf8(bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -22734,6 +22738,26 @@ thread_local! {
     static EXACT_PAGE_DTO_PARSE_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static GRAPH_TEXT_VALIDATION_TARGET_READS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+static MANAGED_PARSE_CENSUS_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static MANAGED_PARSE_CENSUS_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Cross-thread counter for the ignored MS cost-census probe. Run that probe
+/// with one test thread; ordinary assertions keep using thread-local counters.
+#[cfg(test)]
+pub(crate) fn start_managed_parse_census() {
+    MANAGED_PARSE_CENSUS_CALLS.store(0, Ordering::Relaxed);
+    MANAGED_PARSE_CENSUS_ENABLED.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn finish_managed_parse_census() -> usize {
+    MANAGED_PARSE_CENSUS_ENABLED.store(false, Ordering::Release);
+    MANAGED_PARSE_CENSUS_CALLS.swap(0, Ordering::AcqRel)
 }
 
 #[cfg(test)]
