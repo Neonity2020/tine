@@ -22,6 +22,8 @@ import {
   type SidebarSessionState,
   sanitizeRecent,
   setRecentPages,
+  capturePdfSessionTarget,
+  restorePdfSessionTarget,
 } from "./ui";
 import {
   feedPaneId,
@@ -34,6 +36,7 @@ import {
   restorePaneLayout,
   type LayoutNode,
 } from "./panes";
+import { parsePersistedPdfTarget, type PersistedPdfTarget } from "./uiStateRegistry";
 
 export type PersistedLayoutNode =
   | {
@@ -56,6 +59,7 @@ export interface PersistedSession extends PaneSnapshot {
   layout?: PersistedLayoutNode;
   focusedPaneId?: string;
   recentPages?: RecentItem[];
+  pdfTarget?: PersistedPdfTarget | null;
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -205,6 +209,7 @@ export function buildPersistedSession(): PersistedSession {
     layout: serializeLayout(layoutRoot()),
     focusedPaneId: focusedPaneId(),
     recentPages: recentPages(),
+    pdfTarget: capturePdfSessionTarget(),
   };
 }
 
@@ -214,6 +219,7 @@ export function parsePersistedSession(raw: string): {
   focusedPaneId: string;
   sidebar: SidebarSessionState;
   recent: RecentItem[];
+  pdfTarget: PersistedPdfTarget | null;
 } | null {
   try {
     const s = JSON.parse(raw) as PersistedSession;
@@ -225,6 +231,7 @@ export function parsePersistedSession(raw: string): {
       recentExpanded: s.recentSectionExpanded,
     };
     const recent = s.recentPages === undefined ? legacyRecentPages() : sanitizeRecent(s.recentPages);
+    const restoredPdfTarget = parsePersistedPdfTarget(s.pdfTarget);
     if (s.layout && !isMobilePlatform) {
       const snapshots = new Map<string, PaneSnapshot>();
       const layout = parseLayoutNode(s.layout, snapshots, { value: false });
@@ -235,6 +242,7 @@ export function parsePersistedSession(raw: string): {
           focusedPaneId: typeof s.focusedPaneId === "string" ? s.focusedPaneId : "main",
           sidebar,
           recent,
+          pdfTarget: restoredPdfTarget,
         };
       }
     }
@@ -252,6 +260,7 @@ export function parsePersistedSession(raw: string): {
           focusedPaneId: "main",
           sidebar,
           recent,
+          pdfTarget: restoredPdfTarget,
         };
       }
     }
@@ -263,6 +272,7 @@ export function parsePersistedSession(raw: string): {
       focusedPaneId: "main",
       sidebar,
       recent,
+      pdfTarget: restoredPdfTarget,
     };
   } catch {
     return null;
@@ -284,6 +294,7 @@ export function applyParsedSession(parsed: NonNullable<ReturnType<typeof parsePe
   } else {
     restorePaneLayout(parsed.layout, parsed.snapshots, parsed.focusedPaneId);
   }
+  restorePdfSessionTarget(parsed.pdfTarget);
 }
 
 export async function flushSession(): Promise<void> {

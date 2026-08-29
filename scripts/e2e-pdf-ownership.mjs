@@ -251,6 +251,10 @@ async function openSharedPdf() {
   const link = await browser.$(".pdf-link");
   await link.waitForExist({ timeout: 15_000 });
   await link.click();
+  await waitForSharedPdf();
+}
+
+async function waitForSharedPdf() {
   await browser.waitUntil(() => browser.execute(() =>
     document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "shared.pdf" &&
     document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready") === "true"), {
@@ -281,7 +285,7 @@ async function switchGraph(graph) {
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
 }
 
-const receipt = { graphSwitch: {}, safeClose: {} };
+const receipt = { graphSwitch: {}, safeClose: {}, sessionRestore: {} };
 try {
   wmLog = fs.openSync(path.join(ARTIFACTS, "window-manager.log"), "w");
   driverLog = fs.openSync(path.join(ARTIFACTS, "tauri-driver.log"), "w");
@@ -335,7 +339,9 @@ try {
   await stopDriver();
 
   await connect();
-  await openSharedPdf();
+  // The open PDF resource is graph-session state. A clean relaunch must mount
+  // it automatically under the freshly minted graph ownership generation.
+  await waitForSharedPdf();
   const relaunchedZoom = Number((await browser.$(".pdf-zoom-level").getText()).replace("%", "")) / 100;
   if (Math.abs(relaunchedZoom - closeScheduledZoom) >= 0.0001) {
     throw new Error(`relaunch restored PDF scale ${relaunchedZoom}, expected ${closeScheduledZoom}`);
@@ -345,8 +351,24 @@ try {
     persistedZoom: sidecarScale(GRAPH_A),
     relaunchedZoom,
   };
+  receipt.sessionRestore.openPdfRestoredAutomatically = true;
+
+  // An explicit user close is also durable and must not be confused with the
+  // transition-only suspend used while rebinding a graph.
+  await browser.$(".pdf-close-btn").click();
+  await browser.$(".pdf-viewer").waitForExist({ reverse: true, timeout: 10_000 });
+  await closeTineNatively();
+  try { await browser.deleteSession(); } catch {}
+  browser = undefined;
+  await stopDriver();
+  await connect();
+  await sleep(1_000);
+  if (await browser.$(".pdf-viewer").isExisting()) {
+    throw new Error("explicitly closed PDF reopened after a clean relaunch");
+  }
+  receipt.sessionRestore.explicitCloseStayedClosed = true;
   fs.writeFileSync(path.join(ARTIFACTS, "pdf-ownership-native-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
-  console.log(`PASS: PDF graph-switch and safe-close ownership are filesystem-stable: ${JSON.stringify(receipt)}`);
+  console.log(`PASS: PDF ownership and graph-session restore are stable: ${JSON.stringify(receipt)}`);
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { await stopApp(); } catch {}

@@ -24,6 +24,7 @@ import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawer
 import { currentPdfOwnership, type PdfOwnership } from "./pdfOwnership";
 import { issue248Collector, issue248Now } from "./issue248Probe";
 import type { ExportNode } from "./editor/exportText";
+import type { PersistedPdfTarget } from "./uiStateRegistry";
 
 const THEME_KEY = "logseq-claude.theme";
 export type ThemePreference = "light" | "dark" | "system";
@@ -2045,6 +2046,33 @@ export interface PdfTarget {
   highlightId?: string;
 }
 export const [pdfTarget, setPdfTarget] = createSignal<PdfTarget | null>(null);
+export function capturePdfSessionTarget(): PersistedPdfTarget | null {
+  const current = pdfTarget();
+  return current ? { filename: current.filename, label: current.label } : null;
+}
+
+/** Apply persisted stable identity under the current graph generation. */
+export function restorePdfSessionTarget(target: PersistedPdfTarget | null): boolean {
+  if (!target) {
+    setPdfTarget(null);
+    return true;
+  }
+  const owner = currentPdfOwnership();
+  if (!owner) {
+    setPdfTarget(null);
+    return false;
+  }
+  setPdfTarget({ ...target, owner });
+  return true;
+}
+
+/** Clear runtime ownership without turning a graph transition into a user close. */
+export function suspendPdfForGraphTransition(): PersistedPdfTarget | null {
+  const stable = capturePdfSessionTarget();
+  setPdfTarget(null);
+  return stable;
+}
+
 export function openPdf(filename: string, label: string, page?: number, highlightId?: string) {
   const owner = currentPdfOwnership();
   if (!owner) return;
@@ -2055,7 +2083,10 @@ export function openPdf(filename: string, label: string, page?: number, highligh
   if (current?.filename === filename && current.owner.generation === owner.generation &&
       page == null && highlightId == null) return;
   setPdfTarget({ filename, label, owner, page, highlightId });
+  scheduleSessionSave();
 }
 export function closePdf() {
+  if (!pdfTarget()) return;
   setPdfTarget(null);
+  scheduleSessionSave();
 }
