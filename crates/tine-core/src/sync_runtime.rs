@@ -1906,6 +1906,9 @@ pub struct SyncRuntimeStatusSnapshot {
     /// is the exact predicate `tick` itself consults, so it is true only while a
     /// further tick can still act on provider work.
     pub provider_runnable: bool,
+    /// True until both FTS families have caught up to the live projection.
+    /// Search consumers must fall back or report progress while this is set.
+    pub search_index_building: bool,
     pub managed_local_pending: usize,
     pub managed_local_checkpointed_sequence: u64,
     pub managed_local_next_sequence: u64,
@@ -1932,7 +1935,10 @@ impl SyncRuntimeStatusSnapshot {
     /// sleep.
     #[must_use]
     pub const fn has_runnable_work(&self) -> bool {
-        self.watcher.pending || self.provider_runnable || self.sweep_deadline_due
+        self.watcher.pending
+            || self.provider_runnable
+            || self.search_index_building
+            || self.sweep_deadline_due
     }
 }
 
@@ -3246,6 +3252,7 @@ pub enum SyncRuntimeQueryReply {
     Pages(Vec<SyncPageDto>),
     PageWithBlocks(Option<SyncPageWithBlocksDto>),
     Search(Vec<SyncSearchHitDto>),
+    SearchBuilding { horizon_sequence: u64 },
     Properties(Vec<SyncPropertyDto>),
     Tags(Vec<SyncTagDto>),
     Tasks(Vec<SyncTaskDto>),
@@ -3629,6 +3636,7 @@ impl SyncRuntimeHandle {
             shared_phase: None,
             provider_pending: 0,
             provider_runnable: false,
+            search_index_building: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -3678,6 +3686,7 @@ impl SyncRuntimeHandle {
                         shared_phase: None,
                         provider_pending: 0,
                         provider_runnable: false,
+                        search_index_building: false,
                         managed_local_pending: 0,
                         managed_local_checkpointed_sequence: 0,
                         managed_local_next_sequence: 0,
@@ -5406,6 +5415,9 @@ enum CleanFullScanStep {
 }
 
 const CLEAN_FULL_SCAN_PATH_BUDGET: usize = 16;
+/// Search indexing is disposable background work. Bound each actor turn so
+/// editor/provider traffic can interleave with a graph-sized build.
+const SEARCH_INDEX_BUILD_ROW_BUDGET: usize = 128;
 const CLEAN_FULL_SCAN_TIME_BUDGET: Duration = Duration::from_millis(25);
 
 impl CleanWatcherState {
@@ -9452,6 +9464,11 @@ fn run_actor_loop(
             .local_completion_deadline_remaining(Instant::now())
             .into_iter()
             .chain(actor.sweep_deadline_remaining())
+            .chain(
+                actor
+                    .search_index_build_has_work()
+                    .then_some(Duration::from_millis(10)),
+            )
             .fold(MANAGED_LOCAL_IDLE_TICK, Duration::min);
         let request = match receiver.recv_timeout(timeout) {
             Ok(request) => request,
@@ -9462,6 +9479,7 @@ fn run_actor_loop(
                     .is_some_and(|managed| managed.pending_count() != 0)
                     || actor.local_completion_flush_due(Instant::now())
                     || actor.sweep_deadline_due()
+                    || actor.search_index_build_has_work()
                 {
                     let tick = actor.tick();
                     actor.last_tick = Some(tick);
@@ -13079,13 +13097,15 @@ impl RuntimeActor {
                     },
                 )))
             }
-            SyncRuntimeQueryRequest::Search { query, limit } => Ok(SyncRuntimeQueryReply::Search(
-                read.search(&query, limit)
-                    .map_err(materialized_query_error)?
-                    .into_iter()
-                    .map(sync_search_hit)
-                    .collect(),
-            )),
+            SyncRuntimeQueryRequest::Search { query, limit } => match read.search(&query, limit) {
+                Ok(hits) => Ok(SyncRuntimeQueryReply::Search(
+                    hits.into_iter().map(sync_search_hit).collect(),
+                )),
+                Err(crate::oplog::MaterializationError::SearchIndexBuilding {
+                    horizon_sequence,
+                }) => Ok(SyncRuntimeQueryReply::SearchBuilding { horizon_sequence }),
+                Err(error) => Err(materialized_query_error(error)),
+            },
             SyncRuntimeQueryRequest::PropertiesForOwner { owner, limit } => {
                 let owner = parse_entity_id(owner)?;
                 Ok(SyncRuntimeQueryReply::Properties(
@@ -14201,6 +14221,10 @@ impl RuntimeActor {
 
         if application_unlinked_candidate_strategy(&names_norm)
             == ApplicationUnlinkedCandidateStrategy::FullExactFallback
+            || self
+                .active_database()
+                .map(|database| database.search_index_building().unwrap_or(true))
+                .unwrap_or(true)
         {
             // unicode61 deliberately has no candidate for a tokenless literal.
             // Preserve correctness through exact application pages, never the
@@ -14210,16 +14234,9 @@ impl RuntimeActor {
                 if excluded.excludes_name(&entry.name) {
                     continue;
                 }
-                let current = match self.load_application_reference_exact_ready(&entry.rel_path)? {
-                    ApplicationExactLoad::Loaded(current) => current,
-                    ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
-                            "application_unlinked_references_page_load",
-                        ))
-                    }
-                };
+                let page = self.load_application_reference_source_exact_ready(&entry.rel_path)?;
                 let matches = crate::query::application_page_reference_matches(
-                    &current.page,
+                    &page,
                     &canonical,
                     &names_norm,
                     ReferenceKind::Plain,
@@ -14228,7 +14245,7 @@ impl RuntimeActor {
                     &self.graph.config,
                 );
                 if !matches.is_empty() {
-                    sources.push((entry.rel_path, entry.date_key, current.page, matches));
+                    sources.push((entry.rel_path, entry.date_key, page, matches));
                 }
             }
             return Ok(bound_application_reference_sources(
@@ -14316,12 +14333,17 @@ impl RuntimeActor {
             sources.push((path.as_str().to_owned(), entry.date_key, page, matches));
         }
         for page_id in candidate_pages {
-            let current = self.load_application_reference_page_id_ready(page_id)?;
-            if excluded.excludes_name(&current.page.name) {
+            let (path, _) = page_headers.get(&page_id).ok_or(
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_unlinked_references_candidate_header_missing",
+                ),
+            )?;
+            let page = self.load_application_reference_source_exact_ready(path.as_str())?;
+            if excluded.excludes_name(&page.name) {
                 continue;
             }
             let matches = crate::query::application_page_reference_matches(
-                &current.page,
+                &page,
                 &canonical,
                 &names_norm,
                 ReferenceKind::Plain,
@@ -14334,22 +14356,13 @@ impl RuntimeActor {
             }
             let entry = self
                 .graph
-                .projected_inventory_entry(
-                    &current.editor.page.path,
-                    &current.page.name,
-                    current.editor.page.kind,
-                )
+                .projected_inventory_entry(path, &page.name, model_sync_page_kind(page.kind))
                 .map_err(|_| {
                     SyncApplicationPageRequestError::ActorRefusedAt(
                         "application_unlinked_references_overlay_inventory_entry",
                     )
                 })?;
-            sources.push((
-                current.editor.page.path.as_str().to_owned(),
-                entry.date_key,
-                current.page,
-                matches,
-            ));
+            sources.push((path.as_str().to_owned(), entry.date_key, page, matches));
         }
         Ok(bound_application_reference_sources(
             sources, max_rows, max_bytes, false,
@@ -15801,7 +15814,7 @@ impl RuntimeActor {
             .as_slice()
         {
             if page.path == path {
-                if let Ok(Some(current)) = load_projected_source_rebased_application_page_from_parts(
+                match load_projected_source_rebased_application_page_from_parts(
                     self.active_engine()
                         .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?,
                     self.active_database()
@@ -15810,11 +15823,15 @@ impl RuntimeActor {
                     &self.application_hydration_cache,
                     page.page_id,
                 ) {
-                    if current.editor.page.path == path {
+                    Ok(Some(current)) if current.editor.page.path == path => {
                         return Ok(self.finish_managed_application_query_exact_load(
                             ApplicationExactLoad::Loaded(current),
                         ));
                     }
+                    Err(SyncEditorRequestError::RequestTooLarge(size)) => {
+                        return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
+                    }
+                    Ok(_) | Err(_) => {}
                 }
             }
         }
@@ -15917,7 +15934,7 @@ impl RuntimeActor {
             .as_slice()
         {
             if page.path == path {
-                if let Ok(Some(current)) = load_projected_source_rebased_application_page_from_parts(
+                match load_projected_source_rebased_application_page_from_parts(
                     self.active_engine()
                         .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?,
                     self.active_database()
@@ -15926,9 +15943,13 @@ impl RuntimeActor {
                     &self.application_hydration_cache,
                     page.page_id,
                 ) {
-                    if current.editor.page.path == path {
+                    Ok(Some(current)) if current.editor.page.path == path => {
                         return Ok(ApplicationExactLoad::Loaded(current));
                     }
+                    Err(SyncEditorRequestError::RequestTooLarge(size)) => {
+                        return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
+                    }
+                    Ok(_) | Err(_) => {}
                 }
             }
         }
@@ -16107,29 +16128,70 @@ impl RuntimeActor {
         Ok(ApplicationExactLoad::Loaded(current))
     }
 
-    /// Reference panels return a bounded set of shallow matches, so the
-    /// write-oriented whole-page editor limit must not reject a larger source
-    /// page before that result budget is applied. Ordinary pages retain the
-    /// projected fast path; only its explicit size refusal falls back to one
-    /// linear authenticated read of the source page.
-    fn load_application_reference_exact_ready(
+    /// Full reference fallback scans need the exact current source, but not a
+    /// write-capable editor DTO. Avoid imposing the editor's block limit (and
+    /// the physical query row limit behind it) before the bounded reference
+    /// result is selected.
+    fn load_application_reference_source_exact_ready(
         &self,
         path: &str,
-    ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
-        match self.load_application_exact_ready(path) {
-            Err(SyncApplicationPageRequestError::RequestTooLarge(size))
-                if size.blocks > MAX_SYNC_APPLICATION_PAGE_BLOCKS =>
-            {
-                let path = ManagedPath::parse(path.to_owned()).map_err(|_| {
-                    SyncApplicationPageRequestError::InvalidRequest(
-                        SyncApplicationPageInvalidRequest::InvalidPath,
-                    )
-                })?;
-                self.load_hot_application_exact_untracked_ready_with_block_limit(&path, usize::MAX)
-                    .map(|current| self.finish_managed_application_query_exact_load(current))
-            }
-            result => result,
+    ) -> Result<PageDto, SyncApplicationPageRequestError> {
+        let path = ManagedPath::parse(path.to_owned()).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidPath,
+            )
+        })?;
+        if let Some(current) = self.application_navigation_overlay_ready()?.get(&path) {
+            let (_, page) =
+                current
+                    .as_ref()
+                    .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_reference_source_deleted",
+                    ))?;
+            #[cfg(test)]
+            self.note_managed_application_query_result_page_hydration();
+            return Ok(page.clone());
         }
+        let read = self.application_materialized_read_ready()?;
+        let pages = read.pages_by_path(&path, 2).map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_reference_source_pages_by_path",
+            )
+        })?;
+        let [page] = pages.as_slice() else {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                if pages.is_empty() {
+                    "application_reference_source_missing"
+                } else {
+                    "application_reference_source_ambiguous"
+                },
+            ));
+        };
+        if page.path != path {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_reference_source_path_mismatch",
+            ));
+        }
+        let source = self
+            .graph
+            .read_application_projection_input(&path)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("application_reference_source_read")
+            })?
+            .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_reference_source_missing",
+            ))?;
+        let parsed = self
+            .graph
+            .parse_exact_page_dto(&path, &source)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_reference_source_parse",
+                )
+            })?;
+        #[cfg(test)]
+        self.note_managed_application_query_result_page_hydration();
+        Ok(parsed)
     }
 
     fn load_application_page_id_ready(
@@ -20629,6 +20691,52 @@ impl RuntimeActor {
         outcome
     }
 
+    fn search_index_build_has_work(&self) -> bool {
+        self.clean
+            .as_ref()
+            .map(|clean| {
+                // A status-read failure must never be published as "ready":
+                // every FTS consumer would then be allowed to read a partial
+                // index. Keep the lane runnable so the authored build step
+                // surfaces the concrete storage error instead.
+                clean
+                    .runtime
+                    .database()
+                    .search_index_building()
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false)
+    }
+
+    fn tick_clean_search_index_build(&mut self) -> SyncRuntimeTick {
+        let clean = self
+            .clean
+            .as_mut()
+            .expect("search indexing is routed only to a clean actor");
+        let mut session = match clean.runtime.admit_clean_mutation(&self.graph) {
+            Ok(session) => session,
+            Err(error) => {
+                return SyncRuntimeTick::RecoveryBlocked(format!(
+                    "search index build could not enter the managed runtime: {error}"
+                ));
+            }
+        };
+        let (_, _, database) = match session.parts() {
+            Ok(parts) => parts,
+            Err(error) => {
+                return SyncRuntimeTick::RecoveryBlocked(format!(
+                    "search index build lost workspace authority: {error}"
+                ));
+            }
+        };
+        match database.advance_search_index_build(SEARCH_INDEX_BUILD_ROW_BUDGET) {
+            Ok(_) => SyncRuntimeTick::Recovering,
+            Err(error) => {
+                SyncRuntimeTick::Failed(format!("background search index build failed: {error}"))
+            }
+        }
+    }
+
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
         match self.admit_deferred_absence_observations() {
             Ok(true) => return SyncRuntimeTick::Recovering,
@@ -20768,6 +20876,8 @@ impl RuntimeActor {
             {
                 return if self.provider_has_work() {
                     self.tick_clean_provider()
+                } else if self.search_index_build_has_work() {
+                    self.tick_clean_search_index_build()
                 } else {
                     SyncRuntimeTick::Idle
                 };
@@ -22752,6 +22862,7 @@ impl RuntimeActor {
             // publication intents remain.
             provider_runnable: self.shared_phase == Some(SyncSharedPhase::Active)
                 && self.provider_has_work(),
+            search_index_building: self.search_index_build_has_work(),
             managed_local_pending: self
                 .managed_local
                 .as_ref()
@@ -28603,6 +28714,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn managed_search_reports_building_then_returns_backend_results() {
+        let fixture =
+            ActivationFixture::scaled("managed-search-lazy-fts-backend-integration", 0x7f75, 512);
+        fs::write(fixture.graph_root.join("notes/Task.md"), "- target page\n").unwrap();
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("scaled graph activates");
+        assert!(handle.status().unwrap().search_index_building);
+        assert!(matches!(
+            handle
+                .query(SyncRuntimeQueryRequest::Search {
+                    query: "synthetic".into(),
+                    limit: 8,
+                })
+                .unwrap(),
+            SyncRuntimeQueryReply::SearchBuilding { .. }
+        ));
+        assert!(
+            !managed_block_search(&handle, "synthetic", 8).is_empty(),
+            "fuzzy block search must decline partial FTS and use its exact fallback"
+        );
+        let unlinked = handle
+            .application_navigation(SyncApplicationNavigationRequest::UnlinkedReferences {
+                name: "Task".into(),
+                max_rows: 8,
+                max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+        assert!(matches!(
+            unlinked,
+            SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::UnlinkedReferences(
+                    SyncApplicationBoundedRefGroups { total, .. }
+                )
+            } if total > 0
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.status().unwrap().search_index_building && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!handle.status().unwrap().search_index_building);
+        assert!(matches!(
+            handle
+                .query(SyncRuntimeQueryRequest::Search {
+                    query: "synthetic".into(),
+                    limit: 8,
+                })
+                .unwrap(),
+            SyncRuntimeQueryReply::Search(ref hits) if !hits.is_empty()
+        ));
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+        fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
     impl Drop for ActivationFixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
@@ -32543,6 +32714,9 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(pages, SyncRuntimeQueryReply::Pages(ref pages) if !pages.is_empty()));
+        assert!(handle.status().unwrap().search_index_building);
+        assert_eq!(handle.tick().unwrap(), SyncRuntimeTick::Recovering);
+        drive_search_index_to_ready(&handle, 4096);
         assert_eq!(handle.tick().unwrap(), SyncRuntimeTick::Idle);
         let stopped = handle.clean_shutdown().unwrap();
         assert!(matches!(stopped, SyncShutdownOutcome::Safe(_)));
@@ -46082,6 +46256,138 @@ mod tests {
         );
     }
 
+    fn assert_search_index_matches_materialized_sources(database_path: &Path) {
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        let phase: i64 = connection
+            .query_row(
+                "SELECT phase FROM search_fts_build WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, 1, "the corpus FTS differential requires readiness");
+        let outbox: i64 = connection
+            .query_row("SELECT COUNT(*) FROM search_fts_outbox", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(outbox, 0, "a ready corpus index retained catch-up rows");
+
+        let expected = "SELECT 0 AS entity_type, page_id AS entity_id, page_id,
+                               searchable_text AS text,
+                               normalized_searchable_text AS normalized_text
+                        FROM pages
+                        UNION ALL
+                        SELECT 1 AS entity_type, block_id AS entity_id, page_id,
+                               searchable_text AS text,
+                               normalized_searchable_text AS normalized_text
+                        FROM blocks";
+        let standard = "SELECT owner.entity_type, owner.entity_id, owner.page_id,
+                                fts.text, fts.normalized_text
+                         FROM search_fts_owners AS owner
+                         JOIN search_fts AS fts ON fts.rowid = owner.rowid";
+        let substring = "SELECT owner.entity_type, owner.entity_id, owner.page_id,
+                                 source.text, substring.normalized_text
+                          FROM search_fts_owners AS owner
+                          JOIN search_substring_fts AS substring
+                            ON substring.rowid = owner.rowid
+                          JOIN (
+                              SELECT 0 AS entity_type, page_id AS entity_id,
+                                     page_id, searchable_text AS text
+                              FROM pages
+                              UNION ALL
+                              SELECT 1 AS entity_type, block_id AS entity_id,
+                                     page_id, searchable_text AS text
+                              FROM blocks
+                          ) AS source
+                            ON source.entity_type = owner.entity_type
+                           AND source.entity_id = owner.entity_id";
+        let count =
+            |sql: String| -> i64 { connection.query_row(&sql, [], |row| row.get(0)).unwrap() };
+        for (family, actual) in [("standard", standard), ("substring", substring)] {
+            let missing = count(format!(
+                "SELECT COUNT(*) FROM (SELECT * FROM ({expected}) EXCEPT SELECT * FROM ({actual}))"
+            ));
+            let extra = count(format!(
+                "SELECT COUNT(*) FROM (SELECT * FROM ({actual}) EXCEPT SELECT * FROM ({expected}))"
+            ));
+            assert_eq!(
+                (missing, extra),
+                (0, 0),
+                "{family} FTS differs from the authoritative materialized corpus rows"
+            );
+        }
+    }
+
+    fn drive_search_index_to_ready(handle: &SyncRuntimeHandle, turn_budget: usize) {
+        for _ in 0..turn_budget {
+            if !handle.status().unwrap().search_index_building {
+                return;
+            }
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::Failed(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                ),
+                "the FTS build failed: {tick:?}"
+            );
+        }
+        panic!("the FTS build exceeded its bounded turn budget");
+    }
+
+    /// Private-corpus counterpart to tine-storage's permanent synthetic
+    /// differential. The source graph is copied before activation; this test
+    /// never prints corpus content and mutates only that disposable copy.
+    #[test]
+    #[ignore = "manual gate: lazy and delta FTS differential on an anonymized corpus copy"]
+    fn managed_search_index_real_corpus_differential() {
+        let source = real_graph_copy_source_from_env("TINE_MANAGED_ACTIVATION_GRAPH_COPY");
+        let fixture = ActivationFixture::copied_graph("managed-search-fts-corpus", 0xf750, &source);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("the corpus copy activates");
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+        drive_search_index_to_ready(&handle, 4096);
+        assert_search_index_matches_materialized_sources(&fixture.request.database_path);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert_search_index_matches_materialized_sources(&fixture.request.database_path);
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened.handle.expect("the indexed corpus copy reopens");
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("corpus inventory did not load: {other:?}"),
+        };
+        let (page, revision) = pages
+            .iter()
+            .find_map(|entry| {
+                let loaded = load_application_exact(&handle, &entry.rel_path);
+                (!loaded.0.blocks.is_empty()).then_some(loaded)
+            })
+            .expect("the corpus copy has an editable block");
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "ms07 corpus delta-maintenance probe",
+        );
+        drain_managed_local(&handle);
+        drive_search_index_to_ready(&handle, 4096);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert_search_index_matches_materialized_sources(&fixture.request.database_path);
+    }
+
     #[test]
     #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
     fn managed_crash_reopen_aged_history_manual_benchmark() {
@@ -50060,24 +50366,30 @@ mod tests {
         fs::write(&source, body).unwrap();
 
         let handle = open_reopened_managed_actor(&fixture);
-        let outcome = handle
-            .application_navigation(SyncApplicationNavigationRequest::UnlinkedReferences {
-                name: "Target".into(),
-                max_rows: 32,
-                max_bytes: 1024 * 1024,
-            })
-            .unwrap();
-        let SyncApplicationNavigationOutcome::Loaded {
-            reply: SyncApplicationNavigationReply::UnlinkedReferences(result),
-        } = outcome
-        else {
-            panic!("managed unlinked references returned the wrong outcome: {outcome:?}")
+        let assert_large_source_result = || {
+            let outcome = handle
+                .application_navigation(SyncApplicationNavigationRequest::UnlinkedReferences {
+                    name: "Target".into(),
+                    max_rows: 32,
+                    max_bytes: 1024 * 1024,
+                })
+                .unwrap();
+            let SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::UnlinkedReferences(result),
+            } = outcome
+            else {
+                panic!("managed unlinked references returned the wrong outcome: {outcome:?}")
+            };
+            assert_eq!(result.total, 1);
+            assert_eq!(result.groups.len(), 1);
+            assert_eq!(result.groups[0].page, "Large source");
+            assert_eq!(result.groups[0].blocks[0].raw, "Target appears here");
+            assert!(!result.exceeded);
         };
-        assert_eq!(result.total, 1);
-        assert_eq!(result.groups.len(), 1);
-        assert_eq!(result.groups[0].page, "Large source");
-        assert_eq!(result.groups[0].blocks[0].raw, "Target appears here");
-        assert!(!result.exceeded);
+        assert!(handle.status().unwrap().search_index_building);
+        assert_large_source_result();
+        drive_search_index_to_ready(&handle, 4096);
+        assert_large_source_result();
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -50141,6 +50453,7 @@ mod tests {
         // 2. Literal fuzzy search -- the `((` block picker. `zqx` occurs on
         // exactly one page, so this also proves the managed narrowing returns
         // the same answer the unnarrowed Direct scan does.
+        drive_search_index_to_ready(&handle, 4096);
         handle
             .reset_managed_application_query_instrumentation()
             .unwrap();

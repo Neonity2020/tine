@@ -338,6 +338,9 @@ export interface SparseV2RuntimeStatus {
    * work a tick can advance. Diagnostic only; `provider_pending` is a broad
    * inventory that legitimately stays non-zero. */
   provider_runnable: boolean;
+  /** Both FTS families are catching up in bounded background turns. Search
+   * remains exact through the non-indexed fallback until this clears. */
+  search_index_building: boolean;
 }
 
 export type SparseV2Availability =
@@ -715,6 +718,7 @@ export type SparseV2QueryReply =
   | { kind: "pages"; value: SparseV2Page[] }
   | { kind: "page_with_blocks"; value: SparseV2PageWithBlocks | null }
   | { kind: "search"; value: SparseV2SearchHit[] }
+  | { kind: "search_building"; value: { horizon_sequence: number } }
   | { kind: "properties"; value: SparseV2Property[] }
   | { kind: "tags"; value: SparseV2Tag[] }
   | { kind: "tasks"; value: SparseV2Task[] }

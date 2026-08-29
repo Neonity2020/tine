@@ -24,6 +24,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed storage now opens before its search indexes finish building.**
+  Both Unicode and CJK substring indexes are built in bounded background turns;
+  searches remain complete through an explicit slower fallback and show
+  “Search index building…” until readiness. Live edits are caught up before the
+  marker flips, and later one-block saves update only that block's search rows
+  instead of rewriting its whole page.
+
 - **Managed storage no longer forces a durable SQLite cache sync for every
   accepted event or schema statement.** The disposable WAL projection now uses
   `synchronous=NORMAL`, creates its schema in one atomic transaction, and keeps

@@ -1036,7 +1036,7 @@ mod tests {
             );
         }
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
-        assert!(contract.contains("SQLite schema 20 provides"));
+        assert!(contract.contains("SQLite schema 21 provides"));
         assert!(contract.contains("explicitly either `Baseline` or an accepted"));
         assert!(contract.contains("then deleted rather than retained as a\nsecond ready route"));
     }

@@ -269,7 +269,7 @@ and manifest tail.
 | `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
-| configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
+| configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
 | device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
@@ -828,14 +828,16 @@ edit therefore waits for ordinary reconciliation rather than being guessed,
 while a same-topology content edit cannot make one selector fresh and another
 refuse at `hot_source_join`.
 
-SQLite schema 20 provides the physical replacement for all four native
+SQLite schema 21 provides the physical replacement for all four native
 identity-index families. Page-name and portable-path rows contain one complete,
 application-owned causal point record; exact names and paths are inline and do
 not depend on a content-addressed side blob. External Logseq UUID introductions
 and block-home claims are append-only bounded histories which preserve every
 claimant. Every causal origin is explicitly either `Baseline` or an accepted
 `(batch, dot)`; activation never fabricates a bootstrap batch merely to seed an
-index. The old Patricia values remain only as a differential oracle until the
+index. Schema 21 additionally makes the disposable FTS readiness protocol
+explicit; it does not change the identity-record semantics. The old Patricia
+values remain only as a differential oracle until the
 single production cutover, and are then deleted rather than retained as a
 second ready route.
 

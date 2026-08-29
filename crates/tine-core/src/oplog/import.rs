@@ -12903,7 +12903,13 @@ mod tests {
         let projection_rows = |rows: Vec<(&'static str, ContentDigest)>| {
             rows.into_iter()
                 .filter(|(table, _)| {
-                    !matches!(*table, "materialization_stamp" | "materialization_batches")
+                    !matches!(
+                        *table,
+                        "materialization_stamp"
+                            | "materialization_batches"
+                            | "search_fts_build"
+                            | "search_fts_outbox"
+                    )
                 })
                 .collect::<Vec<_>>()
         };
@@ -18073,7 +18079,8 @@ mod tests {
                 "INSERT INTO pages
                  SELECT randomblob(16), home_document_id, name || ' stale',
                         name_key || ' stale', path || '.stale', text_kind,
-                        preamble, searchable_text
+                        preamble, searchable_text,
+                        normalized_searchable_text || ' stale'
                  FROM pages ORDER BY page_id LIMIT 1",
             ),
             (

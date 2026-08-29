@@ -231,6 +231,7 @@ function receiveManagedUnavailableRuntime(
       shared_phase: null,
       provider_pending: 0,
       provider_runnable: false,
+      search_index_building: false,
     },
     application_page_admission: {
       binding_generation: 1,

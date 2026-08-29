@@ -9457,6 +9457,28 @@ impl From<storage_frontier::FrontierError> for ProjectionError {
 }
 
 impl SqliteFrontier {
+    pub(crate) fn search_index_building(&self) -> Result<bool, ProjectionError> {
+        self.physical
+            .search_index_status()
+            .map(|status| {
+                matches!(
+                    status,
+                    storage_frontier::PhysicalSearchIndexStatus::Building { .. }
+                )
+            })
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn advance_search_index_build(
+        &mut self,
+        limit: usize,
+    ) -> Result<bool, ProjectionError> {
+        self.physical
+            .advance_search_index_build(limit)
+            .map(|step| step.ready)
+            .map_err(Into::into)
+    }
+
     /// Open a read-only reference view at `engine`'s exact accepted frontier.
     /// A SQLite prefix is usable only when its ordinary materialization stamp
     /// matches that frontier. Any newer portion is bounded by the existing tail

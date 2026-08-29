@@ -44,6 +44,7 @@ function runtime(lastTick: SparseV2Tick | null = null): SparseV2RuntimeStatus {
     shared_phase: null,
     provider_pending: 0,
     provider_runnable: false,
+    search_index_building: false,
   };
 }
 

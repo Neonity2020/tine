@@ -745,6 +745,7 @@ pub(crate) struct SparseV2RuntimeStatusDto {
     /// showing `provider_pending > 0` with an idle watcher cannot be read
     /// without this. See `docs/storage-sync-contract.md` §2.3.
     provider_runnable: bool,
+    search_index_building: bool,
     managed_local_pending: usize,
     managed_local_checkpointed_sequence: u64,
     managed_local_next_sequence: u64,
@@ -937,6 +938,7 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
         }),
         provider_pending,
         provider_runnable: snapshot.provider_runnable,
+        search_index_building: snapshot.search_index_building,
         managed_local_pending: snapshot.managed_local_pending,
         managed_local_checkpointed_sequence: snapshot.managed_local_checkpointed_sequence,
         managed_local_next_sequence: snapshot.managed_local_next_sequence,
@@ -3952,6 +3954,7 @@ mod clean_shutdown_slot_tests {
             shared_phase: None,
             provider_pending: 0,
             provider_runnable: false,
+            search_index_building: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -6482,6 +6485,16 @@ mod tests {
                     "text": "exact wire",
                     "rank": -0.25
                 }]
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SyncRuntimeQueryReply::SearchBuilding {
+                horizon_sequence: 12,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "kind": "search_building",
+                "value": { "horizon_sequence": 12 }
             })
         );
         assert_eq!(

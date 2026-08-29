@@ -3016,6 +3016,9 @@ pub enum MaterializationError {
         materialized: u64,
         frontier: u64,
     },
+    SearchIndexBuilding {
+        horizon_sequence: u64,
+    },
     DuplicateCollision(BatchId),
     InvalidQuery(String),
 }
@@ -3058,6 +3061,9 @@ impl fmt::Display for MaterializationError {
                     "materialization for batch {batch_id} has different canonical bytes"
                 )
             }
+            Self::SearchIndexBuilding { horizon_sequence } => {
+                write!(f, "search index building from projection frontier {horizon_sequence}")
+            }
             Self::InvalidQuery(error) => write!(f, "invalid materialization query: {error}"),
         }
     }
@@ -3096,6 +3102,9 @@ impl From<storage::MaterializationError> for MaterializationError {
                 materialized,
                 frontier,
             },
+            storage::MaterializationError::SearchIndexBuilding { horizon_sequence } => {
+                Self::SearchIndexBuilding { horizon_sequence }
+            }
             storage::MaterializationError::InvalidQuery(error) => Self::InvalidQuery(error),
         }
     }

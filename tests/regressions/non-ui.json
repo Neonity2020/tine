@@ -5288,6 +5288,25 @@
    "notes": "Internal MS-06 cost-model correction. SQLite is a disposable frontier-stamped projection, never accepted-history authority. Its writable WAL now uses synchronous=NORMAL, fresh schema creation is one atomic transaction, and ordinary/candidate commits record zero per-transaction durability barriers. A completed projection becomes reusable only after the existing explicit WAL checkpoint and atomic file-set publication. Missing, stale, corrupt, or power-loss-damaged projection state is validated and rebuilt from the immutable baseline plus accepted manifests; the recovery tests pin that loss of this cache cannot lose accepted graph content. Upstream tine-storage fail-before/pass-after tests directly query the NORMAL pragma and force a late schema collision to prove all earlier DDL rolls back."
   },
   {
+   "id": "REG-MANAGED-LAZY-FTS-DELTA",
+   "title": "Managed activation does not wait for FTS and ready saves maintain entity deltas",
+   "family": "managed-storage-performance-and-search",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": ["all"],
+   "layer": "rust-core-storage-and-frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_search_reports_building_then_returns_backend_results"
+    ],
+    "failBefore": "The pre-MS-07 terminal builder inserted both FTS families on the activation critical path, and every whole-page replacement deleted and reinserted the page plus all block search rows even when one block's text changed."
+   },
+   "notes": "Internal MS-07 cost-model correction. Both indexes remain present. A frontier-stamped build cursor and same-transaction latest-after-state outbox make partial indexes unreadable, crash-resumable, and exact across concurrent edits. Raw FTS search reports building; managed fuzzy search declines its optimization and unlinked references use the full exact application-page path. The Quick Switcher explains that results remain complete but may be temporarily slower. Upstream tine-storage tests separately pin zero activation FTS rows, one-block/no-page and page-title logical-row budgets, and edit-during-build catch-up; their counters deliberately exclude FTS5 shadow-table internals."
+  },
+  {
    "id": "REG-JOURNAL-FEED-READ-ERROR-385",
    "title": "A journal feed read failure is not presented as an empty graph",
    "family": "journal-feed",

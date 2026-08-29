@@ -152,6 +152,7 @@ mod managed_application_move_wire_tests {
                     "shared_phase": null,
                     "provider_pending": 0,
                     "provider_runnable": false,
+                    "search_index_building": false,
                     "managed_local_pending": 0,
                     "managed_local_checkpointed_sequence": 0,
                     "managed_local_next_sequence": 0,

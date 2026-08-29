@@ -85,6 +85,10 @@ describe("Tine-managed storage app boundary", () => {
           },
         ],
       },
+      {
+        kind: "search_building",
+        value: { horizon_sequence: 12 },
+      },
     ] satisfies SparseV2QueryReply[];
 
     expect(replies).toEqual([
@@ -99,6 +103,10 @@ describe("Tine-managed storage app boundary", () => {
             rank: -0.25,
           },
         ],
+      },
+      {
+        kind: "search_building",
+        value: { horizon_sequence: 12 },
       },
     ]);
   });

@@ -29,7 +29,7 @@ fs2 = "0.4.3"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 unicode-normalization = "=0.1.25"
 unicode-segmentation = "1"
-tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", rev = "75d782236104a7d98dd86034024665a94b37591c" }
+tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", rev = "03e28ec26f4bcc1dd36b4998ddd58e1e816660be" }
 
 [target.'cfg(windows)'.dependencies]
 cap-fs-ext = "=4.0.2"
@@ -44,4 +44,4 @@ windows-sys = { version = "0.61.2", features = [
 
 [dev-dependencies]
 pretty_assertions = "1"
-tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", rev = "75d782236104a7d98dd86034024665a94b37591c", features = ["test-support"] }
+tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", rev = "03e28ec26f4bcc1dd36b4998ddd58e1e816660be", features = ["test-support"] }
