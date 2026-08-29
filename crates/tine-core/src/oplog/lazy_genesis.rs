@@ -421,13 +421,16 @@ impl LazyGenesisSqliteReceiptV1 {
         &self,
         page: &LazyGenesisPageInput,
     ) -> io::Result<Option<super::MaterializedPageInput>> {
+        if self.schema_version != LAZY_GENESIS_SQLITE_RECEIPT_SCHEMA_VERSION
+            || self.parser_schema_version != LAZY_GENESIS_PARSER_SCHEMA_VERSION
+        {
+            return Ok(None);
+        }
         let encoded_len = match postcard::to_allocvec(self) {
             Ok(bytes) => bytes.len(),
             Err(_) => return Ok(None),
         };
-        if self.schema_version != LAZY_GENESIS_SQLITE_RECEIPT_SCHEMA_VERSION
-            || self.parser_schema_version != LAZY_GENESIS_PARSER_SCHEMA_VERSION
-            || !sqlite_receipt_within_bounds(encoded_len, self.row_count as usize)
+        if !sqlite_receipt_within_bounds(encoded_len, self.row_count as usize)
             || self.exact_source_digest != ContentDigest::of(&page.exact_source_bytes)
             || self.semantic_digest != sqlite_receipt_semantic_digest(&self.payload)
         {

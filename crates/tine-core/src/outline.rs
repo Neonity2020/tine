@@ -12,8 +12,6 @@ use std::ops::Range;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(test)]
-use std::sync::{LazyLock, Mutex};
 
 #[cfg(test)]
 thread_local! {
@@ -24,28 +22,18 @@ thread_local! {
 static MANAGED_PARSE_CENSUS_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static MANAGED_PARSE_CENSUS_CALLS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static MANAGED_PARSE_CENSUS_THREADS: LazyLock<Mutex<std::collections::BTreeMap<String, usize>>> =
-    LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
-
 /// Cross-thread parser-primitive counter for the ignored MS cost census. Run
 /// that probe with one test thread; ordinary assertions remain thread-local.
 #[cfg(test)]
 pub(crate) fn start_managed_parse_census() {
     MANAGED_PARSE_CENSUS_CALLS.store(0, Ordering::Relaxed);
-    MANAGED_PARSE_CENSUS_THREADS.lock().unwrap().clear();
     MANAGED_PARSE_CENSUS_ENABLED.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
 pub(crate) fn finish_managed_parse_census() -> usize {
     MANAGED_PARSE_CENSUS_ENABLED.store(false, Ordering::Release);
-    let calls = MANAGED_PARSE_CENSUS_CALLS.swap(0, Ordering::AcqRel);
-    eprintln!(
-        "managed_parse_census_threads={:?}",
-        MANAGED_PARSE_CENSUS_THREADS.lock().unwrap()
-    );
-    calls
+    MANAGED_PARSE_CENSUS_CALLS.swap(0, Ordering::AcqRel)
 }
 
 #[cfg(test)]
@@ -360,13 +348,6 @@ fn parse_document_uncached(
         OUTLINE_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
         if MANAGED_PARSE_CENSUS_ENABLED.load(Ordering::Relaxed) {
             MANAGED_PARSE_CENSUS_CALLS.fetch_add(1, Ordering::Relaxed);
-            let thread = std::thread::current();
-            let name = thread
-                .name()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("{:?}", thread.id()));
-            let mut threads = MANAGED_PARSE_CENSUS_THREADS.lock().unwrap();
-            *threads.entry(name).or_default() += 1;
         }
     }
     let outline = lsdoc::parse_outline(source, format.lsdoc_name())
@@ -381,6 +362,7 @@ fn parse_document_uncached(
                 roots: Vec::new(),
             },
             block_spans: Vec::new(),
+            unbulleted_markdown_headings: Vec::new(),
             blank_lines_before_blocks: Vec::new(),
             blank_lines_after_preamble: 0,
             leading_blank_lines: 0,
@@ -403,6 +385,11 @@ fn parse_document_uncached(
     let mut flat = Vec::with_capacity(outline.headers.len());
     let mut blank_lines_before_blocks = vec![0; outline.headers.len()];
     let mut block_spans = Vec::with_capacity(outline.headers.len());
+    let unbulleted_markdown_headings = outline
+        .headers
+        .iter()
+        .map(|header| header.kind == OutlineHeaderKind::MarkdownUnbulletedAtxHeading)
+        .collect();
     for (event, header) in outline.headers.iter().enumerate() {
         let header_line = line_indexes[event];
         let next_header_line = line_indexes
@@ -495,6 +482,7 @@ fn parse_document_uncached(
     Ok(ParsedDocument {
         document: Document { pre_block, roots },
         block_spans,
+        unbulleted_markdown_headings,
         blank_lines_before_blocks,
         blank_lines_after_preamble,
         leading_blank_lines,
@@ -504,20 +492,22 @@ fn parse_document_uncached(
     })
 }
 
-/// Return a parser-owned insertion point that keeps an unbulleted Markdown
-/// heading structural when projection span instrumentation decorates its raw
-/// bytes. Tine deliberately does not recover the ATX title boundary itself:
-/// inserting immediately before the parser-reported physical-line terminator
-/// is sufficient for the temporary marker and leaves the exact source intact
-/// when that marker is removed.
-pub(crate) fn markdown_unbulleted_heading_line_end(raw: &str) -> Option<usize> {
-    let outline = lsdoc::parse_outline(raw, OutlineFormat::Markdown.lsdoc_name()).ok()?;
-    let first = outline.headers.first()?;
-    (first.kind == OutlineHeaderKind::MarkdownUnbulletedAtxHeading
-        && first.header_start == 0
-        && first.line.start == 0
-        && first.line_content.slice(raw).is_some())
-    .then_some(first.line_content.end)
+/// Return the insertion point for a canonical semantic ATX heading without
+/// invoking the whole-document outline parser per block. Source-layout
+/// retention itself is admitted by `unbulleted_markdown_headings`, captured
+/// from lsdoc's page parse above; this helper only checks that an edited or
+/// generated block still has the canonical `#{1,6} whitespace` shape.
+pub(crate) fn markdown_atx_heading_line_end(raw: &str) -> Option<usize> {
+    let line_end = raw.find(['\r', '\n']).unwrap_or(raw.len());
+    let first_line = &raw[..line_end];
+    let hashes = first_line.bytes().take_while(|byte| *byte == b'#').count();
+    (hashes > 0
+        && hashes <= 6
+        && first_line
+            .as_bytes()
+            .get(hashes)
+            .is_some_and(u8::is_ascii_whitespace))
+    .then_some(line_end)
 }
 
 #[cfg(test)]
@@ -877,5 +867,18 @@ mod tests {
         assert!(parse_document(invalid, OutlineFormat::Markdown).is_err());
         assert!(parse_document(invalid, OutlineFormat::Markdown).is_err());
         assert_eq!(parse_attempts(), 8, "parser refusals must never be cached");
+    }
+
+    #[test]
+    fn canonical_atx_heading_line_end_needs_one_to_six_hashes_and_whitespace() {
+        assert_eq!(markdown_atx_heading_line_end("# Heading"), Some(9));
+        assert_eq!(markdown_atx_heading_line_end("###### H\nbody"), Some(8));
+        assert_eq!(
+            markdown_atx_heading_line_end("## Heading\r\nbody"),
+            Some(10)
+        );
+        assert_eq!(markdown_atx_heading_line_end("#Heading"), None);
+        assert_eq!(markdown_atx_heading_line_end("####### Heading"), None);
+        assert_eq!(markdown_atx_heading_line_end(" - # Heading"), None);
     }
 }

@@ -18141,15 +18141,6 @@ impl ShardedHotEngine {
                         seal.verify_and_take_annotations(self, source, path, before, prior)?;
                     super::projection::note_finalizer_sealed_pending_local_predecessor_use();
                     (annotations, true)
-                } else if prior.clean_manifest_authority.is_some() {
-                    // `validate_clean_manifest_projection_authority` above has
-                    // just rebound this affine capture to the unchanged clean
-                    // head, current semantic page, exact bytes, and receiver-
-                    // local intent. Its annotations were produced by the same
-                    // capture-side replay, so rendering the predecessor again
-                    // here can add no authority; it only performs a third
-                    // parser invocation on an ordinary steady editor save.
-                    (prior.intent.annotations().to_vec(), false)
                 } else {
                     super::projection::note_finalizer_predecessor_replay_render();
                     let replay = super::projection::plan_projection_with_layout_annotations(

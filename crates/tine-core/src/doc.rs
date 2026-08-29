@@ -50,6 +50,10 @@ pub struct Document {
 pub(crate) struct ParsedDocument {
     pub(crate) document: Document,
     pub(crate) block_spans: Vec<Range<usize>>,
+    /// Whether each source-order structural event was an lsdoc-owned
+    /// unbulleted Markdown ATX heading. This stays parallel to `block_spans` so
+    /// layout retention never has to invoke the outline parser per block.
+    pub(crate) unbulleted_markdown_headings: Vec<bool>,
     /// Empty structural lines immediately before each block header, in
     /// depth-first/source order. These are document formatting, not block raw.
     pub(crate) blank_lines_before_blocks: Vec<usize>,
@@ -1008,12 +1012,10 @@ impl SerializeOpts {
                 blank_lines,
             });
             if parsed
-                .block_spans
+                .unbulleted_markdown_headings
                 .get(index)
-                .and_then(|span| source.get(span.clone()))
-                .is_some_and(|block_source| {
-                    crate::outline::markdown_unbulleted_heading_line_end(block_source).is_some()
-                })
+                .copied()
+                .unwrap_or(false)
             {
                 identity_bound_unbulleted_headings.insert(identity.block_identity.clone());
             }
@@ -1235,7 +1237,7 @@ fn emit_block(
 ) {
     let unbulleted_promoted_heading = promoted_heading_layout.is_some() && *block_index == 0;
     let unbulleted_identity_heading = identity_bound_unbulleted_headings.contains(&block.uuid)
-        && crate::outline::markdown_unbulleted_heading_line_end(&block.raw).is_some();
+        && crate::outline::markdown_atx_heading_line_end(&block.raw).is_some();
     let blank_lines = blank_lines_before_blocks
         .get(*block_index)
         .copied()
@@ -1671,15 +1673,31 @@ mod promoted_heading_tests {
     }
 
     #[test]
-    fn heading_led_markdown_admission_uses_original_and_canonical_parses_only() {
+    fn heading_led_markdown_admission_reuses_identical_canonical_parse() {
         crate::outline::reset_parse_attempts();
 
         assert!(markdown_structurally_round_trips(NESTED_SOURCE));
         assert_eq!(
             crate::outline::parse_attempts(),
-            2,
-            "heading-led admission needs only the retained original parse and canonical reparse"
+            1,
+            "an identical canonical source must reuse the exact original parse"
         );
+    }
+
+    #[test]
+    fn heading_layout_identity_uses_page_parse_events_without_per_block_outline_parses() {
+        let mut doc = parse(NESTED_SOURCE);
+        doc.roots[0].uuid = "heading-layout-identity".into();
+        let identities = layout_identities_of(&doc);
+
+        crate::outline::reset_parse_attempts();
+        let opts = SerializeOpts::detect_with_layout_identities(Some(NESTED_SOURCE), &identities);
+        assert_eq!(
+            crate::outline::parse_attempts(),
+            1,
+            "layout retention must consume heading facts from the page parse"
+        );
+        assert_eq!(serialize_with(&doc, &opts), NESTED_SOURCE);
     }
 
     #[test]

@@ -46421,6 +46421,7 @@ mod tests {
         crate::outline::start_managed_parse_census();
         drain_managed_local(&handle);
         let drain_parses = crate::outline::finish_managed_parse_census();
+        assert_eq!(drain_parses, 0, "first managed-local drain reparsed a page");
 
         let (page, revision) = load_application_exact(&handle, &selected_path);
         crate::outline::start_managed_parse_census();
@@ -46441,6 +46442,10 @@ mod tests {
         crate::outline::start_managed_parse_census();
         drain_managed_local(&handle);
         let second_drain_parses = crate::outline::finish_managed_parse_census();
+        assert_eq!(
+            second_drain_parses, 0,
+            "steady managed-local drain reparsed a page"
+        );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

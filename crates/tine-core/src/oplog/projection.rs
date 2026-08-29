@@ -4027,7 +4027,7 @@ fn mark_document_blocks(
         let end = span_marker(marker_prefix, *index, 'E');
         let start_offset = match format {
             ProjectionFormat::Markdown => {
-                crate::outline::markdown_unbulleted_heading_line_end(&block.raw).unwrap_or(0)
+                crate::outline::markdown_atx_heading_line_end(&block.raw).unwrap_or(0)
             }
             ProjectionFormat::Org => 0,
         };

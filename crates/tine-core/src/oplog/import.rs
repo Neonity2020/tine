@@ -13932,6 +13932,7 @@ mod tests {
             "  collapsed:: true\n",
             "  scheduled:: <2026-08-29 Sat>\n",
             "  - child [[Target]]\n",
+            "- ## Receipt heading\n",
         );
         let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
             "lazy-genesis-parser-schema-tripwire",
@@ -13961,13 +13962,27 @@ mod tests {
             .page(page_id)
             .unwrap()
             .unwrap();
-        let receipt = page.sqlite_receipt.expect("new baseline carries a receipt");
+        let receipt = page
+            .sqlite_receipt
+            .as_ref()
+            .expect("new baseline carries a receipt");
         assert_eq!(receipt.parser_schema_version_for_test(), 1);
+        let verified = receipt
+            .verified_payload(&page)
+            .unwrap()
+            .expect("the schema tripwire receipt verifies");
+        assert!(
+            verified
+                .blocks
+                .iter()
+                .any(|block| block.heading_level == Some(2)),
+            "the schema tripwire must exercise heading_level"
+        );
         assert_eq!(
             *receipt.semantic_digest_for_test().as_bytes(),
             [
-                195, 70, 254, 43, 127, 103, 212, 55, 33, 14, 8, 234, 94, 109, 112, 165,
-                141, 15, 218, 187, 32, 148, 129, 65, 214, 220, 61, 42, 142, 88, 130, 192,
+                90, 215, 215, 39, 130, 201, 86, 11, 239, 107, 129, 34, 193, 152, 128, 32,
+                139, 248, 210, 21, 96, 17, 230, 4, 25, 107, 167, 12, 182, 18, 141, 91,
             ],
             "a parser/materialized projection change must update this digest and explicitly bump LAZY_GENESIS_PARSER_SCHEMA_VERSION"
         );

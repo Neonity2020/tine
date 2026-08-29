@@ -69,10 +69,10 @@ independent exact-source parser-and-compare validator.
 The foreground editor lane may retain a thread-local, three-entry exact-source
 parser cache for the accepted base, requested target, and clean render base.
 Entries are byte-and-format keyed, limited to 2 MiB sources, and parser failures
-are never cached. Capture/finalization may also reuse clean predecessor
-annotations only after the clean-head and current-semantic authority has been
-revalidated in the same affine transaction. These are bounded computation
-shortcuts, not durable state or independent authority.
+are never cached. Parser-owned unbulleted-heading event facts are carried out of
+that same whole-document parse instead of invoking the outline parser once per
+block during layout retention. These are bounded computation shortcuts, not
+durable state or independent authority.
 
 Fresh activation writes only the new format. Before 0.7, experimental older
 managed state may be rebuilt from a verified complete Markdown projection. If
