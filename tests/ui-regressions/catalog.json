@@ -7764,7 +7764,7 @@
     "scenario": "codeblock.edit-rendered-layout-parity",
     "failBefore": "proven"
    },
-   "notes": "The rendered face of a whole-block code fence is .code-block: mono stack, 0.86em, line-height 1.5, padding 10px 12px, white-space pre with horizontal overflow. The editor that replaced it was the ordinary proportional 16px/26px wrapped textarea with no card, so focusing a code block re-laid every line \u2014 the 'layout jump'. The editor now presents as the SAME card while the block is code-shaped (detector: whole visible buffer is one md ```/~~~ fence or org #+BEGIN_SRC/#+BEGIN_EXAMPLE, calc excluded, mixed content excluded, unclosed fence tolerated while typing), including wrap=off so long lines scroll horizontally like the card; the buffer stays honest raw text with fences, and live transitions recompute per keystroke. Font override follows the existing --tine-editable-font precedent (.calc-wrap) because editables set font-family via an !important textarea rule. Fail-before proven causally: the component class assertions fail without the editor change, and the browser geometry harness (Chromium, deterministic screenshots) measured pre/post \u2014 wide 1120px height delta +76.1px / narrow 700px +154.1px (long line wraps into ~6 lines, no horizontal scroll, fontFamily/fontSize/lineHeight/padding all differ) \u2192 after: identical computed fonts/size/leading/padding, wrap=off, horizontal overflow, height delta 39.08px \u2248 the two fence lines at both widths; failures list empty. Numeric geometry is the evidence; final visual approval remains with the manager. Typography modes never alter code text (literal in both), so they are unaffected by design."
+   "notes": "The rendered face of a whole-block code fence is .code-block: mono stack, 0.86em, line-height 1.5, padding 10px 12px, white-space pre with horizontal overflow. The editor that replaced it was the ordinary proportional 16px/26px wrapped textarea with no card, so focusing a code block re-laid every line \u2014 the 'layout jump'. The editor now presents as the SAME card while the block is code-shaped (detector: whole visible buffer is one md ```/~~~ fence or org #+BEGIN_SRC/#+BEGIN_EXAMPLE, calc excluded, mixed content excluded, unclosed fence tolerated while typing), including wrap=off so long lines scroll horizontally like the card, and live transitions recompute per keystroke. Font override follows the existing --tine-editable-font precedent (.calc-wrap) because editables set font-family via an !important textarea rule. Fail-before proven causally: the component class assertions fail without the editor change, and the browser geometry harness (Chromium, deterministic screenshots) measured pre/post \u2014 wide 1120px height delta +76.1px / narrow 700px +154.1px (long line wraps into ~6 lines, no horizontal scroll, fontFamily/fontSize/lineHeight/padding all differ) \u2192 after: identical computed fonts/size/leading/padding, wrap=off, horizontal overflow, height delta 39.08px \u2248 the two fence lines at both widths; failures list empty. Numeric geometry is the evidence; final visual approval remains with the manager. Typography modes never alter code text (literal in both), so they are unaffected by design. UPDATE 2026-08-29 (GH #412/#413): the 'buffer stays honest raw text with fences' half of this contract is intentionally superseded by the Martin-authorized body-only code editor contract (UI-CODEBLOCK-BODY-ONLY-412 + UI-CODE-FENCE-SCAFFOLD-413): a COMPLETE whole-block wrapper's editor now shows only the payload between the wrapper lines and re-attaches the exact wrapper bytes on commit; the card presentation and live-transition halves of this row are unchanged and still enforced."
   },
   {
    "id": "UI-AUTOPAIR-DEFAULT-OG-PARITY-291",
@@ -8735,6 +8735,88 @@
     "failBefore": "unavailable"
    },
    "notes": "The focused method taps a real demo-graph block, requests the Android IME, and probes short and long rendered text with initial native long presses only—no follow-up handle drag, IME dismissal, or orientation change. It requires a non-empty textarea selection and Tine’s mobile toolbar, and receipts WindowInsets IME state. Hosted API-35 evidence is still unverified; the row stays reported rather than claiming OEM ActionMode/IME coverage."
+  },
+  {
+   "id": "UI-CODEBLOCK-BODY-ONLY-412",
+   "title": "Ctrl/Cmd+A inside a complete code-block wrapper selects exactly the payload — the first press is the native payload-only select-all and the second press escalates to the block subtree",
+   "family": "editor-selection",
+   "sources": {
+    "issues": [
+     412
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/Block.codeBodyEdit.test.tsx",
+     "src/components/Block.selectAll.test.tsx",
+     "src/editor/codeFence.test.ts",
+     "scripts/e2e-editor-interactions.mjs"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #412: inside a fenced code block Ctrl+A grabbed the fences too, so copying code always carried the backticks. With the body-only code editor contract (the shared codeBodyProjection — a pure, reversible open/body/close split for a COMPLETE whole-block md/org code wrapper, exact wrapper bytes preserved on commit), the editor surface contains only the payload, so the native first press can never reach the fences; the GH #262 second-press block-subtree escalation is unchanged. Mixed content, incomplete/malformed wrappers and ```calc keep raw editing by design (the projection returns null). Fail-before proven on base 848ae2ab: the new component tests failed (editor showed the raw fences) and the pure projection tests failed at import."
+  },
+  {
+   "id": "UI-CODE-FENCE-SCAFFOLD-413",
+   "title": "Typing three backticks opens a complete code fence scaffold (exactly three backticks, matching closing fence, interior caret), winning over generic symmetric-backtick pairing; the open code block no longer shows its fences while editing",
+   "family": "editor-typing",
+   "sources": {
+    "issues": [
+     413
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/Block.codeFenceScaffold.test.tsx",
+     "src/components/Block.codeBodyEdit.test.tsx",
+     "src/components/Block.codeFenceAutocomplete.test.tsx",
+     "src/components/Block.autopairMatrix.test.tsx",
+     "scripts/e2e-editor-interactions.mjs"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #413: with auto-pairing ON (the default), the third backtick hit the generic symmetric-pair path and stacked a FOURTH backtick, no closing fence was ever added, and once the code block opened, the fences stayed visible while editing. The third backtick of a whole-buffer fence trigger is now an explicit scaffold decision (``` then blank line then closing fence, caret inside) that runs BEFORE pairing and regardless of the pairing toggle; single inline backticks and every bracket/ref pairing are untouched, and mid-text runs keep inline behavior. With the body-only code view (the GH #412 shared contract) an open complete code block shows only its payload; the /code language picker and typed language completion keep working because the view swap waits for the picker (its query lives on the opening fence line). Fail-before proven on base 848ae2ab: scaffold assertions failed with a lone '```' raw and a four-backtick buffer, and the body-view assertions failed with fences visible."
+  },
+  {
+   "id": "UI-EMBED-ARROW-UP-EXIT-415",
+   "title": "Up arrow from the first visual row of an embed root exits the embed to the block preceding it in the host page, while all internal embed navigation stays surface-local",
+   "family": "caret-navigation",
+   "sources": {
+    "issues": [
+     415
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/Block.embedExitUp.test.tsx",
+     "src/components/Block.embedHierarchy.test.tsx",
+     "src/components/LiveRefGroup.nav.test.tsx",
+     "scripts/e2e-editor-interactions.mjs"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #415: arrow navigation inside an embed was surface-local (GH #341) but the embed ROOT had no in-surface previous block, so Up at its first row did nothing and the caret was trapped until the user reached for the mouse. LiveRefGroup now carries an EmbedNavExitContext with the embed host's block id, and Block's ArrowUp falls back — only when the scoped previous is empty — to the block preceding the embed host in the host page, mounted in the primary surface so the embed stays rendered; rows inside the embed still navigate internally (sibling tests unchanged). Fail-before proven on base 848ae2ab: the exit test failed with the editing session stuck on the embedded target."
   },
   {
    "id": "UI-PDF-GRAPH-SESSION-RESTORE-001",

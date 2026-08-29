@@ -145,7 +145,7 @@ import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
-import { codeFenceOnly } from "../editor/codeFence";
+import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
 import { seedAssetBlob } from "../assetCache";
@@ -307,6 +307,12 @@ export const CaptureCtx = createContext<CaptureApi | null>(null);
 // surfaces at once (see startEditing's surface stamping).
 export const SurfaceContext = createContext<string>("main");
 export const OutlineScopeContext = createContext<OutlineScope | null>(null);
+// GH #415: a block embed renders the target outline as a surface-local group
+// (GH #341). Up from the first visual row of the embed ROOT has no in-surface
+// destination; LiveRefGroup carries the embed's host block here so the caret
+// can exit to the host page (to the block preceding the embed there), the way
+// OG leaves the embed upward instead of trapping the caret.
+export const EmbedNavExitContext = createContext<{ hostBlockId: string } | null>(null);
 export interface CollapseSurfaceApi {
   collapsed: (id: string, stored: boolean) => boolean;
   toggle: (id: string, current: boolean) => void;
@@ -1178,6 +1184,7 @@ export function Editor(props: { id: string }): JSX.Element {
   // drives edit-focus arbitration when the same block renders in several surfaces.
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
+  const embedNavExit = useContext(EmbedNavExitContext);
   // Ref/query arrow navigation stays in the rendered result surface (GH #341),
   // while structural edits still target the source outline: a split/merge
   // destination need not remain a query or backlink result. Embeds are true
@@ -1223,9 +1230,9 @@ export function Editor(props: { id: string }): JSX.Element {
   // GH #357: the rendered face of a whole-block code fence is a mono, no-wrap,
   // padded card (.code-block). The editor was the ordinary proportional wrapped
   // textarea, so clicking a code block re-laid every line — the visible "jump".
-  // While the buffer IS code-shaped, present the editor as the same card
-  // (honest raw text, fences included). Mixed content / ```calc keep their own
-  // modes. Re-derived per keystroke so typing a fence in or out flips live.
+  // While the buffer IS code-shaped, present the editor as the same card.
+  // Mixed content / ```calc keep their own modes. Re-derived per keystroke so
+  // typing a fence in or out flips live.
   const codeEditing = createMemo(() => codeFenceOnly(editorValue(), pageFmt()) !== null);
   const editorHeadingLevel = createMemo(() => {
     const visible = editorValue();
@@ -1263,8 +1270,11 @@ export function Editor(props: { id: string }): JSX.Element {
     // unchanged, don't rewrite. Needed for org, where reattaching the hidden
     // drawer canonicalizes its position — so `next === raw` alone wouldn't catch
     // a block whose drawer wasn't already canonical, and would churn the file.
-    if (!commitAsCalc && text === editorValue()) return;
-    const visible = commitAsCalc ? serializeCalcExitCommit(text) : text;
+    if (!commitAsCalc && !codeShown() && text === editorValue()) return;
+    // For calc, `text` is the bare expressions the user sees — re-fence it.
+    // For a code wrapper it is the payload body — re-attach the exact wrapper
+    // bytes (GH #412/#413: the body-only projection is reversible).
+    const visible = commitAsCalc ? serializeCalcExitCommit(text) : codeWrapCommit(text) ?? text;
     const next = joinProps(visible, splitProps(node().raw, hideFn(), pageFmt()).hidden, pageFmt());
     // No-op commit (text that reconstructs the identical raw): don't mark the page
     // dirty or push undo — avoids churn and can't rewrite the block's bytes.
@@ -1305,6 +1315,25 @@ export function Editor(props: { id: string }): JSX.Element {
   const [ac, setAc] = createSignal<Trigger | null>(null);
   const [acItems, setAcItems] = createSignal<AcItem[]>([]);
   const [acIndex, setAcIndex] = createSignal(0);
+  // GH #412/#413: inside a COMPLETE whole-block code wrapper the editor shows
+  // only the payload between the wrapper lines (fences stay out of the editing
+  // surface, and select-all can only reach the payload); commits re-attach the
+  // exact raw wrapper bytes via the reversible projection. Mixed content,
+  // incomplete/malformed wrappers and ```calc keep their existing modes, which
+  // is why this is derived separately from the code-card presentation above
+  // (the card also covers the still-unclosed fence being typed). The
+  // code-language picker suppresses the swap while it's open: its query lives
+  // on the opening fence line, which the body-only view hides.
+  const codeShown = createMemo(() => {
+    if (ac()?.kind === "code-language") return null;
+    return codeBodyProjection(editorValue(), pageFmt());
+  });
+  // The text the editor surface commits FROM when the code buffer is live:
+  // the view shows `body`, the store keeps the exact wrapper bytes around it.
+  const codeWrapCommit = (text: string): string | null => {
+    const p = codeShown();
+    return p ? codeBodyJoin(p, text) : null;
+  };
   const [propertyValueKey, setPropertyValueKey] = createSignal<string | null>(null);
   let propertyFacets: [string, string[]][] = [];
   let acListRef: HTMLDivElement | undefined;
@@ -1638,13 +1667,18 @@ export function Editor(props: { id: string }): JSX.Element {
     // malformed fence must still commit as calc), but allow this explicit
     // completion transition without requiring blur + re-entry (GH #57).
     const enteredCalc = !editingCalc() ? calcSource(spaced.raw) : null;
+    // A completion that lands a COMPLETE code wrapper (the language pick on
+    // the opening fence line) swaps the editor to the body-only view — map the
+    // caret from raw into body space, the same transition as calc above.
+    const codeWrap = enteredCalc === null ? codeBodyProjection(spaced.raw, pageFmt()) : null;
     commit(spaced.raw);
     if (enteredCalc !== null) setEditingCalc(true);
     closeAc();
     queueMicrotask(() => {
-      const shown = enteredCalc ?? spaced.raw;
-      const openingEnd = enteredCalc !== null ? spaced.raw.indexOf("\n") + 1 : 0;
-      const shownCaret = enteredCalc !== null
+      const shown = enteredCalc ?? codeWrap?.body ?? spaced.raw;
+      const openingEnd =
+        enteredCalc !== null ? spaced.raw.indexOf("\n") + 1 : codeWrap ? codeWrap.open.length : 0;
+      const shownCaret = enteredCalc !== null || codeWrap
         ? Math.max(0, Math.min(shown.length, spaced.caret - openingEnd))
         : spaced.caret;
       ref.value = shown;
@@ -2389,7 +2423,12 @@ export function Editor(props: { id: string }): JSX.Element {
     if (want == null) {
       offset = editorValue().length;
     } else if (typeof want === "number") {
-      offset = want;
+      // Numeric targets arrive in RAW block coordinates (rendered-face click
+      // spans, raw lengths). A body-only code editor maps them through the
+      // wrapper: an opener hit snaps to the body start, a closer/trailing hit
+      // to the body end.
+      const p = codeShown();
+      offset = p ? Math.max(0, Math.min(want - p.open.length, p.body.length)) : want;
     } else {
       // Cross-block navigation: Down targets the first source line; Up targets
       // the bottom visual row. The latter uses the mounted textarea's wrapping;
@@ -2564,6 +2603,31 @@ export function Editor(props: { id: string }): JSX.Element {
       }
       if (ch === "【") {
         handled = applyFullWidthRefReplace();
+      }
+      // GH #413: the third backtick of a whole-block fence trigger is an
+      // EXPLICIT scaffold decision, not a character to pair — insert the
+      // matching closing fence and land the caret between them. This wins over
+      // the generic symmetric-backtick pairing below (which stacked a fourth
+      // backtick and never added the closer). Whole-buffer only: a `` ` `` run
+      // inside prose keeps the ordinary inline behavior. With the scaffold
+      // committed, the editor is in the body-only code view below.
+      if (
+        !handled && ch === "`" && pageFmt() === "md" &&
+        !isCalc() && codeShown() === null &&
+        ref.value === "```" && ref.selectionStart === 3
+      ) {
+        const scaffold = "```\n\n```";
+        ref.value = scaffold;
+        commit(scaffold);
+        queueMicrotask(() => {
+          const body = codeShown()?.body;
+          if (body !== undefined) ref.value = body;
+          ref.setSelectionRange(0, 0);
+          ref.focus();
+          autosize();
+          refreshAutocompleteAfterInput();
+        });
+        return;
       }
       if (!handled && autoPairing()) {
         // Opt-in general auto-pairing (brackets/quotes), which also folds in the
@@ -3169,13 +3233,16 @@ export function Editor(props: { id: string }): JSX.Element {
       // Enter. See caretInDisplayMath — a deliberate divergence from OG.
       const inMath = !isAnnot() && !inFence && caretInDisplayMath(raw, start);
       const inPageProperties = !isAnnot() && isFirstPagePropertiesBlock(raw);
+      // GH #412/#413: a body-only code editor has no fence lines in view, so
+      // `caretInFence` can't see it — gate on the projection directly.
+      const inCode = !isAnnot() && codeShown() !== null;
       // Double-Enter escape: the first Enter creates a trailing blank line; the
       // second removes that sentinel and creates a normal sibling. Keep the text
       // trim and structural insertion in one undo unit so one Undo restores the
       // exact pre-exit special block and removes the sibling.
-      if ((isCalc() || inFence || inMath || inPageProperties) && start === end) {
-        const kind = isCalc() ? "calc" : inFence ? "fence" : inMath ? "math" : "properties";
-        const trimmed = multilineExitTrim(raw, start, kind);
+      if ((isCalc() || inFence || inMath || inPageProperties || inCode) && start === end) {
+        const kind = isCalc() ? "calc" : inFence ? "fence" : inMath ? "math" : inCode ? "code" : "properties";
+        const trimmed = kind === "code" ? codeBodyExitTrim(raw, start) : multilineExitTrim(raw, start, kind);
         if (trimmed !== null) {
           e.preventDefault();
           let newId = props.id;
@@ -3202,6 +3269,12 @@ export function Editor(props: { id: string }): JSX.Element {
       // let the textarea insert the newline natively, like OG.
       if (isCalc()) return;
       e.preventDefault();
+      // Inside a body-only code editor, Enter inserts a real newline and stays
+      // in the block (same rule as the raw-fence path below it).
+      if (inCode) {
+        softNewlineCmd();
+        return;
+      }
       // Inside a fenced code block, Enter inserts a real newline and stays in the
       // block instead of splitting into a new bullet (which would break the fence
       // — GH #66). caretInFence treats a still-unterminated fence (being typed) as
@@ -3265,8 +3338,10 @@ export function Editor(props: { id: string }): JSX.Element {
         return;
       }
       if (start === 0) {
-        // Never merge a highlight or calc block away (their structure must stay).
-        if (isAnnot() || isCalc()) return;
+        // Never merge a highlight, calc, or body-only code block away (their
+        // structure must stay — the merge would smuggle raw wrapper bytes into
+        // the previous block's text).
+        if (isAnnot() || isCalc() || codeShown()) return;
         // Own-numbered state is a block property, never an in-block `1.` marker.
         // At offset zero OG removes only that property and preserves the text
         // (`src/main/frontend/handler/editor.cljs:2752-2764`, 6e7afa8eb).
@@ -3291,10 +3366,10 @@ export function Editor(props: { id: string }): JSX.Element {
       }
     } else if (e.key === "Delete" && end === start && start === raw.length) {
       // GH #213: forward-delete merges with the NEXT block — the mirror of
-      // Backspace's merge with the previous one. Never merge a highlight or
-      // calc block itself (same rule as Backspace), and never absorb an
-      // annotation/calc block's raw text into this one.
-      if (isAnnot() || isCalc()) return;
+      // Backspace's merge with the previous one. Never merge a highlight,
+      // calc, or body-only code block itself (same rule as Backspace), and
+      // never absorb an annotation/calc block's raw text into this one.
+      if (isAnnot() || isCalc() || codeShown()) return;
       const next = nextVisible(props.id, structuralScope);
       if (next) {
         const nextRaw = doc.byId[next]?.raw ?? "";
@@ -3338,6 +3413,13 @@ export function Editor(props: { id: string }): JSX.Element {
       const before = raw.slice(0, start);
       if (!before.includes("\n") && caretAtFirstRow(ref, start)) {
         let prev = prevVisible(props.id, outlineScope);
+        // GH #415: at the top of an embed ROOT there is no in-surface previous
+        // block. Exit the embed upward to the block that precedes the embed in
+        // the host page (editing the host itself would unmount the embed under
+        // the caret); the destination mounts in the primary surface, not this
+        // embed surface.
+        const exitingEmbed = !prev && embedNavExit !== null;
+        if (exitingEmbed) prev = prevVisible(embedNavExit!.hostBlockId);
         // A canonical page header is not normally an outline node. Materialize
         // its transient ordinary-editor representation only when the primary
         // page/pane caret crosses the first-body boundary; reference, embed and
@@ -3353,7 +3435,12 @@ export function Editor(props: { id: string }): JSX.Element {
           e.preventDefault();
           // Keep the caret's column on the previous block's bottom visual row.
           // Resolution happens after its textarea mounts, when wrapping is known.
-          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" }, null, navigationSurface());
+          startEditing(
+            prev,
+            { col: start - (before.lastIndexOf("\n") + 1), edge: "last" },
+            null,
+            exitingEmbed ? null : navigationSurface(),
+          );
         }
       }
     } else if (e.key === "ArrowDown" && !e.shiftKey) {
@@ -3487,6 +3574,7 @@ export function Editor(props: { id: string }): JSX.Element {
     const syntaxSensitive =
       sheetCell ||
       isCalc() ||
+      codeShown() !== null ||
       caretInFence(ref.value, start) ||
       caretOnOpeningFence(ref.value, start) ||
       caretInDisplayMath(ref.value, start);
@@ -3584,6 +3672,7 @@ export function Editor(props: { id: string }): JSX.Element {
         isPasteableUrl(url) &&
         !isPasteableUrl(ref.value.slice(start, end)) &&
         !isCalc() &&
+        codeShown() === null &&
         !caretInFence(ref.value, start) &&
         !caretOnOpeningFence(ref.value, start)
       ) {
@@ -3650,7 +3739,7 @@ export function Editor(props: { id: string }): JSX.Element {
         classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null, "code-edit": codeEditing() }}
         spellcheck={spellcheckEnabled()}
         wrap={codeEditing() ? "off" : "soft"}
-        value={isCalc() ? (calcLive() ?? "") : editorValue()}
+        value={isCalc() ? (calcLive() ?? "") : (codeShown()?.body ?? editorValue())}
         placeholder={cap?.bulletHint?.()}
         onInput={onInput}
         onCompositionStart={onCompositionStart}
