@@ -28,6 +28,7 @@ on:
           - windows
           - android
           - android-runtime
+          - android-ui-runtime
           - performance
       windows_test_name:
         description: Full Rust harness name for one exact Windows tine-core test (windows scope only)
@@ -495,6 +496,89 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: bash .github/scripts/android-managed-storage-runtime.sh
+
+  # This is a manual physical-input observation lane, not a release gate. It
+  # drives the packaged x86_64 WebView with Android MotionEvents and preserves
+  # per-method screenshots, DOM/native receipts, JUnit accounting, and logcat.
+  # A reported UI outcome remains red until its exact method passes here.
+  android-ui-runtime:
+    name: Android UI runtime / MotionEvent proof receipts
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'android-ui-runtime'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
+      - name: Install pinned Android build toolchain
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;35.0.0" \
+            "ndk;26.3.11579264" "platform-tools" >/dev/null
+          NDK="$ANDROID_SDK_ROOT/ndk/26.3.11579264"
+          for v in NDK_HOME ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_LATEST_HOME; do
+            echo "$v=$NDK" >> "$GITHUB_ENV"
+          done
+
+      - run: npm ci
+
+      - name: Pin Android identifier to page.tine.app
+        run: |
+          node -e "const f='./src-tauri/tauri.conf.json',c=require(f);c.identifier='page.tine.app';require('fs').writeFileSync(f,JSON.stringify(c,null,2)+'\n');"
+
+      - name: Build debug x86_64 app and instrumentation APKs
+        run: |
+          npx tauri android build --debug --target x86_64 --apk --ci
+          cd src-tauri/gen/android
+          ./gradlew :app:assembleUniversalDebugAndroidTest \
+            -PabiList=x86_64 -ParchList=x86_64 -PtargetList=x86_64 \
+            -x :app:rustBuildUniversalDebug -x :app:rustBuildX86_64Debug
+
+      - name: Enable KVM for the Android emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run physical Android UI MotionEvent proofs
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: default
+          emulator-boot-timeout: 300
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash .github/scripts/android-ui-runtime.sh
+        env:
+          TINE_ANDROID_UI_RUNTIME_ARTIFACT_DIR: ${{ github.workspace }}/test-results/android-ui-runtime
+
+      - name: Upload Android UI runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-ui-runtime-${{ github.sha }}
+          path: test-results/android-ui-runtime
+          if-no-files-found: error
+          retention-days: 14
 
   # Focused, signed APK proof for the frozen sync candidate. This remains outside
   # full CI: it is manually dispatched only with scope=android and never releases.

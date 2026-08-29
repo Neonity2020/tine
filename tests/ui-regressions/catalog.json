@@ -8660,6 +8660,81 @@
     "failBefore": "proven"
    },
    "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey (5/5 runs failed on it). The App.tsx sweep-listener effect used bare `() => snapshot().field` accessors inside on(), which re-run on every snapshot replacement even with unchanged values; the effect unconditionally called clearAbsenceSweeps(). Restore's completion emits runtime status events, so finishing a Restore refired the effect and closed the panel the user was looking at while transiently wiping the sweep list (instrumented capture: diag-3 store log, four identical-input refires 150ms after disposition). Fix: memoized effect inputs + rebindAbsenceSweepScope clears only on real generation changes. Fail-before is the instrumented E2E evidence; the helper unit test plus the journey's restore-action/restored-history assertions are the regression coverage."
+  },
+  {
+   "id": "UI-ANDROID-UI-RUNTIME-RESPONSIVE-205",
+   "title": "Physical Android WebView responsive chrome fits at portrait and landscape 90%–110% interface scale",
+   "family": "topbar",
+   "sources": {
+    "issues": [
+     205
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "reported",
+   "coverage": {
+    "tests": [
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent",
+     ".github/scripts/android-ui-runtime.sh"
+    ],
+    "scenario": "android-ui-runtime.responsive-chrome-motion-events",
+    "failBefore": "unavailable"
+   },
+   "notes": "The focused manual API-35 x86_64 lane resets to the real first-run demo graph, drives the packaged WebView with Android MotionEvents, and records inner/visual viewport, DPR, root zoom, topbar geometry, direct and overflow actions, free width, JUnit accounting, screenshot, DOM/native receipt, and targeted logcat. It asserts declared fit/no-clipping behavior rather than fixed screenshot pixels. The hardware-equivalent hosted emulator has not run for this branch, so #205 remains reported here; it is not evidence for every OEM WebView or display scale."
+  },
+  {
+   "id": "UI-ANDROID-UI-RUNTIME-LONG-PRESS-207",
+   "title": "Physical Android long press on a page reference opens one Page actions menu without preview, selection, or navigation",
+   "family": "page-link-gestures",
+   "sources": {
+    "issues": [
+     207
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "reported",
+   "coverage": {
+    "tests": [
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation",
+     ".github/scripts/android-ui-runtime.sh"
+    ],
+    "scenario": "android-ui-runtime.page-reference-exclusive-long-press",
+    "failBefore": "unavailable"
+   },
+   "notes": "The manual native method installs a DOM mutation trace, sends one Android ACTION_DOWN/long-press/ACTION_UP sequence to a rendered demo-graph page reference, and fails unless exactly one Page actions menu remains while preview count, selection text, and route stay unchanged. Its receipt is retained even on failure so a flash-and-disappear cannot be counted green. No hosted result exists for this branch, and the emulator result must not be substituted for the reporter's OEM outcome."
+  },
+  {
+   "id": "UI-ANDROID-UI-RUNTIME-INITIAL-SELECTION-375",
+   "title": "Physical Android initial long-press selection keeps IME and exposes Tine’s mobile formatting toolbar",
+   "family": "mobile-editing",
+   "sources": {
+    "issues": [
+     375
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "reported",
+   "coverage": {
+    "tests": [
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement",
+     ".github/scripts/android-ui-runtime.sh"
+    ],
+    "scenario": "android-ui-runtime.initial-native-selection-toolbar",
+    "failBefore": "unavailable"
+   },
+   "notes": "The focused method taps a real demo-graph block, requests the Android IME, and probes short and long rendered text with initial native long presses only—no follow-up handle drag, IME dismissal, or orientation change. It requires a non-empty textarea selection and Tine’s mobile toolbar, and receipts WindowInsets IME state. Hosted API-35 evidence is still unverified; the row stays reported rather than claiming OEM ActionMode/IME coverage."
   }
  ]
 }

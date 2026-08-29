@@ -13,7 +13,7 @@ The frozen release candidate receives the exhaustive pass.
 | Docs/image-only pull request | No app CI | Avoid runner work for prose and image-only changes. A Flatpak/website metadata PR still gets its path-specific lightweight validator. |
 | Push to `master` | No app test/build workflow | Merging does not repeat CI after the reviewed commit. Website pushes may still deploy Pages; issue automation is separate from app CI. |
 | Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards, Windows compile-all `tine-core` targets + contract-selected cross-layer integration smoke, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence against the certified `tine-storage` pin. |
-| Manual `ci`, focused scope | Only `windows`, `android`, or `performance` | Platform/performance proof while developing relevant changes. A focused run never satisfies the release gate. |
+| Manual `ci`, focused scope | Only `windows`, `android`, `android-runtime`, `android-ui-runtime`, or `performance` | Platform/performance proof while developing relevant changes. A focused run never satisfies the release gate. |
 | Manual `ui-e2e` | Complete or scenario-focused Linux/Windows real-app proof | UI/harness debugging between releases without starting ordinary full CI. |
 | Manual `Flatpak build test` | Real offline Flatpak build | Focused packaging proof. The release workflow calls the same workflow as a hard gate. |
 | Manual `release`, `mode=build` | Exact-SHA CI evidence check, release preflight, real Flatpak, desktop/Android packages, release E2E, candidate assembly | Expensive release proof. It fails before packaging if the exact candidate lacks successful full CI evidence. With `publish=false` it creates an immutable private candidate and receipt. |
@@ -131,8 +131,19 @@ not a quiet gate expansion during a release.
 - Run focused local tests while editing and the affected behavior family's
   real-app proof before integration when relevant.
 - Dispatch `ui-e2e` for Linux/Windows harness or native UI changes.
-- Dispatch manual `ci` with `scope=windows`, `scope=android`, or
-  `scope=performance` when that platform boundary is the thing being changed.
+- Dispatch manual `ci` with `scope=windows`, `scope=android`,
+  `scope=android-runtime`, `scope=android-ui-runtime`, or `scope=performance`
+  when that platform boundary is the thing being changed.
+- `scope=android-ui-runtime` is the manual API-35 x86_64 Android WebView lane
+  for the #205 responsive-chrome, #207 page-reference long-press, and #375
+  initial-native-selection journeys. It uses instrumentation-injected
+  MotionEvents and runs each method in a fresh app/WebView lifetime. The
+  artifact retains exact app/device/WebView identity, JUnit accounting,
+  screenshot, DOM/native JSON receipt, and targeted logcat even when a method
+  is red. It asserts semantic fit/menu/selection outcomes rather than fixed
+  screenshot pixels; it is hardware-equivalent evidence only, not OEM WebView
+  or IME coverage. A red or unrun method remains unverified and cannot support
+  a release or public fixed claim.
 - The frozen `scope=full` release gate includes the Android app-UID managed
   activation, crash-recovery, sharing, clean-shutdown, and reopen journey.
 - Dispatch the Flatpak workflow for offline packaging changes.
