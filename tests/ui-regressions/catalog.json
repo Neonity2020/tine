@@ -523,7 +523,7 @@
     "scenario": "topbar.responsive-workspace-overflow",
     "failBefore": "proven"
    },
-   "notes": "GH #205. The full workspace label moved from the no-wrap toolbar to a sidebar header; the toolbar retains only a compact W fallback when that sidebar is not mounted. A topbar inline-size container query keeps sidebar, search, Settings, and native window controls visible while calendar, journals, theme, right sidebar, and history actions use one transient-layer overflow menu below the available-width threshold. Follow-up (2026-07-21, reporter Louis-15): Back/Forward gained a higher-priority tier and remain inline until the 300px floor. Follow-up (2026-08-27, Martin): the 460px desktop threshold still hid four frequent actions on a 390px Android toolbar even though no custom window controls occupied the row. Fit is now conditional on the real cluster: frameless desktop windows retain the 460px content-box tier because they carry Minimize/Maximize/Close, while phone/system-frame toolbars keep all actions through a measured 345px content-box floor (390px viewport including padding). Chromium geometry proves no clipping and the expected direct/overflow sets at 900, system-frame 440, phone 390, custom-frame 440, 360, and 280px. The topbar also retains position:relative; z-index:45 as stacking hardening for a reporter-only Windows transparent-dropdown report that does NOT reproduce in Chromium \u2014 not a claimed fix."
+   "notes": "GH #205. The full workspace label moved from the no-wrap toolbar to a sidebar header; the toolbar retains only a compact W fallback when that sidebar is not mounted. A topbar inline-size container query keeps sidebar, search, Settings, and native window controls visible while lower-priority actions use one transient-layer overflow menu. Follow-up (2026-07-21, reporter Louis-15): Back/Forward gained a higher-priority tier and remain inline until the 300px floor. Follow-up (2026-08-28, reporter Louis-15): the frequently used right-sidebar action now has its own priority tier, stays direct after calendar/journals/theme collapse, and joins overflow only below the measured 250px last-resort content-box floor. Frameless desktop windows still collapse it with other optional actions at 460px because Minimize/Maximize/Close occupy the row. Chromium geometry proves no clipping, duplication, or missing action across 900, system-frame 440, phone 390, custom-frame 440, 360, 280, and 240px. The topbar also retains position:relative; z-index:45 as stacking hardening for a reporter-only Windows transparent-dropdown report that does NOT reproduce in Chromium \u2014 not a claimed fix."
   },
   {
    "id": "UI-TOPBAR-OVERFLOW-OUTSIDE-DISMISS-205",
@@ -572,6 +572,32 @@
     "scenario": "references.livrefgroup-collapse-prune-bound",
     "failBefore": "proven"
    }
+  },
+  {
+   "id": "UI-ANDROID-SYSTEM-INSET-OWNERSHIP-205",
+   "title": "Android reserves each system-bar inset exactly once, leaving the Tine topbar adjacent to the status-bar boundary without overlap or wasted space",
+   "family": "android-layout",
+   "sources": {
+    "issues": [
+     205
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/mobileSafeArea.test.ts",
+     "src/systemInsets.test.ts",
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt"
+    ],
+    "scenario": "android.system-inset-single-owner",
+    "failBefore": "proven"
+   },
+   "notes": "GH #205 physical-device follow-up (Martin, 2026-08-29). The exact signed 1fa7fef7 APK passed sidebar priority, overflow actions, rotations, 90/100/110 percent scale, and tap routing, but a physical Android screenshot showed approximately one additional status-bar-sized blank band above Tine's topbar. The native Activity already insets the WebView while app.css independently consumes CSS safe-area env() values; WebView 124 on the hosted API-35 emulator reports those CSS values as zero, masking the overlap, while an OEM WebView may expose them. Android therefore names the native viewport as the sole system-inset owner and zeros the centralized CSS tokens; browser/iOS CSS safe-area behavior remains unchanged. Exact pixel size is flexible: the blocking outcomes are no system-bar overlap and no second reserved inset."
   },
   {
    "id": "UI-PAGE-ACTIONS-MENU-002",
@@ -8748,7 +8774,7 @@
     "android"
    ],
    "layer": "native",
-   "status": "reported",
+   "status": "fixing",
    "coverage": {
     "tests": [
      "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent",
@@ -8757,7 +8783,7 @@
     "scenario": "android-ui-runtime.responsive-chrome-motion-events",
     "failBefore": "proven"
    },
-   "notes": "The focused manual API-35 x86_64 lane resets to the real first-run demo graph, drives the packaged WebView with Android MotionEvents, and records inner/visual viewport, DPR, root zoom, topbar geometry, direct and overflow actions, free width, JUnit accounting, screenshot, DOM/native receipt, and targeted logcat. Hosted run 33251907222 produced six non-vacuous geometry samples with no clipping, but the visible portrait overflow control ignored the native tap at root zoom 1.0, 0.9, and 1.1; landscape fit remained clean. This is a product failure, not evidence for every OEM WebView or display scale."
+   "notes": "The focused manual API-35 x86_64 lane resets to the real first-run demo graph, drives the packaged WebView with Android MotionEvents, and records responsive/native geometry plus durable evidence. The reporter's approximately 360-CSS-pixel phone is encoded as a distinct priority tier: calendar, journals, and theme may overflow while the requested right-sidebar action remains one tap away; only a last-resort 250px content box may move it into overflow. Android edge-to-edge handling must also keep the WebView inside actual system-bar and display-cutout insets without consuming descendant IME insets. The isolated extraction must rerun this method on its exact candidate; prior broad UI-02 runs are discovery evidence only and do not certify this branch or every OEM WebView/display scale."
   },
   {
    "id": "UI-ANDROID-UI-RUNTIME-LONG-PRESS-207",

@@ -82,10 +82,12 @@ class AndroidUiRuntimeTest {
           // than using a test-only component or desktop-width substitute.
           setRootZoom(webView, scale)
           val receipt = measureChrome(webView)
+          val nativeViewport = nativeViewportState(webView)
           receipt.put("journey", "205-responsive-chrome")
           receipt.put("requestedOrientation", orientationName)
           receipt.put("orientation", currentOrientation(scenario))
           receipt.put("requestedRootZoom", scale)
+          receipt.put("nativeViewport", nativeViewport)
           receipts.put(receipt)
 
           val clipped = receipt.optJSONArray("clipped") ?: JSONArray()
@@ -93,8 +95,12 @@ class AndroidUiRuntimeTest {
           val containerWidth = receipt.optDouble("containerWidth", Double.NaN)
           val navigationCount = receipt.optJSONArray("directNavigation")?.length() ?: -1
           val optionalCount = receipt.optJSONArray("directOptional")?.length() ?: -1
+          val sidebarDirect = receipt.optBoolean("directRightSidebar")
           val overflowVisible = receipt.optBoolean("overflowVisible")
           val winControls = receipt.optBoolean("winControls")
+          val systemInsetsOwner = receipt.optString("systemInsetsOwner")
+          val appPadding = receipt.optJSONObject("appPadding") ?: JSONObject()
+          val topbar = receipt.optJSONObject("topbar") ?: JSONObject()
           val viewport = receipt.optJSONObject("viewport")
           val viewportWidth = viewport?.optDouble("innerWidth", Double.NaN) ?: Double.NaN
           val viewportHeight = viewport?.optDouble("innerHeight", Double.NaN) ?: Double.NaN
@@ -112,14 +118,30 @@ class AndroidUiRuntimeTest {
           if (winControls) {
             fitFailures += "$orientationName scale=$scale Android unexpectedly rendered desktop window controls"
           }
+          if (abs(nativeViewport.optInt("webViewTop") - nativeViewport.optInt("statusBarTop")) > NATIVE_INSET_TOLERANCE_PX) {
+            fitFailures += "$orientationName scale=$scale WebView top ${nativeViewport.optInt("webViewTop")} did not meet status inset ${nativeViewport.optInt("statusBarTop")}"
+          }
+          if (systemInsetsOwner != "native-viewport") {
+            fitFailures += "$orientationName scale=$scale Android system inset owner was '$systemInsetsOwner'"
+          }
+          val cssInsetValues = listOf("top", "right", "bottom", "left").map { appPadding.optDouble(it, Double.NaN) }
+          if (cssInsetValues.any { !it.isFinite() || abs(it) > CSS_INSET_TOLERANCE_PX }) {
+            fitFailures += "$orientationName scale=$scale native-owned app padding was $appPadding"
+          }
+          val topbarTop = topbar.optDouble("top", Double.NaN)
+          if (!topbarTop.isFinite() || abs(topbarTop) > CSS_INSET_TOLERANCE_PX) {
+            fitFailures += "$orientationName scale=$scale topbar began at $topbarTop inside the already-inset WebView"
+          }
           if (!containerWidth.isFinite()) {
             fitFailures += "$orientationName scale=$scale did not report a container width"
           } else {
-            val expectOptional = if (containerWidth <= OPTIONAL_ACTION_FLOOR_PX) 0 else 4
+            val expectOptional = if (containerWidth <= OPTIONAL_ACTION_FLOOR_PX) 0 else 3
             val expectNavigation = if (containerWidth <= NAVIGATION_ACTION_FLOOR_PX) 0 else 2
             val expectOverflow = containerWidth <= OPTIONAL_ACTION_FLOOR_PX
-            if (optionalCount != expectOptional || navigationCount != expectNavigation || overflowVisible != expectOverflow) {
-              fitFailures += "$orientationName scale=$scale width=$containerWidth expected optional=$expectOptional navigation=$expectNavigation overflow=$expectOverflow, observed optional=$optionalCount navigation=$navigationCount overflow=$overflowVisible"
+            val expectSidebarDirect = containerWidth > RIGHT_SIDEBAR_FLOOR_PX
+            if (optionalCount != expectOptional || navigationCount != expectNavigation ||
+              sidebarDirect != expectSidebarDirect || overflowVisible != expectOverflow) {
+              fitFailures += "$orientationName scale=$scale width=$containerWidth expected optional=$expectOptional navigation=$expectNavigation sidebar=$expectSidebarDirect overflow=$expectOverflow, observed optional=$optionalCount navigation=$navigationCount sidebar=$sidebarDirect overflow=$overflowVisible"
             }
           }
 
@@ -138,11 +160,9 @@ class AndroidUiRuntimeTest {
             }
             val opened = measureChrome(webView)
             val openedActions = jsonStrings(opened.optJSONArray("visibleOverflowActions"))
-            val expectedActions = if (containerWidth <= NAVIGATION_ACTION_FLOOR_PX) {
-              listOf("calendar", "journals", "theme", "right-sidebar", "back", "forward")
-            } else {
-              listOf("calendar", "journals", "theme", "right-sidebar")
-            }
+            val expectedActions = mutableListOf("calendar", "journals", "theme")
+            if (containerWidth <= RIGHT_SIDEBAR_FLOOR_PX) expectedActions += "right-sidebar"
+            if (containerWidth <= NAVIGATION_ACTION_FLOOR_PX) expectedActions += listOf("back", "forward")
             receipt.put("openedOverflowActions", JSONArray(openedActions))
             if (openedActions != expectedActions) {
               fitFailures += "$orientationName scale=$scale width=$containerWidth expected overflow=$expectedActions observed=$openedActions"
@@ -445,7 +465,9 @@ class AndroidUiRuntimeTest {
         const style = getComputedStyle(element);
         if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return null;
         return JSON.stringify({ left: rect.left, top: rect.top, width: rect.width, height: rect.height,
-          viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, dpr: window.devicePixelRatio });
+          viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+          rootZoom: parseFloat(getComputedStyle(document.documentElement).zoom) || 1,
+          dpr: window.devicePixelRatio });
       })()
     """.trimIndent()
     return evaluateJsonOrNull(webView, expression)
@@ -616,9 +638,13 @@ class AndroidUiRuntimeTest {
   private fun motionPoint(webView: WebView, rect: JSONObject, cssX: Double, cssY: Double): Pair<Float, Float> {
     val viewportWidth = rect.getDouble("viewportWidth")
     val viewportHeight = rect.getDouble("viewportHeight")
-    val x = (cssX * webView.width / viewportWidth)
+    // CSS root zoom changes getBoundingClientRect's coordinate space without
+    // changing window.innerWidth. Convert back to the physical viewport before
+    // injecting; omission previously turned a zoomed overflow tap into Settings.
+    val rootZoom = rect.optDouble("rootZoom", 1.0)
+    val x = (cssX * rootZoom * webView.width / viewportWidth)
       .coerceIn(1.0, (webView.width - 1).toDouble())
-    val y = (cssY * webView.height / viewportHeight)
+    val y = (cssY * rootZoom * webView.height / viewportHeight)
       .coerceIn(1.0, (webView.height - 1).toDouble())
     return x.toFloat() to y.toFloat()
   }
@@ -631,16 +657,21 @@ class AndroidUiRuntimeTest {
       located.countDown()
     }
     assertTrue("packaged WebView screen location was unavailable", located.await(EVALUATE_TIMEOUT_MS, TimeUnit.MILLISECONDS))
-    val event = MotionEvent.obtain(
-      downTime,
-      SystemClock.uptimeMillis(),
-      action,
-      location[0] + x,
-      location[1] + y,
-      0,
-    ).apply {
-      source = InputDevice.SOURCE_TOUCHSCREEN
+    val pointer = MotionEvent.PointerProperties().apply {
+      id = 0
+      toolType = MotionEvent.TOOL_TYPE_FINGER
     }
+    val coordinates = MotionEvent.PointerCoords().apply {
+      this.x = location[0] + x
+      this.y = location[1] + y
+      pressure = if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) 0f else 1f
+      size = 1f
+    }
+    val event = MotionEvent.obtain(
+      downTime, SystemClock.uptimeMillis(), action, 1,
+      arrayOf(pointer), arrayOf(coordinates), 0, 0, 1f, 1f,
+      0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0,
+    )
     try {
       assertTrue(
         "Android UiAutomation did not inject the native MotionEvent",
@@ -741,6 +772,28 @@ class AndroidUiRuntimeTest {
     })()
   """.trimIndent())
 
+  private fun nativeViewportState(webView: WebView): JSONObject {
+    val observed = AtomicReference<JSONObject>()
+    val latch = CountDownLatch(1)
+    webView.post {
+      val location = IntArray(2)
+      webView.getLocationOnScreen(location)
+      val rootInsets = webView.rootWindowInsets
+      val status = rootInsets?.getInsets(WindowInsets.Type.statusBars())
+      val navigation = rootInsets?.getInsets(WindowInsets.Type.navigationBars())
+      observed.set(JSONObject()
+        .put("webViewLeft", location[0])
+        .put("webViewTop", location[1])
+        .put("webViewWidth", webView.width)
+        .put("webViewHeight", webView.height)
+        .put("statusBarTop", status?.top ?: 0)
+        .put("navigationBarBottom", navigation?.bottom ?: 0))
+      latch.countDown()
+    }
+    assertTrue("native WebView geometry was unavailable", latch.await(EVALUATE_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+    return checkNotNull(observed.get())
+  }
+
   private fun measureChrome(webView: WebView): JSONObject = evaluateJson(webView, """
     (() => {
       const visible = (element) => {
@@ -752,6 +805,8 @@ class AndroidUiRuntimeTest {
       if (!topbar) return null;
       const bar = topbar.getBoundingClientRect();
       const topbarStyle = getComputedStyle(topbar);
+      const app = document.querySelector('.app-container');
+      const appStyle = app ? getComputedStyle(app) : null;
       // Popover menu buttons are descendants of the topbar component but are
       // not occupants of its direct row. Including them made the free-space
       // measurement circular whenever the menu was open.
@@ -759,6 +814,7 @@ class AndroidUiRuntimeTest {
         .filter((button) => !button.closest('.topbar-overflow-menu') && visible(button));
       const navigation = [...topbar.querySelectorAll('.topbar-navigation-action')].filter(visible);
       const optional = [...topbar.querySelectorAll('.topbar-optional-action')].filter(visible);
+      const sidebar = topbar.querySelector('.topbar-sidebar-action');
       const overflowTrigger = topbar.querySelector('[data-topbar-overflow-trigger]');
       const overflowMenu = topbar.querySelector('.topbar-overflow-menu');
       const clipped = direct
@@ -777,12 +833,20 @@ class AndroidUiRuntimeTest {
         // Container queries use the content box. `width` is border-box here
         // because of the global box-sizing rule, so subtract the real padding.
         containerWidth: topbar.clientWidth - parseFloat(topbarStyle.paddingLeft) - parseFloat(topbarStyle.paddingRight),
-        topbar: { left: bar.left, right: bar.right, width: bar.width, height: bar.height },
+        topbar: { left: bar.left, top: bar.top, right: bar.right, width: bar.width, height: bar.height },
+        systemInsetsOwner: document.documentElement.dataset.systemInsets || '',
+        appPadding: appStyle ? {
+          top: parseFloat(appStyle.paddingTop),
+          right: parseFloat(appStyle.paddingRight),
+          bottom: parseFloat(appStyle.paddingBottom),
+          left: parseFloat(appStyle.paddingLeft),
+        } : null,
         winControls: !!topbar.querySelector('.win-controls'),
         overflowVisible: !!overflowTrigger && visible(overflowTrigger),
         overflowMenuVisible: !!overflowMenu && visible(overflowMenu),
         directNavigation: navigation.map((button) => button.getAttribute('aria-label') || button.title || ''),
         directOptional: optional.map((button) => button.getAttribute('aria-label') || button.title || ''),
+        directRightSidebar: !!sidebar && visible(sidebar),
         directActions: direct.map((button) => {
           const rect = button.getBoundingClientRect();
           return {
@@ -955,5 +1019,8 @@ class AndroidUiRuntimeTest {
     const val SWIPE_SETTLE_MS = 320L
     const val OPTIONAL_ACTION_FLOOR_PX = 345.0
     const val NAVIGATION_ACTION_FLOOR_PX = 300.0
+    const val RIGHT_SIDEBAR_FLOOR_PX = 250.0
+    const val NATIVE_INSET_TOLERANCE_PX = 1
+    const val CSS_INSET_TOLERANCE_PX = 0.5
   }
 }

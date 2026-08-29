@@ -29,6 +29,7 @@ on:
           - android
           - android-runtime
           - android-ui-runtime
+          - android-ui-runtime-205
           - performance
       windows_test_name:
         description: Full Rust harness name for one exact Windows tine-core test (windows scope only)
@@ -503,7 +504,7 @@ jobs:
   # A reported UI outcome remains red until its exact method passes here.
   android-ui-runtime:
     name: Android UI runtime / MotionEvent proof receipts
-    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'android-ui-runtime'
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -570,6 +571,7 @@ jobs:
           script: bash .github/scripts/android-ui-runtime.sh
         env:
           TINE_ANDROID_UI_RUNTIME_ARTIFACT_DIR: ${{ github.workspace }}/test-results/android-ui-runtime
+          TINE_ANDROID_UI_RUNTIME_ONLY: ${{ inputs.scope == 'android-ui-runtime-205' && '205' || '' }}
 
       - name: Upload Android UI runtime evidence
         if: always()

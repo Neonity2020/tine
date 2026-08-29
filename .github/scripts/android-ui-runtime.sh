@@ -78,14 +78,17 @@ run_journey() {
   # single logcat line). Debug instrumentation permits run-as without exposing
   # any user graph or host filesystem data.
   adb exec-out run-as page.tine.app cat "files/android-ui-runtime/$method.json" > "$receipt_file" || true
-  if ! adb exec-out run-as page.tine.app cat "files/android-ui-runtime/$method.failure.json" > "$failure_file"; then
+  if ! adb exec-out run-as page.tine.app cat "files/android-ui-runtime/$method.failure.json" > "$failure_file" 2>/dev/null ||
+    ! jq -e . "$failure_file" >/dev/null 2>&1; then
     rm -f "$failure_file"
   fi
   grep -F 'TINE_ANDROID_UI_RUNTIME_RECEIPT ' "$runner_log" > "$receipts" || true
   png_signature="$(od -An -tx1 -N8 "$screenshot_file" 2>/dev/null | tr -d ' \n')"
 
   started="$(grep -Eo 'run started: [0-9]+ tests?' "$runner_log" | grep -Eo '[0-9]+' | tail -1 || true)"
-  finished="$(grep -c 'TestRunner.*finished: ' "$runner_log" || true)"
+  # Count this method's per-test completion, not TestRunner's separate
+  # `run finished: 1 tests` summary line.
+  finished="$(grep -cF "finished: $method" "$runner_log" || true)"
   failed="$(grep -c 'TestRunner.*failed: ' "$runner_log" || true)"
   {
     printf 'method=%s\n' "$method"
@@ -110,11 +113,17 @@ run_journey() {
   fi
 }
 
-overall=0
-for method in \
+methods=(
   responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent \
   longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation \
-  initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement; do
+  initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement
+)
+if [[ "${TINE_ANDROID_UI_RUNTIME_ONLY:-}" == "205" ]]; then
+  methods=(responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent)
+fi
+
+overall=0
+for method in "${methods[@]}"; do
   if ! run_journey "$method"; then
     overall=1
   fi
