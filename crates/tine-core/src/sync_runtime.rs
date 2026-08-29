@@ -36027,9 +36027,20 @@ mod tests {
             1,
             "only initialize's top-level namespace creation is bootstrap"
         );
-        assert!(initialize.contains(
-            "open_receipt_namespaces(\n            capability,\n            store_id,\n            ReceiptDirectoryDurability::PrePromotionBootstrap"
-        ));
+        assert_eq!(
+            initialize
+                .matches("ReceiptDirectoryDurability::PrePromotionBootstrap")
+                .count(),
+            1,
+            "the empty-store namespace opener must select bootstrap durability"
+        );
+        assert_eq!(
+            initialize
+                .matches("ReceiptDirectoryDurability::PromotedAuthority")
+                .count(),
+            1,
+            "the claimed-store namespace opener must select promoted durability"
+        );
         assert!(
             !source[initialize_end..].contains("publish_bootstrap_immutable_exact("),
             "promoted receipt operations must use the strict publisher"

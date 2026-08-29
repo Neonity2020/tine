@@ -1600,7 +1600,7 @@ and every projection directory barrier passes through it:
 
 | Class | What it covers | Policy |
 | --- | --- | --- |
-| `PrivateDurableAuthority` | The oplog manifest, object archive, local journal and receipt store below app-private storage — and graph-tree artifacts the graph is the **sole** authority for: conflict copies, trash, withdrawn bytes, assets. | Strict on **every** platform, Android included. A barrier the filesystem refuses is a real durability failure. |
+| `PrivateDurableAuthority` | The oplog manifest, object archive, local journal and promoted/operational receipt store below app-private storage — and graph-tree artifacts the graph is the **sole** authority for: conflict copies, trash, withdrawn bytes, assets. | Strict on **every** platform, Android included. A barrier the filesystem refuses is a real durability failure. The empty receipt-store initialization exception is confined to §2.10c. |
 | `SharedReconstructibleProjection` | The Markdown/Org projection of an already-accepted manifest into the user's graph tree. | Strict everywhere except Android. On Android only, and only for `PermissionDenied`/`Unsupported`/`InvalidInput` (`EPERM`/`ENOTSUP`/`EINVAL`), the barrier **degrades**. Every other errno stays fatal. |
 
 The crash story for the degraded case still holds: the projection is derived
@@ -2104,7 +2104,10 @@ without letting that setup exception leak into retained receiver authority.
 On a device that permits exact app-private writes but persistently refuses
 directory fsync, setup can still complete because its empty structure is
 reconstructible, but the first operational receipt refuses: managed storage is
-not usable without durability for its private authority.
+not usable without durability for its private authority. A promoted store that
+has lost only its nested empty pending-cleanup initialization structure also
+rebuilds that structure strictly and may refuse during open; it never discards
+or silently reconstructs operational receipt authority.
 
 Before an enrollment binding exists, the empty receipt store's initialization
 artifacts are reconstructible bootstrap state rather than authority; no

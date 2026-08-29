@@ -269,15 +269,13 @@ fn android_receipt_directory_identity(
 /// A strict receipt barrier can refuse after the namespace mutation became
 /// visible. Remember that exact parent within this process so only its next
 /// idempotent retry re-establishes durability; ordinary existing-name reads do
-/// not pay an extra device round trip. See storage-sync-contract.md §2.10a.
+/// not pay an extra device round trip. See storage-sync-contract.md §2.10c.
 #[cfg(target_os = "android")]
 fn sync_promoted_receipt_directory(directory: &Dir) -> Result<(), StoreError> {
     let identity = android_receipt_directory_identity(directory)?;
-    let mut debts = android_receipt_barrier_debts().lock().map_err(|_| {
-        StoreError::Io(io::Error::other(
-            "Android receipt barrier debt lock poisoned",
-        ))
-    })?;
+    let mut debts = android_receipt_barrier_debts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match sync_dir_required(directory) {
         Ok(()) => {
             debts.remove(&identity);
@@ -293,11 +291,9 @@ fn sync_promoted_receipt_directory(directory: &Dir) -> Result<(), StoreError> {
 #[cfg(target_os = "android")]
 fn retry_promoted_receipt_barrier_if_needed(directory: &Dir) -> Result<(), StoreError> {
     let identity = android_receipt_directory_identity(directory)?;
-    let mut debts = android_receipt_barrier_debts().lock().map_err(|_| {
-        StoreError::Io(io::Error::other(
-            "Android receipt barrier debt lock poisoned",
-        ))
-    })?;
+    let mut debts = android_receipt_barrier_debts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !debts.contains(&identity) {
         return Ok(());
     }
@@ -2997,7 +2993,7 @@ impl ProjectionReceiptStore {
                 // directory entry became visible. A create/recovery retry must
                 // complete that barrier before accepting the existing name;
                 // read-only inspection does not mutate and pays no barrier.
-                // See storage-sync-contract.md §2.10a.
+                // See storage-sync-contract.md §2.10c.
                 #[cfg(target_os = "android")]
                 if create {
                     retry_promoted_receipt_barrier_if_needed(&parent)?;
@@ -4245,6 +4241,9 @@ fn open_pending_cleanup_namespace(
     let initializing = existing.is_none();
     if initializing {
         match open_dir_nofollow(forensics, PENDING_CLEANUP_DIR) {
+            // If a prior create made the name visible before its barrier
+            // refused, the authority publication below synchronizes this same
+            // parent before initialization can succeed.
             Ok(_) => {}
             Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                 ensure_directory_nofollow_with_durability(
@@ -4312,6 +4311,8 @@ fn initialize_pending_cleanup_rounds(
         validate_pending_cleanup_round_root(namespace, false)?;
         for name in PENDING_CLEANUP_ROUND_DIRS {
             match open_dir_nofollow(namespace, name) {
+                // The round-state publication below synchronizes this same
+                // parent, including any existing name left by a refused create.
                 Ok(_) => {}
                 Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                     ensure_directory_nofollow_with_durability(namespace, name, durability)?;
