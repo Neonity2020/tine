@@ -66,6 +66,7 @@ import type {
 import { measureIssue248Async } from "./issue248Probe";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
+import { recordGraphOpenCommand } from "./graphOpenTrace";
 
 // Encode asset bytes as one base64 string for the save_*/copy_image IPC. The old
 // `Array.from(bytes)` produced a JSON number[] — ~4-5x the payload + a multi-MB
@@ -918,10 +919,12 @@ class TauriBackend implements Backend {
       result = await this.invoke<T>(cmd, leasedArgs);
     } catch (error) {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
+      recordGraphOpenCommand(cmd, started, "failed");
       reportPhase("failed", performance.now() - started);
       throw error;
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
+    recordGraphOpenCommand(cmd, started, "completed");
     if (slow) reportPhase("completed", performance.now() - started);
     // A command that makes the core REBIND — `refresh_graph` installs a fresh
     // `Graph`, with a fresh (empty) editor-activation registry — must announce

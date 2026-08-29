@@ -22,6 +22,7 @@ import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwn
 import { openConfiguredHomePage } from "./homePage";
 import { safeManagedErrorDetail } from "./managedDiagnostics";
 import type { PersistedPdfTarget } from "./uiStateRegistry";
+import { beginGraphOpenTrace, markGraphOpen } from "./graphOpenTrace";
 
 const GRAPH_KEY = "tine.graphPath";
 export const PARTIAL_PROVIDER_REFUSAL =
@@ -92,6 +93,7 @@ export async function loadGraphPath(
     supersedeCurrent?: boolean;
   } = {}
 ): Promise<LoadGraphPathOutcome> {
+  beginGraphOpenTrace();
   const startedAt = performance.now();
   let graphPath = path;
   const ownsTransition = !options.transitionHeld;
@@ -185,6 +187,7 @@ export async function loadGraphPath(
   }
   if (continuation !== graphLoadContinuation) return { kind: "aborted" };
   console.info(`[tine] frontend graph open: native binding ready at ${Math.round(performance.now() - startedAt)} ms`);
+  markGraphOpen("native_binding_ready");
   if (result.kind === "focused_existing") {
     if (rebindsPdfOwner && prev) {
       activatePdfOwnership(prev);
@@ -263,6 +266,7 @@ export async function loadGraphPath(
     await restoreSession();
   }
   console.info(`[tine] frontend graph open: session restored at ${Math.round(performance.now() - startedAt)} ms`);
+  markGraphOpen("session_restored");
   // GH #245: a configured home page wins over the ordinary landing on an
   // ordinary open (first bind or graph switch) — not on a same-graph reload /
   // watcher refresh. Later explicit intents (quick capture, deep link) still
@@ -277,6 +281,7 @@ export async function loadGraphPath(
     );
   }
   console.info(`[tine] frontend graph open: interactive at ${Math.round(performance.now() - startedAt)} ms`);
+  markGraphOpen("interactive");
   return { kind: result.kind, root: meta.root };
   } finally {
     if (ownsTransition && continuation === graphLoadContinuation) {

@@ -6682,10 +6682,43 @@ impl Drop for ColdOpenLocalCompletionGuard {
     }
 }
 
+/// Opt-in, content-free decomposition of the clean managed cold-open path.
+/// The ordinary progress API deliberately stays coarse; this trace exists for
+/// directed `TINE_DEBUG=1` performance diagnosis and never carries paths,
+/// identities, names, content, or authority.
+struct CleanOpenStageTrace {
+    started: Option<Instant>,
+    previous: Option<Instant>,
+}
+
+impl CleanOpenStageTrace {
+    fn new() -> Self {
+        let started = runtime_debug_diagnostics_enabled().then(Instant::now);
+        Self {
+            started,
+            previous: started,
+        }
+    }
+
+    fn phase(&mut self, phase: &'static str) {
+        let (Some(started), Some(previous)) = (self.started, self.previous) else {
+            return;
+        };
+        let now = Instant::now();
+        eprintln!(
+            "[tine] managed clean open stage: {phase}; phase_ms={}; total_ms={}",
+            now.duration_since(previous).as_millis(),
+            now.duration_since(started).as_millis(),
+        );
+        self.previous = Some(now);
+    }
+}
+
 fn open_clean_runtime_resources_with_progress(
     request: &SyncRuntimeOpenRequest,
     progress: &mut dyn FnMut(SyncLocalActivationProgress),
 ) -> Result<Option<CleanRuntimeResources>, String> {
+    let mut trace = CleanOpenStageTrace::new();
     let identities = request.clean_identities.as_ref().ok_or_else(|| {
         "clean managed runtime open has no persisted local identity record".to_owned()
     })?;
@@ -6710,6 +6743,7 @@ fn open_clean_runtime_resources_with_progress(
     else {
         return Ok(None);
     };
+    trace.phase("authenticated baseline open");
     // (c) §1: the claim precheck is the HEAD of the clean cold open, before
     // `Graph::open_checked` -- which is not read-only, because its publication
     // recovery renames graph files and moves artifacts to `.trash/`. Clean
@@ -6718,7 +6752,9 @@ fn open_clean_runtime_resources_with_progress(
     // fresh store never reaches this line. The full in-place validation inside
     // the receipt-store open below stays as defense in depth.
     ProjectionReceiptStore::precheck_authoritative_claim(&request.receipt_root).map_err(display)?;
+    trace.phase("receipt claim precheck");
     let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
+    trace.phase("graph open");
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
         identities.endpoint_id,
@@ -6731,6 +6767,7 @@ fn open_clean_runtime_resources_with_progress(
         endpoint,
     )
     .map_err(display)?;
+    trace.phase("endpoint and receipt open");
     if opened.marker().workspace_id() != identities.workspace_id
         || opened.marker().lineage_digest() != identities.lineage_digest
     {
@@ -6748,6 +6785,7 @@ fn open_clean_runtime_resources_with_progress(
         .repair_covered_object_mismatches(&covered)
         .map_err(display)?;
     store.validate_namespace().map_err(display)?;
+    trace.phase("object store repair and validation");
     engine
         .attach_clean_archive_store(store.duplicate_retained_capability().map_err(display)?)
         .map_err(display)?;
@@ -6762,6 +6800,7 @@ fn open_clean_runtime_resources_with_progress(
         .replay_clean_committed_tail(baseline_claim_source.as_ref())
         .map_err(display)?;
     drop(baseline_claim_source);
+    trace.phase("committed tail replay");
     let projection = if replayed == 0 {
         let expected = engine.accepted_frontier_root().map_err(display)?;
         let baseline_projection = open_or_rebuild_clean_genesis_projection(
@@ -6771,6 +6810,7 @@ fn open_clean_runtime_resources_with_progress(
             ReferenceCatalogPolicyV1::default(),
         )
         .map_err(display)?;
+        trace.phase("clean genesis projection validation");
         LeasedWorkspaceProjection::adopt_clean_genesis(
             lease,
             &request.database_path,
@@ -6799,6 +6839,11 @@ fn open_clean_runtime_resources_with_progress(
         .map(|(projection, ())| projection)
         .map_err(|(_, error)| display(error))?
     };
+    trace.phase(if replayed == 0 {
+        "clean genesis projection adoption"
+    } else {
+        "replayed projection open"
+    });
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
         .map_err(display)?;
@@ -6816,6 +6861,7 @@ fn open_clean_runtime_resources_with_progress(
         .into_iter()
         .collect();
     let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
+    trace.phase("engine indexes and sweeps open");
     let mut retired_own_intent_ids = engine.local_completed_projection_intent_ids();
     let endpoint = engine
         .projection_endpoint_binding()
@@ -6840,6 +6886,7 @@ fn open_clean_runtime_resources_with_progress(
         binding.device_id().as_uuid(),
     )
     .map_err(display)?;
+    trace.phase("retained journals open");
     let retained_own_intents =
         retained_local_completion_intents(&managed_local, &projection_turns)?;
     retired_own_intent_ids.extend(retained_own_intents.iter().copied());
@@ -6869,6 +6916,7 @@ fn open_clean_runtime_resources_with_progress(
         completion_guard.runtime_mut(),
         &mut projection_turns,
     )?;
+    trace.phase("retained journals drain");
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeProjectionRepair,
     });
@@ -6878,9 +6926,11 @@ fn open_clean_runtime_resources_with_progress(
         completion_guard.runtime_mut(),
         &mut projection_turns,
     )?;
+    trace.phase("terminal projection repair");
     // Repair -> actor assembly boundary: the pre-actor window ends with zero
     // buffered entries, independent of how long actor construction takes.
     let runtime = completion_guard.finish()?;
+    trace.phase("completion flush");
     Ok(Some(CleanRuntimeResources {
         graph,
         receipts,
@@ -49349,6 +49399,31 @@ mod tests {
     /// immutable baseline. The retired retained-root counters no longer
     /// describe this path; the real-scale wall-clock benchmark below covers
     /// its separate performance property.
+    #[test]
+    fn clean_cold_reopen_reuses_the_authenticated_genesis_projection() {
+        let fixture = ActivationFixture::scaled("clean-cold-reopen-reuses-projection", 0xa0eb, 3);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("scaled graph activates");
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(handle);
+
+        reset_projection_open_test_observation(workspace_id);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let observation = take_projection_open_test_observation(workspace_id);
+        assert_eq!(
+            observation.recovery, "opened-existing",
+            "an unchanged clean projection was rebuilt: {}",
+            observation.reason
+        );
+    }
+
     #[test]
     fn managed_projection_rebuilds_clean_genesis_from_baseline() {
         let fixture = ActivationFixture::scaled("managed-rebuild-lookup-sessions", 0xa0ec, 3);

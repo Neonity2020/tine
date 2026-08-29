@@ -50,7 +50,7 @@ use cap_std::fs::MetadataExt as CapMetadataExt;
 use cap_std::fs::OpenOptions as CapOpenOptions;
 use cap_std::{ambient_authority, fs::Dir as CapDir};
 use fs2::FileExt as _;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tine_storage::sqlite::{
     self as storage_frontier, PhysicalFileCheckpoint, PhysicalSqliteDatabase, SqliteFileSet,
@@ -108,12 +108,41 @@ pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
 const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const PROJECTION_BASELINE_CACHE_SUFFIX: &str = ".projection-baselines.sqlite";
 
 fn encode_projection_baseline(description: BlobDescription) -> [u8; 40] {
     let mut encoded = [0_u8; 40];
     encoded[..32].copy_from_slice(description.sha256());
     encoded[32..].copy_from_slice(&description.byte_length().to_be_bytes());
     encoded
+}
+
+fn projection_baseline_cache_path(projection_path: &Path) -> PathBuf {
+    let mut path = projection_path.as_os_str().to_os_string();
+    path.push(PROJECTION_BASELINE_CACHE_SUFFIX);
+    PathBuf::from(path)
+}
+
+fn open_projection_baseline_cache(projection_path: &Path) -> Result<Connection, ProjectionError> {
+    let path = projection_baseline_cache_path(projection_path);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(ProjectionError::UnsafePath(format!(
+                "projection baseline cache {} is not a regular file",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let connection =
+        Connection::open_with_flags(path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+    Ok(connection)
 }
 /// Bounded current-path catalog page size for terminal construction. The rows
 /// are drained into materialization chunks, so this only caps how many
@@ -4813,12 +4842,13 @@ impl SqliteFrontier {
         &self.path
     }
 
-    /// Ensure the disposable projection-baseline acceleration exists. This is
-    /// deliberately outside the authenticated materialization schema: loss or
-    /// rebuild costs one render-and-bind, never authority or a graph rewrite.
+    /// Ensure the disposable projection-baseline acceleration exists. Keep it
+    /// in its own sibling SQLite file: the authenticated projection rejects
+    /// unknown schema objects, and this cache is neither authority nor part of
+    /// that schema. Loss or rebuild costs one render-and-bind, never authority
+    /// or a graph rewrite.
     pub(crate) fn ensure_projection_baseline_digest_column(&self) -> Result<(), ProjectionError> {
-        let connection = Connection::open(&self.path)
-            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        let connection = open_projection_baseline_cache(&self.path)?;
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS projection_baselines (\
@@ -4837,8 +4867,7 @@ impl SqliteFrontier {
         path: &ManagedPath,
         description: BlobDescription,
     ) -> Result<bool, ProjectionError> {
-        let connection = Connection::open(&self.path)
-            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        let connection = open_projection_baseline_cache(&self.path)?;
         let baseline = encode_projection_baseline(description);
         let matched = connection
             .query_row(
@@ -4866,8 +4895,7 @@ impl SqliteFrontier {
         path: &ManagedPath,
         description: BlobDescription,
     ) -> Result<(), ProjectionError> {
-        let connection = Connection::open(&self.path)
-            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        let connection = open_projection_baseline_cache(&self.path)?;
         connection
             .execute(
                 "INSERT INTO projection_baselines \
@@ -4890,7 +4918,7 @@ impl SqliteFrontier {
 
     #[cfg(test)]
     pub(crate) fn clear_projection_baselines_for_test(&self) {
-        let connection = Connection::open(&self.path).unwrap();
+        let connection = open_projection_baseline_cache(&self.path).unwrap();
         connection
             .execute("DELETE FROM projection_baselines", [])
             .unwrap();
@@ -4898,7 +4926,7 @@ impl SqliteFrontier {
 
     #[cfg(test)]
     pub(crate) fn projection_baseline_count_for_test(&self) -> u64 {
-        let connection = Connection::open(&self.path).unwrap();
+        let connection = open_projection_baseline_cache(&self.path).unwrap();
         connection
             .query_row("SELECT count(*) FROM projection_baselines", [], |row| {
                 row.get(0)
@@ -10345,6 +10373,39 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn projection_baseline_cache_is_a_separate_disposable_database() {
+        let root = TestDir::new("projection-baseline-cache-separate");
+        let projection = root.path().join("projection.sqlite");
+        let cache = projection_baseline_cache_path(&projection);
+
+        let connection = open_projection_baseline_cache(&projection).unwrap();
+        connection
+            .execute_batch("CREATE TABLE cache_probe (value INTEGER NOT NULL);")
+            .unwrap();
+        drop(connection);
+
+        assert!(!projection.exists());
+        assert!(cache.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projection_baseline_cache_refuses_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("projection-baseline-cache-symlink");
+        let projection = root.path().join("projection.sqlite");
+        let cache = projection_baseline_cache_path(&projection);
+        let target = root.path().join("outside.sqlite");
+        fs::write(&target, b"not a cache").unwrap();
+        symlink(&target, &cache).unwrap();
+
+        let error = open_projection_baseline_cache(&projection).unwrap_err();
+        assert!(matches!(error, ProjectionError::UnsafePath(_)));
+        assert_eq!(fs::read(target).unwrap(), b"not a cache");
     }
 
     fn open_test_projection(

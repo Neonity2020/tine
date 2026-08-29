@@ -79,6 +79,23 @@ function nativeDialogIds(env) {
   }
 }
 
+function mainWindowIds(env) {
+  try {
+    return xdo(env, "search", "--onlyvisible", "--name", "^Tine( — .*)?$").split(/\s+/).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
 function hasWindowManager(env) {
   try {
     return /_NET_SUPPORTING_WM_CHECK.*window id/i.test(
@@ -186,8 +203,8 @@ async function waitFor(predicate, label, timeoutMs = 30_000) {
   throw new Error(`timed out waiting for ${label}${lastError ? `: ${String(lastError)}` : ""}`);
 }
 
-function runEnv(graph, xdg) {
-  return {
+function runEnv(graph, xdg, debugLog) {
+  const env = {
     ...process.env,
     TINE_GRAPH: graph,
     XDG_DATA_HOME: path.join(xdg, "data"),
@@ -200,13 +217,45 @@ function runEnv(graph, xdg) {
     LIBGL_ALWAYS_SOFTWARE: "1",
     GDK_BACKEND: "x11",
   };
+  if (debugLog) {
+    env.TINE_DEBUG = "1";
+    env.TINE_DEBUG_LOG = debugLog;
+  }
+  return env;
 }
 
-async function launch(graph, xdg, runDir) {
-  const env = runEnv(graph, xdg);
+let launchSequence = 0;
+
+function nativeGraphOpenTrace(debugLog) {
+  const graphPhases = [];
+  const managedCleanPhases = [];
+  let projectionRecovery = null;
+  const text = fs.existsSync(debugLog) ? fs.readFileSync(debugLog, "utf8") : "";
+  for (const line of text.split("\n")) {
+    const graph = line.match(/graph load phase: (.*); phase_ms=(\d+); total_ms=(\d+)/u);
+    if (graph) {
+      graphPhases.push({ name: graph[1], phaseMs: Number(graph[2]), totalMs: Number(graph[3]) });
+      continue;
+    }
+    const clean = line.match(/managed clean open stage: (.*); phase_ms=(\d+); total_ms=(\d+)/u);
+    if (clean) {
+      managedCleanPhases.push({ name: clean[1], phaseMs: Number(clean[2]), totalMs: Number(clean[3]) });
+      continue;
+    }
+    const recovery = line.match(/clean genesis projection recovery: ([a-z-]+)/u);
+    if (recovery) projectionRecovery = recovery[1];
+  }
+  return { graphPhases, managedCleanPhases, projectionRecovery };
+}
+
+async function launch(graph, xdg, runDir, label) {
+  const sequence = ++launchSequence;
+  const debugLog = path.join(runDir, `graph-open-${sequence}-${label}.log`);
+  const env = runEnv(graph, xdg, debugLog);
   const driverPort = await freePort();
   const nativePort = await freePort();
-  const log = fs.openSync(path.join(runDir, `tauri-driver-${driverPort}.log`), "w");
+  const driverLog = path.join(runDir, `tauri-driver-${driverPort}.log`);
+  const log = fs.openSync(driverLog, "w");
   const driver = spawn(
     TAURI_DRIVER,
     ["--port", String(driverPort), "--native-port", String(nativePort), "--native-driver", WEBKIT_DRIVER],
@@ -229,8 +278,24 @@ async function launch(graph, xdg, runDir) {
         "tauri:options": { application: APP },
       },
     });
-    await browser.$(".ls-block, .page-title, .journal-day").waitForExist({ timeout: 45_000 });
-    return { browser, driver, log, env, coldOpenMs: performance.now() - started };
+    await browser.$(".ls-block, .journal-day").waitForExist({ timeout: 45_000 });
+    const windowId = await waitFor(() => mainWindowIds(env)[0], "native Tine window", 15_000);
+    const appPid = Number(xdo(env, "getwindowpid", windowId));
+    const frontend = await browser.execute(() => window.__TINE_GRAPH_OPEN_TRACE__ ?? null);
+    return {
+      browser,
+      driver,
+      log,
+      env,
+      appPid,
+      coldOpenMs: performance.now() - started,
+      coldOpenTrace: {
+        frontend,
+        native: nativeGraphOpenTrace(driverLog),
+        debugLog,
+        driverLog,
+      },
+    };
   } catch (error) {
     try { await browser?.deleteSession(); } catch {}
     stopProcessGroup(driver);
@@ -240,6 +305,22 @@ async function launch(graph, xdg, runDir) {
 }
 
 async function closeSession(session) {
+  if (session?.browser && session?.appPid && processAlive(session.appPid)) {
+    let quit;
+    try {
+      quit = await session.browser.executeAsync((done) => {
+        globalThis.__TAURI_INTERNALS__.invoke("tine_quit").then(
+          () => done({ ok: true }),
+          (error) => done({ error: String(error) }),
+        );
+      });
+    } catch {
+      // A successful quit destroys the WebView before WebDriver can serialize
+      // the command result. Process disappearance below is the oracle.
+    }
+    if (quit?.error) throw new Error(`Tine refused the benchmark's clean quit: ${quit.error}`);
+    await waitFor(() => !processAlive(session.appPid), "Tine clean quit", 30_000);
+  }
   try { await session?.browser?.deleteSession(); } catch {}
   stopProcessGroup(session?.driver);
   try { fs.closeSync(session?.log); } catch {}
@@ -407,9 +488,21 @@ async function openStorageSettings(browser) {
 }
 
 async function closeSettings(browser) {
-  for (let attempt = 0; attempt < 3 && await browser.$(".settings-modal").isExisting(); attempt += 1) {
+  if (!await browser.$(".settings-modal").isExisting()) return;
+  await browser.execute(() => {
+    const buttons = [...document.querySelectorAll(".settings-pane-head button")];
+    const close = buttons.at(-1);
+    if (close instanceof HTMLButtonElement) close.click();
+  });
+  await sleep(100);
+  if (await browser.$(".settings-modal").isExisting()) {
+    await browser.execute(() => {
+      const overlay = document.querySelector(".modal-overlay");
+      if (overlay instanceof HTMLElement) overlay.click();
+    });
+  }
+  if (await browser.$(".settings-modal").isExisting()) {
     await browser.keys(["Escape"]);
-    await sleep(100);
   }
   await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 12_000 });
 }
@@ -446,6 +539,7 @@ async function measureMode(mode, session, target, marker) {
     keystrokeP95Ms: keystrokes.inputHandlerP95Ms,
     keystrokeScheduleLagP95Ms: keystrokes.scheduleLagP95Ms,
     marker,
+    coldOpenTrace: session.coldOpenTrace,
   };
 }
 
@@ -464,7 +558,7 @@ const { graph, target, fileCount } = seedGraph(root);
 for (const directory of ["data", "config", "cache"]) fs.mkdirSync(path.join(xdg, directory), { recursive: true });
 fs.mkdirSync(runDir, { recursive: true });
 const receipt = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   kind: "storage-mode-run",
   testedCommit: gitRevision(),
   app: APP,
@@ -497,28 +591,28 @@ try {
   const env = runEnv(graph, xdg);
   windowManager = await startWindowManager(env);
   if (MODE_ORDER[0] === "direct") {
-    activeSession = await launch(graph, xdg, runDir);
+    activeSession = await launch(graph, xdg, runDir, "direct");
     receipt.modes.direct = await measureMode("direct", activeSession, target, "direct storage benchmark marker");
     await transition(activeSession, "managed");
     await closeSession(activeSession);
-    activeSession = await launch(graph, xdg, runDir);
+    activeSession = await launch(graph, xdg, runDir, "managed");
     receipt.modes.managed = await measureMode("managed", activeSession, target, "managed storage benchmark marker");
   } else {
     // Activation is setup, not a measured operation. It makes the first mode
     // managed while retaining the exact graph and XDG profile for both cells.
-    activeSession = await launch(graph, xdg, runDir);
+    activeSession = await launch(graph, xdg, runDir, "activation-setup");
     await transition(activeSession, "managed");
     await closeSession(activeSession);
-    activeSession = await launch(graph, xdg, runDir);
+    activeSession = await launch(graph, xdg, runDir, "managed");
     receipt.modes.managed = await measureMode("managed", activeSession, target, "managed storage benchmark marker");
     await transition(activeSession, "direct");
     await closeSession(activeSession);
-    activeSession = await launch(graph, xdg, runDir);
+    activeSession = await launch(graph, xdg, runDir, "direct");
     receipt.modes.direct = await measureMode("direct", activeSession, target, "direct storage benchmark marker");
   }
   for (const mode of ["direct", "managed"]) {
-    const { marker, ...metrics } = receipt.modes[mode];
-    receipt.modes[mode] = { metrics, marker };
+    const { marker, coldOpenTrace, ...metrics } = receipt.modes[mode];
+    receipt.modes[mode] = { metrics, marker, coldOpenTrace };
   }
   fs.mkdirSync(path.dirname(OUTPUT), { recursive: true });
   fs.writeFileSync(OUTPUT, `${JSON.stringify(receipt, null, 2)}\n`);

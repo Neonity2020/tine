@@ -828,6 +828,7 @@ pub(crate) fn load_graph_for_label(
             );
             format!("Managed storage opened but its pages are not usable: {error}")
         })?;
+        graph_load_phase(started, &mut previous, "managed application readiness");
         if let Err(error) = state.storage_supervisor.commit_if_current(managed_id, || {
             state
                 .graphs
@@ -864,6 +865,7 @@ pub(crate) fn load_graph_for_label(
             Some(StableStorageMode::Managed),
             None,
         )?;
+        graph_load_phase(started, &mut previous, "managed publish");
         state.note_focused(window_label);
         poke_watcher(state);
         remember_graph(app, &meta.root)?;
@@ -934,6 +936,7 @@ pub(crate) fn load_graph_for_label(
             return Err(error);
         }
     };
+    graph_load_phase(started, &mut previous, "Direct Files prepare");
     let direct = match state.storage_supervisor.commit_if_current(direct_id, || {
         publish_prepared_direct_files(app, window_label, state, prepared)
     }) {
@@ -956,7 +959,7 @@ pub(crate) fn load_graph_for_label(
         Some(StableStorageMode::Direct),
         None,
     )?;
-    graph_load_phase(started, &mut previous, "Direct Files open and publish");
+    graph_load_phase(started, &mut previous, "Direct Files publish");
     Ok(LoadGraphResult::Loaded {
         meta: direct.meta,
         binding_generation: direct.binding_generation,
