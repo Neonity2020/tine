@@ -35465,7 +35465,10 @@ mod tests {
         let dir = scratch("external-admission-parse-count");
         let graph = Graph::open(&dir);
         for (relative, content, expected_attempts) in [
-            ("pages/reused.md", "- parent\n  - child\n", 2),
+            // Markdown's round-trip oracle produces identical canonical
+            // source here, so the exact-source cache reuses its retained
+            // original parse instead of invoking the outline parser again.
+            ("pages/reused.md", "- parent\n  - child\n", 1),
             ("pages/reused.org", "* parent\n** child\n", 1),
         ] {
             let entry = PageEntry {
