@@ -587,7 +587,7 @@
     "android"
    ],
    "layer": "native",
-   "status": "fixing",
+   "status": "covered",
    "coverage": {
     "tests": [
      "src/mobileSafeArea.test.ts",
