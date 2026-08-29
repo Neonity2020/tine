@@ -901,6 +901,11 @@ assert.ok(
 );
 assert.match(
   androidUiRuntimeScript,
+  /cat "files\/android-ui-runtime\/\$method\.failure\.json"[\s\S]*?jq -e \. "\$failure_file"[\s\S]*?rm -f "\$failure_file"/,
+  "Android UI evidence must discard absent or invalid failure-file reads"
+);
+assert.match(
+  androidUiRuntimeScript,
   /if ! run_journey "\$method"; then[\s\S]*?overall=1/,
   "Android UI runner must run each selected method in a separately reset instrumentation lifetime"
 );
