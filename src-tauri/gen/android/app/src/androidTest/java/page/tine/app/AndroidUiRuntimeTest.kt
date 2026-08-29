@@ -128,8 +128,13 @@ class AndroidUiRuntimeTest {
               "responsive measurement reported a visible overflow trigger without a tappable trigger"
             }
             tap(webView, overflow)
-            awaitCondition("overflow menu after real tap") {
+            val overflowOpened = waitForCondition {
               measureChrome(webView).optBoolean("overflowMenuVisible")
+            }
+            receipt.put("overflowOpenedAfterNativeTap", overflowOpened)
+            if (!overflowOpened) {
+              fitFailures += "$orientationName scale=$scale overflow did not open after native tap"
+              continue
             }
             val opened = measureChrome(webView)
             val openedActions = jsonStrings(opened.optJSONArray("visibleOverflowActions"))
@@ -451,8 +456,9 @@ class AndroidUiRuntimeTest {
         const element = elements.find((candidate) => {
           const rect = candidate.getBoundingClientRect();
           const style = getComputedStyle(candidate);
+          const safeBottom = window.innerHeight * 0.58;
           return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 &&
-            rect.bottom > 64 && rect.top < window.innerHeight - 24;
+            rect.top > 64 && rect.bottom < safeBottom;
         });
         if (!element) return null;
         const rect = element.getBoundingClientRect();
@@ -482,7 +488,7 @@ class AndroidUiRuntimeTest {
               const singleLine = rect.height <= lineHeight * 1.6;
               return length >= $minimumTextLength && length <= $maximumTextLength &&
                 (${if (requireSingleVisualLine) "singleLine" else "!singleLine"}) &&
-                rect.bottom > 64 && rect.top < window.innerHeight - 24;
+                rect.top > 64 && rect.bottom < window.innerHeight * 0.58;
             });
           if (!block) return null;
           const content = block.querySelector(':scope > .block-main > .block-content-wrapper');
@@ -883,9 +889,14 @@ class AndroidUiRuntimeTest {
   }
 
   private fun emitFailureEvidence(test: String, webView: WebView?, failure: Throwable) {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val directory = File(context.filesDir, "android-ui-runtime")
+    require(directory.mkdirs() || directory.isDirectory) { "could not create Android UI evidence directory $directory" }
+    val journeyReceipt = File(directory, "$test.json")
+    val outcome = if (journeyReceipt.isFile && journeyReceipt.length() > 0) "product-failure" else "harness-failure"
     val receipt = JSONObject()
       .put("test", test)
-      .put("outcome", "harness-failure")
+      .put("outcome", outcome)
       .put("failureClass", failure.javaClass.name)
       .put("failureMessage", failure.message ?: "")
     if (webView != null) {
@@ -906,16 +917,14 @@ class AndroidUiRuntimeTest {
         receipt.put("dom", "unavailable")
       }
     }
-    val context = ApplicationProvider.getApplicationContext<Context>()
-    val directory = File(context.filesDir, "android-ui-runtime")
-    require(directory.mkdirs() || directory.isDirectory) { "could not create Android UI evidence directory $directory" }
     InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()?.let { screenshot ->
       File(directory, "$test.png").outputStream().use { output ->
         screenshot.compress(Bitmap.CompressFormat.PNG, 100, output)
       }
       receipt.put("screenshot", "$test.png")
     }
-    File(directory, "$test.json").writeText(receipt.toString())
+    val evidenceFile = if (outcome == "product-failure") File(directory, "$test.failure.json") else journeyReceipt
+    evidenceFile.writeText(receipt.toString())
     Log.e(RECEIPT_TAG, "TINE_ANDROID_UI_RUNTIME_FAILURE $receipt")
   }
 

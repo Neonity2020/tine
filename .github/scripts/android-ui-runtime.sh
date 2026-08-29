@@ -41,12 +41,13 @@ adb shell settings put secure show_ime_with_hard_keyboard 1
 
 run_journey() {
   local method="$1"
-  local name runner_output runner_log receipt_file screenshot_file receipts started finished failed status png_signature
+  local name runner_output runner_log receipt_file failure_file screenshot_file receipts started finished failed status png_signature
   name="${method//./_}"
   name="${name//\#/_}"
   runner_output="$artifact_root/$name.junit.txt"
   runner_log="$artifact_root/$name.logcat.txt"
   receipt_file="$artifact_root/$name.receipt.json"
+  failure_file="$artifact_root/$name.failure.json"
   screenshot_file="$artifact_root/$name.png"
   receipts="$artifact_root/$name.receipts.jsonl"
 
@@ -77,6 +78,9 @@ run_journey() {
   # single logcat line). Debug instrumentation permits run-as without exposing
   # any user graph or host filesystem data.
   adb exec-out run-as page.tine.app cat "files/android-ui-runtime/$method.json" > "$receipt_file" || true
+  if ! adb exec-out run-as page.tine.app cat "files/android-ui-runtime/$method.failure.json" > "$failure_file"; then
+    rm -f "$failure_file"
+  fi
   grep -F 'TINE_ANDROID_UI_RUNTIME_RECEIPT ' "$runner_log" > "$receipts" || true
   png_signature="$(od -An -tx1 -N8 "$screenshot_file" 2>/dev/null | tr -d ' \n')"
 
