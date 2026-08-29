@@ -472,7 +472,21 @@ fn publish_android_private_immutable(
         }
     };
 
-    if verify_existing()? {
+    // A failed strict directory barrier may leave the exact final name in the
+    // page cache and namespace even though its insertion is not crash-durable.
+    // Retry must re-establish that barrier before accepting byte-identical
+    // publication; otherwise repeated turns would eventually skip every
+    // refusal and falsely report a durable promoted receipt. Bootstrap state
+    // remains deliberately reconstructible and needs no such retry barrier.
+    let accept_existing = || -> Result<bool, StoreError> {
+        let exists = verify_existing()?;
+        if exists && matches!(durability, ReceiptDirectoryDurability::PromotedAuthority) {
+            sync_dir_required(dir)?;
+        }
+        Ok(exists)
+    };
+
+    if accept_existing()? {
         return Ok(());
     }
 
@@ -503,7 +517,7 @@ fn publish_android_private_immutable(
         crate::durability_counters::sync_file(&temp)?;
         drop(temp);
 
-        if verify_existing()? {
+        if accept_existing()? {
             return Ok(());
         }
 
@@ -2897,7 +2911,17 @@ impl ProjectionReceiptStore {
                     "private receipt namespace {namespace}/{name} is not a directory"
                 )));
             }
-            Ok(_) => return Ok(Some(open_dir_nofollow(&parent, &name)?)),
+            Ok(_) => {
+                // On Android a prior strict mkdir barrier can refuse after the
+                // directory entry became visible. A create/recovery retry must
+                // complete that barrier before accepting the existing name;
+                // read-only inspection does not mutate and pays no barrier.
+                #[cfg(target_os = "android")]
+                if create {
+                    sync_dir_required(&parent)?;
+                }
+                return Ok(Some(open_dir_nofollow(&parent, &name)?));
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }

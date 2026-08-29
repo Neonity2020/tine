@@ -5277,10 +5277,9 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/sync_runtime.rs::tests::android_receipt_barriers_are_reconstructible_only_during_pre_promotion_bootstrap",
-     "crates/tine-core/src/filesystem_durability.rs::tests::only_the_reconstructible_projection_class_degrades_and_only_on_android"
+     "crates/tine-core/src/sync_runtime.rs::tests::android_receipt_barriers_are_reconstructible_only_during_pre_promotion_bootstrap"
     ],
-    "failBefore": "The Android receipt publisher and directory creator unconditionally used sync_reconstructible_directory, so PermissionDenied, Unsupported, and InvalidInput were swallowed even after the receipt-store identity had been promoted into receiver authority."
+    "failBefore": "The Android receipt publisher and directory creator unconditionally used sync_reconstructible_directory, so PermissionDenied, Unsupported, and InvalidInput were swallowed even after the receipt-store identity had been promoted into receiver authority. The first repair still accepted an exact existing file or directory without retrying a previously refused strict barrier, allowing repeated idempotent drain turns to converge to false success; the closure regression now pins both strict entry points and both existing-name retry barriers."
    },
    "notes": "Internal MS-04 campaign finding. User-visible harm and safety class: a save or received operation could report success after Android refused the parent-directory durability barrier for a promoted receipt, allowing a crash to lose the receipt name while accepted history treats it as durable. Pre-promotion initialization remains reconstructible from unchanged Direct Files and may use the narrow Android capability-refusal exception; all operational receipt records and namespaces are PrivateDurableAuthority and fail closed on every barrier refusal."
   },

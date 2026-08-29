@@ -28,7 +28,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   for promoted managed-storage projection receipts.** Only the receipt store's
   pre-enrollment initialization remains reconstructible; bases, intents,
   attempts, mutation authority, completions, cleanup, and forensic records now
-  keep strict private-authority barriers on every platform.
+  keep strict private-authority barriers on every platform. An idempotent retry
+  also re-establishes a previously refused barrier before accepting an existing
+  receipt name or operational namespace.
 
 - **Images changed by Syncthing, Dropbox, an external editor, or another Tine
   window now refresh in place without reopening the graph.** Tine observes the

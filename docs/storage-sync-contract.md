@@ -2093,8 +2093,8 @@ boundary, not by platform or by syscall alone:
 
 | Receipt publication | Durability class | Android capability refusal | Required response |
 | --- | --- | --- | --- |
-| Initialization claim, top-level namespaces, and store claim before any enrollment binding promotes that store identity | Pre-promotion reconstructible bootstrap | The exact file bytes remain synced; `PermissionDenied`/`Unsupported`/`InvalidInput` from the parent-directory barrier may degrade | Retry may archive the one diagnostic tree and reconstruct it from unchanged Direct Files |
-| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | Refuse the publication and keep the accepted operation pending/recoverable; do not report a receipt whose name was not durably published |
+| Initialization claim, top-level namespaces, and store claim while initializing an empty receipt store; these artifacts alone carry no operation authority | Reconstructible bootstrap | The exact file bytes remain synced; `PermissionDenied`/`Unsupported`/`InvalidInput` from the parent-directory barrier may degrade | During first activation, retry may archive one diagnostic tree and reconstruct it from unchanged Direct Files. A promoted reopen may recreate only this empty initialization structure; nonempty claimless state is refused. |
+| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | A crash or power loss could otherwise lose a supposedly durable receipt name. Refuse the publication and keep the accepted operation pending/recoverable; do not report success until an idempotent retry completes the strict parent-directory barrier. |
 
 The implementation makes the first row an explicitly named bootstrap-only
 helper used solely inside `ProjectionReceiptStore::initialize`; the ordinary
@@ -2102,13 +2102,16 @@ receipt publisher and directory creator are the strict second row. This keeps
 an Android setup capability limitation from wedging activation without letting
 that setup exception leak into retained receiver authority.
 
-Before an enrollment binding exists, projection receipts are reconstructible
-bootstrap state rather than authority. If Android cannot reopen a receipt tree
-left by an interrupted or older activation, retry retains one sibling
+Before an enrollment binding exists, the empty receipt store's initialization
+artifacts are reconstructible bootstrap state rather than authority; no
+operational receipt is published before the activation marker. If Android
+cannot reopen a receipt tree left by an interrupted or older activation, retry retains one sibling
 `receipts.pre-promotion-failed` diagnostic tree and initializes a clean receipt
 store from the unchanged Markdown/Org source. Once enrollment has promoted the
 receipt-store identity, this recovery is forbidden: normal exact identity and
-receipt recovery rules apply.
+receipt recovery rules apply. Recreating an absent or empty initialization
+structure is still allowed because it discards no operation receipt; a nonempty
+claimless store is refused.
 
 The same rule governs the archive a clean activation builds. Before the
 activation marker is committed, the archive carries no authority and is

@@ -36037,6 +36037,32 @@ mod tests {
             "promoted receipt namespaces must use strict directory barriers"
         );
 
+        let strict_directory_start = source
+            .find("fn ensure_directory_nofollow(")
+            .expect("strict receipt directory entry point");
+        let bootstrap_directory_start = source[strict_directory_start..]
+            .find("fn ensure_bootstrap_directory_nofollow(")
+            .map(|offset| strict_directory_start + offset)
+            .expect("bootstrap receipt directory entry point");
+        assert!(
+            source[strict_directory_start..bootstrap_directory_start]
+                .contains("ReceiptDirectoryDurability::PromotedAuthority"),
+            "the ordinary receipt directory entry point must select strict promoted durability"
+        );
+
+        let strict_publisher_start = source
+            .find("fn publish_immutable_exact(")
+            .expect("strict receipt publisher entry point");
+        let bootstrap_publisher_start = source[strict_publisher_start..]
+            .find("fn publish_bootstrap_immutable_exact(")
+            .map(|offset| strict_publisher_start + offset)
+            .expect("bootstrap receipt publisher entry point");
+        assert!(
+            source[strict_publisher_start..bootstrap_publisher_start]
+                .contains("ReceiptDirectoryDurability::PromotedAuthority"),
+            "the ordinary receipt publisher must select strict promoted durability"
+        );
+
         let publisher_start = source
             .find("fn publish_android_private_immutable(")
             .expect("Android receipt publisher");
@@ -36047,6 +36073,28 @@ mod tests {
         let publisher = &source[publisher_start..publisher_end];
         assert!(publisher.contains("ReceiptDirectoryDurability::PromotedAuthority"));
         assert!(publisher.contains("sync_dir_required(dir)"));
+        let existing_retry_start = publisher
+            .find("let accept_existing =")
+            .expect("idempotent publication retry policy");
+        let temporary_start = publisher[existing_retry_start..]
+            .find("let temp_name =")
+            .map(|offset| existing_retry_start + offset)
+            .expect("temporary publication follows existing-name admission");
+        assert!(
+            publisher[existing_retry_start..temporary_start].contains("sync_dir_required(dir)"),
+            "an existing promoted receipt name must re-establish its strict barrier"
+        );
+
+        let intent_namespace_start = source
+            .find("    fn open_intent_namespace(")
+            .expect("per-intent namespace opener");
+        let intent_namespace_end = source[intent_namespace_start..]
+            .find("\n    fn validate_forensic_record(")
+            .map(|offset| intent_namespace_start + offset)
+            .expect("end of per-intent namespace opener");
+        let intent_namespace = &source[intent_namespace_start..intent_namespace_end];
+        assert!(intent_namespace.contains("if create"));
+        assert!(intent_namespace.contains("sync_dir_required(&parent)"));
     }
 
     #[test]
