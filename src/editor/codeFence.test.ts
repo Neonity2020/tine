@@ -62,14 +62,14 @@ describe("codeBodyProjection", () => {
   it("splits a complete markdown fence into exact open/body/close bytes", () => {
     const text = "```js\nconst x = 1;\nconsole.log(x);\n```";
     const p = codeBodyProjection(text, "md");
-    expect(p).toEqual({ open: "```js\n", body: "const x = 1;\nconsole.log(x);\n", close: "```", lang: "js" });
+    expect(p).toEqual({ open: "```js\n", body: "const x = 1;\nconsole.log(x);", close: "\n```", lang: "js" });
     expect(p!.open + p!.body + p!.close).toBe(text);
   });
 
-  it("projects an empty authored scaffold to its single blank body line", () => {
+  it("keeps an empty scaffold's structural separator out of the payload", () => {
     const text = "```\n\n```";
     const p = codeBodyProjection(text, "md");
-    expect(p).toEqual({ open: "```\n", body: "\n", close: "```", lang: "" });
+    expect(p).toEqual({ open: "```\n", body: "", close: "\n```", lang: "" });
     expect(p!.open + p!.body + p!.close).toBe(text);
   });
 
@@ -83,14 +83,14 @@ describe("codeBodyProjection", () => {
   it("preserves exact wrapper bytes: tilde fence, longer runs, closer-only trailing blanks", () => {
     const text = "~~~sh\necho hi\n~~~\n\n";
     const p = codeBodyProjection(text, "md");
-    expect(p).toEqual({ open: "~~~sh\n", body: "echo hi\n", close: "~~~\n\n", lang: "sh" });
+    expect(p).toEqual({ open: "~~~sh\n", body: "echo hi", close: "\n~~~\n\n", lang: "sh" });
     expect(p!.open + p!.body + p!.close).toBe(text);
   });
 
   it("a shorter fence run is body content, not the closer (CommonMark length rule)", () => {
     const text = "````js\n```\nconst x = 1\n````";
     const p = codeBodyProjection(text, "md");
-    expect(p).toEqual({ open: "````js\n", body: "```\nconst x = 1\n", close: "````", lang: "js" });
+    expect(p).toEqual({ open: "````js\n", body: "```\nconst x = 1", close: "\n````", lang: "js" });
     expect(p!.open + p!.body + p!.close).toBe(text);
     // And the same text without its closing four-run is INCOMPLETE (typing it
     // by hand must not make the shorter inner run the closer).
@@ -100,18 +100,18 @@ describe("codeBodyProjection", () => {
   it("a fence run with an info string is body content, never a closer", () => {
     const text = "```\n```x\n```";
     const p = codeBodyProjection(text, "md");
-    expect(p).toEqual({ open: "```\n", body: "```x\n", close: "```", lang: "" });
+    expect(p).toEqual({ open: "```\n", body: "```x", close: "\n```", lang: "" });
     expect(p!.open + p!.body + p!.close).toBe(text);
   });
 
   it("projects org #+begin_src and #+begin_example with exact case preserved", () => {
     const src = "#+BEGIN_SRC python\nx = 1\n#+END_SRC";
     const p = codeBodyProjection(src, "org");
-    expect(p).toEqual({ open: "#+BEGIN_SRC python\n", body: "x = 1\n", close: "#+END_SRC", lang: "python" });
+    expect(p).toEqual({ open: "#+BEGIN_SRC python\n", body: "x = 1", close: "\n#+END_SRC", lang: "python" });
     expect(p!.open + p!.body + p!.close).toBe(src);
     const ex = "#+begin_example\nstuff\n#+end_example";
     const q = codeBodyProjection(ex, "org");
-    expect(q).toEqual({ open: "#+begin_example\n", body: "stuff\n", close: "#+end_example", lang: "" });
+    expect(q).toEqual({ open: "#+begin_example\n", body: "stuff", close: "\n#+end_example", lang: "" });
     expect(q!.open + q!.body + q!.close).toBe(ex);
   });
 
@@ -128,9 +128,9 @@ describe("codeBodyProjection", () => {
   it("payload range for GH #412: the body sits between the exact wrapper bytes", () => {
     const text = "```\necho hello\n```";
     const p = codeBodyProjection(text, "md");
-    expect(p!.body).toBe("echo hello\n");
+    expect(p!.body).toBe("echo hello");
     // Selecting the body in the projection's coordinate space excludes both fences.
-    expect(text.slice(p!.open.length, p!.open.length + p!.body.length)).toBe("echo hello\n");
+    expect(text.slice(p!.open.length, p!.open.length + p!.body.length)).toBe("echo hello");
     expect(p!.body).not.toContain("```");
   });
 });
@@ -139,7 +139,7 @@ describe("codeBodyProjection", () => {
 // the closer's bytes intact when the user types into the phantom last row or
 // the double-Enter exit trims the trailing blank line.
 describe("codeBodyJoin", () => {
-  const proj = { open: "```js\n", close: "```" };
+  const proj = { open: "```js\n", close: "\n```" };
 
   it("round-trips every projected body", () => {
     for (const body of ["", "\n", "const x = 1;\n", "const x = 1\n\n"]) {
@@ -148,14 +148,19 @@ describe("codeBodyJoin", () => {
     }
   });
 
-  it("keeps the closer on its own line when text is typed into the phantom last row", () => {
-    // The user typed "()" into the always-empty last body row — the closer
-    // must not be glued to it.
+  it("keeps the structural closer separator outside the editable body", () => {
     expect(codeBodyJoin(proj, "const x = 1\n()")).toBe("```js\nconst x = 1\n()\n```");
     // The double-Enter exit's trimmed body has no trailing newline.
     expect(codeBodyJoin(proj, "const x = 1")).toBe("```js\nconst x = 1\n```");
     // First character in an empty code block.
     expect(codeBodyJoin(proj, "x")).toBe("```js\nx\n```");
+  });
+
+  it("does not manufacture a payload newline across character-by-character commits", () => {
+    let raw = codeBodyJoin(proj, "n");
+    expect(codeBodyProjection(raw, "md")!.body).toBe("n");
+    raw = codeBodyJoin(codeBodyProjection(raw, "md")!, "na");
+    expect(codeBodyProjection(raw, "md")!.body).toBe("na");
   });
 });
 

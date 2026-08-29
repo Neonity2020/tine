@@ -174,7 +174,7 @@ describe("auto-pair matrix — ON by default (GH #291 OG parity)", () => {
       // shared boundary rule, not a code-fence special case.) A complete fence
       // edits body-only (GH #412/#413), so the typed surface is the payload.
       typeChar(fenced.textarea, "(", { caret: "const x = 1".length });
-      expect(fenced.textarea.value).toBe("const x = 1()\n");
+      expect(fenced.textarea.value).toBe("const x = 1()");
     } finally {
       fenced.dispose();
     }

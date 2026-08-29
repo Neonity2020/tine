@@ -60,7 +60,7 @@ describe("code-fence editor presentation", () => {
       expect(ta.getAttribute("wrap")).toBe("off");
       // Body-only code view (GH #412/#413): the payload, without the fences;
       // the wrapper bytes are preserved on commit (see codeBodyEdit tests).
-      expect(ta.value).toBe("const x = 1;\nconsole.log(x);\n");
+      expect(ta.value).toBe("const x = 1;\nconsole.log(x);");
     } finally {
       dispose();
     }
@@ -126,7 +126,7 @@ describe("code-fence editor presentation", () => {
     try {
       const ta = root.querySelector("textarea")!;
       expect(ta.classList.contains("code-edit")).toBe(true);
-      expect(ta.value).toBe("const x = 1;\n");
+      expect(ta.value).toBe("const x = 1;");
       // The code-only shape breaks (text after the fence): the class drops
       // live and the editor returns to the honest raw text.
       setRaw(id, "```js\nconst x = 1;\n```\nplain note");
@@ -137,7 +137,7 @@ describe("code-fence editor presentation", () => {
       setRaw(id, fenced);
       await Promise.resolve();
       expect(ta.classList.contains("code-edit")).toBe(true);
-      expect(ta.value).toBe("const x = 1;\n");
+      expect(ta.value).toBe("const x = 1;");
     } finally {
       dispose();
     }

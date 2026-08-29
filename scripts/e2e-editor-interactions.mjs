@@ -77,9 +77,23 @@ let browser;
 
 async function openProofPage() {
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
-  const link = await browser.$(`a.page-ref=${PAGE}`);
-  await link.waitForExist({ timeout: 10_000 });
-  await link.click();
+  let opened = false;
+  for (const selector of [`a.page-ref=${PAGE}`, `span.page-ref=${PAGE}`, `*=${PAGE}`]) {
+    const link = await browser.$(selector);
+    if (!await link.isExisting()) continue;
+    await link.click();
+    opened = true;
+    break;
+  }
+  if (!opened) {
+    const state = await browser.execute(() => ({
+      title: document.querySelector("h1.page-title")?.textContent?.trim() ?? null,
+      pageRefs: [...document.querySelectorAll(".page-ref")].map((node) => node.textContent?.trim()),
+      blocks: [...document.querySelectorAll(".ls-block")].map((node) => node.textContent?.trim()).slice(0, 10),
+    }));
+    fs.writeFileSync(path.join(ARTIFACTS, "navigation-failure.json"), `${JSON.stringify(state, null, 2)}\n`);
+    throw new Error(`could not find the proof-page reference: ${JSON.stringify(state)}`);
+  }
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === PAGE, {
     timeout: 10_000,
     timeoutMsg: `${PAGE} did not open`,
@@ -132,7 +146,7 @@ async function provePayloadOnlySelection() {
   const editor = await browser.$(".page-blocks textarea.block-editor.code-edit");
   await editor.waitForExist({ timeout: 5_000 });
   const initial = await activeEditorReceipt("412-code-body-initial");
-  if (initial.value !== "echo hello\n" || initial.value.includes("```")) {
+  if (initial.value !== "echo hello" || initial.value.includes("```")) {
     throw new Error(`complete code wrapper did not expose only its payload: ${JSON.stringify(initial)}`);
   }
   await browser.keys(["Control", "a"]);
@@ -140,7 +154,10 @@ async function provePayloadOnlySelection() {
   if (selected.selectionStart !== 0 || selected.selectionEnd !== selected.value.length || selected.value.includes("```")) {
     throw new Error(`native first Ctrl+A did not select exactly the payload: ${JSON.stringify(selected)}`);
   }
-  await browser.keys(["native payload"]);
+  // Use the WebDriver element text-input endpoint for ordinary text. The
+  // browser-level `keys` helper intentionally presses every supplied character
+  // before releasing any of them, which is correct for chords but not prose.
+  await editor.addValue("native payload");
   await browser.keys(["Escape"]);
   await browser.waitUntil(() => {
     const bytes = fs.readFileSync(PAGE_FILE, "utf8");

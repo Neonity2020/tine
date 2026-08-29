@@ -75,7 +75,7 @@ describe("body-only code editor (GH #412/#413)", () => {
   it("shows only the payload of a complete markdown fence, never the fences", () => {
     const { textarea, dispose } = mountPage("```\necho hello\n```");
     try {
-      expect(textarea.value).toBe("echo hello\n");
+      expect(textarea.value).toBe("echo hello");
       expect(textarea.value).not.toContain("```");
       // The code-card presentation itself is unchanged (GH #357 contract).
       expect(textarea.classList.contains("code-edit")).toBe(true);
@@ -108,7 +108,7 @@ describe("body-only code editor (GH #412/#413)", () => {
   it("shows only the body of an org #+BEGIN_SRC block and keeps org wrapper bytes", () => {
     const { textarea, blockId, dispose } = mountPage("#+BEGIN_SRC python\nx = 1\n#+END_SRC", "org");
     try {
-      expect(textarea.value).toBe("x = 1\n");
+      expect(textarea.value).toBe("x = 1");
       textarea.setSelectionRange(0, 0);
       typeText(textarea, "# ");
       expect(doc.byId[blockId].raw).toBe("#+BEGIN_SRC python\n# x = 1\n#+END_SRC");
@@ -150,7 +150,7 @@ describe("body-only code editor (GH #412/#413)", () => {
     const m = mount(() => <For each={pageByName(name)?.roots ?? []}>{(id) => <Block id={id} />}</For>);
     try {
       const ta = m.root.querySelector("textarea.block-editor") as HTMLTextAreaElement;
-      expect(ta.value).toBe("echo hello\n");
+      expect(ta.value).toBe("echo hello");
 
       // Press 1: falls through to the native select-all — which CANNOT reach
       // the fences because they are not part of the edited text at all.
@@ -159,7 +159,7 @@ describe("body-only code editor (GH #412/#413)", () => {
       expect(editingId()).toBe("code-holder");
       // The browser applies select-all: exactly the payload is selected.
       ta.setSelectionRange(0, ta.value.length);
-      expect(ta.value.slice(ta.selectionStart, ta.selectionEnd)).toBe("echo hello\n");
+      expect(ta.value.slice(ta.selectionStart, ta.selectionEnd)).toBe("echo hello");
       expect(ta.value.slice(ta.selectionStart, ta.selectionEnd)).not.toContain("```");
 
       // Press 2: the existing GH #262 escalation selects the block subtree.

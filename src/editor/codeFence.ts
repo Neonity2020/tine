@@ -134,18 +134,26 @@ export function codeBodyProjection(text: string, format: "md" | "org"): CodeBody
   const open = first + "\n";
   let closeStart = open.length;
   for (let i = 1; i < closer; i++) closeStart += lines[i].length + 1;
-  return { open, body: text.slice(open.length, closeStart), close: text.slice(closeStart), lang };
+  // The final newline before the closer is wrapper structure, not editable
+  // payload. Keeping it in `body` made every one-character live commit project
+  // a new trailing newline back into the controlled textarea, so the next
+  // character landed on a fresh line. Preserve that exact byte in `close`
+  // instead; explicit payload newlines remain in `body`.
+  const structuralSeparator = Math.max(open.length, closeStart - 1);
+  return {
+    open,
+    body: text.slice(open.length, structuralSeparator),
+    close: text.slice(structuralSeparator),
+    lang,
+  };
 }
 
-/** Rebuild the raw wrapper text for an edited body. This is the projection's
- *  inverse for every projected body, and it stays sane for bodies that are
- *  NOT in projected form: a projected body is "" or ends with "\n", so the
- *  user's last body row is always the phantom empty row before the closer;
- *  text typed INTO that row materializes it as a real line, which needs its
- *  own newline before the closer's bytes. The wrapper bytes (`open`/`close`)
- *  are re-attached exactly, never canonicalized. */
+/** Rebuild the raw wrapper text for an edited body. The mandatory separator
+ *  before the closer belongs to `close`, so ordinary per-character commits do
+ *  not leak it into the controlled textarea. Explicit body newlines remain
+ *  payload. The wrapper bytes are re-attached exactly, never canonicalized. */
 export function codeBodyJoin(proj: Pick<CodeBodyProjection, "open" | "close">, body: string): string {
-  return proj.open + body + (body !== "" && !body.endsWith("\n") ? "\n" : "") + proj.close;
+  return proj.open + body + proj.close;
 }
 
 /** The body-space counterpart of the special-block double-Enter exit: with
