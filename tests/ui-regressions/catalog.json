@@ -180,7 +180,7 @@
     "macos"
    ],
    "layer": "native",
-   "status": "reported",
+   "status": "reproduced",
    "coverage": {
     "tests": [
      "crates/tine-core/src/sync_runtime.rs::android_instrumentation_save_journey_shape_succeeds_on_a_host_graph",
@@ -8755,9 +8755,9 @@
      ".github/scripts/android-ui-runtime.sh"
     ],
     "scenario": "android-ui-runtime.responsive-chrome-motion-events",
-    "failBefore": "unavailable"
+    "failBefore": "proven"
    },
-   "notes": "The focused manual API-35 x86_64 lane resets to the real first-run demo graph, drives the packaged WebView with Android MotionEvents, and records inner/visual viewport, DPR, root zoom, topbar geometry, direct and overflow actions, free width, JUnit accounting, screenshot, DOM/native receipt, and targeted logcat. It asserts declared fit/no-clipping behavior rather than fixed screenshot pixels. The hardware-equivalent hosted emulator has not run for this branch, so #205 remains reported here; it is not evidence for every OEM WebView or display scale."
+   "notes": "The focused manual API-35 x86_64 lane resets to the real first-run demo graph, drives the packaged WebView with Android MotionEvents, and records inner/visual viewport, DPR, root zoom, topbar geometry, direct and overflow actions, free width, JUnit accounting, screenshot, DOM/native receipt, and targeted logcat. Hosted run 33251907222 produced six non-vacuous geometry samples with no clipping, but the visible portrait overflow control ignored the native tap at root zoom 1.0, 0.9, and 1.1; landscape fit remained clean. This is a product failure, not evidence for every OEM WebView or display scale."
   },
   {
    "id": "UI-ANDROID-UI-RUNTIME-LONG-PRESS-207",
@@ -8773,16 +8773,16 @@
     "android"
    ],
    "layer": "native",
-   "status": "reported",
+   "status": "reproduced",
    "coverage": {
     "tests": [
      "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation",
      ".github/scripts/android-ui-runtime.sh"
     ],
     "scenario": "android-ui-runtime.page-reference-exclusive-long-press",
-    "failBefore": "unavailable"
+    "failBefore": "proven"
    },
-   "notes": "The manual native method installs a DOM mutation trace, sends one Android ACTION_DOWN/long-press/ACTION_UP sequence to a rendered demo-graph page reference, and fails unless exactly one Page actions menu remains while preview count, selection text, and route stay unchanged. Its receipt is retained even on failure so a flash-and-disappear cannot be counted green. No hosted result exists for this branch, and the emulator result must not be substituted for the reporter's OEM outcome."
+   "notes": "The manual native method installs a DOM mutation trace, sends one Android ACTION_DOWN/long-press/ACTION_UP sequence to a rendered demo-graph page reference, and fails unless exactly one Page actions menu remains while preview count, selection text, and route stay unchanged. Hosted run 33251907222 reached a real demo page reference and retained the full product-failure receipt: zero Page actions menus, one preview, and selected text `Roadmap`, with the route unchanged. The emulator result must not be substituted for the reporter's OEM outcome."
   },
   {
    "id": "UI-ANDROID-UI-RUNTIME-INITIAL-SELECTION-375",
@@ -8807,7 +8807,7 @@
     "scenario": "android-ui-runtime.initial-native-selection-toolbar",
     "failBefore": "unavailable"
    },
-   "notes": "The focused method taps a real demo-graph block, requests the Android IME, and probes short and long rendered text with initial native long presses only—no follow-up handle drag, IME dismissal, or orientation change. It requires a non-empty textarea selection and Tine’s mobile toolbar, and receipts WindowInsets IME state. Hosted API-35 evidence is still unverified; the row stays reported rather than claiming OEM ActionMode/IME coverage."
+   "notes": "The focused method is designed to tap a real demo-graph block, request the Android IME, and probe short and long rendered text with initial native long presses only—no follow-up handle drag, IME dismissal, or orientation change. Hosted API-35 run 33251907222 compiled and executed the harness but timed out before a focused textarea existed, retaining a valid screenshot and structured harness-failure receipt but no journey receipt. #375 therefore remains unproven; this row records an acceptance-lane gap, not product or OEM ActionMode/IME evidence."
   },
   {
    "id": "UI-CODEBLOCK-BODY-ONLY-412",
