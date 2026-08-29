@@ -59,3 +59,106 @@ export function codeFenceOnly(text: string, format: "md" | "org"): CodeFenceShap
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// GH #412/#413: the body-only projection behind the code editor.
+//
+// While the whole visible block is ONE COMPLETE code wrapper, the block editor
+// shows only the payload between the wrapper lines and commits re-attach the
+// exact wrapper bytes. The projection is the pure contract: it splits the raw
+// text into `open` (opening fence line, newline included), `body` (everything
+// between the wrapper lines, verbatim) and `close` (closer line through the
+// end of the block), so `open + body + close === text` always holds. Unlike
+// `codeFenceOnly` (a presentation-shape detector that tolerates an unclosed
+// fence while typing), the projection requires a CLOSED wrapper with the
+// CommonMark closing rule — the closer uses the opener's character and is at
+// least as long. Mixed content, incomplete/malformed wrappers and ```calc
+// (its own editor mode) return null and keep raw editing.
+
+export interface CodeBodyProjection {
+  /** Opening fence/`#+begin` line bytes INCLUDING the trailing newline. */
+  open: string;
+  /** Body bytes between the wrapper lines, verbatim (may be "" or end in "\n"). */
+  body: string;
+  /** Closing fence/`#+end` line through the end of the text (trailing blank
+   *  lines after the closer included, exactly as authored). */
+  close: string;
+  /** Info-string language id ("" when none). */
+  lang: string;
+}
+
+/** Find the wrapper's closer line index (≥ 1) under the CommonMark closing
+ *  rule, or -1 when no line closes the wrapper. */
+function closerLineIndex(lines: string[], format: "md" | "org", fence: { char: "`" | "~"; length: number } | null): number {
+  for (let i = 1; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (format === "org") {
+      if (ORG_END.test(trimmed)) return i;
+      continue;
+    }
+    const run = /^(`{3,}|~{3,})$/.exec(trimmed);
+    if (run && fence && run[1][0] === fence.char && run[1].length >= fence.length) return i;
+  }
+  return -1;
+}
+
+/** Split a COMPLETE whole-block code wrapper into exact open/body/close
+ *  bytes, or null for mixed, incomplete, malformed, calc, or non-code text. */
+export function codeBodyProjection(text: string, format: "md" | "org"): CodeBodyProjection | null {
+  const lines = text.split("\n");
+  if (lines.length < 2) return null;
+  const first = lines[0];
+  let lang: string;
+  let fence: { char: "`" | "~"; length: number } | null = null;
+  if (format === "md") {
+    const m = MD_FENCE.exec(first);
+    if (!m) return null;
+    lang = langOf(m[2] ?? "");
+    if (lang === "calc") return null;
+    fence = { char: m[1][0] as "`" | "~", length: m[1].length };
+  } else {
+    const src = ORG_SRC.exec(first);
+    if (src) {
+      lang = langOf(src[1] ?? "");
+      if (lang === "calc") return null;
+    } else if (ORG_EXAMPLE.test(first)) {
+      lang = "";
+    } else {
+      return null;
+    }
+  }
+  const closer = closerLineIndex(lines, format, fence);
+  if (closer === -1) return null; // incomplete: still being authored
+  // Content after the closer (other than trailing blank lines) is mixed.
+  if (!lines.slice(closer + 1).every((line) => line.trim() === "")) return null;
+  const open = first + "\n";
+  let closeStart = open.length;
+  for (let i = 1; i < closer; i++) closeStart += lines[i].length + 1;
+  return { open, body: text.slice(open.length, closeStart), close: text.slice(closeStart), lang };
+}
+
+/** Rebuild the raw wrapper text for an edited body. This is the projection's
+ *  inverse for every projected body, and it stays sane for bodies that are
+ *  NOT in projected form: a projected body is "" or ends with "\n", so the
+ *  user's last body row is always the phantom empty row before the closer;
+ *  text typed INTO that row materializes it as a real line, which needs its
+ *  own newline before the closer's bytes. The wrapper bytes (`open`/`close`)
+ *  are re-attached exactly, never canonicalized. */
+export function codeBodyJoin(proj: Pick<CodeBodyProjection, "open" | "close">, body: string): string {
+  return proj.open + body + (body !== "" && !body.endsWith("\n") ? "\n" : "") + proj.close;
+}
+
+/** The body-space counterpart of the special-block double-Enter exit: with
+ *  the caret on a TRAILING blank body line, drop that sentinel line (the
+ *  caller then commits the trimmed body and creates a sibling block). Blank
+ *  lines in the middle are ordinary content; an all-blank body never exits. */
+export function codeBodyExitTrim(text: string, caret: number): string | null {
+  const c = Math.max(0, Math.min(caret, text.length));
+  const lineStart = text.lastIndexOf("\n", c - 1) + 1;
+  let lineEnd = text.indexOf("\n", c);
+  if (lineEnd === -1) lineEnd = text.length;
+  if (text.slice(lineStart, lineEnd).trim() !== "" || lineStart === 0) return null;
+  if (text.slice(lineEnd).trim() !== "") return null;
+  const trimmed = text.slice(0, lineStart - 1);
+  return trimmed.trim() === "" ? null : trimmed;
+}

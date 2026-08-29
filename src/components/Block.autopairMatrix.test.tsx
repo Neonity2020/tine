@@ -171,9 +171,10 @@ describe("auto-pair matrix — ON by default (GH #291 OG parity)", () => {
     const fenced = mountEditor("```js\nconst x = 1\n```");
     try {
       // Line-end is a boundary: pairs. (Inside a word it wouldn't — the same
-      // shared boundary rule, not a code-fence special case.)
-      typeChar(fenced.textarea, "(", { caret: "```js\nconst x = 1".length });
-      expect(fenced.textarea.value).toBe("```js\nconst x = 1()\n```");
+      // shared boundary rule, not a code-fence special case.) A complete fence
+      // edits body-only (GH #412/#413), so the typed surface is the payload.
+      typeChar(fenced.textarea, "(", { caret: "const x = 1".length });
+      expect(fenced.textarea.value).toBe("const x = 1()\n");
     } finally {
       fenced.dispose();
     }

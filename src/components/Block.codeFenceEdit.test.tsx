@@ -2,7 +2,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { For, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { initParser } from "../render/parse";
-import { loadSingle, pageByName, resetStore } from "../store";
+import { loadSingle, pageByName, resetStore, setRaw } from "../store";
 import { startEditing } from "../editorController";
 import type { BlockDto, PageDto } from "../types";
 import { Block } from "./Block";
@@ -13,6 +13,12 @@ import { Editor } from "./Block";
 // textarea, so clicking a code block changed every line's layout. While the
 // block IS code-shaped, the editor now presents as the same code card; mixed
 // blocks keep ordinary editing presentation.
+//
+// GH #412/#413 follow-up (the Martin-authorized body-only code editor
+// contract): a COMPLETE whole-block wrapper's editor shows only the payload
+// between the wrapper lines and preserves the wrapper bytes on commit. The
+// earlier "raw text, fences editable" assertion below is intentionally
+// replaced by that contract; the card presentation (mono, no-wrap) is not.
 
 beforeAll(async () => {
   await initParser();
@@ -52,8 +58,9 @@ describe("code-fence editor presentation", () => {
       // Hard requirement: no soft wrapping — long code lines scroll
       // horizontally exactly like the rendered white-space:pre card.
       expect(ta.getAttribute("wrap")).toBe("off");
-      // The raw text is untouched: fences stay visible and editable.
-      expect(ta.value).toBe("```js\nconst x = 1;\nconsole.log(x);\n```");
+      // Body-only code view (GH #412/#413): the payload, without the fences;
+      // the wrapper bytes are preserved on commit (see codeBodyEdit tests).
+      expect(ta.value).toBe("const x = 1;\nconsole.log(x);\n");
     } finally {
       dispose();
     }
@@ -108,8 +115,9 @@ describe("code-fence editor presentation", () => {
     }
   });
 
-  it("live-typing transitions update the presentation (plain text → typing a fence → closing it)", async () => {
-    loadSingle(page("Live", [blk("c5", "```js\nconst x = 1;\n```")]));
+  it("live transitions update the presentation when the block's code shape changes", async () => {
+    const fenced = "```js\nconst x = 1;\n```";
+    loadSingle(page("Live", [blk("c5", fenced)]));
     const id = pageByName("Live")!.roots[0];
     startEditing(id, 0);
     const { root, dispose } = mount(() => (
@@ -118,11 +126,18 @@ describe("code-fence editor presentation", () => {
     try {
       const ta = root.querySelector("textarea")!;
       expect(ta.classList.contains("code-edit")).toBe(true);
-      // Break the code-only shape (text after the fence): class drops live.
-      ta.value = "```js\nconst x = 1;\n```\nplain note";
-      ta.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      expect(ta.value).toBe("const x = 1;\n");
+      // The code-only shape breaks (text after the fence): the class drops
+      // live and the editor returns to the honest raw text.
+      setRaw(id, "```js\nconst x = 1;\n```\nplain note");
       await Promise.resolve();
       expect(ta.classList.contains("code-edit")).toBe(false);
+      expect(ta.value).toBe("```js\nconst x = 1;\n```\nplain note");
+      // …and back: the body-only code view flips in again.
+      setRaw(id, fenced);
+      await Promise.resolve();
+      expect(ta.classList.contains("code-edit")).toBe(true);
+      expect(ta.value).toBe("const x = 1;\n");
     } finally {
       dispose();
     }
