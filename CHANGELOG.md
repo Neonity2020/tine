@@ -43,6 +43,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   managed oplog or `.tine-sync`; open PDF/audio/video sessions are not replaced
   mid-use and see new bytes when reopened.
 
+- Windows updater failures now leave a privacy-safe stage and cause in
+  Diagnostics, with a sanitized detailed chain available in debug mode. A
+  32-bit Windows build also links to the manual package instead of offering an
+  automatic install that its signed updater manifest does not publish (GH
+  #241). The reporter's underlying native network failure remains under
+  investigation.
+
 - Block background colors no longer crowd their bullets. Regular dots and
   numbered-list ordinals now occupy the same 22px control track, while the
   rounded highlight keeps text aligned with an unhighlighted or edited block.

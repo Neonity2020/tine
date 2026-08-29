@@ -70,7 +70,7 @@ use commands::{
     write_highlights, write_pdf_view_state,
 };
 use debug::{
-    clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
+    app_architecture, clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
     diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, flight_init,
     install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
 };
@@ -916,6 +916,7 @@ pub fn run() {
             apply_spellcheck,
             list_spellcheck_dictionaries,
             debug_info,
+            app_architecture,
             debug_log,
             diagnostic_ipc_event,
             diagnostic_frontend_event,

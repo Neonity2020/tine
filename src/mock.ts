@@ -776,6 +776,9 @@ export function mockBackend(): Backend {
       if (requested === "android" || requested === "ios") return requested;
       return "desktop";
     },
+    async appArchitecture(): Promise<string> {
+      return "x86_64";
+    },
     async listInstalledPlugins() {
       return mockPlugins.map((plugin) => ({ ...plugin }));
     },
