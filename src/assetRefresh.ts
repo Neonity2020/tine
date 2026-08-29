@@ -44,8 +44,9 @@ function deferHotSwap(rel: string): boolean {
 }
 
 /** Apply one native watcher epoch. Images (and image-like unknown embeds)
- * refresh in place. PDF/audio/video bytes are invalidated for the next open but
- * an already-open document or playback session is deliberately left alone. */
+ * refresh in place. PDF/audio/video never receive a reactive re-key, so an
+ * already-open document or playback session stays on its current bytes; their
+ * uncached open paths read current disk bytes the next time they are opened. */
 export function applyObservedAssetChanges(paths: string[]): void {
   for (const rel of new Set(paths.filter(Boolean))) {
     if (deferHotSwap(rel)) invalidateAsset(rel);
