@@ -19,7 +19,7 @@
 
 import { isTauri, backend } from "./backend";
 import { platformKind } from "./platform";
-import { pushToast, dismissToast } from "./ui";
+import { pushToast, dismissToast, openSettings } from "./ui";
 
 const REPO = "martinkoutecky/tine";
 const RELEASES_PAGE = `https://github.com/${REPO}/releases/latest`;
@@ -40,6 +40,123 @@ function isNewer(a: [number, number, number], b: [number, number, number]): bool
 }
 
 type UpdateMode = "self" | "manual" | "unavailable";
+
+export type UpdaterFailureStage =
+  | "manifest_fetch"
+  | "manifest_parse"
+  | "target_selection"
+  | "download"
+  | "signature_verification"
+  | "install"
+  | "relaunch";
+
+export type UpdaterFailureCause =
+  | "network"
+  | "invalid_manifest"
+  | "unsupported_target"
+  | "invalid_signature"
+  | "install_failed"
+  | "relaunch_failed"
+  | "unknown";
+
+type UpdaterFailurePhase = "check" | "apply" | "relaunch";
+type UpdaterFailure = { stage: UpdaterFailureStage; cause: UpdaterFailureCause };
+
+function errorText(error: unknown): string {
+  const parts: string[] = [];
+  const seen = new Set<object>();
+  let current: unknown = error;
+  while (current != null && parts.length < 4) {
+    if (typeof current === "string") {
+      parts.push(current);
+      break;
+    }
+    if (typeof current !== "object" || seen.has(current)) break;
+    seen.add(current);
+    const message = (current as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) parts.push(message);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return parts.join(" caused by ") || "unknown updater failure";
+}
+
+/** Reduce a native/plugin failure to fixed tokens before it enters the always-on
+ * diagnostic report. The raw text is never sent to that recorder. */
+export function classifyUpdaterFailure(phase: UpdaterFailurePhase, error: unknown): UpdaterFailure {
+  const text = errorText(error).toLowerCase();
+  if (phase === "relaunch") return { stage: "relaunch", cause: "relaunch_failed" };
+  if (phase === "check") {
+    if (/request|network|connect|connection|dns|tls|certificate|proxy|timed? ?out/.test(text)) {
+      return { stage: "manifest_fetch", cause: "network" };
+    }
+    if (
+      /none of the fallback platforms (?:was|were) found|platform .+ (?:was|is) not found in (?:the )?(?:release|response)/.test(text)
+    ) {
+      return { stage: "target_selection", cause: "unsupported_target" };
+    }
+    if (
+      /invalid json|deserialize|failed to parse|release response|release manifest|missing field|unknown field|invalid type|expected (?:value|identifier|struct|sequence|map)|trailing characters|eof while parsing|key must be a string/.test(text)
+    ) {
+      return { stage: "manifest_parse", cause: "invalid_manifest" };
+    }
+    return { stage: "manifest_fetch", cause: "unknown" };
+  }
+  if (/minisign|signature|base64/.test(text)) {
+    return { stage: "signature_verification", cause: "invalid_signature" };
+  }
+  if (/request|network|download|connect|connection|dns|tls|certificate|proxy|timed? ?out/.test(text)) {
+    return { stage: "download", cause: "network" };
+  }
+  if (/install|package|authentication|permission|access denied|binary|archive|rename/.test(text)) {
+    return { stage: "install", cause: "install_failed" };
+  }
+  // `downloadAndInstall` is one upstream call. If it supplies no classifiable
+  // cause, do not pretend to know which internal sub-step failed.
+  return { stage: "install", cause: "unknown" };
+}
+
+function safeUpdaterErrorChain(error: unknown): string {
+  return errorText(error)
+    .replace(/\b(?:https?|file):\/\/[^\s"'<>]+/gi, "<url>")
+    .replace(/\b(proxy[-_ ]?authorization|authorization)\s*[:=]\s*[^\r\n,;]+/gi, "$1=<redacted>")
+    .replace(
+      /\b(password|passwd|access[_-]?token|api[_-]?key|token|credential|secret)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      "$1=<redacted>",
+    )
+    .replace(/(?:[A-Za-z]:[\\/]|\\\\|\/\/)[^\r\n,;]+/g, "<path>")
+    .replace(/(^|\s|\(|"|')\/(?:home|Users|tmp|var|etc)\/[^\r\n,;)\]"']+/gi, "$1<path>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+}
+
+function emitUpdaterDiagnostic(failure: UpdaterFailure, error: unknown): void {
+  // Fixed enum tokens only enter the always-on report. The bounded, scrubbed
+  // chain goes solely to the opt-in debug log.
+  void backend().diagnosticFrontendEvent(
+    "updater_failure",
+    undefined,
+    undefined,
+    undefined,
+    failure.stage,
+    failure.cause,
+  ).catch(() => {});
+  const safeChain = safeUpdaterErrorChain(error);
+  void backend().debugLog(
+    `updater failure stage=${failure.stage} cause=${failure.cause}: ${safeChain}`,
+  ).catch(() => {});
+  console.error("[update] self-update failed:", safeChain);
+}
+
+const STAGE_LABEL: Record<UpdaterFailureStage, string> = {
+  manifest_fetch: "manifest fetch",
+  manifest_parse: "manifest parsing",
+  target_selection: "platform selection",
+  download: "download",
+  signature_verification: "signature verification",
+  install: "installation",
+  relaunch: "relaunch",
+};
 
 /** Resolve update behavior conservatively. Mobile builds update through their
  * distribution channel; a platform-detection failure must therefore fail closed
@@ -62,6 +179,7 @@ function openReleases(): void {
 }
 
 let offeredUpdateToastId: number | null = null;
+let offerGeneration = 0;
 
 /** The toast's "Download" action. Win/Linux packaged app → run the Tauri updater
  *  in place and relaunch; everything else (macOS, browser, or any failure) → open
@@ -73,34 +191,88 @@ async function applyUpdateOrOpen(): Promise<void> {
     openReleases();
     return;
   }
-  let progressId: number | null = null;
+  let update: Awaited<ReturnType<(typeof import("@tauri-apps/plugin-updater"))["check"]>>;
   try {
     const { check } = await import("@tauri-apps/plugin-updater");
-    const update = await check();
-    if (!update) {
-      // No signed `latest.json` yet (or already current) → manual path.
-      openReleases();
-      return;
-    }
-    progressId = pushToast(`Downloading Tine ${update.version}…`, "info", { sticky: true });
+    update = await check();
+  } catch (error) {
+    const failure = classifyUpdaterFailure("check", error);
+    emitUpdaterDiagnostic(failure, error);
+    pushToast(
+      `Couldn't apply the update during ${STAGE_LABEL[failure.stage]} — opening the releases page instead. Diagnostics has the safe failure stage; launch Tine with --debug for the sanitized cause chain.`,
+      "error",
+      { action: { label: "Diagnostics", run: () => openSettings("diagnostics") } },
+    );
+    openReleases();
+    return;
+  }
+  if (!update) {
+    // No signed `latest.json` yet (or already current) → manual path.
+    openReleases();
+    return;
+  }
+
+  const progressId = pushToast(`Downloading Tine ${update.version}…`, "info", { sticky: true });
+  try {
     await update.downloadAndInstall();
+  } catch (error) {
+    dismissToast(progressId);
+    const failure = classifyUpdaterFailure("apply", error);
+    emitUpdaterDiagnostic(failure, error);
+    pushToast(
+      `Couldn't apply the update during ${STAGE_LABEL[failure.stage]} — opening the releases page instead. Diagnostics has the safe failure stage; launch Tine with --debug for the sanitized cause chain.`,
+      "error",
+      { action: { label: "Diagnostics", run: () => openSettings("diagnostics") } },
+    );
+    openReleases();
+    return;
+  }
+
+  try {
     const { relaunch } = await import("@tauri-apps/plugin-process");
     await relaunch(); // process restarts into the new version (this toast goes with it)
-  } catch (err) {
-    if (progressId != null) dismissToast(progressId);
-    // GH #241: never fail silently here. A swallowed error made every updater
-    // failure (signature/verify/download/install) indistinguishable from the
-    // manual fallback, so Windows failures were undiagnosable. Log the real
-    // error (it lands in the debug log) and tell the user; the releases page
-    // still opens as the safe fallback — it can never brick the app.
-    console.error("[update] self-update failed:", err);
-    pushToast("Couldn't apply the update — opening the releases page instead. The debug log has the error.", "error");
-    openReleases(); // signature/verify/network failure → never brick, just offer the page
+  } catch (error) {
+    dismissToast(progressId);
+    const failure = classifyUpdaterFailure("relaunch", error);
+    emitUpdaterDiagnostic(failure, error);
+    pushToast(
+      `The update installed but Tine could not relaunch. Diagnostics has the safe failure stage; launch Tine with --debug for the sanitized cause chain.`,
+      "error",
+      { action: { label: "Diagnostics", run: () => openSettings("diagnostics") } },
+    );
   }
 }
 
-function offerUpdate(version: string, current: string): void {
+/** @internal Exported for deterministic concurrency coverage. */
+export async function offerUpdate(version: string, current: string): Promise<void> {
+  const generation = ++offerGeneration;
+  let architecture: string | null = null;
+  try {
+    architecture = await backend().appArchitecture();
+  } catch {
+    // The packaged app always has this native command. Preserve the established
+    // offer if an older browser/mock boundary cannot report architecture.
+  }
+  // Startup and an explicit check can resolve concurrently. Only the newest
+  // offer attempt may replace/publish the singleton sticky prompt.
+  if (generation !== offerGeneration) return;
   if (offeredUpdateToastId !== null) dismissToast(offeredUpdateToastId);
+  if (architecture === "x86") {
+    const failure: UpdaterFailure = {
+      stage: "target_selection",
+      cause: "unsupported_target",
+    };
+    emitUpdaterDiagnostic(failure, "automatic updater target unavailable for x86");
+    offeredUpdateToastId = pushToast(
+      `Tine ${version} is available, but automatic updates are not supported by this experimental 32-bit Windows build. Download the x86 package manually.`,
+      "warn",
+      {
+        sticky: true,
+        action: { label: "Download manually", run: openReleases },
+      },
+    );
+    return;
+  }
   offeredUpdateToastId = pushToast(
     `Tine ${version} is available — you're on ${current}.`,
     "info",
@@ -133,7 +305,7 @@ export async function checkForUpdate(): Promise<void> {
     const latest = typeof tag === "string" ? parseVer(tag) : null;
     if (!latest || !isNewer(latest, cur)) return;
 
-    offerUpdate(latest.join("."), cur.join("."));
+    await offerUpdate(latest.join("."), cur.join("."));
   } catch {
     // offline / rate-limited / network blocked — never bother the user.
   }
@@ -166,7 +338,7 @@ export async function checkForUpdateNow(): Promise<UpdateStatus> {
     if (isNewer(latest, cur)) {
       const version = latest.join(".");
       const current = cur.join(".");
-      offerUpdate(version, current);
+      await offerUpdate(version, current);
       return { kind: "available", version, current };
     }
     return { kind: "current", version: cur.join(".") };

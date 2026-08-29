@@ -58,6 +58,17 @@ const androidManagedRuntimeScript = fs.readFileSync(
   path.join(process.cwd(), ".github/scripts/android-managed-storage-runtime.sh"),
   "utf8"
 );
+const androidUiRuntimeScript = fs.readFileSync(
+  path.join(process.cwd(), ".github/scripts/android-ui-runtime.sh"),
+  "utf8"
+);
+const androidUiRuntimeTest = fs.readFileSync(
+  path.join(
+    process.cwd(),
+    "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt"
+  ),
+  "utf8"
+);
 const windowsWebviewDriverInstaller = fs.readFileSync(
   path.join(process.cwd(), "scripts/install-windows-webview2-driver.ps1"),
   "utf8"
@@ -554,6 +565,11 @@ assert.match(
 );
 assert.match(
   ciWorkflow,
+  /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- android-ui-runtime/,
+  "manual CI does not expose the focused Android UI runtime proof scope"
+);
+assert.match(
+  ciWorkflow,
   /pull_request:[\s\S]*?paths-ignore:[\s\S]*?"\*\*\/\*\.md"/,
   "docs-only pull requests still start app validation"
 );
@@ -783,6 +799,7 @@ assert.doesNotMatch(
 assert.doesNotMatch(fullLinux.join("\n"), /cargo test -p tine-core/, "Linux full evidence still has a monolithic core run");
 const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
 const androidManagedRuntime = yamlBlock(ciJobs, "android-managed-storage-runtime", 2);
+const androidUiRuntime = yamlBlock(ciJobs, "android-ui-runtime", 2);
 const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
 const performanceBench = yamlBlock(ciJobs, "bench", 2);
 assert.equal(yamlScalar(fullLinux, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
@@ -817,6 +834,118 @@ assert.match(
   /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest\nif ! run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest; then[\s\S]*QUARANTINED Android Safe Back instrumentation/,
   "managed-storage runtime must remain blocking while exhausted Safe Back emulator infrastructure is explicitly quarantined"
 );
+assert.equal(
+  yamlScalar(androidUiRuntime, "name", 4),
+  "Android UI runtime / MotionEvent proof receipts"
+);
+assert.equal(
+  yamlScalar(androidUiRuntime, "if", 4),
+  "github.event_name == 'workflow_dispatch' && inputs.scope == 'android-ui-runtime'"
+);
+assert.doesNotMatch(
+  androidUiRuntime.join("\n"),
+  /inputs\.scope == 'full'/,
+  "physical Android UI proof must remain a focused manual lane, not an all-frontend release gate"
+);
+assert.equal(
+  yamlScalar(yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs"), "uses", 8),
+  "reactivecircus/android-emulator-runner@v2"
+);
+const androidUiRuntimeUpload = yamlNamedStep(androidUiRuntime, "Upload Android UI runtime evidence");
+assert.equal(yamlScalar(androidUiRuntimeUpload, "if", 8), "always()");
+assert.equal(yamlScalar(androidUiRuntimeUpload, "uses", 8), "actions/upload-artifact@v4");
+assert.equal(
+  yamlScalar(yamlBlock(androidUiRuntimeUpload, "with", 8), "name", 10),
+  "android-ui-runtime-${{ github.sha }}"
+);
+assert.match(
+  androidUiRuntimeScript,
+  /adb shell pm clear page\.tine\.app[\s\S]*?adb shell am instrument -w/,
+  "Android UI runtime runner must reset the first-run graph and retain JUnit, screenshot, receipt, and targeted logcat evidence"
+);
+for (const evidence of [
+  "TINE_ANDROID_UI_RUNTIME_RECEIPT",
+  'cat "files/android-ui-runtime/$method.png"',
+  "adb exec-out run-as page.tine.app cat",
+  'screenshot_png_signature',
+  '89504e470d0a1a0a',
+  'jq -e --arg method',
+  "AndroidRuntime:E DEBUG:V chromium:E TineAndroidUi:I TestRunner:V libc:F",
+]) {
+  assert.ok(androidUiRuntimeScript.includes(evidence), `Android UI runtime runner is missing ${evidence}`);
+}
+for (const method of [
+  "responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent",
+  "longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation",
+  "initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement",
+]) {
+  assert.ok(
+    androidUiRuntimeScript.includes(method),
+    `Android UI runner must select the ${method} instrumentation method`
+  );
+  assert.ok(androidUiRuntimeTest.includes(`fun ${method}()`), `Android UI instrumentation is missing ${method}`);
+}
+assert.match(
+  androidUiRuntimeScript,
+  /if ! run_journey "\$method"; then[\s\S]*?overall=1/,
+  "Android UI runner must run each selected method in a separately reset instrumentation lifetime"
+);
+assert.match(
+  androidUiRuntimeTest,
+  /MotionEvent\.obtain[\s\S]*?uiAutomation\.injectInputEvent/,
+  "Android UI instrumentation must inject real Android MotionEvents through Android UiAutomation"
+);
+assert.doesNotMatch(
+  androidUiRuntimeTest,
+  /webView\.dispatchTouchEvent/,
+  "Android UI instrumentation must not bypass Android's screen-level input path"
+);
+assert.doesNotMatch(
+  androidUiRuntimeTest,
+  /new PointerEvent|new MouseEvent|dispatchEvent\(new (?:PointerEvent|MouseEvent)/,
+  "Android UI instrumentation must not replace native input with synthetic JavaScript pointer events"
+);
+assert.match(
+  androidUiRuntimeTest,
+  /MutationObserver[\s\S]*?menuAdds[\s\S]*?previewAdds[\s\S]*?selectionEvents[\s\S]*?routeEvents/,
+  "page-reference long press must retain a mutation trace and reject preview, selection, and navigation side effects"
+);
+for (const nonVacuousBoundary of [
+  "welcomeGone",
+  "openDemoWelcomePage",
+  "awaitVisibleElementByScrolling",
+  "MotionEvent.ACTION_MOVE",
+  "directOptional",
+  "menuAdds",
+  "previewAdds",
+  "selectionEvents",
+  "routeEvents",
+  "first-line-caret-second-line-hold",
+  "tapAtEditorLine",
+  "longPressAtEditorLine",
+  "toolbarVisible",
+  "uiAutomation.takeScreenshot",
+]) {
+  assert.ok(
+    androidUiRuntimeTest.includes(nonVacuousBoundary),
+    `Android UI instrumentation is missing the non-vacuous ${nonVacuousBoundary} boundary`
+  );
+}
+assert.doesNotMatch(
+  androidUiRuntimeTest,
+  /scenario\.close\(\)/,
+  "per-method force-stop must own WebView teardown because ActivityScenario.close crashes the hosted emulator's HWUI thread"
+);
+assert.ok(
+  androidUiRuntimeTest.includes("TINE_ANDROID_UI_RUNTIME_FAILURE"),
+  "Android UI instrumentation must preserve a screenshot and DOM receipt when a harness stage fails"
+);
+for (const semanticReceipt of ["WindowInsets.Type.ime()", "mobileToolbar", "selectionLength"]) {
+  assert.ok(
+    androidUiRuntimeTest.includes(semanticReceipt),
+    `initial native selection must receipt ${semanticReceipt}`
+  );
+}
 assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
 assert.equal(
   yamlScalar(androidTestApk, "if", 4),

@@ -180,7 +180,7 @@
     "macos"
    ],
    "layer": "native",
-   "status": "reported",
+   "status": "reproduced",
    "coverage": {
     "tests": [
      "crates/tine-core/src/sync_runtime.rs::android_instrumentation_save_journey_shape_succeeds_on_a_host_graph",
@@ -6527,8 +6527,32 @@
    "notes": "GH #253. Matches were already tracked per-occurrence and highlighted; only the reveal scrolled the whole block to center. revealInPageFindMatch now resolves the active occurrence's Range rect (same ordinal as the highlight layer) and adjusts the nearest vertical scroller to center it, falling back to the coarse block scroll when no DOM-text range exists (edit-mode textarea). WebKitGTK scroll behavior not runtime-verified here; jsdom test with stubbed range rects proves the semantic scroll delta (fail-before: scrollTop stayed 0 pre-fix). REVIEW CORRECTION (manager, integration): nearestVerticalScroller accepted any ancestor with overflow-y auto/scroll, including one that does not actually overflow. Adjusting such an element's scrollTop is a no-op, and the function still reported success, so the caller skipped its block-level scrollIntoView fallback and the occurrence stayed off-screen -- strictly worse than the behaviour this change replaced. It now requires scrollHeight > clientHeight; the existing jsdom fixture had to start modelling a scroller that really can scroll. KNOWN COVERAGE GAP: a regression test for the non-scrolling-ancestor branch was attempted and withdrawn -- revealInPageFindMatch did not reach the scroll step under that jsdom fixture and chasing it was harness work, not product work (AGENTS.md economy rule). The guard is reasoned from the DOM contract and is not covered by a test."
   },
   {
-   "id": "UI-UPDATER-FAILURE-SURFACE-241",
-   "title": "Windows update checks use the native network path, show one offer, and require separate install confirmation",
+   "id": "UI-UPDATER-NATIVE-TRANSPORT-241",
+   "title": "The native Windows updater reaches the signed manifest and installer assets through the affected network route",
+   "family": "updater",
+   "sources": {
+    "issues": [
+     241
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "windows"
+   ],
+   "layer": "native",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "src/update.test.ts"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #241. Negative v0.6.94 and v0.6.97 reporter follow-ups revoke the native-transport fix claim: WebView2 reaches GitHub, while the Rust updater fails fetching latest.json before manifest parsing, target selection, signature verification, download, or installation. Native TLS and Reqwest's manual Windows system-proxy feature are present but are structural evidence only; PAC/WPAD or integrated-auth proxy behavior remains a hypothesis pending a representative Windows reproduction or sanitized causal chain. Do not mark this covered from compilation or feature-tree checks."
+  },
+  {
+   "id": "UI-UPDATER-DIAGNOSTICS-241",
+   "title": "Updater failures expose a privacy-safe stage and cause while retaining a sanitized opt-in causal chain",
    "family": "updater",
    "sources": {
     "issues": [
@@ -6549,7 +6573,56 @@
     "scenario": null,
     "failBefore": "proven"
    },
-   "notes": "GH #241. Negative v0.6.94 reporter follow-up revoked the earlier fix claim: the WebView could fetch GitHub's release API and offer v0.6.95, but the Rust updater still reported 'error sending request' for latest.json. The Windows updater disabled default features to select native-tls/Schannel, which also left Reqwest without its separate system-proxy feature; Windows now explicitly enables that feature so the native request reads the OS proxy configuration as well as using the OS trust store. Startup and manual checks replace the prior offer instead of stacking two install toasts. Fail-before proved both omissions. Signed-manifest verification, separate install confirmation, Linux/macOS rustls behavior, and the manual releases-page fallback remain intact. Physical Windows confirmation remains required."
+   "notes": "GH #241. The old toast claimed the debug log contained the error, but ordinary diagnostics recorded no updater event and the console exposed only an undifferentiated outer error. Manifest fetch/parse/target selection, download/signature/install, and relaunch now map to fixed stage/cause tokens in the privacy-safe report. The bounded opt-in chain removes URLs, queries, credentials, and local paths; the failure toast links to Diagnostics and names --debug as the detailed path. Fail-before: no diagnostic event or sanitized chain was emitted."
+  },
+  {
+   "id": "UI-UPDATER-OFFER-CONTRACT-241",
+   "title": "Startup and manual update checks share one offer and installation still requires explicit confirmation",
+   "family": "updater",
+   "sources": {
+    "issues": [
+     241
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "windows",
+    "linux"
+   ],
+   "layer": "unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/update.test.ts"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #241. The v0.6.97 negative follow-up concerns native transport, not the independent prompt behavior. Startup and explicit checks replace the existing offer rather than stacking dialogs, checking never installs, and only the Install update action invokes the signed native updater."
+  },
+  {
+   "id": "UI-UPDATER-TARGET-SUPPORT-241",
+   "title": "A Windows x86 build without signed updater metadata offers the exact manual package path instead of an impossible install",
+   "family": "updater",
+   "sources": {
+    "issues": [
+     241
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "windows"
+   ],
+   "layer": "unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/update.test.ts"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #241. The reporter's v0.6.97 diagnostics identify an x86 process, while release-layout intentionally omits windows-i686 updater entries during the experimental GH #275 pilot. The architecture is now read from the native process before presenting an action; x86 receives a sticky manual-download explanation and never calls updater.check. Fail-before: every desktop architecture received Install update even when the signed manifest could not contain its target."
   },
   {
    "id": "UI-EDITOR-MATH-BLOCK-ENTER-278",
@@ -8660,6 +8733,81 @@
     "failBefore": "proven"
    },
    "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey (5/5 runs failed on it). The App.tsx sweep-listener effect used bare `() => snapshot().field` accessors inside on(), which re-run on every snapshot replacement even with unchanged values; the effect unconditionally called clearAbsenceSweeps(). Restore's completion emits runtime status events, so finishing a Restore refired the effect and closed the panel the user was looking at while transiently wiping the sweep list (instrumented capture: diag-3 store log, four identical-input refires 150ms after disposition). Fix: memoized effect inputs + rebindAbsenceSweepScope clears only on real generation changes. Fail-before is the instrumented E2E evidence; the helper unit test plus the journey's restore-action/restored-history assertions are the regression coverage."
+  },
+  {
+   "id": "UI-ANDROID-UI-RUNTIME-RESPONSIVE-205",
+   "title": "Physical Android WebView responsive chrome fits at portrait and landscape 90%–110% interface scale",
+   "family": "topbar",
+   "sources": {
+    "issues": [
+     205
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "reported",
+   "coverage": {
+    "tests": [
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent",
+     ".github/scripts/android-ui-runtime.sh"
+    ],
+    "scenario": "android-ui-runtime.responsive-chrome-motion-events",
+    "failBefore": "proven"
+   },
+   "notes": "The focused manual API-35 x86_64 lane resets to the real first-run demo graph, drives the packaged WebView with Android MotionEvents, and records inner/visual viewport, DPR, root zoom, topbar geometry, direct and overflow actions, free width, JUnit accounting, screenshot, DOM/native receipt, and targeted logcat. Hosted run 33251907222 produced six non-vacuous geometry samples with no clipping, but the visible portrait overflow control ignored the native tap at root zoom 1.0, 0.9, and 1.1; landscape fit remained clean. This is a product failure, not evidence for every OEM WebView or display scale."
+  },
+  {
+   "id": "UI-ANDROID-UI-RUNTIME-LONG-PRESS-207",
+   "title": "Physical Android long press on a page reference opens one Page actions menu without preview, selection, or navigation",
+   "family": "page-link-gestures",
+   "sources": {
+    "issues": [
+     207
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation",
+     ".github/scripts/android-ui-runtime.sh"
+    ],
+    "scenario": "android-ui-runtime.page-reference-exclusive-long-press",
+    "failBefore": "proven"
+   },
+   "notes": "The manual native method installs a DOM mutation trace, sends one Android ACTION_DOWN/long-press/ACTION_UP sequence to a rendered demo-graph page reference, and fails unless exactly one Page actions menu remains while preview count, selection text, and route stay unchanged. Hosted run 33251907222 reached a real demo page reference and retained the full product-failure receipt: zero Page actions menus, one preview, and selected text `Roadmap`, with the route unchanged. The emulator result must not be substituted for the reporter's OEM outcome."
+  },
+  {
+   "id": "UI-ANDROID-UI-RUNTIME-INITIAL-SELECTION-375",
+   "title": "Physical Android initial long-press selection keeps IME and exposes Tine’s mobile formatting toolbar",
+   "family": "mobile-editing",
+   "sources": {
+    "issues": [
+     375
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "reported",
+   "coverage": {
+    "tests": [
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement",
+     ".github/scripts/android-ui-runtime.sh"
+    ],
+    "scenario": "android-ui-runtime.initial-native-selection-toolbar",
+    "failBefore": "unavailable"
+   },
+   "notes": "The focused method is designed to tap a real demo-graph block, request the Android IME, and probe short and long rendered text with initial native long presses only—no follow-up handle drag, IME dismissal, or orientation change. Hosted API-35 run 33251907222 compiled and executed the harness but timed out before a focused textarea existed, retaining a valid screenshot and structured harness-failure receipt but no journey receipt. #375 therefore remains unproven; this row records an acceptance-lane gap, not product or OEM ActionMode/IME evidence."
   },
   {
    "id": "UI-CODEBLOCK-BODY-ONLY-412",

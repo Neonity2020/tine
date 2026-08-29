@@ -97,6 +97,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("activate_sparse_v2", NoGraphSlot),
     ("adopt_sparse_v2_shared", NoGraphSlot),
     ("app_platform", NoGraphSlot),
+    ("app_architecture", NoGraphSlot),
     ("apply_journal_filename_migrations", LegacyOnly),
     ("apply_spellcheck", NoGraphSlot),
     ("approve_external_assets", NoGraphSlot),
