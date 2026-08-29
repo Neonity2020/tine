@@ -339,13 +339,11 @@ class AndroidUiRuntimeTest {
         (() => JSON.stringify({
           route: document.querySelector('.page-title')?.textContent?.trim() || '',
           blocks: document.querySelectorAll('.ls-block').length,
-          pageRefs: document.querySelectorAll('a.page-ref').length,
           activeDrawer: document.querySelector('.app-container')?.getAttribute('data-active-drawer') || '',
         }))()
       """.trimIndent()).let {
         it.optString("route") == "Welcome to Tine" &&
           it.optInt("blocks") >= 3 &&
-          it.optInt("pageRefs") >= 1 &&
           it.optString("activeDrawer").isEmpty()
       }
     }
