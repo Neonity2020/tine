@@ -996,12 +996,12 @@ pub(crate) fn note_asset_read(window_label: &str, path: &Path) {
     }
 }
 
-fn merge_recent_asset_reads(window_label: &str, state: &mut AssetWatchState) -> bool {
+fn merge_recent_asset_reads(window_label: &str, state: &mut AssetWatchState) -> HashSet<PathBuf> {
     let Some(reads) = RECENT_ASSET_READS.get() else {
-        return false;
+        return HashSet::new();
     };
     let Ok(mut reads) = reads.lock() else {
-        return false;
+        return HashSet::new();
     };
     let now = Instant::now();
     let keys = reads
@@ -1013,23 +1013,27 @@ fn merge_recent_asset_reads(window_label: &str, state: &mut AssetWatchState) -> 
         })
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
-    let mut merged = false;
+    let mut merged = HashSet::new();
     for key in keys {
         if let Some(read) = reads.remove(&key) {
+            let path = key.1;
             match read.stamp {
                 Some(stamp) => {
-                    state.snap.insert(key.1, stamp);
+                    state.snap.insert(path.clone(), stamp);
                 }
                 None => {
-                    state.snap.remove(&key.1);
+                    state.snap.remove(&path);
                 }
             }
-            merged = true;
+            merged.insert(path);
         }
     }
     reads.retain(|_, read| now.duration_since(read.recorded_at) <= ASSET_SELF_WRITE_TTL);
-    if merged && crate::debug::debug_enabled() {
-        crate::debug::diag("asset observer merged a WebView-read baseline");
+    if !merged.is_empty() && crate::debug::debug_enabled() {
+        crate::debug::diag(format!(
+            "asset observer merged {} WebView-read baseline(s)",
+            merged.len()
+        ));
     }
     merged
 }
@@ -1112,9 +1116,8 @@ fn reconcile_asset_observation(
     // A read seed is an observation boundary, not a filesystem event. Compare
     // it to current metadata even if its intervening kernel event happened
     // before this watcher binding existed.
-    let observed_read = merge_recent_asset_reads(window_label, state);
-    let need_full =
-        force_full || poll_mode || observed_read || asset_full_scan_owned(&state.root, full_paths);
+    let observed_reads = merge_recent_asset_reads(window_label, state);
+    let need_full = force_full || poll_mode || asset_full_scan_owned(&state.root, full_paths);
     let mut changed = Vec::<(PathBuf, Option<FileStamp>)>::new();
     if need_full {
         let current = collect_asset_files(&state.root);
@@ -1135,10 +1138,9 @@ fn reconcile_asset_observation(
             state.snap.extend(current.files);
         }
     } else {
-        for path in exact_paths
-            .iter()
-            .filter(|path| path.starts_with(&state.root))
-        {
+        let mut exact = exact_paths.clone();
+        exact.extend(observed_reads);
+        for path in exact.iter().filter(|path| path.starts_with(&state.root)) {
             if asset_relative_event_path(&state.root, path).is_none() {
                 continue;
             }
@@ -2297,13 +2299,13 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         }
                     }
                     _ => {
-                        let assets = asset_root
-                            .clone()
-                            .unwrap_or_else(|| legacy_graph.assets_path());
                         graphs.insert(
                             label,
                             WatchedGraph {
-                                assets: AssetWatchState::new(assets),
+                                assets: asset_root
+                                    .clone()
+                                    .map(AssetWatchState::new)
+                                    .unwrap_or_default(),
                                 legacy_graph,
                                 root,
                                 snap: HashMap::new(),
@@ -3559,6 +3561,35 @@ mod tests {
                 false,
             ),
             vec!["startup.png"]
+        );
+    }
+
+    #[test]
+    fn asset_read_handoff_compares_only_the_assets_that_were_read() {
+        let graph = TempGraph::new("asset-read-exact-handoff");
+        let assets = graph.path("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let rendered = assets.join("rendered.png");
+        let unrelated = assets.join("unrelated.png");
+        std::fs::write(&rendered, b"rendered old").unwrap();
+        std::fs::write(&unrelated, b"unrelated old").unwrap();
+        let mut state = AssetWatchState::new(assets);
+        note_asset_read("exact-handoff", &rendered);
+
+        std::fs::write(&rendered, b"rendered replacement").unwrap();
+        std::fs::write(&unrelated, b"unrelated replacement").unwrap();
+
+        assert_eq!(
+            reconcile_asset_observation(
+                "exact-handoff",
+                &mut state,
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+                false,
+            ),
+            vec!["rendered.png"],
+            "a WebView read seed must not trigger a whole asset-tree scan"
         );
     }
 
