@@ -234,6 +234,9 @@ export interface Backend {
   listKnownGraphs(): Promise<KnownGraph[]>;
   forgetKnownGraph(path: string): Promise<void>;
   appPlatform(): Promise<"android" | "ios" | "desktop">;
+  /** Compile-time process architecture. Used to avoid offering updater targets
+   * that the signed release manifest deliberately does not publish. */
+  appArchitecture(): Promise<string>;
   /** Immutable, app-local plugin packages. Installation stores bytes but never
    * executes them; enabling is an explicit second step after host validation. */
   listInstalledPlugins(): Promise<InstalledPluginRecord[]>;
@@ -759,7 +762,14 @@ export interface Backend {
   cancelGraphVerification(operationId: string): Promise<void>;
   saveGraphVerificationReport(text: string): Promise<boolean>;
   onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void>;
-  diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number): Promise<void>;
+  diagnosticFrontendEvent(
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure",
+    line?: number,
+    column?: number,
+    delayMs?: number,
+    updaterStage?: string,
+    updaterCause?: string,
+  ): Promise<void>;
 }
 
 export interface DebugInfo {
@@ -963,6 +973,9 @@ class TauriBackend implements Backend {
   }
   appPlatform() {
     return this.call<"android" | "ios" | "desktop">("app_platform");
+  }
+  appArchitecture() {
+    return this.call<string>("app_architecture");
   }
   listInstalledPlugins() {
     return this.call<InstalledPluginRecord[]>("list_installed_plugins");
@@ -1772,8 +1785,22 @@ class TauriBackend implements Backend {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphVerificationProgress>("graph-verification-progress", (event) => cb(event.payload));
   }
-  diagnosticFrontendEvent(kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay", line?: number, column?: number, delayMs?: number) {
-    return this.call<void>("diagnostic_frontend_event", { kind, line, column, delayMs });
+  diagnosticFrontendEvent(
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure",
+    line?: number,
+    column?: number,
+    delayMs?: number,
+    updaterStage?: string,
+    updaterCause?: string,
+  ) {
+    return this.call<void>("diagnostic_frontend_event", {
+      kind,
+      line,
+      column,
+      delayMs,
+      updaterStage,
+      updaterCause,
+    });
   }
   getSmoothScroll() {
     return this.call<boolean>("get_smooth_scroll");

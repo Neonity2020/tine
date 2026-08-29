@@ -466,7 +466,44 @@ pub(crate) fn diagnostic_frontend_event(
     line: Option<u64>,
     column: Option<u64>,
     delay_ms: Option<u64>,
+    updater_stage: Option<String>,
+    updater_cause: Option<String>,
 ) {
+    if kind == "updater_failure" {
+        let Some(stage) = updater_stage.filter(|value| {
+            matches!(
+                value.as_str(),
+                "manifest_fetch"
+                    | "manifest_parse"
+                    | "target_selection"
+                    | "download"
+                    | "signature_verification"
+                    | "install"
+                    | "relaunch"
+            )
+        }) else {
+            return;
+        };
+        let Some(cause) = updater_cause.filter(|value| {
+            matches!(
+                value.as_str(),
+                "network"
+                    | "invalid_manifest"
+                    | "unsupported_target"
+                    | "invalid_signature"
+                    | "install_failed"
+                    | "relaunch_failed"
+                    | "unknown"
+            )
+        }) else {
+            return;
+        };
+        let mut fields = Map::new();
+        fields.insert("stage".into(), json!(stage));
+        fields.insert("cause".into(), json!(cause));
+        record_fixed_event("updater.failure", fields);
+        return;
+    }
     if !matches!(
         kind.as_str(),
         "uncaught_error" | "unhandled_rejection" | "heartbeat_delay"
@@ -479,6 +516,11 @@ pub(crate) fn diagnostic_frontend_event(
     fields.insert("column".into(), json!(column));
     fields.insert("delayMs".into(), json!(delay_ms));
     record_fixed_event("frontend.health", fields);
+}
+
+#[tauri::command]
+pub(crate) fn app_architecture() -> &'static str {
+    std::env::consts::ARCH
 }
 
 #[tauri::command]
@@ -736,5 +778,29 @@ mod tests {
         assert!(!source.contains("fields.insert(\"path\""));
         assert!(!source.contains("fields.insert(\"detail\""));
         assert!(source.contains("verboseDebugLogIncluded\": false"));
+    }
+
+    #[test]
+    fn updater_diagnostics_accept_only_fixed_stage_and_cause_tokens() {
+        let source = include_str!("debug.rs");
+        for token in [
+            "manifest_fetch",
+            "manifest_parse",
+            "target_selection",
+            "download",
+            "signature_verification",
+            "install",
+            "relaunch",
+            "network",
+            "invalid_manifest",
+            "unsupported_target",
+            "invalid_signature",
+            "install_failed",
+            "relaunch_failed",
+        ] {
+            assert!(source.contains(&format!("\"{token}\"")));
+        }
+        assert!(source.contains("record_fixed_event(\"updater.failure\", fields)"));
+        assert!(!source.contains("fields.insert(\"updaterError\""));
     }
 }

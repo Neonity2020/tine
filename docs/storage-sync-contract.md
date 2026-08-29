@@ -1600,7 +1600,7 @@ and every projection directory barrier passes through it:
 
 | Class | What it covers | Policy |
 | --- | --- | --- |
-| `PrivateDurableAuthority` | The oplog manifest, object archive, local journal and receipt store below app-private storage — and graph-tree artifacts the graph is the **sole** authority for: conflict copies, trash, withdrawn bytes, assets. | Strict on **every** platform, Android included. A barrier the filesystem refuses is a real durability failure. |
+| `PrivateDurableAuthority` | The oplog manifest, object archive, local journal and promoted/operational receipt store below app-private storage — and graph-tree artifacts the graph is the **sole** authority for: conflict copies, trash, withdrawn bytes, assets. | Strict on **every** platform, Android included. A barrier the filesystem refuses is a real durability failure. The empty receipt-store initialization exception is confined to §2.10c. |
 | `SharedReconstructibleProjection` | The Markdown/Org projection of an already-accepted manifest into the user's graph tree. | Strict everywhere except Android. On Android only, and only for `PermissionDenied`/`Unsupported`/`InvalidInput` (`EPERM`/`ENOTSUP`/`EINVAL`), the barrier **degrades**. Every other errno stays fatal. |
 
 The crash story for the degraded case still holds: the projection is derived
@@ -2088,13 +2088,37 @@ available. Honest concurrent Tine writers remain excluded by the runtime lease;
 a hostile process inside the same application sandbox is outside this threat
 model.
 
-Before an enrollment binding exists, projection receipts are reconstructible
-bootstrap state rather than authority. If Android cannot reopen a receipt tree
-left by an interrupted or older activation, retry retains one sibling
+Directory-barrier refusal is classified at the receipt store's promotion
+boundary, not by platform or by syscall alone:
+
+| Receipt publication | Durability class | Android capability refusal | Required response |
+| --- | --- | --- | --- |
+| Initialization claim, top-level namespaces, pending-cleanup namespace and rounds, their initialization authority/state, and store claim while initializing an empty receipt store; these artifacts alone carry no operation authority | Reconstructible bootstrap | The exact file bytes remain synced; `PermissionDenied`/`Unsupported`/`InvalidInput` from the parent-directory barrier may degrade | During first activation, retry may archive one diagnostic tree and reconstruct it from unchanged Direct Files. A promoted reopen may recreate only this empty initialization structure; nonempty claimless state is refused. |
+| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | A crash or power loss could otherwise lose a supposedly durable receipt name. Refuse the publication and keep the accepted operation pending/recoverable. If a refusal happened after the name became visible, only that process and parent directory retain a barrier debt; an idempotent retry must repay it before reporting success, while ordinary existing-name reads pay no barrier. |
+
+`ProjectionReceiptStore::initialize` passes the first row's durability phase
+through both the top-level helpers and the nested pending-cleanup initializer;
+the ordinary receipt publisher and directory creator are the strict second
+row. This keeps an Android setup capability limitation from wedging activation
+without letting that setup exception leak into retained receiver authority.
+On a device that permits exact app-private writes but persistently refuses
+directory fsync, setup can still complete because its empty structure is
+reconstructible, but the first operational receipt refuses: managed storage is
+not usable without durability for its private authority. A promoted store that
+has lost only its nested empty pending-cleanup initialization structure also
+rebuilds that structure strictly and may refuse during open; it never discards
+or silently reconstructs operational receipt authority.
+
+Before an enrollment binding exists, the empty receipt store's initialization
+artifacts are reconstructible bootstrap state rather than authority; no
+operational receipt is published before the activation marker. If Android
+cannot reopen a receipt tree left by an interrupted or older activation, retry retains one sibling
 `receipts.pre-promotion-failed` diagnostic tree and initializes a clean receipt
 store from the unchanged Markdown/Org source. Once enrollment has promoted the
 receipt-store identity, this recovery is forbidden: normal exact identity and
-receipt recovery rules apply.
+receipt recovery rules apply. Recreating an absent or empty initialization
+structure is still allowed because it discards no operation receipt; a nonempty
+claimless store is refused.
 
 The same rule governs the archive a clean activation builds. Before the
 activation marker is committed, the archive carries no authority and is

@@ -24,6 +24,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Android no longer treats a refused directory durability barrier as success
+  for promoted managed-storage projection receipts.** Only the receipt store's
+  pre-enrollment initialization remains reconstructible; bases, intents,
+  attempts, mutation authority, completions, cleanup, and forensic records now
+  keep strict private-authority barriers on every platform. An idempotent retry
+  repays a recorded barrier refusal before accepting an existing receipt name
+  or operational namespace, without adding barriers to ordinary reads. Android
+  devices that cannot provide app-private directory durability may initialize
+  the reconstructible empty store, but managed operations now refuse rather
+  than claiming unsafe success.
+
 - **Images changed by Syncthing, Dropbox, an external editor, or another Tine
   window now refresh in place without reopening the graph.** Tine observes the
   approved `assets/` directory separately from page reconciliation in Direct
@@ -31,6 +42,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   Asset bytes remain ordinary filesystem-synchronized files and never enter the
   managed oplog or `.tine-sync`; open PDF/audio/video sessions are not replaced
   mid-use and see new bytes when reopened.
+
+- Windows updater failures now leave a privacy-safe stage and cause in
+  Diagnostics, with a sanitized detailed chain available in debug mode. A
+  32-bit Windows build also links to the manual package instead of offering an
+  automatic install that its signed updater manifest does not publish (GH
+  #241). The reporter's underlying native network failure remains under
+  investigation.
 
 - Block background colors no longer crowd their bullets. Regular dots and
   numbered-list ordinals now occupy the same 22px control track, while the

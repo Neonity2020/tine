@@ -35955,7 +35955,7 @@ mod tests {
     fn android_receipt_bootstrap_does_not_reenter_capability_preflights() {
         let source = include_str!("oplog/projection_store.rs");
         let directory_start = source
-            .find("fn ensure_directory_nofollow(")
+            .find("fn ensure_directory_nofollow_with_durability(")
             .expect("receipt directory helper");
         let read_start = source[directory_start..]
             .find("fn read_optional_regular(")
@@ -35986,6 +35986,162 @@ mod tests {
                 "Android receipt bootstrap must not re-enter {forbidden}"
             );
         }
+    }
+
+    /// Receipt-store setup is disposable until enrollment promotes its store
+    /// identity. After promotion, receipt names are durable receiver authority
+    /// and Android must not inherit the bootstrap barrier exception.
+    #[test]
+    fn android_receipt_barriers_are_reconstructible_only_during_pre_promotion_bootstrap() {
+        let source = include_str!("oplog/projection_store.rs");
+        assert_eq!(
+            source.matches("publish_bootstrap_immutable_exact(").count(),
+            3,
+            "only the helper plus the init and claim publications may use bootstrap durability"
+        );
+        assert_eq!(
+            source
+                .matches("ensure_bootstrap_directory_nofollow(")
+                .count(),
+            2,
+            "only the helper plus initialize's namespace creation may use bootstrap durability"
+        );
+
+        let initialize_start = source.find("    fn initialize(").expect("initialize");
+        let initialize_end = source[initialize_start..]
+            .find("\n    fn namespace(")
+            .map(|offset| initialize_start + offset)
+            .expect("end of initialize");
+        let initialize = &source[initialize_start..initialize_end];
+        assert_eq!(
+            initialize
+                .matches("publish_bootstrap_immutable_exact(")
+                .count(),
+            2,
+            "only the initialization and store claims are bootstrap publications"
+        );
+        assert_eq!(
+            initialize
+                .matches("ensure_bootstrap_directory_nofollow(")
+                .count(),
+            1,
+            "only initialize's top-level namespace creation is bootstrap"
+        );
+        assert_eq!(
+            initialize
+                .matches("ReceiptDirectoryDurability::PrePromotionBootstrap")
+                .count(),
+            1,
+            "the empty-store namespace opener must select bootstrap durability"
+        );
+        assert_eq!(
+            initialize
+                .matches("ReceiptDirectoryDurability::PromotedAuthority")
+                .count(),
+            1,
+            "the claimed-store namespace opener must select promoted durability"
+        );
+        assert!(
+            !source[initialize_end..].contains("publish_bootstrap_immutable_exact("),
+            "promoted receipt operations must use the strict publisher"
+        );
+        assert!(
+            !source[initialize_end..].contains("ensure_bootstrap_directory_nofollow("),
+            "promoted receipt namespaces must use strict directory barriers"
+        );
+
+        let strict_directory_start = source
+            .find("fn ensure_directory_nofollow(")
+            .expect("strict receipt directory entry point");
+        let bootstrap_directory_start = source[strict_directory_start..]
+            .find("fn ensure_bootstrap_directory_nofollow(")
+            .map(|offset| strict_directory_start + offset)
+            .expect("bootstrap receipt directory entry point");
+        assert!(
+            source[strict_directory_start..bootstrap_directory_start]
+                .contains("ReceiptDirectoryDurability::PromotedAuthority"),
+            "the ordinary receipt directory entry point must select strict promoted durability"
+        );
+
+        let strict_publisher_start = source
+            .find("fn publish_immutable_exact(")
+            .expect("strict receipt publisher entry point");
+        let bootstrap_publisher_start = source[strict_publisher_start..]
+            .find("fn publish_bootstrap_immutable_exact(")
+            .map(|offset| strict_publisher_start + offset)
+            .expect("bootstrap receipt publisher entry point");
+        assert!(
+            source[strict_publisher_start..bootstrap_publisher_start]
+                .contains("ReceiptDirectoryDurability::PromotedAuthority"),
+            "the ordinary receipt publisher must select strict promoted durability"
+        );
+
+        let publisher_start = source
+            .find("fn publish_android_private_immutable(")
+            .expect("Android receipt publisher");
+        let publisher_end = source[publisher_start..]
+            .find("\n#[cfg(test)]\nthread_local!")
+            .map(|offset| publisher_start + offset)
+            .expect("end of Android receipt publisher");
+        let publisher = &source[publisher_start..publisher_end];
+        assert!(publisher.contains("ReceiptDirectoryDurability::PromotedAuthority"));
+        assert!(publisher.contains("sync_promoted_receipt_directory(dir)"));
+        let existing_retry_start = publisher
+            .find("let accept_existing =")
+            .expect("idempotent publication retry policy");
+        let temporary_start = publisher[existing_retry_start..]
+            .find("let temp_name =")
+            .map(|offset| existing_retry_start + offset)
+            .expect("temporary publication follows existing-name admission");
+        assert!(
+            publisher[existing_retry_start..temporary_start]
+                .contains("retry_promoted_receipt_barrier_if_needed(dir)"),
+            "an existing promoted receipt name must repay a recorded strict-barrier debt"
+        );
+
+        let intent_namespace_start = source
+            .find("    fn open_intent_namespace(")
+            .expect("per-intent namespace opener");
+        let intent_namespace_end = source[intent_namespace_start..]
+            .find("\n    fn validate_forensic_record(")
+            .map(|offset| intent_namespace_start + offset)
+            .expect("end of per-intent namespace opener");
+        let intent_namespace = &source[intent_namespace_start..intent_namespace_end];
+        assert!(intent_namespace.contains("if create"));
+        assert!(intent_namespace.contains("retry_promoted_receipt_barrier_if_needed(&parent)"));
+
+        let debt_sync_start = source
+            .find("fn sync_promoted_receipt_directory(")
+            .expect("strict receipt barrier debt recorder");
+        let debt_retry_start = source[debt_sync_start..]
+            .find("fn retry_promoted_receipt_barrier_if_needed(")
+            .map(|offset| debt_sync_start + offset)
+            .expect("strict receipt barrier debt retry");
+        let helper_end = source[debt_retry_start..]
+            .find("\nfn ensure_directory_nofollow_with_durability(")
+            .map(|offset| debt_retry_start + offset)
+            .expect("end of receipt barrier debt helpers");
+        let recorder = &source[debt_sync_start..debt_retry_start];
+        assert!(recorder.contains("sync_dir_required(directory)"));
+        assert!(recorder.contains("debts.insert(identity)"));
+        let retry = &source[debt_retry_start..helper_end];
+        assert!(retry.contains("if !debts.contains(&identity)"));
+        assert!(retry.contains("return Ok(())"));
+        assert!(retry.contains("sync_dir_required(directory)"));
+        assert!(retry.contains("debts.remove(&identity)"));
+
+        let cleanup_start = source
+            .find("fn open_receipt_namespaces(")
+            .expect("receipt namespace opener");
+        let cleanup_end = source[cleanup_start..]
+            .find("\nfn validate_pending_cleanup_round_root(")
+            .map(|offset| cleanup_start + offset)
+            .expect("end of pending-cleanup initialization");
+        let cleanup_initialization = &source[cleanup_start..cleanup_end];
+        assert!(cleanup_initialization.contains("durability: ReceiptDirectoryDurability"));
+        assert!(cleanup_initialization.contains("ensure_directory_nofollow_with_durability("));
+        assert!(cleanup_initialization.contains("publish_immutable_exact_with_durability("));
+        assert!(cleanup_initialization.contains("durability,"));
     }
 
     #[test]

@@ -14,6 +14,8 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
+#[cfg(target_os = "android")]
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
@@ -237,7 +239,78 @@ fn create_android_private_directory(path: &Path) -> Result<Dir, ProjectionStoreE
     open_android_private_directory(path)
 }
 
-fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptDirectoryDurability {
+    /// The store has not yet published the claim enrollment will promote, so
+    /// the namespace is still reconstructible from unchanged Direct Files.
+    PrePromotionBootstrap,
+    /// Enrollment has promoted the store identity. Its receipt names are now
+    /// private durable authority and every directory barrier is strict.
+    PromotedAuthority,
+}
+
+#[cfg(target_os = "android")]
+type AndroidReceiptDirectoryIdentity = (u64, u64);
+
+#[cfg(target_os = "android")]
+fn android_receipt_barrier_debts() -> &'static Mutex<BTreeSet<AndroidReceiptDirectoryIdentity>> {
+    static DEBTS: OnceLock<Mutex<BTreeSet<AndroidReceiptDirectoryIdentity>>> = OnceLock::new();
+    DEBTS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(target_os = "android")]
+fn android_receipt_directory_identity(
+    directory: &Dir,
+) -> Result<AndroidReceiptDirectoryIdentity, StoreError> {
+    let metadata = directory.try_clone()?.into_std_file().metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// A strict receipt barrier can refuse after the namespace mutation became
+/// visible. Remember that exact parent within this process so only its next
+/// idempotent retry re-establishes durability; ordinary existing-name reads do
+/// not pay an extra device round trip. See storage-sync-contract.md §2.10c.
+#[cfg(target_os = "android")]
+fn sync_promoted_receipt_directory(directory: &Dir) -> Result<(), StoreError> {
+    let identity = android_receipt_directory_identity(directory)?;
+    let mut debts = android_receipt_barrier_debts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match sync_dir_required(directory) {
+        Ok(()) => {
+            debts.remove(&identity);
+            Ok(())
+        }
+        Err(error) => {
+            debts.insert(identity);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn retry_promoted_receipt_barrier_if_needed(directory: &Dir) -> Result<(), StoreError> {
+    let identity = android_receipt_directory_identity(directory)?;
+    let mut debts = android_receipt_barrier_debts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !debts.contains(&identity) {
+        return Ok(());
+    }
+    match sync_dir_required(directory) {
+        Ok(()) => {
+            debts.remove(&identity);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_directory_nofollow_with_durability(
+    root: &Dir,
+    name: &str,
+    durability: ReceiptDirectoryDurability,
+) -> Result<(), ProjectionStoreError> {
     #[cfg(target_os = "android")]
     {
         let component = Path::new(name);
@@ -267,12 +340,38 @@ fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionSto
         // one honest Tine writer, so an fstatat-style preflight adds no safety
         // but is rejected by some physical devices even when mkdir/open work.
         open_dir_nofollow(root, name)?;
-        crate::filesystem_durability::sync_reconstructible_directory(root)?;
+        match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => {
+                crate::filesystem_durability::sync_reconstructible_directory(root)?;
+            }
+            ReceiptDirectoryDurability::PromotedAuthority => {
+                sync_promoted_receipt_directory(root)?;
+            }
+        }
         return Ok(());
     }
 
     #[cfg(not(target_os = "android"))]
-    super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+    {
+        let _ = durability;
+        super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+    }
+}
+
+fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+    ensure_directory_nofollow_with_durability(
+        root,
+        name,
+        ReceiptDirectoryDurability::PromotedAuthority,
+    )
+}
+
+fn ensure_bootstrap_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+    ensure_directory_nofollow_with_durability(
+        root,
+        name,
+        ReceiptDirectoryDurability::PrePromotionBootstrap,
+    )
 }
 
 fn read_optional_regular(
@@ -365,16 +464,48 @@ fn publish_immutable_exact(
     bytes: &[u8],
     kind: &'static str,
 ) -> Result<(), StoreError> {
+    publish_immutable_exact_with_durability(
+        dir,
+        filename,
+        bytes,
+        kind,
+        ReceiptDirectoryDurability::PromotedAuthority,
+    )
+}
+
+fn publish_immutable_exact_with_durability(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+    durability: ReceiptDirectoryDurability,
+) -> Result<(), StoreError> {
     #[cfg(target_os = "android")]
     {
-        return publish_android_private_immutable(dir, filename, bytes, kind);
+        return publish_android_private_immutable(dir, filename, bytes, kind, durability);
     }
 
     #[cfg(not(target_os = "android"))]
     {
+        let _ = durability;
         crate::durability_counters::note_immutable_publication();
         publish_immutable_exact_strict(dir, filename, bytes, kind)
     }
+}
+
+fn publish_bootstrap_immutable_exact(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+) -> Result<(), StoreError> {
+    publish_immutable_exact_with_durability(
+        dir,
+        filename,
+        bytes,
+        kind,
+        ReceiptDirectoryDurability::PrePromotionBootstrap,
+    )
 }
 
 /// Android's app-private filesystem is single-writer from Tine's point of
@@ -390,6 +521,7 @@ fn publish_android_private_immutable(
     filename: &str,
     bytes: &[u8],
     kind: &'static str,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<(), StoreError> {
     let verify_existing = || -> Result<bool, StoreError> {
         match read_optional_regular(dir, filename, bytes.len() as u64, Some(bytes.len() as u64)) {
@@ -403,7 +535,21 @@ fn publish_android_private_immutable(
         }
     };
 
-    if verify_existing()? {
+    // A failed strict directory barrier may leave the exact final name in the
+    // page cache and namespace even though its insertion is not crash-durable.
+    // Retry must re-establish that barrier before accepting byte-identical
+    // publication; otherwise repeated turns would eventually skip every
+    // refusal and falsely report a durable promoted receipt. Bootstrap state
+    // remains deliberately reconstructible and needs no such retry barrier.
+    let accept_existing = || -> Result<bool, StoreError> {
+        let exists = verify_existing()?;
+        if exists && matches!(durability, ReceiptDirectoryDurability::PromotedAuthority) {
+            retry_promoted_receipt_barrier_if_needed(dir)?;
+        }
+        Ok(exists)
+    };
+
+    if accept_existing()? {
         return Ok(());
     }
 
@@ -415,7 +561,7 @@ fn publish_android_private_immutable(
     // As for receipt directories, use the ordinary Android primitive without
     // the hostile-namespace flags added by the generic capability publisher.
     // The retained file is still create-new, fully synced, and verified byte
-    // for byte before this pre-promotion store is accepted.
+    // for byte before the publication is accepted.
     let temp_fd = unsafe {
         libc::openat(
             dir.as_fd().as_raw_fd(),
@@ -434,7 +580,7 @@ fn publish_android_private_immutable(
         crate::durability_counters::sync_file(&temp)?;
         drop(temp);
 
-        if verify_existing()? {
+        if accept_existing()? {
             return Ok(());
         }
 
@@ -449,7 +595,14 @@ fn publish_android_private_immutable(
         if renamed < 0 {
             return Err(StoreError::Io(io::Error::last_os_error()));
         }
-        crate::filesystem_durability::sync_reconstructible_directory(dir)?;
+        match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => {
+                crate::filesystem_durability::sync_reconstructible_directory(dir)?;
+            }
+            ReceiptDirectoryDurability::PromotedAuthority => {
+                sync_promoted_receipt_directory(dir)?;
+            }
+        }
         if !verify_existing()? {
             return Err(StoreError::Io(io::Error::new(
                 ErrorKind::NotFound,
@@ -1303,7 +1456,11 @@ impl ProjectionReceiptStore {
         let bytes = read_optional_regular(&capability, STORE_CLAIM_FILE, 512, None)?
             .ok_or(ProjectionStoreError::MalformedStoreClaim)?;
         let expected = validate_claim(&bytes, store_id, workspace_id, Some(endpoint))?;
-        let namespaces = open_receipt_namespaces(&capability, store_id)?;
+        let namespaces = open_receipt_namespaces(
+            &capability,
+            store_id,
+            ReceiptDirectoryDurability::PromotedAuthority,
+        )?;
         if namespaces.identities() != expected {
             return Err(ProjectionStoreError::NamespaceSubstitution(
                 "top-level receipt namespace".into(),
@@ -2670,7 +2827,11 @@ impl ProjectionReceiptStore {
             .map_err(|error| error.at("read private receipt store claim"))?;
         if let Some(bytes) = existing {
             let expected = validate_claim(&bytes, store_id, workspace_id, endpoint)?;
-            let namespaces = open_receipt_namespaces(capability, store_id)?;
+            let namespaces = open_receipt_namespaces(
+                capability,
+                store_id,
+                ReceiptDirectoryDurability::PromotedAuthority,
+            )?;
             if namespaces.identities() != expected {
                 return Err(ProjectionStoreError::NamespaceSubstitution(
                     "top-level receipt namespace".into(),
@@ -2693,7 +2854,7 @@ impl ProjectionReceiptStore {
                 if capability.entries()?.next().transpose()?.is_some() {
                     return Err(ProjectionStoreError::ClaimlessNonemptyStore);
                 }
-                publish_immutable_exact(
+                publish_bootstrap_immutable_exact(
                     capability,
                     STORE_INIT_FILE,
                     &expected_init,
@@ -2711,15 +2872,19 @@ impl ProjectionReceiptStore {
             ATTEMPTS_DIR,
             FORENSICS_DIR,
         ] {
-            ensure_directory_nofollow(capability, namespace).map_err(|error| {
+            ensure_bootstrap_directory_nofollow(capability, namespace).map_err(|error| {
                 error.at(format!("create private receipt namespace {namespace}"))
             })?;
         }
         require_incomplete_store_is_empty(capability)?;
-        let namespaces = open_receipt_namespaces(capability, store_id)
-            .map_err(|error| error.at("open private receipt namespaces"))?;
+        let namespaces = open_receipt_namespaces(
+            capability,
+            store_id,
+            ReceiptDirectoryDurability::PrePromotionBootstrap,
+        )
+        .map_err(|error| error.at("open private receipt namespaces"))?;
         let claim = claim_bytes(store_id, workspace_id, endpoint, &namespaces.identities());
-        publish_immutable_exact(
+        publish_bootstrap_immutable_exact(
             capability,
             STORE_CLAIM_FILE,
             &claim,
@@ -2823,7 +2988,18 @@ impl ProjectionReceiptStore {
                     "private receipt namespace {namespace}/{name} is not a directory"
                 )));
             }
-            Ok(_) => return Ok(Some(open_dir_nofollow(&parent, &name)?)),
+            Ok(_) => {
+                // On Android a prior strict mkdir barrier can refuse after the
+                // directory entry became visible. A create/recovery retry must
+                // complete that barrier before accepting the existing name;
+                // read-only inspection does not mutate and pays no barrier.
+                // See storage-sync-contract.md §2.10c.
+                #[cfg(target_os = "android")]
+                if create {
+                    retry_promoted_receipt_barrier_if_needed(&parent)?;
+                }
+                return Ok(Some(open_dir_nofollow(&parent, &name)?));
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -4041,9 +4217,11 @@ fn validate_claim(
 fn open_receipt_namespaces(
     capability: &Dir,
     store_id: ProjectionReceiptStoreId,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<ReceiptNamespaces, ProjectionStoreError> {
     let forensics = open_bound_namespace(capability, FORENSICS_DIR)?;
-    let pending_cleanup = open_pending_cleanup_namespace(&forensics.capability, store_id)?;
+    let pending_cleanup =
+        open_pending_cleanup_namespace(&forensics.capability, store_id, durability)?;
     Ok(ReceiptNamespaces {
         bases: open_bound_namespace(capability, BASES_DIR)?,
         intents: open_bound_namespace(capability, INTENTS_DIR)?,
@@ -4057,14 +4235,22 @@ fn open_receipt_namespaces(
 fn open_pending_cleanup_namespace(
     forensics: &Dir,
     store_id: ProjectionReceiptStoreId,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<BoundNamespace, ProjectionStoreError> {
     let existing = read_optional_regular(forensics, PENDING_CLEANUP_AUTHORITY, 1024, None)?;
     let initializing = existing.is_none();
     if initializing {
         match open_dir_nofollow(forensics, PENDING_CLEANUP_DIR) {
+            // If a prior create made the name visible before its barrier
+            // refused, the authority publication below synchronizes this same
+            // parent before initialization can succeed.
             Ok(_) => {}
             Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                ensure_directory_nofollow(forensics, PENDING_CLEANUP_DIR)?;
+                ensure_directory_nofollow_with_durability(
+                    forensics,
+                    PENDING_CLEANUP_DIR,
+                    durability,
+                )?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -4087,13 +4273,14 @@ fn open_pending_cleanup_namespace(
         Some(_) => {}
         None => {}
     }
-    initialize_pending_cleanup_rounds(&directory, store_id, identity, initializing)?;
+    initialize_pending_cleanup_rounds(&directory, store_id, identity, initializing, durability)?;
     if initializing {
-        publish_immutable_exact(
+        publish_immutable_exact_with_durability(
             forensics,
             PENDING_CLEANUP_AUTHORITY,
             &expected,
             "pending projection cleanup namespace authority",
+            durability,
         )?;
     }
     Ok(BoundNamespace {
@@ -4107,6 +4294,7 @@ fn initialize_pending_cleanup_rounds(
     store_id: ProjectionReceiptStoreId,
     namespace_identity: DirectoryIdentity,
     allow_initialization: bool,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<(), ProjectionStoreError> {
     let existing = read_optional_mutation_authority_bounded(
         namespace,
@@ -4123,9 +4311,11 @@ fn initialize_pending_cleanup_rounds(
         validate_pending_cleanup_round_root(namespace, false)?;
         for name in PENDING_CLEANUP_ROUND_DIRS {
             match open_dir_nofollow(namespace, name) {
+                // The round-state publication below synchronizes this same
+                // parent, including any existing name left by a refused create.
                 Ok(_) => {}
                 Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                    ensure_directory_nofollow(namespace, name)?;
+                    ensure_directory_nofollow_with_durability(namespace, name, durability)?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -4145,11 +4335,12 @@ fn initialize_pending_cleanup_rounds(
             active_round: 0,
         };
         let bytes = encode_pending_cleanup_round_state(&state)?;
-        publish_immutable_exact(
+        publish_immutable_exact_with_durability(
             namespace,
             PENDING_CLEANUP_ROUND_STATE,
             &bytes,
             "pending projection cleanup round state",
+            durability,
         )?;
     }
     let _ = open_pending_cleanup_rounds(namespace, store_id, namespace_identity)?;
