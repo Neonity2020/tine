@@ -24,6 +24,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Android keeps the right-sidebar control one tap away at ordinary phone
+  widths and keeps Tine outside the system bars.** Lower-priority topbar actions
+  still move into `...` when space is constrained, while the right-sidebar
+  button remains direct until the last-resort tier; native status, navigation,
+  and display-cutout insets now bound the WebView itself (GH #205).
+
 - **Android no longer treats a refused directory durability barrier as success
   for promoted managed-storage projection receipts.** Only the receipt store's
   pre-enrollment initialization remains reconstructible; bases, intents,

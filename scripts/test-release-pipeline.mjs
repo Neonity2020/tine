@@ -570,6 +570,11 @@ assert.match(
 );
 assert.match(
   ciWorkflow,
+  /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- android-ui-runtime-205/,
+  "manual CI does not expose the isolated GH #205 Android proof scope"
+);
+assert.match(
+  ciWorkflow,
   /pull_request:[\s\S]*?paths-ignore:[\s\S]*?"\*\*\/\*\.md"/,
   "docs-only pull requests still start app validation"
 );
@@ -840,7 +845,7 @@ assert.equal(
 );
 assert.equal(
   yamlScalar(androidUiRuntime, "if", 4),
-  "github.event_name == 'workflow_dispatch' && inputs.scope == 'android-ui-runtime'"
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205')"
 );
 assert.doesNotMatch(
   androidUiRuntime.join("\n"),
@@ -885,6 +890,15 @@ for (const method of [
   );
   assert.ok(androidUiRuntimeTest.includes(`fun ${method}()`), `Android UI instrumentation is missing ${method}`);
 }
+assert.ok(
+  androidUiRuntimeScript.includes('TINE_ANDROID_UI_RUNTIME_ONLY:-') &&
+    androidUiRuntimeScript.includes('methods=(responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent)'),
+  "isolated GH #205 dispatch must select only its responsive instrumentation method"
+);
+assert.ok(
+  androidUiRuntimeScript.includes('grep -cF "finished: $method"'),
+  "Android UI accounting must not count the separate run-finished summary as a second test"
+);
 assert.match(
   androidUiRuntimeScript,
   /if ! run_journey "\$method"; then[\s\S]*?overall=1/,
