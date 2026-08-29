@@ -892,8 +892,13 @@ assert.match(
 );
 assert.match(
   androidUiRuntimeTest,
-  /MotionEvent\.obtain[\s\S]*?webView\.dispatchTouchEvent/,
-  "Android UI instrumentation must inject real Android MotionEvents into the packaged WebView"
+  /MotionEvent\.obtain[\s\S]*?uiAutomation\.injectInputEvent/,
+  "Android UI instrumentation must inject real Android MotionEvents through Android UiAutomation"
+);
+assert.doesNotMatch(
+  androidUiRuntimeTest,
+  /webView\.dispatchTouchEvent/,
+  "Android UI instrumentation must not bypass Android's screen-level input path"
 );
 assert.doesNotMatch(
   androidUiRuntimeTest,
@@ -907,6 +912,7 @@ assert.match(
 );
 for (const nonVacuousBoundary of [
   "welcomeGone",
+  "openDemoWelcomePage",
   "awaitVisibleElementByScrolling",
   "MotionEvent.ACTION_MOVE",
   "directOptional",

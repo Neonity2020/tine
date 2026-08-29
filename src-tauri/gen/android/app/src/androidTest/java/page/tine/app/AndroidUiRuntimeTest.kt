@@ -36,8 +36,8 @@ import org.junit.runner.RunWith
  *
  * The test only uses JavaScript to observe the packaged WebView (and, for the
  * responsive matrix, set the production Android root-zoom property). Every
- * WebView control is activated through [MotionEvent]s dispatched into its real
- * Android view; it never manufactures PointerEvent or MouseEvent objects.
+ * WebView control is activated through screen-level [MotionEvent]s injected by
+ * Android UiAutomation; it never manufactures PointerEvent or MouseEvent objects.
  * The runner clears app data before each method, so the tap on the real
  * first-run "Create a new graph" control always produces the same demo graph.
  */
@@ -285,6 +285,7 @@ class AndroidUiRuntimeTest {
         }
       }
       awaitTopbar(activeWebView)
+      openDemoWelcomePage(activeWebView)
       block(scenario, activeWebView)
     } catch (failure: Throwable) {
       emitFailureEvidence(test, webView, failure)
@@ -319,6 +320,37 @@ class AndroidUiRuntimeTest {
     awaitCondition("loaded Tine topbar") { elementRectOrNull(webView, "header.topbar") != null }
   }
 
+  /**
+   * Creating the demo graph intentionally lands on today's journal. At phone
+   * width the persisted-default left sidebar is also a modal drawer, so leaving
+   * it open both hides the fixture and intercepts later topbar gestures. Reach
+   * the demo's real Welcome favorite through native input; active navigation
+   * then closes the compact drawer through the production callback.
+   */
+  private fun openDemoWelcomePage(webView: WebView) {
+    val welcome = awaitElementRectByText(
+      webView,
+      "#sidebar-favorites-list .nav-page",
+      "Welcome to Tine",
+    )
+    tap(webView, welcome)
+    awaitCondition("Welcome to Tine demo page with dismissed navigation drawer") {
+      evaluateJson(webView, """
+        (() => JSON.stringify({
+          route: document.querySelector('.page-title')?.textContent?.trim() || '',
+          blocks: document.querySelectorAll('.ls-block').length,
+          pageRefs: document.querySelectorAll('a.page-ref').length,
+          activeDrawer: document.querySelector('.app-container')?.getAttribute('data-active-drawer') || '',
+        }))()
+      """.trimIndent()).let {
+        it.optString("route") == "Welcome to Tine" &&
+          it.optInt("blocks") >= 3 &&
+          it.optInt("pageRefs") >= 1 &&
+          it.optString("activeDrawer").isEmpty()
+      }
+    }
+  }
+
   private fun awaitEditor(webView: WebView, blockId: String, requireMultipleVisualLines: Boolean = false): JSONObject {
     var result: JSONObject? = null
     awaitCondition("real focused block textarea") {
@@ -345,6 +377,26 @@ class AndroidUiRuntimeTest {
     var result: JSONObject? = null
     awaitCondition("element $selector") {
       result = elementRectOrNull(webView, selector)
+      result != null
+    }
+    return checkNotNull(result)
+  }
+
+  private fun awaitElementRectByText(webView: WebView, selector: String, text: String): JSONObject {
+    var result: JSONObject? = null
+    awaitCondition("element $selector containing $text") {
+      result = evaluateJsonOrNull(webView, """
+        (() => {
+          const element = [...document.querySelectorAll(${JSONObject.quote(selector)})]
+            .find((candidate) => candidate.textContent?.includes(${JSONObject.quote(text)}));
+          if (!element) return null;
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return null;
+          return JSON.stringify({ left: rect.left, top: rect.top, width: rect.width, height: rect.height,
+            viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, dpr: window.devicePixelRatio });
+        })()
+      """.trimIndent())
       result != null
     }
     return checkNotNull(result)
@@ -533,19 +585,31 @@ class AndroidUiRuntimeTest {
   }
 
   private fun dispatchMotion(webView: WebView, downTime: Long, action: Int, x: Float, y: Float) {
-    val delivered = CountDownLatch(1)
+    val located = CountDownLatch(1)
+    val location = IntArray(2)
     webView.post {
-      val event = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, x, y, 0).apply {
-        source = InputDevice.SOURCE_TOUCHSCREEN
-      }
-      try {
-        webView.dispatchTouchEvent(event)
-      } finally {
-        event.recycle()
-        delivered.countDown()
-      }
+      webView.getLocationOnScreen(location)
+      located.countDown()
     }
-    assertTrue("native MotionEvent was not delivered to the packaged WebView", delivered.await(EVALUATE_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+    assertTrue("packaged WebView screen location was unavailable", located.await(EVALUATE_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+    val event = MotionEvent.obtain(
+      downTime,
+      SystemClock.uptimeMillis(),
+      action,
+      location[0] + x,
+      location[1] + y,
+      0,
+    ).apply {
+      source = InputDevice.SOURCE_TOUCHSCREEN
+    }
+    try {
+      assertTrue(
+        "Android UiAutomation did not inject the native MotionEvent",
+        InstrumentationRegistry.getInstrumentation().uiAutomation.injectInputEvent(event, true),
+      )
+    } finally {
+      event.recycle()
+    }
   }
 
   private fun installLongPressMutationTrace(webView: WebView) {
