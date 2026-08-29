@@ -220,8 +220,10 @@ class AndroidUiRuntimeTest {
       // No subsequent move event drags a native selection handle, so a green
       // receipt proves the initial-selection boundary rather than a workaround.
       for ((kind, textBounds) in listOf(
-        "single-line" to (1 to 80),
         "first-line-caret-second-line-hold" to (140 to Int.MAX_VALUE),
+        // Probe the scarce wrapped fixture before opening an editor/IME. The
+        // short target is abundant near the same physical scroll position.
+        "single-line" to (1 to 80),
       )) {
         val target = awaitContentBlock(webView, textBounds.first, textBounds.second, kind == "single-line")
         val blockId = target.getString("blockId")
