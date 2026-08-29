@@ -496,18 +496,22 @@ fn parse_document_uncached(
 /// invoking the whole-document outline parser per block. Source-layout
 /// retention itself is admitted by `unbulleted_markdown_headings`, captured
 /// from lsdoc's page parse above; this helper only checks that an edited or
-/// generated block still has the canonical `#{1,6} whitespace` shape.
+/// generated block still has lsdoc's accepted Markdown heading-marker shape.
 pub(crate) fn markdown_atx_heading_line_end(raw: &str) -> Option<usize> {
     let line_end = raw.find(['\r', '\n']).unwrap_or(raw.len());
     let first_line = &raw[..line_end];
-    let hashes = first_line.bytes().take_while(|byte| *byte == b'#').count();
-    (hashes > 0
-        && hashes <= 6
-        && first_line
-            .as_bytes()
-            .get(hashes)
-            .is_some_and(u8::is_ascii_whitespace))
-    .then_some(line_end)
+    let leading_spaces = first_line
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t' | 0x1a | 0x0c))
+        .count();
+    let after_spaces = &first_line[leading_spaces..];
+    let hashes = after_spaces
+        .bytes()
+        .take_while(|byte| *byte == b'#')
+        .count();
+    let boundary = &after_spaces[hashes..];
+    (hashes > 0 && (boundary.is_empty() || matches!(boundary.as_bytes()[0], b' ' | b'\t' | 0x0c)))
+        .then_some(line_end)
 }
 
 #[cfg(test)]
@@ -870,15 +874,19 @@ mod tests {
     }
 
     #[test]
-    fn canonical_atx_heading_line_end_needs_one_to_six_hashes_and_whitespace() {
+    fn atx_heading_line_end_matches_lsdoc_marker_boundaries() {
         assert_eq!(markdown_atx_heading_line_end("# Heading"), Some(9));
         assert_eq!(markdown_atx_heading_line_end("###### H\nbody"), Some(8));
         assert_eq!(
             markdown_atx_heading_line_end("## Heading\r\nbody"),
             Some(10)
         );
+        assert_eq!(markdown_atx_heading_line_end("####### Heading"), Some(15));
+        assert_eq!(markdown_atx_heading_line_end("###"), Some(3));
+        assert_eq!(markdown_atx_heading_line_end("  ## Heading"), Some(12));
+        assert_eq!(markdown_atx_heading_line_end("\u{1a}# Heading"), Some(10));
+        assert_eq!(markdown_atx_heading_line_end("#\u{0c}Heading"), Some(9));
         assert_eq!(markdown_atx_heading_line_end("#Heading"), None);
-        assert_eq!(markdown_atx_heading_line_end("####### Heading"), None);
         assert_eq!(markdown_atx_heading_line_end(" - # Heading"), None);
     }
 }

@@ -5401,6 +5401,7 @@
      "crates/tine-core/src/oplog/import.rs::tests::import_admission_reuses_the_parser_owned_document",
      "crates/tine-core/src/outline.rs::tests::exact_source_parse_cache_is_three_entry_format_keyed_and_never_caches_refusals",
      "crates/tine-core/src/doc.rs::promoted_heading_tests::heading_layout_identity_uses_page_parse_events_without_per_block_outline_parses",
+     "crates/tine-core/src/doc.rs::promoted_heading_tests::lsdoc_extended_unbulleted_heading_forms_remain_byte_exact_with_layout_identity",
      "crates/tine-core/src/sync_runtime.rs::tests::managed_one_block_save_stays_within_two_parser_passes"
     ],
     "failBefore": "proven on the MS-08 packet base: rebuilding a missing disposable SQLite projection reparsed both pages in a two-page healthy baseline; the permanent budget requires zero source parses for already-receipted pages"

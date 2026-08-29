@@ -71,8 +71,10 @@ parser cache for the accepted base, requested target, and clean render base.
 Entries are byte-and-format keyed, limited to 2 MiB sources, and parser failures
 are never cached. Parser-owned unbulleted-heading event facts are carried out of
 that same whole-document parse instead of invoking the outline parser once per
-block during layout retention. These are bounded computation shortcuts, not
-durable state or independent authority.
+block during layout retention. The non-parser marker-placement check mirrors
+lsdoc's leading-space, hash-run, and boundary rules, including its extended ATX
+forms. These are bounded computation shortcuts, not durable state or
+independent authority.
 
 Fresh activation writes only the new format. Before 0.7, experimental older
 managed state may be rebuilt from a verified complete Markdown projection. If

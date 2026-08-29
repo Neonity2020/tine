@@ -1701,6 +1701,20 @@ mod promoted_heading_tests {
     }
 
     #[test]
+    fn lsdoc_extended_unbulleted_heading_forms_remain_byte_exact_with_layout_identity() {
+        for source in [
+            "####### Heading\n\t- child\n- sibling",
+            "###\n\t- child\n- sibling",
+        ] {
+            let mut doc = parse(source);
+            doc.roots[0].uuid = "extended-heading-layout-identity".into();
+            let identities = layout_identities_of(&doc);
+            let opts = SerializeOpts::detect_with_layout_identities(Some(source), &identities);
+            assert_eq!(serialize_with(&doc, &opts), source, "source={source:?}");
+        }
+    }
+
+    #[test]
     fn edited_promoted_heading_keeps_nested_layout_while_identity_stays_first() {
         let mut doc = parse(NESTED_SOURCE);
         let identities = assign_layout_identities(&mut doc);
