@@ -17497,7 +17497,7 @@ mod tests {
         assert_eq!(zero_opened.rebuild.physical_candidate_transactions, 1);
         assert_eq!(
             zero_opened.rebuild.physical_candidate_durability_barriers,
-            1
+            0
         );
         assert_eq!(zero_opened.rebuild.physical_ordinary_transactions, 0);
         assert_materialized_snapshot_matches(&zero_authority, &zero_opened.database);
@@ -17636,7 +17636,7 @@ mod tests {
         assert_eq!(multi_opened.rebuild.physical_candidate_transactions, 1);
         assert_eq!(
             multi_opened.rebuild.physical_candidate_durability_barriers,
-            1
+            0
         );
         assert_eq!(multi_opened.rebuild.physical_ordinary_transactions, 0);
         assert_eq!(
@@ -17706,7 +17706,7 @@ mod tests {
             let parts = prepared.aggregate().parts().len();
             assert_eq!(opened.rebuild.accepted_events_applied, parts);
             assert_eq!(opened.rebuild.physical_candidate_transactions, 1);
-            assert_eq!(opened.rebuild.physical_candidate_durability_barriers, 1);
+            assert_eq!(opened.rebuild.physical_candidate_durability_barriers, 0);
             assert_eq!(opened.rebuild.physical_ordinary_transactions, 0);
             assert_eq!(proof.bootstrap_rebuild().bootstrap_part_reads, parts);
             assert_materialized_snapshot_matches(&authority, &opened.database);

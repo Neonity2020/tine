@@ -295,6 +295,16 @@ mod tests {
             "the storage contract must state the enforced move barrier budget \
              ({MANAGED_MOVE_BARRIER_BUDGET})"
         );
+        for required in [
+            "writable WAL uses `synchronous=NORMAL`",
+            "fresh schema DDL is one atomic transaction",
+            "transaction commits are not authority or individual durability barriers",
+        ] {
+            assert!(
+                contract.contains(required),
+                "the storage contract must retain the disposable SQLite boundary: {required}"
+            );
+        }
     }
 
     #[test]

@@ -5264,6 +5264,30 @@
    "notes": "Internal MS-05 campaign change, not a pre-existing reachable crash bug on the packet base. The managed-local drain now installs object final names before its existing batch-wide filesystem flush while the exact journal record is still undrained; this creates a bounded pre-barrier torn-object state so the flush can follow object installation without weakening post-publication durability. Cold open performs a structural archive open, acquires the workspace sole-writer lease, decodes only uncheckpointed managed-local frames, replaces only one unambiguous digest-matching canonical object, rereads it, and then runs ordinary full validation. The same batch-wide flush makes every object and the staged manifest durable before the manifest is installed and before publication returns, so the journal checkpoint never retires the only recovery authority prematurely. A control in the same regression corrupts an object whose record was fully drained and proves activation still refuses; manifests, uncovered mismatches, ambiguous coverage, noncanonical bytes, and workspace mismatches never receive repair authority. Public archive publication remains strict; a source guard confines the turn-covered path to local_journal_drain. The measured 10/13 save/move barrier totals and barrier kinds do not change. Windows and macOS retain per-artifact durable publication."
   },
   {
+   "id": "REG-MANAGED-DISPOSABLE-SQLITE-NORMAL",
+   "title": "Disposable managed SQLite projection commits do not claim per-event durability",
+   "family": "managed-storage-performance-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/import.rs::tests::inactive_bootstrap_sqlite_rebuilds_zero_one_and_forced_multipart_exactly",
+     "crates/tine-core/src/oplog/sqlite.rs::tests::rebuild_streams_linearly_with_one_live_event_and_evidence_record",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_safe_reopen_rebuilds_a_deleted_disposable_projection",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_safe_reopen_rebuilds_an_unreadable_disposable_projection"
+    ],
+    "failBefore": "The exact pre-MS-06 tine-storage revision configured writable projection databases with synchronous=FULL, counted one durability barrier per ordinary or candidate transaction, and left earlier schema objects committed when a later DDL statement failed."
+   },
+   "notes": "Internal MS-06 cost-model correction. SQLite is a disposable frontier-stamped projection, never accepted-history authority. Its writable WAL now uses synchronous=NORMAL, fresh schema creation is one atomic transaction, and ordinary/candidate commits record zero per-transaction durability barriers. A completed projection becomes reusable only after the existing explicit WAL checkpoint and atomic file-set publication. Missing, stale, corrupt, or power-loss-damaged projection state is validated and rebuilt from the immutable baseline plus accepted manifests; the recovery tests pin that loss of this cache cannot lose accepted graph content. Upstream tine-storage fail-before/pass-after tests directly query the NORMAL pragma and force a late schema collision to prove all earlier DDL rolls back."
+  },
+  {
    "id": "REG-JOURNAL-FEED-READ-ERROR-385",
    "title": "A journal feed read failure is not presented as an empty graph",
    "family": "journal-feed",

@@ -24,6 +24,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed storage no longer forces a durable SQLite cache sync for every
+  accepted event or schema statement.** The disposable WAL projection now uses
+  `synchronous=NORMAL`, creates its schema in one atomic transaction, and keeps
+  durability at the existing explicit checkpoint and atomic file-set
+  publication boundary. A lost or corrupt cache still rebuilds from the
+  immutable baseline and accepted operation history.
+
 - **A crash during managed archive publication can no longer strand an edit
   whose exact bytes are still durable in the local journal.** Cold open repairs
   only torn object names covered unambiguously by an undrained local record,

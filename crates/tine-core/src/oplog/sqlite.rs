@@ -15505,9 +15505,9 @@ mod tests {
         assert_eq!(large.accepted_events_validated, 48);
         assert_eq!(large.accepted_events_applied, 48);
         assert_eq!(small.physical_ordinary_transactions, 24);
-        assert_eq!(small.physical_ordinary_durability_barriers, 24);
+        assert_eq!(small.physical_ordinary_durability_barriers, 0);
         assert_eq!(large.physical_ordinary_transactions, 48);
-        assert_eq!(large.physical_ordinary_durability_barriers, 48);
+        assert_eq!(large.physical_ordinary_durability_barriers, 0);
         assert_eq!(small.physical_candidate_transactions, 0);
         assert_eq!(large.physical_candidate_transactions, 0);
         assert_eq!(small.max_live_events, 1);
