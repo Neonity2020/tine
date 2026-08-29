@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { buildPersistedSession, parsePersistedSession, type PersistedSession } from "./session";
+import { applyParsedSession, buildPersistedSession, parsePersistedSession, type PersistedSession } from "./session";
 import { resetPaneLayoutToSingle, restorePaneLayout, type LayoutNode } from "./panes";
 import type { PaneSnapshot } from "./router";
 import {
@@ -15,7 +15,12 @@ import {
   setRightSidebar,
   setFavoritesSectionExpanded,
   setRecentSectionExpanded,
+  pdfTarget,
+  restorePendingPdfSessionTarget,
+  restorePdfSessionTarget,
+  setPdfTarget,
 } from "./ui";
+import { activatePdfOwnership, resetPdfOwnershipForTest } from "./pdfOwnership";
 
 const journals = (): PaneSnapshot => ({
   tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
@@ -30,11 +35,49 @@ const page = (name: string): PaneSnapshot => ({
 });
 
 beforeEach(() => {
+  resetPdfOwnershipForTest();
   resetPaneLayoutToSingle(journals());
   applySidebarSession({});
+  restorePdfSessionTarget(null);
 });
 
 describe("persisted split session", () => {
+  it("persists only the stable PDF resource identity and restores it with fresh ownership", () => {
+    setPdfTarget({
+      filename: "assets/paper.pdf",
+      label: "Paper",
+      owner: { graphRoot: "/old", generation: 41 },
+      page: 7,
+      highlightId: "highlight-7",
+    });
+
+    const persisted = buildPersistedSession();
+    expect(persisted.pdfTarget).toEqual({ filename: "assets/paper.pdf", label: "Paper" });
+    expect(JSON.stringify(persisted.pdfTarget)).not.toContain("generation");
+    expect(JSON.stringify(persisted.pdfTarget)).not.toContain("page");
+    expect(JSON.stringify(persisted.pdfTarget)).not.toContain("highlight");
+
+    const parsed = parsePersistedSession(JSON.stringify(persisted))!;
+    setPdfTarget(null);
+    applyParsedSession(parsed);
+    expect(pdfTarget()).toBeNull(); // no live graph ownership: stable identity remains pending for bind
+
+    const owner = activatePdfOwnership("/fresh-graph");
+    expect(restorePendingPdfSessionTarget()).toBe(true);
+    expect(pdfTarget()).toEqual({ filename: "assets/paper.pdf", label: "Paper", owner });
+  });
+
+  it("fails a malformed PDF target closed without discarding the rest of the session", () => {
+    const raw = JSON.stringify({
+      ...buildPersistedSession(),
+      pdfTarget: { filename: "assets/paper.pdf", label: 42, owner: { generation: 9 } },
+    });
+
+    const parsed = parsePersistedSession(raw)!;
+    expect(parsed.pdfTarget).toBeNull();
+    expect(parsed.snapshots.get("main")?.tabs).toHaveLength(1);
+  });
+
   it("copies only bounded route fields while retaining exact page ownership", () => {
     const path = "pages/client-b/Twin.md";
     const raw = JSON.stringify({

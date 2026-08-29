@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { backend } from "./backend";
 import { layoutPaneIds, layoutRoot, paneRouter, resetPaneLayoutToSingle, restorePaneLayout } from "./panes";
 import type { PaneSnapshot } from "./router";
 import { buildPersistedSession } from "./session";
-import { applySidebarSession, rightSidebar } from "./ui";
+import { applySidebarSession, pdfTarget, rightSidebar, setPdfTarget } from "./ui";
+import { activatePdfOwnership, resetPdfOwnershipForTest, type PdfOwnership } from "./pdfOwnership";
 import {
   activeWorkspaceId,
   createWorkspace,
@@ -38,14 +39,41 @@ function registryFromCurrent() {
   });
 }
 
+let pdfOwner: PdfOwnership;
+
 beforeEach(() => {
   resetPaneLayoutToSingle(journals());
   applySidebarSession({ right: false, items: [] });
   resetWorkspacesForTest();
+  resetPdfOwnershipForTest();
+  pdfOwner = activatePdfOwnership("/test/workspace-graph");
   vi.restoreAllMocks();
 });
 
+afterEach(() => {
+  setPdfTarget(null);
+  resetPdfOwnershipForTest();
+});
+
 describe("named workspace switching", () => {
+  it("keeps independent PDF open/closed identity in each named workspace", async () => {
+    setPdfTarget({ filename: "assets/alpha.pdf", label: "Alpha", owner: pdfOwner, page: 8 });
+    vi.spyOn(backend(), "loadWorkspaces").mockResolvedValue(registryFromCurrent());
+    vi.spyOn(backend(), "saveWorkspaces").mockResolvedValue();
+    vi.spyOn(backend(), "saveSession").mockResolvedValue();
+
+    await initializeWorkspaces();
+    const beta = await createWorkspace("Beta");
+    expect(pdfTarget()).toBeNull();
+
+    setPdfTarget({ filename: "assets/beta.pdf", label: "Beta", owner: pdfOwner, highlightId: "hl" });
+    await switchWorkspace("default");
+    expect(pdfTarget()).toEqual({ filename: "assets/alpha.pdf", label: "Alpha", owner: pdfOwner });
+
+    await switchWorkspace(beta);
+    expect(pdfTarget()).toEqual({ filename: "assets/beta.pdf", label: "Beta", owner: pdfOwner });
+  });
+
   it("restores the first workspace's routed tabs and split layout after creating and using a second", async () => {
     restorePaneLayout(
       {
