@@ -2094,6 +2094,9 @@ export function mockBackend(): Backend {
     async onGraphChangedBulk(): Promise<() => void> {
       return () => {};
     },
+    async onAssetChanged(): Promise<() => void> {
+      return () => {};
+    },
     async onGraphConfigChanged(): Promise<() => void> {
       return () => {};
     },

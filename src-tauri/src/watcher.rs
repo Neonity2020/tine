@@ -72,6 +72,14 @@ struct GraphChangedBulk {
     changes: Vec<GraphChange>,
 }
 
+/// One coalesced cache-invalidation epoch for ordinary files below the graph's
+/// approved assets capability. Paths are assets-relative and never expose the
+/// user's absolute graph or external-assets location to the WebView.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct AssetChangedBatch {
+    paths: Vec<String>,
+}
+
 /// Every sparse-runtime watcher event is scoped to the graph binding that
 /// produced it. A window can be rebound to another graph while a watcher cycle
 /// is in flight; the frontend must be able to drop that older cycle instead of
@@ -151,6 +159,14 @@ struct SparseV2ErrorEvent {
 struct Pending {
     paths: HashSet<PathBuf>,
     full_paths: HashSet<PathBuf>,
+    /// Exact ordinary-file events retained for the separate asset observer.
+    /// This queue grants no graph-text or managed-operation admission: it is
+    /// later intersected with each binding's approved assets capability and
+    /// reduced to frontend cache invalidations only.
+    asset_paths: HashSet<PathBuf>,
+    /// Ambiguous/directory asset candidates. Only a candidate owned by an
+    /// assets capability requests that capability's metadata-only rescan.
+    asset_full_paths: HashSet<PathBuf>,
     /// Candidate `logseq/config.edn` paths. Configuration is not graph text --
     /// `incremental_page_paths` discards it a few lines below, which is why an
     /// external config edit was invisible until the next graph open -- so it
@@ -195,6 +211,11 @@ impl Pending {
             .filter(|path| path_is_config_file_name(path))
         {
             self.config_paths.insert(path.clone());
+        }
+        if let Some(paths) = incremental_asset_paths(&event) {
+            self.asset_paths.extend(paths);
+        } else if !event.paths.is_empty() {
+            self.asset_full_paths.extend(event.paths.iter().cloned());
         }
         if event.need_rescan() {
             if event.paths.is_empty() {
@@ -715,6 +736,33 @@ fn incremental_page_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
     )
 }
 
+/// Preserve exact ordinary-file events for the asset observer without deciding
+/// here whether a path belongs to an assets capability. The callback has one
+/// process-wide queue; binding ownership is deliberately resolved after drain.
+fn incremental_asset_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
+    use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
+
+    let supported = matches!(
+        event.kind,
+        EventKind::Create(CreateKind::File)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Metadata(_))
+            | EventKind::Remove(RemoveKind::File)
+            | EventKind::Create(CreateKind::Any)
+            | EventKind::Modify(ModifyKind::Any)
+            | EventKind::Modify(ModifyKind::Name(
+                RenameMode::From | RenameMode::To | RenameMode::Both
+            ))
+    );
+    if !supported || event.paths.is_empty() || event.need_rescan() {
+        return None;
+    }
+    if event.paths.iter().any(|path| path_is_existing_dir(path)) {
+        return None;
+    }
+    Some(event.paths.clone())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileStamp {
     modified: SystemTime,
@@ -773,6 +821,351 @@ fn metadata_stamp(md: &std::fs::Metadata) -> Option<FileStamp> {
 struct GraphTextSnapshot {
     files: HashMap<PathBuf, FileStamp>,
     complete: bool,
+}
+
+struct AssetSnapshot {
+    files: HashMap<PathBuf, FileStamp>,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct AssetWatchState {
+    root: PathBuf,
+    snap: HashMap<PathBuf, FileStamp>,
+    baseline: bool,
+    active: bool,
+}
+
+impl AssetWatchState {
+    fn new(root: PathBuf) -> Self {
+        // Capture before the OS watch is installed. The first reconcile after
+        // installation then closes the binding→watch handoff: a sync client
+        // that replaces an already-rendered image in that interval differs
+        // from this baseline instead of silently becoming the baseline.
+        let snapshot = collect_asset_files(&root);
+        Self {
+            root,
+            snap: snapshot.files,
+            baseline: true,
+            active: true,
+        }
+    }
+
+    fn active_root(&self) -> Option<&PathBuf> {
+        self.active.then_some(&self.root)
+    }
+}
+
+/// Tine's atomic asset publishers use hidden numeric temp names. They are
+/// implementation artifacts, not logical assets; the final rename is the one
+/// observation consumers care about.
+fn is_tine_atomic_asset_temp_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    if !stem.starts_with('.') {
+        return false;
+    }
+    let mut parts = stem.rsplit('.');
+    let mut tail = parts.next().unwrap_or_default();
+    if !tail.chars().all(|value| value.is_ascii_digit()) {
+        // Replacement/copy helpers may name the publication purpose between
+        // the numeric sequence and `.tmp`.
+        tail = parts.next().unwrap_or_default();
+    }
+    if !tail.chars().all(|value| value.is_ascii_digit()) {
+        return false;
+    }
+    parts
+        .next()
+        .is_some_and(|pid| !pid.is_empty() && pid.chars().all(|value| value.is_ascii_digit()))
+}
+
+fn collect_asset_files(root: &Path) -> AssetSnapshot {
+    let mut files = HashMap::new();
+    let mut complete = true;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let read_dir = match std::fs::read_dir(&directory) {
+            Ok(read_dir) => read_dir,
+            Err(error) if directory == root && error.kind() == std::io::ErrorKind::NotFound => {
+                continue
+            }
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        for entry in read_dir {
+            let Ok(entry) = entry else {
+                complete = false;
+                continue;
+            };
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                complete = false;
+                continue;
+            };
+            // No-follow, exactly like graph-text scans: an asset-directory
+            // symlink cannot widen the already-approved capability or loop.
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || is_tine_atomic_asset_temp_path(&path) {
+                continue;
+            }
+            match entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata_stamp(&metadata))
+            {
+                Some(stamp) => {
+                    files.insert(path, stamp);
+                }
+                None => complete = false,
+            }
+        }
+    }
+    AssetSnapshot { files, complete }
+}
+
+fn asset_relative_event_path(root: &Path, path: &Path) -> Option<String> {
+    if is_tine_atomic_asset_temp_path(path) {
+        return None;
+    }
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    relative
+        .to_str()
+        .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+#[derive(Clone, Copy)]
+struct RecentAssetSelfWrite {
+    stamp: Option<FileStamp>,
+    recorded_at: Instant,
+}
+
+const ASSET_SELF_WRITE_TTL: Duration = Duration::from_secs(30);
+const ASSET_SELF_WRITE_CAP: usize = 4096;
+static RECENT_ASSET_SELF_WRITES: OnceLock<Mutex<HashMap<(String, PathBuf), RecentAssetSelfWrite>>> =
+    OnceLock::new();
+
+/// Assets already handed to a WebView can be rendered before the watcher loop
+/// has installed that graph's OS watch. Retain the observed file identity long
+/// enough for the watcher to use it as the cache's real baseline instead of
+/// accidentally baselining a replacement that arrived during startup.
+static RECENT_ASSET_READS: OnceLock<Mutex<HashMap<(String, PathBuf), RecentAssetSelfWrite>>> =
+    OnceLock::new();
+
+pub(crate) fn note_asset_read(window_label: &str, path: &Path) {
+    let reads = RECENT_ASSET_READS.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut reads) = reads.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    reads.retain(|_, read| now.duration_since(read.recorded_at) <= ASSET_SELF_WRITE_TTL);
+    if reads.len() >= ASSET_SELF_WRITE_CAP {
+        if let Some(oldest) = reads
+            .iter()
+            .min_by_key(|(_, read)| read.recorded_at)
+            .map(|(key, _)| key.clone())
+        {
+            reads.remove(&oldest);
+        }
+    }
+    reads.insert(
+        (window_label.to_owned(), path.to_path_buf()),
+        RecentAssetSelfWrite {
+            stamp: file_snapshot(path),
+            recorded_at: now,
+        },
+    );
+    if crate::debug::debug_enabled() {
+        crate::debug::diag("asset observer recorded one WebView read");
+    }
+}
+
+fn merge_recent_asset_reads(window_label: &str, state: &mut AssetWatchState) -> bool {
+    let Some(reads) = RECENT_ASSET_READS.get() else {
+        return false;
+    };
+    let Ok(mut reads) = reads.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    let keys = reads
+        .iter()
+        .filter(|((label, path), read)| {
+            now.duration_since(read.recorded_at) <= ASSET_SELF_WRITE_TTL
+                && label == window_label
+                && path.starts_with(&state.root)
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let mut merged = false;
+    for key in keys {
+        if let Some(read) = reads.remove(&key) {
+            match read.stamp {
+                Some(stamp) => {
+                    state.snap.insert(key.1, stamp);
+                }
+                None => {
+                    state.snap.remove(&key.1);
+                }
+            }
+            merged = true;
+        }
+    }
+    reads.retain(|_, read| now.duration_since(read.recorded_at) <= ASSET_SELF_WRITE_TTL);
+    if merged && crate::debug::debug_enabled() {
+        crate::debug::diag("asset observer merged a WebView-read baseline");
+    }
+    merged
+}
+
+/// Record the final filesystem state published by one window's own asset
+/// command. The watcher suppresses that echo only for the originating WebView;
+/// other windows still need the invalidation.
+pub(crate) fn note_asset_self_write(window_label: &str, path: &Path) {
+    let writes = RECENT_ASSET_SELF_WRITES.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut writes) = writes.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    writes.retain(|_, write| now.duration_since(write.recorded_at) <= ASSET_SELF_WRITE_TTL);
+    if writes.len() >= ASSET_SELF_WRITE_CAP {
+        if let Some(oldest) = writes
+            .iter()
+            .min_by_key(|(_, write)| write.recorded_at)
+            .map(|(key, _)| key.clone())
+        {
+            writes.remove(&oldest);
+        }
+    }
+    let canonical_path = std::fs::canonicalize(path).ok().or_else(|| {
+        let parent = std::fs::canonicalize(path.parent()?).ok()?;
+        Some(parent.join(path.file_name()?))
+    });
+    let path = canonical_path.unwrap_or_else(|| path.to_path_buf());
+    writes.insert(
+        (window_label.to_owned(), path.clone()),
+        RecentAssetSelfWrite {
+            stamp: file_snapshot(&path),
+            recorded_at: now,
+        },
+    );
+}
+
+fn take_matching_asset_self_write(
+    window_label: &str,
+    path: &Path,
+    stamp: Option<FileStamp>,
+) -> bool {
+    let Some(writes) = RECENT_ASSET_SELF_WRITES.get() else {
+        return false;
+    };
+    let Ok(mut writes) = writes.lock() else {
+        return false;
+    };
+    let key = (window_label.to_owned(), path.to_path_buf());
+    let Some(write) = writes.remove(&key) else {
+        return false;
+    };
+    Instant::now().duration_since(write.recorded_at) <= ASSET_SELF_WRITE_TTL && write.stamp == stamp
+}
+
+fn asset_full_scan_owned(root: &Path, paths: &HashSet<PathBuf>) -> bool {
+    paths
+        .iter()
+        .any(|path| path.starts_with(root) || root.starts_with(path))
+}
+
+fn reconcile_asset_observation(
+    window_label: &str,
+    state: &mut AssetWatchState,
+    exact_paths: &HashSet<PathBuf>,
+    full_paths: &HashSet<PathBuf>,
+    force_full: bool,
+    poll_mode: bool,
+) -> Vec<String> {
+    if !state.active {
+        return Vec::new();
+    }
+    if !state.baseline {
+        let snapshot = collect_asset_files(&state.root);
+        state.snap = snapshot.files;
+        state.baseline = true;
+        return Vec::new();
+    }
+
+    // A read seed is an observation boundary, not a filesystem event. Compare
+    // it to current metadata even if its intervening kernel event happened
+    // before this watcher binding existed.
+    let observed_read = merge_recent_asset_reads(window_label, state);
+    let need_full =
+        force_full || poll_mode || observed_read || asset_full_scan_owned(&state.root, full_paths);
+    let mut changed = Vec::<(PathBuf, Option<FileStamp>)>::new();
+    if need_full {
+        let current = collect_asset_files(&state.root);
+        for (path, stamp) in &current.files {
+            if state.snap.get(path) != Some(stamp) {
+                changed.push((path.clone(), Some(*stamp)));
+            }
+        }
+        if current.complete {
+            for path in state.snap.keys() {
+                if !current.files.contains_key(path) {
+                    changed.push((path.clone(), None));
+                }
+            }
+            state.snap = current.files;
+        } else {
+            // A partial walk can prove present changes but never deletion.
+            state.snap.extend(current.files);
+        }
+    } else {
+        for path in exact_paths
+            .iter()
+            .filter(|path| path.starts_with(&state.root))
+        {
+            if asset_relative_event_path(&state.root, path).is_none() {
+                continue;
+            }
+            let current = file_snapshot(path);
+            if state.snap.get(path).copied() == current {
+                continue;
+            }
+            match current {
+                Some(stamp) => {
+                    state.snap.insert(path.clone(), stamp);
+                }
+                None => {
+                    state.snap.remove(path);
+                }
+            }
+            changed.push((path.clone(), current));
+        }
+    }
+
+    let mut logical = changed
+        .into_iter()
+        .filter(|(path, stamp)| !take_matching_asset_self_write(window_label, path, *stamp))
+        .filter_map(|(path, _)| asset_relative_event_path(&state.root, &path))
+        .collect::<Vec<_>>();
+    logical.sort();
+    logical.dedup();
+    logical
 }
 
 fn collect_graph_text_files(graph: &Graph) -> GraphTextSnapshot {
@@ -1489,11 +1882,12 @@ fn sparse_observations(
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
-        if relative
-            .components()
-            .next()
-            .is_some_and(|component| component.as_os_str() == ".tine-sync")
-        {
+        if relative.components().next().is_some_and(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name == ".tine-sync" || name.eq_ignore_ascii_case("assets"))
+        }) {
             continue;
         }
         let observation = relative
@@ -1680,6 +2074,7 @@ fn take_sparse_initial_tick(pending: &mut bool) -> bool {
 struct WatchedGraph {
     legacy_graph: LegacyGraphLease,
     root: PathBuf,
+    assets: AssetWatchState,
     snap: HashMap<PathBuf, FileStamp>,
     baseline: bool,
     last_reconcile_error: Option<String>,
@@ -1690,12 +2085,26 @@ struct WatchedGraph {
     pending_observation_epoch: Option<GraphTextExternalObservationTicket>,
 }
 
+fn asset_root_for_slot(app: &tauri::AppHandle, slot: &GraphSlot) -> Option<PathBuf> {
+    let root = &slot.root_key;
+    match Graph::external_assets_target(root) {
+        Ok(Some(live)) => crate::settings::approved_external_assets(app, root)
+            .and_then(|approved| std::fs::canonicalize(approved).ok())
+            .filter(|approved| approved == &live)
+            .map(|_| live),
+        Ok(None) => Some(root.join("assets")),
+        Err(_) => None,
+    }
+}
+
 fn route_drained_direct_frontiers(
     graphs: &mut HashMap<String, WatchedGraph>,
     latest_entries: Vec<(String, Arc<GraphSlot>)>,
     drained: &HashMap<PathBuf, GraphTextExternalObservationTicket>,
+    asset_root_for: impl Fn(&GraphSlot) -> Option<PathBuf>,
 ) {
     for (label, slot) in latest_entries {
+        let asset_root = asset_root_for(&slot);
         let Ok((latest_graph, root)) = direct_watch_paths(&slot) else {
             continue;
         };
@@ -1711,6 +2120,10 @@ fn route_drained_direct_frontiers(
                     .legacy_graph
                     .owns_graph_text_external_observation_ticket(ticket)
                 {
+                    current.assets = asset_root
+                        .clone()
+                        .map(AssetWatchState::new)
+                        .unwrap_or_default();
                     current.legacy_graph = latest_graph;
                     current.snap.clear();
                     current.baseline = false;
@@ -1723,6 +2136,10 @@ fn route_drained_direct_frontiers(
                 graphs.insert(
                     label,
                     WatchedGraph {
+                        assets: asset_root
+                            .clone()
+                            .map(AssetWatchState::new)
+                            .unwrap_or_default(),
                         legacy_graph: latest_graph,
                         root,
                         snap: HashMap::new(),
@@ -1768,6 +2185,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         struct WatchedSparse {
             handle: SyncRuntimeHandle,
             root: PathBuf,
+            assets: AssetWatchState,
             binding_generation: u64,
             last_error: Option<String>,
             retry: RetrySchedule,
@@ -1805,6 +2223,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             graphs.retain(|label, _| live.contains(label));
             sparse_graphs.retain(|label, _| live.contains(label));
             for (label, slot) in entries {
+                let asset_root = asset_root_for_slot(&app, &slot);
                 if let Some(handle) = slot.sparse_runtime().cloned() {
                     graphs.remove(&label);
                     match sparse_graphs.get_mut(&label) {
@@ -1813,6 +2232,12 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 && current.binding_generation == slot.binding_generation =>
                         {
                             current.handle = handle;
+                            if asset_root.as_ref() != current.assets.active_root() {
+                                current.assets = asset_root
+                                    .clone()
+                                    .map(AssetWatchState::new)
+                                    .unwrap_or_default();
+                            }
                         }
                         _ => {
                             relay_absence_sweep_events(
@@ -1826,6 +2251,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 WatchedSparse {
                                     handle,
                                     root: slot.root_key.clone(),
+                                    assets: asset_root
+                                        .clone()
+                                        .map(AssetWatchState::new)
+                                        .unwrap_or_default(),
                                     binding_generation: slot.binding_generation,
                                     last_error: None,
                                     retry: RetrySchedule::default(),
@@ -1860,11 +2289,21 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             current.pending_observation_epoch = None;
                         }
                         current.legacy_graph = legacy_graph;
+                        if asset_root.as_ref() != current.assets.active_root() {
+                            current.assets = asset_root
+                                .clone()
+                                .map(AssetWatchState::new)
+                                .unwrap_or_default();
+                        }
                     }
                     _ => {
+                        let assets = asset_root
+                            .clone()
+                            .unwrap_or_else(|| legacy_graph.assets_path());
                         graphs.insert(
                             label,
                             WatchedGraph {
+                                assets: AssetWatchState::new(assets),
                                 legacy_graph,
                                 root,
                                 snap: HashMap::new(),
@@ -1887,10 +2326,28 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         .map(|(label, graph)| (label.clone(), graph.root.clone())),
                 )
                 .collect();
-            let desired: HashSet<PathBuf> = labels_by_root
+            let watch_labels = labels_by_root
                 .iter()
-                .map(|(_, root)| root.clone())
-                .collect();
+                .cloned()
+                .chain(
+                    graphs
+                        .iter()
+                        .filter(|(_, graph)| {
+                            graph.assets.active && !graph.assets.root.starts_with(&graph.root)
+                        })
+                        .map(|(label, graph)| (label.clone(), graph.assets.root.clone())),
+                )
+                .chain(
+                    sparse_graphs
+                        .iter()
+                        .filter(|(_, graph)| {
+                            graph.assets.active && !graph.assets.root.starts_with(&graph.root)
+                        })
+                        .map(|(label, graph)| (label.clone(), graph.assets.root.clone())),
+                )
+                .collect::<Vec<_>>();
+            let desired: HashSet<PathBuf> =
+                watch_labels.iter().map(|(_, root)| root.clone()).collect();
             if let Ok(mut roots) = watched_roots.lock() {
                 if *roots != desired {
                     roots.clone_from(&desired);
@@ -1898,6 +2355,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             }
 
             // Bring the OS watcher in line with the current mode + graph roots.
+            let mut newly_watched = HashSet::new();
             if inotify {
                 if watcher.is_none() {
                     let txc = tx.clone();
@@ -1946,6 +2404,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         match w.watch(&dir, notify::RecursiveMode::Recursive) {
                             Ok(()) => {
                                 watch_failures.remove(&dir);
+                                newly_watched.insert(dir.clone());
                                 watched.insert(dir);
                             }
                             Err(error) => {
@@ -1957,7 +2416,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 // distinct message so a retry loop cannot spam.
                                 let message = error.to_string();
                                 if watch_failures.get(&dir) != Some(&message) {
-                                    for (label, root) in labels_by_root.iter() {
+                                    for (label, root) in watch_labels.iter() {
                                         if root == &dir {
                                             let _ =
                                                 app.emit_to(label, "graph-watch-error", &message);
@@ -1980,6 +2439,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             let (
                 paths,
                 full_paths,
+                asset_paths,
+                asset_full_paths,
                 config_paths,
                 drained_observation_epochs,
                 event_need_full,
@@ -1989,6 +2450,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 if let Ok(mut p) = pending.lock() {
                     let paths = std::mem::take(&mut p.paths);
                     let full_paths = std::mem::take(&mut p.full_paths);
+                    let asset_paths = std::mem::take(&mut p.asset_paths);
+                    let asset_full_paths = std::mem::take(&mut p.asset_full_paths);
                     let config_paths = std::mem::take(&mut p.config_paths);
                     let observation_epochs = p.take_legacy_observation_epochs();
                     let need_full = p.need_full;
@@ -1999,6 +2462,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     (
                         paths,
                         full_paths,
+                        asset_paths,
+                        asset_full_paths,
                         config_paths,
                         observation_epochs,
                         need_full,
@@ -2010,6 +2475,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         HashSet::new(),
                         HashSet::new(),
                         HashSet::new(),
+                        HashSet::new(),
+                        HashSet::new(),
                         HashMap::new(),
                         true,
                         true,
@@ -2018,6 +2485,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 }
             } else {
                 (
+                    HashSet::new(),
+                    HashSet::new(),
                     HashSet::new(),
                     HashSet::new(),
                     HashSet::new(),
@@ -2040,12 +2509,64 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     &mut graphs,
                     latest_entries,
                     &drained_observation_epochs,
+                    |slot| asset_root_for_slot(&app, slot),
                 );
             }
             // A focus-driven rescan demands the same full stat diff a kernel
             // rescan does, for the Direct lane and the managed lane alike.
             let explicit_rescan = pending_full_rescan();
             let event_need_full = event_need_full || explicit_rescan.is_some();
+
+            // Assets are ordinary externally synchronized files, not managed
+            // graph text. Observe only their metadata here and emit one
+            // assets-relative cache-invalidation batch; this lane never calls
+            // Graph reconciliation, the sparse actor, or the provider API.
+            for (label, graph) in graphs.iter_mut() {
+                let watch_handoff = newly_watched
+                    .iter()
+                    .any(|root| graph.assets.root.starts_with(root));
+                let changed = reconcile_asset_observation(
+                    label,
+                    &mut graph.assets,
+                    &asset_paths,
+                    &asset_full_paths,
+                    event_need_full || notify_error || watch_handoff,
+                    !inotify,
+                );
+                if !changed.is_empty() {
+                    if crate::debug::debug_enabled() {
+                        crate::debug::diag(format!(
+                            "asset observer emitting {} invalidation(s)",
+                            changed.len()
+                        ));
+                    }
+                    let _ =
+                        app.emit_to(label, "asset-changed", AssetChangedBatch { paths: changed });
+                }
+            }
+            for (label, graph) in sparse_graphs.iter_mut() {
+                let watch_handoff = newly_watched
+                    .iter()
+                    .any(|root| graph.assets.root.starts_with(root));
+                let changed = reconcile_asset_observation(
+                    label,
+                    &mut graph.assets,
+                    &asset_paths,
+                    &asset_full_paths,
+                    event_need_full || notify_error || watch_handoff,
+                    !inotify,
+                );
+                if !changed.is_empty() {
+                    if crate::debug::debug_enabled() {
+                        crate::debug::diag(format!(
+                            "asset observer emitting {} invalidation(s)",
+                            changed.len()
+                        ));
+                    }
+                    let _ =
+                        app.emit_to(label, "asset-changed", AssetChangedBatch { paths: changed });
+                }
+            }
             for (label, graph) in graphs.iter_mut() {
                 if let Some(epoch) = drained_observation_epochs.get(&graph.root).copied() {
                     if graph
@@ -2935,14 +3456,16 @@ mod tests {
     fn explicit_unmanaged_file_events_do_not_schedule_graph_scans() {
         use notify::event::{CreateKind, EventKind, RemoveKind};
 
-        for (kind, path) in [
+        for (kind, path, asset_paths) in [
             (
                 EventKind::Create(CreateKind::File),
                 PathBuf::from("/graphs/a/assets/image.png"),
+                1,
             ),
             (
                 EventKind::Remove(RemoveKind::File),
                 PathBuf::from("/graphs/a/logseq/config.edn"),
+                1,
             ),
         ] {
             let mut pending = Pending::default();
@@ -2954,7 +3477,147 @@ mod tests {
             assert!(!pending.need_full);
             assert!(pending.full_paths.is_empty());
             assert!(pending.paths.is_empty());
+            assert_eq!(
+                pending.asset_paths.len(),
+                asset_paths,
+                "ordinary exact files must remain available to the separate asset observer"
+            );
         }
+    }
+
+    #[test]
+    fn asset_observation_names_only_paths_inside_the_asset_capability() {
+        let root = Path::new("/graphs/a/assets");
+        assert_eq!(
+            asset_relative_event_path(root, Path::new("/graphs/a/assets/diagrams/flow.svg")),
+            Some("diagrams/flow.svg".into())
+        );
+        assert_eq!(
+            asset_relative_event_path(root, Path::new("/graphs/a/pages/flow.svg")),
+            None
+        );
+        assert_eq!(asset_relative_event_path(root, root), None);
+    }
+
+    #[test]
+    fn asset_observation_refreshes_peers_but_suppresses_the_originating_self_write() {
+        let graph = TempGraph::new("asset-self-write");
+        let assets = graph.path("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let mut origin = AssetWatchState::new(assets.clone());
+        let mut peer = AssetWatchState::new(assets.clone());
+        let empty = HashSet::new();
+        assert!(
+            reconcile_asset_observation("main", &mut origin, &empty, &empty, true, false,)
+                .is_empty()
+        );
+        assert!(
+            reconcile_asset_observation("second", &mut peer, &empty, &empty, true, false,)
+                .is_empty()
+        );
+
+        let image = assets.join("nested/image.png");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"new image bytes").unwrap();
+        note_asset_self_write("main", &image);
+        let exact = HashSet::from([image]);
+
+        assert_eq!(
+            reconcile_asset_observation("second", &mut peer, &exact, &empty, false, false),
+            vec!["nested/image.png"]
+        );
+        assert!(
+            reconcile_asset_observation("main", &mut origin, &exact, &empty, false, false,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn asset_read_before_watcher_binding_remains_the_refresh_baseline() {
+        let graph = TempGraph::new("asset-read-before-watch");
+        let assets = graph.path("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let image = assets.join("startup.png");
+        std::fs::write(&image, b"bytes rendered before watcher binding").unwrap();
+        note_asset_read("main", &image);
+
+        // An external synchronizer replaces the file before AssetWatchState is
+        // constructed. A fresh directory snapshot alone would baseline these
+        // new bytes and lose the invalidation for the already-rendered image.
+        let replacement = assets.join("startup.replacement");
+        std::fs::write(&replacement, b"replacement bytes").unwrap();
+        std::fs::rename(&replacement, &image).unwrap();
+        let mut state = AssetWatchState::new(assets);
+
+        assert_eq!(
+            reconcile_asset_observation(
+                "main",
+                &mut state,
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+                false,
+            ),
+            vec!["startup.png"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_write_marker_canonicalizes_an_approved_external_assets_link() {
+        use std::os::unix::fs::symlink;
+
+        let graph = TempGraph::new("asset-self-write-external");
+        let external = TempGraph::new("asset-self-write-external-target");
+        let external_assets = external.path("approved-assets");
+        std::fs::create_dir_all(&external_assets).unwrap();
+        symlink(&external_assets, graph.path("assets")).unwrap();
+        let mut state = AssetWatchState::new(external_assets.clone());
+        let image = external_assets.join("linked.png");
+        std::fs::write(&image, b"linked image").unwrap();
+        note_asset_self_write("main", &graph.path("assets/linked.png"));
+
+        assert!(reconcile_asset_observation(
+            "main",
+            &mut state,
+            &HashSet::from([image]),
+            &HashSet::new(),
+            false,
+            false,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn uncertain_asset_rescan_is_metadata_only_and_does_not_invent_deletions() {
+        let source = include_str!("watcher.rs");
+        let body = source
+            .split_once("fn collect_asset_files(")
+            .unwrap()
+            .1
+            .split_once("fn asset_relative_event_path(")
+            .unwrap()
+            .0;
+        assert!(!body.contains("std::fs::read("));
+        assert!(!body.contains("Graph::"));
+        assert!(!body.contains("observe_watcher"));
+
+        let graph = TempGraph::new("asset-full-diff");
+        let assets = graph.path("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        graph.write("assets/one.png", "one");
+        let mut state = AssetWatchState::new(assets);
+        let empty = HashSet::new();
+        assert!(
+            reconcile_asset_observation("main", &mut state, &empty, &empty, true, false,)
+                .is_empty()
+        );
+        graph.write("assets/one.png", "changed-length");
+        graph.write("assets/two.svg", "two");
+        assert_eq!(
+            reconcile_asset_observation("main", &mut state, &empty, &empty, true, false),
+            vec!["one.png", "two.svg"]
+        );
     }
 
     #[test]
@@ -3211,6 +3874,14 @@ mod tests {
         let root = PathBuf::from("/graph");
         let paths = HashSet::from([root.join(".tine-sync/v2/objects/immutable")]);
         assert!(sparse_observations(&root, &paths, &HashSet::new(), false, false).is_empty());
+    }
+
+    #[test]
+    fn sparse_watcher_never_routes_asset_observation_into_the_managed_actor() {
+        let root = PathBuf::from("/graph");
+        let exact = HashSet::from([root.join("assets/image.png")]);
+        let ambiguous = HashSet::from([root.join("assets/nested")]);
+        assert!(sparse_observations(&root, &exact, &ambiguous, false, false).is_empty());
     }
 
     #[test]
@@ -3904,6 +4575,7 @@ mod tests {
         let mut graphs = HashMap::from([(
             "main".to_owned(),
             WatchedGraph {
+                assets: AssetWatchState::new(old_graph.assets_path()),
                 legacy_graph: old_graph,
                 root: graph_dir.root.clone(),
                 snap: HashMap::new(),
@@ -3932,6 +4604,7 @@ mod tests {
             &mut graphs,
             vec![("main".to_owned(), replacement_slot)],
             &drained,
+            |slot| slot.legacy_graph().ok().map(|graph| graph.assets_path()),
         );
 
         let routed = graphs.get_mut("main").unwrap();
