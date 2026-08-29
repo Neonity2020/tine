@@ -5711,7 +5711,7 @@ dependencies = [
 [[package]]
 name = "tine-storage"
 version = "0.8.10"
-source = "git+https://github.com/martinkoutecky/tine-storage?rev=5f88f1dcb1b70e85bd355e0b9fc10920a8e7ac50#5f88f1dcb1b70e85bd355e0b9fc10920a8e7ac50"
+source = "git+https://github.com/martinkoutecky/tine-storage?rev=3e787866553bb5af9ce4ca84d428fdee9bf94058#3e787866553bb5af9ce4ca84d428fdee9bf94058"
 dependencies = [
  "cap-fs-ext",
  "cap-std",

@@ -3079,6 +3079,9 @@ impl From<rusqlite::Error> for MaterializationError {
 
 impl From<storage::MaterializationError> for MaterializationError {
     fn from(error: storage::MaterializationError) -> Self {
+        if let Some(horizon_sequence) = error.search_index_building_horizon() {
+            return Self::SearchIndexBuilding { horizon_sequence };
+        }
         match error {
             storage::MaterializationError::Sqlite(error) => Self::Sqlite(error),
             storage::MaterializationError::Schema(error) => Self::Schema(error),
@@ -3102,9 +3105,6 @@ impl From<storage::MaterializationError> for MaterializationError {
                 materialized,
                 frontier,
             },
-            storage::MaterializationError::SearchIndexBuilding { horizon_sequence } => {
-                Self::SearchIndexBuilding { horizon_sequence }
-            }
             storage::MaterializationError::InvalidQuery(error) => Self::InvalidQuery(error),
         }
     }
