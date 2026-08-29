@@ -308,6 +308,29 @@
    }
   },
   {
+   "id": "REG-ASSET-OBSERVATION-001",
+   "title": "Externally changed asset images refresh without admitting asset bytes to graph text or managed storage",
+   "family": "external-files",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native-ui",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/watcher.rs",
+     "src/mediaEditors.test.ts",
+     "scripts/e2e-external-assets.mjs"
+    ],
+    "scenario": "filesystem.asset-observation-and-cache-refresh",
+    "failBefore": "proven"
+   }
+  },
+  {
    "id": "REG-ANDROID-BACKUP-RESTORE-EXDEV-001",
    "title": "Backup restore pages journals sidecars and config keep recovery and publication on the live graph filesystem when app data is on another device",
    "family": "backup-recovery",
