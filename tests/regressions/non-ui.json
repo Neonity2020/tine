@@ -5263,6 +5263,28 @@
    "notes": "The reporter's privacy-safe graph verification listed 748 local dated Markdown/Org journals, while the diagnostic recorded journal_feed_page as failed. This repair distinguishes a failed read from a successful empty inventory without weakening background refresh recovery. The native reason for the reporter's iCloud-specific failure remains reporter-verification evidence, not a claimed root cause."
   },
   {
+   "id": "REG-MANAGED-ANDROID-PROMOTED-RECEIPT-BARRIER-STRICT",
+   "title": "Promoted Android projection receipts never degrade a refused directory barrier",
+   "family": "managed-storage-durability",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::android_receipt_barriers_are_reconstructible_only_during_pre_promotion_bootstrap",
+     "crates/tine-core/src/filesystem_durability.rs::tests::only_the_reconstructible_projection_class_degrades_and_only_on_android"
+    ],
+    "failBefore": "The Android receipt publisher and directory creator unconditionally used sync_reconstructible_directory, so PermissionDenied, Unsupported, and InvalidInput were swallowed even after the receipt-store identity had been promoted into receiver authority."
+   },
+   "notes": "Internal MS-04 campaign finding. User-visible harm and safety class: a save or received operation could report success after Android refused the parent-directory durability barrier for a promoted receipt, allowing a crash to lose the receipt name while accepted history treats it as durable. Pre-promotion initialization remains reconstructible from unchanged Direct Files and may use the narrow Android capability-refusal exception; all operational receipt records and namespaces are PrivateDurableAuthority and fail closed on every barrier refusal."
+  },
+  {
    "id": "REG-MANAGED-FOCUS-EXTERNAL-REFRESH-397",
    "title": "Managed application-page selectors read same-structure external Markdown content consistently while reconciliation is pending",
    "family": "managed-storage-external-reconciliation",

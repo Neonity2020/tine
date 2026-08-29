@@ -2088,6 +2088,20 @@ available. Honest concurrent Tine writers remain excluded by the runtime lease;
 a hostile process inside the same application sandbox is outside this threat
 model.
 
+Directory-barrier refusal is classified at the receipt store's promotion
+boundary, not by platform or by syscall alone:
+
+| Receipt publication | Durability class | Android capability refusal | Required response |
+| --- | --- | --- | --- |
+| Initialization claim, top-level namespaces, and store claim before any enrollment binding promotes that store identity | Pre-promotion reconstructible bootstrap | The exact file bytes remain synced; `PermissionDenied`/`Unsupported`/`InvalidInput` from the parent-directory barrier may degrade | Retry may archive the one diagnostic tree and reconstruct it from unchanged Direct Files |
+| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | Refuse the publication and keep the accepted operation pending/recoverable; do not report a receipt whose name was not durably published |
+
+The implementation makes the first row an explicitly named bootstrap-only
+helper used solely inside `ProjectionReceiptStore::initialize`; the ordinary
+receipt publisher and directory creator are the strict second row. This keeps
+an Android setup capability limitation from wedging activation without letting
+that setup exception leak into retained receiver authority.
+
 Before an enrollment binding exists, projection receipts are reconstructible
 bootstrap state rather than authority. If Android cannot reopen a receipt tree
 left by an interrupted or older activation, retry retains one sibling

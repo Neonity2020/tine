@@ -237,7 +237,21 @@ fn create_android_private_directory(path: &Path) -> Result<Dir, ProjectionStoreE
     open_android_private_directory(path)
 }
 
-fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptDirectoryDurability {
+    /// The store has not yet published the claim enrollment will promote, so
+    /// the namespace is still reconstructible from unchanged Direct Files.
+    PrePromotionBootstrap,
+    /// Enrollment has promoted the store identity. Its receipt names are now
+    /// private durable authority and every directory barrier is strict.
+    PromotedAuthority,
+}
+
+fn ensure_directory_nofollow_with_durability(
+    root: &Dir,
+    name: &str,
+    durability: ReceiptDirectoryDurability,
+) -> Result<(), ProjectionStoreError> {
     #[cfg(target_os = "android")]
     {
         let component = Path::new(name);
@@ -267,12 +281,36 @@ fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionSto
         // one honest Tine writer, so an fstatat-style preflight adds no safety
         // but is rejected by some physical devices even when mkdir/open work.
         open_dir_nofollow(root, name)?;
-        crate::filesystem_durability::sync_reconstructible_directory(root)?;
+        match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => {
+                crate::filesystem_durability::sync_reconstructible_directory(root)?;
+            }
+            ReceiptDirectoryDurability::PromotedAuthority => sync_dir_required(root)?,
+        }
         return Ok(());
     }
 
     #[cfg(not(target_os = "android"))]
-    super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+    {
+        let _ = durability;
+        super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+    }
+}
+
+fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+    ensure_directory_nofollow_with_durability(
+        root,
+        name,
+        ReceiptDirectoryDurability::PromotedAuthority,
+    )
+}
+
+fn ensure_bootstrap_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+    ensure_directory_nofollow_with_durability(
+        root,
+        name,
+        ReceiptDirectoryDurability::PrePromotionBootstrap,
+    )
 }
 
 fn read_optional_regular(
@@ -367,7 +405,37 @@ fn publish_immutable_exact(
 ) -> Result<(), StoreError> {
     #[cfg(target_os = "android")]
     {
-        return publish_android_private_immutable(dir, filename, bytes, kind);
+        return publish_android_private_immutable(
+            dir,
+            filename,
+            bytes,
+            kind,
+            ReceiptDirectoryDurability::PromotedAuthority,
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        crate::durability_counters::note_immutable_publication();
+        publish_immutable_exact_strict(dir, filename, bytes, kind)
+    }
+}
+
+fn publish_bootstrap_immutable_exact(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+) -> Result<(), StoreError> {
+    #[cfg(target_os = "android")]
+    {
+        return publish_android_private_immutable(
+            dir,
+            filename,
+            bytes,
+            kind,
+            ReceiptDirectoryDurability::PrePromotionBootstrap,
+        );
     }
 
     #[cfg(not(target_os = "android"))]
@@ -390,6 +458,7 @@ fn publish_android_private_immutable(
     filename: &str,
     bytes: &[u8],
     kind: &'static str,
+    durability: ReceiptDirectoryDurability,
 ) -> Result<(), StoreError> {
     let verify_existing = || -> Result<bool, StoreError> {
         match read_optional_regular(dir, filename, bytes.len() as u64, Some(bytes.len() as u64)) {
@@ -415,7 +484,7 @@ fn publish_android_private_immutable(
     // As for receipt directories, use the ordinary Android primitive without
     // the hostile-namespace flags added by the generic capability publisher.
     // The retained file is still create-new, fully synced, and verified byte
-    // for byte before this pre-promotion store is accepted.
+    // for byte before the publication is accepted.
     let temp_fd = unsafe {
         libc::openat(
             dir.as_fd().as_raw_fd(),
@@ -449,7 +518,12 @@ fn publish_android_private_immutable(
         if renamed < 0 {
             return Err(StoreError::Io(io::Error::last_os_error()));
         }
-        crate::filesystem_durability::sync_reconstructible_directory(dir)?;
+        match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => {
+                crate::filesystem_durability::sync_reconstructible_directory(dir)?;
+            }
+            ReceiptDirectoryDurability::PromotedAuthority => sync_dir_required(dir)?,
+        }
         if !verify_existing()? {
             return Err(StoreError::Io(io::Error::new(
                 ErrorKind::NotFound,
@@ -2693,7 +2767,7 @@ impl ProjectionReceiptStore {
                 if capability.entries()?.next().transpose()?.is_some() {
                     return Err(ProjectionStoreError::ClaimlessNonemptyStore);
                 }
-                publish_immutable_exact(
+                publish_bootstrap_immutable_exact(
                     capability,
                     STORE_INIT_FILE,
                     &expected_init,
@@ -2711,7 +2785,7 @@ impl ProjectionReceiptStore {
             ATTEMPTS_DIR,
             FORENSICS_DIR,
         ] {
-            ensure_directory_nofollow(capability, namespace).map_err(|error| {
+            ensure_bootstrap_directory_nofollow(capability, namespace).map_err(|error| {
                 error.at(format!("create private receipt namespace {namespace}"))
             })?;
         }
@@ -2719,7 +2793,7 @@ impl ProjectionReceiptStore {
         let namespaces = open_receipt_namespaces(capability, store_id)
             .map_err(|error| error.at("open private receipt namespaces"))?;
         let claim = claim_bytes(store_id, workspace_id, endpoint, &namespaces.identities());
-        publish_immutable_exact(
+        publish_bootstrap_immutable_exact(
             capability,
             STORE_CLAIM_FILE,
             &claim,

@@ -35955,7 +35955,7 @@ mod tests {
     fn android_receipt_bootstrap_does_not_reenter_capability_preflights() {
         let source = include_str!("oplog/projection_store.rs");
         let directory_start = source
-            .find("fn ensure_directory_nofollow(")
+            .find("fn ensure_directory_nofollow_with_durability(")
             .expect("receipt directory helper");
         let read_start = source[directory_start..]
             .find("fn read_optional_regular(")
@@ -35986,6 +35986,67 @@ mod tests {
                 "Android receipt bootstrap must not re-enter {forbidden}"
             );
         }
+    }
+
+    /// Receipt-store setup is disposable until enrollment promotes its store
+    /// identity. After promotion, receipt names are durable receiver authority
+    /// and Android must not inherit the bootstrap barrier exception.
+    #[test]
+    fn android_receipt_barriers_are_reconstructible_only_during_pre_promotion_bootstrap() {
+        let source = include_str!("oplog/projection_store.rs");
+        assert_eq!(
+            source.matches("publish_bootstrap_immutable_exact(").count(),
+            3,
+            "only the helper plus the init and claim publications may use bootstrap durability"
+        );
+        assert_eq!(
+            source
+                .matches("ensure_bootstrap_directory_nofollow(")
+                .count(),
+            2,
+            "only the helper plus initialize's namespace creation may use bootstrap durability"
+        );
+
+        let initialize_start = source.find("    fn initialize(").expect("initialize");
+        let initialize_end = source[initialize_start..]
+            .find("\n    fn namespace(")
+            .map(|offset| initialize_start + offset)
+            .expect("end of initialize");
+        let initialize = &source[initialize_start..initialize_end];
+        assert_eq!(
+            initialize
+                .matches("publish_bootstrap_immutable_exact(")
+                .count(),
+            2,
+            "only the initialization and store claims are bootstrap publications"
+        );
+        assert_eq!(
+            initialize
+                .matches("ensure_bootstrap_directory_nofollow(")
+                .count(),
+            1,
+            "only initialize's top-level namespace creation is bootstrap"
+        );
+        assert!(!initialize.contains("sync_dir_required("));
+        assert!(
+            !source[initialize_end..].contains("publish_bootstrap_immutable_exact("),
+            "promoted receipt operations must use the strict publisher"
+        );
+        assert!(
+            !source[initialize_end..].contains("ensure_bootstrap_directory_nofollow("),
+            "promoted receipt namespaces must use strict directory barriers"
+        );
+
+        let publisher_start = source
+            .find("fn publish_android_private_immutable(")
+            .expect("Android receipt publisher");
+        let publisher_end = source[publisher_start..]
+            .find("\n#[cfg(test)]\nthread_local!")
+            .map(|offset| publisher_start + offset)
+            .expect("end of Android receipt publisher");
+        let publisher = &source[publisher_start..publisher_end];
+        assert!(publisher.contains("ReceiptDirectoryDurability::PromotedAuthority"));
+        assert!(publisher.contains("sync_dir_required(dir)"));
     }
 
     #[test]

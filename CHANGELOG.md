@@ -24,6 +24,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Android no longer treats a refused directory durability barrier as success
+  for promoted managed-storage projection receipts.** Only the receipt store's
+  pre-enrollment initialization remains reconstructible; bases, intents,
+  attempts, mutation authority, completions, cleanup, and forensic records now
+  keep strict private-authority barriers on every platform.
+
 - **Images changed by Syncthing, Dropbox, an external editor, or another Tine
   window now refresh in place without reopening the graph.** Tine observes the
   approved `assets/` directory separately from page reconciliation in Direct
