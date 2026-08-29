@@ -2093,14 +2093,18 @@ boundary, not by platform or by syscall alone:
 
 | Receipt publication | Durability class | Android capability refusal | Required response |
 | --- | --- | --- | --- |
-| Initialization claim, top-level namespaces, and store claim while initializing an empty receipt store; these artifacts alone carry no operation authority | Reconstructible bootstrap | The exact file bytes remain synced; `PermissionDenied`/`Unsupported`/`InvalidInput` from the parent-directory barrier may degrade | During first activation, retry may archive one diagnostic tree and reconstruct it from unchanged Direct Files. A promoted reopen may recreate only this empty initialization structure; nonempty claimless state is refused. |
-| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | A crash or power loss could otherwise lose a supposedly durable receipt name. Refuse the publication and keep the accepted operation pending/recoverable; do not report success until an idempotent retry completes the strict parent-directory barrier. |
+| Initialization claim, top-level namespaces, pending-cleanup namespace and rounds, their initialization authority/state, and store claim while initializing an empty receipt store; these artifacts alone carry no operation authority | Reconstructible bootstrap | The exact file bytes remain synced; `PermissionDenied`/`Unsupported`/`InvalidInput` from the parent-directory barrier may degrade | During first activation, retry may archive one diagnostic tree and reconstruct it from unchanged Direct Files. A promoted reopen may recreate only this empty initialization structure; nonempty claimless state is refused. |
+| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | A crash or power loss could otherwise lose a supposedly durable receipt name. Refuse the publication and keep the accepted operation pending/recoverable. If a refusal happened after the name became visible, only that process and parent directory retain a barrier debt; an idempotent retry must repay it before reporting success, while ordinary existing-name reads pay no barrier. |
 
-The implementation makes the first row an explicitly named bootstrap-only
-helper used solely inside `ProjectionReceiptStore::initialize`; the ordinary
-receipt publisher and directory creator are the strict second row. This keeps
-an Android setup capability limitation from wedging activation without letting
-that setup exception leak into retained receiver authority.
+`ProjectionReceiptStore::initialize` passes the first row's durability phase
+through both the top-level helpers and the nested pending-cleanup initializer;
+the ordinary receipt publisher and directory creator are the strict second
+row. This keeps an Android setup capability limitation from wedging activation
+without letting that setup exception leak into retained receiver authority.
+On a device that permits exact app-private writes but persistently refuses
+directory fsync, setup can still complete because its empty structure is
+reconstructible, but the first operational receipt refuses: managed storage is
+not usable without durability for its private authority.
 
 Before an enrollment binding exists, the empty receipt store's initialization
 artifacts are reconstructible bootstrap state rather than authority; no

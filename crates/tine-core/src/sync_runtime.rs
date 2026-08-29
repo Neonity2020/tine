@@ -36027,7 +36027,9 @@ mod tests {
             1,
             "only initialize's top-level namespace creation is bootstrap"
         );
-        assert!(!initialize.contains("sync_dir_required("));
+        assert!(initialize.contains(
+            "open_receipt_namespaces(\n            capability,\n            store_id,\n            ReceiptDirectoryDurability::PrePromotionBootstrap"
+        ));
         assert!(
             !source[initialize_end..].contains("publish_bootstrap_immutable_exact("),
             "promoted receipt operations must use the strict publisher"
@@ -36072,7 +36074,7 @@ mod tests {
             .expect("end of Android receipt publisher");
         let publisher = &source[publisher_start..publisher_end];
         assert!(publisher.contains("ReceiptDirectoryDurability::PromotedAuthority"));
-        assert!(publisher.contains("sync_dir_required(dir)"));
+        assert!(publisher.contains("sync_promoted_receipt_directory(dir)"));
         let existing_retry_start = publisher
             .find("let accept_existing =")
             .expect("idempotent publication retry policy");
@@ -36081,8 +36083,9 @@ mod tests {
             .map(|offset| existing_retry_start + offset)
             .expect("temporary publication follows existing-name admission");
         assert!(
-            publisher[existing_retry_start..temporary_start].contains("sync_dir_required(dir)"),
-            "an existing promoted receipt name must re-establish its strict barrier"
+            publisher[existing_retry_start..temporary_start]
+                .contains("retry_promoted_receipt_barrier_if_needed(dir)"),
+            "an existing promoted receipt name must repay a recorded strict-barrier debt"
         );
 
         let intent_namespace_start = source
@@ -36094,7 +36097,40 @@ mod tests {
             .expect("end of per-intent namespace opener");
         let intent_namespace = &source[intent_namespace_start..intent_namespace_end];
         assert!(intent_namespace.contains("if create"));
-        assert!(intent_namespace.contains("sync_dir_required(&parent)"));
+        assert!(intent_namespace.contains("retry_promoted_receipt_barrier_if_needed(&parent)"));
+
+        let debt_sync_start = source
+            .find("fn sync_promoted_receipt_directory(")
+            .expect("strict receipt barrier debt recorder");
+        let debt_retry_start = source[debt_sync_start..]
+            .find("fn retry_promoted_receipt_barrier_if_needed(")
+            .map(|offset| debt_sync_start + offset)
+            .expect("strict receipt barrier debt retry");
+        let helper_end = source[debt_retry_start..]
+            .find("\nfn ensure_directory_nofollow_with_durability(")
+            .map(|offset| debt_retry_start + offset)
+            .expect("end of receipt barrier debt helpers");
+        let recorder = &source[debt_sync_start..debt_retry_start];
+        assert!(recorder.contains("sync_dir_required(directory)"));
+        assert!(recorder.contains("debts.insert(identity)"));
+        let retry = &source[debt_retry_start..helper_end];
+        assert!(retry.contains("if !debts.contains(&identity)"));
+        assert!(retry.contains("return Ok(())"));
+        assert!(retry.contains("sync_dir_required(directory)"));
+        assert!(retry.contains("debts.remove(&identity)"));
+
+        let cleanup_start = source
+            .find("fn open_receipt_namespaces(")
+            .expect("receipt namespace opener");
+        let cleanup_end = source[cleanup_start..]
+            .find("\nfn validate_pending_cleanup_round_root(")
+            .map(|offset| cleanup_start + offset)
+            .expect("end of pending-cleanup initialization");
+        let cleanup_initialization = &source[cleanup_start..cleanup_end];
+        assert!(cleanup_initialization.contains("durability: ReceiptDirectoryDurability"));
+        assert!(cleanup_initialization.contains("ensure_directory_nofollow_with_durability("));
+        assert!(cleanup_initialization.contains("publish_immutable_exact_with_durability("));
+        assert!(cleanup_initialization.contains("durability,"));
     }
 
     #[test]

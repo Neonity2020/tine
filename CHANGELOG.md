@@ -29,8 +29,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   pre-enrollment initialization remains reconstructible; bases, intents,
   attempts, mutation authority, completions, cleanup, and forensic records now
   keep strict private-authority barriers on every platform. An idempotent retry
-  also re-establishes a previously refused barrier before accepting an existing
-  receipt name or operational namespace.
+  repays a recorded barrier refusal before accepting an existing receipt name
+  or operational namespace, without adding barriers to ordinary reads. Android
+  devices that cannot provide app-private directory durability may initialize
+  the reconstructible empty store, but managed operations now refuse rather
+  than claiming unsafe success.
 
 - **Images changed by Syncthing, Dropbox, an external editor, or another Tine
   window now refresh in place without reopening the graph.** Tine observes the
