@@ -8680,7 +8680,8 @@
     "tests": [
      "src/components/Block.codeBodyEdit.test.tsx",
      "src/components/Block.selectAll.test.tsx",
-     "src/editor/codeFence.test.ts"
+     "src/editor/codeFence.test.ts",
+     "scripts/e2e-editor-interactions.mjs"
     ],
     "scenario": null,
     "failBefore": "proven"
@@ -8707,7 +8708,8 @@
      "src/components/Block.codeFenceScaffold.test.tsx",
      "src/components/Block.codeBodyEdit.test.tsx",
      "src/components/Block.codeFenceAutocomplete.test.tsx",
-     "src/components/Block.autopairMatrix.test.tsx"
+     "src/components/Block.autopairMatrix.test.tsx",
+     "scripts/e2e-editor-interactions.mjs"
     ],
     "scenario": null,
     "failBefore": "proven"
@@ -8733,7 +8735,8 @@
     "tests": [
      "src/components/Block.embedExitUp.test.tsx",
      "src/components/Block.embedHierarchy.test.tsx",
-     "src/components/LiveRefGroup.nav.test.tsx"
+     "src/components/LiveRefGroup.nav.test.tsx",
+     "scripts/e2e-editor-interactions.mjs"
     ],
     "scenario": null,
     "failBefore": "proven"
