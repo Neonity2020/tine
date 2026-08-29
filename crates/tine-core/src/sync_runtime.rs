@@ -30210,19 +30210,18 @@ mod tests {
         found
     }
 
-    /// A batched archive publication has ONE durability point, and its
-    /// protocol is chosen so that no crash inside it can leave an immutable
-    /// name whose bytes never reached stable storage. Artifacts are staged
-    /// under temporary names, flushed once, and only then installed under
-    /// their final names.
+    /// A batched archive publication has one data barrier. Strict callers take
+    /// it before every final-name install. The managed-local drain may install
+    /// object names first while its exact journal frame remains undrained, then
+    /// takes the same barrier before installing the manifest and before the
+    /// caller may checkpoint.
     ///
     /// This is the crash-safety contract in `docs/storage-sync-contract.md`,
-    /// "Durability barriers and the batch commit point": every final name a
-    /// reader can see names durable, byte-correct content, and a torn batch is
-    /// simply not accepted. `ObjectStore::validate_namespace` refuses an
-    /// archive containing a name whose bytes do not hash to it, so a design
-    /// that installed before flushing could strand an accepted edit that is
-    /// still durable in the journal.
+    /// "Durability barriers and the batch commit point": a pre-barrier object
+    /// final may be torn only while the undrained journal still supplies its
+    /// exact repair authority. After the barrier every surviving name has
+    /// durable, byte-correct content, and the manifest remains absent until
+    /// then.
     ///
     /// In-scope scenario: crash or power loss during a batched publication.
     #[test]
@@ -30512,9 +30511,9 @@ mod tests {
     enum ArchiveBatchCut {
         /// Between the objects and the manifest, before the batch's barrier.
         BeforeManifest,
-        /// After the required pre-install data barrier (strict batch-wide or
-        /// journal-covered manifest-only), part-way through installing final
-        /// names and before the directory barriers.
+        /// Part-way through installing final names and before the directory
+        /// barriers. This is post-barrier for strict publication and
+        /// pre-barrier for the first journal-covered object install.
         DuringInstall,
     }
 

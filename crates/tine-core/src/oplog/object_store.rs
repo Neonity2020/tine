@@ -200,8 +200,9 @@ thread_local! {
 }
 
 /// Arm one deterministic cut immediately after the next staged archive
-/// artifact is installed under its final name — the crash point between the
-/// batch's single data barrier and its directory barriers.
+/// artifact is installed under its final name. On a strict publication this is
+/// after the data barrier; on a turn-covered publication the first object cut
+/// is deliberately before it, while the exact journal frame remains undrained.
 #[cfg(test)]
 pub(crate) fn cut_after_next_archive_install() {
     ARCHIVE_INSTALL_CUT.with(|armed| armed.set(true));
@@ -1892,10 +1893,12 @@ impl ObjectStore {
     /// becomes visible. The managed-local drain may instead set
     /// `turn_covered_objects`: its durable, still-undrained journal frame is the
     /// exact recovery authority for object bytes, so object temporaries may be
-    /// installed without a pre-install data flush. The manifest remains the
-    /// archive commit marker and is always flushed before installation. Cold
-    /// open repairs only torn object names covered byte-for-byte by such an
-    /// undrained record, then runs the ordinary full namespace validation.
+    /// installed before the batch-wide data flush. That flush then covers both
+    /// the installed object inodes and the staged manifest; the manifest is
+    /// installed only afterward, and the journal checkpoint can advance only
+    /// after publication returns. Cold open repairs only torn object names
+    /// covered byte-for-byte by an undrained record, then runs the ordinary full
+    /// namespace validation.
     fn publish_prepared_impl(
         &self,
         batch: &PreparedBatch,
@@ -3266,28 +3269,23 @@ impl ObjectStore {
         &self,
         covered: &BTreeMap<ContentDigest, Vec<u8>>,
     ) -> Result<usize, StoreError> {
+        if covered.is_empty() {
+            return Ok(0);
+        }
         let objects = self.open_namespace(OBJECTS_DIR)?;
         let mut repaired = 0_usize;
-        for entry in objects.entries()? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name
-                .to_str()
-                .ok_or_else(|| StoreError::MalformedPath("non-UTF-8 entry under objects".into()))?;
-            require_regular_entry(&entry.file_type()?, name)?;
-            if is_temp_name(name) {
-                continue;
-            }
-            let expected = parse_object_filename(name)?;
-            let observed = read_required_regular(&objects, name, MAX_OBJECT_BYTES as u64, None)?;
-            if ContentDigest::of(&observed) == expected {
-                continue;
-            }
-            let Some(replacement) = covered.get(&expected) else {
+        for (expected, replacement) in covered {
+            let name = object_filename(*expected);
+            let Some(observed) =
+                read_optional_regular(&objects, &name, MAX_OBJECT_BYTES as u64, None)?
+            else {
                 continue;
             };
-            if ContentDigest::of(replacement) != expected {
-                return Err(StoreError::ObjectPathMismatch(expected));
+            if ContentDigest::of(&observed) == *expected {
+                continue;
+            }
+            if ContentDigest::of(replacement) != *expected {
+                return Err(StoreError::ObjectPathMismatch(*expected));
             }
             let object = OperationObject::decode(replacement)?;
             if object.workspace_id() != self.workspace_id {
@@ -3297,20 +3295,20 @@ impl ObjectStore {
                 });
             }
             if object.encode()?.as_slice() != replacement {
-                return Err(StoreError::ObjectPathMismatch(expected));
+                return Err(StoreError::ObjectPathMismatch(*expected));
             }
             tine_storage::DurableDirectoryPublication::open(&objects)
-                .map_err(|error| publication_error(error, Collision::Object(expected)))?
-                .replace_exact(name, &observed, replacement)
-                .map_err(|error| publication_error(error, Collision::Object(expected)))?;
+                .map_err(|error| publication_error(error, Collision::Object(*expected)))?
+                .replace_exact(&name, &observed, replacement)
+                .map_err(|error| publication_error(error, Collision::Object(*expected)))?;
             let installed = read_required_regular(
                 &objects,
-                name,
+                &name,
                 MAX_OBJECT_BYTES as u64,
                 Some(replacement.len() as u64),
             )?;
             if installed != *replacement {
-                return Err(StoreError::ObjectPathMismatch(expected));
+                return Err(StoreError::ObjectPathMismatch(*expected));
             }
             repaired = repaired.saturating_add(1);
         }
@@ -7021,30 +7019,34 @@ fn publish_immutable(
 ///    namespace with no barrier. Temporary names are invisible to every
 ///    reader: `ObjectStore::validate_namespace` and every replay path address
 ///    artifacts by their content-addressed or batch-addressed final names.
-/// 2. **Pre-install data barrier.** Strict callers use one `syncfs` to flush
-///    all staged bytes. A managed-local drain whose exact object bytes remain
-///    in its undrained journal frame flushes only the manifest commit marker.
-/// 3. **Install.** Each final name is inserted no-replace. Strict callers have
-///    already made every staged byte durable. On the journal-covered path only
-///    an object may be installed before its bytes are flushed; the undrained
-///    record is then its exact crash-recovery authority.
-/// 4. **Directory barriers.** One `fsync` per distinct namespace makes the
+/// 2. **Object install for a journal-covered turn.** Its object final names are
+///    inserted no-replace while the exact journal frame remains undrained.
+///    Strict callers skip this step.
+/// 3. **One data barrier.** `syncfs` flushes every staged inode. Strict callers
+///    take it before any final-name install; a journal-covered turn takes it
+///    after object install and before manifest install.
+/// 4. **Remaining installs.** Strict callers insert every final name; the
+///    journal-covered turn inserts its now-durable manifest commit marker.
+/// 5. **Directory barriers.** One `fsync` per distinct namespace makes the
 ///    name insertions durable — two for an ordinary batch (objects, batches).
 ///
-/// For a strict caller, step 3 after step 2 ensures no visible name can refer
-/// to unflushed bytes. For the managed-local drain, a crash may leave a torn
-/// object final name; cold open replaces it only when an uncheckpointed local
-/// journal record supplies the exact canonical bytes, and only before normal
-/// archive validation. The manifest is never allowed that relaxation.
+/// For a strict caller, the data barrier before install ensures no visible name
+/// can refer to unflushed bytes. For the managed-local drain, a crash during
+/// step 2 may leave a torn object final name; cold open replaces it only when
+/// an uncheckpointed local journal record supplies the exact canonical bytes.
+/// After step 3 every object is durable, so publication may return and the
+/// caller may eventually checkpoint without losing repair authority too early.
+/// The manifest is never installed before its data barrier.
 ///
 /// ## Crash points
 ///
 /// | crash at | on disk | recovery |
 /// |---|---|---|
 /// | during staging | temporary names only, contents arbitrary | the batch is not accepted; the journal frame is undrained and the drain republishes. Temporaries are ignored by every reader. |
-/// | after staging, before the barrier | as above | as above |
-/// | after the barrier, during installs | strict: a durable prefix; turn-covered: possibly torn object names but never an unflushed manifest name | the drain republishes; cold open repairs only exact journal-covered object mismatches before validation |
-/// | after installs, before a directory barrier | possibly no final name durable | as above |
+/// | after staging, before an install | temporary names only | as above |
+/// | during journal-covered object installs, before the barrier | a prefix of possibly torn object names; no manifest name | cold open repairs only exact journal-covered object mismatches before validation |
+/// | after the barrier, during remaining installs | every surviving final name has durable correct bytes | the drain republishes and verifies exact existing names |
+/// | after installs, before a directory barrier | possibly no final name durable after reboot; any surviving name has durable correct bytes | the drain republishes |
 /// | after the directory barriers | the whole batch durable | the drain proceeds to checkpoint |
 ///
 /// In every row the accepted operation itself is unaffected: it became durable
@@ -7152,15 +7154,19 @@ impl ArchiveBatchPublication {
         if self.staged.is_empty() {
             return Ok(());
         }
-        self.barrier_staged_data()?;
-        for artifact in &self.staged {
-            install_staged_artifact(
-                &self.namespaces[artifact.namespace],
-                &artifact.temp_name,
-                &artifact.final_name,
-                artifact.limit,
-            )?;
-            archive_install_cut_hook()?;
+        if self.strict_filesystem_barrier {
+            self.barrier_staged_data()?;
+            self.install_staged_where(|_| true)?;
+        } else {
+            // The undrained journal is exact recovery authority while object
+            // names install. Flush the whole staged set only after those names
+            // exist, then install the now-durable manifest commit marker. The
+            // journal checkpoint cannot advance until this method returns, so
+            // every crash before the barrier remains repairable and every crash
+            // after it has durable object bytes.
+            self.install_staged_where(|artifact| !artifact.requires_preinstall_flush)?;
+            self.barrier_staged_data()?;
+            self.install_staged_where(|artifact| artifact.requires_preinstall_flush)?;
         }
         let mut barriered: Vec<usize> = Vec::new();
         for artifact in &self.staged {
@@ -7173,23 +7179,28 @@ impl ArchiveBatchPublication {
         Ok(())
     }
 
-    /// Apply the caller's pre-install data barrier policy.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn install_staged_where(
+        &self,
+        predicate: impl Fn(&StagedArchiveArtifact) -> bool,
+    ) -> Result<(), StoreError> {
+        for artifact in self.staged.iter().filter(|artifact| predicate(artifact)) {
+            install_staged_artifact(
+                &self.namespaces[artifact.namespace],
+                &artifact.temp_name,
+                &artifact.final_name,
+                artifact.limit,
+            )?;
+            archive_install_cut_hook()?;
+        }
+        Ok(())
+    }
+
+    /// Flush every staged inode. Strict callers take this before all installs;
+    /// a journal-covered caller takes it after object installs but before the
+    /// manifest install and before the journal checkpoint can advance.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn barrier_staged_data(&self) -> Result<(), StoreError> {
-        if !self.strict_filesystem_barrier {
-            for artifact in self
-                .staged
-                .iter()
-                .filter(|artifact| artifact.requires_preinstall_flush)
-            {
-                let file = tine_storage::open_file_nofollow(
-                    &self.namespaces[artifact.namespace],
-                    &artifact.temp_name,
-                )?;
-                crate::durability_counters::sync_file(&file)?;
-            }
-            return Ok(());
-        }
         match crate::filesystem_durability::sync_filesystem_containing(&self.archive) {
             Ok(()) => Ok(()),
             // Android app-private storage on some vendor filesystems denies the
@@ -7201,9 +7212,18 @@ impl ArchiveBatchPublication {
             #[cfg(target_os = "android")]
             Err(error) if crate::filesystem_durability::is_capability_refusal(&error) => {
                 for artifact in &self.staged {
+                    let name = match self.namespaces[artifact.namespace]
+                        .symlink_metadata(&artifact.temp_name)
+                    {
+                        Ok(_) => artifact.temp_name.as_str(),
+                        Err(error) if error.kind() == ErrorKind::NotFound => {
+                            artifact.final_name.as_str()
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     let file = tine_storage::open_file_nofollow(
                         &self.namespaces[artifact.namespace],
-                        &artifact.temp_name,
+                        name,
                     )?;
                     crate::durability_counters::sync_file(&file)?;
                 }
@@ -10206,12 +10226,96 @@ mod bootstrap_store_tests {
         let counts = session.counts();
         BarrierSession::detach_current_thread();
 
-        assert_eq!(counts.get(Barrier::Filesystem), 0, "{}", counts.report());
+        assert_eq!(counts.get(Barrier::Filesystem), 1, "{}", counts.report());
         assert_eq!(
             counts.get(Barrier::File),
-            2,
-            "the lineage claim and manifest must remain file-durable: {}",
+            1,
+            "the lineage claim keeps its own file barrier while the batch-wide filesystem barrier covers objects and manifest: {}",
             counts.report()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn turn_covered_objects_install_before_the_barrier_but_manifest_and_return_do_not() {
+        use crate::durability_counters::{Barrier, BarrierSession};
+
+        let fixture = EmptyBootstrapFixture::new("turn-covered-barrier-order");
+        let store = fixture.store();
+        let prepared = ordinary_prepared_batch(fixture.workspace);
+
+        let interrupted_session = BarrierSession::begin();
+        cut_after_next_archive_install();
+        assert!(matches!(
+            store.publish_turn_covered_prepared(&prepared),
+            Err(StoreError::Io(error))
+                if error.to_string().contains("deterministic cut after an archive install")
+        ));
+        let interrupted_counts = interrupted_session.counts();
+        BarrierSession::detach_current_thread();
+        assert_eq!(
+            interrupted_counts.get(Barrier::Filesystem),
+            0,
+            "the first object install must precede the batch barrier: {}",
+            interrupted_counts.report()
+        );
+        assert!(
+            std::fs::read_dir(fixture.archive.join(OBJECTS_DIR))
+                .unwrap()
+                .flatten()
+                .any(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp-")),
+            "the deterministic cut must leave one installed object final"
+        );
+        assert!(store.committed_manifests().unwrap().is_empty());
+
+        let completed_session = BarrierSession::begin();
+        store.publish_turn_covered_prepared(&prepared).unwrap();
+        let completed_counts = completed_session.counts();
+        BarrierSession::detach_current_thread();
+        assert_eq!(
+            completed_counts.get(Barrier::Filesystem),
+            1,
+            "publication may return only after the whole-batch data barrier: {}",
+            completed_counts.report()
+        );
+        assert_eq!(store.committed_manifests().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn turn_covered_archive_publication_is_confined_to_the_local_journal_drain() {
+        fn count_rust_occurrences(directory: &Path, needle: &str) -> usize {
+            std::fs::read_dir(directory)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .map(|path| {
+                    if path.is_dir() {
+                        count_rust_occurrences(&path, needle)
+                    } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+                        std::fs::read_to_string(path)
+                            .unwrap()
+                            .matches(needle)
+                            .count()
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        }
+
+        let call = [".", "publish_turn_covered_prepared("].concat();
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert_eq!(
+            count_rust_occurrences(&source_root, &call),
+            4,
+            "one production call plus the three direct test probes must be the complete call-site set"
+        );
+        assert_eq!(
+            include_str!("local_journal_drain.rs")
+                .matches(&call)
+                .count(),
+            1,
+            "the sole production caller must remain the managed-local journal drain"
         );
     }
 

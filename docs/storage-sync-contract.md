@@ -1654,26 +1654,29 @@ flushed commit marker.
    namespace, with no barrier. Temporary names are not archive entries: every
    reader — `ObjectStore::validate_namespace`, `inspect_batch`, every replay —
    addresses artifacts by content-addressed or batch-addressed *final* names.
-2. **Pre-install data barrier.** Ordinary publishers call `syncfs` once for the
-   whole staged set. The managed-local drain, whose exact object bytes remain in
-   its undrained journal frame, flushes the manifest temporary but does not
-   pre-flush each object temporary.
-3. **Install.** Each final name is inserted no-replace. For an ordinary
-   publisher all bytes are already durable. On the journal-covered path, an
-   object name may survive a crash with torn bytes; a manifest name may not.
-4. **Directory barriers.** One `fsync` per distinct namespace touched — two for
+2. **Journal-covered object install.** Only the managed-local drain inserts its
+   object final names at this point. Its exact frame is still undrained, so a
+   crash-torn object remains repairable. Strict callers skip this step.
+3. **One data barrier.** `syncfs` flushes the whole staged set. Strict callers
+   take it before any final name is visible; the managed-local drain takes it
+   after object installation while the manifest is still temporary.
+4. **Remaining installs.** Ordinary publishers insert every final name. The
+   managed-local drain inserts only its now-durable manifest commit marker.
+5. **Directory barriers.** One `fsync` per distinct namespace touched — two for
    an ordinary batch (`objects`, `batches`).
 
-Step 3 after step 2 remains the complete argument for every strict caller. The
-journal-covered path deliberately admits one additional crash state: an object
-final name whose bytes were not fully flushed. Cold open first authenticates the
-archive structure, then—under the workspace's sole-writer lease—decodes only
-uncheckpointed managed-local frames and builds an exact digest-to-canonical-byte
-repair set. It replaces a mismatching object only when that set names one
-unambiguous exact replacement, rereads the result, and then runs the ordinary
-full namespace validation. An uncovered mismatch, ambiguous coverage, a
-noncanonical replacement, a workspace mismatch, or a torn manifest still
-refuses activation. Drained history is never recovery authority.
+The strict path's barrier-before-install ordering remains unchanged. The
+journal-covered path deliberately admits one additional crash state only
+between steps 2 and 3: an object final name whose bytes were not fully flushed.
+Cold open first authenticates the archive structure, then—under the workspace's
+sole-writer lease—decodes only uncheckpointed managed-local frames and builds an
+exact digest-to-canonical-byte repair set. It replaces a mismatching object only
+when that set names one unambiguous exact replacement, rereads the result, and
+then runs the ordinary full namespace validation. An uncovered mismatch,
+ambiguous coverage, a noncanonical replacement, a workspace mismatch, or a torn
+manifest still refuses activation. Drained history is never recovery authority
+because step 3 makes every object durable before publication returns and before
+the caller may advance the checkpoint.
 
 `tine_storage::ExactImmutablePublicationBatch` now implements the strict form in
 the shared storage primitive: stage, flush all staged data, install no-replace,
@@ -1694,9 +1697,10 @@ journal recovery authority.
 | Crash at | On disk | Recovery |
 | --- | --- | --- |
 | During staging | Temporary names only, contents arbitrary | Batch not accepted. The journal frame is undrained, so the drain republishes the byte-identical batch. Temporaries are invisible to readers. |
-| After staging, before the barrier | As above | As above. |
-| After the barrier, during installs | Strict: a durable prefix. Journal-covered: a prefix whose object bytes may be torn, but no unflushed manifest name. | The drain republishes. After process loss, cold open repairs only exact undrained-journal-covered object mismatches before full validation. |
-| After installs, before a directory barrier | Some name insertions may disappear; surviving journal-covered object bytes may be torn. | Same as the row above; the journal checkpoint has not advanced. |
+| After staging, before an install | As above | As above. |
+| During journal-covered object installs, before the barrier | A prefix of object names whose bytes may be torn; no manifest name. | Cold open repairs only exact undrained-journal-covered object mismatches before full validation. |
+| After the barrier, during remaining installs | Every surviving final name has durable, byte-correct content. | The drain republishes and verifies exact existing names. |
+| After installs, before a directory barrier | Some name insertions may disappear; every surviving name has durable, byte-correct content. | The drain republishes; the journal checkpoint has not advanced. |
 | After the directory barriers | The whole batch durable | The drain proceeds to checkpoint. |
 
 In every row the *accepted operation* is unaffected: it became durable in the
@@ -1714,8 +1718,9 @@ the ordinary durable publisher, so this optimization and repair state do not
 arise there. On Android, a strict caller whose vendor filesystem denies the
 filesystem-wide flush as a *capability* (`EPERM`/`ENOTSUP`/`EINVAL`) falls back
 to one `fsync` per staged artifact. Every other errno stays fatal. The
-journal-covered Android path uses the same manifest-only pre-install flush as
-Linux and the same exact cold-open repair authorization.
+journal-covered Android path installs object names while its journal frame is
+undrained, then uses the same whole-batch flush and exact cold-open repair
+authorization as Linux before it installs the manifest.
 
 **Read paths take no barriers.** `fsync` before reading a file defends nothing:
 a read is served from the same page cache the writer wrote into, so forcing
@@ -1788,17 +1793,17 @@ for a save and from 112 to 87 for a cross-page move. Packet C-2 adds exactly
 one coalesced local-completion chain install when this fixture reaches idle:
 one directory barrier plus one staged-publication filesystem barrier for the
 whole operation, never per page. Packet 2c removes own-endpoint receipt
-publication from that executor. MS-05 keeps the exact totals but changes the
-archive leg from a filesystem-wide flush to one strict manifest-file flush,
-because the undrained journal now authorizes exact torn-object repair. The final
-exact attribution is: save foreground
+publication from that executor. MS-05 keeps the exact totals and barrier kinds;
+it moves the archive filesystem flush after the journal-covered object installs
+but before manifest install and journal checkpoint. The final exact attribution
+is: save foreground
 `file_fsync=1 dir_fsync=2 syncfs=0 total=3`, save total
-`file_fsync=3 dir_fsync=6 syncfs=1 total=10`; move foreground is zero and move
-total is `file_fsync=7 dir_fsync=5 syncfs=1 total=13`. These are exact-equality
+`file_fsync=2 dir_fsync=6 syncfs=2 total=10`; move foreground is zero and move
+total is `file_fsync=6 dir_fsync=5 syncfs=2 total=13`. These are exact-equality
 assertions, not ceilings: either upward or downward drift requires a new
-attribution before the pin moves. The MS-05 barrier delta is therefore honest:
-zero fewer total barriers, but one less whole-filesystem `syncfs` in exchange
-for one manifest-only file `fsync` per operation. The packet-2b removed 6/25 directory barriers were repeated
+attribution before the pin moves. The MS-05 barrier delta is therefore zero:
+the packet changes crash-safe ordering and recovery, not the number or kind of
+durability syscalls. The packet-2b removed 6/25 directory barriers were repeated
 `SharedReconstructibleProjection` barriers within turns; no strict authority or
 quarantine barrier was removed.
 

@@ -29,9 +29,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   only torn object names covered unambiguously by an undrained local record,
   under the workspace's sole-writer lease, and then performs the ordinary full
   archive validation. Uncovered corruption and torn manifests still refuse
-  activation. Public archive publishers remain strict; the local drain replaces
-  one filesystem-wide flush with one manifest-only file flush without changing
-  the enforced 10/13 save and cross-page-move barrier totals.
+  activation. Public archive publishers remain strict; the local drain installs
+  recoverable object names before its batch-wide flush, then installs the
+  already-durable manifest and only afterward may checkpoint the journal. The
+  enforced 10/13 save and cross-page-move barrier totals do not change.
 
 - **Android no longer treats a refused directory durability barrier as success
   for promoted managed-storage projection receipts.** Only the receipt store's
