@@ -53,6 +53,7 @@ export function defaultWorkspaceSession(): PersistedSession {
     layout: { kind: "pane", paneId: "main", ...pane },
     focusedPaneId: "main",
     recentPages: [],
+    pdfTarget: null,
   };
 }
 

@@ -8660,6 +8660,33 @@
     "failBefore": "proven"
    },
    "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey (5/5 runs failed on it). The App.tsx sweep-listener effect used bare `() => snapshot().field` accessors inside on(), which re-run on every snapshot replacement even with unchanged values; the effect unconditionally called clearAbsenceSweeps(). Restore's completion emits runtime status events, so finishing a Restore refired the effect and closed the panel the user was looking at while transiently wiping the sweep list (instrumented capture: diag-3 store log, four identical-input refires 150ms after disposition). Fix: memoized effect inputs + rebindAbsenceSweepScope clears only on real generation changes. Fail-before is the instrumented E2E evidence; the helper unit test plus the journey's restore-action/restored-history assertions are the regression coverage."
+  },
+  {
+   "id": "UI-PDF-GRAPH-SESSION-RESTORE-001",
+   "title": "An open PDF resource returns after relaunch and an explicit close stays closed",
+   "family": "pdf",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/uiStateRegistry.test.ts",
+     "src/session.test.ts",
+     "src/workspaces.test.ts",
+     "src/graph.test.tsx",
+     "src/render/annotationRef.test.tsx",
+     "scripts/e2e-pdf-ownership.mjs"
+    ],
+    "scenario": "pdf.graph-session-open-close-restore",
+    "failBefore": "proven"
+   },
+   "notes": "Private UI-state/PDF queue item, 2026-08-29. Only stable filename and label cross the session boundary. Graph ownership generation, page, highlight intent, native handles, and sidecar view state remain transient and are reminted or loaded by their existing owners. Transition suspend/restore is deliberately save-free so a delayed graph-A close cannot overwrite graph B."
   }
  ]
 }

@@ -24,6 +24,7 @@ import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawer
 import { currentPdfOwnership, type PdfOwnership } from "./pdfOwnership";
 import { issue248Collector, issue248Now } from "./issue248Probe";
 import type { ExportNode } from "./editor/exportText";
+import type { PersistedPdfTarget } from "./uiStateRegistry";
 
 const THEME_KEY = "logseq-claude.theme";
 export type ThemePreference = "light" | "dark" | "system";
@@ -2045,6 +2046,44 @@ export interface PdfTarget {
   highlightId?: string;
 }
 export const [pdfTarget, setPdfTarget] = createSignal<PdfTarget | null>(null);
+let pendingPdfSessionTarget: PersistedPdfTarget | null = null;
+export function capturePdfSessionTarget(): PersistedPdfTarget | null {
+  const current = pdfTarget();
+  return current ? { filename: current.filename, label: current.label } : null;
+}
+
+/** Apply persisted stable identity under the current graph generation. */
+export function restorePdfSessionTarget(target: PersistedPdfTarget | null): boolean {
+  if (!target) {
+    pendingPdfSessionTarget = null;
+    setPdfTarget(null);
+    return true;
+  }
+  pendingPdfSessionTarget = target;
+  const owner = currentPdfOwnership();
+  if (!owner) {
+    setPdfTarget(null);
+    return false;
+  }
+  pendingPdfSessionTarget = null;
+  setPdfTarget({ ...target, owner });
+  return true;
+}
+
+/** Finish a pre-bind session restore once the graph has minted PDF ownership. */
+export function restorePendingPdfSessionTarget(): boolean {
+  if (!pendingPdfSessionTarget) return true;
+  return restorePdfSessionTarget(pendingPdfSessionTarget);
+}
+
+/** Clear runtime ownership without turning a graph transition into a user close. */
+export function suspendPdfForGraphTransition(): PersistedPdfTarget | null {
+  const stable = capturePdfSessionTarget() ?? pendingPdfSessionTarget;
+  pendingPdfSessionTarget = null;
+  setPdfTarget(null);
+  return stable;
+}
+
 export function openPdf(filename: string, label: string, page?: number, highlightId?: string) {
   const owner = currentPdfOwnership();
   if (!owner) return;
@@ -2054,8 +2093,13 @@ export function openPdf(filename: string, label: string, page?: number, highligh
   const current = pdfTarget();
   if (current?.filename === filename && current.owner.generation === owner.generation &&
       page == null && highlightId == null) return;
+  pendingPdfSessionTarget = null;
   setPdfTarget({ filename, label, owner, page, highlightId });
+  scheduleSessionSave();
 }
 export function closePdf() {
+  if (!pdfTarget() && !pendingPdfSessionTarget) return;
+  pendingPdfSessionTarget = null;
   setPdfTarget(null);
+  scheduleSessionSave();
 }

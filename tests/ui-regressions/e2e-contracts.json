@@ -518,10 +518,17 @@
      "userOutcome": "An in-place graph switch and ordinary safe close persist PDF work only through the window-local graph generation that created it.",
      "blocking": true,
      "authority": "Tine PDF graph-owner generation and safe-close persistence contract"
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A PDF left open is restored automatically after a clean relaunch, while an explicitly closed PDF stays closed.",
+     "blocking": true,
+     "authority": "Tine graph-session UI state lifetime contract"
     }
    ],
    "acceptableVariations": [
-    "PDF rendering and graph-switch presentation may vary while the old graph is drained, the viewer is remounted, and sidecar bytes remain owner-isolated."
+    "PDF rendering and graph-switch presentation may vary while the old graph is drained, the viewer is remounted, and sidecar bytes remain owner-isolated.",
+    "The restored PDF may become visible at any point after graph binding, as long as it appears without another user open gesture."
    ],
    "nonRequirements": [
     "Exact PDF pixels, graph-switch animation, or debounce completion time."
