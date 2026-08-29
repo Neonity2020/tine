@@ -48,6 +48,45 @@ pub(crate) const MAX_LAZY_GENESIS_PROVIDER_INDEX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const LAZY_GENESIS_PROVIDER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LAZY_GENESIS_PAGES: usize = 1_000_000;
 const MAX_LAZY_GENESIS_BLOCKS: u64 = 100_000_000;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RECEIPT_LIMITS: std::cell::Cell<Option<(usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn lazy_genesis_receipt_limits() -> (usize, usize, usize) {
+    #[cfg(test)]
+    if let Some(limits) = TEST_RECEIPT_LIMITS.with(std::cell::Cell::get) {
+        return limits;
+    }
+    (
+        MAX_LAZY_GENESIS_SQLITE_RECEIPT_BYTES,
+        MAX_LAZY_GENESIS_SQLITE_RECEIPT_ROWS,
+        MAX_LAZY_GENESIS_CAPSULE_BYTES,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn with_lazy_genesis_receipt_limits_for_test<T>(
+    receipt_bytes: usize,
+    receipt_rows: usize,
+    capsule_bytes: usize,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_RECEIPT_LIMITS.with(|limits| limits.set(None));
+        }
+    }
+    TEST_RECEIPT_LIMITS.with(|limits| {
+        assert!(limits.get().is_none(), "lazy-genesis receipt limits nested");
+        limits.set(Some((receipt_bytes, receipt_rows, capsule_bytes)));
+    });
+    let _reset = Reset;
+    operation()
+}
 const LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION: u32 = 1;
 const CLEAN_SHARED_ENROLLMENT_SCHEMA_VERSION: u32 = 1;
 const CLEAN_SHARED_STATE_SCHEMA_VERSION: u32 = 1;
@@ -351,14 +390,13 @@ pub(crate) struct LazyGenesisSqliteReceiptV1 {
 impl LazyGenesisSqliteReceiptV1 {
     pub(crate) fn new(
         exact_source_bytes: &[u8],
-        payload: super::MaterializedPageInput,
+        payload: &super::MaterializedPageInput,
     ) -> io::Result<Option<Self>> {
         let rows = payload.blocks.len().saturating_add(1);
         if !sqlite_receipt_within_bounds(0, rows) {
             return Ok(None);
         }
-        let payload =
-            postcard::to_allocvec(&payload).map_err(|error| invalid(error.to_string()))?;
+        let payload = postcard::to_allocvec(payload).map_err(|error| invalid(error.to_string()))?;
         let semantic_digest = sqlite_receipt_semantic_digest(&payload);
         let receipt = Self {
             schema_version: LAZY_GENESIS_SQLITE_RECEIPT_SCHEMA_VERSION,
@@ -383,14 +421,13 @@ impl LazyGenesisSqliteReceiptV1 {
         &self,
         page: &LazyGenesisPageInput,
     ) -> io::Result<Option<super::MaterializedPageInput>> {
+        let encoded_len = match postcard::to_allocvec(self) {
+            Ok(bytes) => bytes.len(),
+            Err(_) => return Ok(None),
+        };
         if self.schema_version != LAZY_GENESIS_SQLITE_RECEIPT_SCHEMA_VERSION
             || self.parser_schema_version != LAZY_GENESIS_PARSER_SCHEMA_VERSION
-            || !sqlite_receipt_within_bounds(
-                postcard::to_allocvec(self)
-                    .map_err(|error| invalid(error.to_string()))?
-                    .len(),
-                self.row_count as usize,
-            )
+            || !sqlite_receipt_within_bounds(encoded_len, self.row_count as usize)
             || self.exact_source_digest != ContentDigest::of(&page.exact_source_bytes)
             || self.semantic_digest != sqlite_receipt_semantic_digest(&self.payload)
         {
@@ -417,6 +454,16 @@ impl LazyGenesisSqliteReceiptV1 {
     pub(crate) fn mark_parser_stale_for_test(&mut self) {
         self.parser_schema_version = self.parser_schema_version.saturating_add(1);
     }
+
+    #[cfg(test)]
+    pub(crate) const fn semantic_digest_for_test(&self) -> ContentDigest {
+        self.semantic_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn parser_schema_version_for_test(&self) -> u32 {
+        self.parser_schema_version
+    }
 }
 
 fn sqlite_receipt_semantic_digest(payload: &[u8]) -> ContentDigest {
@@ -430,6 +477,10 @@ fn sqlite_receipt_matches_capsule(
     payload: &super::MaterializedPageInput,
     page: &LazyGenesisPageInput,
 ) -> bool {
+    // The capsule independently binds page/block identity, topology, source
+    // content, and UUID claims. Parser-derived facets such as search text,
+    // properties, tags, task state, headings, and references are instead
+    // guarded by LAZY_GENESIS_PARSER_SCHEMA_VERSION and its digest tripwire.
     payload.page_id == page.page_id
         && payload.home_document_id == page.home_document_id
         && payload.name == page.name
@@ -456,9 +507,9 @@ fn sqlite_receipt_matches_capsule(
             })
 }
 
-const fn sqlite_receipt_within_bounds(encoded_bytes: usize, rows: usize) -> bool {
-    encoded_bytes <= MAX_LAZY_GENESIS_SQLITE_RECEIPT_BYTES
-        && rows <= MAX_LAZY_GENESIS_SQLITE_RECEIPT_ROWS
+fn sqlite_receipt_within_bounds(encoded_bytes: usize, rows: usize) -> bool {
+    let (max_bytes, max_rows, _) = lazy_genesis_receipt_limits();
+    encoded_bytes <= max_bytes && rows <= max_rows
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -519,7 +570,7 @@ impl LazyGenesisPageCapsuleV1 {
             && postcard::to_allocvec(&capsule)
                 .map_err(|error| invalid(error.to_string()))?
                 .len()
-                > MAX_LAZY_GENESIS_CAPSULE_BYTES
+                > lazy_genesis_receipt_limits().2
         {
             capsule.sqlite_receipt = None;
         }

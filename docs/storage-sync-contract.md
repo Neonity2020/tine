@@ -635,6 +635,12 @@ capsule comparison. Only divergence established by that retained parse refuses
 reconstruction. A payload and digest consistently authored together are trusted
 at baseline construction under the crash/corruption threat model in §3; they
 are not a defense against a malicious byte-forging actor.
+Ordinary foreground saves separately retain at most three exact parser results
+per worker thread (accepted base, requested target, and clean render base), only
+for sources up to 2 MiB and never for parser failures. Finalization may reuse
+clean predecessor annotations only after rebinding the affine capture to the
+unchanged clean head and current semantic page. Neither optimization is durable
+authority; an exact cache miss or failed revalidation takes the complete path.
 One canonical activation-record pass fans each parsed page into both the
 baseline pack and bounded SQLite materialization chunks. Neither candidate is
 published by that construction pass, and SQLite does not re-read, re-parse, or

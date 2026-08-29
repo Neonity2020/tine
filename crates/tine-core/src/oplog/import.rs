@@ -3718,7 +3718,8 @@ fn spool_bootstrap_operations(
             )
         })?;
         let accepted = accepted_identities.assignments_for(&record.page.path)?;
-        let mut genesis_page = lazy_genesis_page_input(&record)?;
+        let sqlite_page = record.sqlite_page();
+        let mut genesis_page = lazy_genesis_page_input(&record, &sqlite_page)?;
         let (checkpoint, dependencies) = lazy_checkpoints.push_page(&genesis_page, &accepted)?;
         genesis_page.document_checkpoint = checkpoint;
         genesis_page.document_dependencies = Some(dependencies);
@@ -3741,6 +3742,7 @@ fn spool_bootstrap_operations(
 
 fn lazy_genesis_page_input(
     record: &ActivationPageRecordV1,
+    sqlite_page: &super::MaterializedPageInput,
 ) -> Result<LazyGenesisPageInput, BootstrapStreamingImportError> {
     let blocks = record
         .page
@@ -3780,7 +3782,7 @@ fn lazy_genesis_page_input(
         document_dependencies: None,
         sqlite_receipt: crate::oplog::lazy_genesis::LazyGenesisSqliteReceiptV1::new(
             &record.exact_source_bytes,
-            record.sqlite_page(),
+            sqlite_page,
         )?,
     })
 }
@@ -3862,7 +3864,8 @@ fn build_lazy_genesis_from_activation_records(
                     .map(|logseq_uuid| (block.block_id, logseq_uuid))
             })
             .collect();
-        let mut page = lazy_genesis_page_input(&record)?;
+        let sqlite_page = record.sqlite_page();
+        let mut page = lazy_genesis_page_input(&record, &sqlite_page)?;
         let (checkpoint, dependencies) = checkpoints.push_page(&page, &page_assignments)?;
         page.document_checkpoint = checkpoint;
         page.document_dependencies = Some(dependencies);
@@ -4024,7 +4027,8 @@ fn build_clean_activation_candidates(
                     .map(|logseq_uuid| (block.block_id, logseq_uuid))
             })
             .collect();
-        let mut capsule = lazy_genesis_page_input(&record)?;
+        let sqlite_page = record.sqlite_page();
+        let mut capsule = lazy_genesis_page_input(&record, &sqlite_page)?;
         instrumentation.record_and_input_micros = instrumentation
             .record_and_input_micros
             .saturating_add(elapsed_micros(record_started));
@@ -4041,7 +4045,7 @@ fn build_clean_activation_candidates(
             .baseline_pack_micros
             .saturating_add(elapsed_micros(baseline_started));
         let sqlite_started = Instant::now();
-        sqlite.push_page(record.sqlite_page(), policy)?;
+        sqlite.push_page(sqlite_page, policy)?;
         instrumentation.sqlite_push_micros = instrumentation
             .sqlite_push_micros
             .saturating_add(elapsed_micros(sqlite_started));
@@ -8917,7 +8921,7 @@ pub(crate) fn capture_activation_page_record(
 ) -> io::Result<CapturedActivationPageRecord> {
     let mut instrumentation = ImportInstrumentation::default();
     let parsed =
-        parse_external_nodes(graph, path, bytes, &mut instrumentation).map_err(|block| {
+        parse_external_nodes(graph, path, bytes, false, &mut instrumentation).map_err(|block| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}: {}", path, block.detail),
@@ -9227,10 +9231,11 @@ fn parse_external_nodes(
     graph: &Graph,
     path: &ManagedPath,
     bytes: &[u8],
+    require_round_trip: bool,
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<ParsedExternalTree, ImportBlock> {
     let parsed = graph
-        .parse_external_document(path, bytes, true)
+        .parse_external_document(path, bytes, require_round_trip)
         .map_err(|error| {
             authority_block(
                 ImportBlockReason::UnsafeInput,
@@ -9596,7 +9601,7 @@ fn match_blocks(
                 instrumentation.present_document_parses.saturating_add(1);
             external_by_path.insert(
                 path.clone(),
-                parse_external_nodes(graph, path, bytes.bytes(), instrumentation)?,
+                parse_external_nodes(graph, path, bytes.bytes(), true, instrumentation)?,
             );
         }
     }
@@ -9607,7 +9612,7 @@ fn match_blocks(
             .saturating_add(1);
         base_by_path.insert(
             page.path().clone(),
-            parse_external_nodes(graph, page.path(), page.bytes(), instrumentation).map_err(
+            parse_external_nodes(graph, page.path(), page.bytes(), true, instrumentation).map_err(
                 |mut block| {
                     block.reason = ImportBlockReason::CorruptBase;
                     block.logical_completion_ids = vec![page.logical_completion_id()];
@@ -12273,6 +12278,32 @@ mod tests {
             1,
             "Org admission reproduces bytes from the original parse"
         );
+
+        let (root, _old_oracle, _workspace) = prepare_streaming_bootstrap(
+            "activation-capture-single-parse",
+            &[
+                ("pages/captured.md", "- parent\n  - child\n"),
+                ("pages/captured.org", "* parent\n** child\n"),
+            ],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let markdown_path = ManagedPath::parse("pages/captured.md").unwrap();
+        crate::outline::reset_parse_attempts();
+        capture_activation_page_record(&graph, &markdown_path, b"- parent\n  - child\n").unwrap();
+        assert_eq!(
+            crate::outline::parse_attempts(),
+            1,
+            "activation capture must not spend a second parser pass on a round-trip admission check"
+        );
+
+        let org_path = ManagedPath::parse("pages/captured.org").unwrap();
+        crate::outline::reset_parse_attempts();
+        capture_activation_page_record(&graph, &org_path, b"* parent\n** child\n").unwrap();
+        assert_eq!(
+            crate::outline::parse_attempts(),
+            1,
+            "Org activation capture must retain the same one-pass parser budget"
+        );
     }
 
     #[test]
@@ -13825,6 +13856,120 @@ mod tests {
                 .to_string()
                 .contains("block identity differs from its exact source bytes"),
             "receiptless fallback must retain exact-source divergence detection: {error}"
+        );
+    }
+
+    #[test]
+    fn oversized_receipts_are_omitted_and_rebuild_through_parser_fallback() {
+        fn exercise(label: &str, receipt_bytes: usize, capsule_bytes: usize, seed: u128) {
+            let (root, old_oracle, workspace) =
+                prepare_streaming_bootstrap(label, &[("pages/alpha.md", "- alpha\n")]);
+            let graph = Graph::open(&root.path().join("graph"));
+            let lineage = LineageDigest::of(label.as_bytes());
+            let preparation = crate::oplog::lazy_genesis::with_lazy_genesis_receipt_limits_for_test(
+                receipt_bytes,
+                crate::oplog::bootstrap_import::MAX_PARSED_NODES_PER_SOURCE_FILE as usize + 1,
+                capsule_bytes,
+                || {
+                    prepare_clean_activation(
+                        &graph,
+                        old_oracle.source_capture().clone(),
+                        workspace,
+                        lineage,
+                        DocumentId::from_uuid(Uuid::from_u128(seed)),
+                        &root.path().join("clean-preparation"),
+                        &root.path().join("clean-preparation.sqlite"),
+                        &ReferenceCatalogPolicyV1::default(),
+                    )
+                    .unwrap()
+                },
+            );
+            let page_id = preparation
+                .candidates()
+                .baseline()
+                .page_ids()
+                .next()
+                .unwrap();
+            assert!(
+                preparation
+                    .candidates()
+                    .baseline()
+                    .page(page_id)
+                    .unwrap()
+                    .unwrap()
+                    .sqlite_receipt
+                    .is_none(),
+                "the injected limit must omit, not refuse, the receipt"
+            );
+
+            crate::outline::reset_parse_attempts();
+            let rebuilt = open_or_rebuild_clean_genesis_projection(
+                &root.path().join("clean-rebuilt.sqlite"),
+                ProjectionClaim::current(workspace, lineage),
+                preparation.candidates().baseline(),
+                ReferenceCatalogPolicyV1::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::outline::parse_attempts(),
+                1,
+                "an omitted receipt must rebuild through the retained parser"
+            );
+            drop(rebuilt);
+        }
+
+        exercise("receipt-byte-cap-omit", 0, usize::MAX, 0x5a84);
+        exercise("whole-capsule-cap-omit", usize::MAX, 1, 0x5a85);
+    }
+
+    #[test]
+    fn lazy_genesis_parser_projection_schema_has_an_explicit_digest_tripwire() {
+        let source = concat!(
+            "title:: Receipt schema\n",
+            "category:: [[Work]]\n\n",
+            "- TODO [#A] Parent #alpha\n",
+            "  id:: 11111111-1111-4111-8111-111111111111\n",
+            "  collapsed:: true\n",
+            "  scheduled:: <2026-08-29 Sat>\n",
+            "  - child [[Target]]\n",
+        );
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "lazy-genesis-parser-schema-tripwire",
+            &[("pages/schema.md", source)],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            LineageDigest::of(b"lazy-genesis-parser-schema-tripwire"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a86)),
+            &root.path().join("clean-preparation"),
+            &root.path().join("clean-preparation.sqlite"),
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        let page_id = preparation
+            .candidates()
+            .baseline()
+            .page_ids()
+            .next()
+            .unwrap();
+        let page = preparation
+            .candidates()
+            .baseline()
+            .page(page_id)
+            .unwrap()
+            .unwrap();
+        let receipt = page.sqlite_receipt.expect("new baseline carries a receipt");
+        assert_eq!(receipt.parser_schema_version_for_test(), 1);
+        assert_eq!(
+            *receipt.semantic_digest_for_test().as_bytes(),
+            [
+                195, 70, 254, 43, 127, 103, 212, 55, 33, 14, 8, 234, 94, 109, 112, 165,
+                141, 15, 218, 187, 32, 148, 129, 65, 214, 220, 61, 42, 142, 88, 130, 192,
+            ],
+            "a parser/materialized projection change must update this digest and explicitly bump LAZY_GENESIS_PARSER_SCHEMA_VERSION"
         );
     }
 

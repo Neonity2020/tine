@@ -46331,23 +46331,47 @@ mod tests {
         let source = real_graph_copy_source_from_env("TINE_MANAGED_ACTIVATION_GRAPH_COPY");
         let fixture = ActivationFixture::copied_graph("managed-parse-receipt", 0xa0d8, &source);
 
-        crate::model::start_managed_parse_census();
+        crate::outline::start_managed_parse_census();
         let activation = activate_with_scale_receipt(&fixture);
-        let activation_parses = crate::model::finish_managed_parse_census();
-        assert_eq!(
-            activation_parses, activation.source_files,
-            "activation must parse each source file exactly once"
+        let activation_parses = crate::outline::finish_managed_parse_census();
+        assert!(
+            activation_parses <= activation.source_files,
+            "activation must perform at most one parser invocation per source file: parses={activation_parses}, files={}",
+            activation.source_files,
         );
 
-        crate::model::start_managed_parse_census();
+        crate::outline::start_managed_parse_census();
         let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-        let cold_open_parses = crate::model::finish_managed_parse_census();
+        let cold_open_parses = crate::outline::finish_managed_parse_census();
         assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
         assert_eq!(
             cold_open_parses, 0,
             "a healthy cold open must not parse pages"
         );
         let handle = opened.handle.expect("the activated corpus reopens");
+        drive_initial_feed_with_turn_budget(&handle, 4096);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        crate::oplog::sqlite::remove_disposable_projection(&fixture.request.database_path).unwrap();
+        crate::outline::start_managed_parse_census();
+        let rebuild_started = Instant::now();
+        let rebuilt = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let rebuild_ms = rebuild_started.elapsed().as_millis();
+        let rebuild_parses = crate::outline::finish_managed_parse_census();
+        assert_eq!(rebuilt.status, SyncRuntimeOpenStatus::Active);
+        assert_eq!(
+            rebuild_parses, 0,
+            "a healthy receipted baseline rebuild must not parse source pages"
+        );
+        assert!(
+            rebuild_ms < 10_000,
+            "real-corpus SQLite rebuild exceeded 10 seconds: {rebuild_ms} ms"
+        );
+        let handle = rebuilt.handle.expect("the rebuilt corpus reopens");
         drive_initial_feed_with_turn_budget(&handle, 4096);
 
         let pages = match handle.application_page_inventory().unwrap() {
@@ -46361,58 +46385,78 @@ mod tests {
                 (!page.blocks.is_empty()).then_some((page, revision))
             })
             .expect("the census corpus has a nonempty page");
+        let selected_path = page.path.clone();
 
-        crate::model::start_managed_parse_census();
+        crate::outline::start_managed_parse_census();
         let _ = save_application_block_text(
             &handle,
             page,
             revision,
             "managed parse receipt census edit",
         );
-        let foreground_save_parses = crate::model::finish_managed_parse_census();
+        let foreground_save_parses = crate::outline::finish_managed_parse_census();
+        let foreground = handle
+            .managed_application_save_instrumentation()
+            .expect("the corpus save reports foreground parse accounting");
+        eprintln!(
+            "managed_parse_receipt_foreground total_parses={} application_stages={:?} guarded_graph_validation_parse_pairs={} graph_wide={:?}",
+            foreground_save_parses,
+            foreground.application_stages,
+            foreground.guarded_graph_validation_parse_pairs,
+            foreground.graph_wide,
+        );
+        assert_eq!(
+            foreground
+                .application_stages
+                .editor_accepted_parses
+                .saturating_add(foreground.application_stages.editor_target_parses),
+            2,
+            "the same-process save lane exceeded its two-parse budget"
+        );
         assert!(
             foreground_save_parses <= 2,
-            "one-block foreground save exceeded its two-parse budget: {foreground_save_parses}"
+            "one-block foreground save exceeded its two-parser-primitive budget: {foreground_save_parses}"
         );
 
-        crate::model::start_managed_parse_census();
+        crate::outline::start_managed_parse_census();
         drain_managed_local(&handle);
-        let drain_parses = crate::model::finish_managed_parse_census();
+        let drain_parses = crate::outline::finish_managed_parse_census();
+
+        let (page, revision) = load_application_exact(&handle, &selected_path);
+        crate::outline::start_managed_parse_census();
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "managed parse receipt second census edit",
+        );
+        let second_foreground_save_parses = crate::outline::finish_managed_parse_census();
+        eprintln!(
+            "managed_parse_receipt_second_foreground total_parses={second_foreground_save_parses}"
+        );
+        assert!(
+            second_foreground_save_parses <= 2,
+            "steady one-block foreground save exceeded its two-parser-primitive budget: {second_foreground_save_parses}"
+        );
+        crate::outline::start_managed_parse_census();
+        drain_managed_local(&handle);
+        let second_drain_parses = crate::outline::finish_managed_parse_census();
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
         drop(handle);
 
-        crate::oplog::sqlite::remove_disposable_projection(&fixture.request.database_path).unwrap();
-        crate::model::start_managed_parse_census();
-        let rebuild_started = Instant::now();
-        let rebuilt = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-        let rebuild_ms = rebuild_started.elapsed().as_millis();
-        let rebuild_parses = crate::model::finish_managed_parse_census();
-        assert_eq!(rebuilt.status, SyncRuntimeOpenStatus::Active);
-        assert_eq!(
-            rebuild_parses, 0,
-            "a healthy receipted SQLite rebuild must not parse source pages"
-        );
-        assert!(
-            rebuild_ms < 10_000,
-            "real-corpus SQLite rebuild exceeded 10 seconds: {rebuild_ms} ms"
-        );
-        let rebuilt = rebuilt.handle.expect("the rebuilt corpus reopens");
-        assert!(matches!(
-            rebuilt.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-
         eprintln!(
-            "managed_parse_receipt_census source_files={} activation_parses={} activation_ms={} cold_open_parses={} foreground_save_parses={} drain_parses={} rebuild_parses={} rebuild_ms={}",
+            "managed_parse_receipt_census source_files={} activation_parses={} activation_ms={} cold_open_parses={} foreground_save_parses={} drain_parses={} second_foreground_save_parses={} second_drain_parses={} rebuild_parses={} rebuild_ms={}",
             activation.source_files,
             activation_parses,
             activation.total_ms,
             cold_open_parses,
             foreground_save_parses,
             drain_parses,
+            second_foreground_save_parses,
+            second_drain_parses,
             rebuild_parses,
             rebuild_ms,
         );
@@ -46429,11 +46473,17 @@ mod tests {
         drive_initial_feed(&handle);
         let (page, revision) = load_application_exact(&handle, "Root.md");
 
+        crate::outline::start_managed_parse_census();
         let _ = save_application_block_text(
             &handle,
             page,
             revision,
             "managed one-block two-parser-pass budget",
+        );
+        let primitive_parses = crate::outline::finish_managed_parse_census();
+        assert!(
+            primitive_parses <= 2,
+            "one-block foreground save exceeded its two-parser-primitive budget: {primitive_parses}"
         );
         let stages = handle
             .managed_application_save_instrumentation()
@@ -46450,6 +46500,20 @@ mod tests {
         );
         assert_eq!(stages.response_target_exact_dto_reparses, 0);
 
+        drain_managed_local(&handle);
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        crate::outline::start_managed_parse_census();
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "managed one-block second parser-pass budget",
+        );
+        let second_primitive_parses = crate::outline::finish_managed_parse_census();
+        assert!(
+            second_primitive_parses <= 2,
+            "steady one-block foreground save exceeded its two-parser-primitive budget: {second_primitive_parses}"
+        );
         drain_managed_local(&handle);
         assert!(matches!(
             handle.clean_shutdown().unwrap(),

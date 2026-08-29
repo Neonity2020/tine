@@ -46,6 +46,7 @@ pub struct Document {
 /// each structural block in depth-first/source order. A parent's own interval
 /// ends at its first child's header; a leaf owns through the next structural
 /// header or file end.
+#[derive(Clone)]
 pub(crate) struct ParsedDocument {
     pub(crate) document: Document,
     pub(crate) block_spans: Vec<Range<usize>>,

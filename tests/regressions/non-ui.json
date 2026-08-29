@@ -5394,14 +5394,17 @@
     "tests": [
      "crates/tine-core/src/oplog/import.rs::tests::clean_genesis_rebuild_reuses_receipted_semantics_without_parsing_source_pages",
      "crates/tine-core/src/oplog/import.rs::tests::invalid_or_stale_clean_genesis_receipts_reparse_and_verify_exact_source",
+     "crates/tine-core/src/oplog/import.rs::tests::oversized_receipts_are_omitted_and_rebuild_through_parser_fallback",
+     "crates/tine-core/src/oplog/import.rs::tests::lazy_genesis_parser_projection_schema_has_an_explicit_digest_tripwire",
      "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_v4_dual_decode_defaults_to_receiptless_fallback",
      "crates/tine-core/src/oplog/lazy_genesis.rs::tests::sqlite_receipt_bounds_are_inclusive_and_omit_after_either_cap",
      "crates/tine-core/src/oplog/import.rs::tests::import_admission_reuses_the_parser_owned_document",
+     "crates/tine-core/src/outline.rs::tests::exact_source_parse_cache_is_three_entry_format_keyed_and_never_caches_refusals",
      "crates/tine-core/src/sync_runtime.rs::tests::managed_one_block_save_stays_within_two_parser_passes"
     ],
     "failBefore": "proven on the MS-08 packet base: rebuilding a missing disposable SQLite projection reparsed both pages in a two-page healthy baseline; the permanent budget requires zero source parses for already-receipted pages"
    },
-   "notes": "Internal MS-08 cost-model correction. New page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Receiptless capsule v4 remains dual-decodable. Any absent, stale, invalid, or capsule-inconsistent receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save path was re-censused and already pins exactly one accepted-baseline parse plus one target parse, so this packet adds no speculative save rewrite."
+   "notes": "Internal MS-08 cost-model correction. New page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Receiptless capsule v4 remains dual-decodable. Any absent, stale, invalid, or capsule-inconsistent receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save census now counts the underlying parser primitive rather than selected callers. A bounded three-entry exact-source cache covers the accepted base, requested target, and clean render base; finalization reuses clean predecessor annotations only after authority revalidation. The first and steady post-drain one-block saves both remain within two physical parser invocations."
   }
  ]
 }

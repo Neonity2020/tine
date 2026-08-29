@@ -29,7 +29,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   versioned semantic receipt that is verified and reused during a healthy
   rebuild. Existing receiptless baselines, oversized pages, parser upgrades,
   and invalid receipts retain the prior exact-source reparse-and-compare path.
-  Foreground one-block saves remain capped at their existing two parser passes.
+  Foreground one-block saves also reuse exact bounded parser results and the
+  clean predecessor proof already revalidated during capture, keeping both the
+  first and steady post-drain save within two physical parser invocations.
 
 - **Managed storage now opens before its search indexes finish building.**
   Both Unicode and CJK substring indexes are built in bounded background turns;

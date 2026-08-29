@@ -11,13 +11,47 @@ use std::fmt;
 use std::ops::Range;
 
 #[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
+
+#[cfg(test)]
 thread_local! {
     static OUTLINE_PARSE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
+static MANAGED_PARSE_CENSUS_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static MANAGED_PARSE_CENSUS_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static MANAGED_PARSE_CENSUS_THREADS: LazyLock<Mutex<std::collections::BTreeMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
+
+/// Cross-thread parser-primitive counter for the ignored MS cost census. Run
+/// that probe with one test thread; ordinary assertions remain thread-local.
+#[cfg(test)]
+pub(crate) fn start_managed_parse_census() {
+    MANAGED_PARSE_CENSUS_CALLS.store(0, Ordering::Relaxed);
+    MANAGED_PARSE_CENSUS_THREADS.lock().unwrap().clear();
+    MANAGED_PARSE_CENSUS_ENABLED.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn finish_managed_parse_census() -> usize {
+    MANAGED_PARSE_CENSUS_ENABLED.store(false, Ordering::Release);
+    let calls = MANAGED_PARSE_CENSUS_CALLS.swap(0, Ordering::AcqRel);
+    eprintln!(
+        "managed_parse_census_threads={:?}",
+        MANAGED_PARSE_CENSUS_THREADS.lock().unwrap()
+    );
+    calls
+}
+
+#[cfg(test)]
 pub(crate) fn reset_parse_attempts() {
     OUTLINE_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+    OUTLINE_PARSE_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 #[cfg(test)]
@@ -49,6 +83,26 @@ impl OutlineFormat {
             ) | (Self::Org, OutlineHeaderKind::OrgHeadline)
         )
     }
+}
+
+const OUTLINE_PARSE_CACHE_ENTRIES: usize = 3;
+const MAX_OUTLINE_PARSE_CACHE_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+
+struct OutlineParseCacheEntry {
+    source: String,
+    format: OutlineFormat,
+    parsed: ParsedDocument,
+}
+
+thread_local! {
+    /// A save repeatedly asks the canonical serializer to inspect the same
+    /// accepted base, target, and clean manifest render base. Retain only the
+    /// three most recent bounded exact sources on that worker thread; equality
+    /// is byte-for-byte, so this adds no semantic authority and parser failures
+    /// are never cached.
+    static OUTLINE_PARSE_CACHE:
+        std::cell::RefCell<std::collections::VecDeque<OutlineParseCacheEntry>> =
+            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -265,8 +319,56 @@ pub(crate) fn parse_document(
     source: &str,
     format: OutlineFormat,
 ) -> Result<ParsedDocument, OutlineAdapterError> {
+    if source.len() <= MAX_OUTLINE_PARSE_CACHE_SOURCE_BYTES {
+        if let Some(parsed) = OUTLINE_PARSE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let position = cache
+                .iter()
+                .position(|entry| entry.format == format && entry.source == source)?;
+            let entry = cache.remove(position).expect("located parse cache entry");
+            let parsed = entry.parsed.clone();
+            cache.push_back(entry);
+            Some(parsed)
+        }) {
+            return Ok(parsed);
+        }
+    }
+
+    let parsed = parse_document_uncached(source, format)?;
+    if source.len() <= MAX_OUTLINE_PARSE_CACHE_SOURCE_BYTES {
+        OUTLINE_PARSE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() == OUTLINE_PARSE_CACHE_ENTRIES {
+                cache.pop_front();
+            }
+            cache.push_back(OutlineParseCacheEntry {
+                source: source.to_owned(),
+                format,
+                parsed: parsed.clone(),
+            });
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_document_uncached(
+    source: &str,
+    format: OutlineFormat,
+) -> Result<ParsedDocument, OutlineAdapterError> {
     #[cfg(test)]
-    OUTLINE_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
+    {
+        OUTLINE_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
+        if MANAGED_PARSE_CENSUS_ENABLED.load(Ordering::Relaxed) {
+            MANAGED_PARSE_CENSUS_CALLS.fetch_add(1, Ordering::Relaxed);
+            let thread = std::thread::current();
+            let name = thread
+                .name()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("{:?}", thread.id()));
+            let mut threads = MANAGED_PARSE_CENSUS_THREADS.lock().unwrap();
+            *threads.entry(name).or_default() += 1;
+        }
+    }
     let outline = lsdoc::parse_outline(source, format.lsdoc_name())
         .map_err(|_| OutlineAdapterError::ParserOwnership)?;
     let lines = physical_lines(source);
@@ -743,5 +845,37 @@ mod tests {
             parse_document(&canonical, OutlineFormat::Markdown).expect("canonical Markdown");
         assert!(reparsed.document.roots[0].children.is_empty());
         assert!(!doc::markdown_structurally_round_trips(input));
+    }
+
+    #[test]
+    fn exact_source_parse_cache_is_three_entry_format_keyed_and_never_caches_refusals() {
+        reset_parse_attempts();
+        for source in ["- alpha\n", "- beta\n", "- gamma\n"] {
+            parse_document(source, OutlineFormat::Markdown).unwrap();
+        }
+        assert_eq!(parse_attempts(), 3);
+        parse_document("- alpha\n", OutlineFormat::Markdown).unwrap();
+        assert_eq!(
+            parse_attempts(),
+            3,
+            "all three exact save sources remain hot"
+        );
+
+        parse_document("- delta\n", OutlineFormat::Markdown).unwrap();
+        assert_eq!(parse_attempts(), 4);
+        parse_document("- beta\n", OutlineFormat::Markdown).unwrap();
+        assert_eq!(
+            parse_attempts(),
+            5,
+            "the least-recently-used source was evicted"
+        );
+
+        parse_document("- beta\n", OutlineFormat::Org).unwrap();
+        assert_eq!(parse_attempts(), 6, "format is part of the exact cache key");
+
+        let invalid = "- $$x$$ # #+BEGIN_NOTE\r\nx\r\n#+END_NOTE";
+        assert!(parse_document(invalid, OutlineFormat::Markdown).is_err());
+        assert!(parse_document(invalid, OutlineFormat::Markdown).is_err());
+        assert_eq!(parse_attempts(), 8, "parser refusals must never be cached");
     }
 }
