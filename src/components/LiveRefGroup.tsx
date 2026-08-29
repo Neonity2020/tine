@@ -1,7 +1,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, onCleanup, onMount, untrack, useContext, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { blockProperty, collapseEpochOf, doc, ensurePageLoaded, formatForPage, pageByName, setBlockProperty } from "../store";
-import { Block, CollapseSurfaceContext, OutlineScopeContext, SurfaceContext, type CollapseSurfaceApi } from "./Block";
+import { Block, CollapseSurfaceContext, EmbedNavExitContext, OutlineScopeContext, SurfaceContext, type CollapseSurfaceApi } from "./Block";
 import { RefBlocks } from "./RefBlocks";
 import { observeNear, unobserveNear } from "../lazyObserve";
 import type { BlockDto, PageKind, ReferenceBlockEvidence } from "../types";
@@ -272,6 +272,12 @@ export function LiveRefGroup(props: {
           collapsed: (id, stored) => collapseSurface.collapsed(id, stored),
           navOnly: true,
         }}>
+        {/* GH #415: Up from the first visual row of an embed's ROOT row exits
+            the embed into the host page; the other rows stay surface-local.
+            Only a block embed carries a host block id. */}
+        <EmbedNavExitContext.Provider value={
+          props.surface === "embed" && props.hostBlockId ? { hostBlockId: props.hostBlockId } : null
+        }>
         <LinkDepthContext.Provider value={linkDepth + 1}>
         <For each={props.blocks.map((b) => b.id)}>
           {(id) => {
@@ -331,6 +337,7 @@ export function LiveRefGroup(props: {
           }}
         </For>
         </LinkDepthContext.Provider>
+        </EmbedNavExitContext.Provider>
         </OutlineScopeContext.Provider>
         </SurfaceContext.Provider>
         </CollapseSurfaceContext.Provider>
