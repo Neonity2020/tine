@@ -28,7 +28,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   widths and keeps Tine outside the system bars.** Lower-priority topbar actions
   still move into `...` when space is constrained, while the right-sidebar
   button remains direct until the last-resort tier; native status, navigation,
-  and display-cutout insets now bound the WebView itself (GH #205).
+  and display-cutout insets now bound the WebView itself. Android also treats
+  that native viewport as the sole inset owner, so OEM WebViews that expose CSS
+  safe-area values do not add a second wasteful band above the topbar (GH #205).
 
 - **Android no longer treats a refused directory durability barrier as success
   for promoted managed-storage projection receipts.** Only the receipt store's

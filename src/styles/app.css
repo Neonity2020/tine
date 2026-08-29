@@ -33,8 +33,11 @@ body {
    a monospace shorthand later in this file; safety must survive those rules. */
 :root {
   --tine-editable-emoji-font: "Noto Emoji Variable";
-  /* System-inset gutters for viewport-fixed chrome.
-     `.app-container` already pads the app SHELL by the four insets, but a
+  /* One named owner for system-inset gutters. Browser/iOS surfaces use CSS
+     env() values. MainActivity already sizes Android's WebView inside the
+     native insets, so main.tsx selects `native-viewport` before render and the
+     four tokens become zero instead of reserving the same bars a second time.
+     `.app-container` pads the app SHELL by the active tokens, but a
      `position: fixed` overlay is laid out against the viewport and escapes that
      padding completely — so every full-viewport overlay has to reapply them.
      A larger vh/px constant cannot substitute: the status bar, cutout and
@@ -44,10 +47,20 @@ body {
      Overriding these four variables is also how the browser harness
      (scripts/check-mobile-safe-area.mjs) can measure inset behaviour in a
      desktop Chromium, where env() is always 0. */
-  --overlay-inset-top: env(safe-area-inset-top, 0px);
-  --overlay-inset-right: env(safe-area-inset-right, 0px);
-  --overlay-inset-bottom: env(safe-area-inset-bottom, 0px);
-  --overlay-inset-left: env(safe-area-inset-left, 0px);
+  --system-inset-top: env(safe-area-inset-top, 0px);
+  --system-inset-right: env(safe-area-inset-right, 0px);
+  --system-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --system-inset-left: env(safe-area-inset-left, 0px);
+  --overlay-inset-top: var(--system-inset-top);
+  --overlay-inset-right: var(--system-inset-right);
+  --overlay-inset-bottom: var(--system-inset-bottom);
+  --overlay-inset-left: var(--system-inset-left);
+}
+html[data-system-insets="native-viewport"] {
+  --system-inset-top: 0px;
+  --system-inset-right: 0px;
+  --system-inset-bottom: 0px;
+  --system-inset-left: 0px;
 }
 html[data-editable-emoji="windows"] {
   --tine-editable-emoji-font: "Segoe UI Emoji", "Noto Emoji Variable";
@@ -95,8 +108,8 @@ textarea {
      buttons sit behind the status bar and can't be tapped. All four insets are
      0 on desktop, so this is a no-op there. box-sizing keeps 100vh honest. */
   box-sizing: border-box;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right)
-    env(safe-area-inset-bottom) env(safe-area-inset-left);
+  padding: var(--system-inset-top) var(--system-inset-right)
+    var(--system-inset-bottom) var(--system-inset-left);
 }
 
 /* Shown only if the wasm block renderer fails to load (degraded mode). */
@@ -257,19 +270,19 @@ textarea {
 .app-container[data-mobile-drawer-mode="true"] .left-sidebar,
 .app-container[data-mobile-drawer-mode="true"] .right-sidebar {
   position: fixed;
-  top: env(safe-area-inset-top);
-  bottom: env(safe-area-inset-bottom);
+  top: var(--system-inset-top);
+  bottom: var(--system-inset-bottom);
   z-index: 90;
   width: min(
     var(--mobile-drawer-width, 320px),
-    calc(100vw - 44px - env(safe-area-inset-left) - env(safe-area-inset-right))
+    calc(100vw - 44px - var(--system-inset-left) - var(--system-inset-right))
   ) !important;
-  max-width: calc(100vw - 44px - env(safe-area-inset-left) - env(safe-area-inset-right));
+  max-width: calc(100vw - 44px - var(--system-inset-left) - var(--system-inset-right));
   flex: none !important;
   box-shadow: 0 8px 30px rgba(0, 0, 0, .28);
 }
-.app-container[data-mobile-drawer-mode="true"] .left-sidebar { left: env(safe-area-inset-left); right: auto; }
-.app-container[data-mobile-drawer-mode="true"] .right-sidebar { right: env(safe-area-inset-right); left: auto; }
+.app-container[data-mobile-drawer-mode="true"] .left-sidebar { left: var(--system-inset-left); right: auto; }
+.app-container[data-mobile-drawer-mode="true"] .right-sidebar { right: var(--system-inset-right); left: auto; }
 .app-container[data-mobile-drawer-mode="true"] .sidebar-resizer,
 .app-container[data-mobile-drawer-mode="true"] .rs-resizer,
 .app-container[data-mobile-drawer-mode="true"] .resize-grip { display: none; }
@@ -5136,9 +5149,9 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
 .sel-toolbar-mobile {
   position: fixed;
   top: auto;
-  bottom: var(--mobile-kb-toolbar-lift, calc(64px + env(safe-area-inset-bottom)));
-  left: max(6px, env(safe-area-inset-left));
-  right: max(6px, env(safe-area-inset-right));
+  bottom: var(--mobile-kb-toolbar-lift, calc(64px + var(--system-inset-bottom)));
+  left: max(6px, var(--system-inset-left));
+  right: max(6px, var(--system-inset-right));
   z-index: 81;
   justify-content: center;
 }
@@ -5178,8 +5191,8 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
 
 .mobile-keyboard-toolbar {
   position: fixed;
-  left: env(safe-area-inset-left);
-  right: env(safe-area-inset-right);
+  left: var(--system-inset-left);
+  right: var(--system-inset-right);
   z-index: 80;
   transform: translateY(-100%);
   display: flex;

@@ -98,6 +98,9 @@ class AndroidUiRuntimeTest {
           val sidebarDirect = receipt.optBoolean("directRightSidebar")
           val overflowVisible = receipt.optBoolean("overflowVisible")
           val winControls = receipt.optBoolean("winControls")
+          val systemInsetsOwner = receipt.optString("systemInsetsOwner")
+          val appPadding = receipt.optJSONObject("appPadding") ?: JSONObject()
+          val topbar = receipt.optJSONObject("topbar") ?: JSONObject()
           val viewport = receipt.optJSONObject("viewport")
           val viewportWidth = viewport?.optDouble("innerWidth", Double.NaN) ?: Double.NaN
           val viewportHeight = viewport?.optDouble("innerHeight", Double.NaN) ?: Double.NaN
@@ -115,8 +118,19 @@ class AndroidUiRuntimeTest {
           if (winControls) {
             fitFailures += "$orientationName scale=$scale Android unexpectedly rendered desktop window controls"
           }
-          if (nativeViewport.optInt("webViewTop") < nativeViewport.optInt("statusBarTop")) {
-            fitFailures += "$orientationName scale=$scale WebView top ${nativeViewport.optInt("webViewTop")} remained under status inset ${nativeViewport.optInt("statusBarTop")}"
+          if (abs(nativeViewport.optInt("webViewTop") - nativeViewport.optInt("statusBarTop")) > NATIVE_INSET_TOLERANCE_PX) {
+            fitFailures += "$orientationName scale=$scale WebView top ${nativeViewport.optInt("webViewTop")} did not meet status inset ${nativeViewport.optInt("statusBarTop")}"
+          }
+          if (systemInsetsOwner != "native-viewport") {
+            fitFailures += "$orientationName scale=$scale Android system inset owner was '$systemInsetsOwner'"
+          }
+          val cssInsetValues = listOf("top", "right", "bottom", "left").map { appPadding.optDouble(it, Double.NaN) }
+          if (cssInsetValues.any { !it.isFinite() || abs(it) > CSS_INSET_TOLERANCE_PX }) {
+            fitFailures += "$orientationName scale=$scale native-owned app padding was $appPadding"
+          }
+          val topbarTop = topbar.optDouble("top", Double.NaN)
+          if (!topbarTop.isFinite() || abs(topbarTop) > CSS_INSET_TOLERANCE_PX) {
+            fitFailures += "$orientationName scale=$scale topbar began at $topbarTop inside the already-inset WebView"
           }
           if (!containerWidth.isFinite()) {
             fitFailures += "$orientationName scale=$scale did not report a container width"
@@ -791,6 +805,8 @@ class AndroidUiRuntimeTest {
       if (!topbar) return null;
       const bar = topbar.getBoundingClientRect();
       const topbarStyle = getComputedStyle(topbar);
+      const app = document.querySelector('.app-container');
+      const appStyle = app ? getComputedStyle(app) : null;
       // Popover menu buttons are descendants of the topbar component but are
       // not occupants of its direct row. Including them made the free-space
       // measurement circular whenever the menu was open.
@@ -817,7 +833,14 @@ class AndroidUiRuntimeTest {
         // Container queries use the content box. `width` is border-box here
         // because of the global box-sizing rule, so subtract the real padding.
         containerWidth: topbar.clientWidth - parseFloat(topbarStyle.paddingLeft) - parseFloat(topbarStyle.paddingRight),
-        topbar: { left: bar.left, right: bar.right, width: bar.width, height: bar.height },
+        topbar: { left: bar.left, top: bar.top, right: bar.right, width: bar.width, height: bar.height },
+        systemInsetsOwner: document.documentElement.dataset.systemInsets || '',
+        appPadding: appStyle ? {
+          top: parseFloat(appStyle.paddingTop),
+          right: parseFloat(appStyle.paddingRight),
+          bottom: parseFloat(appStyle.paddingBottom),
+          left: parseFloat(appStyle.paddingLeft),
+        } : null,
         winControls: !!topbar.querySelector('.win-controls'),
         overflowVisible: !!overflowTrigger && visible(overflowTrigger),
         overflowMenuVisible: !!overflowMenu && visible(overflowMenu),
@@ -997,5 +1020,7 @@ class AndroidUiRuntimeTest {
     const val OPTIONAL_ACTION_FLOOR_PX = 345.0
     const val NAVIGATION_ACTION_FLOOR_PX = 300.0
     const val RIGHT_SIDEBAR_FLOOR_PX = 250.0
+    const val NATIVE_INSET_TOLERANCE_PX = 1
+    const val CSS_INSET_TOLERANCE_PX = 0.5
   }
 }

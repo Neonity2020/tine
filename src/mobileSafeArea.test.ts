@@ -10,10 +10,23 @@ import { describe, expect, it } from "vitest";
  */
 describe("mobile safe-area insets", () => {
   const css = readFileSync("src/styles/app.css", "utf8");
+  const main = readFileSync("src/main.tsx", "utf8");
 
-  it("defines every inset token from the platform's own value", () => {
+  it("centralizes each platform inset behind one system token", () => {
     for (const side of ["top", "right", "bottom", "left"]) {
-      expect(css).toContain(`--overlay-inset-${side}: env(safe-area-inset-${side}, 0px);`);
+      expect(css).toContain(`--system-inset-${side}: env(safe-area-inset-${side}, 0px);`);
+      expect(css).toContain(`--overlay-inset-${side}: var(--system-inset-${side});`);
+    }
+    expect(css.match(/env\(safe-area-inset-(?:top|right|bottom|left)(?:, 0px)?\)/gu)).toHaveLength(4);
+  });
+
+  it("gives Android's already-inset native viewport sole ownership", () => {
+    const installation = "installSystemInsetOwner();";
+    expect(main).toContain(installation);
+    expect(main.indexOf(installation)).toBeLessThan(main.indexOf("applyTheme();"));
+    expect(css).toContain('html[data-system-insets="native-viewport"]');
+    for (const side of ["top", "right", "bottom", "left"]) {
+      expect(css).toContain(`--system-inset-${side}: 0px;`);
     }
   });
 

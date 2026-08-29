@@ -574,6 +574,32 @@
    }
   },
   {
+   "id": "UI-ANDROID-SYSTEM-INSET-OWNERSHIP-205",
+   "title": "Android reserves each system-bar inset exactly once, leaving the Tine topbar adjacent to the status-bar boundary without overlap or wasted space",
+   "family": "android-layout",
+   "sources": {
+    "issues": [
+     205
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "android"
+   ],
+   "layer": "native",
+   "status": "fixing",
+   "coverage": {
+    "tests": [
+     "src/mobileSafeArea.test.ts",
+     "src/systemInsets.test.ts",
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt"
+    ],
+    "scenario": "android.system-inset-single-owner",
+    "failBefore": "proven"
+   },
+   "notes": "GH #205 physical-device follow-up (Martin, 2026-08-29). The exact signed 1fa7fef7 APK passed sidebar priority, overflow actions, rotations, 90/100/110 percent scale, and tap routing, but a physical Android screenshot showed approximately one additional status-bar-sized blank band above Tine's topbar. The native Activity already insets the WebView while app.css independently consumes CSS safe-area env() values; WebView 124 on the hosted API-35 emulator reports those CSS values as zero, masking the overlap, while an OEM WebView may expose them. Android therefore names the native viewport as the sole system-inset owner and zeros the centralized CSS tokens; browser/iOS CSS safe-area behavior remains unchanged. Exact pixel size is flexible: the blocking outcomes are no system-bar overlap and no second reserved inset."
+  },
+  {
    "id": "UI-PAGE-ACTIONS-MENU-002",
    "title": "Only the page-actions trigger that owns the open menu reports aria-expanded",
    "family": "page-actions",

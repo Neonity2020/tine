@@ -21,7 +21,9 @@ import "./lsShimInstall";
 import "./styles/app.css";
 import { installEditableEmojiPlatform } from "./editableEmoji";
 import { applyContentWidths } from "./contentWidth";
+import { installSystemInsetOwner } from "./systemInsets";
 
+installSystemInsetOwner();
 installEditableEmojiPlatform();
 applyTheme();
 applyAccent();
