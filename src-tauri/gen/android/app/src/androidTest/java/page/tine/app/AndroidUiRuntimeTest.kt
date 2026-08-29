@@ -54,9 +54,26 @@ class AndroidUiRuntimeTest {
         "portrait" to ActivityInfo.SCREEN_ORIENTATION_PORTRAIT,
         "landscape" to ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE,
       )) {
-        setOrientation(scenario, orientation)
+        // The hosted emulator starts in portrait. Re-requesting the orientation
+        // that is already active can recreate Tauri's surface while retaining a
+        // briefly queryable old WebView. Only rotate when the requested state
+        // differs, then require the replacement surface and viewport to agree.
+        if (currentOrientation(scenario) != orientationName) setOrientation(scenario, orientation)
         webView = awaitWebView(scenario)
         awaitTopbar(webView)
+        awaitCondition("$orientationName rendered WebView") {
+          val ready = evaluateJson(webView, """
+            (() => JSON.stringify({
+              route: document.querySelector('.page-title')?.textContent?.trim() || '',
+              blocks: document.querySelectorAll('.ls-block').length,
+              width: window.innerWidth,
+              height: window.innerHeight,
+            }))()
+          """.trimIndent())
+          ready.optString("route") == "Welcome to Tine" && ready.optInt("blocks") >= 3 &&
+            (if (orientationName == "landscape") ready.optDouble("width") > ready.optDouble("height")
+            else ready.optDouble("height") >= ready.optDouble("width"))
+        }
 
         for (scale in listOf(1.0, 0.9, 1.1)) {
           // Android production zoom is document-root CSS zoom (src/zoom.ts).
@@ -300,7 +317,11 @@ class AndroidUiRuntimeTest {
   private fun awaitWebView(scenario: ActivityScenario<MainActivity>): WebView {
     var found: WebView? = null
     awaitCondition("Tauri WebView") {
-      scenario.onActivity { activity -> found = findWebView(activity.window.decorView) }
+      scenario.onActivity { activity ->
+        found = findWebView(activity.window.decorView)?.takeIf {
+          it.isAttachedToWindow && it.isShown && it.width > 0 && it.height > 0
+        }
+      }
       found != null
     }
     return checkNotNull(found)
@@ -549,8 +570,10 @@ class AndroidUiRuntimeTest {
 
   private fun swipeUp(webView: WebView) {
     val x = webView.width * 0.72f
-    val startY = webView.height * 0.78f
-    val endY = webView.height * 0.28f
+    // The first-run demo displays two bottom toasts. Start above them so the
+    // physical gesture reaches the outline scroller rather than a toast layer.
+    val startY = webView.height * 0.55f
+    val endY = webView.height * 0.18f
     val downTime = SystemClock.uptimeMillis()
     dispatchMotion(webView, downTime, MotionEvent.ACTION_DOWN, x, startY)
     repeat(SWIPE_STEPS) { index ->
