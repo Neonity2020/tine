@@ -1640,14 +1640,13 @@ single phase reports — is what turns an ordinary edit from milliseconds on a
 local SSD into hundreds of milliseconds on a slow or network filesystem, and it
 is invisible to phase timers because the multiplicity is spread across modules.
 
-**Invariant — one durability point per accepted batch.** An accepted batch's
-archive materialization (its content-addressed operation objects and its batch
-manifest) is made durable by exactly ONE barrier for the whole set. Before that
-barrier, no artifact of the batch need be individually durable and the batch is
-**not accepted**; after it, every artifact is durable together. Recovery treats
-a partially written batch as not-accepted and reconstructs it, and no reader may
-be able to observe an artifact of the batch in a state that is neither "absent"
-nor "exactly the intended bytes".
+**Invariant — acceptance authority precedes relaxed archive publication.** The
+managed-local journal frame is durable before archive materialization begins and
+is checkpointed only after publication completes. While that exact frame remains
+undrained, its canonical object bytes may authorize archive-object recovery. No
+other caller receives this relaxation: ordinary archive publishers take a strict
+pre-install data barrier, and the batch manifest always remains a strictly
+flushed commit marker.
 
 **The protocol** (`oplog/object_store.rs::ArchiveBatchPublication`):
 
@@ -1655,34 +1654,40 @@ nor "exactly the intended bytes".
    namespace, with no barrier. Temporary names are not archive entries: every
    reader — `ObjectStore::validate_namespace`, `inspect_batch`, every replay —
    addresses artifacts by content-addressed or batch-addressed *final* names.
-2. **One barrier.** `syncfs` on the private archive filesystem. This is the
-   batch's single durability point.
-3. **Install.** Each final name is inserted no-replace. This is metadata over
-   data that is already durable.
+2. **Pre-install data barrier.** Ordinary publishers call `syncfs` once for the
+   whole staged set. The managed-local drain, whose exact object bytes remain in
+   its undrained journal frame, flushes the manifest temporary but does not
+   pre-flush each object temporary.
+3. **Install.** Each final name is inserted no-replace. For an ordinary
+   publisher all bytes are already durable. On the journal-covered path, an
+   object name may survive a crash with torn bytes; a manifest name may not.
 4. **Directory barriers.** One `fsync` per distinct namespace touched — two for
    an ordinary batch (`objects`, `batches`).
 
-Step 3 comes after step 2 deliberately, and that ordering is the whole
-crash-safety argument. Installing final names *before* the flush (which is what
-`tine_storage::ExactImmutablePublicationBatch` does, and why this path does not
-use it) admits a state where an immutable name is present with bytes that never
-reached the platter — most visibly zero-length under ext4 delayed allocation.
-`validate_namespace` correctly refuses such an archive
-(`StoreError::ObjectPathMismatch`), so that state would strand an accepted edit
-that is still durable in the journal. Staging first removes the state from the
-reachable set instead of adding recovery for it.
+Step 3 after step 2 remains the complete argument for every strict caller. The
+journal-covered path deliberately admits one additional crash state: an object
+final name whose bytes were not fully flushed. Cold open first authenticates the
+archive structure, then—under the workspace's sole-writer lease—decodes only
+uncheckpointed managed-local frames and builds an exact digest-to-canonical-byte
+repair set. It replaces a mismatching object only when that set names one
+unambiguous exact replacement, rereads the result, and then runs the ordinary
+full namespace validation. An uncovered mismatch, ambiguous coverage, a
+noncanonical replacement, a workspace mismatch, or a torn manifest still
+refuses activation. Drained history is never recovery authority.
 
-**Ordering between artifact classes.** Pointer-before-pointee durability is
-preserved without a second barrier because the pointer and the pointee are in
-the *same* batch: the manifest references its objects, and the single barrier
-makes objects and manifest durable together. Two references cross the batch
-boundary and keep their own barriers: the archive's **lineage claim**, which
-every manifest asserts and which is written once in an archive's lifetime
-before this batch runs; and the **local journal frame**, which is the acceptance
-authority and is already durable from the foreground save. Nothing outside the
-batch points *into* it before the batch completes: the journal frame is
-checkpointed — the point at which the archive becomes authoritative and the
-frame becomes reclaimable — strictly after this publication returns.
+`tine_storage::ExactImmutablePublicationBatch` now implements the strict form in
+the shared storage primitive: stage, flush all staged data, install no-replace,
+then flush every destination directory. Tine's local drain retains its narrower
+archive publisher because only it can apply the undrained-journal authorization
+and manifest carve-out.
+
+**Ordering between artifact classes.** The archive's **lineage claim** remains
+durable before every manifest that asserts it. The **local journal frame** is
+already durable before the drain starts. Objects install before the strictly
+flushed **manifest commit marker**, and the journal checkpoint advances only
+after both namespace directory barriers complete. Thus a durable manifest never
+points to an object lacking either durable archive bytes or exact undrained
+journal recovery authority.
 
 **Crash points.**
 
@@ -1690,8 +1695,8 @@ frame becomes reclaimable — strictly after this publication returns.
 | --- | --- | --- |
 | During staging | Temporary names only, contents arbitrary | Batch not accepted. The journal frame is undrained, so the drain republishes the byte-identical batch. Temporaries are invisible to readers. |
 | After staging, before the barrier | As above | As above. |
-| After the barrier, during installs | A prefix of final names, every one with durable, byte-correct content | The drain republishes; each already-installed name verifies byte-identical and is accepted as published. |
-| After installs, before a directory barrier | Possibly no name insertion durable | Same as the row above; any surviving name is byte-correct. |
+| After the barrier, during installs | Strict: a durable prefix. Journal-covered: a prefix whose object bytes may be torn, but no unflushed manifest name. | The drain republishes. After process loss, cold open repairs only exact undrained-journal-covered object mismatches before full validation. |
+| After installs, before a directory barrier | Some name insertions may disappear; surviving journal-covered object bytes may be torn. | Same as the row above; the journal checkpoint has not advanced. |
 | After the directory barriers | The whole batch durable | The drain proceeds to checkpoint. |
 
 In every row the *accepted operation* is unaffected: it became durable in the
@@ -1704,13 +1709,13 @@ publication is device-local). **Out of scope:** an adversary who can write
 arbitrary bytes to the user's filesystem
 (`specs/notes/2026-08-07-trust-model-and-threat-model-decision.md`).
 
-**Platforms without `syncfs`** (Windows, macOS) have no batched barrier to take,
-so `ArchiveBatchPublication::stage` publishes each artifact through the ordinary
-durable publisher and `commit` is inert; the barrier count there is unchanged.
-On Android, a vendor filesystem that denies the filesystem-wide flush as a
-*capability* (`EPERM`/`ENOTSUP`/`EINVAL`) falls back to one `fsync` per staged
-artifact — the barriers this batch exists to avoid, but a correct durability
-point and an available product. Every other errno stays fatal.
+**Platforms without `syncfs`** (Windows, macOS) publish each artifact through
+the ordinary durable publisher, so this optimization and repair state do not
+arise there. On Android, a strict caller whose vendor filesystem denies the
+filesystem-wide flush as a *capability* (`EPERM`/`ENOTSUP`/`EINVAL`) falls back
+to one `fsync` per staged artifact. Every other errno stays fatal. The
+journal-covered Android path uses the same manifest-only pre-install flush as
+Linux and the same exact cold-open repair authorization.
 
 **Read paths take no barriers.** `fsync` before reading a file defends nothing:
 a read is served from the same page cache the writer wrote into, so forcing
@@ -1783,12 +1788,17 @@ for a save and from 112 to 87 for a cross-page move. Packet C-2 adds exactly
 one coalesced local-completion chain install when this fixture reaches idle:
 one directory barrier plus one staged-publication filesystem barrier for the
 whole operation, never per page. Packet 2c removes own-endpoint receipt
-publication from that executor. The final exact attribution is: save foreground
+publication from that executor. MS-05 keeps the exact totals but changes the
+archive leg from a filesystem-wide flush to one strict manifest-file flush,
+because the undrained journal now authorizes exact torn-object repair. The final
+exact attribution is: save foreground
 `file_fsync=1 dir_fsync=2 syncfs=0 total=3`, save total
-`file_fsync=2 dir_fsync=6 syncfs=2 total=10`; move foreground is zero and move
-total is `file_fsync=6 dir_fsync=5 syncfs=2 total=13`. These are exact-equality
+`file_fsync=3 dir_fsync=6 syncfs=1 total=10`; move foreground is zero and move
+total is `file_fsync=7 dir_fsync=5 syncfs=1 total=13`. These are exact-equality
 assertions, not ceilings: either upward or downward drift requires a new
-attribution before the pin moves. The packet-2b removed 6/25 directory barriers were repeated
+attribution before the pin moves. The MS-05 barrier delta is therefore honest:
+zero fewer total barriers, but one less whole-filesystem `syncfs` in exchange
+for one manifest-only file `fsync` per operation. The packet-2b removed 6/25 directory barriers were repeated
 `SharedReconstructibleProjection` barriers within turns; no strict authority or
 quarantine barrier was removed.
 

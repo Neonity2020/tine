@@ -808,7 +808,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                     error.to_string(),
                 );
             }
-            if let Err(error) = archive.publish_prepared(record.prepared_batch()) {
+            if let Err(error) = archive.publish_turn_covered_prepared(record.prepared_batch()) {
                 if publication_conflict(&error) {
                     return conflict(
                         ManagedLocalDrainStage::ArchivePublication,

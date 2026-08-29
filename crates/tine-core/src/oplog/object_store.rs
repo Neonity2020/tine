@@ -1589,6 +1589,20 @@ impl ObjectStore {
     /// Open or create a store at an explicit root and retain the opened
     /// directory capability for all later operations.
     pub fn open(root: &Path, workspace_id: WorkspaceId) -> Result<Self, StoreError> {
+        let store = Self::open_structural(root, workspace_id)?;
+        store.validate_namespace()?;
+        Ok(store)
+    }
+
+    /// Retain and structurally authenticate the archive without yet trusting
+    /// immutable object contents. This narrow cold-open seam exists so the
+    /// caller can acquire the workspace lease, recover undrained journal bytes,
+    /// repair exactly covered torn object names, and only then run the ordinary
+    /// full namespace validation.
+    pub(crate) fn open_structural(
+        root: &Path,
+        workspace_id: WorkspaceId,
+    ) -> Result<Self, StoreError> {
         let name = root
             .file_name()
             .ok_or_else(|| StoreError::UnsafeEntry("store root has no final component".into()))?;
@@ -1624,14 +1638,12 @@ impl ObjectStore {
         let capability = open_dir_nofollow(&parent_capability, name)?;
         ensure_directory(&capability, OBJECTS_DIR)?;
         ensure_directory(&capability, BATCHES_DIR)?;
-        let store = Self {
+        Ok(Self {
             root_path: canonical_parent.join(name),
             workspace_id,
             capability,
             counters: Arc::new(StoreCounters::default()),
-        };
-        store.validate_namespace()?;
-        Ok(store)
+        })
     }
 
     pub fn root_path(&self) -> &Path {
@@ -1670,7 +1682,7 @@ impl ObjectStore {
         artifacts: &[(&str, &[u8], u64)],
         collision_kind: &'static str,
     ) -> Result<(), StoreError> {
-        let mut publication = ArchiveBatchPublication::new(&self.capability)?;
+        let mut publication = ArchiveBatchPublication::strict(&self.capability)?;
         let namespace_index = publication.namespace(namespace)?;
         for (name, bytes, limit) in artifacts {
             publication.stage(
@@ -1679,6 +1691,7 @@ impl ObjectStore {
                 bytes,
                 *limit,
                 Collision::Exact(collision_kind),
+                false,
             )?;
         }
         publication.commit()
@@ -1829,7 +1842,20 @@ impl ObjectStore {
         if batch.manifest().origin() == BatchOrigin::BootstrapImport {
             return Err(StoreError::BootstrapBatchRequiresDirectPublication);
         }
-        self.publish_prepared_impl(batch, false)
+        self.publish_prepared_impl(batch, false, false)
+    }
+
+    /// Publish an ordinary batch whose exact bytes are still retained by the
+    /// caller's undrained managed-local journal frame. Only that durable turn
+    /// permits object installation without a pre-install data barrier.
+    pub(crate) fn publish_turn_covered_prepared(
+        &self,
+        batch: &PreparedBatch,
+    ) -> Result<(), StoreError> {
+        if batch.manifest().origin() == BatchOrigin::BootstrapImport {
+            return Err(StoreError::BootstrapBatchRequiresDirectPublication);
+        }
+        self.publish_prepared_impl(batch, false, true)
     }
 
     /// Seed a bootstrap-origin archive fixture without exposing a production
@@ -1857,37 +1883,24 @@ impl ObjectStore {
             BatchOrigin::BootstrapImport,
             "bootstrap fixture publication requires BootstrapImport origin"
         );
-        self.publish_prepared_impl(batch, true)
+        self.publish_prepared_impl(batch, true, false)
     }
 
-    /// Publish one accepted batch's complete archive materialization through a
-    /// SINGLE durability point.
+    /// Publish one accepted batch's complete archive materialization.
     ///
-    /// Every object and the manifest are staged under their final immutable
-    /// names without an individual barrier; one filesystem barrier at the end
-    /// makes the whole set durable at once. This is the "one durability point
-    /// per accepted batch" invariant in `docs/storage-sync-contract.md`; the
-    /// per-artifact publisher it replaces performed two barriers (file fsync
-    /// plus directory fsync) for each of the four-to-eight artifacts an
-    /// ordinary edit produces.
-    ///
-    /// The batch is safe to tear because it is not the acceptance authority.
-    /// The accepted operation is already durable in the local journal before
-    /// this runs (`oplog/local_journal_drain.rs` — "the journal is the durable
-    /// foreground boundary"), and the journal frame is checkpointed only AFTER
-    /// this function returns. A crash at any point therefore re-enters the same
-    /// drain, which republishes this exact byte-identical set.
-    ///
-    /// Republication of a torn predecessor is the one behaviour the
-    /// per-artifact publisher did not need. Without a per-file barrier a
-    /// crash can leave an immutable name installed whose bytes were never
-    /// flushed, and the strict publisher reports that as a byte collision and
-    /// refuses forever. `stage_batched_publication` repairs exactly that case:
-    /// see its refusal-scenario note.
+    /// Ordinary callers use a strict batch barrier before any immutable name
+    /// becomes visible. The managed-local drain may instead set
+    /// `turn_covered_objects`: its durable, still-undrained journal frame is the
+    /// exact recovery authority for object bytes, so object temporaries may be
+    /// installed without a pre-install data flush. The manifest remains the
+    /// archive commit marker and is always flushed before installation. Cold
+    /// open repairs only torn object names covered byte-for-byte by such an
+    /// undrained record, then runs the ordinary full namespace validation.
     fn publish_prepared_impl(
         &self,
         batch: &PreparedBatch,
         allow_bootstrap: bool,
+        turn_covered_objects: bool,
     ) -> Result<(), StoreError> {
         let manifest = batch.manifest();
         if manifest.workspace_id() != self.workspace_id {
@@ -1911,7 +1924,11 @@ impl ObjectStore {
 
         let objects = self.open_namespace(OBJECTS_DIR)?;
         let batches = self.open_namespace(BATCHES_DIR)?;
-        let mut publication = ArchiveBatchPublication::new(&self.capability)?;
+        let mut publication = if turn_covered_objects {
+            ArchiveBatchPublication::turn_covered(&self.capability)?
+        } else {
+            ArchiveBatchPublication::strict(&self.capability)?
+        };
         let objects_namespace = publication.namespace(&objects)?;
         let batches_namespace = publication.namespace(&batches)?;
         for object in batch.objects() {
@@ -1930,6 +1947,7 @@ impl ObjectStore {
                     &bytes,
                     MAX_OBJECT_BYTES as u64,
                     Collision::Object(digest),
+                    false,
                 )
                 .map_err(|error| publication_stage_error("publish operation object", error))?;
         }
@@ -1941,6 +1959,7 @@ impl ObjectStore {
                 &manifest_bytes,
                 MAX_MANIFEST_BYTES as u64,
                 Collision::Batch(batch_id),
+                true,
             )
             .map_err(|error| publication_stage_error("publish operation manifest", error))?;
 
@@ -3235,7 +3254,70 @@ impl ObjectStore {
         Ok(bytes)
     }
 
-    fn validate_namespace(&self) -> Result<(), StoreError> {
+    /// Repair only content-addressed object names whose canonical bytes remain
+    /// authoritative in an undrained managed-local journal record.
+    ///
+    /// The caller holds the archive's sole-writer workspace lease. Each
+    /// replacement is still bound to the exact bad bytes observed here, staged
+    /// and flushed before an atomic same-directory replacement, followed by a
+    /// directory barrier. Uncovered, ambiguous, malformed, or foreign objects
+    /// are deliberately left for `validate_namespace` to refuse unchanged.
+    pub(crate) fn repair_covered_object_mismatches(
+        &self,
+        covered: &BTreeMap<ContentDigest, Vec<u8>>,
+    ) -> Result<usize, StoreError> {
+        let objects = self.open_namespace(OBJECTS_DIR)?;
+        let mut repaired = 0_usize;
+        for entry in objects.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| StoreError::MalformedPath("non-UTF-8 entry under objects".into()))?;
+            require_regular_entry(&entry.file_type()?, name)?;
+            if is_temp_name(name) {
+                continue;
+            }
+            let expected = parse_object_filename(name)?;
+            let observed = read_required_regular(&objects, name, MAX_OBJECT_BYTES as u64, None)?;
+            if ContentDigest::of(&observed) == expected {
+                continue;
+            }
+            let Some(replacement) = covered.get(&expected) else {
+                continue;
+            };
+            if ContentDigest::of(replacement) != expected {
+                return Err(StoreError::ObjectPathMismatch(expected));
+            }
+            let object = OperationObject::decode(replacement)?;
+            if object.workspace_id() != self.workspace_id {
+                return Err(StoreError::WorkspaceMismatch {
+                    expected: self.workspace_id,
+                    found: object.workspace_id(),
+                });
+            }
+            if object.encode()?.as_slice() != replacement {
+                return Err(StoreError::ObjectPathMismatch(expected));
+            }
+            tine_storage::DurableDirectoryPublication::open(&objects)
+                .map_err(|error| publication_error(error, Collision::Object(expected)))?
+                .replace_exact(name, &observed, replacement)
+                .map_err(|error| publication_error(error, Collision::Object(expected)))?;
+            let installed = read_required_regular(
+                &objects,
+                name,
+                MAX_OBJECT_BYTES as u64,
+                Some(replacement.len() as u64),
+            )?;
+            if installed != *replacement {
+                return Err(StoreError::ObjectPathMismatch(expected));
+            }
+            repaired = repaired.saturating_add(1);
+        }
+        Ok(repaired)
+    }
+
+    pub(crate) fn validate_namespace(&self) -> Result<(), StoreError> {
         let mut manifests = Vec::new();
         for (directory, kind) in [
             (OBJECTS_DIR, NamespaceKind::Objects),
@@ -6921,8 +7003,8 @@ fn publish_immutable(
         .map_err(|error| publication_error(error, collision))
 }
 
-/// One accepted batch's archive artifacts, published through a SINGLE
-/// durability point.
+/// One accepted batch's archive artifacts, published under either the strict
+/// or journal-turn-covered protocol.
 ///
 /// ## Why this exists
 ///
@@ -6939,23 +7021,21 @@ fn publish_immutable(
 ///    namespace with no barrier. Temporary names are invisible to every
 ///    reader: `ObjectStore::validate_namespace` and every replay path address
 ///    artifacts by their content-addressed or batch-addressed final names.
-/// 2. **One barrier.** `syncfs` flushes the whole private archive filesystem
-///    once. After it returns, every staged byte is on stable storage. This is
-///    the batch's single durability point.
-/// 3. **Install.** Each final name is inserted no-replace. This is a metadata
-///    operation over data that is *already* durable, so a visible final name
-///    can never name bytes that were never flushed.
+/// 2. **Pre-install data barrier.** Strict callers use one `syncfs` to flush
+///    all staged bytes. A managed-local drain whose exact object bytes remain
+///    in its undrained journal frame flushes only the manifest commit marker.
+/// 3. **Install.** Each final name is inserted no-replace. Strict callers have
+///    already made every staged byte durable. On the journal-covered path only
+///    an object may be installed before its bytes are flushed; the undrained
+///    record is then its exact crash-recovery authority.
 /// 4. **Directory barriers.** One `fsync` per distinct namespace makes the
 ///    name insertions durable — two for an ordinary batch (objects, batches).
 ///
-/// Step 3 after step 2 is the whole safety argument, and it is why this does
-/// not use `tine_storage::ExactImmutablePublicationBatch`: that primitive
-/// installs final names *before* its single flush, so a crash inside it can
-/// leave an immutable name whose bytes never reached the platter.
-/// `validate_namespace` correctly refuses such an archive
-/// (`StoreError::ObjectPathMismatch`), which would strand an accepted edit
-/// that is still durable in the journal. Staging first removes that state
-/// from the reachable set instead of adding recovery for it.
+/// For a strict caller, step 3 after step 2 ensures no visible name can refer
+/// to unflushed bytes. For the managed-local drain, a crash may leave a torn
+/// object final name; cold open replaces it only when an uncheckpointed local
+/// journal record supplies the exact canonical bytes, and only before normal
+/// archive validation. The manifest is never allowed that relaxation.
 ///
 /// ## Crash points
 ///
@@ -6963,7 +7043,7 @@ fn publish_immutable(
 /// |---|---|---|
 /// | during staging | temporary names only, contents arbitrary | the batch is not accepted; the journal frame is undrained and the drain republishes. Temporaries are ignored by every reader. |
 /// | after staging, before the barrier | as above | as above |
-/// | after the barrier, during installs | a prefix of final names, every one with durable correct bytes | the drain republishes; each installed name verifies byte-identical and is accepted as already published |
+/// | after the barrier, during installs | strict: a durable prefix; turn-covered: possibly torn object names but never an unflushed manifest name | the drain republishes; cold open repairs only exact journal-covered object mismatches before validation |
 /// | after installs, before a directory barrier | possibly no final name durable | as above |
 /// | after the directory barriers | the whole batch durable | the drain proceeds to checkpoint |
 ///
@@ -6971,12 +7051,13 @@ fn publish_immutable(
 /// in the local journal during the foreground save, before this runs, and its
 /// journal frame is checkpointed only after this returns.
 ///
-/// On platforms without `syncfs` (Windows, macOS) there is no batched barrier
-/// to have, so `stage` publishes each artifact through the ordinary durable
-/// publisher and `commit` is inert. The barrier count there is unchanged.
+/// On platforms without `syncfs` (Windows, macOS), `stage` publishes each
+/// artifact through the ordinary durable publisher and `commit` is inert. The
+/// barrier count there is unchanged.
 struct ArchiveBatchPublication {
     archive: Dir,
     namespaces: Vec<Dir>,
+    strict_filesystem_barrier: bool,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     staged: Vec<StagedArchiveArtifact>,
 }
@@ -6987,13 +7068,23 @@ struct StagedArchiveArtifact {
     temp_name: String,
     final_name: String,
     limit: u64,
+    requires_preinstall_flush: bool,
 }
 
 impl ArchiveBatchPublication {
-    fn new(archive: &Dir) -> Result<Self, StoreError> {
+    fn strict(archive: &Dir) -> Result<Self, StoreError> {
+        Self::new(archive, true)
+    }
+
+    fn turn_covered(archive: &Dir) -> Result<Self, StoreError> {
+        Self::new(archive, false)
+    }
+
+    fn new(archive: &Dir, strict_filesystem_barrier: bool) -> Result<Self, StoreError> {
         Ok(Self {
             archive: archive.try_clone()?,
             namespaces: Vec::new(),
+            strict_filesystem_barrier,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             staged: Vec::new(),
         })
@@ -7013,6 +7104,7 @@ impl ArchiveBatchPublication {
         bytes: &[u8],
         limit: u64,
         _collision: Collision,
+        requires_preinstall_flush: bool,
     ) -> Result<(), StoreError> {
         let dir = &self.namespaces[namespace];
         let temp_name = format!(".tmp-{}", Uuid::new_v4());
@@ -7030,6 +7122,7 @@ impl ArchiveBatchPublication {
             temp_name,
             final_name: final_name.to_owned(),
             limit,
+            requires_preinstall_flush,
         });
         Ok(())
     }
@@ -7042,6 +7135,7 @@ impl ArchiveBatchPublication {
         bytes: &[u8],
         _limit: u64,
         collision: Collision,
+        _requires_preinstall_flush: bool,
     ) -> Result<(), StoreError> {
         publish_immutable(&self.namespaces[namespace], final_name, bytes, collision)
     }
@@ -7079,9 +7173,23 @@ impl ArchiveBatchPublication {
         Ok(())
     }
 
-    /// The batch's single durability point.
+    /// Apply the caller's pre-install data barrier policy.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn barrier_staged_data(&self) -> Result<(), StoreError> {
+        if !self.strict_filesystem_barrier {
+            for artifact in self
+                .staged
+                .iter()
+                .filter(|artifact| artifact.requires_preinstall_flush)
+            {
+                let file = tine_storage::open_file_nofollow(
+                    &self.namespaces[artifact.namespace],
+                    &artifact.temp_name,
+                )?;
+                crate::durability_counters::sync_file(&file)?;
+            }
+            return Ok(());
+        }
         match crate::filesystem_durability::sync_filesystem_containing(&self.archive) {
             Ok(()) => Ok(()),
             // Android app-private storage on some vendor filesystems denies the
@@ -10024,6 +10132,34 @@ mod bootstrap_store_tests {
         PreparedBatch::new(manifest, vec![object]).unwrap()
     }
 
+    fn ordinary_prepared_batch(workspace: WorkspaceId) -> PreparedBatch {
+        let payload = b"ordinary semantic effect".to_vec();
+        let object = OperationObject::new(
+            workspace,
+            DocumentId::from_uuid(Uuid::from_u128(0x7400)),
+            ObjectKind::SemanticEffect,
+            payload.clone(),
+        )
+        .unwrap();
+        let descriptor = object.descriptor().unwrap();
+        let device = DeviceId::from_uuid(Uuid::from_u128(0x7401));
+        let manifest = OperationBatch::new_with_causality(
+            workspace,
+            LineageDigest::from_bytes([0x74; 32]),
+            BatchId::from_uuid(Uuid::from_u128(0x7402)),
+            device,
+            SessionId::from_uuid(Uuid::from_u128(0x7403)),
+            BatchOrigin::LocalMutation,
+            BatchCausalDot::new(CausalPeerId::from_device_id(device), 1).unwrap(),
+            Vec::new(),
+            FrontierV2::new(Vec::new()).unwrap(),
+            SemanticEffectDigest::of(&payload),
+            vec![descriptor],
+        )
+        .unwrap();
+        PreparedBatch::new(manifest, vec![object]).unwrap()
+    }
+
     #[test]
     fn generic_publication_rejects_bootstrap_batches_without_prefix_writes() {
         let fixture = EmptyBootstrapFixture::new("generic-rejection");
@@ -10039,6 +10175,44 @@ mod bootstrap_store_tests {
         ));
         assert!(store.committed_manifests().unwrap().is_empty());
         assert!(!fixture.archive.join(BOOTSTRAP_DIR).exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ordinary_publication_keeps_the_strict_preinstall_filesystem_barrier() {
+        use crate::durability_counters::{Barrier, BarrierSession};
+
+        let fixture = EmptyBootstrapFixture::new("ordinary-strict-barrier");
+        let store = fixture.store();
+        let prepared = ordinary_prepared_batch(fixture.workspace);
+        let session = BarrierSession::begin();
+        store.publish_prepared(&prepared).unwrap();
+        let counts = session.counts();
+        BarrierSession::detach_current_thread();
+
+        assert_eq!(counts.get(Barrier::Filesystem), 1, "{}", counts.report());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn journal_turn_coverage_relaxes_only_object_preinstall_flushes() {
+        use crate::durability_counters::{Barrier, BarrierSession};
+
+        let fixture = EmptyBootstrapFixture::new("ordinary-turn-covered");
+        let store = fixture.store();
+        let prepared = ordinary_prepared_batch(fixture.workspace);
+        let session = BarrierSession::begin();
+        store.publish_turn_covered_prepared(&prepared).unwrap();
+        let counts = session.counts();
+        BarrierSession::detach_current_thread();
+
+        assert_eq!(counts.get(Barrier::Filesystem), 0, "{}", counts.report());
+        assert_eq!(
+            counts.get(Barrier::File),
+            2,
+            "the lineage claim and manifest must remain file-durable: {}",
+            counts.report()
+        );
     }
 
     #[test]

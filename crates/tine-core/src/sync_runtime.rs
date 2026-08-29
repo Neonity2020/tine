@@ -6725,11 +6725,19 @@ fn open_clean_runtime_resources_with_progress(
         return Err("clean activation marker differs from persisted local identities".into());
     }
     let (mut engine, baseline, _) = opened.into_parts();
+    let binding = ActorRuntimeBinding::from_clean(identities, endpoint, &receipts);
     let operation_archive_path = clean_operation_archive_directory(&request.archive_root);
+    let store = ObjectStore::open_structural(&operation_archive_path, identities.workspace_id)
+        .map_err(display)?;
+    let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id).map_err(display)?;
+    let covered =
+        clean_undrained_object_repair_coverage(&request.application_runtime_root, &binding)?;
+    store
+        .repair_covered_object_mismatches(&covered)
+        .map_err(display)?;
+    store.validate_namespace().map_err(display)?;
     engine
-        .attach_clean_archive_store(
-            ObjectStore::open(&operation_archive_path, identities.workspace_id).map_err(display)?,
-        )
+        .attach_clean_archive_store(store.duplicate_retained_capability().map_err(display)?)
         .map_err(display)?;
     let baseline_claim_source = engine
         .clean_transient_projection_claim_snapshot()
@@ -6742,9 +6750,6 @@ fn open_clean_runtime_resources_with_progress(
         .replay_clean_committed_tail(baseline_claim_source.as_ref())
         .map_err(display)?;
     drop(baseline_claim_source);
-    let store =
-        ObjectStore::open(&operation_archive_path, identities.workspace_id).map_err(display)?;
-    let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id).map_err(display)?;
     let projection = if replayed == 0 {
         let expected = engine.accepted_frontier_root().map_err(display)?;
         let baseline_projection = open_or_rebuild_clean_genesis_projection(
@@ -6806,7 +6811,6 @@ fn open_clean_runtime_resources_with_progress(
     let runtime =
         CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
             .map_err(display)?;
-    let binding = ActorRuntimeBinding::from_clean(identities, endpoint, &receipts);
     let mut completion_guard = ColdOpenLocalCompletionGuard::new(runtime);
     // §4.7 steps 5-6: both journals become available before terminal work can
     // mutate the graph; the semantic managed-local queue drains first.
@@ -10639,12 +10643,24 @@ fn prepare_clean_foreground_journal(
     ))
 }
 
-fn open_clean_foreground_journal(
+struct RecoveredCleanForegroundJournal {
+    directory: Dir,
+    journal: ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
+    checkpoint: ManagedLocalDrainCheckpoint,
+    checkpoint_batch_id: Option<BatchId>,
+    recovered_frames: Vec<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    cleanup_pending: bool,
+}
+
+/// Select and decode the durable managed-local tail without requiring a graph,
+/// engine, SQLite projection, or operation archive. Cold open uses this narrow
+/// seam before archive validation so an undrained record can authorize repair
+/// of exactly the content-addressed object bytes it still carries.
+fn recover_clean_foreground_journal_only(
     application_runtime_root: &Path,
     binding: &ActorRuntimeBinding,
-    graph: &Graph,
-    runtime: &mut CleanLocalRuntime,
-) -> Result<ManagedLocalRuntimeState, String> {
+    create_if_absent: bool,
+) -> Result<Option<RecoveredCleanForegroundJournal>, String> {
     let root = Dir::open_ambient_dir(application_runtime_root, ambient_authority())
         .map_err(|error| format!("cannot retain clean foreground journal root: {error}"))?;
     ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
@@ -10701,6 +10717,7 @@ fn open_clean_foreground_journal(
                 anchor.accepted_batch_id(),
             )
         }
+        None if !create_if_absent => return Ok(None),
         None => {
             let checkpoint = ManagedLocalDrainCheckpoint::initial(
                 device_id,
@@ -10781,6 +10798,70 @@ fn open_clean_foreground_journal(
         checkpoint_batch_id = Some(record.prepared_batch().manifest().batch_id());
     }
     let recovered_frames = recovered_frames.split_off(checkpointed);
+    Ok(Some(RecoveredCleanForegroundJournal {
+        directory,
+        journal,
+        checkpoint,
+        checkpoint_batch_id,
+        recovered_frames,
+        cleanup_pending: !anchors.is_empty(),
+    }))
+}
+
+fn clean_undrained_object_repair_coverage(
+    application_runtime_root: &Path,
+    binding: &ActorRuntimeBinding,
+) -> Result<BTreeMap<ContentDigest, Vec<u8>>, String> {
+    let Some(RecoveredCleanForegroundJournal {
+        recovered_frames, ..
+    }) = recover_clean_foreground_journal_only(application_runtime_root, binding, false)?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut covered = BTreeMap::<ContentDigest, Vec<u8>>::new();
+    for frame in recovered_frames {
+        let record = crate::oplog::decode_managed_local_record(&frame).map_err(|error| {
+            format!(
+                "clean foreground journal record {}:{} is invalid during archive repair pre-scan: {error}",
+                frame.device_id(),
+                frame.sequence()
+            )
+        })?;
+        for object in record.prepared_batch().objects() {
+            let bytes = object.encode().map_err(display)?;
+            let digest = ContentDigest::of(&bytes);
+            match covered.entry(digest) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(bytes);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get().as_slice() == bytes.as_slice() => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(format!(
+                        "undrained clean foreground records ambiguously cover object {digest}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(covered)
+}
+
+fn open_clean_foreground_journal(
+    application_runtime_root: &Path,
+    binding: &ActorRuntimeBinding,
+    graph: &Graph,
+    runtime: &mut CleanLocalRuntime,
+) -> Result<ManagedLocalRuntimeState, String> {
+    let RecoveredCleanForegroundJournal {
+        directory,
+        journal,
+        checkpoint,
+        checkpoint_batch_id,
+        recovered_frames,
+        cleanup_pending,
+    } = recover_clean_foreground_journal_only(application_runtime_root, binding, true)?
+        .ok_or_else(|| "clean foreground journal creation did not return a journal".to_owned())?;
 
     let mut latest_projection_frames = BTreeMap::new();
     let mut latest_task_query_overlay = BTreeMap::new();
@@ -10846,7 +10927,7 @@ fn open_clean_foreground_journal(
         pending_commit: None,
         authorship_complete: BTreeSet::new(),
         last_failure: None,
-        cleanup_pending: !anchors.is_empty(),
+        cleanup_pending,
     })
 }
 
@@ -30296,12 +30377,144 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cold_open_repairs_only_torn_objects_covered_by_an_undrained_local_record() {
+        let fixture = ActivationFixture::nested_unicode("covered-torn-archive-object", 0xa1c4);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        )
+        .unwrap();
+        let (mut page, revision) = match actor
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "Root.md".into(),
+                },
+            })
+            .unwrap()
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("foreground target did not load: {other:?}"),
+        };
+        page.blocks[0].raw = "journal-authorized torn object repair".into();
+        crate::model::inject_journal_projection_before_publish_failure(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "retain one undrained repair authority",
+        ));
+        let outcome = actor
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SyncApplicationPageSaveOutcome::Deferred {
+                state: SyncEditorDeferred::BlockedRecovery { .. }
+            }
+        ));
+        let frame = actor
+            .managed_local
+            .as_ref()
+            .unwrap()
+            .frames
+            .front()
+            .expect("the injected cut retains one journal frame");
+        let record = crate::oplog::decode_managed_local_record(frame).unwrap();
+        let object_bytes = record.prepared_batch().objects()[0].encode().unwrap();
+        let digest = ContentDigest::of(&object_bytes);
+
+        let archive_path = clean_operation_archive_directory(&fixture.request.archive_root);
+        let store =
+            ObjectStore::open(&archive_path, fixture.request.identities.workspace_id).unwrap();
+        assert_eq!(store.stage_object_bytes(&object_bytes).unwrap(), digest);
+        let objects_dir = archive_path.join(crate::oplog::sync_layout::ARCHIVE_OBJECTS_DIR);
+        let object_path = fs::read_dir(&objects_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(&digest.to_string()))
+            })
+            .expect("the covered object was published under its content address");
+        fs::write(&object_path, b"torn object bytes").unwrap();
+        drop(store);
+        drop(actor);
+
+        let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+            .unwrap()
+            .expect("an undrained record repairs its covered torn object");
+        assert_eq!(fs::read(&object_path).unwrap(), object_bytes);
+        drop(reopened);
+
+        let uncovered = ActivationFixture::nested_unicode("uncovered-torn-archive-object", 0xa1c5);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(uncovered.request.clone());
+        let handle = activated.handle.expect("uncovered fixture activates");
+        drive_initial_feed(&handle);
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "a fully drained object has no repair authority",
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        let archive_path = clean_operation_archive_directory(&uncovered.request.archive_root);
+        let objects_dir = archive_path.join(crate::oplog::sync_layout::ARCHIVE_OBJECTS_DIR);
+        let object_path = fs::read_dir(&objects_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.is_file()
+                    && !path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".tmp-")
+            })
+            .expect("activation published an object not covered by an undrained record");
+        let uncovered_bytes = fs::read(&object_path).unwrap();
+        let uncovered_digest = ContentDigest::of(&uncovered_bytes);
+        assert!(
+            object_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(&uncovered_digest.to_string()),
+            "the control object starts byte-correct"
+        );
+        fs::write(&object_path, b"uncovered torn bytes").unwrap();
+
+        let refused = match open_clean_runtime_resources(&reopen_request(&uncovered.request)) {
+            Err(error) => error,
+            Ok(_) => panic!("a torn object without an undrained record must stay a refusal"),
+        };
+        assert!(refused.contains("do not match path"), "{refused}");
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum ArchiveBatchCut {
         /// Between the objects and the manifest, before the batch's barrier.
         BeforeManifest,
-        /// After the batch's single data barrier, part-way through installing
-        /// final names and before the directory barriers.
+        /// After the required pre-install data barrier (strict batch-wide or
+        /// journal-covered manifest-only), part-way through installing final
+        /// names and before the directory barriers.
         DuringInstall,
     }
 
