@@ -93,6 +93,10 @@ async function loadHarness(
     events.push("restore-pdf");
     return true;
   });
+  const restorePendingPdfSessionTarget = vi.fn(() => {
+    events.push("restore-pending-pdf");
+    return true;
+  });
   const pushToast = vi.fn();
 
   vi.doMock("./backend", () => ({ backend: () => api }));
@@ -127,6 +131,7 @@ async function loadHarness(
     setGraphTransitioning: vi.fn(),
     suspendPdfForGraphTransition,
     restorePdfSessionTarget,
+    restorePendingPdfSessionTarget,
   }));
   vi.doMock("./pdfOwnership", () => ({
     drainPdfWork,
@@ -175,6 +180,7 @@ async function loadHarness(
     api, events, setAliasMap, pushToast,
     drainPdfWork, retirePdfOwnership, activatePdfOwnership,
     suspendPdfForGraphTransition, restorePdfSessionTarget,
+    restorePendingPdfSessionTarget,
     applyTemplateVars, prepareTemplateVars,
     setMeta: (next: GraphMeta | null) => { meta = next; },
     bumpEpoch: () => { epoch += 1; },
@@ -436,6 +442,7 @@ describe("default journal template graph bind", () => {
 
     expect(events).toEqual([
       `activate-pdf:${META.root}`,
+      "restore-pending-pdf",
       "bump-epoch",
       "save-template",
     ]);
@@ -629,14 +636,19 @@ describe("PDF graph ownership", () => {
 
     await harness.loadGraphPath(META.root, { forceRefresh: true });
 
-    expect(harness.events.slice(0, 5)).toEqual([
+    expect(harness.events.slice(0, 6)).toEqual([
       "drain-pdf",
       "retire-pdf",
       "suspend-pdf",
       "load-refresh",
       `activate-pdf:${META.root}`,
+      "restore-pdf",
     ]);
     expect(harness.activatePdfOwnership).toHaveBeenCalledTimes(2);
+    expect(harness.restorePdfSessionTarget).toHaveBeenCalledWith({
+      filename: "assets/paper.pdf",
+      label: "Paper",
+    });
   });
 
   it("restores the suspended PDF under fresh old-graph ownership when rebind fails", async () => {

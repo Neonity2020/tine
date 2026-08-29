@@ -362,10 +362,14 @@ try {
   browser = undefined;
   await stopDriver();
   await connect();
-  await sleep(1_000);
+  // Prove the graph has rebound and rendered its real journal content before
+  // treating viewer absence as evidence. A fixed delay could pass vacuously on
+  // a slow startup whose session restore had not run yet.
+  await browser.$(".pdf-link").waitForExist({ timeout: 15_000 });
   if (await browser.$(".pdf-viewer").isExisting()) {
     throw new Error("explicitly closed PDF reopened after a clean relaunch");
   }
+  receipt.sessionRestore.postBindContentReady = true;
   receipt.sessionRestore.explicitCloseStayedClosed = true;
   fs.writeFileSync(path.join(ARTIFACTS, "pdf-ownership-native-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
   console.log(`PASS: PDF ownership and graph-session restore are stable: ${JSON.stringify(receipt)}`);

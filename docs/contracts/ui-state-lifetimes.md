@@ -22,7 +22,10 @@ transition from saving state under the wrong graph.
 
 The typed registry in `src/uiStateRegistry.ts` is the code authority for the
 fields migrated to this contract. `GraphSessionUiStateSchema` and
-`graphSessionUiStateRegistry` form a compile-time completeness pair.
+`graphSessionUiStateRegistry` form a compile-time completeness pair, and
+`PersistedSession` explicitly extends the schema so its migrated fields cannot
+silently drift from that authority. The registry is incremental rather than a
+claim that every legacy session field has already been migrated.
 
 | Field | Owner | Lifetime | Reset trigger | Persisted representation |
 |---|---|---|---|---|

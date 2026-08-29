@@ -16,8 +16,11 @@ import {
   setFavoritesSectionExpanded,
   setRecentSectionExpanded,
   pdfTarget,
+  restorePendingPdfSessionTarget,
+  restorePdfSessionTarget,
   setPdfTarget,
 } from "./ui";
+import { activatePdfOwnership, resetPdfOwnershipForTest } from "./pdfOwnership";
 
 const journals = (): PaneSnapshot => ({
   tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
@@ -32,9 +35,10 @@ const page = (name: string): PaneSnapshot => ({
 });
 
 beforeEach(() => {
+  resetPdfOwnershipForTest();
   resetPaneLayoutToSingle(journals());
   applySidebarSession({});
-  setPdfTarget(null);
+  restorePdfSessionTarget(null);
 });
 
 describe("persisted split session", () => {
@@ -56,7 +60,11 @@ describe("persisted split session", () => {
     const parsed = parsePersistedSession(JSON.stringify(persisted))!;
     setPdfTarget(null);
     applyParsedSession(parsed);
-    expect(pdfTarget()).toBeNull(); // no live graph ownership: restoration waits for the post-bind pass
+    expect(pdfTarget()).toBeNull(); // no live graph ownership: stable identity remains pending for bind
+
+    const owner = activatePdfOwnership("/fresh-graph");
+    expect(restorePendingPdfSessionTarget()).toBe(true);
+    expect(pdfTarget()).toEqual({ filename: "assets/paper.pdf", label: "Paper", owner });
   });
 
   it("fails a malformed PDF target closed without discarding the rest of the session", () => {

@@ -3,7 +3,7 @@
 
 import { backend } from "./backend";
 import { managedStorageRuntime } from "./managedStorageRuntime";
-import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, restorePdfSessionTarget, suspendPdfForGraphTransition } from "./ui";
+import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, restorePdfSessionTarget, restorePendingPdfSessionTarget, suspendPdfForGraphTransition } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
@@ -198,7 +198,17 @@ export async function loadGraphPath(
   if (result.kind === "already_current" && hadGraph && !options.forceRefresh) {
     return { kind: "already_current", root: meta.root };
   }
-  if (!hadGraph || rebindsPdfOwner) activatePdfOwnership(meta.root);
+  if (!hadGraph || rebindsPdfOwner) {
+    activatePdfOwnership(meta.root);
+    if (rebindsPdfOwner && !switching) {
+      // Same-root refresh retires the old generation but retains this graph's
+      // stable session identity under the freshly minted owner.
+      restorePdfSessionTarget(suspendedPdfTarget);
+    } else if (!hadGraph) {
+      // A parsed session can arrive before native graph ownership exists.
+      restorePendingPdfSessionTarget();
+    }
+  }
   resetStore();
   resetNavigationIndex();
   clearAssetBlobCache(); // old graph's image blob URLs must not leak into the new one
