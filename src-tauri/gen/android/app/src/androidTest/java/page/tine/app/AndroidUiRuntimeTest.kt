@@ -227,7 +227,7 @@ class AndroidUiRuntimeTest {
       )) {
         val target = awaitContentBlock(webView, textBounds.first, textBounds.second, kind == "single-line")
         val blockId = target.getString("blockId")
-        tapContentStart(webView, target)
+        tapContentEditorEntry(webView, target)
         val textarea = awaitEditor(webView, blockId, kind != "single-line")
         if (kind != "single-line") {
           // Establish the reporter's literal starting state through touch: the
@@ -535,10 +535,11 @@ class AndroidUiRuntimeTest {
     SystemClock.sleep(TAP_SETTLE_MS)
   }
 
-  private fun tapContentStart(webView: WebView, content: JSONObject) {
-    // A content wrapper's centre can lie over an inline page reference. Use
-    // the leading text band so the physical tap reliably enters block edit.
-    val cssX = content.getDouble("left") + minOf(32.0, content.getDouble("width") * 0.18)
+  private fun tapContentEditorEntry(webView: WebView, content: JSONObject) {
+    // The rendered text band can contain links and chips at any horizontal
+    // position. The wrapper's trailing padding owns the same production
+    // mousedown-to-edit path without invoking an inline control.
+    val cssX = content.getDouble("left") + content.getDouble("width") - 6.0
     val cssY = content.getDouble("top") + content.getDouble("lineHeight") * 0.5
     tapAt(webView, motionPoint(webView, content, cssX, cssY))
   }
