@@ -12079,6 +12079,10 @@ struct RuntimeActor {
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
+    /// A disposable FTS build failure is reported but not retried in a hot
+    /// loop. The physical marker remains building, so readers keep using
+    /// complete fallbacks; reopening the actor gives the cache one fresh try.
+    search_index_build_failure: Option<String>,
     absence_sweep_subscribers: Vec<mpsc::Sender<SyncAbsenceSweepEvent>>,
     last_absence_sweep_events: BTreeMap<String, SyncAbsenceSweepEvent>,
     terminal: Option<String>,
@@ -12571,6 +12575,7 @@ impl RuntimeActor {
             recovery,
             last_watcher,
             last_tick: None,
+            search_index_build_failure: None,
             absence_sweep_subscribers: Vec::new(),
             last_absence_sweep_events: BTreeMap::new(),
             terminal: None,
@@ -20691,7 +20696,7 @@ impl RuntimeActor {
         outcome
     }
 
-    fn search_index_build_has_work(&self) -> bool {
+    fn search_index_building(&self) -> bool {
         self.clean
             .as_ref()
             .map(|clean| {
@@ -20708,32 +20713,40 @@ impl RuntimeActor {
             .unwrap_or(false)
     }
 
+    fn search_index_build_has_work(&self) -> bool {
+        self.search_index_build_failure.is_none() && self.search_index_building()
+    }
+
+    fn fail_search_index_build(&mut self, detail: String) -> SyncRuntimeTick {
+        if self.search_index_build_failure.is_none() {
+            self.search_index_build_failure = Some(detail.clone());
+        }
+        SyncRuntimeTick::Failed(detail)
+    }
+
     fn tick_clean_search_index_build(&mut self) -> SyncRuntimeTick {
-        let clean = self
-            .clean
-            .as_mut()
-            .expect("search indexing is routed only to a clean actor");
-        let mut session = match clean.runtime.admit_clean_mutation(&self.graph) {
-            Ok(session) => session,
-            Err(error) => {
-                return SyncRuntimeTick::RecoveryBlocked(format!(
+        let result = {
+            let clean = self
+                .clean
+                .as_mut()
+                .expect("search indexing is routed only to a clean actor");
+            match clean.runtime.admit_clean_mutation(&self.graph) {
+                Ok(mut session) => match session.parts() {
+                    Ok((_, _, database)) => database
+                        .advance_search_index_build(SEARCH_INDEX_BUILD_ROW_BUDGET)
+                        .map_err(|error| format!("background search index build failed: {error}")),
+                    Err(error) => Err(format!(
+                        "search index build lost workspace authority: {error}"
+                    )),
+                },
+                Err(error) => Err(format!(
                     "search index build could not enter the managed runtime: {error}"
-                ));
+                )),
             }
         };
-        let (_, _, database) = match session.parts() {
-            Ok(parts) => parts,
-            Err(error) => {
-                return SyncRuntimeTick::RecoveryBlocked(format!(
-                    "search index build lost workspace authority: {error}"
-                ));
-            }
-        };
-        match database.advance_search_index_build(SEARCH_INDEX_BUILD_ROW_BUDGET) {
+        match result {
             Ok(_) => SyncRuntimeTick::Recovering,
-            Err(error) => {
-                SyncRuntimeTick::Failed(format!("background search index build failed: {error}"))
-            }
+            Err(detail) => self.fail_search_index_build(detail),
         }
     }
 
@@ -22823,9 +22836,11 @@ impl RuntimeActor {
             watcher: self.last_watcher,
             last_tick: self.last_tick.clone(),
             detail: self.terminal.clone().or_else(|| {
-                self.managed_local
-                    .as_ref()
-                    .and_then(|managed| managed.last_failure.clone())
+                self.search_index_build_failure.clone().or_else(|| {
+                    self.managed_local
+                        .as_ref()
+                        .and_then(|managed| managed.last_failure.clone())
+                })
             }),
             shared_role: self.shared_role,
             shared_phase: self.shared_phase,
@@ -22862,7 +22877,7 @@ impl RuntimeActor {
             // publication intents remain.
             provider_runnable: self.shared_phase == Some(SyncSharedPhase::Active)
                 && self.provider_has_work(),
-            search_index_building: self.search_index_build_has_work(),
+            search_index_building: self.search_index_building(),
             managed_local_pending: self
                 .managed_local
                 .as_ref()
@@ -28772,6 +28787,56 @@ mod tests {
         ));
         drop(handle);
         fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    #[test]
+    fn managed_search_build_failure_is_reported_once_without_hot_retrying() {
+        let fixture = ActivationFixture::scaled("managed-search-build-failure-latch", 0x7f76, 64);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        )
+        .unwrap();
+        assert!(actor.snapshot().search_index_building);
+
+        let connection = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE search_fts_build SET phase = 2 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let failed = actor.tick();
+        assert!(
+            matches!(failed, SyncRuntimeTick::Failed(ref detail) if detail.contains("background search index build failed")),
+            "the first corrupt-cache build turn must report its failure: {failed:?}"
+        );
+        let status = actor.snapshot();
+        assert!(
+            status.search_index_building,
+            "the unreadable physical marker must keep every consumer on its complete fallback"
+        );
+        assert!(
+            status
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("background search index build failed")),
+            "the latched cache failure must remain visible: {status:?}"
+        );
+        assert_eq!(
+            actor.tick(),
+            SyncRuntimeTick::Idle,
+            "a disposable-cache failure must not schedule another immediate build turn"
+        );
     }
 
     impl Drop for ActivationFixture {
