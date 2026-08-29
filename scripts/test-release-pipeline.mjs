@@ -907,6 +907,8 @@ assert.match(
 );
 for (const nonVacuousBoundary of [
   "welcomeGone",
+  "awaitVisibleElementByScrolling",
+  "MotionEvent.ACTION_MOVE",
   "directOptional",
   "menuAdds",
   "previewAdds",
@@ -923,6 +925,15 @@ for (const nonVacuousBoundary of [
     `Android UI instrumentation is missing the non-vacuous ${nonVacuousBoundary} boundary`
   );
 }
+assert.doesNotMatch(
+  androidUiRuntimeTest,
+  /scenario\.close\(\)/,
+  "per-method force-stop must own WebView teardown because ActivityScenario.close crashes the hosted emulator's HWUI thread"
+);
+assert.ok(
+  androidUiRuntimeTest.includes("TINE_ANDROID_UI_RUNTIME_FAILURE"),
+  "Android UI instrumentation must preserve a screenshot and DOM receipt when a harness stage fails"
+);
 for (const semanticReceipt of ["WindowInsets.Type.ime()", "mobileToolbar", "selectionLength"]) {
   assert.ok(
     androidUiRuntimeTest.includes(semanticReceipt),

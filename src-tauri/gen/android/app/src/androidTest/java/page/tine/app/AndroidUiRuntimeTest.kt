@@ -45,7 +45,7 @@ import org.junit.runner.RunWith
 class AndroidUiRuntimeTest {
   @Test
   fun responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent() {
-    withFreshDemoGraph { scenario, initialWebView ->
+    withFreshDemoGraph("responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent") { scenario, initialWebView ->
       val receipts = JSONArray()
       val fitFailures = mutableListOf<String>()
       var webView = initialWebView
@@ -78,8 +78,19 @@ class AndroidUiRuntimeTest {
           val optionalCount = receipt.optJSONArray("directOptional")?.length() ?: -1
           val overflowVisible = receipt.optBoolean("overflowVisible")
           val winControls = receipt.optBoolean("winControls")
+          val viewport = receipt.optJSONObject("viewport")
+          val viewportWidth = viewport?.optDouble("innerWidth", Double.NaN) ?: Double.NaN
+          val viewportHeight = viewport?.optDouble("innerHeight", Double.NaN) ?: Double.NaN
           if (clipped.length() != 0 || freeWidth < -1.0) {
             fitFailures += "$orientationName scale=$scale clipped=$clipped freeWidth=$freeWidth"
+          }
+          val viewportMatchesOrientation = if (orientationName == "landscape") {
+            viewportWidth > viewportHeight
+          } else {
+            viewportHeight >= viewportWidth
+          }
+          if (!viewportMatchesOrientation) {
+            fitFailures += "$orientationName scale=$scale viewport=${viewportWidth}x$viewportHeight did not match Android orientation"
           }
           if (winControls) {
             fitFailures += "$orientationName scale=$scale Android unexpectedly rendered desktop window controls"
@@ -136,15 +147,10 @@ class AndroidUiRuntimeTest {
 
   @Test
   fun longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation() {
-    withFreshDemoGraph { _, webView ->
-      awaitCondition("a rendered page reference in the demo graph") {
-        elementRectOrNull(webView, "a.page-ref") != null
-      }
+    withFreshDemoGraph("longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation") { _, webView ->
+      val pageRef = awaitVisibleElementByScrolling(webView, "a.page-ref", "a rendered page reference in the demo graph")
       installLongPressMutationTrace(webView)
       val before = locationAndSelection(webView)
-      val pageRef = requireNotNull(elementRectOrNull(webView, "a.page-ref")) {
-        "the first-run demo graph did not render a page reference"
-      }
       longPress(webView, pageRef)
       val menuObserved = waitForCondition {
         pageActionsState(webView).optInt("pageActionsMenus") == 1
@@ -184,7 +190,7 @@ class AndroidUiRuntimeTest {
 
   @Test
   fun initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement() {
-    withFreshDemoGraph { scenario, webView ->
+    withFreshDemoGraph("initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement") { scenario, webView ->
       val selections = JSONArray()
       val failures = mutableListOf<String>()
 
@@ -255,15 +261,20 @@ class AndroidUiRuntimeTest {
     }
   }
 
-  private fun withFreshDemoGraph(block: (ActivityScenario<MainActivity>, WebView) -> Unit) {
+  private fun withFreshDemoGraph(
+    test: String,
+    block: (ActivityScenario<MainActivity>, WebView) -> Unit,
+  ) {
     val scenario = ActivityScenario.launch(MainActivity::class.java)
+    var webView: WebView? = null
     try {
-      val webView = awaitWebView(scenario)
-      val createDemo = awaitElementRect(webView, ".welcome-choice-primary")
+      val activeWebView = awaitWebView(scenario)
+      webView = activeWebView
+      val createDemo = awaitElementRect(activeWebView, ".welcome-choice-primary")
       // First-run onboarding itself is a user action in the packaged app.
-      tap(webView, createDemo)
+      tap(activeWebView, createDemo)
       awaitCondition("first-run demo graph route after Create a new graph") {
-        evaluateJson(webView, """
+        evaluateJson(activeWebView, """
           (() => JSON.stringify({
             welcomeGone: !document.querySelector('.welcome-overlay'),
             route: document.querySelector('.page-title')?.textContent?.trim() || '',
@@ -273,11 +284,16 @@ class AndroidUiRuntimeTest {
           it.optBoolean("welcomeGone") && it.optString("route").isNotEmpty() && it.optInt("blocks") > 0
         }
       }
-      awaitTopbar(webView)
-      block(scenario, webView)
-    } finally {
-      scenario.close()
+      awaitTopbar(activeWebView)
+      block(scenario, activeWebView)
+    } catch (failure: Throwable) {
+      emitFailureEvidence(test, webView, failure)
+      throw failure
     }
+    // Do not close ActivityScenario here. On the hosted API-35 x86_64 image,
+    // destroying Tauri's active WebView from the instrumentation thread aborts
+    // HWUI on a destroyed mutex. The shell runner gives every method its own
+    // process lifetime and force-stops the package before the next method.
   }
 
   private fun awaitWebView(scenario: ActivityScenario<MainActivity>): WebView {
@@ -334,6 +350,14 @@ class AndroidUiRuntimeTest {
     return checkNotNull(result)
   }
 
+  private fun awaitVisibleElementByScrolling(webView: WebView, selector: String, description: String): JSONObject {
+    repeat(MAX_FIXTURE_SCROLLS + 1) { attempt ->
+      visibleElementRectOrNull(webView, selector)?.let { return it }
+      if (attempt < MAX_FIXTURE_SCROLLS) swipeUp(webView)
+    }
+    throw AssertionError("timed out waiting for $description after $MAX_FIXTURE_SCROLLS native scroll gestures")
+  }
+
   private fun elementRectOrNull(webView: WebView, selector: String): JSONObject? {
     val expression = """
       (() => {
@@ -349,15 +373,33 @@ class AndroidUiRuntimeTest {
     return evaluateJsonOrNull(webView, expression)
   }
 
+  private fun visibleElementRectOrNull(webView: WebView, selector: String): JSONObject? {
+    val expression = """
+      (() => {
+        const elements = [...document.querySelectorAll(${JSONObject.quote(selector)})];
+        const element = elements.find((candidate) => {
+          const rect = candidate.getBoundingClientRect();
+          const style = getComputedStyle(candidate);
+          return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 &&
+            rect.bottom > 64 && rect.top < window.innerHeight - 24;
+        });
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        return JSON.stringify({ left: rect.left, top: rect.top, width: rect.width, height: rect.height,
+          viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, dpr: window.devicePixelRatio });
+      })()
+    """.trimIndent()
+    return evaluateJsonOrNull(webView, expression)
+  }
+
   private fun awaitContentBlock(
     webView: WebView,
     minimumTextLength: Int,
     maximumTextLength: Int,
     requireSingleVisualLine: Boolean,
   ): JSONObject {
-    var result: JSONObject? = null
-    awaitCondition("demo block with $minimumTextLength..$maximumTextLength visible characters") {
-      result = evaluateJsonOrNull(webView, """
+    repeat(MAX_FIXTURE_SCROLLS + 1) { attempt ->
+      val result = evaluateJsonOrNull(webView, """
         (() => {
           const block = [...document.querySelectorAll('.ls-block')]
             .find((candidate) => {
@@ -368,7 +410,8 @@ class AndroidUiRuntimeTest {
               const lineHeight = parseFloat(getComputedStyle(content).lineHeight) || 20;
               const singleLine = rect.height <= lineHeight * 1.6;
               return length >= $minimumTextLength && length <= $maximumTextLength &&
-                (${if (requireSingleVisualLine) "singleLine" else "!singleLine"});
+                (${if (requireSingleVisualLine) "singleLine" else "!singleLine"}) &&
+                rect.bottom > 64 && rect.top < window.innerHeight - 24;
             });
           if (!block) return null;
           const content = block.querySelector(':scope > .block-main > .block-content-wrapper');
@@ -379,9 +422,13 @@ class AndroidUiRuntimeTest {
             blockId: block.dataset.blockId, textLength: content.innerText.trim().length });
         })()
       """.trimIndent())
-      result != null
+      if (result != null) return result
+      if (attempt < MAX_FIXTURE_SCROLLS) swipeUp(webView)
     }
-    return checkNotNull(result)
+    throw AssertionError(
+      "timed out waiting for a demo block with $minimumTextLength..$maximumTextLength visible characters " +
+        "after $MAX_FIXTURE_SCROLLS native scroll gestures",
+    )
   }
 
   private fun setRootZoom(webView: WebView, scale: Double) {
@@ -448,6 +495,22 @@ class AndroidUiRuntimeTest {
     SystemClock.sleep((ViewConfiguration.getLongPressTimeout() + LONG_PRESS_MARGIN_MS).toLong())
     dispatchMotion(webView, downTime, MotionEvent.ACTION_UP, point.first, point.second)
     SystemClock.sleep(LONG_PRESS_SETTLE_MS)
+  }
+
+  private fun swipeUp(webView: WebView) {
+    val x = webView.width * 0.72f
+    val startY = webView.height * 0.78f
+    val endY = webView.height * 0.28f
+    val downTime = SystemClock.uptimeMillis()
+    dispatchMotion(webView, downTime, MotionEvent.ACTION_DOWN, x, startY)
+    repeat(SWIPE_STEPS) { index ->
+      val fraction = (index + 1).toFloat() / SWIPE_STEPS
+      val y = startY + (endY - startY) * fraction
+      SystemClock.sleep(SWIPE_STEP_MS)
+      dispatchMotion(webView, downTime, MotionEvent.ACTION_MOVE, x, y)
+    }
+    dispatchMotion(webView, downTime, MotionEvent.ACTION_UP, x, endY)
+    SystemClock.sleep(SWIPE_SETTLE_MS)
   }
 
   private fun motionPoint(webView: WebView, rect: JSONObject): Pair<Float, Float> {
@@ -659,17 +722,7 @@ class AndroidUiRuntimeTest {
   private fun setOrientation(scenario: ActivityScenario<MainActivity>, requested: Int) {
     scenario.onActivity { it.requestedOrientation = requested }
     val expected = if (requested == ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE) "landscape" else "portrait"
-    awaitCondition("$expected Android orientation and WebView viewport") {
-      if (currentOrientation(scenario) != expected) return@awaitCondition false
-      var currentWebView: WebView? = null
-      scenario.onActivity { activity -> currentWebView = findWebView(activity.window.decorView) }
-      val webView = currentWebView ?: return@awaitCondition false
-      val viewport = evaluateJson(webView, """
-        (() => JSON.stringify({ width: window.innerWidth, height: window.innerHeight }))()
-      """.trimIndent())
-      if (expected == "landscape") viewport.optInt("width") > viewport.optInt("height")
-      else viewport.optInt("height") >= viewport.optInt("width")
-    }
+    awaitCondition("$expected Android orientation") { currentOrientation(scenario) == expected }
   }
 
   private fun evaluateJson(webView: WebView, expression: String): JSONObject {
@@ -744,6 +797,43 @@ class AndroidUiRuntimeTest {
     println(line)
   }
 
+  private fun emitFailureEvidence(test: String, webView: WebView?, failure: Throwable) {
+    val receipt = JSONObject()
+      .put("test", test)
+      .put("outcome", "harness-failure")
+      .put("failureClass", failure.javaClass.name)
+      .put("failureMessage", failure.message ?: "")
+    if (webView != null) {
+      try {
+        receipt.put("dom", evaluateJson(webView, """
+          (() => JSON.stringify({
+            route: document.querySelector('.page-title')?.textContent?.trim() || '',
+            blocks: document.querySelectorAll('.ls-block').length,
+            pageRefs: document.querySelectorAll('a.page-ref').length,
+            editors: document.querySelectorAll('textarea.block-editor').length,
+            scrollY: window.scrollY,
+            viewport: { width: window.innerWidth, height: window.innerHeight },
+            activeTag: document.activeElement?.tagName || '',
+            activeClass: document.activeElement?.className || '',
+          }))()
+        """.trimIndent()))
+      } catch (_: Throwable) {
+        receipt.put("dom", "unavailable")
+      }
+    }
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val directory = File(context.filesDir, "android-ui-runtime")
+    require(directory.mkdirs() || directory.isDirectory) { "could not create Android UI evidence directory $directory" }
+    InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()?.let { screenshot ->
+      File(directory, "$test.png").outputStream().use { output ->
+        screenshot.compress(Bitmap.CompressFormat.PNG, 100, output)
+      }
+      receipt.put("screenshot", "$test.png")
+    }
+    File(directory, "$test.json").writeText(receipt.toString())
+    Log.e(RECEIPT_TAG, "TINE_ANDROID_UI_RUNTIME_FAILURE $receipt")
+  }
+
   private companion object {
     const val RECEIPT_TAG = "TineAndroidUi"
     const val STARTUP_TIMEOUT_MS = 45_000L
@@ -753,6 +843,10 @@ class AndroidUiRuntimeTest {
     const val LONG_PRESS_MARGIN_MS = 250
     const val LONG_PRESS_SETTLE_MS = 450L
     const val SELECTION_TIMEOUT_MS = 8_000L
+    const val MAX_FIXTURE_SCROLLS = 14
+    const val SWIPE_STEPS = 8
+    const val SWIPE_STEP_MS = 18L
+    const val SWIPE_SETTLE_MS = 320L
     const val OPTIONAL_ACTION_FLOOR_PX = 345.0
     const val NAVIGATION_ACTION_FLOOR_PX = 300.0
   }

@@ -68,10 +68,9 @@ run_journey() {
 
   adb logcat -d -v time \
     AndroidRuntime:E DEBUG:V chromium:E TineAndroidUi:I TestRunner:V libc:F '*:S' > "$runner_log" || true
-  # The ActivityScenario closes before am instrument returns, so a shell
-  # screencap here would normally show the launcher. The test captures while
-  # the asserted menu/selection/topbar is still alive and writes beside its
-  # JSON receipt; pull those exact in-journey bytes.
+  # A shell screencap after am instrument would not prove the asserted state.
+  # The test captures while the menu/selection/topbar is alive and writes
+  # beside its JSON receipt; pull those exact in-journey bytes.
   adb exec-out run-as page.tine.app cat "files/android-ui-runtime/$method.png" > "$screenshot_file" || true
   # The log line is convenient in an Actions failure view, while this exact file
   # is the durable DOM/native receipt (large responsive matrices can exceed a
