@@ -227,7 +227,7 @@ class AndroidUiRuntimeTest {
       )) {
         val target = awaitContentBlock(webView, textBounds.first, textBounds.second, kind == "single-line")
         val blockId = target.getString("blockId")
-        tap(webView, target)
+        tapContentStart(webView, target)
         val textarea = awaitEditor(webView, blockId, kind != "single-line")
         if (kind != "single-line") {
           // Establish the reporter's literal starting state through touch: the
@@ -495,10 +495,11 @@ class AndroidUiRuntimeTest {
           if (!block) return null;
           const content = block.querySelector(':scope > .block-main > .block-content-wrapper');
           const rect = content.getBoundingClientRect();
+          const lineHeight = parseFloat(getComputedStyle(content).lineHeight) || 20;
           if (rect.width <= 0 || rect.height <= 0) return null;
           return JSON.stringify({ left: rect.left, top: rect.top, width: rect.width, height: rect.height,
             viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
-            blockId: block.dataset.blockId, textLength: content.innerText.trim().length });
+            lineHeight, blockId: block.dataset.blockId, textLength: content.innerText.trim().length });
         })()
       """.trimIndent())
       if (result != null) return result
@@ -532,6 +533,14 @@ class AndroidUiRuntimeTest {
     SystemClock.sleep(TAP_SETTLE_MS)
     dispatchMotion(webView, downTime, MotionEvent.ACTION_UP, point.first, point.second)
     SystemClock.sleep(TAP_SETTLE_MS)
+  }
+
+  private fun tapContentStart(webView: WebView, content: JSONObject) {
+    // A content wrapper's centre can lie over an inline page reference. Use
+    // the leading text band so the physical tap reliably enters block edit.
+    val cssX = content.getDouble("left") + minOf(32.0, content.getDouble("width") * 0.18)
+    val cssY = content.getDouble("top") + content.getDouble("lineHeight") * 0.5
+    tapAt(webView, motionPoint(webView, content, cssX, cssY))
   }
 
   private fun longPress(webView: WebView, rect: JSONObject) {
