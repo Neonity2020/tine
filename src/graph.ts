@@ -3,7 +3,7 @@
 
 import { backend } from "./backend";
 import { managedStorageRuntime } from "./managedStorageRuntime";
-import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
+import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, restorePdfSessionTarget, restorePendingPdfSessionTarget, suspendPdfForGraphTransition } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
@@ -21,6 +21,7 @@ import { endEdit } from "./editorController";
 import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
 import { openConfiguredHomePage } from "./homePage";
 import { safeManagedErrorDetail } from "./managedDiagnostics";
+import type { PersistedPdfTarget } from "./uiStateRegistry";
 
 const GRAPH_KEY = "tine.graphPath";
 export const PARTIAL_PROVIDER_REFUSAL =
@@ -147,6 +148,7 @@ export async function loadGraphPath(
   const prev = graphMeta()?.root || persistedGraphPath();
   const switching = !!prev && !!graphPath && prev !== graphPath;
   const rebindsPdfOwner = hadGraph && (switching || options.forceRefresh === true);
+  let suspendedPdfTarget: PersistedPdfTarget | null = null;
   if (!(await authorizeGraphAccess(graphPath))) return { kind: "aborted" };
   // This is the last await before the backend graph binding can change.  Flush
   // delayed view state plus complete highlight/area mutations under A; only a
@@ -157,7 +159,7 @@ export async function loadGraphPath(
   }
   if (rebindsPdfOwner) {
     retirePdfOwnership();
-    closePdf();
+    suspendedPdfTarget = suspendPdfForGraphTransition();
   }
   if (continuation !== graphLoadContinuation) return { kind: "aborted" };
 
@@ -174,14 +176,20 @@ export async function loadGraphPath(
     // load_graph failed before installing a replacement binding.  Publish a new
     // local generation for the still-bound old graph; the retired viewer stays
     // closed, so no callback can regain its former authority.
-    if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
+    if (rebindsPdfOwner && prev) {
+      activatePdfOwnership(prev);
+      restorePdfSessionTarget(suspendedPdfTarget);
+    }
     if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     throw error;
   }
   if (continuation !== graphLoadContinuation) return { kind: "aborted" };
   console.info(`[tine] frontend graph open: native binding ready at ${Math.round(performance.now() - startedAt)} ms`);
   if (result.kind === "focused_existing") {
-    if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
+    if (rebindsPdfOwner && prev) {
+      activatePdfOwnership(prev);
+      restorePdfSessionTarget(suspendedPdfTarget);
+    }
     if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     return { kind: "focused_existing" };
   }
@@ -190,7 +198,17 @@ export async function loadGraphPath(
   if (result.kind === "already_current" && hadGraph && !options.forceRefresh) {
     return { kind: "already_current", root: meta.root };
   }
-  if (!hadGraph || rebindsPdfOwner) activatePdfOwnership(meta.root);
+  if (!hadGraph || rebindsPdfOwner) {
+    activatePdfOwnership(meta.root);
+    if (rebindsPdfOwner && !switching) {
+      // Same-root refresh retires the old generation but retains this graph's
+      // stable session identity under the freshly minted owner.
+      restorePdfSessionTarget(suspendedPdfTarget);
+    } else if (!hadGraph) {
+      // A parsed session can arrive before native graph ownership exists.
+      restorePendingPdfSessionTarget();
+    }
+  }
   resetStore();
   resetNavigationIndex();
   clearAssetBlobCache(); // old graph's image blob URLs must not leak into the new one

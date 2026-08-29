@@ -389,6 +389,12 @@ replaces and deletes each old route.
 | immutable oplog/archive | managed page/journal semantic truth | assets, PDF sidecars, config/settings |
 | SQLite, scratch, projection receipts | acceleration, reconstruction, diagnostics | semantic truth or permission to overwrite Markdown |
 
+The native watcher may observe metadata changes below the approved assets
+capability solely to invalidate WebView render caches. That observation grants
+no managed actor admission, publishes no operation or provider object, and does
+not make Tine responsible for transferring or resolving asset bytes; the user's
+whole-directory synchronizer remains their transport.
+
 Authority is transferred only by a validated, durably published record while
 the current owner retains the relevant lease/capability. A path name, a newer
 mtime, a cache row, or provider arrival alone never transfers authority. Any

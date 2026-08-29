@@ -43,6 +43,7 @@ import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
 import { applyGraphConfigChange, loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
+import { applyObservedAssetChanges } from "./assetRefresh";
 import { favoritesPageChanged } from "./favoritesStore";
 import { checkForUpdate } from "./update";
 import { WelcomeLayer } from "./components/Welcome";
@@ -136,7 +137,7 @@ import { initAssetSettings } from "./assetSettings";
 import { initMediaEditorSettings } from "./mediaEditorSettings";
 import { initSpellcheckSettings } from "./spellcheckSettings";
 import { initLinkDefault } from "./editor/linkDefault";
-import { initDebug } from "./debug";
+import { dbg, initDebug } from "./debug";
 import { WindowControls, ResizeGrips, installWindowChrome, maximized } from "./components/WindowChrome";
 import { initNativeChrome, isMac, isMobilePlatform, osDrawsWindowControls } from "./nativeChrome";
 import {
@@ -1042,37 +1043,44 @@ export function App(): JSX.Element {
   onMount(() => {
     let disposed = false;
     let started = false;
-    let unlisten = () => {};
+    let unlistenStorage = () => {};
+    let unlistenAssets = () => {};
     const start = () => {
       if (disposed || started) return;
       started = true;
       startupRecovery.start();
     };
-    // Subscribe before starting: native transition identity is the only
-    // progress authority, and early synchronous receipts must not be missed.
-    void backend().onStorageTransition((event) => {
-      storageTransitionRuntime.receive(event);
-      startupRecovery.receiveTransition(event);
-    }).then((stop) => {
+    // Install both observation bridges before opening the graph. Native
+    // managed-open phases can begin synchronously with the graph-open command,
+    // while an image may render before the watcher has finished binding its
+    // approved external-assets root. Starting after both listeners settle
+    // prevents either early event from falling into a WebView subscription gap.
+    void Promise.allSettled([
+      backend().onStorageTransition((event) => {
+        storageTransitionRuntime.receive(event);
+        startupRecovery.receiveTransition(event);
+      }),
+      backend().onAssetChanged((batch) => {
+        dbg(`asset-changed paths=${batch.paths.length}`);
+        applyObservedAssetChanges(batch.paths);
+      }),
+    ]).then(([storage, assets]) => {
+      if (storage.status === "fulfilled") unlistenStorage = storage.value;
+      if (assets.status === "fulfilled") unlistenAssets = assets.value;
       if (disposed) {
-        stop();
+        unlistenStorage();
+        unlistenAssets();
         return;
       }
-      unlisten = stop;
-      // Native managed-open phases can begin synchronously with the graph-open
-      // command.  Do not start that command until its progress listener is
-      // installed: otherwise Android WebView startup can lose the first (and,
-      // for a long clean-manifest recovery, only) phase receipt.
-      start();
-    }).catch(() => {
-      // If the event bridge itself is unavailable, startup still attempts the
+      // If either event bridge is unavailable, startup still attempts the
       // native command; command failure remains actionable without inventing a
       // timeout-based storage outcome.
       start();
     });
     onCleanup(() => {
       disposed = true;
-      unlisten();
+      unlistenStorage();
+      unlistenAssets();
       startupRecovery.dispose();
     });
   });

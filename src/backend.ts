@@ -671,6 +671,9 @@ export interface Backend {
   /** Subscribe to coalesced external bulk revisions (Concord P2): one event
    *  per reconcile cycle that changed more than the bulk threshold of pages. */
   onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void>;
+  /** Subscribe to externally changed graph assets. This is cache observation,
+   *  not managed-storage or oplog admission. */
+  onAssetChanged(cb: (batch: AssetChangedBatch) => void): Promise<() => void>;
   /** Subscribe to `logseq/config.edn` being re-read after an outside change.
    *  Carries the fresh GraphMeta; a graph whose settings did not move emits
    *  nothing. */
@@ -816,6 +819,13 @@ export interface GraphChange {
  *  threshold of pages. Carries the same per-page change shape. */
 export interface GraphChangedBulk {
   changes: GraphChange[];
+}
+
+/** One coalesced watcher epoch for ordinary files under the approved assets
+ * capability. Paths are relative to assets/; absolute device paths never cross
+ * the bridge. */
+export interface AssetChangedBatch {
+  paths: string[];
 }
 
 export function isTauri(): boolean {
@@ -1662,6 +1672,10 @@ class TauriBackend implements Backend {
   async onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
+  }
+  async onAssetChanged(cb: (batch: AssetChangedBatch) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<AssetChangedBatch>("asset-changed", (e) => cb(e.payload));
   }
   async onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");

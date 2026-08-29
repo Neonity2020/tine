@@ -24,6 +24,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Images changed by Syncthing, Dropbox, an external editor, or another Tine
+  window now refresh in place without reopening the graph.** Tine observes the
+  approved `assets/` directory separately from page reconciliation in Direct
+  Files and managed storage, including an approved external-assets target.
+  Asset bytes remain ordinary filesystem-synchronized files and never enter the
+  managed oplog or `.tine-sync`; open PDF/audio/video sessions are not replaced
+  mid-use and see new bytes when reopened.
+
 - Block background colors no longer crowd their bullets. Regular dots and
   numbered-list ordinals now occupy the same 22px control track, while the
   rounded highlight keeps text aligned with an unhighlighted or edited block.

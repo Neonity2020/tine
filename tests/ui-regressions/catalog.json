@@ -8739,6 +8739,33 @@
     "failBefore": "proven"
    },
    "notes": "GH #415: arrow navigation inside an embed was surface-local (GH #341) but the embed ROOT had no in-surface previous block, so Up at its first row did nothing and the caret was trapped until the user reached for the mouse. LiveRefGroup now carries an EmbedNavExitContext with the embed host's block id, and Block's ArrowUp falls back — only when the scoped previous is empty — to the block preceding the embed host in the host page, mounted in the primary surface so the embed stays rendered; rows inside the embed still navigate internally (sibling tests unchanged). Fail-before proven on base 848ae2ab: the exit test failed with the editing session stuck on the embedded target."
+  },
+  {
+   "id": "UI-PDF-GRAPH-SESSION-RESTORE-001",
+   "title": "An open PDF resource returns after relaunch and an explicit close stays closed",
+   "family": "pdf",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/uiStateRegistry.test.ts",
+     "src/session.test.ts",
+     "src/workspaces.test.ts",
+     "src/graph.test.tsx",
+     "src/render/annotationRef.test.tsx",
+     "scripts/e2e-pdf-ownership.mjs"
+    ],
+    "scenario": "pdf.graph-session-open-close-restore",
+    "failBefore": "proven"
+   },
+   "notes": "Private UI-state/PDF queue item, 2026-08-29. Only stable filename and label cross the session boundary. Graph ownership generation, page, highlight intent, native handles, and sidecar view state remain transient and are reminted or loaded by their existing owners. Transition suspend/restore is deliberately save-free so a delayed graph-A close cannot overwrite graph B."
   }
  ]
 }

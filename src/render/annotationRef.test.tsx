@@ -1,12 +1,20 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { backend } from "../backend";
-import { openPdf, pdfTarget, setPdfTarget } from "../ui";
+import {
+  closePdf,
+  openPdf,
+  pdfTarget,
+  restorePdfSessionTarget,
+  setPdfTarget,
+  suspendPdfForGraphTransition,
+} from "../ui";
 import { setDoc } from "../store";
 import { AnnotationBody } from "../components/AnnotationBody";
 import { AstBody } from "./body";
 import { initParser } from "./parse";
 import { activatePdfOwnership, resetPdfOwnershipForTest, type PdfOwnership } from "../pdfOwnership";
+import { mainRouter } from "../panes";
 
 let pdfOwner: PdfOwnership;
 
@@ -33,6 +41,26 @@ async function settle(): Promise<void> {
 }
 
 describe("PDF annotation block references (GH #61)", () => {
+  it("saves user open/close but keeps transition suspend/restore side-effect free", () => {
+    const schedule = vi.spyOn(mainRouter(), "scheduleSessionSave").mockImplementation(() => {});
+
+    openPdf("assets/paper.pdf", "Paper");
+    expect(schedule).toHaveBeenCalledOnce();
+
+    const stable = suspendPdfForGraphTransition();
+    expect(stable).toEqual({ filename: "assets/paper.pdf", label: "Paper" });
+    expect(schedule).toHaveBeenCalledOnce();
+
+    expect(restorePdfSessionTarget(stable)).toBe(true);
+    expect(pdfTarget()?.owner).toBe(pdfOwner);
+    expect(schedule).toHaveBeenCalledOnce();
+
+    closePdf();
+    expect(schedule).toHaveBeenCalledTimes(2);
+    closePdf();
+    expect(schedule).toHaveBeenCalledTimes(2);
+  });
+
   it("opens the owning PDF at hl-page on a plain click", async () => {
     const id = "61a00000-0000-0000-0000-000000000001";
     vi.spyOn(backend(), "resolveBlocks").mockResolvedValue([{

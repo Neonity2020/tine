@@ -2707,15 +2707,20 @@ pub(crate) fn read_asset(
     // Return RAW bytes (not a JSON number[]), so a multi-MB PDF/image isn't
     // serialized element-by-element and re-parsed on the JS side — the frontend
     // receives an ArrayBuffer directly.
-    with_filesystem_graph(&state, |g| {
-        max_bytes
+    let window_label = state.window.label().to_string();
+    let (bytes, path) = with_filesystem_graph(&state, |g| {
+        let path = g.asset_file_for_read(&name).map_err(|e| e.to_string())?;
+        let bytes = max_bytes
             .map_or_else(
                 || g.read_asset(&name),
                 |limit| g.read_asset_limited(&name, limit),
             )
-            .map(tauri::ipc::Response::new)
-            .map_err(|e| e.to_string())
-    })
+            .map_err(|e| e.to_string())?;
+        Ok((bytes, path))
+    })?;
+    crate::watcher::note_asset_read(&window_label, &path);
+    crate::state::poke_watcher(&state.state);
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Validate one graph media file and return its top-level asset name for the
@@ -3006,9 +3011,13 @@ pub(crate) fn import_asset(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
+    let window_label = state.window.label().to_string();
     with_filesystem_graph(&state, |g| {
-        g.import_asset(std::path::Path::new(&path), name.as_deref())
-            .map_err(|e| e.to_string())
+        let stored = g
+            .import_asset(std::path::Path::new(&path), name.as_deref())
+            .map_err(|e| e.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
+        Ok(stored)
     })
 }
 
@@ -3080,10 +3089,13 @@ pub(crate) fn import_native_capture(
         ));
     }
     let mut capture = capture.into_std();
+    let window_label = state.window.label().to_string();
     let stored = with_filesystem_graph(&state, |graph| {
-        graph
+        let stored = graph
             .import_asset_file(&mut capture, &name, max_bytes)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &graph.assets_path().join(&stored));
+        Ok(stored)
     })?;
     // The graph asset is authoritative now. Cleanup failure is harmless cache
     // litter and must not make the frontend omit the already-durable reference.
@@ -3595,7 +3607,13 @@ pub(crate) async fn list_orphan_assets(
 /// Move an orphaned asset to the recoverable trash.
 #[tauri::command]
 pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_trash_graph(&state, |g| g.trash_asset(&name).map_err(|e| e.to_string()))
+    let window_label = state.window.label().to_string();
+    with_trash_graph(&state, |g| {
+        let path = g.assets_path().join(&name);
+        g.trash_asset(&name).map_err(|e| e.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &path);
+        Ok(())
+    })
 }
 
 /// Count + total bytes in the recoverable asset trash.
@@ -4698,8 +4716,11 @@ pub(crate) fn save_asset(
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let bytes = decode_asset_b64(&bytes_b64)?;
+    let window_label = state.window.label().to_string();
     with_filesystem_graph(&state, |g| {
-        g.save_asset(&name, &bytes).map_err(|e| e.to_string())
+        let stored = g.save_asset(&name, &bytes).map_err(|e| e.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
+        Ok(stored)
     })
 }
 
@@ -4817,9 +4838,13 @@ pub(crate) fn save_pdf_area_image(
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let bytes = decode_asset_b64(&bytes_b64)?;
+    let window_label = state.window.label().to_string();
     with_filesystem_graph(&state, |g| {
-        g.write_pdf_area_image(&pdf, page, &id, stamp, &bytes)
-            .map_err(|e| e.to_string())
+        let stored = g
+            .write_pdf_area_image(&pdf, page, &id, stamp, &bytes)
+            .map_err(|e| e.to_string())?;
+        crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
+        Ok(stored)
     })
 }
 

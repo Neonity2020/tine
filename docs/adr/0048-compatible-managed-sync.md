@@ -69,7 +69,9 @@ sync is declared stable.
 
 The experimental compatible v1 implementation manages page and journal text only.
 Assets, PDF sidecars, and `config.edn` continue to be synchronized as ordinary files
-by the user's provider. Backup restore is operation-first: a verified post-migration
+by the user's provider. Tine may watch asset metadata to invalidate stale image
+render caches, but that does not admit asset bytes to the operation log or create a
+second transfer/conflict system. Backup restore is operation-first: a verified post-migration
 snapshot becomes one graph replacement operation before files are copied, and an
 immutable projection intent lets startup finish that explicit overwrite after a
 crash. Pre-migration backups without durable block ids are refused while managed
