@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
 import { openJournals, openPage, openPageInNewTab, openFile, openInNewTab, openPageTarget, openPageTargetInNewTab, route, type PageTarget } from "../router";
+import { openRouteInOtherPane } from "../panes";
 import {
   addGroup,
   deleteGroup,
@@ -326,7 +327,13 @@ export function Sidebar(props: {
                         onClick={(e) => {
                           if (rowReorderClickSuppressed()) return;
                           const dest = internalLinkDest(e);
-                          openSidebarPageTarget(name, itemKind(name), dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
+                          if (dest === "pane") {
+                            // Alt+click (GH #438): the same other-pane route the
+                            // page refs and search results use; alias-resolved
+                            // like every other favorite-row destination.
+                            const t = target();
+                            openRouteInOtherPane({ kind: "page", name: t.name, pageKind: t.kind });
+                          } else openSidebarPageTarget(name, itemKind(name), dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
                         }}
                         onAuxClick={(e) =>
                           internalLinkAuxClick(e, () => openSidebarPageTarget(name, itemKind(name), "new-tab"))
@@ -385,6 +392,7 @@ export function Sidebar(props: {
                           const dest = internalLinkDest(e);
                           if (dest === "sidebar") openPageInSidebar(target());
                           else if (dest === "background") openPageTargetInNewTab(target());
+                          else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target() });
                           else { openPageTarget(target()); props.onActiveNavigationComplete?.(); }
                         }}
                         onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(target()))}
@@ -427,6 +435,7 @@ export function Sidebar(props: {
                     else if (dest === "background") p.path
                       ? openInNewTab({ kind: "page", name: p.name, pageKind: "page", path: p.path })
                       : openPageInNewTab(p.name, "page");
+                    else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: p.name, pageKind: "page", ...(p.path ? { path: p.path } : {}) });
                     else openEntry(p.path, p.name);
                   }}
                   onAuxClick={(e) =>

@@ -1,6 +1,7 @@
 import { For, Show, createResource, createSignal, createMemo, createEffect, onCleanup, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { openPage, openPageInNewTab } from "../router";
+import { openRouteInOtherPane } from "../panes";
 import { openPageInSidebar, openPageContextMenu } from "../ui";
 import { LiveRefGroup } from "./LiveRefGroup";
 import type { BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
@@ -512,6 +513,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                       const dest = internalLinkDest(e);
                       if (dest === "sidebar") openPageInSidebar(group().page, group().kind);
                       else if (dest === "background") openPageInNewTab(group().page, group().kind);
+                      else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: group().page, pageKind: group().kind });
                       else openPage(group().page, group().kind);
                     }}
                     onPointerDown={longPress.onPointerDown}

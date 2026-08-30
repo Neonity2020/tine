@@ -2,6 +2,7 @@ import { For, Show, createResource, createSignal, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { dataRev, graphEpoch } from "../ui";
 import { openPage, openPageInNewTab } from "../router";
+import { openRouteInOtherPane } from "../panes";
 import { openPageInSidebar, openPageContextMenu } from "../ui";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { LiveRefGroup } from "./LiveRefGroup";
@@ -74,6 +75,7 @@ export function BlockReferences(props: { id: string }): JSX.Element {
                     const dest = internalLinkDest(e);
                     if (dest === "sidebar") openPageInSidebar(g.page, g.kind);
                     else if (dest === "background") openPageInNewTab(g.page, g.kind);
+                    else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: g.page, pageKind: g.kind });
                     else openPage(g.page, g.kind);
                   }}
                   onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(g.page, g.kind))}

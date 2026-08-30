@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Alt+click opens an internal page or block link in the other pane.**
+  After the unified click contract moved Ctrl/Cmd+click to background tabs,
+  ordinary links had no mouse+modifier route to a pane; Alt+click is that
+  route again, matching the long-standing Alt+click / Alt+Enter gesture on
+  Search and Quick Switcher results. It splits right when there is only one
+  pane, and Shift+click (right sidebar), Ctrl/Cmd+click and middle-click
+  (background tab) keep their existing meanings everywhere. (GH #438)
+
 - **Declarative themes can now shape reading presentation without running code.**
   Theme API 0.2 adds bounded Tine-owned presets for editorial serif typography,
   journal headers, and a Today task summary, while existing color-only 0.1
