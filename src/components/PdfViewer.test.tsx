@@ -1562,6 +1562,21 @@ describe("PdfViewer released-OG themes and outline", () => {
     }
   });
 
+  it("keeps Close as the terminal PDF toolbar action", async () => {
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(documentWithPages([page(612, 792)])) });
+    const view = mountViewer();
+    try {
+      await flush();
+      const actions = view.host.querySelector(".pdf-toolbar-actions")!;
+      const buttons = [...actions.querySelectorAll<HTMLButtonElement>("button")];
+      expect(buttons.at(-1)?.title).toBe("Close PDF");
+      expect(buttons.at(-1)?.getAttribute("aria-label")).toBe("Close PDF");
+      expect(buttons.at(-1)?.classList.contains("pdf-close-btn")).toBe(true);
+    } finally {
+      view.dispose();
+    }
+  });
+
   it("matches released OG 1.0.0 page-theme filtering without inverting highlight overlays", () => {
     const css = readFileSync("src/styles/app.css", "utf8");
     expect(css).toContain('.pdf-viewer[data-theme="light"] {\n  --pdf-container-bg: #fff;\n  --pdf-toolbar-bg: #fff;\n  --pdf-page-bg: #fff;');

@@ -2086,9 +2086,6 @@ export function PdfViewer(props: {
       <div class="pdf-toolbar">
         <span class="pdf-title">{props.label}</span>
         <div class="pdf-toolbar-actions">
-          <button class="icon-btn pdf-close-btn" title="Close PDF" onClick={closePdf}>
-            ✕
-          </button>
           <div class="pdf-pager">
             <button class="icon-btn" title="Previous page" onClick={() => scrollToPage(curPage() - 1)}>
               ‹
@@ -2187,6 +2184,15 @@ export function PdfViewer(props: {
             }}
           >
             ⋯
+          </button>
+          <button
+            type="button"
+            class="icon-btn pdf-close-btn"
+            title="Close PDF"
+            aria-label="Close PDF"
+            onClick={closePdf}
+          >
+            ✕
           </button>
         </div>
       </div>

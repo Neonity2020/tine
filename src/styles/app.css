@@ -9601,8 +9601,8 @@ html.row-reorder-dragging * {
   min-width: 0;
 }
 
-/* Close leads the fixed control cluster, so a constrained reader can never
-   clip its only escape action from the far edge. */
+/* Close terminates the fixed control cluster, matching its conventional
+   discoverable position while remaining visible at the protected far edge. */
 .pdf-close-btn {
   flex: 0 0 auto;
 }

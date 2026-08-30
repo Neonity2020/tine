@@ -24,6 +24,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **The PDF reader's Close control is now the terminal toolbar action.** It
+  stays at the conventional far-right edge with an explicit accessible label,
+  instead of reading like another tool in the middle of the control cluster
+  (GH #443).
+
 - **Bounded managed block-referrer panels now show the same document-order
   prefix and exact result count as Direct Files.** The SQLite-backed route
   finishes generation-bound candidate discovery before applying the shared row
