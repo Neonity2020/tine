@@ -150,6 +150,19 @@ async function clickPdfLink(label) {
   await link.click();
 }
 
+async function openPdfNotes() {
+  const toolbarNotes = await browser.$(".pdf-notes-btn");
+  if (await toolbarNotes.isDisplayed()) {
+    await toolbarNotes.click();
+    return;
+  }
+
+  await browser.$('button[aria-label="More settings"]').click();
+  const overflowNotes = await browser.$(".pdf-settings-overflow button=Notes");
+  await overflowNotes.waitForClickable({ timeout: 10_000 });
+  await overflowNotes.click();
+}
+
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
@@ -210,7 +223,7 @@ try {
   await browser.$('button[title="Zoom in"]').click();
   const savedZoom = await browser.$(".pdf-zoom-level").getText();
 
-  await browser.$(".pdf-notes-btn").click();
+  await openPdfNotes();
   await browser.waitUntil(() => browser.execute(() =>
     [...document.querySelectorAll(".pane-leaf")].some((pane) =>
       pane.querySelector(".page-title")?.textContent?.trim() === "hls__first")), {
